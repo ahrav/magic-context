@@ -19,7 +19,7 @@ function makeDb(): Database {
     return db;
 }
 
-// A 1x1 transparent PNG data URL, standing in for a rendered mural.
+// FAKE_MURAL_DATA_URL is a 1x1 transparent PNG data URL used as a rendered mural.
 const FAKE_MURAL_DATA_URL =
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
@@ -40,7 +40,7 @@ function imageUrl(messages: MessageLike[]): string | undefined {
     )?.url;
 }
 
-/** Concatenated text of the prepended synthetic m[0] head message. */
+/* */
 function headText(messages: MessageLike[]): string {
     return (
         messages[0]?.parts
@@ -77,9 +77,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
                 mural: muralOption(),
             });
             expect(first.injected).toBe(true);
-            // m[0] carries the mural marker block.
             expect(first.m0Bytes?.toString("utf8")).toContain("<memory-mural>");
-            // The prepended synthetic head message carries an image file part.
             const head = hardMessages[0];
             const imagePart = head?.parts.find(
                 (part) => (part as { type?: string }).type === "file",
@@ -88,8 +86,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             expect(imagePart?.mime).toBe("image/png");
             expect(imagePart?.url).toBe(FAKE_MURAL_DATA_URL);
 
-            // A defer pass (no mural option supplied) must replay the SAME baked-in
-            // data URL from state, not drop the image — the "swaps only on a HARD
+            // A defer pass without a mural option replays the baked-in state data URL instead of removing the image.
             // fold" rule.
             const deferMessages: MessageLike[] = [];
             const second = injectM0M1({
@@ -339,8 +336,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
                 category: "ARCHITECTURE",
             });
 
-            // Fold with a mural so both the marker and the image payload are cached
-            // against this claim snapshot.
+            // The hard fold caches the marker and image payload for this claim snapshot.
             const foldMessages: MessageLike[] = [];
             injectM0M1({
                 db,
@@ -357,16 +353,14 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             expect(headText(foldMessages)).toContain("<memory-mural>");
             expect(headText(foldMessages)).toContain("<project-memory>");
 
-            // Withdraw the claim after the mural was cached, so the next pass must fold.
+            // Withdrawing the cached claim forces the next pass to fold.
             setProjectMemoryClaimLifecycle(
                 db,
                 { producer: "test", operationKey: "mural-stale-archive" },
                 { token: claim.token, state: "archived", actor: "user:test" },
             );
 
-            // A sibling writer keeps landing claims, so every materialize attempt loses
-            // the staleness check and the pass falls back to replaying the cached m[0]
-            // — which still carries the mural marker and the cached image payload.
+            // A sibling writer makes every materialize attempt fail its staleness check, so the pass replays cached m[0], including the mural marker and image payload.
             let concurrentClaims = 0;
             const staleMessages: MessageLike[] = [];
             const stale = injectM0M1({
@@ -390,9 +384,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             });
             expect(stale.materializationContentionRetryExhausted).toBe(true);
 
-            // The publication fence withholds the claim text, so every other
-            // claim-derived representation must obey it too: no image part, no
-            // marker promising one, and no cached payload left to replay.
+            // The publication fence suppresses all claim-derived representations: the image part, mural marker, and cached replay payload.
             const staleText = headText(staleMessages);
             expect(staleText).not.toContain("<project-memory>");
             expect(staleText).not.toContain("<memory-mural>");
@@ -416,7 +408,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
                 state,
                 projectPath: undefined,
                 isCacheBustingPass: true,
-                // muralEnabled defaults undefined → no image path.
+                // muralEnabled defaults to undefined, so injectM0M1 adds no mural image part.
             });
             expect(result.m0Bytes?.toString("utf8")).not.toContain("<memory-mural>");
             const imagePart = messages[0]?.parts.find(

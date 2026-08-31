@@ -16,8 +16,6 @@ export interface StripPiProcessedImagesResult {
 	newlyStrippedIds: string[];
 }
 
-// A non-empty marker preserves user/tool-result boundaries and keeps Anthropic
-// tool_result content valid after Pi removes the image bytes.
 const STRIPPED_IMAGE_MARKER = "[image stripped]";
 
 function isLargeImagePart(value: unknown): value is PiImagePart {
@@ -33,9 +31,6 @@ function isLargeImagePart(value: unknown): value is PiImagePart {
 }
 
 /**
- * Freeze newly aged Pi image-message ids on cache-busting passes, then replay
- * the frozen set on every pass. Persistence happens before mutation so bytes
- * only ship when the next pass can reproduce them.
  */
 export function stripPiProcessedImages(args: {
 	db: ContextDatabase;

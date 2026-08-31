@@ -108,8 +108,8 @@ describe("publish path over a journaling synapse lane", () => {
             const host = new DetailedSynapseTestHost();
             registerDetailedChunkProject(db, "git:chunk-unapplied", host);
             const compartmentId = seedCompartment(db, "ses-unapplied");
-            // Every result page is malformed, so no page yields a receipt and no
-            // receipt group covers the compartment's windows.
+            // Every result page is malformed, so no page yields a receipt.
+            // No receipt group covers the compartment's windows.
             host.resultPages = () => {
                 const error = new Error("malformed page") as Error & { code: string };
                 error.code = "schema_violation";
@@ -134,12 +134,9 @@ describe("publish path over a journaling synapse lane", () => {
                         call[1].includes("no receipt group covered its windows"),
                 ),
             ).toBe(true);
-            // Receipt-less destination rows are the split state the ledger
-            // exists to prevent, so the legacy path stays out of this compartment.
+            // Receipt-less destination rows stay out of the legacy path.
             expect(chunkRowCount(db, compartmentId)).toBe(0);
-            // The ledger owns the outcome: a page recorded against this
-            // compartment is what makes the lane's answer `false` rather than the
-            // `null` that hands the compartment to the legacy path.
+            // `null` hands the compartment to the legacy path.
             expect(ledgerRows(db)).toEqual([
                 { application_group: `compartment:${compartmentId}`, state: "failed" },
             ]);

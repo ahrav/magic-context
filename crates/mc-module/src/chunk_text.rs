@@ -21,31 +21,34 @@ pub(crate) struct CompactedText {
     pub(crate) commit_hashes: Vec<String>,
 }
 
-pub(crate) fn compact_text_for_summary(text: &str, role: &str) -> CompactedText {
+pub(crate) fn compact_text_for_summary(text: String, role: &str) -> CompactedText {
     let commit_hashes = if role == "assistant" {
-        extract_commit_hashes(text)
+        extract_commit_hashes(&text)
     } else {
         Vec::new()
     };
-    if commit_hashes.is_empty() || !commit_verb_regex().is_match(text) {
+    if commit_hashes.is_empty() || !commit_verb_regex().is_match(&text) {
         return CompactedText {
-            text: text.to_string(),
+            text,
             commit_hashes,
         };
     }
-    let without_hashes = commit_hash_extract_regex().replace_all(text, "");
-    let without_hashes = empty_parens_regex().replace_all(&without_hashes, "");
-    let without_hashes = space_before_comma_regex().replace_all(&without_hashes, ",");
-    let without_hashes = repeated_comma_regex().replace_all(&without_hashes, ", ");
-    let without_hashes = repeated_space_regex().replace_all(&without_hashes, " ");
-    let without_hashes = space_before_punct_regex().replace_all(&without_hashes, "$1");
-    let trimmed = without_hashes.trim();
-    CompactedText {
-        text: if trimmed.is_empty() {
-            text.to_string()
+    let compacted = {
+        let without_hashes = commit_hash_extract_regex().replace_all(&text, "");
+        let without_hashes = empty_parens_regex().replace_all(&without_hashes, "");
+        let without_hashes = space_before_comma_regex().replace_all(&without_hashes, ",");
+        let without_hashes = repeated_comma_regex().replace_all(&without_hashes, ", ");
+        let without_hashes = repeated_space_regex().replace_all(&without_hashes, " ");
+        let without_hashes = space_before_punct_regex().replace_all(&without_hashes, "$1");
+        let trimmed = without_hashes.trim();
+        if trimmed.is_empty() {
+            None
         } else {
-            trimmed.to_string()
-        },
+            Some(trimmed.to_string())
+        }
+    };
+    CompactedText {
+        text: compacted.unwrap_or(text),
         commit_hashes,
     }
 }
@@ -131,11 +134,16 @@ fn truncate_arg(value: &str) -> String {
 }
 
 pub(crate) fn clean_user_text(text: &str) -> String {
+    clean_user_text_cow(text).trim().to_string()
+}
+
+pub(crate) fn clean_user_text_cow(text: &str) -> std::borrow::Cow<'_, str> {
     let without_reminders = system_reminder_regex().replace_all(text, "");
-    without_reminders
-        .replace(OMO_INTERNAL_INITIATOR_MARKER, "")
-        .trim()
-        .to_string()
+    if without_reminders.contains(OMO_INTERNAL_INITIATOR_MARKER) {
+        std::borrow::Cow::Owned(without_reminders.replace(OMO_INTERNAL_INITIATOR_MARKER, ""))
+    } else {
+        without_reminders
+    }
 }
 
 pub(crate) fn is_system_directive(text: &str) -> bool {
@@ -143,7 +151,14 @@ pub(crate) fn is_system_directive(text: &str) -> bool {
 }
 
 pub(crate) fn normalize_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut output = String::with_capacity(text.len());
+    for word in text.split_whitespace() {
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(word);
+    }
+    output
 }
 
 pub(crate) fn compact_role(role: &str) -> String {

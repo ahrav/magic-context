@@ -726,7 +726,7 @@ fn released_pin_references_are_pruned_after_the_reclaim_grace() {
 
     // Expiry releases the pin, but the artifact stays live so reclamation never
     // touches its references.
-    store.run_capture_pin_maintenance_for_test(2).unwrap();
+    store.run_capture_pin_maintenance(2).unwrap();
     let inspect = || {
         Connection::open(root.path().join("core.sqlite"))
             .unwrap()
@@ -737,14 +737,10 @@ fn released_pin_references_are_pruned_after_the_reclaim_grace() {
     };
     assert_eq!(inspect(), 1);
 
-    store
-        .run_capture_pin_maintenance_for_test(GRACE_MS)
-        .unwrap();
+    store.run_capture_pin_maintenance(GRACE_MS).unwrap();
     assert_eq!(inspect(), 1, "pruned inside the grace window");
 
-    store
-        .run_capture_pin_maintenance_for_test(GRACE_MS + 3)
-        .unwrap();
+    store.run_capture_pin_maintenance(GRACE_MS + 3).unwrap();
     assert_eq!(inspect(), 0, "released reference outlived the grace window");
     assert!(object_path(root.path(), &handle.digest).exists());
     // The pin row itself is the durable audit record and survives the prune.

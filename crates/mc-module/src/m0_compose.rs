@@ -1,12 +1,11 @@
-//! The store → m0 byte producer for the HARD branch: read a session's durable state
-//! (compartments, memories or the workspace union, user-profile, project-docs) and
-//! compose the frozen m0 baseline bytes plus the watermarks the HARD persists.
+//! This module reads a session's durable state.
+//! The durable state includes compartments, memories or the workspace union, the user profile, and project docs.
+//! This module composes frozen m0 bytes and watermarks that HARD persists.
 //!
-//! This is the BYTE producer only — it does not classify or decide HARD-vs-SOFT (that's
-//! `apply_once`, which feeds these bytes into the cache core). It is pure given the store
-//! contents + `now_ms` + `budget`: same inputs → same bytes, the property the frozen-m0
-//! cache depends on. The expiry cutoff (`now_ms`) is passed in (frozen at the HARD by the
-//! caller, never read here from a live clock) so a later defer replays identical bytes.
+//! This module produces bytes but does not classify HARD versus SOFT.
+//! `apply_once` feeds these bytes into the cache core.
+//! This module returns identical bytes for identical store contents, `now_ms`, and `budget`.
+//! The caller supplies frozen `now_ms`; this module never reads a live clock.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -25,10 +24,8 @@ use crate::project_docs::read_project_docs_canonical;
 pub(crate) const MEMORY_MURAL_BLOCK: &str =
     "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
 
-/// Why composing the HARD m0 from the store failed.
 #[derive(Debug)]
 pub enum M0ComposeError {
-    /// A store read failed.
     Store(McStoreError),
     /// The stored compartment ranges overlap or otherwise fail strict ordering.
     CoverageGap(CoverageGap),
@@ -49,35 +46,28 @@ impl From<McStoreError> for M0ComposeError {
     }
 }
 
-/// The composed m0 baseline: its frozen bytes plus the watermarks the HARD persists into
-/// [`mc_store::ModuleMeta`] atomically with those bytes.
+/// `M0Composition` holds bytes and watermarks that HARD persists atomically in `ModuleMeta`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct M0Composition {
-    /// The frozen m0 baseline bytes (docs + profile + decayed compartments + memories).
+    /// `m0_bytes` contains docs, the profile, decayed compartments, and memories.
     pub m0_bytes: String,
-    /// Optional image block appended after the m0 text block on the OpenCode wire.
+    /// `mural` follows the m0 text block on the OpenCode wire.
     pub mural: Option<M0MuralBlock>,
-    /// The last raw message id covered by m0 — the cache/revert anchor. Empty when the
-    /// session has no compartments (nothing summarized → no covered prefix → the whole
-    /// live array is the tail).
+    /// `boundary_id` anchors cache reverts at the last covered raw message.
+    /// `boundary_id` is empty when no compartments are summarized, leaving the live array as the tail.
     pub boundary_id: String,
-    /// The last covered ordinal (the m0 coverage end / tail-trim point). None when there
-    /// are no compartments.
+    /// `coverage_ordinal` marks m0's tail-trim point.
+    /// `coverage_ordinal` is `None` when no compartments exist.
     pub coverage_ordinal: Option<u64>,
-    /// The FIRST covered ordinal (the leading edge of m0 coverage = the first compartment's
-    /// start). None when there are no compartments. The caller fails loud if any live item
-    /// sits BELOW this — it would be covered by no compartment yet trimmed as covered (a
-    /// silent leading-gap drop).
+    /// `first_covered_ordinal` is the first covered ordinal; the caller rejects live items below it to prevent trimming an uncovered leading gap.
     pub first_covered_ordinal: Option<u64>,
-    /// The highest compartment sequence folded into m0 (advances only on a HARD).
+    /// `folded_compartment_seq` advances only on a HARD.
     pub folded_compartment_seq: i64,
-    /// m0 contains these rendered claim revision locators.
     pub rendered_revision_locators: Vec<String>,
     /// The claim rows supply this generation vector.
     pub claim_snapshot_vector: Option<SnapshotVector>,
-    /// The canonical project-docs hash, a SNAPSHOT MARKER persisted with the bytes (NOT a
-    /// HARD trigger — see `M0ContentEpoch`). Records which docs version is in m0 so the
-    /// next natural HARD re-reads current docs.
+    /// `docs_hash` records the project-docs version included in m0; it does not trigger HARD.
+    /// The next natural HARD re-reads current docs.
     pub docs_hash: String,
 }
 
@@ -99,37 +89,30 @@ pub struct M0MuralBlock {
     pub content_hash: String,
 }
 
-/// The fixed expiry/budget inputs for an m0 compose, threaded from the caller so the
-/// HARD freezes them (a defer replays the same bytes, never re-reading a live clock or
 /// config).
 pub struct M0ComposeInputs<'a> {
     pub session_id: &'a str,
-    /// The project the store reads key off (resolved from the route binding, never the
+    /// `project_path` comes from the route binding; the request body cannot override it.
     /// request body).
     pub project_path: &'a str,
-    /// The project directory on disk, for reading ARCHITECTURE.md / STRUCTURE.md.
+    /// `project_directory` identifies the directory containing `ARCHITECTURE.md` and `STRUCTURE.md`.
     pub project_directory: &'a str,
-    /// The expiry cutoff, FROZEN at the HARD (a memory expiring after this still renders;
-    /// a later defer uses the same cutoff → identical bytes).
     pub now_ms: i64,
-    /// The history budget in tokens selected for this frozen render decision. The decay
-    /// renderer fits the compartments to it; under a loose budget the render is estimator-independent.
+    /// `history_budget_tokens` limits frozen rendering.
+    /// The renderer produces estimator-independent output when all compartments fit.
     pub history_budget_tokens: f64,
-    /// System-role content that is no longer in the live tail because the current fold
-    /// covers its ordinal. Passing it explicitly keeps m0 composition deterministic and
+    /// Passing system-role content covered by the current fold keeps m0 composition deterministic and replayable.
     /// replayable.
     pub covered_system_messages: &'a [String],
     /// Disabled memory removes both project memories and the user-profile memory block.
     pub memory_enabled: bool,
-    /// Maximum token estimate for the grouped project-memory block.
     pub memory_budget_tokens: f64,
-    /// Maximum token estimate for the user-profile block.
     pub user_profile_budget_tokens: f64,
-    /// Whether the TypeScript materializer would include the project-docs block.
+    /// `inject_docs` matches whether the TypeScript materializer includes the project-docs block.
     pub inject_docs: bool,
-    /// Gate temporal heading dates at render time, including rows persisted by a prior pass.
+    /// `temporal_awareness` gates temporal heading dates at render time, including rows persisted by a prior pass.
     pub temporal_awareness: bool,
-    /// OpenCode-only image bytes already resolved and capability-gated by the host.
+    /// The host resolves and capability-gates OpenCode-only image bytes before passing them here.
     pub mural: Option<&'a M0MuralInput>,
 }
 
@@ -161,12 +144,7 @@ pub(crate) fn trim_claims_to_budget(
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Vec<MirroredClaimMemory> {
     let budget = budget_tokens.max(1.0);
-    // Selection is the record of what m0 rendered: callers derive
-    // `rendered_revision_locators` from the result. Dropping non-positive
-    // categories here keeps that record aligned with
-    // `render_claim_memory_block`, which refuses to render them, so a
-    // hand-assembled warning claim cannot consume budget or be reported as
-    // rendered content it never became.
+    // `rendered_revision_locators` includes only claims rendered by `render_claim_memory_block`.
     let mut ordered = claims
         .iter()
         .filter(|claim| is_positive_memory_category(&claim.category))
@@ -252,13 +230,13 @@ pub(crate) fn trim_user_profile_to_budget(
         .collect()
 }
 
-/// Count only the rendered `<session-history>` slice, matching the history budget's scope.
+/// The history estimate counts only the rendered `<session-history>` slice to match the history budget.
 fn history_slice_tokens(m0_text: &str, estimate_tokens: impl Fn(&str) -> usize) -> usize {
     extract_m0_block(m0_text, "session-history").map_or(0, |slice| estimate_tokens(&slice))
 }
 
-/// Render m0 and, when the history slice overshoots, tighten decay pressure at most three times.
-/// The capped final render is retained even when its history still exceeds the slack threshold.
+/// The renderer retries at most three times while history tokens exceed 105% of a positive budget.
+/// After three retries, the function returns the last render even if history tokens exceed 105% of the budget.
 fn render_m0_with_decay_pressure_retry(
     inputs: &M0Inputs<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
@@ -291,8 +269,6 @@ fn render_m0_with_decay_pressure_retry(
     m0_bytes
 }
 
-/// Read the store and compose the HARD m0 bytes + watermarks. `estimate_tokens` is the
-/// token estimator used for every injection budget and the history fit.
 pub fn compose_m0_from_claim_mirror(
     store: &McStore,
     inputs: &M0ComposeInputs<'_>,
@@ -308,12 +284,7 @@ fn compose_m0(
     claims: &[MirroredClaimMemory],
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<M0Composition, M0ComposeError> {
-    // --- compartments: the session history, coverage anchor, and folded watermark ---
     let compartments = store.load_compartments(inputs.session_id)?;
-    // Store-pure coverage checks enforce strict ordering without assuming integer
-    // contiguity: consumer producers may retire ordinal numbers permanently. The
-    // transform layer has the live array and fails loud if a present message below
-    // the coverage end is not covered by any compartment.
     let coverage = resolve_coverage(&compartments).map_err(M0ComposeError::CoverageGap)?;
     let (boundary_id, coverage_ordinal, first_covered_ordinal, folded_compartment_seq) =
         match &coverage {
@@ -323,7 +294,6 @@ fn compose_m0(
                 Some(c.first_covered_ordinal),
                 c.max_sequence,
             ),
-            // no compartments → nothing summarized → no covered prefix
             None => (String::new(), None, None, 0),
         };
 
@@ -337,7 +307,6 @@ fn compose_m0(
         .map(|claim| claim.revision_locator.clone())
         .collect();
 
-    // --- user-profile + project-docs ---
     let user_profile = if inputs.memory_enabled {
         store.load_active_user_memories()?
     } else {
@@ -354,8 +323,6 @@ fn compose_m0(
         crate::project_docs::ProjectDocs::default()
     };
 
-    // Compose m0 through the shared renderer after the project/profile budgets have selected
-    // their candidates. History keeps its existing decay-pressure fit in this same render.
     let decay_compartments: Vec<DecayRenderCompartment> = compartments
         .iter()
         .map(|compartment| {

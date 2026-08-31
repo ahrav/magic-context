@@ -19,16 +19,12 @@ import { getLeaseGeneration, runLeaseGuardedWrite } from "./lease";
 export type DreamerMaintenanceLane = "hygiene" | "verification";
 
 /**
- * Read a project's live claims for one maintenance lane.
  *
- * Two attempts, matching every other production reader of this state: a
- * concurrent write during the read window moves the claim/policy generations
- * and reports `stale`, which is routine rather than exceptional. A single
- * attempt would return `[]` on that outcome, and because the dreamer tasks
- * treat an empty pool as "this project has no claims", the whole pass would
- * no-op with no error. Exhausting both attempts still yields `[]` — the pass
- * is skipped, not failed — but says so, so a project whose generations keep
- * moving is visible instead of looking idle.
+ * A concurrent write during the read window can change claim or policy generations.
+ * A stale result would otherwise return `[]`.
+ * Dreamer tasks interpret an empty pool as a project with no claims and perform no work.
+ * The function returns `[]` without an error after both attempts produce stale results.
+ * The function logs exhausted retries so projects with continuously changing generations are visible.
  */
 export function readDreamerProjectClaims(
     db: Database,

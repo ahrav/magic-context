@@ -1,48 +1,28 @@
 /**
- * Harness-agnostic tagging over the Transcript interface.
+ * This module tags `Transcript` parts without a harness-specific message type.
  *
- * This is a deliberately minimal alternative to the OpenCode-specific
- * `tag-messages.ts` that operates on `MessageLike[]`. The OpenCode flow
- * carries 380+ lines of accumulated complexity:
  *
- *   - source-content persistence (for cross-pass detag/restore behavior),
- *   - tool-call indexing across separate "tool" and "tool_result" parts,
- *   - reasoning-byte tracking for historian projection,
- *   - file-part stable IDs,
- *   - existing-tag resolver with content-id fallback.
+ * Source-content persistence supports cross-pass detagging and restoration.
+ * OpenCode indexes tool calls across separate `tool` and `tool_result` parts.
+ * OpenCode tracks reasoning bytes for historian projection.
+ * OpenCode resolves existing tags by content ID when no direct match exists.
  *
- * Most of that is OpenCode-specific (cache stability across multi-pass
- * transforms, AI SDK part-id semantics, file part shapes). Pi's
- * `pi.on("context", ...)` fires once per LLM call with a complete
- * `AgentMessage[]`, so we can use a simpler tagging contract:
+ * `pi.on("context", ...)` receives one complete transcript per LLM call.
+ * A complete transcript per context event removes the need for cross-pass tagging state.
  *
- *   1. Walk the transcript in order.
- *   2. For each tag-eligible part (text, tool_use, tool_result), assign
- *      a tag number via the shared `Tagger`.
- *   3. Inject `§N§ ` prefix into the visible text (unless skipped).
- *   4. Build a `TagTarget` so `applyPendingOperations` from
- *      `apply-operations.ts` can replace this part with a sentinel when
- *      a queued drop fires.
+ * Only `text`, `tool_use`, and `tool_result` parts are tag-eligible.
+ * Each eligible visible text receives a `§N§ ` prefix unless tagging skips it.
+ * A `TagTarget` lets `applyPendingOperations` replace the part with a sentinel when a queued drop fires.
  *
  * Tool drops aggregate by call_id across both invocation and result
- * occurrences (mirrors OpenCode tag-messages.ts:196-220). When a drop
- * fires for a tool tag, BOTH the assistant `toolCall`/`tool_use` part
- * and the user `toolResult`/`tool_result` part are mutated together so
- * the LLM sees consistent dropped state. Without this aggregation:
+ * A queued tool-tag drop replaces both the assistant `toolCall`/`tool_use` part and the user `toolResult`/`tool_result` part.
+ * Aggregating both occurrences keeps the dropped tool state consistent.
  *
- *   - Tool tag byte_size reflects only the args (~58 bytes for a `read`)
- *     because the FIRST occurrence (invocation) is tagged first and
- *     `assignTag` short-circuits the SECOND occurrence (result, ~4KB)
- *     to the same tag without updating byte_size.
- *   - Drops touch only the second occurrence (last write wins on
- *     `targets.set`), leaving the first in original form.
+ * `byte_size` records only invocation args when `assignTag` assigns the invocation first and reuses its tag for the result.
+ * `assignTag` leaves the invocation part in its original form.
  *
- * Reuses unchanged from the OpenCode path:
  *
- *   - `Tagger` (DB-backed counter + assignment store).
- *   - `applyPendingOperations` (operates on `Map<number, TagTarget>`).
- *   - `applyFlushedStatuses` (same).
- *   - Tag prefix primitives (`prependTag`, `stripTagPrefix`, `byteSize`).
+ * Tagger stores assignments and allocates tags in the DB.
  */
 
 import { createHash } from "node:crypto";
@@ -70,42 +50,39 @@ export const TEXT_TAG_IDENTITY_MARKER = ":mc-text-v1:";
 
 export interface TagTranscriptOptions {
     /**
-     * When true, skip injecting `§N§` prefix into visible text. Tags
-     * still get assigned in the DB so historian/drops can reference
-     * them; the agent just doesn't see the markers. Used when the session's
-     * tool surface has no `ctx_reduce` tool to act on the markers. Cache-safe
-     * because the availability verdict is frozen per session.
+     * `skipPrefixInjection` still assigns tags in the DB so historian and drops can reference them.
+     * Sessions whose tool surface lacks `ctx_reduce` must set `skipPrefixInjection`, so the agent cannot act on markers.
+     * `skipPrefixInjection` is fixed for each session.
      */
     skipPrefixInjection?: boolean;
     /**
-     * Pi-only: map of messageId → raw-message fingerprint. When a NEW message
-     * text tag is created, its fingerprint is persisted on the tag row so a
-     * later pass can adopt the fallback-id tag onto the real SessionEntry id
-     * (keeping tag_number/§N§ stable). OpenCode omits this → tags store NULL
-     * → adoption never fires. Keyed by the bare messageId (not the `:pN`
-     * contentId) since all parts of a message share one fingerprint.
+     * Only Pi supplies raw-message fingerprints keyed by message ID.
+     * A new text tag persists its message fingerprint on the tag row.
+     * A later pass adopts a fallback-ID tag onto the real `SessionEntry` ID.
+     * OpenCode omits fingerprints, so its tags store NULL and adoption never fires.
+     * `entryFingerprintByMessageId` uses bare `messageId` keys, not `:pN` `contentId` keys.
+     * `entryFingerprintByMessageId` uses bare `messageId` keys because all parts of a message share one fingerprint.
      */
     entryFingerprintByMessageId?: ReadonlyMap<string, string>;
     /**
-     * Stable Pi message ids observed on a prior pass. Their immutable parts may
-     * reuse tag assignments while this pass still reapplies visible prefixes and
-     * rebuilds the complete set of messages affected by each tag.
+     * `reuseMessageIds` contains stable Pi message IDs observed on a prior pass.
+     * Immutable parts reuse tag assignments while the tagger reapplies visible prefixes.
+     * The tagger rebuilds the complete set of messages affected by each tag.
      */
     reuseMessageIds?: ReadonlySet<string>;
     /**
-     * Pi message ids whose persisted text-part vector no longer matches the
-     * current vector. Their parts use content-derived identities instead of
-     * positional `:pN` keys, so sibling insertion/deletion cannot rebind an
-     * older durable tag to different text.
+     * `textIdentityDriftMessageIds` contains Pi message IDs whose persisted text-part vectors differ from the current vectors.
+     * Parts of messages in `textIdentityDriftMessageIds` use content-derived identities instead of positional `:pN` keys.
+     * Content-derived identities prevent sibling insertion or deletion from rebinding durable tags.
      */
     textIdentityDriftMessageIds?: ReadonlySet<string>;
-    /** Source-content cache shared with Pi's batched identity preflight. */
+    /** Pi's batched identity preflight shares `textIdentitySourceCache`. */
     textIdentitySourceCache?: Map<number, string>;
-    /** Exact text/count pairs retained by Pi for safe lazy-token backfill reuse. */
+    /** Pi retains exact text/count pairs for safe lazy-token backfill reuse. */
     textTokenCache?: Map<string, { text: string; tokenCount: number }>;
-    /** Exact tool-result text/count pairs retained under composite tag identity. */
+    /** `toolTokenCache` retains exact tool-result text/count pairs under composite tag identities. */
     toolTokenCache?: Map<string, { text: string; tokenCount: number }>;
-    /** Optional process-local benchmark callback; production callers omit it. */
+    /* */
     onTiming?: (
         phase: "identity" | "prefix" | "targets" | "tokenCounting",
         elapsedMs: number,
@@ -117,43 +94,36 @@ export interface TagTranscriptResult {
 }
 
 /**
- * Tag eligible parts of a transcript and build TagTargets for them.
  *
- * "Eligible" means: parts that contribute meaningfully to the LLM input
- * and whose content can be replaced when dropped. Specifically:
+ * Eligible parts contribute to LLM input.
+ * Eligible parts can be replaced when dropped.
  *
- *   - text parts (user or assistant): tagged as type "message", inject
- *     prefix into the visible text, target supports setContent.
- *   - thinking parts: NOT tagged. Reasoning content has provider-
- *     specific signed-content semantics (Anthropic redacted_thinking,
- *     etc.) and replacing them mid-conversation breaks signature
- *     verification. The historian's clear-reasoning pass handles them
- *     separately if needed.
- *   - tool_use parts (assistant tool invocations): tagged as type
- *     "tool", target supports drop/truncate via the tag-content
+ * The tagger assigns user and assistant text parts type `message`.
+ * The tagger injects the prefix into visible text; each text `TagTarget` supports `setContent`.
+ * Thinking parts use provider-specific signed content.
+ * Replacing signed thinking content mid-conversation breaks signature verification.
+ * The historian's clear-reasoning pass handles thinking parts separately.
+ * The tagger assigns assistant tool_use parts type "tool".
+ * The TagTarget supports dropping or truncating tool content.
  *     primitives.
- *   - tool_result parts (folded into user messages by the Pi adapter):
- *     tagged as type "tool", paired with the corresponding invocation
- *     for full-pair drops.
- *   - image, file, structural, unknown: skipped.
+ * The Pi adapter folds tool_result parts into user messages.
+ * The tagger assigns each tool_result part type "tool".
+ * The tagger pairs each tool_result with its invocation so a full-pair drop affects both.
  *
- * The contentId we pass to the tagger uses the part's stable id when
- * available, otherwise a synthetic locator. Pi's adapter exposes:
- *   - tool_use parts: id = ToolCall.id (from pi-ai)
- *   - tool_result parts: id = ToolResultMessage.toolCallId
- *   - text parts: id = undefined → we synthesize from message+ordinal
+ * The tagger uses a stable part ID as contentId when available.
+ * The tagger uses a synthetic locator when no stable part ID exists.
+ * The Pi adapter maps each tool_use part ID to ToolCall.id.
+ * The Pi adapter maps each tool_result part ID to ToolResultMessage.toolCallId.
+ * The tagger derives text-part IDs from the message ID and ordered text content.
  */
 /**
- * Per-callId aggregation of tool occurrences across the transcript.
- * Built up during the walk and used to:
- *   1. Assign one tag per call_id with byte_size = the tool_RESULT (output)
- *      size, and inputByteSize = the tool_use (args) size, tracked SEPARATELY
- *      (mirrors OpenCode tag-messages.ts). Reclaim accounting sums them
- *      (byteSize + inputByteSize + reasoning); folding args into byte_size too
- *      would double-count the args for a large-input/small-output tool.
- *   2. Build a single aggregate TagTarget that mutates BOTH the
- *      invocation and result occurrences atomically, so a queued drop
- *      replaces both halves with a sentinel instead of last-write-wins.
+ * The tagger assigns one tag per call ID.
+ * The tagger records tool-result output in byteSize and tool-use arguments in inputByteSize.
+ * Reclaim accounting sums byteSize, inputByteSize, and reasoning.
+ * Including arguments in byteSize would double-count them during reclaim accounting.
+ * The tagger builds one aggregate TagTarget for each invocation/result pair.
+ * The aggregate TagTarget updates both invocation and result occurrences atomically.
+ * A queued drop replaces both occurrences with sentinels.
  */
 interface ToolOccurrence {
     message: { info: { id?: string; role: string } };
@@ -173,15 +143,15 @@ interface ToolAggregate {
     /** Every occurrence seen so far belongs to a previously tagged stable message. */
     identityReusable: boolean;
     occurrences: ToolOccurrence[];
-    /** Largest byteSize seen across occurrences — used as the tag size. */
+    /** The aggregate uses the largest occurrence byteSize as its tag size. */
     maxByteSize: number;
-    /** Token count paired with maxByteSize (the same output occurrence). */
+    /** The aggregate stores the token count from the occurrence that supplied maxByteSize. */
     maxTokenCount: number;
-    /** Tool name from the first occurrence we see one on. */
+    /** The aggregate stores the first non-null tool name observed. */
     toolName: string | null;
-    /** Input byte size from the invocation occurrence (for storage projection). */
+    /** The aggregate stores the invocation's input byte size for storage projection. */
     inputByteSize: number;
-    /** Persisted input-token count, or null for a legacy/unobserved invocation. */
+    /** The aggregate stores the persisted input-token count, or null when no invocation was observed. */
     inputTokenCount: number | null;
 }
 
@@ -217,21 +187,14 @@ export function tagTranscript(
         ? { identity: 0, prefix: 0, targets: 0, tokenCounting: 0 }
         : undefined;
 
-    // Tool aggregation is keyed by the same owner+callId identity used by
-    // assignToolTag. OpenCode/Pi callId counters can repeat across turns, so
-    // a bare callId key can merge distinct invocations and replay drops/status
-    // changes against the wrong tool pair.
+    // OpenCode/Pi callId counters can repeat across turns.
+    // A bare callId key can merge distinct invocations.
+    // Such merges can replay drops and status changes against the wrong tool pair.
     const toolAggregates = new Map<string, ToolAggregate & { tagId: number }>();
     const openToolAggregateKeysByCallId = new Map<string, string[]>();
     let activeToolResultRun: { callId: string; aggregateKey: string } | undefined;
 
-    // v3.3.1 Layer C (plan v3.3.1 Finding #16): the previous outer
-    // db.transaction() wrapper rolled back EVERY tag insert + savedSource
-    // when a single UNIQUE collision fired late in the walk. Per-tag
-    // SAVEPOINTs inside `assignToolTag` / `assignTag` already give us the
-    // atomicity we need. Removing the wrapper matches OpenCode's
-    // tag-messages.ts design — see the long comment there for the
-    // rationale (cache-bust amplifier story).
+    // Per-tag SAVEPOINTs isolate a UNIQUE collision to its tag insert, preserving earlier inserts and `savedSource`.
     for (let msgIndex = 0; msgIndex < transcript.messages.length; msgIndex += 1) {
         const message = transcript.messages[msgIndex];
         if (message === undefined) continue;
@@ -259,11 +222,7 @@ export function tagTranscript(
             }
 
             if (part.kind === "text") {
-                // Synthetic message ids (Pi tail synthetic user with
-                // no id) cannot be tagged — there's no stable handle
-                // to bind a tag to across passes. Pass through
-                // untagged; this is rare (only happens for the
-                // dangling tool-result tail case in Pi).
+                // tagTranscript passes through Pi tail synthetic user messages without IDs because tags require a stable cross-pass handle.
                 if (messageId === undefined) {
                     textOrdinal += 1;
                     continue;
@@ -301,7 +260,7 @@ export function tagTranscript(
                 const callId = part.id;
                 if (typeof callId !== "string" || callId.length === 0) {
                     activeToolResultRun = undefined;
-                    // No stable callId to aggregate on. Tag independently.
+                    // Parts without a stable callId receive independent tags.
                     tagToolPart({
                         sessionId,
                         message,
@@ -335,8 +294,8 @@ export function tagTranscript(
                     }
                 }
                 const aggregateKey: string = existingKey ?? makeToolCompositeKey(messageId, callId);
-                // Keep block memoization separate from aggregate tag identity. The
-                // ordinal comes from this message's stable result-part order, not cache writes.
+                // Block memoization remains separate from aggregate tag identity.
+                // The result-part ordinal follows the message's stable result-part order rather than cache-write order.
                 const tokenCacheKey =
                     resultBlockOrdinal === undefined
                         ? aggregateKey
@@ -347,9 +306,7 @@ export function tagTranscript(
                     const canReuseIdentity = reuseIdentity && existing.identityReusable;
                     let text = "";
                     if (canReuseIdentity) {
-                        // Prefix replay always needs result text. Byte length is also
-                        // cheap enough to guard the durable growth invariant; BPE and
-                        // DB writes remain staged behind an actual persisted-size bump.
+                        // Prefix replay requires result text, so the code defers BPE and DB writes until persisted size increases; byte length guards durable growth.
                         if (part.kind === "tool_result") {
                             text = part.getText() ?? "";
                             applyGrownToolResultAccounting({
@@ -454,9 +411,7 @@ export function tagTranscript(
                         tagId: reusableTagId,
                         identityReusable: true,
                         occurrences: [{ message, part, kind: part.kind }],
-                        // Stable identity does not imply stable payload size. Seed from
-                        // the persisted row so unchanged results avoid BPE while a
-                        // genuinely larger folded result can still bump accounting.
+                        // Stable identity does not guarantee stable payload size; the code seeds from the persisted row.
                         maxByteSize: reusableAccounting.byteSize,
                         maxTokenCount: reusableAccounting.tokenCount ?? 0,
                         toolName: null,
@@ -562,7 +517,6 @@ export function tagTranscript(
                     activeToolResultRun = { callId, aggregateKey };
                 }
             }
-            // thinking, image, file, structural, unknown → skip.
         }
     }
 
@@ -712,7 +666,7 @@ function markToolAggregateResolved(
     openToolAggregateKeysByCallId.set(callId, nextPendingKeys);
 }
 
-/** Real-tokenizer count for tagged text (images bill by visual tokens). */
+/** Tagged text uses the real tokenizer because images bill by visual tokens. */
 function estimateTagTextTokens(text: string): number {
     if (!text) return 0;
     if (text.startsWith("data:image/")) return estimateImageTokensFromDataUrl(text);
@@ -726,9 +680,8 @@ function getToolPartByteSize(part: TranscriptPart, text: string): number {
 }
 
 /**
- * Real-tokenizer mirror of {@link getToolPartByteSize}: token count of a tool
- * part's output text (falling back to the raw payload for non-text results,
- * matching the byte path so token_count stays consistent with byte_size).
+ * Tool tags use the same tokenizer count as `getToolPartByteSize`.
+ * Empty `tool_result` text with positive `rawByteSize()` uses serialized raw-payload tokens.
  */
 function getToolPartTokenCount(part: TranscriptPart, text: string): number {
     if (text.length > 0 || part.kind !== "tool_result") return estimateTokens(text);
@@ -763,8 +716,6 @@ function getCachedToolPartTokenCount(
 }
 
 function getNonTextToolResultByteSize(part: TranscriptPart): number {
-    // Prefer the adapter's exact raw-payload size when available (Pi's
-    // tool_result proxy can serialize the real content array, incl. images).
     const raw = part.rawByteSize?.();
     if (typeof raw === "number" && raw > 0) return raw;
     const record = isRecord(part) ? part : undefined;
@@ -833,8 +784,6 @@ function tagTextPart(args: TagTextPartArgs): void {
         null,
         0,
         args.entryFingerprint,
-        // Lazy: fires only on fresh insert. Strip any §N§ prefix so a re-tag
-        // from already-prefixed text still tokenizes the pristine content.
         () => {
             const tokenStart = args.timing ? performance.now() : 0;
             const cached = args.textTokenCache?.get(contentId);
@@ -855,17 +804,9 @@ function tagTextPart(args: TagTextPartArgs): void {
         },
     );
 
-    // Persist the original (pre-tagged) source content so caveman
-    // compression and other "compress from original" heuristics have
-    // pristine text to read on later passes. saveSourceContent uses
-    // INSERT OR IGNORE — first write wins; later passes that re-tag
-    // the same (sessionId, tagId) pair from already-prefixed text won't
-    // overwrite the original. Cache-stable.
+    // saveSourceContent preserves pre-tagged source text for compression-from-original heuristics.
     //
-    // We strip any existing §N§ prefix before saving in case a previous
-    // pass already injected one and the persisted source got lost
-    // (e.g. legacy session created before this code shipped). For new
-    // sessions stripTagPrefix is a no-op on the very first pass.
+    // stripTagPrefix prevents existing §N§ prefixes from being saved as source content.
     const sourceContent = stripTagPrefix(text);
     if (sourceContent.trim().length > 0) {
         saveSourceContent(args.db, args.sessionId, tagId, sourceContent);
@@ -904,12 +845,8 @@ interface TagToolPartArgs {
 
 function tagToolPart(args: TagToolPartArgs): void {
     const identityStart = args.timing ? performance.now() : 0;
-    // Prefer the part's stable id (tool call id from Pi/OpenCode); fall
-    // back to a synthetic locator. Tool calls and their results MAY
-    // share an id (Pi sets toolCallId on ToolResultMessage to match the
-    // originating ToolCall.id); when that happens, both tag operations
-    // resolve to the same tag number — desired behavior, since drops
-    // target the call-id pair as a unit.
+    // Sharing a part.id makes a tool call and its result use the same tag.
+    // A shared tag lets drops target the call-result pair together.
     const stableId = args.part.id;
     const contentId = stableId ?? `${args.messageId}:t${args.partIndex}`;
     const reusableTagId = args.reuseIdentity
@@ -927,12 +864,7 @@ function tagToolPart(args: TagToolPartArgs): void {
     const tokenStart = args.timing ? performance.now() : 0;
     const toolTokenCount = getToolPartTokenCount(args.part, text);
     if (args.timing) args.timing.tokenCounting += performance.now() - tokenStart;
-    // v3.3.1 Layer C: synthetic ownership for the no-callId Pi
-    // fallback. Owner == callId == contentId. The composite key
-    // collapses to a unique synthetic identifier per part, preserving
-    // the legacy "each part gets its own tag" behavior while
-    // satisfying the composite-identity contract (TagEntry.tool_owner_message_id
-    // is non-null, lazy-adoption path is correctly bypassed).
+    // Parts without `callId` receive distinct synthetic identifiers.
     const tagId = args.tagger.assignToolTag(
         args.sessionId,
         contentId,
@@ -958,9 +890,7 @@ function tagToolPart(args: TagToolPartArgs): void {
 }
 
 function applySingleToolPrefixAndTarget(args: TagToolPartArgs, tagId: number, text: string): void {
-    // For tool parts, the visible payload is the tool result text. We
-    // can inject the tag prefix into it for in-text references; this
-    // matches the OpenCode behavior of tagging tool outputs.
+    // Tool-result text accepts tag prefixes for in-text references.
     if (!args.skipPrefixInjection && args.part.kind === "tool_result") {
         const prefixStart = args.timing ? performance.now() : 0;
         args.part.setText(prependTag(tagId, text));
@@ -976,28 +906,17 @@ function setToolContentOrText(part: TranscriptPart, content: string): boolean {
     try {
         if (part.setToolOutput(content)) return true;
     } catch {
-        // Pi assistant tool_use parts deliberately assert if callers try
-        // to write a nonexistent output slot. Truncated-mode drops still
-        // need to shrink the invocation, so fall back to visible text/args
-        // replacement while preserving the adapter-level invariant.
+        // Pi assistant tool_use parts reject writes without an output slot.
+        // Truncated-mode drops must still shrink the invocation.
+        // Truncated-mode drops replace text when no output slot exists.
     }
     return part.setText(content);
 }
 
 /**
- * Build a TagTarget that walks ALL occurrences of a tool call (invocation
- * + result) when mutating. This is the per-callId aggregate target used
- * by `tagTranscript` so a single drop replaces both halves.
+ * The TagTarget mutates every invocation and result for the tool call.
  *
- * The closures hold a reference to the same `occurrences` array stored
- * on the aggregate, so when the array gets mutated (a second occurrence
- * is pushed mid-walk), the next call to setContent/drop/truncate sees
- * all occurrences automatically. Callers MUST rebuild the target after
- * pushing a new occurrence so the targets map points to a fresh closure
- * over the updated array — otherwise consumers that captured the target
- * before the push won't see the new occurrence.
  *
- * Mirrors OpenCode's createToolDropTarget semantics in tool-drop-target.ts.
  */
 function buildAggregateTarget(tagId: number, occurrences: ToolOccurrence[]): TagTarget {
     const role = occurrences[0]?.message.info.role ?? "user";
@@ -1005,13 +924,8 @@ function buildAggregateTarget(tagId: number, occurrences: ToolOccurrence[]): Tag
 
     return {
         setContent(content: string): boolean {
-            // Walk all occurrences; mutate every one. Return true if at
-            // least one occurrence's content actually changed (used to
-            // gate sentinel-replay re-writes).
             let changed = false;
             for (const occ of occurrences) {
-                // Try setToolOutput first (works on tool_result-shaped parts);
-                // fall back to setText so tool_use parts also get sentinelized.
                 if (setToolContentOrText(occ.part, content)) {
                     changed = true;
                 }
@@ -1019,7 +933,6 @@ function buildAggregateTarget(tagId: number, occurrences: ToolOccurrence[]): Tag
             return changed;
         },
         getContent(): string | null {
-            // Prefer the result occurrence's content (the bulky payload).
             for (const occ of occurrences) {
                 if (occ.kind === "tool_result") {
                     return occ.part.getText() ?? null;
@@ -1028,7 +941,6 @@ function buildAggregateTarget(tagId: number, occurrences: ToolOccurrence[]): Tag
             return occurrences[0]?.part.getText() ?? null;
         },
         drop(): "removed" | "absent" {
-            // Replace BOTH halves with the dropped sentinel.
             const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
             let any = false;
             for (const occ of occurrences) {
@@ -1037,10 +949,7 @@ function buildAggregateTarget(tagId: number, occurrences: ToolOccurrence[]): Tag
             return any ? "removed" : "absent";
         },
         truncate(): "truncated" | "absent" {
-            // Skeleton-drop: replace BOTH halves' content with the one
-            // canonical `[dropped §N§]` placeholder (byte-identical to a full
-            // drop and to OpenCode). Frozen by the dropMode column → replays
-            // the same string every pass. The tool_use call survives intact.
+            // `truncate()` preserves the tool invocation and replaces each occurrence's content with `[dropped §N§]`.
             const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
             let any = false;
             for (const occ of occurrences) {
@@ -1051,11 +960,6 @@ function buildAggregateTarget(tagId: number, occurrences: ToolOccurrence[]): Tag
             return any ? "truncated" : "absent";
         },
         editMarker(): "truncated" | "absent" {
-            // Edit-marker: preserve the tool_use input's filePath + a region
-            // hint of the diff, sentinelize the result half. Separate from
-            // truncate() so the existing skeleton bytes are never touched.
-            // Deterministic + idempotent (re-derived from source each pass; the
-            // region-hint clamp self-guards via ...[truncated]).
             const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
             let any = false;
             for (const occ of occurrences) {
@@ -1072,15 +976,9 @@ function buildAggregateTarget(tagId: number, occurrences: ToolOccurrence[]): Tag
             }
             return any ? "truncated" : "absent";
         },
-        // Non-mutating reclaim predicate (Pi parity with OpenCode's canDrop).
-        // Pi sentinelizes BOTH halves, so unlike OpenCode there's no
-        // result-part requirement — a target reclaims as long as it still has
-        // at least one live occurrence to sentinelize.
         canDrop(): boolean {
             return occurrences.length > 0;
         },
-        // Non-mutating read of the invocation input (the tool_use occurrence
-        // carries the arguments). Used by smart-drops supersession selection.
         readInput(): Record<string, unknown> | null {
             for (const occ of occurrences) {
                 const input = occ.part.getToolInput?.();
@@ -1096,15 +994,7 @@ function buildAggregateTarget(tagId: number, occurrences: ToolOccurrence[]): Tag
 }
 
 /**
- * TagTarget for a tag-eligible text part. The shared
- * `applyPendingOperations` flow calls `setContent` to swap in a
- * sentinel like `[dropped §N§]` when a queued drop fires; `getContent`
- * returns the current visible text so the truncated-preview path can
- * compute its before/after.
  *
- * The `message.info.role` is used by `buildReplacementContent` in
- * `apply-operations.ts` to differentiate user-message drops (which
- * preserve a truncated preview) from assistant drops (full sentinel).
  */
 function buildTextTarget(
     part: TranscriptPart,
@@ -1117,9 +1007,6 @@ function buildTextTarget(
         getContent(): string | null {
             return part.getText() ?? null;
         },
-        // `message` is typed as MessageLike, which has parts: unknown[].
-        // We don't carry parts here (the apply-operations flow only
-        // reads `info.role` on this field), so a minimal stub is
         // sufficient.
         message: {
             info: { id: message.info.id, role: message.info.role },
@@ -1129,12 +1016,6 @@ function buildTextTarget(
 }
 
 /**
- * TagTarget for a tag-eligible tool part. Tool parts get full-drop or
- * skeleton-drop treatment from `applyFlushedStatuses` based on the stored
- * `drop_mode` column. Both render the SAME canonical `[dropped §N§]`
- * placeholder — full-drop replaces the whole pair, skeleton-drop keeps the
- * tool_use call and replaces only its output. One placeholder string,
- * byte-identical across passes and across harnesses.
  */
 function buildToolTarget(
     part: TranscriptPart,
@@ -1149,21 +1030,10 @@ function buildToolTarget(
             return part.getText() ?? null;
         },
         drop(): "removed" | "absent" {
-            // Replace the tool part's visible content with a "[dropped]"
-            // shell. We can't physically remove the part because Pi
-            // requires tool_use ↔ tool_result pairing for the LLM call
-            // to validate; instead we shrink the content to a sentinel.
-            // For Pi the current Transcript contract treats both
-            // invocation and result parts symmetrically — both expose
-            // setText / setToolOutput.
             const replaced = part.replaceWithSentinel(`[dropped \u00a7${tagId}\u00a7]`);
             return replaced ? "removed" : "absent";
         },
         truncate(): "truncated" | "absent" {
-            // Skeleton-drop: replace the tool output with the one canonical
-            // `[dropped §N§]` placeholder (byte-identical to a full drop and to
-            // OpenCode). Frozen by the dropMode column, so it replays the same
-            // string every pass. The tool_use call itself survives intact.
             const ok = setToolContentOrText(part, `[dropped \u00a7${tagId}\u00a7]`);
             return ok ? "truncated" : "absent";
         },

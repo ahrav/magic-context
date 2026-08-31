@@ -142,9 +142,8 @@ describe("promoteRelease", () => {
         const corpusPath = join(releaseDir, "corpus.json");
         const original = readFileSync(corpusPath, "utf8");
 
-        // Duplicate object member: JSON.parse keeps the last value, so the
-        // scan, schema, and recomputed fingerprints all see the clean
-        // survivor while the leaked first member stays in the file bytes.
+        // JSON.parse keeps the last duplicate member; the first member remains in the file bytes.
+        // The scan, schema validation, and recomputed fingerprints see only the last duplicate member.
         const smuggled = original.replace(
             '{\n  "schemaVersion":',
             '{\n  "schemaVersion": "leaked-secret-payload",\n  "schemaVersion":',
@@ -168,9 +167,8 @@ describe("promoteRelease", () => {
         expect(() =>
             loadReviewedRelease(releaseDir, { expectedManifestFingerprint: trusted }),
         ).not.toThrow();
-        // Forge an approval and re-bind the tuple fingerprint so the
-        // directory stays internally consistent: only the external
-        // expectation can catch it.
+        // Changing manifest.approvals.privacy.approver preserves internal consistency when loadReviewedRelease recomputes the tuple fingerprint.
+        // The external expectedManifestFingerprint detects the forged approval.
         const manifestPath = join(releaseDir, "manifest.json");
         const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
         manifest.approvals.privacy.approver = "op-forged";
@@ -196,8 +194,7 @@ describe("promoteRelease", () => {
     it("preserves the prior release byte-identically on failure and interruption", () => {
         const root = releasesRoot();
         const { releaseDir } = promoteRelease(promotableInput(root));
-        // The tampered marker detects a promoter that replaces an existing
-        // release instead of rejecting it.
+        // The trailing newline detects a promoter that replaces an existing release directory.
         const tamperPath = join(releaseDir, "corpus.json");
         const tampered = `${readFileSync(tamperPath, "utf8")}\n`;
         writeFileSync(tamperPath, tampered);

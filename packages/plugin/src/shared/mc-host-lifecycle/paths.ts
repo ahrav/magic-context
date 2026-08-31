@@ -1,20 +1,7 @@
 /**
- * Lifecycle data-root resolution and filesystem admission (plan U3, KTD11).
  *
- * Root selection mirrors the Rust resolver in `crates/mc-host/src/instance.rs`
- * exactly: an absolute nonempty `XDG_DATA_HOME` wins, then an absolute
- * nonempty `HOME/.local/share`, and everything else is `no_data_dir`. Relative
- * or empty values are ignored rather than joined to cwd, and `os.homedir()` is
- * never consulted as competing authority.
  *
- * This module deliberately does NOT reuse `data-path.ts`'s `getDataDir()`:
- * that resolver serves application storage (with `os.homedir()` fallback and
- * test backstops that must keep their current behavior), while lifecycle
- * paths must agree byte-for-byte with the Rust daemon or two processes would
- * coordinate on different roots. The test-isolation guard is preserved by
- * honoring `MAGIC_CONTEXT_TEST_DATA_DIR` the same way `data-path.ts` does, and
- * by sharing its `NODE_ENV=test` backstop root so an unisolated test cannot
- * reach the user's live tree through either resolver.
+ * Lifecycle paths must not use `getDataDir()` because it can resolve a different root than the daemon.
  */
 
 import { execFileSync } from "node:child_process";
@@ -34,19 +21,7 @@ function absoluteOrNull(value: string | undefined): string | null {
 }
 
 /**
- * Resolve the lifecycle data root from the supplied environment. The
- * `MAGIC_CONTEXT_TEST_DATA_DIR` guard (set only by test preloads) wins over
- * the HOME fallback but not over an explicit absolute `XDG_DATA_HOME`,
- * matching `data-path.ts`'s isolation contract.
  *
- * That contract includes a third layer, and this resolver honors it too: the
- * preload only runs when `bun test`'s CWD has a bunfig wiring `[test] preload`,
- * so a run from a directory without it executes every test with no preload and
- * no `MAGIC_CONTEXT_TEST_DATA_DIR`. Falling through to the real `HOME` there
- * would let a lifecycle policy probe, start, stop, or stage inside the user's
- * live `~/.local/share` tree. Bun sets `NODE_ENV=test` for every `bun test`
- * regardless of CWD and production never sets it, so that window redirects to
- * the same throwaway root the storage resolver uses.
  */
 export function resolveLifecycleDataRoot(
     env: Record<string, string | undefined> = process.env,
@@ -80,16 +55,8 @@ export function connectionFilePath(dataRoot: string): string {
 /**
  * The connection file a managed daemon publishes to.
  *
- * The lifecycle root is authoritative because `McHostLifecyclePolicy` launches
- * the daemon with `XDG_DATA_HOME` set to exactly this root, so the publication
- * lands here. Readers must not re-derive the path from `data-path.ts`'s
- * `getDataDir()`: that resolver accepts a relative `XDG_DATA_HOME`, prefers
- * bun's cached `os.homedir()` over `env.HOME`, and ignores
- * `MAGIC_CONTEXT_TEST_DATA_DIR`, so under any of those it names a different
- * file than the one the daemon just wrote.
  *
- * `fallbackRoot` covers only the `no_data_dir` case, where the policy cannot
- * start a daemon at all and the legacy derivation is the best remaining guess.
+ * Use `fallbackRoot` only when resolution returns `no_data_dir`.
  */
 export function defaultConnectionFilePath(
     fallbackRoot: string,
@@ -100,9 +67,6 @@ export function defaultConnectionFilePath(
 }
 
 /**
- * Sensitive roots for diagnostic path redaction: the admitted data root and
- * the HOME it may derive from. Renderers must replace these prefixes before
- * any path reaches human or JSON output (R35).
  */
 export function sensitiveRootsFor(
     dataRoot: string,
@@ -115,17 +79,14 @@ export function sensitiveRootsFor(
 }
 
 /**
- * Replace a sensitive root with a stable placeholder, matching on path
- * boundaries rather than characters: a sibling that merely starts with the
- * root's text (`<root>-backup`) is a different directory and keeps its own
- * name, so only the root itself and paths beneath it are replaced.
+ * A path matches a sensitive root only when it is the root or lies beneath it.
+ * A sibling whose name starts with a root's text is not beneath that root.
  */
 export function redactLifecyclePath(value: string, sensitiveRoots: string[]): string {
     let redacted = value;
     for (const root of sensitiveRoots) {
-        // A placeholder already stands in for the leading segments. It is not a
-        // path, and re-measuring it would resolve it against cwd and can redact
-        // a second time.
+        // A `<data-root>` placeholder is not an absolute path.
+        // Resolving a placeholder against cwd could redact it twice.
         if (!path.isAbsolute(redacted)) break;
         const relative = path.relative(root, redacted);
         const beneathRoot =
@@ -139,16 +100,13 @@ export function redactLifecyclePath(value: string, sensitiveRoots: string[]): st
 }
 
 // ---------------------------------------------------------------------------
-// Filesystem admission (KTD11 / R27).
 // ---------------------------------------------------------------------------
 
 /**
- * A rejection carries the reason class it actually earned. Only a host whose
- * platform the release qualifies can have its filesystem judged, so a
- * platform this function cannot judge for is reported as `unsupported_platform`
- * rather than as a filesystem verdict: telling an operator to
- * `set_data_directory` on a platform where no data directory can ever be
- * admitted names a remedy that cannot work.
+ * Only release-qualified platforms undergo filesystem admission.
+ * Report an unqualified platform as `unsupported_platform`.
+ * Do not return a filesystem verdict for an unsupported platform.
+ * Do not recommend `set_data_directory` when the platform cannot admit a data directory.
  */
 export type FilesystemAdmission =
     | { ok: true }
@@ -166,19 +124,12 @@ export type FilesystemAdmission =
       };
 
 /**
- * Filesystem types that cannot provide the required cross-process lock,
- * no-follow, atomic-replacement, fsync, and retained-execution semantics.
+ * The deny-list excludes filesystems that lack required locking, no-follow, atomic replacement, fsync, or retained execution semantics.
  *
- * A deny-list, so unknown types pass — the practical bounded check, since full
- * semantics are release-qualified rather than runtime-probed. That trade means
- * the list has to actually enumerate the remote families, because anything
- * missing from it is admitted: the check fails open on exactly the locality
- * axis the requirement is about. Distributed and network filesystems are listed
- * alongside the classic remote ones for that reason.
+ * Unknown filesystem types pass because required semantics are release-qualified rather than runtime-probed.
+ * The deny-list must enumerate remote filesystem families because omitted types are admitted.
+ * The deny-list includes distributed and network filesystems because omitted types are admitted.
  *
- * The release contract enumerates filesystem *capability* names
- * (`local_filesystem`, `cross_process_locks`, ...), never filesystem types, so
- * this set is the only implementation of the locality requirement.
  */
 const UNSUPPORTED_FS_TYPES = new Set([
     // Classic remote/network.
@@ -197,7 +148,6 @@ const UNSUPPORTED_FS_TYPES = new Set([
     "curlftpfs",
     "davfs",
     "fuse.davfs2",
-    // Distributed and cluster filesystems.
     "ceph",
     "cephfs",
     "fuse.ceph",
@@ -211,7 +161,6 @@ const UNSUPPORTED_FS_TYPES = new Set([
     "fuse.moosefs",
     "gfs2",
     "ocfs2",
-    // Object-store and hypervisor passthrough mounts.
     "fuse.s3fs",
     "fuse.rclone",
     "fuse.gcsfuse",
@@ -225,7 +174,7 @@ export interface MountEntry {
     options: string[];
 }
 
-/** Parse `/proc/self/mounts` (Linux). Octal escapes in mount points are decoded. */
+/* */
 export function parseMounts(text: string): MountEntry[] {
     const entries: MountEntry[] = [];
     for (const line of text.split("\n")) {
@@ -244,11 +193,10 @@ export function parseMounts(text: string): MountEntry[] {
 }
 
 /**
- * The mount whose options govern `root`: the longest containing mount point,
- * and among equal-length points the last entry in the table. Stacked mounts
- * share a mount point and `/proc/self/mounts` lists them in ascending mount
- * order, so the final equal-length match is the one currently on top and the
- * only one the kernel traverses.
+ * The longest containing mount point governs `root`.
+ * Among equal-length mount points, the parser selects the last entry in the table.
+ * When mounts share a mount point, ascending mount-table order makes the final equal-length match the topmost mount.
+ * The kernel traverses only the topmost mount.
  */
 function longestMountFor(root: string, mounts: MountEntry[]): MountEntry | null {
     let best: MountEntry | null = null;
@@ -266,17 +214,9 @@ function longestMountFor(root: string, mounts: MountEntry[]): MountEntry | null 
 }
 
 /**
- * The path the kernel actually traverses for `root`: lexically resolved, then
- * with its deepest existing ancestor replaced by that ancestor's realpath. A
- * `..` segment or a symlinked ancestor otherwise leaves the lookup naming a
- * mount that does not carry the effective path, so admission would describe a
- * different filesystem than the daemon writes to.
+ * The kernel traverses `root` after lexical resolution and after replacing its deepest existing ancestor with that ancestor's realpath.
+ * Otherwise, admission would describe a filesystem different from the one the daemon writes to.
  *
- * A missing tail is expected, because the root is created on first start, and
- * is rejoined onto the resolved ancestor. `missing` collects basenames from the
- * leaf upward, so each shallower segment is unshifted ahead of the deeper ones
- * already held and the join order stays deepest-last. Every other resolution
- * failure propagates so the caller can fail closed.
  */
 function mountLookupPath(root: string, realpath: (value: string) => string): string {
     let cursor = path.resolve(root);
@@ -301,23 +241,17 @@ export interface AdmissionIo {
     platform: NodeJS.Platform;
     readMounts: () => string;
     /**
-     * Canonicalizer applied to the data root before mount lookup, defaulting
-     * to `realpathSync.native`. Substituting it keeps mount selection decidable
-     * against a fabricated mount table that names paths this host does not have.
+     * A custom canonicalizer supports fabricated mount-table paths that do not exist on the host.
      */
     realpath?: (value: string) => string;
 }
 
-// Reading the darwin mount table spawns /sbin/mount synchronously, and
-// admission runs on every lifecycle command reached from request-driven
-// demand-start, and spawning `/sbin/mount` per demand would block the event
-// loop each time. The read is therefore cached, but only briefly: the mount
-// table is not process-lifetime stable, because a volume can be mounted after
-// the first read. A data root on a volume mounted later would otherwise never
-// match its own mount, `longestMountFor` would fall back to `/` — apfs and
-// local, so admissible — and an unsupported filesystem would be admitted. The
-// window bounds that staleness while still collapsing a burst of demands onto
-// one spawn. Measured on a monotonic timeline so a wall-clock step cannot
+// Caching avoids spawning synchronous `/sbin/mount` for every admission.
+// Caching avoids blocking the event loop by spawning `/sbin/mount` for each demand-start.
+// The cache expires after 1,000 ms because the mount table can change.
+// Without expiry, a later-mounted unsupported filesystem could be admitted through the `/` fallback.
+// The 1,000 ms cache bounds mount-table staleness while coalescing bursts into one read.
+// A monotonic clock prevents wall-clock adjustments from changing cache expiry.
 // stretch it.
 const DARWIN_MOUNTS_CACHE_TTL_MS = 1_000;
 
@@ -348,11 +282,8 @@ const defaultAdmissionIo: AdmissionIo = {
 function parseDarwinMounts(text: string): MountEntry[] {
     const entries: MountEntry[] = [];
     for (const line of text.split("\n")) {
-        // `<device> on <mount point> (<fstype>[, <option>...])`. The device is
-        // matched lazily so a mount point containing " on " (volume names are
-        // user-chosen) keeps its full spelling, and the option list is optional
-        // so an entry carrying only a filesystem type is admitted rather than
-        // silently dropped from the mount table.
+        // The lazy device capture preserves mount points containing ` on `.
+        // An entry carrying only a filesystem type is admitted.
         const match = /^(.+?) on (.+) \(([^,()]+)(?:,\s*([^)]*))?\)$/.exec(line);
         if (!match) continue;
         entries.push({
@@ -368,15 +299,8 @@ function parseDarwinMounts(text: string): MountEntry[] {
 }
 
 /**
- * Practical bounded admission of the selected data root: the root must be
- * absolute and, on Linux, sit on a local mount that is neither a known
- * remote/synthetic filesystem type nor mounted `noexec` (retained-object
- * execution). Linux classification runs against the canonicalized root, so
- * `..` segments and symlinked ancestors are judged on the mount the kernel
- * traverses rather than the one the literal string names. macOS admission is
- * release-qualified rather than runtime-probed and passes here. A platform the
- * release does not qualify is rejected as `unsupported_platform`; every other
- * rejection is `unsupported_filesystem`/`set_data_directory`. Nothing here
+ * Linux rejects known remote or synthetic filesystem types and `noexec` mounts.
+ * Linux classifies the canonicalized root, so `..` segments and symlinked ancestors are judged on the mount the kernel uses.
  * mutates anything.
  */
 export function admitLifecycleFilesystem(
@@ -391,9 +315,6 @@ export function admitLifecycleFilesystem(
     });
     if (!path.isAbsolute(dataRoot)) return rejected("data root is not absolute");
     if (io.platform !== "linux" && io.platform !== "darwin") {
-        // Not a filesystem judgment: the mount tables this function reads are
-        // linux- and darwin-specific, so on any other platform there is no
-        // filesystem to admit or reject. The platform itself is what fails.
         return {
             ok: false,
             reason: "unsupported_platform",
@@ -410,8 +331,7 @@ export function admitLifecycleFilesystem(
     } catch {
         return rejected("mount table is unreadable");
     }
-    // The root may not exist yet on a first start; classify by the nearest
-    // mount containing the would-be path, which is what the kernel will use.
+    // Linux classifies a nonexistent root by the mount containing its would-be path because the kernel will use that mount.
     let lookupRoot: string;
     try {
         lookupRoot = mountLookupPath(dataRoot, io.realpath ?? nativeRealpath);

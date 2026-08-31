@@ -126,7 +126,7 @@ fn bench_m0_trim_claims(c: &mut Criterion) {
             })
             .collect();
         // A category outside POSITIVE_MEMORY_CATEGORIES is filtered before any
-        // tokenization, so the cell would time an empty eligible set. commentlint: allow(JUDGE)
+        // tokenization, so the cell would time an empty eligible set.
         let retained = bench_internals::trim_claims_to_budget(&claims, 8_000.0);
         assert!(
             retained > 0,
@@ -223,8 +223,8 @@ fn bench_e2e_first_hard(c: &mut Criterion) {
                     |(dir, store, req)| {
                         let ctx = producer_ctx(dir.path().to_str().expect("utf8 dir"));
                         let out = transform(&store, &req, &ctx).expect("hard pass");
-                        // `out` carries message buffers; return `out` so Criterion drops it after timing. commentlint: allow(JUDGE)
-                        // Reading a Copy field off it would drop the buffers inside the timed section. commentlint: allow(JUDGE)
+                        // `out` carries message buffers; return `out` so Criterion drops it after timing.
+                        // Reading a Copy field off it would drop the buffers inside the timed section.
                         (dir, store, req, out)
                     },
                     criterion::BatchSize::PerIteration,

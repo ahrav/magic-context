@@ -49,8 +49,8 @@ describe("extractLiteralProbes", () => {
     });
 
     it("stops accepting matches once the five prioritized slots are full", () => {
-        // Five quoted spans claim every slot; the later kebab identifiers and
-        // camelCase shapes must not displace or extend them.
+        // The five quoted spans fill all five slots.
+        // Later kebab identifiers and camelCase shapes cannot displace or extend the five quoted spans.
         const query =
             '"one span" "two span" "three span" "four span" "five span" "six span" kebab-late camelLate';
         expect(extractLiteralProbes(query)).toEqual([
@@ -76,7 +76,6 @@ describe("extractLiteralProbes", () => {
     });
 
     it("ignores tokens shorter than the minimum", () => {
-        // "a-b" is 3 chars (kept); bare short words are not identifiers.
         expect(extractLiteralProbes("go to it")).toEqual([]);
     });
 });

@@ -343,7 +343,7 @@ impl KernelStore {
                 })
                 .map_err(|_| KernelError::Io)
             },
-            false,
+            || Ok(()),
         )
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
 
@@ -633,16 +633,37 @@ fn load_artifact_state(
         .iter()
         .filter(|row| row.3.is_none())
         .map(|row| row.0.clone())
-        .collect();
-    let barrier_id = format!("artifact-deletion-{digest}");
-    let prior_commit_seq = connection
+        .collect::<Vec<String>>();
+    let open_barrier = connection
         .query_row(
-            "SELECT delete_commit_seq FROM deletion_backfill_barriers WHERE artifact_digest=?1",
+            "SELECT barrier_id FROM deletion_backfill_barriers
+             WHERE artifact_digest=?1 AND completed_at IS NULL",
             [&digest],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )
         .optional()
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+    let prior_barrier = connection
+        .query_row(
+            "SELECT barrier_id,delete_commit_seq FROM deletion_backfill_barriers
+             WHERE artifact_digest=?1
+             ORDER BY delete_commit_seq DESC,barrier_id DESC LIMIT 1",
+            [&digest],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+    let prior_commit_seq = prior_barrier.as_ref().map(|(_, commit_seq)| *commit_seq);
+    // `idx_deletion_barriers_open` admits one incomplete barrier per digest, and a
+    // completed barrier stays as an audit record holding its primary key.
+    let barrier_id = match (open_barrier, &prior_barrier) {
+        (Some(barrier_id), _) => barrier_id,
+        (None, Some((barrier_id, _))) if live_object_ids.is_empty() => barrier_id.clone(),
+        (None, _) => format!(
+            "artifact-deletion-{digest}-{}",
+            crate::kernel::durable_fs::next_unique_id()
+        ),
+    };
     let (tombstoned, pending_unlink) = connection
         .query_row(
             "SELECT
@@ -731,11 +752,10 @@ fn upsert_barrier(
             "INSERT INTO deletion_backfill_barriers(
                  barrier_id,artifact_digest,artifact_reference,delete_commit_seq,created_at
              ) VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(artifact_digest) DO UPDATE SET
+             ON CONFLICT(artifact_digest) WHERE completed_at IS NULL DO UPDATE SET
                  delete_commit_seq=excluded.delete_commit_seq,
                  artifact_reference=excluded.artifact_reference,
-                 created_at=excluded.created_at,
-                 completed_at=NULL",
+                 created_at=excluded.created_at",
             params![
                 barrier_id,
                 digest,

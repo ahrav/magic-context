@@ -70,7 +70,6 @@ describe("sweepOrphanedRetrospectiveChildren", () => {
 
     test("deletes old privacy-sensitive children in this directory", async () => {
         db = makeOpencodeDb();
-        // old orphans in this dir → swept
         insert(db, "old-user-memories", USER_MEMORIES_CHILD_TITLE, DIR, now - staleMs - 7);
         insert(db, "old", RETROSPECTIVE_CHILD_TITLE, DIR, now - staleMs - 6);
         insert(db, "old-curate", CURATE_CHILD_TITLE, DIR, now - staleMs - 5);
@@ -90,11 +89,8 @@ describe("sweepOrphanedRetrospectiveChildren", () => {
             DIR,
             now - staleMs - 1,
         );
-        // recent child (live run) → NOT swept
         insert(db, "fresh", RETROSPECTIVE_CHILD_TITLE, DIR, now - 1000);
-        // old but a different title → NOT swept
         insert(db, "other-title", "magic-context-dream-verify", DIR, now - staleMs - 1);
-        // old retrospective but ANOTHER directory → NOT swept
         insert(db, "other-dir", RETROSPECTIVE_CHILD_TITLE, "/repo/elsewhere", now - staleMs - 1);
 
         const { client, deleted } = deleteClient();

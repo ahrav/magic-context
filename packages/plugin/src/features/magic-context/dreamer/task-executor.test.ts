@@ -513,7 +513,6 @@ describe("createDreamTaskExecutor — parent session resolution", () => {
         }
 
         // Delay session.list so the resolution await spans both concurrent calls
-        // — the exact window the old flag-before-await memo leaked undefined into.
         let listCalls = 0;
         const createParentIds: Array<string | undefined> = [];
         const client = {
@@ -538,8 +537,8 @@ describe("createDreamTaskExecutor — parent session resolution", () => {
             openOpenCodeDb: () => null,
         });
 
-        // Two DIFFERENT lease domains run concurrently (as the scheduler does via
-        // Promise.all): curate (memory domain) + maintain-docs (its own domain).
+        // Different lease domains allow curate and maintain-docs to run concurrently.
+        // Different lease domains allow curate and maintain-docs to run concurrently.
         const curateKey = leaseKeyFor("curate", project);
         const docsKey = leaseKeyFor("maintain-docs", project);
         expect(acquireLease(db, "h-curate", curateKey)).toBe(true);
@@ -555,8 +554,8 @@ describe("createDreamTaskExecutor — parent session resolution", () => {
             ),
         ]);
 
-        // The list runs once (shared promise), and BOTH children carry the real
-        // parent — none created with an undefined parentID.
+        // The shared session.list promise ensures both children use the defined parentID.
+        // The shared session.list promise ensures both children use the defined parentID.
         expect(listCalls).toBe(1);
         expect(createParentIds.length).toBe(2);
         expect(createParentIds.every((id) => id === "real-parent-session")).toBe(true);
@@ -660,8 +659,8 @@ describe("createDreamTaskExecutor — classify-memories", () => {
             openOpenCodeDb: () => null,
         });
 
-        // classify applies the manifest host-side under a lease-guarded
-        // transaction, so the holder must actually hold the lease.
+        // The manifest transaction requires its lease holder to own the lease.
+        // The manifest transaction requires its lease holder to own the lease.
         const leaseKey = leaseKeyFor("classify-memories", project);
         expect(acquireLease(db, "holder-classify", leaseKey)).toBe(true);
 
@@ -676,7 +675,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         );
 
         expect(result).toEqual({ status: "completed", schedulePatch: undefined });
-        // Zero-tool pure transform agent + the new XML prompt (no ctx_memory call).
+        // Classification must not invoke ctx_memory.
         expect(capturedAgent).toBe("dreamer-classifier");
         expect(capturedPrompt).toContain("## Task: Classify Project Memories");
         expect(capturedPrompt).toContain("Emit one <classify> manifest");
@@ -792,8 +791,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
                 delete: mock(async () => ({})),
             },
         };
-        // This must be a class-backed fake: object-literal mocks cannot expose a detached-method
-        // regression because they do not need instance state through the timer adapter.
+        // The fake must be class-backed so a detached timer-adapter method requires instance state.
         class StatefulTimerModuleClient {
             private readonly instanceState = "timer-transport";
 
@@ -1186,7 +1184,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
                     prompts += 1;
                     return {};
                 }),
-                // Gate turn → verdict "n" (no friction). The deepen turn never runs.
+                // A no-friction gate verdict of "n" skips the deepen turn.
                 messages: mock(async () => ({ data: assistantMessages("n") })),
                 delete: mock(async () => ({})),
             },
@@ -1209,7 +1207,6 @@ describe("createDreamTaskExecutor — retrospective", () => {
             },
         );
 
-        // Completed with the content watermark advanced to the max ts scanned.
         expect(result).toEqual({
             status: "completed",
             schedulePatch: { retrospectiveWatermarkMs: 200 },
@@ -1253,9 +1250,9 @@ describe("createDreamTaskExecutor — retrospective", () => {
             })),
         };
         provider.readUserMessagesBefore = mock(() => []);
-        // The two turns share one `messages` mock — drive the response off the
-        // per-prompt system string the runner sets: gate system → "y: <ord>",
-        // deepen system → the learnings XML.
+        // The shared messages mock selects each response from the runner's per-prompt system string.
+        // The messages mock returns `y: <ord>` for the gate prompt and the learnings XML for the deepen prompt.
+        // The messages mock returns `y: <ord>` for the gate prompt and the learnings XML for the deepen prompt.
         const captured: Array<{ agent: string; system: string; prompt: string }> = [];
         let lastSystem = "";
         const client = {
@@ -1318,7 +1315,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
             status: "completed",
             schedulePatch: { retrospectiveWatermarkMs: 220 },
         });
-        // Two turns: gate (friction-detector system) then deepen (learning system).
+        // The executor runs the friction-detector gate before the learning deepen turn.
         expect(captured).toHaveLength(2);
         expect(captured[0]?.system).toContain("friction detector");
         expect(captured[1]?.agent).toBe("dreamer-retrospective");

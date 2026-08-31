@@ -1,16 +1,6 @@
 /**
- * Shared fail-closed validator primitives for e2e artifact contracts.
  *
- * The prospective-holdout and historian-eval lanes both parse authored JSON
- * artifacts with the same fail-closed vocabulary (`object-required`,
- * `fields-invalid`, `string-invalid`, `id-invalid`, `integer-invalid`,
- * `duplicate`, ...). One implementation lives here so a hardening in one lane
- * cannot silently diverge from the other under identical diagnostic names.
  *
- * Each lane keeps its own error class (tests assert lane-specific
- * `instanceof`), so the primitives are built by a factory parameterized over
- * the error constructor. Diagnostics carry the label path and a code only —
- * never the offending artifact value (diagnostics are an output channel too).
  */
 
 export const HEX64_RE = /^[0-9a-f]{64}$/;
@@ -53,12 +43,6 @@ export function makeContractPrimitives(errorClass: ContractErrorConstructor): Co
     }
 
     function stringValue(value: unknown, label: string): string {
-        // Whitespace-only rejects for the same reason empty does. Production
-        // transcript formatting trims a message and can discard it as empty, and
-        // a blank probe question, answer, or choice is not scoreable — so a
-        // formally valid frozen artifact would carry runtime input its gold
-        // contract can never match. The authored value is returned unaltered:
-        // trimming here would change the bytes a fingerprint covers.
         if (typeof value !== "string" || value.trim().length === 0) fail(`${label}: string-invalid`);
         return value;
     }

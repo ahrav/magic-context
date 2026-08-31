@@ -1024,15 +1024,14 @@ fn deletion_accepts_the_evidence_id_the_caller_supplied_at_ingestion() {
     let root = tempfile::tempdir().unwrap();
     let store = KernelStore::open(root.path()).unwrap();
     seed_domain(&store);
-    let secret = "AKIAIOSFODNN7EXAMPLE";
-    let external_id = format!("evidence-{secret}");
-    let mut request = ingest_request("redacted-identity", b"redacted-identity");
+    let external_id = "evidence-caller-supplied".to_string();
+    let mut request = ingest_request("caller-identity", b"caller-identity");
     request.evidence_id = external_id.clone();
     let handle = store.ingest_artifact(request).unwrap();
 
     let deletion = store
         .delete_artifact(ArtifactDeletionRequest {
-            intent: intent("delete-redacted-identity"),
+            intent: intent("delete-caller-identity"),
             identity: ArtifactDeletionIdentity::EvidenceId(external_id),
             kind: ArtifactDeletionKind::Delete,
             operator_id: None,
@@ -1174,7 +1173,7 @@ fn a_foreign_receipt_replay_never_unlinks_the_artifact() {
         .execute(
             "INSERT INTO operation_receipts(
                  receipt_id,producer,operation_key,request_digest,commit_seq,result_payload,created_at
-             ) VALUES ('foreign-receipt',?1,?2,?3,?4,'unrelated-result',1)",
+             ) VALUES ('foreign-receipt',?1,?2,?3,?4,CAST('unrelated-result' AS BLOB),1)",
             params![
                 request.intent.producer,
                 request.intent.operation_key,

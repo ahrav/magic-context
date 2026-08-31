@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use super::{CommitIntent, RepositoryProvenance, Sensitivity};
-use crate::kernel::durable_fs::open_or_create_secure_directory;
+use crate::kernel::durable_fs::{
+    classify_io, open_or_create_secure_directory, open_secure_directory, StorageError,
+};
 use crate::kernel::{KernelError, KernelStore};
 
 pub(super) const DEFAULT_ARTIFACT_CAP: u64 = 4 * 1024 * 1024 * 1024;
@@ -284,11 +286,18 @@ pub(super) fn prepare_layout(root: &Path) -> Result<PathBuf, KernelError> {
 }
 
 impl KernelStore {
-    pub(super) fn artifact_object_path(&self, digest: &str) -> PathBuf {
-        self.artifacts_path
-            .join("objects")
-            .join(&digest[..2])
-            .join(&digest[2..])
+    /// A same-UID process can replace `artifacts` or `objects` with a symlink
+    /// after the store is open, so neither is trusted as a path component.
+    pub(super) fn open_objects_directory(&self) -> Result<File, StorageError> {
+        let Some(store_root) = self.artifacts_path.parent() else {
+            return Err(classify_io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact root has no parent directory",
+            )));
+        };
+        let root = File::open(store_root).map_err(classify_io)?;
+        let artifacts = open_secure_directory(&root, "artifacts")?;
+        open_secure_directory(&artifacts, "objects")
     }
 
     pub(super) fn cas_is_failed(&self) -> bool {
@@ -301,14 +310,12 @@ impl KernelStore {
 
     pub(super) fn map_cas_storage_error(
         &self,
-        error: crate::kernel::durable_fs::StorageError,
+        error: StorageError,
         non_capacity_kind: ArtifactErrorKind,
     ) -> ArtifactError {
         match error {
-            crate::kernel::durable_fs::StorageError::Exhausted(_) => {
-                ArtifactError::new(ArtifactErrorKind::StorageExhausted)
-            }
-            crate::kernel::durable_fs::StorageError::Other(_) => {
+            StorageError::Exhausted(_) => ArtifactError::new(ArtifactErrorKind::StorageExhausted),
+            StorageError::Other(_) => {
                 self.latch_cas_failure();
                 ArtifactError::new(non_capacity_kind)
             }

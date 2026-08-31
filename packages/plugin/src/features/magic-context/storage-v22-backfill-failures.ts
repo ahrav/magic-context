@@ -38,10 +38,6 @@ interface V22BackfillFailureDbRow {
 }
 
 function normalizeErrorClass(errorClass: RecordableV22BackfillErrorClass): V22BackfillErrorClass {
-    // The database CHECK constraint intentionally keeps the historic small set
-    // for this log table. New identity-resolution details that do not need
-    // queryable recovery state are recorded as `unknown`; the message carries
-    // the actionable detail without requiring a schema migration.
     if (errorClass === "dubious_ownership") {
         return "unknown";
     }

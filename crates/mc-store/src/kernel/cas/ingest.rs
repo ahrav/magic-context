@@ -1,7 +1,8 @@
-use std::fs::{self, File};
+use std::fs::File;
 
 use mc_core::redaction::Detection;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rustix::fs::{self as rfs, AtFlags, OFlags};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -12,14 +13,14 @@ use super::{
     ArtifactIngestRequest, ProviderEgress, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_DETECTIONS,
     MAX_TEXT_FIELD_BYTES,
 };
+use crate::current_time_ms;
 use crate::kernel::durable_fs::{
     classify_io, create_new_file, durable_unlink, open_or_create_secure_directory,
-    open_regular_nofollow, publish_noreplace_between_locked, temp_name, write_and_sync,
-    PublishOutcome, StorageError,
+    open_regular_nofollow, publish_noreplace_between_locked, sync_directory,
+    sync_publish_directories_with, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
 use crate::kernel::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
-use crate::kernel::open::current_time_ms;
-use crate::kernel::redaction::{record, redact, RedactedField};
+use crate::kernel::redaction::{identity, record, redact, RedactedField};
 use crate::kernel::{KernelError, KernelStore, Sensitivity};
 
 const RESERVATION_MS: i64 = 60 * 60 * 1_000;
@@ -62,6 +63,13 @@ impl PreparedArtifact {
         if !is_artifact_digest(&request.intent.request_digest) {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
+        let (repository_id, revision) =
+            request.provenance.as_ref().map_or(("", ""), |provenance| {
+                (
+                    provenance.repository_id.as_str(),
+                    provenance.revision.as_str(),
+                )
+            });
         if [
             request.evidence_id.as_str(),
             request.object_id.as_str(),
@@ -71,11 +79,32 @@ impl PreparedArtifact {
             request.source_id.as_str(),
             request.media_type.as_str(),
             request.retention_class.as_str(),
+            request.intent.producer.as_str(),
+            request.intent.operation_key.as_str(),
+            request.intent.actor.as_str(),
+            request.intent.cause.as_str(),
+            repository_id,
+            revision,
         ]
         .into_iter()
         .any(|field| field.len() > MAX_TEXT_FIELD_BYTES)
         {
             return Err(ArtifactError::new(ArtifactErrorKind::TextFieldTooLong));
+        }
+        if [
+            request.evidence_id.as_str(),
+            request.object_id.as_str(),
+            request.object_kind.as_str(),
+            request.domain_id.as_str(),
+            request.source_kind.as_str(),
+            request.source_id.as_str(),
+            repository_id,
+            revision,
+        ]
+        .into_iter()
+        .any(|field| identity(field).is_err())
+        {
+            return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
         if request.evidence_id.trim().is_empty()
             || request.object_id.trim().is_empty()
@@ -123,7 +152,13 @@ impl PreparedArtifact {
         if payload_redaction.detections.len() > MAX_PAYLOAD_DETECTIONS {
             return Err(ArtifactError::new(ArtifactErrorKind::DetectionLimit));
         }
-        let sensitivity = if !payload_redaction.detections.is_empty() {
+        // A recognized secret anywhere that is stored verbatim-after-redaction must
+        // raise the class, not only one in the payload; otherwise a clean payload
+        // with a leaking media type stays remotely eligible.
+        let metadata_detected = [&request.media_type, &request.retention_class]
+            .into_iter()
+            .any(|field| !redact(field).detections.is_empty());
+        let sensitivity = if !payload_redaction.detections.is_empty() || metadata_detected {
             Sensitivity::Secret
         } else if !inspected {
             request
@@ -231,7 +266,7 @@ impl KernelStore {
         let mut writer = self
             .lock_writer()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-        self.check_budget(&prepared.digest, byte_length)?;
+        self.check_budget(&objects, &prepared.digest, byte_length)?;
         let shard =
             open_or_create_secure_directory(&objects, &prepared.digest[..2]).map_err(|error| {
                 self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
@@ -248,13 +283,11 @@ impl KernelStore {
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         check_fence(&reservation, self.lease_epoch())
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+        // A digest under active reclamation must not be re-admitted.
         if artifact_is_reclaiming(&reservation, &prepared.digest)
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?
         {
             drop(reservation);
-            let _ = durable_unlink(&tmp, &temp_name).map_err(|cleanup| {
-                self.map_cas_storage_error(cleanup, ArtifactErrorKind::IngestionFailClosed)
-            });
             return Err(ArtifactError::for_digest(
                 ArtifactErrorKind::ReclaimInProgress,
                 &prepared.digest,
@@ -297,6 +330,23 @@ impl KernelStore {
                 staged.consume();
                 true
             }
+            // A retained temp link makes the object's link count two, which
+            // `verify_object` rejects.
+            Ok(PublishOutcome::PublishedTempRetained) => {
+                if let Err(error) = durable_unlink(&tmp, &temp_name) {
+                    let mapped =
+                        self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed);
+                    self.cleanup_failed_reference(
+                        &mut writer,
+                        &reservation_id,
+                        &prepared.digest,
+                        true,
+                    );
+                    return Err(mapped);
+                }
+                staged.consume();
+                true
+            }
             Ok(PublishOutcome::AlreadyExists) => {
                 if let Err(error) = durable_unlink(&tmp, &temp_name) {
                     let mapped =
@@ -315,6 +365,16 @@ impl KernelStore {
             }
         };
 
+        if let Err(error) = sync_publish_directories_with(&tmp, &shard, sync_directory) {
+            let mapped = self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed);
+            self.cleanup_failed_reference(
+                &mut writer,
+                &reservation_id,
+                &prepared.digest,
+                published_new,
+            );
+            return Err(mapped);
+        }
         if let Err(error) = verify_object(&shard, &prepared.digest[2..], &prepared.digest) {
             self.cleanup_failed_reference(
                 &mut writer,
@@ -349,7 +409,13 @@ impl KernelStore {
             self.lease_epoch(),
             prepared.request.intent.clone(),
             |envelope| insert_reference(envelope, &prepared, &reservation_id),
-            fault_after_events,
+            || {
+                if fault_after_events {
+                    Err(KernelError::Fault)
+                } else {
+                    Ok(())
+                }
+            },
         );
         match commit_result {
             Ok(receipt) if receipt.replayed => {
@@ -397,24 +463,31 @@ impl KernelStore {
                 digest: prepared.digest,
                 evidence_id: redact(&prepared.request.evidence_id).text,
             }),
-            Err(_) => {
+            Err(error) => {
                 self.cleanup_failed_reference(
                     &mut writer,
                     &reservation_id,
                     &prepared.digest,
                     published_new,
                 );
-                Err(ArtifactError::new(ArtifactErrorKind::ReferenceCommit))
+                Err(ArtifactError::new(match error {
+                    KernelError::InvalidInput => ArtifactErrorKind::InvalidInput,
+                    _ => ArtifactErrorKind::ReferenceCommit,
+                }))
             }
         }
     }
 
-    fn check_budget(&self, digest: &str, byte_length: u64) -> Result<(), ArtifactError> {
-        let usage = regular_file_bytes(&self.artifacts_path.join("objects")).map_err(|error| {
+    fn check_budget(
+        &self,
+        objects: &File,
+        digest: &str,
+        byte_length: u64,
+    ) -> Result<(), ArtifactError> {
+        let usage = regular_file_bytes(objects).map_err(|error| {
             self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed)
         })?;
-        let already_present = fs::symlink_metadata(self.artifact_object_path(digest))
-            .is_ok_and(|metadata| metadata.file_type().is_file());
+        let already_present = object_is_present(objects, digest);
         let projected = usage.saturating_add(if already_present { 0 } else { byte_length });
         if projected > self.artifact_cap {
             return Err(ArtifactError::capacity(usage, self.artifact_cap));
@@ -501,7 +574,7 @@ impl KernelStore {
         if tx.commit().is_err() || protected != 0 {
             return;
         }
-        let Ok(objects) = File::open(self.artifacts_path.join("objects")) else {
+        let Ok(objects) = self.open_objects_directory() else {
             self.latch_cas_failure();
             return;
         };
@@ -554,12 +627,15 @@ fn insert_reference(
         prepared.request.provider_egress,
     )?;
 
-    let evidence_id = redact(&prepared.request.evidence_id);
-    let object_id = redact(&prepared.request.object_id);
-    let object_kind = redact(&prepared.request.object_kind);
-    let domain_id = redact(&prepared.request.domain_id);
-    let source_kind = redact(&prepared.request.source_kind);
-    let source_id = redact(&prepared.request.source_id);
+    // Identity columns must survive round-trip, so a detected secret is refused
+    // rather than replaced: two ids differing only inside a redacted span would
+    // otherwise collapse onto one placeholder-backed identity.
+    let evidence_id = identity(&prepared.request.evidence_id)?;
+    let object_id = identity(&prepared.request.object_id)?;
+    let object_kind = identity(&prepared.request.object_kind)?;
+    let domain_id = identity(&prepared.request.domain_id)?;
+    let source_kind = identity(&prepared.request.source_kind)?;
+    let source_id = identity(&prepared.request.source_id)?;
     let media_type = redact(&prepared.request.media_type);
     let retention_class = redact(&prepared.request.retention_class);
     envelope
@@ -570,11 +646,11 @@ fn insert_reference(
                  created_commit_seq,sensitivity_class
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
-                object_id.text,
-                object_kind.text,
-                domain_id.text,
-                source_kind.text,
-                source_id.text,
+                object_id,
+                object_kind,
+                domain_id,
+                source_kind,
+                source_id,
                 prepared.request.source_revision,
                 envelope.commit_seq,
                 sensitivity.as_str(),
@@ -592,8 +668,8 @@ fn insert_reference(
                  redaction_metadata,created_commit_seq,sensitivity_class
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
-                evidence_id.text,
-                object_id.text,
+                evidence_id,
+                object_id,
                 prepared.artifact_reference,
                 prepared.digest,
                 i64::try_from(prepared.bytes.len()).map_err(|_| KernelError::InvalidInput)?,
@@ -623,7 +699,7 @@ fn insert_reference(
     record(
         envelope.tx,
         "evidence",
-        &evidence_id.text,
+        &evidence_id,
         "payload",
         &prepared.payload_redaction,
         Some(envelope.commit_seq),
@@ -635,23 +711,7 @@ fn insert_reference(
         record(
             envelope.tx,
             "evidence",
-            &evidence_id.text,
-            name,
-            field,
-            Some(envelope.commit_seq),
-        )?;
-    }
-    for (name, field) in [
-        ("object_id", &object_id),
-        ("object_kind", &object_kind),
-        ("domain_id", &domain_id),
-        ("source_kind", &source_kind),
-        ("source_id", &source_id),
-    ] {
-        record(
-            envelope.tx,
-            "object_registry",
-            &object_id.text,
+            &evidence_id,
             name,
             field,
             Some(envelope.commit_seq),
@@ -670,11 +730,11 @@ fn insert_reference(
     }
     envelope.changes.push(PendingChange {
         object: ObjectRow {
-            object_id: object_id.text.clone(),
-            object_kind: object_kind.text.clone(),
-            domain_id: domain_id.text.clone(),
-            source_kind: source_kind.text.clone(),
-            source_id: source_id.text.clone(),
+            object_id: object_id.clone(),
+            object_kind: object_kind.clone(),
+            domain_id: domain_id.clone(),
+            source_kind: source_kind.clone(),
+            source_id: source_id.clone(),
             source_revision: prepared.request.source_revision,
             created_commit_seq: envelope.commit_seq,
             invalidated_commit_seq: None,
@@ -683,16 +743,10 @@ fn insert_reference(
         },
         kind: "insert",
         replaced_object_id: None,
-        redactions: vec![
-            ("object_id".to_string(), object_id),
-            ("object_kind".to_string(), object_kind),
-            ("domain_id".to_string(), domain_id),
-            ("source_kind".to_string(), source_kind),
-            ("source_id".to_string(), source_id),
-        ],
+        redactions: Vec::new(),
         audit: None,
     });
-    Ok(evidence_id.text)
+    Ok(evidence_id)
 }
 
 fn merge_stored_classification(
@@ -789,23 +843,69 @@ fn verify_object(shard: &File, name: &str, digest: &str) -> Result<(), ArtifactE
     Ok(())
 }
 
-pub(super) fn regular_file_bytes(directory: &std::path::Path) -> Result<u64, StorageError> {
+fn storage_errno(source: rustix::io::Errno) -> StorageError {
+    classify_io(std::io::Error::from(source))
+}
+
+fn stat_bytes(stat: &rfs::Stat) -> u64 {
+    u64::try_from(stat.st_size).unwrap_or(0)
+}
+
+fn is_dot_entry(name: &std::ffi::CStr) -> bool {
+    matches!(name.to_bytes(), b"." | b"..")
+}
+
+fn open_shard_nofollow(objects: &File, name: impl rustix::path::Arg) -> Result<File, StorageError> {
+    rfs::openat(
+        objects,
+        name,
+        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rfs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(storage_errno)
+}
+
+pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
     let mut bytes = 0_u64;
-    let entries = fs::read_dir(directory).map_err(classify_io)?;
-    for entry in entries {
-        let entry = entry.map_err(classify_io)?;
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(classify_io(error)),
-        };
-        if metadata.file_type().is_file() {
-            bytes = bytes.saturating_add(metadata.len());
-        } else if metadata.file_type().is_dir() {
-            bytes = bytes.saturating_add(regular_file_bytes(&entry.path())?);
+    for entry in rfs::Dir::read_from(objects).map_err(storage_errno)? {
+        let entry = entry.map_err(storage_errno)?;
+        let name = entry.file_name();
+        if is_dot_entry(name) {
+            continue;
+        }
+        let stat = rfs::statat(objects, name, AtFlags::SYMLINK_NOFOLLOW).map_err(storage_errno)?;
+        let kind = rfs::FileType::from_raw_mode(stat.st_mode);
+        if kind.is_file() {
+            bytes = bytes.saturating_add(stat_bytes(&stat));
+            continue;
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        let shard = open_shard_nofollow(objects, name)?;
+        for shard_entry in rfs::Dir::read_from(&shard).map_err(storage_errno)? {
+            let shard_entry = shard_entry.map_err(storage_errno)?;
+            let shard_name = shard_entry.file_name();
+            if is_dot_entry(shard_name) {
+                continue;
+            }
+            let shard_stat = rfs::statat(&shard, shard_name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(storage_errno)?;
+            if rfs::FileType::from_raw_mode(shard_stat.st_mode).is_file() {
+                bytes = bytes.saturating_add(stat_bytes(&shard_stat));
+            }
         }
     }
     Ok(bytes)
+}
+
+fn object_is_present(objects: &File, digest: &str) -> bool {
+    let Ok(shard) = open_shard_nofollow(objects, &digest[..2]) else {
+        return false;
+    };
+    rfs::statat(&shard, &digest[2..], AtFlags::SYMLINK_NOFOLLOW)
+        .is_ok_and(|stat| rfs::FileType::from_raw_mode(stat.st_mode).is_file())
 }
 
 fn detection_metadata(detections: &[Detection]) -> Result<Vec<u8>, ArtifactError> {

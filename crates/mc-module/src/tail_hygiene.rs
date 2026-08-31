@@ -1,4 +1,4 @@
-//! Shared rendered-tail hygiene metric for the module's Channel-1 and Channel-2 nudges.
+//! The module defines the rendered-tail hygiene metric used by Channel-1 and Channel-2 nudges.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -314,9 +314,9 @@ fn neighborhood_consistent(
     matches!((previous_max, next_min), (Some(previous), Some(next)) if orphan_tag_number >= previous && orphan_tag_number <= next)
 }
 
-/// Build part attribution from exact block identities. Pre-composite legacy rows whose block id is
-/// only a raw call id use the fallback only when one owner arc and its tag-number neighborhood are
-/// unambiguous; recurring call ids otherwise remain T-only.
+/// Part attribution uses exact block identities.
+/// A legacy row with only a raw call ID uses the fallback only when one owner arc and its tag-number neighborhood are unambiguous.
+/// Rows with recurring raw call IDs remain T-only when the fallback owner arc or tag-number neighborhood is ambiguous.
 fn tag_numbers_by_block_and_arc(
     projection: &FlatProjection,
     tag_rows: &[McTagRow],
@@ -688,8 +688,8 @@ pub(crate) fn refresh_tail_hygiene_baseline(
     let mut turn_delta_t = 0i64;
     for part in &measured.parts[previous.baseline_parts.len()..] {
         turn_delta_t = turn_delta_t.saturating_add(part.tokens);
-        // A just-completed output is always in the newest recency reserve. Keeping it T-only
-        // prevents a defer pass from inflating U before the next full bust walk.
+        // A just-completed output remains T-only in the newest recency reserve to prevent a defer pass from inflating U before the next full bust walk.
+        // Keeping a just-completed output T-only prevents a defer pass from inflating U before the next full bust walk.
         if part.kind != TailHygienePartKind::ToolOutput {
             turn_delta_u = turn_delta_u.saturating_add(part.u_tokens);
         }

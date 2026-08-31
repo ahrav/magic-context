@@ -42,28 +42,22 @@ export { extractTexts, hasMeaningfulUserText } from "./read-session-formatting";
 /**
  * Block-tokenization memo.
  *
- * `readSessionChunk` re-tokenizes the TC-chunked eligible tail on every
- * compartment-trigger pass (every `message.updated`). The eligible window is
- * anchored at `lastCompartmentEnd + 1` and built forward, so every block BEHIND
- * the growing tail produces a byte-identical `formatBlock` string pass after
- * pass — re-running the BPE tokenizer on them is pure waste (≈100ms on a large
- * tool-heavy session). This memo is CONTENT-ADDRESSED on the exact block text,
- * so the token count is identical to a fresh `estimateTokens` call (no
- * semantic/threshold change) — only NEW or changed blocks (the tail edge) reach
- * the tokenizer. The cached value cannot substitute the per-tag token store:
- * that store counts FULL content, this counts the TC-chunked form (tool outputs
- * collapsed to one-line summaries), a deliberately different quantity.
+ * `readSessionChunk` re-tokenizes the TC-chunked eligible tail on every `message.updated` event.
+ * `lastCompartmentEnd + 1` anchors the eligible window, which is built forward.
+ * Blocks before the growing tail produce byte-identical `formatBlock` text.
+ * Exact-text keys preserve the result of `estimateTokens`.
+ * `blockTokenMemo` cannot replace the per-tag token store because the two stores count different content.
+ * The per-tag token store counts full content, whereas `blockTokenMemo` counts TC-chunked content.
+ * Tool outputs contribute one-line summaries to the TC-chunked token count.
  *
- * Bounded LRU so it can't grow without limit across sessions; full-string keys
- * (no hashing) keep it exact with zero collision risk. A budget-capped chunk is
- * a few dozen blocks, so a few active sessions sit far under the cap.
+ * `blockTokenMemo` evicts the least-recently-used entry at 2,048 entries; exact string keys avoid hash collisions.
  */
 const BLOCK_TOKEN_MEMO_MAX = 2048;
 const blockTokenMemo = new Map<string, number>();
 function estimateBlockTokens(blockText: string): number {
     const cached = blockTokenMemo.get(blockText);
     if (cached !== undefined) {
-        // Refresh recency (Map preserves insertion order → re-insert = most-recent).
+        // `delete` and `set` refresh recency because `Map` preserves insertion order.
         blockTokenMemo.delete(blockText);
         blockTokenMemo.set(blockText, cached);
         return cached;
@@ -78,32 +72,27 @@ function estimateBlockTokens(blockText: string): number {
 }
 
 let activeRawMessageCache: Map<string, RawMessage[]> | null = null;
-// Parallel to activeRawMessageCache, lifecycle-bound to the same scope. Holds the
-// ABSOLUTE session message count when the cached array is a TAIL-ONLY slice (so
-// `.length` would undercount). Consumers that need the true total read it via
-// getCachedAbsoluteMessageCount; null means "no tail slice active → use the
+// `activeAbsoluteCountCache` shares `activeRawMessageCache`'s lifecycle.
+// `activeAbsoluteCountCache` stores the absolute message count when `activeRawMessageCache` contains only a tail slice.
+// Consumers requiring the absolute count call `getCachedAbsoluteMessageCount`.
+// A null `activeAbsoluteCountCache` means no tail slice is active, so consumers use the cached array length.
 // array length".
 let activeAbsoluteCountCache: Map<string, number> | null = null;
 
 /**
- * Per-session source override for raw message reading.
+ * `RawMessageProvider` overrides raw-message reads for one session.
  *
- * The default implementation of `readRawSessionMessages(sessionId)` reads
- * from OpenCode's session DB via `withReadOnlySessionDb`. Other harnesses
- * (e.g. Pi) provide their session data through a different surface
- * (`pi.sessionManager.getBranch()`), so they register a per-session
- * provider here BEFORE invoking any code path that calls the shared
- * `readRawSessionMessages` / `getRawSessionMessageCount` /
- * `getProtectedTailStartOrdinal` / `readSessionChunk` helpers.
+ * `readRawSessionMessages` reads OpenCode's session DB when no provider is registered.
+ * `Pi` reads session data through `pi.sessionManager.getBranch()`.
+ * `Pi` registers a `RawMessageProvider` for each session.
+ * `RawMessageProvider` registration must precede calls to shared raw-message helpers.
  *
- * The registry is lookup-by-sessionId: a registered provider takes
- * precedence over the OpenCode-DB default. Sessions never registered
- * here continue to read from OpenCode's DB (existing behavior).
+ * A registered provider takes precedence over the OpenCode-DB default for its `sessionId`.
+ * Sessions without a registered provider use the OpenCode-DB default.
  *
- * Lifecycle: providers should be registered for the duration of one
- * historian/trigger evaluation and unregistered afterward to avoid
- * leaking session state across unrelated plugin instances. The
- * `withSessionMessageProvider` helper enforces this by wrapping a
+ * Provider registrations must last one historian or trigger evaluation.
+ * Providers must be unregistered after the evaluation to prevent session state from leaking across plugin instances.
+ * `withRawMessageProvider` enforces this scoped lifetime.
  * scope.
  */
 export interface RawMessageProvider {
@@ -117,18 +106,15 @@ export interface RawMessageProvider {
         after: RawMessageOrdinalAnchor | null,
         limit: number,
     ) => RawMessageOrdinalEntry[];
-    /** Optional fast count path; falls back to readMessages().length. */
+    /** `getMessageCount` falls back to `readMessages().length` when no fast count is available. */
     getMessageCount?: () => number;
-    /** Stored row count including compaction summaries, used for ordinal drift detection. */
+    /** The stored row count includes compaction summaries for ordinal drift detection. */
     getStoredMessageCount?: () => number;
 }
 
 const sessionProviders = new Map<string, RawMessageProvider>();
 
 /**
- * Register a per-session source for raw message reading. Returns an
- * unregister function. Pass-through harnesses (OpenCode) never call
- * this; only Pi/future harnesses install themselves before triggering
  * historian.
  */
 export function setRawMessageProvider(sessionId: string, provider: RawMessageProvider): () => void {
@@ -140,18 +126,12 @@ export function setRawMessageProvider(sessionId: string, provider: RawMessagePro
 }
 
 /**
- * Run `fn` with a temporary per-session provider override. Cleans up
- * on return regardless of throw — preferred over manual
- * `setRawMessageProvider` / `cleanup()` pairs.
+ * `withRawMessageProvider` unregisters the provider after `fn` throws or returns, except after a returned promise settles.
  *
- * ASYNC-SAFE: if `fn` returns a promise, cleanup is deferred until that promise
- * settles, so the provider stays registered for the WHOLE async scope. A bare
- * synchronous `finally` would unregister at `fn`'s FIRST `await` (the function
- * returns a pending promise immediately), leaving later awaited reads —
- * e.g. Pi's post-commit `queueDropsForCompartmentalizedMessages` — with no
- * provider, so they fall through to OpenCode's session DB. For a Pi session
- * that DB is the wrong source (empty), and on a Pi-only install it does not
- * exist at all, throwing `unable to open database file`.
+ * A synchronous `finally` unregisters the provider when `fn` returns a pending promise, before later awaited reads.
+ * A synchronous `finally` would route later awaited reads to OpenCode's session DB.
+ * OpenCode's session DB is empty for Pi sessions and may be absent on Pi-only installs.
+ * On Pi-only installs, reading OpenCode's absent session DB throws `unable to open database file`.
  */
 export function withRawMessageProvider<T>(
     sessionId: string,
@@ -177,7 +157,7 @@ export function withRawMessageProvider<T>(
     return result;
 }
 
-/** Strip system-reminder blocks and OMO markers from user text for chunk compaction. */
+/** Chunk compaction strips system-reminder blocks and OMO markers from user text. */
 export function cleanUserText(text: string): string {
     return removeSystemReminders(text).replace(OMO_INTERNAL_INITIATOR_MARKER, "").trim();
 }
@@ -192,17 +172,15 @@ export interface SessionChunk {
     hasMore: boolean;
     text: string;
     lines: SessionChunkLine[];
-    /** Number of distinct commit clusters — assistant blocks with commits separated by meaningful user turns */
+    /** The commit-cluster count includes assistant blocks with commits separated by meaningful user turns. */
     commitClusterCount: number;
     /**
-     * Contiguous ranges of raw message ordinals whose visible chunk content was
-     * tool-only (TC: lines, no narrative text). Historian frequently skips such
-     * ranges entirely — that's safe, so validation absorbs gaps that fall fully
-     * within these ranges regardless of size. Gaps outside these ranges still
-     * fail validation and trigger a repair retry.
+     * Tool-only ranges contain TC lines and no narrative text.
+     * Validation absorbs gaps that fall fully within these ranges regardless of size.
+     * Gaps outside tool-only ranges fail validation and trigger a repair retry.
      */
     toolOnlyRanges: Array<{ start: number; end: number }>;
-    /** Completed call/result ranges visible in the raw snapshot, including results past this chunk. */
+    /** The raw snapshot includes completed call/result ranges, including results past this chunk. */
     completedToolArcs: Array<{ start: number; end: number }>;
 }
 
@@ -276,27 +254,16 @@ readRawSessionMessages.readPage = readRawSessionMessagePage;
 readRawSessionMessages.getCount = getRawSessionMessageOrdinalCount;
 
 /**
- * Prime the active raw-message cache with a TAIL-ONLY read (only messages
- * at/after the last compartment boundary), so subsequent
- * `readRawSessionMessages(sessionId)` calls in this scope reuse it instead of
- * reading the whole session.
+ * The boundary-resolution path primes the active raw-message cache with messages at or after the last compartment boundary; subsequent `readRawSessionMessages(sessionId)` calls reuse the cache.
  *
- * This is the O(tail) path: the compartment-trigger boundary resolution is
- * offset-forward only (its candidate / suffix / range / head-cap / chunk-scan
- * reads never cross below `baseOrdinal+1`), and the absolute message count it
- * needs is recovered from the tail reader (`baseOrdinal + tail`), NOT from
- * counting pre-boundary rows. On a months-long session the full read grows
- * O(session); this stays flat at the tail size.
+ * Compartment-trigger boundary resolution is O(tail).
+ * Boundary resolution never reads below `baseOrdinal + 1`.
+ * Tail-cache reads scale with tail length rather than session length.
  *
- * The cached array carries ABSOLUTE ordinals (`baseOrdinal+1 …`) so every
- * downstream absolute-ordinal computation matches the full read; the true total
- * is stashed in the parallel absolute-count cache for `.length`-style consumers.
+ * The cached array uses absolute ordinals starting at `baseOrdinal + 1`.
+ * The parallel absolute-count cache stores the true total for `.length`-style consumers.
  *
- * No-op (returns false) when a provider is registered (Pi: in-memory branch read
- * is already cheap and authoritative), no OpenCode DB exists, the cache is
- * already populated, or no usable boundary anchor exists (e.g. no compartments,
- * or the anchor message was deleted) — in which case the caller falls through to
- * the full read, which is correct (everything is eligible / nothing to skip).
+ * The function returns `false` when a provider is registered, no OpenCode DB exists, the cache is populated, or no usable boundary anchor exists; the caller then performs a full read.
  */
 export function primeTailRawMessageCache(args: {
     sessionId: string;
@@ -306,12 +273,8 @@ export function primeTailRawMessageCache(args: {
     const { sessionId, lastCompartmentEnd, anchorMessageId } = args;
     if (!activeRawMessageCache) return false;
     if (activeRawMessageCache.has(sessionId)) return false;
-    // A registered provider (Pi) is the authoritative in-memory source and is
-    // already cheap; never shadow it with a DB read.
     if (sessionProviders.has(sessionId)) return false;
     if (!openCodeDbExists()) return false;
-    // Need a real boundary + anchor to read the tail; otherwise fall through to
-    // the full read (correct for the no-compartment / #132 case).
     if (lastCompartmentEnd < 1 || !anchorMessageId) return false;
 
     const result = withReadOnlySessionDb((db) =>
@@ -324,28 +287,15 @@ export function primeTailRawMessageCache(args: {
 }
 
 /**
- * Absolute session message count for the active scope. Returns the tail-prime's
- * stashed absolute count when a tail slice is cached; otherwise null, signalling
- * callers to use `readRawSessionMessages(sessionId).length` (whole-session
- * array) as before.
  */
 export function getCachedAbsoluteMessageCount(sessionId: string): number | null {
     return activeAbsoluteCountCache?.get(sessionId) ?? null;
 }
 
 /**
- * Prime the active raw-message cache with an IN-MEMORY tail built from the
- * transform's `args.messages` — no opencode.db read at all. This is the hot-path
- * goal: the transform already receives the post-marker tail (the eligible
- * window) as parsed objects, so the boundary resolver can consume it directly.
  *
- * The caller supplies the already-converted absolute-ordinal `RawMessage[]` (via
- * `buildInMemoryTailRawMessages`) plus its absolute count. Same scope/lifecycle
- * rules as the other prime helpers: only inside a `withRawSessionMessageCache`
- * scope, never shadows a registered provider (Pi), and is a no-op if the cache is
- * already populated for the session.
+ * The function requires a `withRawSessionMessageCache` scope, does not shadow a registered provider, and leaves an existing session cache unchanged.
  *
- * Returns true when it primed the cache.
  */
 export function primeInMemoryTailRawMessageCache(args: {
     sessionId: string;
@@ -472,11 +422,6 @@ export function readRawSessionMessageById(sessionId: string, messageId: string):
 function readRawSessionMessagesFromSource(sessionId: string): RawMessage[] {
     const provider = sessionProviders.get(sessionId);
     if (provider) return provider.readMessages();
-    // No provider: fall back to OpenCode's session DB — but only if it exists.
-    // A Pi-only install has no opencode.db, and a Pi transform whose provider
-    // was unregistered out-of-band (e.g. session cleared while an async
-    // historian is mid-flight) must not crash the post-commit drop-queue with
-    // `unable to open database file`. No source → no raw messages.
     if (!openCodeDbExists()) return [];
     return withReadOnlySessionDb((db) => readRawSessionMessagesFromDb(db, sessionId));
 }
@@ -492,21 +437,15 @@ export function getRawSessionMessageCount(sessionId: string): number {
 }
 
 /**
- * Set of raw-session keys observed in the visible window. Pre-v3.3.1
- * this collapsed everything (text, file, tool) into one bare-string Set.
- * That was the bug Finding D in the plan: tool tags share `messageId =
- * callId`, so a callId reused outside the compartment would match a
- * tag inside the compartment by string equality alone, queuing drops
- * for tags that should have stayed live.
+ * Tool tags use `messageId = callId`.
+ * A `callId` reused outside the compartment can match a visible tool tag.
+ * String-only matching can queue drops for live tags.
  *
- * Layer C splits the shape into:
- *   - `messageFileKeys`: bare contentIds (`<msgId>:p<n>` / `<msgId>:fileN`).
- *     These are globally unique within a session, so bare-string match
+ * `messageFileKeys` uses session-unique content IDs, while `toolObservations` uses `callId` and `tool_owner_message_id`.
+ * `messageFileKeys` can match content IDs as bare strings because those IDs are unique within a session.
  *     is correct.
- *   - `toolObservations`: per-callId set of `ownerMsgId` values derived
- *     by FIFO pairing, mirroring `tag-messages.ts`. A tool tag is "in
- *     the visible window" iff its callId AND `tool_owner_message_id`
- *     both appear here.
+ * `toolObservations` maps each `callId` to owner message IDs paired in FIFO order.
+ * A tool tag is visible only when `toolObservations` contains both its `callId` and `tool_owner_message_id`.
  */
 export interface RawSessionTagKeys {
     messageFileKeys: Set<string>;
@@ -520,9 +459,7 @@ export function getRawSessionTagKeysThrough(
     const messages = readRawSessionMessages(sessionId);
     const messageFileKeys = new Set<string>();
     const toolObservations = new Map<string, Set<string>>();
-    // FIFO queue per callId of unpaired invocations — same logic as
-    // tag-messages.ts so the composite keys we produce here match what
-    // the tagger persisted.
+    // `unpairedInvocations` pairs invocation owners with results in FIFO order.
     const unpairedInvocations = new Map<string, string[]>();
 
     for (const message of messages) {
@@ -541,10 +478,7 @@ export function getRawSessionTagKeysThrough(
             const obs = extractToolCallObservation(part);
             if (!obs) continue;
 
-            // FIFO pairing: invocation parts push their owner; result
-            // parts pop. The owner identifies which assistant message
-            // hosts the invocation, which is what `tag-messages.ts`
-            // uses for `tool_owner_message_id`.
+            // The invocation owner is the assistant message that contains the invocation part.
             let ownerMsgId: string;
             if (obs.kind === "invocation") {
                 ownerMsgId = message.id;
@@ -558,13 +492,7 @@ export function getRawSessionTagKeysThrough(
                     if (queue.length === 0) unpairedInvocations.delete(obs.callId);
                     ownerMsgId = popped ?? message.id;
                 } else {
-                    // Result-only window inside this scan: invocation
-                    // wasn't observed in the visible range. Use the
-                    // result's own message id as a best-effort owner.
-                    // The drop queue compares against persisted
-                    // `tool_owner_message_id` and falls back to bare-
-                    // callId match for legacy NULL-owner rows; this
-                    // best-effort ownerMsgId is mainly informational.
+                    // The fallback uses the result message ID when no queued invocation is available, including when the invocation is outside the visible range.
                     ownerMsgId = message.id;
                 }
             }
@@ -601,18 +529,13 @@ export function readSessionChunk(
     eligibleEndOrdinal?: number,
 ): SessionChunk {
     const messages = readRawSessionMessages(sessionId);
-    // When a tail-only slice is primed, `messages.length` is just the slice
-    // size while ordinals are ABSOLUTE — comparing an absolute `lastOrdinal`
-    // against the slice length would wrongly report hasMore=true forever
-    // (historian re-fires on an already-finished session). Use the absolute
-    // session count whenever the prime recorded one.
+    // `lastOrdinal` must be compared with the absolute message count; using `messages.length` would leave `hasMore` true for tail slices.
     const totalMessageCount = getCachedAbsoluteMessageCount(sessionId) ?? messages.length;
     const startOrdinal = Math.max(1, offset);
     const lines: string[] = [];
     const lineMeta: SessionChunkLine[] = [];
     /**
-     * Tool-only block ranges captured at flush time. After the main loop finishes
-     * we merge adjacent ranges into contiguous `toolOnlyRanges` for the validator.
+     * `flushedToolOnlyBlocks` records ranges that are merged into contiguous `toolOnlyRanges` after the loop.
      */
     const flushedToolOnlyBlocks: Array<{ start: number; end: number }> = [];
     let totalTokens = 0;
@@ -641,7 +564,6 @@ export function readSessionChunk(
             return false;
         }
 
-        // Count commit clusters: an A block with commits after a non-A block (or first block) is a new cluster
         if (
             currentBlock.role === "A" &&
             currentBlock.commitHashes.length > 0 &&
@@ -661,9 +583,7 @@ export function readSessionChunk(
         lineMeta.push(...currentBlock.meta);
         totalTokens += blockTokens;
 
-        // Record the flushed block's range if it was pure tool-only content.
-        // Validator uses these ranges to absorb gaps of any size where historian
-        // legitimately skipped tool-only noise.
+        // `toolOnlyRanges` lets the validator absorb gaps of any size caused by skipped tool-only noise.
         if (currentBlock.isToolOnly) {
             flushedToolOnlyBlocks.push({
                 start: currentBlock.startOrdinal,
@@ -681,26 +601,19 @@ export function readSessionChunk(
 
         const meta = { ordinal: msg.ordinal, messageId: msg.id };
 
-        // Skip user messages that are pure system notifications (background task
-        // completions, internal initiator markers, system directives). These carry
-        // zero signal for compartment summaries — unless they contain tool results
-        // with extractable descriptions.
+        // `user` messages without meaningful text are skipped unless `extractToolCallSummaries` finds tool-result descriptions.
         if (msg.role === "user" && !hasMeaningfulUserText(msg.parts)) {
             const tcSummaries = extractToolCallSummaries(msg.parts);
             if (tcSummaries.length === 0) {
                 recordFilteredNoise(meta);
                 continue;
             }
-            // Tool-result-only user messages: merge TC summaries into the
-            // preceding assistant block (same "A" role since tool results follow
-            // assistant tool-use messages in the compacted flow).
             const tcText = tcSummaries.join(" / ");
             if (currentBlock && currentBlock.role === "A") {
                 currentBlock.endOrdinal = msg.ordinal;
                 currentBlock.parts.push(tcText);
                 currentBlock.meta.push(...pendingNoiseMeta, meta);
-                // Do NOT flip isToolOnly here — TC-only content merging into an
-                // existing A block keeps that block's narrative/tool-only status.
+                // `TC-only` content merged into an existing `"A"` block does not change that block's `isToolOnly` status.
                 pendingNoiseMeta = [];
             } else {
                 if (!flushCurrentBlock()) break;
@@ -711,7 +624,6 @@ export function readSessionChunk(
                     parts: [tcText],
                     meta: [...pendingNoiseMeta, meta],
                     commitHashes: [],
-                    // Pure TC-only block — no narrative from text parts.
                     isToolOnly: true,
                 };
                 pendingNoiseMeta = [];
@@ -725,8 +637,6 @@ export function readSessionChunk(
             .map(normalizeText)
             .filter((value) => value.length > 0);
 
-        // For messages with no text content, extract tool-call descriptions as
-        // lightweight summaries so historian sees what actions were taken.
         const toolSummaries = textParts.length === 0 ? extractToolCallSummaries(msg.parts) : [];
         const allParts = [...textParts, ...toolSummaries];
 
@@ -739,8 +649,6 @@ export function readSessionChunk(
         }
 
         // Narrative is present iff this message contributed at least one real text part.
-        // Tool summaries alone count as tool-only. User-role messages here always carry
-        // meaningful text (the no-text user branch returned above).
         const msgHasNarrative = textParts.length > 0;
 
         if (currentBlock && currentBlock.role === role) {
@@ -751,8 +659,6 @@ export function readSessionChunk(
                 currentBlock.commitHashes,
                 compacted.commitHashes,
             );
-            // Once any message in the merged block contributes narrative, the block is
-            // no longer tool-only.
             if (msgHasNarrative) currentBlock.isToolOnly = false;
             pendingNoiseMeta = [];
             continue;
@@ -779,10 +685,7 @@ export function readSessionChunk(
         );
     }
 
-    // Merge adjacent tool-only block ranges into contiguous ranges. Adjacent
-    // means `next.start === prev.end + 1` — a pure tool chain spread across
-    // multiple successive flushed blocks becomes one merged range so validation
-    // can absorb the full gap in a single heal check.
+    // `toolOnlyRanges` represents maximal contiguous tool-only ordinal ranges.
     const toolOnlyRanges: Array<{ start: number; end: number }> = [];
     for (const range of flushedToolOnlyBlocks) {
         const last = toolOnlyRanges[toolOnlyRanges.length - 1];

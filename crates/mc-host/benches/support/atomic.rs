@@ -1,11 +1,8 @@
-//! Pinned two-thread atomic ping-pong: the core-to-core cache-line
 //! transfer floor.
 //!
-//! Two dedicated native threads on verified, distinct pinned CPUs exchange
-//! a token through one padded atomic with acquire/release ordering. The
-//! initiator times whole batches of full A-to-B-to-A round trips; per-batch
-//! mean RTT is the retained observation. Timer overhead is measured and
-//! retained as a bracket, never subtracted.
+//! The initiator records one mean RTT for each batch.
+//! Each measured batch retains its mean RTT.
+//! The benchmark never subtracts timer overhead from batch results.
 
 #![allow(dead_code)]
 
@@ -15,26 +12,22 @@ use std::time::{Duration, Instant};
 
 use super::linux_topology::{current_cpu, pin_current_thread};
 
-/// One cache line (or two, on machines with adjacent-line prefetch) per
-/// atomic so token traffic is the only coherence traffic.
+/// The alignment separates the token from unrelated atomic state.
 #[repr(align(128))]
 struct Padded(AtomicU64);
 
-/// Fixed contract for one ping-pong collection.
 #[derive(Debug, Clone, Copy)]
 pub struct PingPongConfig {
     pub initiator_cpu: u32,
     pub responder_cpu: u32,
-    /// Batches discarded before measurement begins.
     pub warmup_batches: u32,
-    /// Measured batches retained as observations.
+    /// `batches` sets the number of measured observations retained.
     pub batches: u32,
-    /// Full round trips per batch.
+    /// `exchanges_per_batch` sets full round trips per batch.
     pub exchanges_per_batch: u32,
 }
 
-/// Observed CPUs before the first and after the last exchange on one
-/// thread, proving where the work executed.
+/// `ObservedCpus` records CPUs before the first and after the last exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ObservedCpus {
     pub before: u32,
@@ -43,19 +36,18 @@ pub struct ObservedCpus {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PingPongOutput {
-    /// Mean full-RTT nanoseconds of each measured batch.
+    /// `batch_mean_rtt_ns` stores each measured batch's mean full-RTT duration in nanoseconds.
     pub batch_mean_rtt_ns: Vec<f64>,
     pub total_exchanges: u64,
     pub elapsed_ns: u64,
-    /// Median cost of one bracketing `Instant::now()` pair, retained for
-    /// context and never subtracted from batch results.
+    /// `clock_bracket_ns` stores the median duration of 1,000 `Instant::now()` brackets.
+    /// The benchmark never subtracts `clock_bracket_ns` from batch results.
     pub clock_bracket_ns: u64,
     pub initiator: ObservedCpus,
     pub responder: ObservedCpus,
 }
 
 impl PingPongOutput {
-    /// Exchanges per second over the measured window.
     pub fn exchanges_per_sec(&self) -> f64 {
         if self.elapsed_ns == 0 {
             return 0.0;
@@ -64,7 +56,6 @@ impl PingPongOutput {
     }
 }
 
-/// Median elapsed nanoseconds of an empty `Instant::now()` bracket.
 fn clock_bracket_ns() -> u64 {
     let mut samples: Vec<u64> = (0..1000)
         .map(|_| {
@@ -77,13 +68,10 @@ fn clock_bracket_ns() -> u64 {
     samples[samples.len() / 2]
 }
 
-/// Runs the finite ping-pong exchange and returns per-batch observations.
 ///
-/// Token protocol: for exchange `i` (1-based), the initiator stores `2i-1`
-/// (release) and spins for `2i` (acquire); the responder spins for `2i-1`
-/// and stores `2i`. Both threads run the same finite count, so the
-/// exchange terminates without a stop flag or timeout. Pin failures abort
-/// both threads before any exchange.
+/// The release/acquire handoffs publish each exchange between the initiator and responder.
+/// The finite matching counts let every exchange terminate without a stop flag or timeout.
+/// The barrier synchronizes both threads before any exchange.
 pub fn run_ping_pong(cfg: PingPongConfig) -> Result<PingPongOutput, String> {
     if cfg.batches == 0 || cfg.exchanges_per_batch == 0 {
         return Err("batches and exchanges_per_batch must be nonzero".to_owned());
@@ -166,18 +154,13 @@ pub fn run_ping_pong(cfg: PingPongConfig) -> Result<PingPongOutput, String> {
         ))
     };
 
-    // The initiator gets its own thread so `pin_current_thread` never
-    // confines the caller: pinning the calling thread would leave it
-    // restricted to `initiator_cpu` for everything that runs after this
-    // function returns, including spawned child processes that inherit
-    // the affinity mask.
+    // The initiator runs on a dedicated thread so pinning does not restrict the caller.
+    // Child processes inherit the caller's affinity mask.
     let initiator_result = std::thread::spawn(run_initiator)
         .join()
         .map_err(|_| "initiator panicked")?;
     let responder_result = responder.join().map_err(|_| "responder panicked")?;
-    // "aborted before exchange" from one thread is the symptom of the
-    // other thread's pin failure; surface the error naming the root
-    // cause instead of the abort marker.
+    // When both threads fail, return the non-abort error because an abort indicates the peer's pin failure.
     let ((batch_means, measured_ns, initiator_cpus), responder_cpus) =
         match (initiator_result, responder_result) {
             (Ok(initiator), Ok(responder_cpus)) => (initiator, responder_cpus),
@@ -201,8 +184,7 @@ pub fn run_ping_pong(cfg: PingPongConfig) -> Result<PingPongOutput, String> {
     })
 }
 
-/// Times `exchanges` full round trips on already-valid CPUs for Criterion's
-/// `iter_custom`: one warmup-free timed window, no per-exchange
+/// The benchmark times `exchanges` full round trips in one warmup-free, uninstrumented `iter_custom` window.
 /// instrumentation.
 pub fn timed_exchanges(
     initiator_cpu: u32,

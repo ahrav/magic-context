@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-/** FM-OC-2: a dead module crosses the failure threshold and parks with a loud token. */
+/* */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";

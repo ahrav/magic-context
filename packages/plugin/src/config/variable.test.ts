@@ -17,7 +17,7 @@ describe("substituteConfigVariables", () => {
         try {
             rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
         process.env = { ...ORIGINAL_ENV };
     });
@@ -104,9 +104,7 @@ describe("substituteConfigVariables", () => {
 
             const result = substituteConfigVariables({ text: input });
 
-            // The regex `{env:([^}]+)}` requires ≥1 char between the colon and
-            // brace. An empty `{env:}` is not a valid token and passes through
-            // to be parsed as literal JSONC text.
+            // `{env:}` passes through because env tokens require a nonempty name.
             expect(result.text).toBe(input);
             expect(result.warnings).toHaveLength(0);
         });
@@ -164,8 +162,7 @@ describe("substituteConfigVariables", () => {
 
             const result = substituteConfigVariables({ text: input });
 
-            // File doesn't exist, so warning fires — but warning must show it
-            // resolved under homedir, proving the ~ expansion happened.
+            // Missing-file warnings report the homedir-resolved path.
             expect(result.warnings).toHaveLength(1);
             expect(result.warnings[0]).toContain(homedir() + sep);
         });
@@ -177,7 +174,7 @@ describe("substituteConfigVariables", () => {
 
             const result = substituteConfigVariables({ text: input });
 
-            // Escaped so the outer JSONC string still parses cleanly.
+            // JSON escaping preserves the enclosing JSONC string's validity.
             expect(result.text).toBe(`{ "value": "line1 with \\"quote\\"\\nline2" }`);
             const parsed = JSON.parse(result.text);
             expect(parsed.value).toBe('line1 with "quote"\nline2');
@@ -200,7 +197,7 @@ describe("substituteConfigVariables", () => {
 
             const result = substituteConfigVariables({ text: input });
 
-            // Same reasoning as {env:} — empty token pattern doesn't match.
+            // `{file:}` is not a valid token and passes through literally.
             expect(result.text).toBe(input);
             expect(result.warnings).toHaveLength(0);
         });
@@ -270,8 +267,8 @@ describe("substituteConfigVariables", () => {
         });
 
         it("env tokens inside {file:} path expand before file read", () => {
-            // Tokens are substituted left-to-right in passes: env first, then
-            // file. So an env var naming a file path gets resolved during file
+            // Environment substitution runs before file substitution.
+            // The file pass resolves paths emitted by env substitution.
             // substitution.
             process.env.MC_FILE_DIR = tmpDir;
             const keyFile = join(tmpDir, "indirect.txt");
@@ -309,7 +306,7 @@ describe("substituteConfigVariables", () => {
             const input = `{ "key": "{file:~/.ssh/id_rsa}" }`;
             const result = substituteConfigVariables({ text: input });
             // Whether the file exists or not, the sensitive-path warning fires
-            // before the existence check.
+            // The sensitive-path warning precedes the existence check.
             expect(result.warnings.some((w) => w.includes("sensitive path"))).toBe(true);
             expect(result.warnings.some((w) => w.includes("SSH keys"))).toBe(true);
         });

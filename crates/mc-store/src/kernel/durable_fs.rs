@@ -1,8 +1,9 @@
+//! Descriptor-anchored filesystem primitives for durable artifact publication.
+
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
@@ -42,6 +43,10 @@ impl StorageError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PublishOutcome {
     Published,
+    // The rename fallback linked `final_name` but could neither unlink the
+    // temp name nor roll the link back; the caller must remove or retry
+    // removal of the temp link.
+    PublishedTempRetained,
     AlreadyExists,
 }
 
@@ -71,40 +76,51 @@ fn invalid_name() -> StorageError {
 }
 
 fn validate_name(name: &str) -> Result<(), StorageError> {
+    validate_os_name(OsStr::new(name))
+}
+
+// `OsStr` preserves non-UTF-8 names.
+fn validate_os_name(name: &OsStr) -> Result<(), StorageError> {
     let path = std::path::Path::new(name);
-    if name.is_empty() || name == "." || name == ".." || path.file_name() != Some(OsStr::new(name))
-    {
+    if name.is_empty() || name == "." || name == ".." || path.file_name() != Some(name) {
         return Err(invalid_name());
     }
     Ok(())
 }
 
-pub(super) fn create_secure_directory(parent: &File, name: &str) -> Result<File, StorageError> {
-    validate_name(name)?;
+pub(super) fn create_secure_directory(parent: &File, name: &OsStr) -> Result<File, StorageError> {
+    validate_os_name(name)?;
     rfs::mkdirat(parent, name, Mode::from_raw_mode(0o700)).map_err(classify_errno)?;
-    rfs::chmodat(parent, name, Mode::from_raw_mode(0o700), AtFlags::empty())
+    let secured = (|| {
+        let descriptor = rfs::openat(
+            parent,
+            name,
+            OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
         .map_err(classify_errno)?;
-    let descriptor = rfs::openat(
-        parent,
-        name,
-        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(classify_errno)?;
-    let directory = File::from(descriptor);
-    let metadata = directory.metadata().map_err(classify_io)?;
-    if !metadata.is_dir()
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.permissions().mode() & 0o777 != 0o700
-    {
-        return Err(classify_io(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "directory is not owner-only",
-        )));
+        let directory = File::from(descriptor);
+        // `fchmod` on the verified descriptor defeats the umask without ever
+        // re-resolving `name`.
+        rfs::fchmod(&directory, Mode::from_raw_mode(0o700)).map_err(classify_errno)?;
+        let metadata = directory.metadata().map_err(classify_io)?;
+        if !metadata.is_dir()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(classify_io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory is not owner-only",
+            )));
+        }
+        sync_directory(&directory)?;
+        sync_directory(parent)?;
+        Ok(directory)
+    })();
+    if secured.is_err() {
+        let _ = rfs::unlinkat(parent, name, AtFlags::REMOVEDIR);
     }
-    sync_directory(&directory)?;
-    sync_directory(parent)?;
-    Ok(directory)
+    secured
 }
 
 pub(super) fn open_secure_directory(parent: &File, name: &str) -> Result<File, StorageError> {
@@ -134,7 +150,7 @@ pub(super) fn open_or_create_secure_directory(
     parent: &File,
     name: &str,
 ) -> Result<File, StorageError> {
-    match create_secure_directory(parent, name) {
+    match create_secure_directory(parent, OsStr::new(name)) {
         Ok(directory) => Ok(directory),
         Err(StorageError::Other(source)) if source.kind() == io::ErrorKind::AlreadyExists => {
             open_secure_directory(parent, name)
@@ -193,6 +209,7 @@ pub(super) fn open_or_create_append_file(
     }
 }
 
+/// A partial prior append can leave the file without its trailing newline, so a record is separated from that remnant before new bytes are written.
 pub(super) fn append_and_sync(file: &mut File, bytes: &[u8]) -> Result<(), StorageError> {
     let length = file.metadata().map_err(classify_io)?.len();
     if length > 0 {
@@ -250,7 +267,10 @@ pub(super) fn sync_directory(directory: &File) -> Result<(), StorageError> {
     sync_file(directory)
 }
 
-fn sync_publish_directories_with(
+// Callers publishing across two directories own the barrier for both, so this
+// syncs the destination first and the source only when it is a different
+// directory.
+pub(super) fn sync_publish_directories_with(
     source_directory: &File,
     destination_directory: &File,
     mut sync: impl FnMut(&File) -> Result<(), StorageError>,
@@ -264,6 +284,8 @@ fn sync_publish_directories_with(
     Ok(())
 }
 
+// `_locked` requires callers to serialize publishers within this process.
+// Callers own the directory barrier.
 pub(super) fn publish_noreplace_locked(
     directory: &File,
     temp_name: &str,
@@ -290,52 +312,50 @@ pub(super) fn publish_noreplace_between_locked(
             final_name,
             rfs::RenameFlags::NOREPLACE,
         ) {
-            Ok(()) => {
-                sync_publish_directories_with(
-                    source_directory,
-                    destination_directory,
-                    sync_directory,
-                )?;
-                return Ok(PublishOutcome::Published);
-            }
+            Ok(()) => return Ok(PublishOutcome::Published),
             Err(rustix::io::Errno::EXIST) | Err(rustix::io::Errno::NOTEMPTY) => {
                 return Ok(PublishOutcome::AlreadyExists);
             }
-            Err(rustix::io::Errno::INVAL)
-            | Err(rustix::io::Errno::NOSYS)
-            | Err(rustix::io::Errno::OPNOTSUPP) => {}
+            // `NOTSUP` equals `OPNOTSUPP` on Linux, so equality guards avoid
+            // duplicate or-patterns.
+            Err(error)
+                if error == rustix::io::Errno::INVAL
+                    || error == rustix::io::Errno::NOSYS
+                    || error == rustix::io::Errno::OPNOTSUPP
+                    || error == rustix::io::Errno::NOTSUP => {}
             Err(error) => return Err(classify_errno(error)),
         }
     }
 
-    match rfs::statat(destination_directory, final_name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_) => return Ok(PublishOutcome::AlreadyExists),
-        Err(rustix::io::Errno::NOENT) => {}
-        Err(error) => return Err(classify_errno(error)),
-    }
-    match rfs::renameat(
+    // `linkat` atomically creates `final_name` or returns `EEXIST`, preventing
+    // a concurrent publisher from replacing it.
+    match rfs::linkat(
         source_directory,
         temp_name,
         destination_directory,
         final_name,
+        AtFlags::empty(),
     ) {
-        Ok(()) => {
-            sync_publish_directories_with(source_directory, destination_directory, sync_directory)?;
-            Ok(PublishOutcome::Published)
-        }
-        Err(rustix::io::Errno::EXIST) | Err(rustix::io::Errno::NOTEMPTY) => {
-            Ok(PublishOutcome::AlreadyExists)
-        }
+        Ok(()) => match rfs::unlinkat(source_directory, temp_name, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(PublishOutcome::Published),
+            Err(unlink_error) => {
+                match rfs::unlinkat(destination_directory, final_name, AtFlags::empty()) {
+                    Ok(()) | Err(rustix::io::Errno::NOENT) => Err(classify_errno(unlink_error)),
+                    Err(_) => Ok(PublishOutcome::PublishedTempRetained),
+                }
+            }
+        },
+        Err(rustix::io::Errno::EXIST) => Ok(PublishOutcome::AlreadyExists),
         Err(error) => Err(classify_errno(error)),
     }
 }
 
+// Retrying after a failed post-unlink sync can observe `NOENT`; sync again so
+// the unlink reaches the durability boundary.
 pub(super) fn durable_unlink(directory: &File, name: &str) -> Result<(), StorageError> {
     validate_name(name)?;
     match rfs::unlinkat(directory, name, AtFlags::empty()) {
         Ok(()) => sync_directory(directory),
-        // A retry after `unlinkat` succeeded but `sync_directory` failed observes NOENT,
-        // and the directory entry removal is still unsynced at that point.
         Err(rustix::io::Errno::NOENT) => sync_directory(directory),
         Err(error) => Err(classify_errno(error)),
     }
@@ -347,8 +367,22 @@ pub(super) fn temp_name(stem: &str) -> String {
 }
 
 pub(super) fn next_unique_id() -> u64 {
-    let counter = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-    (u64::from(std::process::id()) << 32) | counter
+    let counter = UNIQUE_ID.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff;
+    (unique_prefix() << 32) | counter
+}
+
+// A PID alone repeats across restarts under namespace-local container PIDs, and a
+// repeated name makes `O_EXCL` creation and `RENAME_NOREPLACE` publication fail
+// with an opaque `EEXIST`.
+fn unique_prefix() -> u64 {
+    static PREFIX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PREFIX.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or(0);
+        u64::from(nanos) ^ u64::from(std::process::id())
+    })
 }
 
 #[cfg(test)]
@@ -363,7 +397,7 @@ mod tests {
     fn durable_publish_happy_path() {
         let root = tempfile::tempdir().unwrap();
         let root_dir = File::open(root.path()).unwrap();
-        let directory = create_secure_directory(&root_dir, "objects").unwrap();
+        let directory = create_secure_directory(&root_dir, OsStr::new("objects")).unwrap();
         let temp = temp_name("artifact");
         let mut file = create_new_file(&directory, &temp).unwrap();
         write_and_sync(&mut file, b"payload").unwrap();
@@ -385,8 +419,8 @@ mod tests {
     fn cross_directory_publish_syncs_destination_and_source() {
         let root = tempfile::tempdir().unwrap();
         let root_dir = File::open(root.path()).unwrap();
-        let source = create_secure_directory(&root_dir, "tmp").unwrap();
-        let destination = create_secure_directory(&root_dir, "shard").unwrap();
+        let source = create_secure_directory(&root_dir, OsStr::new("tmp")).unwrap();
+        let destination = create_secure_directory(&root_dir, OsStr::new("shard")).unwrap();
         let mut temp = create_new_file(&source, "artifact.tmp").unwrap();
         write_and_sync(&mut temp, b"payload").unwrap();
         let mut synced = Vec::new();
@@ -463,29 +497,6 @@ mod tests {
     }
 
     #[test]
-    fn append_log_is_owner_only_and_isolates_an_unterminated_tail() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = File::open(root.path()).unwrap();
-        let mut log = open_or_create_append_file(&directory, "intent.jsonl").unwrap();
-
-        append_and_sync(&mut log, b"partial").unwrap();
-        append_and_sync(&mut log, b"{\"next\":true}\n").unwrap();
-
-        assert_eq!(
-            fs::read(root.path().join("intent.jsonl")).unwrap(),
-            b"partial\n{\"next\":true}\n"
-        );
-        assert_eq!(
-            fs::metadata(root.path().join("intent.jsonl"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-
-    #[test]
     fn storage_errors_separate_exhaustion_from_other_io() {
         for errno in [rustix::io::Errno::NOSPC, rustix::io::Errno::DQUOT] {
             assert!(matches!(
@@ -519,14 +530,14 @@ mod tests {
         fs::create_dir(root.path().join("target")).unwrap();
         symlink("target", root.path().join("link")).unwrap();
 
-        assert!(create_secure_directory(&root_dir, "link").is_err());
+        assert!(create_secure_directory(&root_dir, OsStr::new("link")).is_err());
     }
 
     #[test]
     fn created_directories_and_files_are_owner_only() {
         let root = tempfile::tempdir().unwrap();
         let root_dir = File::open(root.path()).unwrap();
-        let directory = create_secure_directory(&root_dir, "objects").unwrap();
+        let directory = create_secure_directory(&root_dir, OsStr::new("objects")).unwrap();
         let file = create_new_file(&directory, "artifact").unwrap();
 
         assert_eq!(

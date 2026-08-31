@@ -1,18 +1,14 @@
-//! Linux CPU-topology reading, pair validation, and thread pinning for the
-//! IPC budget benchmark.
+//! This module reads Linux CPU topology, validates pairs, and pins threads for the IPC budget benchmark.
 //!
-//! Topology comes from stable sysfs interfaces
-//! (docs.kernel.org/admin-guide/cputopology.html) parameterized by a root
-//! directory so tests can classify synthetic fixtures. The measurement
-//! authority is the observed physical relationship: distinct physical
-//! cores, unified-L3 sharing, and CPU-bearing NUMA node membership.
+//! The root parameter lets tests classify synthetic sysfs fixtures.
+//! Classification uses physical-core, unified-L3, and NUMA-node relationships.
 
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// Topology class of an ordered (initiator, responder) CPU pair.
+/// `Class` classifies ordered `(initiator, responder)` CPU pairs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
     SameL3,
@@ -36,27 +32,23 @@ impl Class {
     }
 }
 
-/// One logical CPU's observed physical identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuDesc {
     /// (physical_package_id, core_id): distinct tuples are distinct cores.
     pub core: (u32, u32),
-    /// NUMA node this CPU belongs to.
     pub node: u32,
-    /// Identity of the unified L3 this CPU shares (its shared_cpu_list),
-    /// when one exists.
+    /// `l3` stores the `shared_cpu_list` that identifies the CPU's unified L3.
     pub l3: Option<String>,
-    /// SMT siblings (thread_siblings_list), including this CPU.
+    /// `siblings` contains the CPU's SMT siblings, including the CPU itself.
     pub siblings: Vec<u32>,
 }
 
-/// Observed host topology for the online CPU set.
+/// `Topology` contains observed descriptors for the online CPUs.
 #[derive(Debug, Clone, Default)]
 pub struct Topology {
     pub cpus: BTreeMap<u32, CpuDesc>,
 }
 
-/// Parses a kernel cpulist string such as `0-3,8,10-11`.
 pub fn parse_cpu_list(list: &str) -> Result<BTreeSet<u32>, String> {
     let mut out = BTreeSet::new();
     let trimmed = list.trim();
@@ -91,16 +83,13 @@ fn read_trimmed(path: &Path) -> Result<String, String> {
         .map_err(|err| format!("{}: {err}", path.display()))
 }
 
-/// Reads the online-CPU topology under `root` (`/` on a real host, a
-/// synthetic tree in tests).
+/// Production callers pass `/`; tests pass synthetic sysfs roots.
 pub fn read_topology(root: &Path) -> Result<Topology, String> {
     let cpu_base = root.join("sys/devices/system/cpu");
     let online = parse_cpu_list(&read_trimmed(&cpu_base.join("online"))?)?;
 
     let mut node_of = BTreeMap::new();
     let node_base = root.join("sys/devices/system/node");
-    // Kernels built without CONFIG_NUMA expose no node directory; every
-    // online CPU then belongs to the single logical node 0.
     if !node_base.is_dir() {
         for cpu in &online {
             node_of.insert(*cpu, 0u32);
@@ -155,7 +144,7 @@ pub fn read_topology(root: &Path) -> Result<Topology, String> {
     Ok(Topology { cpus })
 }
 
-/// Finds the unified level-3 cache this CPU shares, identified by its
+/// The CPU's `shared_cpu_list` identifies its unified L3 cache.
 /// shared_cpu_list string.
 fn unified_l3(cache_dir: &Path, cpu: u32) -> Result<Option<String>, String> {
     let Ok(entries) = std::fs::read_dir(cache_dir) else {
@@ -180,9 +169,7 @@ fn unified_l3(cache_dir: &Path, cpu: u32) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// Validates an ordered explicit (initiator, responder) pair against the
-/// observed topology and the declared class. Any violation is a
-/// configuration failure, never a silent substitution.
+/// `validate_pair` rejects an ordered pair that violates the observed topology or declared class rather than substituting CPUs.
 pub fn validate_pair(
     topology: &Topology,
     allowed: &BTreeSet<u32>,
@@ -237,19 +224,16 @@ pub fn validate_pair(
     }
 }
 
-/// Outcome of deterministic auto-selection for a topology class.
+/// The selection result records either a valid pair or why the requested class is unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoSelection {
-    /// A valid ordered pair, lowest CPU numbers first.
+    /// The selected pair is valid and orders CPUs by ascending number.
     Pair(u32, u32),
-    /// The class is unavailable on this host; the reason is retained in the
     /// skipped manifest.
     Unavailable(String),
 }
 
-/// Deterministically selects the lowest-numbered valid ordered pair for a
-/// class, or reports why the class is unavailable. The selection is a
-/// convenience only: callers revalidate through [`validate_pair`].
+/// `select_pair` deterministically selects the lowest-numbered valid ordered pair.
 pub fn auto_select(topology: &Topology, allowed: &BTreeSet<u32>, class: Class) -> AutoSelection {
     let candidates: Vec<u32> = allowed
         .iter()
@@ -276,12 +260,11 @@ pub fn auto_select(topology: &Topology, allowed: &BTreeSet<u32>, class: Class) -
     AutoSelection::Unavailable(reason.to_owned())
 }
 
-/// True when an affinity readback is exactly the one requested CPU.
 pub fn is_singleton_affinity(affinity: &BTreeSet<u32>, cpu: u32) -> bool {
     affinity.len() == 1 && affinity.contains(&cpu)
 }
 
-/// The calling thread's effective affinity set.
+/// The returned set is the calling thread's effective affinity.
 pub fn effective_affinity() -> Result<BTreeSet<u32>, String> {
     let set = rustix::thread::sched_getaffinity(None)
         .map_err(|err| format!("sched_getaffinity: {err}"))?;
@@ -294,9 +277,8 @@ pub fn effective_affinity() -> Result<BTreeSet<u32>, String> {
     Ok(out)
 }
 
-/// Pins the calling thread to one CPU and fails unless the post-pin
-/// readback is a singleton of that CPU. A silently intersected mask would
-/// label results with CPUs that never executed the work.
+/// Pinning fails unless post-pin affinity contains exactly the requested CPU.
+/// The readback must be the singleton `{cpu}`; an intersected mask could label results with CPUs that never executed the work.
 pub fn pin_current_thread(cpu: u32) -> Result<(), String> {
     if cpu as usize >= rustix::thread::CpuSet::MAX_CPU {
         return Err(format!(
@@ -317,10 +299,7 @@ pub fn pin_current_thread(cpu: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Sets the calling thread's affinity to every CPU in `cpus`, widening a
-/// singleton pin back to a full schedulable set. An empty set is an
-/// error: the kernel rejects an empty mask, and silently keeping the old
-/// mask would leave the thread pinned.
+/// The kernel rejects an empty mask; retaining the old mask would leave the thread pinned.
 pub fn set_current_thread_affinity(cpus: &BTreeSet<u32>) -> Result<(), String> {
     if cpus.is_empty() {
         return Err("cannot set affinity to an empty CPU set".to_owned());
@@ -339,7 +318,6 @@ pub fn set_current_thread_affinity(cpus: &BTreeSet<u32>) -> Result<(), String> {
         .map_err(|err| format!("sched_setaffinity({cpus:?}): {err}"))
 }
 
-/// The CPU the calling thread is currently executing on.
 pub fn current_cpu() -> u32 {
     rustix::thread::sched_getcpu() as u32
 }

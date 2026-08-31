@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ----------------------------------------------------------------------
-# Magic Context — OpenCode E2E test runner (runs inside Docker).
+# This script runs Magic Context OpenCode end-to-end tests inside Docker.
 #
 # Two scenarios:
-#   SETUP_SMOKE    — fresh-install path via `doctor --force`
-#   SESSION_SMOKE  — single-turn `opencode run` against aimock
+# SETUP_SMOKE tests the fresh-install path with `doctor --force`.
+# SESSION_SMOKE runs one `opencode run` turn against aimock.
 #
-# Both assertions check the shared SQLite DB at
+# SETUP_SMOKE and SESSION_SMOKE query `~/.local/share/cortexkit/magic-context/context.db`.
 #   ~/.local/share/cortexkit/magic-context/context.db
-# rather than scraping logs, so failures are unambiguous.
+# The scenarios query SQLite instead of parsing logs.
 # ----------------------------------------------------------------------
 
 set -euo pipefail
@@ -42,17 +42,10 @@ section() {
 }
 
 # ----------------------------------------------------------------------
-# Phase 0: install the Magic Context plugin from the local copy so the
-# rest of the script tests the bits we plan to publish, not whatever
-# happens to be on npm. We use `npm link` so global `bunx` resolves the
-# local copy of @cortexkit/opencode-magic-context.
+# The test installs the local plugin to avoid npm's published package.
 # ----------------------------------------------------------------------
 section "Phase 0: install Magic Context locally"
 cd /test/mc-opencode
-# Not tolerant of failure: the plugin bundle marks @opencode-ai/plugin
-# external, so a failed install leaves it unresolvable, OpenCode swallows
-# the import error, and every later assertion measures a session that ran
-# without the plugin at all.
 npm install --no-audit --no-fund --omit=dev 2>&1 | tail -5
 npm link --silent --no-audit --no-fund 2>&1 | tail -3 || true
 test -d node_modules/@opencode-ai/plugin \
@@ -60,35 +53,23 @@ test -d node_modules/@opencode-ai/plugin \
 cd /test/project
 
 # ----------------------------------------------------------------------
-# Phase 1: SETUP_SMOKE — non-interactive setup via `doctor --force`.
-# Doctor's --force mode repairs an existing OpenCode install: it adds
-# the plugin entry, fixes compaction conflicts, ensures tui.json. It
-# does NOT create opencode.json from scratch (that's the setup wizard's
-# job). To simulate the "user just installed OpenCode + ran doctor"
-# path, we seed an empty opencode.json first.
+# `doctor --force` does not create `opencode.json`, so this test seeds an empty file.
 # ----------------------------------------------------------------------
 section "Phase 1: SETUP_SMOKE — doctor --force on a fresh OpenCode install"
 
-# Pre-condition: clean Magic Context state, but a minimal opencode.json
-# exists (this is what the OpenCode installer leaves behind).
 rm -rf "$HOME/.config/opencode" "$HOME/.local/share/cortexkit" "$PLUGIN_LOG"
 mkdir -p "$HOME/.config/opencode"
 echo '{}' > "$HOME/.config/opencode/opencode.json"
 
-# Since v0.16.1 the CLI lives in the unified @cortexkit/magic-context
-# package — opencode-magic-context is now the runtime plugin only. The
-# `magic-context` binary was symlinked into /usr/local/bin during the
-# Dockerfile build, so it resolves the same way `npm install -g
-# @cortexkit/magic-context` would on a real machine.
 DOCTOR_OUT=$(magic-context doctor --harness opencode --force 2>&1 || true)
 echo "$DOCTOR_OUT" | tail -30
 
-# Doctor's actual outro is one of:
-#   "Everything looks good!"
-#   "Found N issue(s), fixed M. Restart OpenCode to apply."
-#   "Fixed M issue(s). Restart OpenCode to apply."
-#   "Found N issue(s) that need manual attention."
-# The first three are success cases; the last is a hard failure (exit 1).
+# Doctor emits exactly one of four outro formats.
+# Doctor can print `Everything looks good!`.
+# Doctor can print `Found N issue(s), fixed M. Restart OpenCode to apply.`
+# Doctor can print `Fixed M issue(s). Restart OpenCode to apply.`
+# Doctor can print `Found N issue(s) that need manual attention.`
+# The first three outro formats match the success regex; the manual-attention format does not.
 check "doctor --force completed without hard failures" \
     "echo \"\$DOCTOR_OUT\" | grep -qE '(Everything looks good|Fixed [0-9]+ issue|Found [0-9]+ issue\\(s\\), fixed)'"
 
@@ -98,28 +79,16 @@ check "OpenCode config still exists at ~/.config/opencode/opencode.json" \
 check "Plugin entry registered in OpenCode config" \
     "grep -qE '@cortexkit/opencode-magic-context' $HOME/.config/opencode/opencode.json"
 
-# Magic Context creates its DB lazily on first plugin load, so it
-# may not exist yet after just `doctor`. The session smoke phase
-# below will trigger DB creation; we just verify doctor didn't
-# leave any unfixed issue.
+# Magic Context creates its DB on first plugin load; `doctor` can complete without creating it.
 check "doctor did not leave issues that need manual attention" \
     "! echo \"\$DOCTOR_OUT\" | grep -qE 'need manual attention'"
 
 # ----------------------------------------------------------------------
-# Phase 2: SESSION_SMOKE — run a real opencode session against aimock.
 # Two assertions:
-#   - the plugin loaded (log file exists, contains a session-id line)
-#   - the plugin tagged ≥1 message in the shared DB with harness='opencode'
 # ----------------------------------------------------------------------
 section "Phase 2: SESSION_SMOKE — single-turn opencode run with aimock"
 
-# Tell OpenCode about an OpenAI-compatible mock provider. Use a
-# file:// plugin specifier so OpenCode loads the locally-built plugin
-# at /test/mc-opencode rather than pulling the published version from
-# npm. Without this, OpenCode's plugin resolver hits its own per-
-# package cache (~/.cache/opencode/packages/) and downloads the
-# @latest npm tarball, which would test the previous release rather
-# than the working tree.
+# `file:///test/mc-opencode` forces OpenCode to load the working-tree plugin instead of its cached `@latest` npm package.
 cat > "$HOME/.config/opencode/opencode.json" <<'JSON'
 {
   "$schema": "https://opencode.ai/config.json",
@@ -136,9 +105,7 @@ cat > "$HOME/.config/opencode/opencode.json" <<'JSON'
 }
 JSON
 
-# Magic Context config — local embeddings (no network), historian
-# pointed at the same mock model so any background historian call also
-# resolves through aimock without external API.
+# Local embeddings and the mock historian model keep background historian requests off external APIs.
 cat > "$HOME/.config/opencode/magic-context.jsonc" <<'JSON'
 {
   "enabled": true,
@@ -150,13 +117,11 @@ cat > "$HOME/.config/opencode/magic-context.jsonc" <<'JSON'
 }
 JSON
 
-# Start aimock in the background.
 node /test/aimock-server.cjs > /tmp/aimock.log 2>&1 &
 AIMOCK_PID=$!
 # shellcheck disable=SC2064
 trap "kill $AIMOCK_PID 2>/dev/null || true" EXIT
 
-# Wait for aimock to be ready (max 15s).
 for _ in $(seq 1 15); do
     if curl -fsS http://127.0.0.1:4010/v1/models > /dev/null 2>&1; then
         break
@@ -166,7 +131,7 @@ done
 check "aimock /v1/models responds" \
     "curl -fsS http://127.0.0.1:4010/v1/models > /dev/null"
 
-# Run opencode for one turn. Cap at 60s so a hung mock doesn't hang CI.
+# The 60-second timeout prevents a hung mock request from blocking CI.
 echo ""
 set +e
 OPENAI_API_KEY=sk-mock-e2e-test \
@@ -182,10 +147,8 @@ tail -20 /tmp/opencode.log
 
 check "opencode produced a log file" "test -s /tmp/opencode.log"
 
-# Plugin log should now exist with at least one transform line.
 check "magic-context plugin log exists" "test -s $PLUGIN_LOG"
 
-# Shared DB should now exist and have at least one tagged message.
 check "shared SQLite DB created" "test -f $DB_PATH"
 
 if [[ -f "$DB_PATH" ]]; then
@@ -195,14 +158,7 @@ if [[ -f "$DB_PATH" ]]; then
     check "at least one OpenCode session_meta row persisted" \
         "test \"$SESSION_META_COUNT\" -gt 0"
 
-    # Schema check: harness column exists and at least one OpenCode-scoped
-    # row was attributed correctly. We don't strictly require any 'tags'
-    # rows because `opencode run` can be SIGKILLed by our 60s timeout
-    # before the plugin's transform fully persists tag rows for a
-    # one-shot message — the session_meta row writes earlier in the
-    # transform pipeline and is the more reliable proof that the plugin
-    # loaded, opened the DB at the correct cortexkit path, and tagged
-    # the session with the right harness.
+    # The test requires `session_meta.harness='opencode'` rather than `tags` rows because the 60-second SIGKILL can interrupt tag persistence after `session_meta` is written.
     SCHEMA_HAS_HARNESS=$(sqlite3 "$DB_PATH" \
         "SELECT COUNT(*) FROM pragma_table_info('tags') WHERE name='harness'" 2>/dev/null || echo "0")
     check "shared DB schema includes the 'harness' column on tags" \

@@ -18,7 +18,7 @@ describe("textMentionsRecentCommit", () => {
 
     it("does NOT fire on a hash alone, or the bare word 'hash'/'sha' + hex", () => {
         expect(textMentionsRecentCommit("the value is abc1234")).toBe(false);
-        // 'hash'/'sha' are intentionally NOT commit-action verbs (parity contract).
+        // 'hash' and 'sha' do not count as commit-action verbs.
         expect(textMentionsRecentCommit("hash is abc1234567")).toBe(false);
         expect(textMentionsRecentCommit("sha abc1234")).toBe(false);
     });

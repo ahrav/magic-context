@@ -1,5 +1,3 @@
-/// <reference types="bun-types" />
-
 import { describe, expect, it } from "bun:test";
 import { hasVisibleNoteReadCall } from "./note-visibility";
 import { makeSentinel } from "./sentinel";
@@ -110,7 +108,6 @@ describe("hasVisibleNoteReadCall", () => {
     });
 
     it("scans newest-first and returns true on first visible match", () => {
-        // Simulate: old read got sentineled, new read is intact — should return true.
         const oldStripped = makeSentinel({
             type: "tool",
             tool: "ctx_note",

@@ -3,9 +3,6 @@ import { isTextPart } from "./tag-part-guards";
 import type { MessageLike } from "./transform-operations";
 
 /**
- * Check if a user message contains real user content (not just ignored
- * notifications, system reminders, or command output). Uses the same
- * logic the historian uses for protected-tail counting.
  */
 function isMeaningfulUserMessage(msg: MessageLike): boolean {
     return msg.info.role === "user" && hasMeaningfulUserText(msg.parts as unknown[]);
@@ -76,16 +73,8 @@ export function appendReminderToUserMessageById(
 }
 
 /**
- * Inject a tool part into the latest replayable assistant message that has an ID.
  *
- * Idempotent on `callID` — if a part with the same `callID` already exists,
- * this is a no-op so defer-pass replays produce byte-identical output.
  *
- * Returns the message ID where the part landed, or `null` if no eligible
- * assistant message exists in the visible window. Assistant messages with an
- * OpenCode `error` are skipped because provider serializers can omit failed or
- * aborted assistants from the wire; anchoring a synthetic tool call there would
- * make its replay disappear on subsequent passes.
  */
 export function injectToolPartIntoLatestAssistant(
     messages: MessageLike[],
@@ -112,10 +101,7 @@ function injectToolPartIntoAnchor(message: MessageLike, part: { callID: string }
 }
 
 /**
- * Inject a tool part into the replayable assistant message with the given ID.
  *
- * Idempotent on `callID`. Returns `true` if the message exists and the part
- * is present after the call, `false` if the anchor message is not in the
  * visible window.
  */
 export function injectToolPartIntoAssistantById(
@@ -144,8 +130,6 @@ function hasToolPartWithCallId(message: MessageLike, callId: string): boolean {
 }
 
 function isReplayableAssistantAnchor(message: MessageLike): boolean {
-    // A compaction summary is rebuilt by marker reconciliation, so anchoring a
-    // synthetic todo part there would lose it when the summary is replaced.
     if (message.info.summary === true) return false;
     return message.info.error === undefined || message.info.error === null;
 }

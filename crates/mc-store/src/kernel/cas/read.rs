@@ -1,5 +1,3 @@
-use std::fs;
-
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
@@ -48,19 +46,12 @@ impl KernelStore {
         if tombstoned {
             return Err(ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable));
         }
-        let objects = fs::File::open(self.artifacts_path.join("objects")).map_err(|_| {
-            ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
-        })?;
-        let shard = open_secure_directory(&objects, &handle.digest[..2]).map_err(|_| {
-            ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
-        })?;
-        let object = open_regular_nofollow(&shard, &handle.digest[2..]).map_err(|_| {
-            ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
-        })?;
-        let Some(bytes) = read_capped(object).map_err(|_| {
-            ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
-        })?
-        else {
+        let missing =
+            || ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest);
+        let objects = self.open_objects_directory().map_err(|_| missing())?;
+        let shard = open_secure_directory(&objects, &handle.digest[..2]).map_err(|_| missing())?;
+        let object = open_regular_nofollow(&shard, &handle.digest[2..]).map_err(|_| missing())?;
+        let Some(bytes) = read_capped(object).map_err(|_| missing())? else {
             return Err(ArtifactError::for_digest(
                 ArtifactErrorKind::CorruptObject,
                 &handle.digest,

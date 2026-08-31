@@ -467,8 +467,7 @@ describe("case registry", () => {
         function impostorVerifier(): VerifierCheck[] {
             return [{ id: "check-red-holds", passed: true }];
         }
-        // Correct `binding` metadata, but the pool executes `verifier` — so
-        // without the structural check this swap publishes a false result.
+        // The pool executes `verifier`, so structural validation rejects metadata-only swaps that publish false results.
         for (const variant of catalog.families[0]!.variants) {
             const entry = registeredCase(variant.id);
             registerIncidentCase(
@@ -498,9 +497,7 @@ describe("case registry", () => {
                 variant.id === "var-red-one"
                     ? {
                           ...entry,
-                          // The bound symbol appears in the wrapper's source
-                          // without ever being called, which is why scanning
-                          // that source cannot prove the coupling.
+                          // Source scanning cannot prove coupling when a wrapper references the bound symbol without calling it.
                           verifier: () => {
                               const unused = caseVerifier;
                               void unused;
@@ -520,9 +517,7 @@ describe("case registry", () => {
     it("rejects an undeclared wrapper even when it does delegate", () => {
         const catalog = fixtureCatalog();
         const registry: IncidentCaseRegistry = new Map();
-        // Delegation alone is indistinguishable from the impostor above by any
-        // property the validator can read, so an adaptation must be declared
-        // through `adaptBoundSymbol` to be accepted.
+        // Delegation is indistinguishable from a callback that invokes `impostorVerifier()` by any property the validator reads, so adaptations must be declared through `adaptBoundSymbol`.
         for (const variant of catalog.families[0]!.variants) {
             const entry = registeredCase(variant.id);
             registerIncidentCase(registry, {
@@ -540,9 +535,7 @@ describe("case registry", () => {
     it("accepts an adapter declared against the bound symbol", () => {
         const catalog = fixtureCatalog();
         const registry: IncidentCaseRegistry = new Map();
-        // The shape the source-linked cases need: their verifiers take a
-        // normalized observation, so the registration adapts the bound symbol
-        // and records which function it was built from.
+        // `adaptBoundSymbol` adapts the bound symbol to source-linked verifiers' normalized observations and records its source function.
         for (const variant of catalog.families[0]!.variants) {
             const entry = registeredCase(variant.id);
             registerIncidentCase(registry, {
@@ -699,8 +692,7 @@ describe("run snapshot selection", () => {
                 variantIds,
                 implementationDigests: data.implementationDigests,
             });
-        // An unknown id alongside a valid one keeps the selection nonempty, so
-        // only an explicit check stops the run from reporting green on a subset.
+        // An unknown id must fail explicitly because valid ids can otherwise leave the selection nonempty and report green for a subset.
         expect(request(["var-green-one", "var-typo-one"])).toThrow(
             /var-typo-one \(unknown variant id\)/,
         );
@@ -971,8 +963,7 @@ describe("case isolation", () => {
         expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
         expect(env.HTTPS_PROXY).toBeUndefined();
         expect(env.OPENAI_API_KEY).toBeUndefined();
-        // A real CARGO_HOME holds registry credentials, so the parent's path is
-        // never inherited — it is relocated into the case-owned home.
+        // A real `CARGO_HOME` can hold registry credentials, so the case relocates it instead of inheriting the parent's path.
         expect(env.CARGO_HOME).toBe(join(workspace.home, ".cargo"));
         const relocated = ["HOME", "TMPDIR", "TMP", "TEMP", "CARGO_HOME"];
         expect(
@@ -1026,9 +1017,8 @@ sendEnvelope();`;
                 },
             }),
         ).rejects.toThrow(/not a loopback/);
-        // Loopback value is not sufficient: the map is spread into the child
-        // env, so an isolation variable or a stripped-proxy name must be
-        // refused even when its URL is perfectly valid loopback.
+        // The child receives a copied environment map, so loopback URLs alone do not prove isolation.
+        // An isolation variable or stripped-proxy name must be rejected even when its URL is valid loopback.
         await expect(
             runFakeChild(snapshot, green, "sendEnvelope();", {
                 providerEndpoints: { HOME: "http://127.0.0.1:19999" },
@@ -1111,7 +1101,7 @@ setInterval(() => {}, 1000);`;
         expect(result.baseline_comparison).toBe("unscored");
         expect(result.reason_code).toBe("deadline_exceeded");
         expect(diagnostics.workspaceDeleted).toBe(true);
-        // The descendant writes after 2500 ms; the marker must remain absent after that delay. commentlint: allow(JUDGE)
+        // Interruption must terminate the descendant before its 2500 ms write.
         await new Promise((resolveWait) =>
             setTimeout(
                 resolveWait,
@@ -1255,7 +1245,6 @@ describe("catalog-bound report", () => {
         const report = buildIncidentReport(reportInput(snapshot, [result]));
         const target = join(testRoot, "reports", "incident-report.json");
         publishIncidentReport(report, join(testRoot, "reports", "warmup.json"));
-        // The test simulates interruption after writing the temporary file and before renaming it. commentlint: allow(JUDGE)
         writeFileSync(`${target}.tmp-dead`, JSON.stringify(report), {
             flag: "w",
         });
@@ -1373,8 +1362,7 @@ describe("catalog-bound report", () => {
         ).toEqual(["var-blocked-one"]);
         expect(incidentPoolExitCode(missingDependencyReport)).toBe(1);
 
-        // A dependency that now passes has stopped blocking, so its dependent
-        // owes an evaluation. Presence of the dependency id is not enough.
+        // A dependent must be evaluated after a previously blocking dependency passes; dependency-id presence alone is insufficient.
         const resolvedDependency = await runFakeChild(
             snapshot,
             red,
@@ -1407,8 +1395,7 @@ describe("catalog-bound report", () => {
     }, 20_000);
 
     it("fails the command on a scored baseline mismatch and passes reviewed outcomes", async () => {
-        // A green-lane case that failed is a resurfaced defect: complete,
-        // scored, and must not exit 0.
+        // A failed green-lane case is a resurfaced defect.
         const regressed = await runFakeChild(
             snapshot,
             green,
@@ -1435,8 +1422,7 @@ describe("catalog-bound report", () => {
         ).toEqual(["var-green-one"]);
         expect(incidentPoolExitCode(regressionReport)).toBe(1);
 
-        // A known-red case failing in a DIFFERENT shape than the reviewed
-        // baseline is also a mismatch, not an expected red.
+        // Known-red cases count as reviewed only when they match the reviewed baseline.
         const shapeChanged = await runFakeChild(
             snapshot,
             red,
@@ -1450,7 +1436,7 @@ describe("catalog-bound report", () => {
         ).toBe("unexpected_failure");
         expect(incidentPoolExitCode(shapeReport)).toBe(1);
 
-        // The reviewed outcomes stay green: expected_green + expected_red.
+        // Known-red cases count as reviewed only when they match the reviewed baseline.
         const greenPass = await runFakeChild(snapshot, green, "sendEnvelope();");
         const reviewedReport = buildIncidentReport(
             reportInput(snapshot, [greenPass.result, redHolds.result]),

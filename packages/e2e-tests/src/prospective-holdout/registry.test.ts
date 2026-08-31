@@ -58,8 +58,7 @@ describe("prospective scenario registry", () => {
             /implementation-escapes-root/,
         );
 
-        // A path the root contains but the tree does not hold is an ordinary missing file, so it
-        // keeps the diagnostic that names availability rather than containment.
+        // A path inside REPO_ROOT but absent from the tree throws implementation-unavailable rather than implementation-escapes-root.
         const missingRegistry: ProspectiveRegistry = new Map();
         const missing = scenario();
         missing.implementationFiles = ["packages/e2e-tests/src/prospective-holdout/absent-file.ts"];

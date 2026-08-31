@@ -1,7 +1,4 @@
 /**
- * Test-only support for exercising the Synapse detailed (versioned-receipt)
- * embedding path against a deterministic in-process host double. Used by the
- * writer suites and the crash matrix; never imported by production code.
  */
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
@@ -27,9 +24,6 @@ export interface RecordedHostCall {
 }
 
 /**
- * Deterministic host double: embed.batch always answers with a job descriptor
- * and embed.result serves the job's exact item set. `resultPages` scripts
- * multi-page or failing result flows; `vectorFor` shapes per-item vectors.
  */
 export class DetailedSynapseTestHost implements SynapseClientLike {
     readonly calls: RecordedHostCall[] = [];

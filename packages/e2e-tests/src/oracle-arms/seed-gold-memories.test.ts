@@ -15,7 +15,7 @@ import { initializeIsolatedContextDb } from "../initialize-context-db";
 import { openTestDb } from "../test-db";
 import { seedGoldMemories } from "./seed-gold-memories";
 
-/** Public claim IDs the policy surface admits for the seeded project. */
+/** Returns the public claim IDs that the policy surface admits for `identity`. */
 function surfaceClaimIds(
     dbPath: string,
     identity: string,
@@ -78,8 +78,7 @@ describe("seedGoldMemories", () => {
                         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_effective_policy'",
                     ).get(),
                 ).toBeDefined();
-                // The alias and its realpath resolve to one canonical identity, so
-                // every seeded claim lands in that identity's project.
+                // The alias and its realpath resolve to the same canonical identity.
                 const projectIds = resolveProjectIdsForIdentities(db, [expectedIdentity]);
                 expect(projectIds).toHaveLength(1);
                 expect(rows.map((row) => row.projectId)).toEqual([
@@ -171,9 +170,9 @@ describe("seedGoldMemories", () => {
         try {
             mkdirSync(workdir, { recursive: true });
             initializeIsolatedContextDb(dataDir);
-            // The second row normalizes to the first row's hash in the same
-            // (project, category) slot, so the claims kernel attaches its
-            // provenance as independent evidence instead of opening a rival claim.
+            // The second row normalizes to the first row's hash in the same (project, category) slot.
+            // The claims kernel attaches the second row's provenance as independent evidence instead of opening a rival claim.
+            // The claims kernel attaches the second row's provenance as independent evidence instead of opening a rival claim.
             const rows = seedGoldMemories({
                 workdir,
                 dbPath,
@@ -186,8 +185,8 @@ describe("seedGoldMemories", () => {
 
             expect(rows).toHaveLength(2);
             expect(new Set(rows.map((row) => row.publicClaimId)).size).toBe(1);
-            // Evidence attaches without superseding the claim, so the surviving
-            // revision is still the first row's content at revision 1.
+            // The second row's evidence attaches without superseding the first claim.
+            // The surviving claim retains the first row's content at revision 1.
             expect(rows.map((row) => row.revision)).toEqual([1, 1]);
             expect(rows.map((row) => row.content)).toEqual([
                 "Duplicate gold fact.",

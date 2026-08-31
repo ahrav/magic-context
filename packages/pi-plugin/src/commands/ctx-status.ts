@@ -211,9 +211,6 @@ function buildStatusDetails(
 				deps.projectIdentity,
 				CANONICAL_DREAM_TASKS,
 			),
-			// Dreamer V2 retired the V1 dream_state['last_dream_at'] field; the
-			// live "last successful run" is MAX(last_run_at) across the project's
-			// task_schedule_state rows (issue #194).
 			lastRunAt: getMostRecentTaskRunAt(deps.db, deps.projectIdentity),
 		},
 		historian: readHistorianState(deps.db, sessionId, meta),

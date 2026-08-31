@@ -1,20 +1,23 @@
 use cortexkit_lease::{
     protect_file, FileLeaseStore, LeaseError, LeaseHandle, LeaseKey, LeaseStore,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use mc_core::claim_operation::is_lower_hex;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex, PoisonError, TryLockError};
+use std::time::Instant;
 
 use super::schema::{
     apply_kernel_schema, kernel_schema_digest, kernel_schema_object_inventory,
     KERNEL_APPLICATION_ID, KERNEL_FORMAT_EPOCH,
 };
+use crate::current_time_ms;
 use crate::sqlite_runtime::{
     compute_marker_digest_for_application_id, evaluate_sqlite_runtime_gate,
     probe_sqlite_engine_identity_off_path, SqliteEngineIdentity,
@@ -22,11 +25,17 @@ use crate::sqlite_runtime::{
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 const READ_POOL_SIZE: usize = 2;
+const WRITER_ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 const RESET_MARKER_PROTOCOL: &str = "mc-kernel-reset-marker-v1";
 const RESET_MARKER_SUFFIX: &str = ".mc-reset";
+const RESET_MARKER_STAGING_SUFFIX: &str = ".staging";
 const RESTORE_MARKER_SUFFIX: &str = ".mc-restore";
 const QUARANTINE_INFIX: &str = ".mc-quarantine-";
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// Limit marker reads to 64 KiB so invalid marker data cannot control
+/// allocation size.
+const RESET_MARKER_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum KernelError {
@@ -35,29 +44,7 @@ pub enum KernelError {
     Foreign,
     Inconclusive,
     Io,
-    IdentityMismatch,
-    FenceLost,
-    Conflict,
-    InvalidInput,
-    FutureSnapshot,
-    NotFound,
-    InvalidCheckpoint,
-    NoRequiredConsumers,
-    ConsumerPending,
-    Fault,
-    Deadline,
-    UnsafeDestination,
-    InvalidBackup,
-    InvalidRestore,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KernelErrorKind {
-    Held,
-    EngineUnsupported,
-    Foreign,
-    Inconclusive,
-    Io,
+    Busy,
     IdentityMismatch,
     FenceLost,
     Conflict,
@@ -75,28 +62,9 @@ pub enum KernelErrorKind {
 }
 
 impl KernelError {
-    pub fn kind(self) -> KernelErrorKind {
-        match self {
-            Self::Held => KernelErrorKind::Held,
-            Self::EngineUnsupported => KernelErrorKind::EngineUnsupported,
-            Self::Foreign => KernelErrorKind::Foreign,
-            Self::Inconclusive => KernelErrorKind::Inconclusive,
-            Self::Io => KernelErrorKind::Io,
-            Self::IdentityMismatch => KernelErrorKind::IdentityMismatch,
-            Self::FenceLost => KernelErrorKind::FenceLost,
-            Self::Conflict => KernelErrorKind::Conflict,
-            Self::InvalidInput => KernelErrorKind::InvalidInput,
-            Self::FutureSnapshot => KernelErrorKind::FutureSnapshot,
-            Self::NotFound => KernelErrorKind::NotFound,
-            Self::InvalidCheckpoint => KernelErrorKind::InvalidCheckpoint,
-            Self::NoRequiredConsumers => KernelErrorKind::NoRequiredConsumers,
-            Self::ConsumerPending => KernelErrorKind::ConsumerPending,
-            Self::Fault => KernelErrorKind::Fault,
-            Self::Deadline => KernelErrorKind::Deadline,
-            Self::UnsafeDestination => KernelErrorKind::UnsafeDestination,
-            Self::InvalidBackup => KernelErrorKind::InvalidBackup,
-            Self::InvalidRestore => KernelErrorKind::InvalidRestore,
-        }
+    /// Returns true only when retrying the unchanged request is valid.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Busy | Self::Held)
     }
 }
 
@@ -108,6 +76,7 @@ impl fmt::Display for KernelError {
             Self::Foreign => "kernel store path contains a foreign database family",
             Self::Inconclusive => "kernel store identity could not be established safely",
             Self::Io => "kernel store I/O failed",
+            Self::Busy => "kernel store lock was not acquired before the busy timeout",
             Self::IdentityMismatch => "kernel store identity does not match this build",
             Self::FenceLost => "kernel store writer fence was lost",
             Self::Conflict => "kernel operation conflicts with an existing receipt",
@@ -119,9 +88,9 @@ impl fmt::Display for KernelError {
             Self::ConsumerPending => "outbox consumer has not reached the commit-log tip",
             Self::Fault => "kernel operation was interrupted",
             Self::Deadline => "kernel operation exceeded its deadline",
-            Self::UnsafeDestination => "kernel backup destination is unsafe",
-            Self::InvalidBackup => "kernel backup could not be verified",
-            Self::InvalidRestore => "kernel restore source could not be verified",
+            Self::UnsafeDestination => "backup destination is not a private local directory",
+            Self::InvalidBackup => "backup artifact failed verification",
+            Self::InvalidRestore => "restore source failed verification",
         })
     }
 }
@@ -139,6 +108,8 @@ pub struct KernelStore {
     pub(super) purge_intent_log: Mutex<File>,
     pub(super) readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
+    // Distinct from mutex poisoning, which `PoisonError::into_inner` recovers: this
+    // records that an unrecoverable restore left the family unusable.
     poisoned: AtomicBool,
     pub(super) cas_failed: AtomicBool,
     pub(super) artifact_cap: u64,
@@ -164,13 +135,6 @@ impl KernelStore {
         Self::open_with_engine_identity_and_cap(root, &identity, super::cas::DEFAULT_ARTIFACT_CAP)
     }
 
-    fn open_with_engine_identity(
-        root: impl AsRef<Path>,
-        identity: &SqliteEngineIdentity,
-    ) -> Result<Self, KernelError> {
-        Self::open_with_engine_identity_and_cap(root, identity, super::cas::DEFAULT_ARTIFACT_CAP)
-    }
-
     fn open_with_engine_identity_and_cap(
         root: impl AsRef<Path>,
         identity: &SqliteEngineIdentity,
@@ -187,7 +151,7 @@ impl KernelStore {
         root: impl AsRef<Path>,
         identity: &SqliteEngineIdentity,
     ) -> Result<Self, KernelError> {
-        Self::open_with_engine_identity(root, identity)
+        Self::open_with_engine_identity_and_cap(root, identity, super::cas::DEFAULT_ARTIFACT_CAP)
     }
 
     #[cfg(feature = "test-support")]
@@ -201,8 +165,7 @@ impl KernelStore {
     }
 
     fn open_supported(root: impl AsRef<Path>, artifact_cap: u64) -> Result<Self, KernelError> {
-        let root = absolute_path(root.as_ref())?;
-        prepare_root(&root)?;
+        let root = prepare_root(root.as_ref())?;
         let db_path = root.join("core.sqlite");
         let lease_store = FileLeaseStore::new(root.join("leases"));
         let lease_key = LeaseKey::new("magic-context-kernel", "sqlite", "core");
@@ -210,34 +173,43 @@ impl KernelStore {
         let lease_epoch = lease.epoch();
         let artifacts_path = super::cas::prepare_layout(&root)?;
 
-        if restore_marker_path(&db_path).exists() {
-            return Err(KernelError::Inconclusive);
+        if entry_exists(&restore_marker_path(&db_path))? {
+            super::backup::resume_restore(&db_path)?;
+        } else {
+            super::backup::reap_orphan_restore_recovery(&db_path)?;
         }
 
-        if reset_marker_path(&db_path).exists() {
+        if entry_exists(&reset_marker_path(&db_path))? {
             resume_quarantine(&db_path)?;
         }
 
-        let expected = expected_identity()?;
         let header = inspect_header(&db_path)?;
         let mut writer = match header {
             HeaderState::Pristine => bootstrap(&db_path)?,
-            HeaderState::Kernel => {
-                let mut conn = open_writer(&db_path).map_err(|_| KernelError::Inconclusive)?;
-                apply_preclassification_profile(&conn).map_err(|_| KernelError::Inconclusive)?;
-                match classify_open_kernel(&mut conn, &expected)? {
-                    OpenIdentity::Exact => conn,
-                    OpenIdentity::Mismatch { incarnation } => {
-                        drop(conn);
-                        quarantine(&db_path, &incarnation, lease_epoch)?;
-                        bootstrap(&db_path)?
-                    }
+            HeaderState::Kernel => match classify_existing_family(&db_path)? {
+                OpenIdentity::Exact => {
+                    let conn = open_writer(&db_path).map_err(|_| KernelError::Inconclusive)?;
+                    apply_preclassification_profile(&conn)
+                        .map_err(|_| KernelError::Inconclusive)?;
+                    conn
                 }
-            }
+                OpenIdentity::Mismatch { incarnation } => {
+                    quarantine(&db_path, &incarnation, lease_epoch)?;
+                    bootstrap(&db_path)?
+                }
+            },
         };
 
         activate_wal(&writer)?;
         stamp_writer_fence(&mut writer, lease_epoch)?;
+        // A store written by the parent build retains a digest of pre-redaction
+        // candidate input, so it is rewritten before the store is handed out.
+        super::envelope::strip_legacy_candidate_verifiers(&mut writer)?;
+        // Two hardening passes are required because the family grows between
+        // them. WAL activation creates `-wal` and `-shm` under the process umask,
+        // so the first pass restricts them as early as possible; a read-only open
+        // recreates `-shm` when it is missing, so the second pass restricts that
+        // one too.
         harden_family(&db_path)?;
         let readers = open_read_pool(&db_path)?;
         harden_family(&db_path)?;
@@ -259,7 +231,9 @@ impl KernelStore {
             db_path,
             _lease: lease,
         };
-        store.run_startup_maintenance()?;
+        // Reclaiming an expired lease keeps every row; deleting aged runs is left to an
+        // explicit call, so opening a store is not a destructive act.
+        store.abandon_expired_staging_runs(crate::current_time_ms())?;
         Ok(store)
     }
 
@@ -267,15 +241,51 @@ impl KernelStore {
         self.lease_epoch
     }
 
+    /// A panic in a caller's closure drops the guard mid-unwind and poisons the
+    /// mutex, so recovering the guard keeps one caught panic from disabling every
+    /// later write. Dropping a rusqlite `Transaction` rolls it back, so the
+    /// recovered connection has no in-flight statement.
     pub(super) fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(KernelError::InvalidRestore);
         }
-        let writer = self.writer.lock().map_err(|_| KernelError::Io)?;
+        let writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         if self.poisoned.load(Ordering::Acquire) {
             return Err(KernelError::InvalidRestore);
         }
         Ok(writer)
+    }
+
+    /// `Mutex::lock` has no timeout, so a deadline-bounded caller polls instead of
+    /// blocking behind an operation that may outlive its own budget.
+    pub(super) fn lock_writer_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
+        loop {
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(KernelError::InvalidRestore);
+            }
+            let guard = match self.writer.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(KernelError::Deadline);
+                    }
+                    std::thread::sleep(WRITER_ACQUIRE_POLL);
+                    continue;
+                }
+            };
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(KernelError::InvalidRestore);
+            }
+            return Ok(guard);
+        }
+    }
+
+    pub(super) fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
     }
 
     pub(super) fn lock_reader(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
@@ -283,15 +293,13 @@ impl KernelStore {
             return Err(KernelError::InvalidRestore);
         }
         let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        let reader = self.readers[index].lock().map_err(|_| KernelError::Io)?;
+        let reader = self.readers[index]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if self.poisoned.load(Ordering::Acquire) {
             return Err(KernelError::InvalidRestore);
         }
         Ok(reader)
-    }
-
-    pub(super) fn poison(&self) {
-        self.poisoned.store(true, Ordering::Release);
     }
 
     #[cfg(feature = "test-support")]
@@ -306,16 +314,55 @@ impl KernelStore {
         Ok(())
     }
 
-    #[cfg(feature = "test-support")]
-    pub fn set_writer_fence_for_test(&self, epoch: i64) -> Result<(), KernelError> {
-        let writer = self.lock_writer()?;
-        writer
-            .execute(
-                "UPDATE writer_fence SET writer_epoch=?1 WHERE id=0",
-                [epoch],
-            )
+    #[allow(
+        dead_code,
+        reason = "connection ownership is restricted to kernel mutation modules"
+    )]
+    pub(crate) fn with_writer<T>(
+        &self,
+        operation: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> Result<T, KernelError> {
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        // `BEGIN IMMEDIATE` blocks a competing writer until this transaction ends.
+        // The fence check and the mutation are therefore atomic.
+        let tx = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| KernelError::Io)?;
-        Ok(())
+        let durable_epoch: i64 = tx
+            .query_row(
+                "SELECT writer_epoch FROM writer_fence WHERE id=0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| KernelError::FenceLost)?;
+        if u64::try_from(durable_epoch).ok() != Some(self.lease_epoch) {
+            return Err(KernelError::FenceLost);
+        }
+        let value = operation(&tx).map_err(|_| KernelError::Io)?;
+        tx.commit().map_err(|_| KernelError::Io)?;
+        Ok(value)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "connection ownership is restricted to kernel query modules"
+    )]
+    pub(crate) fn with_reader<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, KernelError> {
+        let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        // Recovering a poisoned reader guard keeps its pool slot usable.
+        // `Transaction::Drop` rolls back after a closure panic.
+        let mut reader = self.readers[index]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // After its first read, the transaction keeps one snapshot for the
+        // closure. Several reads therefore observe one consistent state.
+        let tx = reader.transaction().map_err(|_| KernelError::Io)?;
+        let value = operation(&tx).map_err(|_| KernelError::Io)?;
+        tx.commit().map_err(|_| KernelError::Io)?;
+        Ok(value)
     }
 }
 
@@ -324,25 +371,36 @@ enum HeaderState {
     Kernel,
 }
 
+/// `Path::exists` maps every error to `false`; only `NotFound` counts as absence.
+fn entry_exists(path: &Path) -> Result<bool, KernelError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(KernelError::Io),
+    }
+}
+
+/// A zero-length main file has never held a committed page.
+///
+/// A `-journal` does not prevent treating an empty main file as pristine.
+fn classify_empty_family(path: &Path) -> Result<HeaderState, KernelError> {
+    if entry_exists(&suffix_path(path, "-wal"))? || entry_exists(&suffix_path(path, "-shm"))? {
+        return Err(KernelError::Inconclusive);
+    }
+    Ok(HeaderState::Pristine)
+}
+
 fn inspect_header(path: &Path) -> Result<HeaderState, KernelError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if family_sidecars(path).iter().any(|sidecar| sidecar.exists()) {
-                return Err(KernelError::Inconclusive);
-            }
-            return Ok(HeaderState::Pristine);
-        }
+        Err(error) if error.kind() == ErrorKind::NotFound => return classify_empty_family(path),
         Err(_) => return Err(KernelError::Io),
     };
     if !metadata.is_file() {
         return Err(KernelError::Inconclusive);
     }
     if metadata.len() == 0 {
-        if family_sidecars(path).iter().any(|sidecar| sidecar.exists()) {
-            return Err(KernelError::Inconclusive);
-        }
-        return Ok(HeaderState::Pristine);
+        return classify_empty_family(path);
     }
     if metadata.len() < 100 {
         return Err(KernelError::Inconclusive);
@@ -367,19 +425,53 @@ struct ExpectedIdentity {
     inventory: Vec<(String, String)>,
 }
 
-fn expected_identity() -> Result<ExpectedIdentity, KernelError> {
-    let mut conn = Connection::open_in_memory().map_err(|_| KernelError::Io)?;
-    apply_kernel_schema(&mut conn, "00000000000000000000000000000000", 0)
-        .map_err(|_| KernelError::Io)?;
-    Ok(ExpectedIdentity {
-        digest: kernel_schema_digest(&conn).map_err(|_| KernelError::Io)?,
-        inventory: kernel_schema_object_inventory(&conn).map_err(|_| KernelError::Io)?,
+static EXPECTED_IDENTITY: LazyLock<Option<ExpectedIdentity>> = LazyLock::new(|| {
+    let mut conn = Connection::open_in_memory().ok()?;
+    apply_kernel_schema(&mut conn, "00000000000000000000000000000000", 0).ok()?;
+    Some(ExpectedIdentity {
+        digest: kernel_schema_digest(&conn).ok()?,
+        inventory: kernel_schema_object_inventory(&conn).ok()?,
     })
+});
+
+fn expected_identity() -> Result<&'static ExpectedIdentity, KernelError> {
+    EXPECTED_IDENTITY.as_ref().ok_or(KernelError::Io)
+}
+
+/// Classification must leave the database and its `-wal` byte-identical.
+///
+/// The `Foreign` and `Inconclusive` outcomes promise untouched durable content.
+/// Journal recovery and WAL checkpointing would both break that promise.
+///
+/// A read-only open may recreate a missing `-shm`; it contains no durable data.
+/// SQLite rebuilds the `-shm` from the `-wal` on demand.
+fn classify_existing_family(path: &Path) -> Result<OpenIdentity, KernelError> {
+    let expected = expected_identity()?;
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| KernelError::Inconclusive)?;
+    conn.pragma_update(None, "query_only", "ON")
+        .map_err(|_| KernelError::Inconclusive)?;
+    conn.pragma_update(None, "trusted_schema", "OFF")
+        .map_err(|_| KernelError::Inconclusive)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)
+        .map_err(|_| KernelError::Inconclusive)?;
+    classify_open_kernel(&mut conn, expected)
 }
 
 enum OpenIdentity {
     Exact,
     Mismatch { incarnation: String },
+}
+
+struct FormatMarker {
+    epoch: i64,
+    incarnation: String,
+    schema_digest: String,
+    created_at: i64,
+    marker_digest: String,
 }
 
 pub(super) fn verify_exact_identity(conn: &mut Connection) -> Result<(), KernelError> {
@@ -389,18 +481,20 @@ pub(super) fn verify_exact_identity(conn: &mut Connection) -> Result<(), KernelE
     if integrity_check != "ok" {
         return Err(KernelError::Inconclusive);
     }
-    match classify_open_kernel(conn, &expected_identity()?)? {
+    // `integrity_check` validates page structure, not references, so a family
+    // written with `foreign_keys=OFF` can pass it while holding dangling rows.
+    let foreign_key_violations: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| KernelError::Inconclusive)?;
+    if foreign_key_violations != 0 {
+        return Err(KernelError::Inconclusive);
+    }
+    match classify_open_kernel(conn, expected_identity()?)? {
         OpenIdentity::Exact => Ok(()),
         OpenIdentity::Mismatch { .. } => Err(KernelError::IdentityMismatch),
     }
-}
-
-struct FormatMarker {
-    epoch: i64,
-    incarnation: String,
-    schema_digest: String,
-    created_at: i64,
-    marker_digest: String,
 }
 
 fn classify_open_kernel(
@@ -451,10 +545,16 @@ fn read_valid_marker(conn: &Connection) -> Result<FormatMarker, KernelError> {
     if present.is_none() {
         return Err(KernelError::Inconclusive);
     }
+    // A lookalike table has no singleton constraint, so `LIMIT 2` detects multiple
+    // rows.
     let mut statement = conn
         .prepare(
             "SELECT format_epoch,database_incarnation_id,schema_digest,created_at,marker_digest
-             FROM mc_kernel_format_marker",
+             FROM mc_kernel_format_marker
+             WHERE length(database_incarnation_id)=32
+               AND length(schema_digest)=64
+               AND length(marker_digest)=64
+             LIMIT 2",
         )
         .map_err(|_| KernelError::Inconclusive)?;
     let rows = statement
@@ -500,13 +600,6 @@ fn read_valid_marker(conn: &Connection) -> Result<FormatMarker, KernelError> {
     })
 }
 
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 pub(super) fn open_writer(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(
         path,
@@ -530,12 +623,22 @@ pub(super) fn apply_preclassification_profile(conn: &Connection) -> rusqlite::Re
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    // REPLACE deletes the conflicting row, which fires its BEFORE DELETE trigger
+    // only when recursive_triggers is ON.
+    conn.pragma_update(None, "recursive_triggers", "ON")?;
     Ok(())
 }
 
+/// `PRAGMA journal_mode` returns the mode now in effect rather than failing.
+///
+/// Readers depend on WAL for snapshot isolation, so the returned mode is checked.
 pub(super) fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
-    conn.pragma_update(None, "journal_mode", "WAL")
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
         .map_err(|_| KernelError::Io)?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(KernelError::Io);
+    }
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(|_| KernelError::Io)
 }
@@ -556,22 +659,38 @@ pub(super) fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<()
     tx.commit().map_err(|_| KernelError::Io)
 }
 
-fn open_read_pool(path: &Path) -> Result<Vec<Mutex<Connection>>, KernelError> {
-    (0..READ_POOL_SIZE)
-        .map(|_| open_reader(path).map(Mutex::new))
-        .collect()
-}
-
 pub(super) fn open_reader(path: &Path) -> Result<Connection, KernelError> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|_| KernelError::Io)?;
+    .map_err(super::map_sqlite)?;
     conn.pragma_update(None, "query_only", "ON")
-        .map_err(|_| KernelError::Io)?;
-    apply_preclassification_profile(&conn).map_err(|_| KernelError::Io)?;
+        .map_err(super::map_sqlite)?;
+    apply_preclassification_profile(&conn).map_err(super::map_sqlite)?;
     Ok(conn)
+}
+
+fn open_read_pool(path: &Path) -> Result<Vec<Mutex<Connection>>, KernelError> {
+    (0..READ_POOL_SIZE)
+        .map(|_| {
+            let conn = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|_| KernelError::Io)?;
+            conn.pragma_update(None, "query_only", "ON")
+                .map_err(|_| KernelError::Io)?;
+            apply_preclassification_profile(&conn).map_err(|_| KernelError::Io)?;
+            let query_only: i64 = conn
+                .query_row("PRAGMA query_only", [], |row| row.get(0))
+                .map_err(|_| KernelError::Io)?;
+            if query_only != 1 {
+                return Err(KernelError::Io);
+            }
+            Ok(Mutex::new(conn))
+        })
+        .collect()
 }
 
 pub(super) fn family_sidecars(path: &Path) -> [PathBuf; 3] {
@@ -615,7 +734,12 @@ fn quarantine(path: &Path, incarnation: &str, lease_epoch: u64) -> Result<(), Ke
 }
 
 fn resume_quarantine(path: &Path) -> Result<(), KernelError> {
-    let bytes = fs::read(reset_marker_path(path)).map_err(|_| KernelError::Inconclusive)?;
+    let marker_path = reset_marker_path(path);
+    let metadata = fs::symlink_metadata(&marker_path).map_err(|_| KernelError::Inconclusive)?;
+    if !metadata.is_file() || metadata.len() > RESET_MARKER_MAX_BYTES {
+        return Err(KernelError::Inconclusive);
+    }
+    let bytes = fs::read(&marker_path).map_err(|_| KernelError::Inconclusive)?;
     let marker: ResetMarker =
         serde_json::from_slice(&bytes).map_err(|_| KernelError::Inconclusive)?;
     if marker.protocol != RESET_MARKER_PROTOCOL
@@ -629,43 +753,51 @@ fn resume_quarantine(path: &Path) -> Result<(), KernelError> {
     move_family(path, &marker)
 }
 
+/// The live marker name appears only once its bytes are durable.
 fn publish_reset_marker(path: &Path, marker: &ResetMarker) -> Result<(), KernelError> {
     let marker_path = reset_marker_path(path);
+    let staging = suffix_path(&marker_path, RESET_MARKER_STAGING_SUFFIX);
     let bytes = serde_json::to_vec(marker).map_err(|_| KernelError::Io)?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&marker_path).map_err(|_| KernelError::Io)?;
-    if file
-        .write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .is_err()
-    {
-        drop(file);
-        let _ = fs::remove_file(&marker_path);
-        return Err(KernelError::Io);
-    }
+    write_private_file(&staging, &bytes)?;
+    fs::rename(&staging, &marker_path).map_err(|_| KernelError::Io)?;
     protect_file(&marker_path).map_err(|_| KernelError::Io)?;
     sync_parent(path)?;
     Ok(())
 }
 
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), KernelError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let outcome = options.open(path).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    if outcome.is_err() {
+        let _ = fs::remove_file(path);
+        return Err(KernelError::Io);
+    }
+    Ok(())
+}
+
+/// The marker's absence declares the reset complete.
+///
+/// Move the marker only after both directories are durable.
 fn move_family(path: &Path, marker: &ResetMarker) -> Result<(), KernelError> {
     prepare_private_dir(&marker.quarantine_dir)?;
-    for source in [
-        suffix_path(path, "-journal"),
-        suffix_path(path, "-wal"),
-        suffix_path(path, "-shm"),
-        path.to_path_buf(),
-    ] {
+    for source in family_sidecars(path)
+        .into_iter()
+        .chain([path.to_path_buf()])
+    {
         move_one(&source, &marker.quarantine_dir)?;
     }
-    let marker_path = reset_marker_path(path);
-    move_one(&marker_path, &marker.quarantine_dir)?;
+    sync_directory(&marker.quarantine_dir)?;
+    sync_parent(path)?;
+    move_one(&reset_marker_path(path), &marker.quarantine_dir)?;
     sync_directory(&marker.quarantine_dir)?;
     sync_parent(path)
 }
@@ -673,9 +805,7 @@ fn move_family(path: &Path, marker: &ResetMarker) -> Result<(), KernelError> {
 fn move_one(source: &Path, destination_dir: &Path) -> Result<(), KernelError> {
     let name = source.file_name().ok_or(KernelError::Inconclusive)?;
     let destination = destination_dir.join(name);
-    let source_exists = source.exists();
-    let destination_exists = destination.exists();
-    match (source_exists, destination_exists) {
+    match (entry_exists(source)?, entry_exists(&destination)?) {
         (true, false) => {
             fs::rename(source, &destination).map_err(|_| KernelError::Io)?;
             protect_file(&destination).map_err(|_| KernelError::Io)
@@ -697,19 +827,14 @@ fn reset_marker_digest(marker: &ResetMarker) -> String {
 }
 
 fn allocate_quarantine_dir(path: &Path, lease_epoch: u64) -> Result<PathBuf, KernelError> {
-    let base = PathBuf::from(format!(
-        "{}{}{}",
-        path.display(),
-        QUARANTINE_INFIX,
-        lease_epoch
-    ));
+    let base = suffix_path(path, &format!("{QUARANTINE_INFIX}{lease_epoch}"));
     for suffix in 0..10_000_u32 {
         let candidate = if suffix == 0 {
             base.clone()
         } else {
-            PathBuf::from(format!("{}-{suffix}", base.display()))
+            suffix_path(&base, &format!("-{suffix}"))
         };
-        if !candidate.exists() {
+        if !entry_exists(&candidate)? {
             return Ok(candidate);
         }
     }
@@ -717,56 +842,67 @@ fn allocate_quarantine_dir(path: &Path, lease_epoch: u64) -> Result<PathBuf, Ker
 }
 
 fn valid_quarantine_path(path: &Path, quarantine: &Path) -> bool {
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    let mut prefix = file_name.to_os_string();
+    prefix.push(QUARANTINE_INFIX);
     quarantine.parent() == path.parent()
         && quarantine.file_name().is_some_and(|name| {
-            name.to_string_lossy().starts_with(&format!(
-                "{}{}",
-                path.file_name().unwrap_or_default().to_string_lossy(),
-                QUARANTINE_INFIX
-            ))
+            name.as_encoded_bytes()
+                .starts_with(prefix.as_encoded_bytes())
         })
 }
 
-fn reset_marker_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}{}", path.display(), RESET_MARKER_SUFFIX))
-}
-
 pub(super) fn restore_marker_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}{}", path.display(), RESTORE_MARKER_SUFFIX))
+    suffix_path(path, RESTORE_MARKER_SUFFIX)
 }
 
-fn suffix_path(path: &Path, suffix: &str) -> PathBuf {
-    PathBuf::from(format!("{}{suffix}", path.display()))
+fn reset_marker_path(path: &Path) -> PathBuf {
+    suffix_path(path, RESET_MARKER_SUFFIX)
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf, KernelError> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        std::env::current_dir()
-            .map(|current| current.join(path))
-            .map_err(|_| KernelError::Io)
-    }
+/// `Path::display` replaces non-UTF-8 bytes, which would name a different file.
+pub(super) fn suffix_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
-fn prepare_root(root: &Path) -> Result<(), KernelError> {
+/// `resume_quarantine` compares the marker's `db_path` against this path by value.
+///
+/// Canonicalizing after creation gives every spelling of one directory one name.
+fn prepare_root(root: &Path) -> Result<PathBuf, KernelError> {
     fs::create_dir_all(root).map_err(|_| KernelError::Io)?;
-    prepare_private_dir(root)
+    prepare_private_dir(root)?;
+    fs::canonicalize(root).map_err(|_| KernelError::Io)
 }
 
 fn prepare_private_dir(path: &Path) -> Result<(), KernelError> {
-    if !path.exists() {
-        fs::create_dir(path).map_err(|_| KernelError::Io)?;
+    // The umask would leave a readable window between `create_dir` and `chmod`.
+    #[cfg(unix)]
+    let created = {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)
+    };
+    #[cfg(not(unix))]
+    let created = fs::create_dir(path);
+    match created {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(KernelError::Io),
     }
     let metadata = fs::symlink_metadata(path).map_err(|_| KernelError::Io)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir() {
         return Err(KernelError::Io);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|_| KernelError::Io)?;
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|_| KernelError::Io)?;
+        }
     }
     Ok(())
 }
@@ -782,16 +918,144 @@ pub(super) fn sync_directory(path: &Path) -> Result<(), KernelError> {
         .map_err(|_| KernelError::Io)
 }
 
-pub(super) fn current_time_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
-}
-
 fn map_lease_error(error: LeaseError) -> KernelError {
     match error {
         LeaseError::Held { .. } => KernelError::Held,
         LeaseError::Io(_) => KernelError::Io,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_read_connections_are_query_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KernelStore::open(directory.path()).unwrap();
+        store
+            .with_reader(|connection| {
+                assert_eq!(
+                    connection.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn stale_writer_fence_blocks_the_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KernelStore::open(directory.path()).unwrap();
+        store
+            .with_writer(|connection| {
+                connection.execute(
+                    "UPDATE writer_fence SET writer_epoch=writer_epoch+1 WHERE id=0",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut called = false;
+        let error = store
+            .with_writer(|_| {
+                called = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error, KernelError::FenceLost);
+        assert!(!called);
+    }
+
+    #[test]
+    fn failed_writer_operation_leaves_no_partial_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KernelStore::open(directory.path()).unwrap();
+        let error = store
+            .with_writer(|tx| -> rusqlite::Result<()> {
+                tx.execute(
+                    "INSERT INTO commit_log(
+                         transaction_id,writer_epoch,producer,operation_key,request_digest,
+                         recorded_at,actor,cause
+                     ) VALUES('t1',1,'fixture','t1','',1,'actor','cause')",
+                    [],
+                )?;
+                Err(rusqlite::Error::InvalidQuery)
+            })
+            .unwrap_err();
+        assert_eq!(error, KernelError::Io);
+        store
+            .with_reader(|tx| {
+                assert_eq!(
+                    tx.query_row("SELECT COUNT(*) FROM commit_log", [], |row| row
+                        .get::<_, i64>(0))?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn store_connections_run_delete_triggers_for_replace() {
+        // The schema-level guard test drives a connection built by
+        // `apply_kernel_connection_profile`, so it cannot observe the pragmas
+        // `KernelStore` sets on its own writer.
+        let directory = tempfile::tempdir().unwrap();
+        let store = KernelStore::open(directory.path()).unwrap();
+        store
+            .with_writer(|tx| {
+                assert_eq!(
+                    tx.query_row("PRAGMA recursive_triggers", [], |row| row.get::<_, i64>(0))?,
+                    1
+                );
+                tx.execute(
+                    "INSERT INTO commit_log(
+                         transaction_id,writer_epoch,producer,operation_key,request_digest,
+                         recorded_at,actor,cause
+                     ) VALUES('t1',1,'fixture','t1','',1,'actor','cause')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let commit_seq = store
+            .with_reader(|tx| {
+                tx.query_row("SELECT commit_seq FROM commit_log", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+
+        for verb in ["INSERT OR REPLACE", "REPLACE"] {
+            let error = store
+                .with_writer(|tx| {
+                    tx.execute(
+                        &format!(
+                            "{verb} INTO commit_log(
+                                 commit_seq,transaction_id,writer_epoch,producer,operation_key,
+                                 request_digest,recorded_at,actor,cause
+                             ) VALUES(?1,'hijack',1,'fixture','hijack','',1,'attacker','rewrite')"
+                        ),
+                        [commit_seq],
+                    )?;
+                    Ok(())
+                })
+                .unwrap_err();
+            assert_eq!(error, KernelError::Io, "{verb} must be refused");
+        }
+
+        store
+            .with_reader(|tx| {
+                assert_eq!(
+                    tx.query_row("SELECT actor FROM commit_log", [], |row| row
+                        .get::<_, String>(0))?,
+                    "actor"
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 }

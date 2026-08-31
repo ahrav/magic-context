@@ -7,14 +7,16 @@ use super::{KernelError, KernelStore};
 
 pub const MAIN_FILE_WARN_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Sizes are sampled per file outside any transaction, so a concurrent commit or
+/// checkpoint can change them between reads. They describe recent growth for
+/// alerting, not a snapshot consistent with `commit_seq`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelFacts {
     pub commit_seq: i64,
     pub main_file_bytes: u64,
     pub family_bytes: u64,
-    pub main_file_warn: bool,
     pub minimum_required_checkpoint: Option<i64>,
-    pub event_lag: i64,
+    pub commit_lag: Option<i64>,
     pub oldest_unconsumed_age_ms: Option<i64>,
     pub artifact_budget: ArtifactBudgetFacts,
 }
@@ -28,14 +30,6 @@ pub struct ArtifactBudgetFacts {
 
 impl KernelStore {
     pub fn facts(&self, now_ms: i64) -> Result<KernelFacts, KernelError> {
-        self.facts_with_threshold(now_ms, MAIN_FILE_WARN_BYTES)
-    }
-
-    fn facts_with_threshold(
-        &self,
-        now_ms: i64,
-        warn_threshold: u64,
-    ) -> Result<KernelFacts, KernelError> {
         if now_ms < 0 {
             return Err(KernelError::InvalidInput);
         }
@@ -57,9 +51,9 @@ impl KernelStore {
                 |row| row.get::<_, Option<i64>>(0),
             )
             .map_err(|_| KernelError::Io)?;
-        let event_lag = minimum_required_checkpoint
-            .map(|checkpoint| commit_seq.saturating_sub(checkpoint))
-            .unwrap_or(0);
+        // `None` distinguishes no registered consumer from a caught-up consumer.
+        let commit_lag =
+            minimum_required_checkpoint.map(|checkpoint| commit_seq.saturating_sub(checkpoint));
         let oldest_unconsumed_created_at = match minimum_required_checkpoint {
             Some(checkpoint) if checkpoint < commit_seq => tx
                 .query_row(
@@ -82,9 +76,8 @@ impl KernelStore {
             commit_seq,
             main_file_bytes,
             family_bytes,
-            main_file_warn: main_file_bytes >= warn_threshold,
             minimum_required_checkpoint,
-            event_lag,
+            commit_lag,
             oldest_unconsumed_age_ms: oldest_unconsumed_created_at
                 .map(|created_at| now_ms.saturating_sub(created_at).max(0)),
             artifact_budget,
@@ -92,22 +85,13 @@ impl KernelStore {
     }
 
     pub fn artifact_budget_facts(&self) -> Result<ArtifactBudgetFacts, KernelError> {
-        let usage_bytes = super::cas::gc::object_usage(&self.artifacts_path)?;
+        let usage_bytes = super::cas::gc::object_usage(self)?;
         let warn_at = self.artifact_cap.saturating_sub(self.artifact_cap / 5);
         Ok(ArtifactBudgetFacts {
             usage_bytes,
             cap_bytes: self.artifact_cap,
             warn: usage_bytes >= warn_at,
         })
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn facts_with_warn_threshold_for_test(
-        &self,
-        now_ms: i64,
-        warn_threshold: u64,
-    ) -> Result<KernelFacts, KernelError> {
-        self.facts_with_threshold(now_ms, warn_threshold)
     }
 }
 

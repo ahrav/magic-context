@@ -1,9 +1,4 @@
-//! Store-backed ctx_memory tool primitives.
 //!
-//! This module is intentionally route/identity agnostic: callers pass the already-resolved
-//! project (and, for the session-aware search helper, session) that the daemon bound. Shared
-//! visibility is read-only for primary agents; facade mutations require project ownership,
-//! which the store rechecks inside the mutation transaction.
 
 use std::collections::BTreeSet;
 
@@ -75,8 +70,7 @@ pub fn list_committed_claims(
                 .and_then(Value::as_str)
                 .is_some_and(is_positive_memory_category)
         })
-        // Category narrowing precedes truncation so a requested category is not
-        // crowded out of the limit by rows the caller did not ask for.
+        // Category narrowing precedes truncation so requested rows are not crowded out by rows the caller did not request.
         .filter(|row| {
             category.is_none_or(|category| {
                 row.attributes.get("category").and_then(Value::as_str) == Some(category)
@@ -189,8 +183,6 @@ pub enum MemorySearchSourceKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemorySearchResult {
     pub source_kind: MemorySearchSourceKind,
-    /// Use the record's primary identifier: memory row id for memory results,
-    /// compartment sequence for compartment results, and note id for note results.
     pub id: i64,
     pub snippet: String,
     pub category: Option<String>,
@@ -207,7 +199,6 @@ struct RankedSearchResult {
     recency: i64,
 }
 
-/// Keyword search over the resolved session's compartments and project notes.
 pub fn search_compartments_and_notes_for_session(
     store: &McStore,
     project_path: &str,
@@ -400,8 +391,6 @@ mod tests {
             "REJECTED_APPROACH",
             "Rejected Redis for session caching.",
         );
-        // Positive control: proves the filter excludes exactly the anti-memory
-        // row rather than draining the whole mirror.
         let positive = mirror_claim(
             "mcm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "CONSTRAINTS",

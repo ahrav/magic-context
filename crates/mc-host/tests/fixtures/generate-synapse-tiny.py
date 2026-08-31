@@ -186,15 +186,11 @@ def main() -> None:
     )
 
     corpus_texts = [
-        # Mean-versus-CLS pooling and output selection both shift these.
         "alpha beta gamma",
         "kappa iota theta eta",
         "alpha",
-        # Both sides of the truncation boundary: 8 tokens exactly, and 10
-        # tokens whose expected vector uses only the first 8.
         "alpha beta gamma delta epsilon zeta eta theta",
         "alpha beta gamma delta epsilon zeta eta theta iota kappa",
-        # Unknown words map to [UNK].
         "unknownword alpha",
     ]
     corpus = {
@@ -223,8 +219,6 @@ def main() -> None:
         "corpus": {"name": "corpus.json", "sha256": sha256_file("corpus.json")},
     }
 
-    # The manifest is the single declaration of the embedding-space fields;
-    # the fingerprint is derived from it so the two can never disagree.
     manifest = {
         "schema_version": 1,
         "model": "tiny-test-model",

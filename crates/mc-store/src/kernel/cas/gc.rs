@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs;
 use std::time::UNIX_EPOCH;
 
 use rusqlite::{params, TransactionBehavior};
+use rustix::fs::{self as rfs, AtFlags};
 
 use super::is_artifact_digest;
 use crate::kernel::durable_fs::{durable_unlink, open_secure_directory, StorageError};
@@ -122,7 +123,7 @@ impl KernelStore {
         Ok(removed.then_some(bytes))
     }
 
-    fn snapshot_gc_candidates(&self) -> Result<Vec<Candidate>, KernelError> {
+    fn snapshot_reclaim_state(&self) -> Result<Vec<Candidate>, KernelError> {
         let reader = self.lock_reader()?;
         let mut statement = reader
             .prepare(
@@ -131,30 +132,30 @@ impl KernelStore {
                  UNION SELECT artifact_digest FROM artifact_pending_unlinks",
             )
             .map_err(|_| KernelError::Io)?;
-        let reclaim_state = statement
+        let digests = statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|_| KernelError::Io)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| KernelError::Io)?;
-        drop(statement);
-        drop(reader);
+        Ok(digests
+            .into_iter()
+            .filter(|digest| is_artifact_digest(digest))
+            .map(|digest| Candidate {
+                digest,
+                modified_at: None,
+            })
+            .collect())
+    }
 
+    fn snapshot_gc_candidates(&self) -> Result<Vec<Candidate>, KernelError> {
+        let reclaim_state = self.snapshot_reclaim_state()?;
         // Reclaiming needs bytes to unlink or durable reclaim state to retire.
         // `evidence_meta` outlives both, and `prepare_reclaim` rechecks liveness per
         // candidate, so a pass costs the object scan plus outstanding reclaim rows
         // rather than the whole reference history.
         let mut candidates: BTreeMap<String, Candidate> = BTreeMap::new();
-        for digest in reclaim_state {
-            if !is_artifact_digest(&digest) {
-                continue;
-            }
-            candidates.insert(
-                digest.clone(),
-                Candidate {
-                    digest,
-                    modified_at: None,
-                },
-            );
+        for candidate in reclaim_state {
+            candidates.insert(candidate.digest.clone(), candidate);
         }
         for object in scan_objects(&self.artifacts_path.join("objects"))? {
             candidates
@@ -166,15 +167,9 @@ impl KernelStore {
     }
 
     fn unlink_artifact(&self, digest: &str) -> Result<(bool, u64), KernelError> {
-        let path = self.artifact_object_path(digest);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_file() => metadata,
-            Ok(_) => return Err(self.latch_gc_failure()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((false, 0)),
-            Err(_) => return Err(self.latch_gc_failure()),
-        };
-        let objects =
-            File::open(self.artifacts_path.join("objects")).map_err(|_| self.latch_gc_failure())?;
+        let objects = self
+            .open_objects_directory()
+            .map_err(|error| self.map_gc_storage_error(error))?;
         let shard = match open_secure_directory(&objects, &digest[..2]) {
             Ok(shard) => shard,
             Err(StorageError::Other(source)) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -182,8 +177,17 @@ impl KernelStore {
             }
             Err(error) => return Err(self.map_gc_storage_error(error)),
         };
+        let stat = match rfs::statat(&shard, &digest[2..], AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOENT) => return Ok((false, 0)),
+            Err(_) => return Err(self.latch_gc_failure()),
+        };
+        if !rfs::FileType::from_raw_mode(stat.st_mode).is_file() {
+            return Err(self.latch_gc_failure());
+        }
+        let byte_length = u64::try_from(stat.st_size).map_err(|_| self.latch_gc_failure())?;
         durable_unlink(&shard, &digest[2..]).map_err(|error| self.map_gc_storage_error(error))?;
-        Ok((true, metadata.len()))
+        Ok((true, byte_length))
     }
 
     fn map_gc_storage_error(&self, error: StorageError) -> KernelError {
@@ -373,8 +377,9 @@ fn scan_objects(root: &std::path::Path) -> Result<Vec<Candidate>, KernelError> {
     Ok(objects)
 }
 
-pub(in crate::kernel) fn object_usage(
-    artifacts_path: &std::path::Path,
-) -> Result<u64, KernelError> {
-    super::ingest::regular_file_bytes(&artifacts_path.join("objects")).map_err(|_| KernelError::Io)
+pub(in crate::kernel) fn object_usage(store: &KernelStore) -> Result<u64, KernelError> {
+    let objects = store
+        .open_objects_directory()
+        .map_err(|_| KernelError::Io)?;
+    super::ingest::regular_file_bytes(&objects).map_err(|_| KernelError::Io)
 }
