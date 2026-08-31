@@ -228,17 +228,17 @@ describe("family-clustered delta estimator", () => {
         expect(overlapping.evidenceSufficient).toBe(true);
     });
 
-    it("pools each primary endpoint over the paired families alone", () => {
-        // fam-shared is neutral at both endpoints; the unpaired families are strongly positive.
+    it("pools each primary endpoint over the paired coordinates alone", () => {
+        // fam-shared is measured at both endpoints on the same coordinates and is neutral; the endpoint-exclusive families are strongly positive.
         const partial = estimate({
             minimumAnalyzableFamilyCount: 1,
             observations: [
                 { coordinateId: "shared:0", familyId: "fam-shared", endpoint: "mc-on-vs-mc-off", delta: 0.01, runHealth: "completed" },
                 { coordinateId: "shared:1", familyId: "fam-shared", endpoint: "mc-on-vs-mc-off", delta: -0.01, runHealth: "completed" },
+                { coordinateId: "shared:0", familyId: "fam-shared", endpoint: "mc-on-vs-compaction", delta: 0.01, runHealth: "completed" },
+                { coordinateId: "shared:1", familyId: "fam-shared", endpoint: "mc-on-vs-compaction", delta: -0.01, runHealth: "completed" },
                 { coordinateId: "only-a:0", familyId: "fam-a", endpoint: "mc-on-vs-mc-off", delta: 0.9, runHealth: "completed" },
                 { coordinateId: "only-a:1", familyId: "fam-b", endpoint: "mc-on-vs-mc-off", delta: 0.9, runHealth: "completed" },
-                { coordinateId: "shared:2", familyId: "fam-shared", endpoint: "mc-on-vs-compaction", delta: 0.01, runHealth: "completed" },
-                { coordinateId: "shared:3", familyId: "fam-shared", endpoint: "mc-on-vs-compaction", delta: -0.01, runHealth: "completed" },
                 { coordinateId: "only-c:0", familyId: "fam-c", endpoint: "mc-on-vs-compaction", delta: 0.9, runHealth: "completed" },
                 { coordinateId: "only-c:1", familyId: "fam-d", endpoint: "mc-on-vs-compaction", delta: 0.9, runHealth: "completed" },
             ],
@@ -253,6 +253,23 @@ describe("family-clustered delta estimator", () => {
             expect(endpoint.pointEstimate).toBeCloseTo(0, 12);
             expect(endpoint.resolution).toBe("unresolved");
         }
+    });
+
+    it("discounts a family whose primary endpoints rest on different coordinates", () => {
+        // One family at both endpoints, but no coordinate supplies both primary comparisons.
+        const split = estimate({
+            minimumAnalyzableFamilyCount: 1,
+            observations: [
+                { coordinateId: "only-off:0", familyId: "fam-a", endpoint: "mc-on-vs-mc-off", delta: 0.9, runHealth: "completed" },
+                { coordinateId: "only-off:1", familyId: "fam-a", endpoint: "mc-on-vs-mc-off", delta: 0.8, runHealth: "completed" },
+                { coordinateId: "only-comp:0", familyId: "fam-a", endpoint: "mc-on-vs-compaction", delta: 0.9, runHealth: "completed" },
+                { coordinateId: "only-comp:1", familyId: "fam-a", endpoint: "mc-on-vs-compaction", delta: 0.8, runHealth: "completed" },
+            ],
+            noiseFloors: undefined,
+        });
+        expect(split.endpoints).toEqual([]);
+        expect(split.analyzableFamilyCount).toBe(0);
+        expect(split.evidenceSufficient).toBe(false);
     });
 
     it("reports a malformed noise floor as an estimator error", () => {

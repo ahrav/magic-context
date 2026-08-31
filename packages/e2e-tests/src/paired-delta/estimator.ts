@@ -313,16 +313,16 @@ export function estimateFamilyDeltas(input: {
         compareCodeUnits(left.endpoint, right.endpoint) ||
         compareCodeUnits(left.familyId, right.familyId) ||
         compareCodeUnits(left.coordinateId, right.coordinateId));
-    const familiesByPrimaryEndpoint = PRIMARY_ENDPOINTS.map((endpoint) => new Set(
+    const coordinatesByPrimaryEndpoint = PRIMARY_ENDPOINTS.map((endpoint) => new Set(
         sorted.filter((observation) => observation.endpoint === endpoint)
-            .map(({ familyId }) => familyId),
+            .map(({ coordinateId }) => coordinateId),
     ));
-    // A family observed at one primary endpoint only has no paired counterpart, so it constrains neither the pooled primary estimates nor the evidence count.
-    const pairedFamilies = new Set([...familiesByPrimaryEndpoint[0]!].filter((familyId) =>
-        familiesByPrimaryEndpoint.every((families) => families.has(familyId))));
+    // Only coordinates present at every primary endpoint contribute to paired estimates and `analyzableFamilyCount`.
+    const pairedCoordinates = new Set([...coordinatesByPrimaryEndpoint[0]!].filter((coordinateId) =>
+        coordinatesByPrimaryEndpoint.every((coordinates) => coordinates.has(coordinateId))));
     const analyzable = sorted.filter((observation) =>
         !PRIMARY_ENDPOINTS.includes(observation.endpoint as PrimaryEndpoint) ||
-        pairedFamilies.has(observation.familyId));
+        pairedCoordinates.has(observation.coordinateId));
     const estimates = [...new Set(analyzable.map(({ endpoint }) => endpoint))]
         .sort(compareCodeUnits)
         .map((endpoint) => estimateEndpoint(
@@ -335,7 +335,9 @@ export function estimateFamilyDeltas(input: {
         ));
     const endpoints = estimates.filter(({ endpoint }) =>
         PRIMARY_ENDPOINTS.includes(endpoint as PrimaryEndpoint));
-    const analyzableFamilyCount = pairedFamilies.size;
+    const analyzableFamilyCount = new Set(analyzable
+        .filter((observation) => PRIMARY_ENDPOINTS.includes(observation.endpoint as PrimaryEndpoint))
+        .map(({ familyId }) => familyId)).size;
     return {
         poolManifestFingerprint: input.lane.poolManifestFingerprint,
         pinnedSnapshotId: input.lane.pinnedSnapshotId,
