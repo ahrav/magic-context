@@ -218,6 +218,7 @@ impl KernelStore {
             })
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::InvalidInput))?;
             line.push(b'\n');
+            receipt_conflict_free(&writer, &request.intent)?;
             let mut log = self
                 .purge_intent_log
                 .lock()
@@ -471,7 +472,9 @@ impl KernelStore {
         let mut statement = tx
             .prepare(
                 "SELECT bc.consumer_id,bc.required_checkpoint_commit_seq,
-                        c.checkpoint_commit_seq,
+                        COALESCE(c.checkpoint_commit_seq,
+                                 CASE WHEN bc.acknowledged_at IS NOT NULL
+                                      THEN bc.required_checkpoint_commit_seq END),
                         (SELECT a.operator_id FROM consumer_abandonments a
                           WHERE a.consumer_id=bc.consumer_id AND a.barrier_id=bc.barrier_id
                             AND a.commit_seq>=bc.required_checkpoint_commit_seq
@@ -638,6 +641,30 @@ fn load_artifact_state(
         tombstoned,
         pending_unlink,
     })
+}
+
+/// Rejects a reused operation key that carries a different request digest, which
+/// the commit refuses after the purge intent would already be durable.
+fn receipt_conflict_free(
+    connection: &rusqlite::Connection,
+    intent: &CommitIntent,
+) -> Result<(), ArtifactError> {
+    let recorded: Option<String> = connection
+        .query_row(
+            "SELECT request_digest FROM operation_receipts
+             WHERE producer=?1 AND operation_key=?2",
+            params![
+                redact(&intent.producer).text,
+                redact(&intent.operation_key).text
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+    if recorded.is_some_and(|digest| digest != intent.request_digest) {
+        return Err(ArtifactError::new(ArtifactErrorKind::ReferenceCommit));
+    }
+    Ok(())
 }
 
 fn injected_storage_error(errno: rustix::io::Errno) -> StorageError {

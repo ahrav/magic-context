@@ -1084,3 +1084,73 @@ fn a_replayed_deletion_reports_the_generation_it_committed() {
         "the re-admitted reference should still be live"
     );
 }
+
+#[test]
+fn a_barrier_records_acknowledgement_before_its_consumer_is_removed() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "ack-audit", b"ack-audit");
+    store
+        .commit(intent("register-ack-audit"), |envelope| {
+            envelope.register_outbox_consumer("search", 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+    let deletion = store
+        .delete_artifact(delete_request(
+            "ack-audit",
+            &handle.digest,
+            ArtifactDeletionKind::Delete,
+        ))
+        .unwrap();
+    store
+        .acknowledge_outbox("search", deletion.commit_seq, 5)
+        .unwrap();
+    store
+        .commit(intent("deregister-ack-audit"), |envelope| {
+            envelope.deregister_outbox_consumer("search", 6)?;
+            Ok("deregistered".to_string())
+        })
+        .unwrap();
+
+    let status = store.deletion_barrier(&deletion.barrier_id).unwrap();
+    assert!(status.cleared);
+    assert_eq!(status.consumers.len(), 1);
+    assert!(
+        status.consumers[0].satisfied,
+        "a cleared barrier reported its acknowledged consumer as unsatisfied"
+    );
+    assert!(status.consumers[0].checkpoint_commit_seq.is_some());
+}
+
+#[test]
+fn a_conflicting_operation_key_leaves_no_durable_purge_record() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let first = ingest(&store, "conflict-one", b"conflict-one");
+    let second = ingest(&store, "conflict-two", b"conflict-two");
+    store
+        .delete_artifact(delete_request(
+            "conflict",
+            &first.digest,
+            ArtifactDeletionKind::Purge,
+        ))
+        .unwrap();
+
+    // Same producer and operation key, different request digest.
+    let mut reused = delete_request("conflict", &second.digest, ArtifactDeletionKind::Purge);
+    reused.intent.request_digest = format!("{:x}", Sha256::digest(b"a different request"));
+    assert_eq!(
+        store.delete_artifact(reused).unwrap_err().kind(),
+        ArtifactErrorKind::ReferenceCommit
+    );
+
+    let log = fs::read_to_string(root.path().join("purge-intent.jsonl")).unwrap();
+    assert!(
+        !log.contains(&second.digest),
+        "a rejected purge left a durable intent record"
+    );
+    assert!(object_path(root.path(), &second.digest).exists());
+}

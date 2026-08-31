@@ -442,6 +442,17 @@ fn complete_satisfied_barriers(
     completed_at: i64,
 ) -> Result<(), KernelError> {
     tx.execute(
+        "UPDATE deletion_backfill_barrier_consumers AS bc SET acknowledged_at=?1
+         WHERE bc.acknowledged_at IS NULL
+           AND EXISTS(
+               SELECT 1 FROM outbox_consumers c
+               WHERE c.consumer_id=bc.consumer_id
+                 AND c.checkpoint_commit_seq>=bc.required_checkpoint_commit_seq
+           )",
+        params![completed_at],
+    )
+    .map_err(|_| KernelError::Io)?;
+    tx.execute(
         "UPDATE deletion_backfill_barriers AS b SET completed_at=?1
          WHERE b.completed_at IS NULL
            AND EXISTS(
