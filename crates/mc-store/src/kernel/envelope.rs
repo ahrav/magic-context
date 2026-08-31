@@ -15,6 +15,8 @@ pub enum Sensitivity {
 }
 
 impl Sensitivity {
+    pub(super) const ALL: &'static [Self] = &[Self::Normal, Self::Sensitive, Self::Secret];
+
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
