@@ -194,8 +194,6 @@ fn rebuild_is_deterministic_and_historical_derivation_is_stable() {
             .collect::<Vec<_>>(),
         ["decision-1"]
     );
-    assert_eq!(old_slice.decisions[0].invalidated_commit_seq, None);
-    assert_eq!(old_slice.decisions[0].superseded_by, None);
     let current_slice = store.slice_as_of(3).unwrap();
     assert_eq!(current_slice.decisions[0].decision_id, "decision-2");
 }
@@ -417,7 +415,7 @@ fn purge_replay_rebuild_failure_preserves_pending_artifact() {
     drop(connection);
 
     let error = store.delete_artifact(request).unwrap_err();
-    assert_eq!(error.kind(), ArtifactErrorKind::ReferenceCommit);
+    assert_eq!(error.kind(), ArtifactErrorKind::AlignmentRebuild);
     let object_path = root
         .path()
         .join("artifacts/objects")
@@ -456,21 +454,11 @@ fn projection_failure_rolls_back_the_canonical_mutation_and_receipt() {
     let store = KernelStore::open(root.path()).unwrap();
     let error = store
         .commit(intent("must-roll-back"), |envelope| {
-            envelope.append_decision_event(
-                "decision-1",
-                DecisionEventSpec {
-                    event_kind: "status".to_string(),
-                    payload: DecisionEventPayload {
-                        summary: "must not persist".to_string(),
-                    },
-                    evidence_id: None,
-                    recorded_at: 10,
-                },
-            )?;
+            envelope.insert_observation(observation(2, "decision-object-1"))?;
             Ok(String::new())
         })
         .unwrap_err();
-    assert_eq!(error.kind(), KernelErrorKind::Io);
+    assert_eq!(error.kind(), KernelErrorKind::CorruptCanonicalRow);
 
     store
         .commit(intent("unrelated-domain"), |envelope| {
@@ -491,7 +479,7 @@ fn projection_failure_rolls_back_the_canonical_mutation_and_receipt() {
     for (table, expected) in [
         ("commit_log", 3),
         ("operation_receipts", 3),
-        ("decision_events", 0),
+        ("observations", 1),
         ("domains", 2),
     ] {
         let count: i64 = connection
@@ -501,4 +489,105 @@ fn projection_failure_rolls_back_the_canonical_mutation_and_receipt() {
             .unwrap();
         assert_eq!(count, expected, "{table}");
     }
+}
+
+#[test]
+fn replay_of_affecting_commit_reports_the_durable_write_when_repair_fails() {
+    let (root, store) = open_store();
+    seed_domain(&store);
+    seed_pair(&store, None);
+    drop(store);
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations SET observation_payload=X'00'
+             WHERE observation_id='observation-1'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = KernelStore::open(root.path()).unwrap();
+    let replay = store
+        .commit(intent("pair"), |_| {
+            panic!("receipt replay must skip operation")
+        })
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.commit_seq, 2);
+}
+
+#[test]
+fn derivation_reads_stored_observation_payloads_that_gained_fields() {
+    let (root, store) = open_store();
+    seed_domain(&store);
+    seed_pair(&store, None);
+    let expected = projection_rows(root.path());
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    let stored: Vec<u8> = connection
+        .query_row(
+            "SELECT observation_payload FROM observations WHERE observation_id='observation-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(stored).unwrap(),
+        r#"{"summary":"observed 1","classification":"implemented"}"#
+    );
+    connection
+        .execute(
+            "UPDATE observations
+             SET observation_payload=CAST(
+                 json_insert(CAST(observation_payload AS TEXT),'$.future_field','x') AS BLOB
+             )
+             WHERE observation_id='observation-1'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(store.rebuild_alignment().unwrap().rows, 1);
+    assert_eq!(projection_rows(root.path()), expected);
+    assert_eq!(store.alignment_as_of(2).unwrap().rows.len(), 1);
+}
+
+#[test]
+fn scope_and_decision_event_commits_leave_the_projection_untouched() {
+    let (root, store) = open_store();
+    seed_domain(&store);
+    seed_pair(&store, None);
+    let expected = projection_rows(root.path());
+    drop(store);
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations SET observation_payload=X'00'
+             WHERE observation_id='observation-1'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = KernelStore::open(root.path()).unwrap();
+    store
+        .commit(intent("event"), |envelope| {
+            envelope.append_decision_event(
+                "decision-1",
+                DecisionEventSpec {
+                    event_kind: "status".to_string(),
+                    payload: DecisionEventPayload {
+                        summary: "unrelated to alignment".to_string(),
+                    },
+                    evidence_id: None,
+                    recorded_at: 10,
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(projection_rows(root.path()), expected);
 }

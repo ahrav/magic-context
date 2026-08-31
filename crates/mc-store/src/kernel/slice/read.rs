@@ -14,8 +14,6 @@ pub struct DecisionRow {
     pub decision_kind: String,
     pub payload: DecisionPayload,
     pub created_commit_seq: i64,
-    pub invalidated_commit_seq: Option<i64>,
-    pub superseded_by: Option<String>,
     pub sensitivity: Sensitivity,
 }
 
@@ -31,8 +29,6 @@ pub struct ObservationRow {
     pub payload: ObservationPayload,
     pub observed_at: i64,
     pub created_commit_seq: i64,
-    pub invalidated_commit_seq: Option<i64>,
-    pub superseded_by: Option<String>,
     pub sensitivity: Sensitivity,
 }
 
@@ -94,8 +90,6 @@ pub(super) fn load_decisions(
         .prepare(
             "SELECT decision_id,object_id,proposition_id,scope_id,anchor_id,evidence_id,
                     decision_kind,decision_payload,created_commit_seq,
-                    CASE WHEN invalidated_commit_seq<=?1 THEN invalidated_commit_seq END,
-                    CASE WHEN invalidated_commit_seq<=?1 THEN superseded_by END,
                     sensitivity_class
              FROM decisions
              WHERE created_commit_seq<=?1
@@ -106,7 +100,7 @@ pub(super) fn load_decisions(
     let rows = statement
         .query_map([requested], |row| {
             let payload = row.get::<_, Vec<u8>>(7)?;
-            let sensitivity = row.get::<_, String>(11)?;
+            let sensitivity = row.get::<_, String>(9)?;
             Ok(DecisionRow {
                 decision_id: row.get(0)?,
                 object_id: row.get(1)?,
@@ -123,8 +117,6 @@ pub(super) fn load_decisions(
                     )
                 })?,
                 created_commit_seq: row.get(8)?,
-                invalidated_commit_seq: row.get(9)?,
-                superseded_by: row.get(10)?,
                 sensitivity: Sensitivity::from_stored(&sensitivity),
             })
         })
@@ -142,8 +134,6 @@ pub(super) fn load_observations(
         .prepare(
             "SELECT observation_id,object_id,proposition_id,scope_id,anchor_id,evidence_id,
                     observation_kind,observation_payload,observed_at,created_commit_seq,
-                    CASE WHEN invalidated_commit_seq<=?1 THEN invalidated_commit_seq END,
-                    CASE WHEN invalidated_commit_seq<=?1 THEN superseded_by END,
                     sensitivity_class
              FROM observations
              WHERE created_commit_seq<=?1
@@ -154,7 +144,7 @@ pub(super) fn load_observations(
     let rows = statement
         .query_map([requested], |row| {
             let payload = row.get::<_, Vec<u8>>(7)?;
-            let sensitivity = row.get::<_, String>(12)?;
+            let sensitivity = row.get::<_, String>(10)?;
             Ok(ObservationRow {
                 observation_id: row.get(0)?,
                 object_id: row.get(1)?,
@@ -172,8 +162,6 @@ pub(super) fn load_observations(
                 })?,
                 observed_at: row.get(8)?,
                 created_commit_seq: row.get(9)?,
-                invalidated_commit_seq: row.get(10)?,
-                superseded_by: row.get(11)?,
                 sensitivity: Sensitivity::from_stored(&sensitivity),
             })
         })
