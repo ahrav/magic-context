@@ -62,6 +62,12 @@ afterEach(async () => {
 });
 
 describe("oracle arm presets", () => {
+    it("enables the complete native compaction block", () => {
+        expect(naiveCompactionOptions()).toEqual({
+            openCodeConfigExtra: { compaction: { auto: true, prune: false } },
+        });
+    });
+
     it("writes an empty plugin list for MC-off", async () => {
         const harness = await createHarness(mcOffOptions());
         const config = JSON.parse(
@@ -115,9 +121,10 @@ describe("oracle arm presets", () => {
         spawned.push(opencode);
         const config = JSON.parse(
             readFileSync(join(opencode.env.configDir, "opencode.json"), "utf8"),
-        ) as { provider?: unknown };
+        ) as { provider?: Record<string, unknown> };
 
-        expect(config.provider).toEqual(providerBlock);
+        expect(config.provider?.anthropic).toEqual(providerBlock.anthropic);
+        expect(config.provider?.["mock-anthropic"]).toBeDefined();
         expect(mock.requests()).toHaveLength(0);
     }, 120_000);
 

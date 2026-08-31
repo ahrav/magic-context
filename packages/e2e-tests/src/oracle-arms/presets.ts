@@ -6,7 +6,7 @@ export function mcOffOptions(): TestHarnessOptions {
 }
 
 export function naiveCompactionOptions(): TestHarnessOptions {
-    return { openCodeConfigExtra: { compaction: { auto: true } } };
+    return { openCodeConfigExtra: { compaction: { auto: true, prune: false } } };
 }
 
 export interface LiveModelOptions {
@@ -17,9 +17,7 @@ export interface LiveModelOptions {
 /**
  * Build the live-model portion of `SpawnOptions`.
  *
- * `openCodeConfigExtra` is shallowly spread over the generated config, so this
- * provider map replaces the default map. Prompt-sending callers that still use
- * the mock provider must include `mock-anthropic` beside the live provider.
+ * `openCodeConfigExtra.provider` is merged beside the generated mock provider.
  * `RustTestHarness.restart()` also drops `openCodeConfigExtra`, so callers must
  * not expect this recipe to survive a restart.
  *

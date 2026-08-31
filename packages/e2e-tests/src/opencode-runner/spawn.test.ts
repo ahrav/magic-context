@@ -34,6 +34,84 @@ function childProcess(fake: FakeChild): ChildProcess {
 }
 
 describe("opencode child lifecycle", () => {
+    it("merges contributed providers beside the generated mock provider", () => {
+        const root = mkdtempSync(join(tmpdir(), "opencode-provider-merge-"));
+        const env: IsolatedEnv = {
+            configDir: join(root, "config"),
+            dataDir: join(root, "data"),
+            cacheDir: join(root, "cache"),
+            workdir: join(root, "work"),
+        };
+        try {
+            for (const dir of Object.values(env)) mkdirSync(dir, { recursive: true });
+            __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                mockProviderURL: "http://127.0.0.1:4321",
+                openCodeConfigExtra: {
+                    provider: {
+                        anthropic: {
+                            api: "@ai-sdk/anthropic",
+                            env: ["ANTHROPIC_API_KEY"],
+                            models: {
+                                "claude-sonnet-4-5-20250929": {
+                                    limit: { context: 32_000 },
+                                },
+                            },
+                        },
+                        "mock-anthropic": { name: "must-not-replace-generated-mock" },
+                    },
+                },
+            });
+
+            const config = JSON.parse(
+                readFileSync(join(env.configDir, "opencode.json"), "utf8"),
+            ) as {
+                provider: Record<string, {
+                    name?: string;
+                    options?: { baseURL?: string };
+                    models?: Record<string, unknown>;
+                }>;
+            };
+            expect(Object.keys(config.provider).sort()).toEqual(["anthropic", "mock-anthropic"]);
+            expect(config.provider["mock-anthropic"]?.name).toBe("Mock Anthropic");
+            expect(config.provider["mock-anthropic"]?.options?.baseURL).toBe(
+                "http://127.0.0.1:4321",
+            );
+            expect(config.provider.anthropic?.models).toHaveProperty(
+                "claude-sonnet-4-5-20250929",
+            );
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects inline credentials in contributed provider config before writing", () => {
+        const root = mkdtempSync(join(tmpdir(), "opencode-provider-secret-"));
+        const env: IsolatedEnv = {
+            configDir: join(root, "config"),
+            dataDir: join(root, "data"),
+            cacheDir: join(root, "cache"),
+            workdir: join(root, "work"),
+        };
+        try {
+            for (const dir of Object.values(env)) mkdirSync(dir, { recursive: true });
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                    openCodeConfigExtra: {
+                        provider: {
+                            anthropic: {
+                                options: { apiKey: "sk-live-must-stay-in-extra-env" },
+                            },
+                        },
+                    },
+                }),
+            ).toThrow(/provider config contains credential-shaped key: provider\.anthropic\.options\.apiKey/);
+            expect(existsSync(join(env.configDir, "opencode.json"))).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("resolves the plugin entry when spawning, not when this module was imported", () => {
         // A module-level `existsSync` snapshot is taken before any caller code
         // runs, so a caller that builds the bundle and then spawns in the same

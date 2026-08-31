@@ -192,6 +192,11 @@ function writeConfigs(
         ? releaseRootPath(opts.releaseRoot, "opencodePlugin")
         : pluginEntryPath();
     const pluginSpec = `file://${pluginEntry}`;
+    const extra = opts.openCodeConfigExtra ?? {};
+    const contributedProviders = extra.provider;
+    assertProviderConfigHasNoCredentials(contributedProviders);
+    const extraWithoutProvider = { ...extra };
+    delete extraWithoutProvider.provider;
 
     const opencodeConfig: Record<string, unknown> = {
         $schema: "https://opencode.ai/config.json",
@@ -203,6 +208,9 @@ function writeConfigs(
         // detector disables itself and the plugin becomes a no-op.
         compaction: { auto: false, prune: false },
         provider: {
+            ...(contributedProviders && typeof contributedProviders === "object"
+                ? contributedProviders
+                : {}),
             "mock-anthropic": {
                 api: "@ai-sdk/anthropic",
                 name: "Mock Anthropic",
@@ -231,7 +239,7 @@ function writeConfigs(
                 },
             },
         },
-        ...(opts.openCodeConfigExtra ?? {}),
+        ...extraWithoutProvider,
     };
 
     // User-tier thresholds stay below project-security raise-only clamps.
@@ -284,6 +292,28 @@ function writeConfigs(
     }
 
     // tui.json: not needed for headless serve, but harmless to emit nothing for now.
+}
+
+const CREDENTIAL_CONFIG_KEY =
+    /^(?:(?:api|access|private|auth)?key|(?:auth)?token|authorization|credentials?|password|secret)$/i;
+
+function assertProviderConfigHasNoCredentials(value: unknown): void {
+    const seen = new WeakSet<object>();
+    const visit = (current: unknown, path: string): void => {
+        if (current === null || typeof current !== "object" || seen.has(current)) return;
+        seen.add(current);
+        for (const [key, child] of Object.entries(current)) {
+            const childPath = `${path}.${key}`;
+            if (CREDENTIAL_CONFIG_KEY.test(key.replaceAll("_", ""))) {
+                throw new Error(
+                    `provider config contains credential-shaped key: ${childPath}; ` +
+                        "pass credentials through extraEnv",
+                );
+            }
+            visit(child, childPath);
+        }
+    };
+    visit(value, "provider");
 }
 
 /**
@@ -484,13 +514,9 @@ function isInheritableEnvKey(key: string): boolean {
  * instead would refuse every default spawn, since that fake default is always
  * present and is shaped like a secret.
  *
- * It does not cover a credential written directly into `openCodeConfigExtra`,
- * which lands in the generated `opencode.json` rather than the environment.
- * `liveModelSpawnOptions()` deliberately keeps the value in `extraEnv` and has
- * the provider block reference it by name, so the sanctioned path stays covered;
- * a caller that inlines an `apiKey` into the provider map instead is outside this
- * guard. Extending to it needs a separate predicate, since config keys are
- * camelCase and match none of the environment-name shapes.
+ * Credentials written directly into `openCodeConfigExtra.provider` are refused
+ * by `writeConfigs`; the sanctioned provider config references an environment
+ * variable and passes its value through `extraEnv`.
  *
  * The pairing this enforces was previously a convention: `liveModelSpawnOptions()`
  * returns the credential and `hostname: "127.0.0.1"` together, and a comment
