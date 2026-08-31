@@ -527,6 +527,65 @@ fn overlay_vendor_rules_honour_the_upstream_safelists() {
     }
 }
 
+/// The regex alternation splits `monkey` around `key`, so the local-context gate
+/// is what has to reject it.
+#[test]
+fn local_context_rejects_key_names_embedded_in_other_identifiers() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let value = "Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24";
+    for key in [
+        "monkey",
+        "turkey",
+        "author",
+        "keyboard",
+        "authority",
+        "max_input_tokens",
+    ] {
+        let report = scanner.scan(&format!("{key}: {value}")).unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "generic-api-key"),
+            "{key} was reported as an API key"
+        );
+    }
+    for key in [
+        "api_key",
+        "ApiKey",
+        "API_KEY",
+        "apikey",
+        "api_tokens",
+        "access_keys",
+    ] {
+        let report = scanner.scan(&format!("{key}: {value}")).unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "generic-api-key"),
+            "{key} produced no generic-api-key finding"
+        );
+    }
+}
+
+/// A recognized prefix over a malformed body is invalid, not unverifiable.
+#[test]
+fn slack_validation_rejects_malformed_bodies() {
+    let scanner = Scanner::new(ScanProfile::Conservative).unwrap();
+    for input in ["xoxb-not-a-real-token", "xoxb-GGGGGGGGGG"] {
+        assert!(
+            scanner.scan(input).unwrap().findings.is_empty(),
+            "{input} was reported as a Slack token"
+        );
+    }
+    let shaped = "xoxp-1234567890-1234567890-1234567890-abcdefghijklmnopqrstuvwxyz1234";
+    assert!(
+        !scanner.scan(shaped).unwrap().findings.is_empty(),
+        "a well-formed token stopped reporting"
+    );
+}
+
 /// The keyed rules stay outside those safelists and carry their own suppressors.
 #[test]
 fn overlay_keyed_rules_stay_outside_the_upstream_safelists() {

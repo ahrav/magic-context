@@ -433,19 +433,23 @@ fn has_secret_key_token(key: &[u8]) -> bool {
 }
 
 fn is_secret_key_token(token: &[u8]) -> bool {
-    SECRET_KEY_WORDS.iter().any(|word| {
-        if token.eq_ignore_ascii_case(word) {
-            return true;
-        }
-        let Some(prefix_len) = token.len().checked_sub(word.len()) else {
-            return false;
-        };
-        prefix_len > 0
-            && token[prefix_len..].eq_ignore_ascii_case(word)
-            && KEY_QUALIFIERS
-                .iter()
-                .any(|qualifier| token[..prefix_len].eq_ignore_ascii_case(qualifier))
-    })
+    SECRET_KEY_WORDS
+        .iter()
+        .any(|word| token_matches_key_name(token, word))
+}
+
+fn token_matches_key_name(token: &[u8], name: &[u8]) -> bool {
+    if token.eq_ignore_ascii_case(name) {
+        return true;
+    }
+    let Some(prefix_len) = token.len().checked_sub(name.len()) else {
+        return false;
+    };
+    prefix_len > 0
+        && token[prefix_len..].eq_ignore_ascii_case(name)
+        && KEY_QUALIFIERS
+            .iter()
+            .any(|qualifier| token[..prefix_len].eq_ignore_ascii_case(qualifier))
 }
 
 fn key_tokens(key: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -662,12 +666,13 @@ fn local_context_allows(
         return Ok(false);
     }
     if let Some(keys) = &spec.key_names_any {
-        for key in keys {
-            if contains_charged_ignore_case(before, key.as_bytes(), work, limits)? {
-                return Ok(true);
-            }
-        }
-        return Ok(false);
+        add_work(work, before.len(), limits.max_work_bytes)?;
+        // Compared per identifier token rather than as a substring, so the `key` inside `monkey` and the `auth` inside `author` do not satisfy the gate.
+        let matched = key_tokens(before).any(|token| {
+            keys.iter()
+                .any(|key| token_matches_key_name(token, key.as_bytes()))
+        });
+        return Ok(matched);
     }
     Ok(true)
 }
@@ -861,23 +866,43 @@ fn validate_pypi(value: &[u8]) -> OfflineVerdict {
     }
 }
 
+// Recognized prefixes return Invalid for body-shape violations; unrecognized prefixes return Indeterminate. The upstream Slack rules spell the first segment after the prefix as a numeric identifier, except `xox[ar]`, which allows one alphanumeric segment.
 fn validate_slack(value: &[u8]) -> OfflineVerdict {
     if value.len() < 10 {
         return OfflineVerdict::Indeterminate;
     }
     let prefix = &value[..4];
-    if value.get(4) != Some(&b'-') && !value.starts_with(b"xoxe.xox") {
+    let body_start = if value.get(4) == Some(&b'-') {
+        5
+    } else if starts_with_ignore_ascii_case(value, b"xoxe.xox") {
+        match value.iter().position(|byte| *byte == b'-') {
+            Some(dash) => dash + 1,
+            None => return OfflineVerdict::Indeterminate,
+        }
+    } else {
+        return OfflineVerdict::Indeterminate;
+    };
+    let numeric_identifier = matches!(prefix, b"xoxb" | b"xoxp" | b"xoxo" | b"xoxs")
+        || prefix.eq_ignore_ascii_case(b"xapp")
+        || prefix.eq_ignore_ascii_case(b"xoxe");
+    let alphanumeric_identifier = matches!(prefix, b"xoxa" | b"xoxr");
+    if !numeric_identifier && !alphanumeric_identifier {
         return OfflineVerdict::Indeterminate;
     }
-    if matches!(
-        prefix,
-        b"xoxb" | b"xoxp" | b"xoxo" | b"xoxs" | b"xoxa" | b"xoxr"
-    ) || prefix.eq_ignore_ascii_case(b"xapp")
-        || prefix.eq_ignore_ascii_case(b"xoxe")
-    {
+    let segment = value[body_start..]
+        .split(|byte| *byte == b'-')
+        .next()
+        .unwrap_or_default();
+    let shaped = !segment.is_empty()
+        && if alphanumeric_identifier {
+            segment.iter().all(u8::is_ascii_alphanumeric)
+        } else {
+            segment.iter().all(u8::is_ascii_digit)
+        };
+    if shaped {
         OfflineVerdict::Valid
     } else {
-        OfflineVerdict::Indeterminate
+        OfflineVerdict::Invalid
     }
 }
 
