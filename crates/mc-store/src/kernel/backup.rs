@@ -358,6 +358,10 @@ impl KernelStore {
             }
         };
 
+        // Every return between staging and the guarded section below would otherwise
+        // leave a full database copy behind, so the staged file is owned until the
+        // section that already cleans it up takes over.
+        let mut staged = StagedRestore(Some(temp_path.as_path()));
         let mut writer = self.lock_writer()?;
         // Matching `lock_reader`, a poisoned guard is recovered rather than failing
         // the restore: the connection behind it is replaced immediately below.
@@ -400,6 +404,7 @@ impl KernelStore {
         drop(old_readers);
         drop(old_writer);
         let mut displaced = false;
+        staged.disarm();
         let restore_result = (|| {
             if fault_before_displace {
                 return Err(KernelError::Fault);
@@ -1041,7 +1046,15 @@ pub(super) fn reap_orphan_restore_recovery(path: &Path) -> Result<(), KernelErro
             continue;
         }
         let candidate = entry.path();
-        if !candidate.is_dir() || !generated_recovery_suffix(&entry.file_name(), &prefix) {
+        if !generated_recovery_suffix(&entry.file_name(), &prefix) {
+            continue;
+        }
+        // `is_dir` follows symlinks, so a symlinked candidate would redirect the
+        // unlinks below at whatever it points to.
+        let Ok(candidate_meta) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if !candidate_meta.is_dir() {
             continue;
         }
         // Removing only family members and then rmdir leaves any directory holding
@@ -1083,9 +1096,25 @@ fn remove_restore_scratch(path: &Path) -> Result<(), KernelError> {
     for entry in entries {
         let entry = entry.map_err(|_| KernelError::Inconclusive)?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && name.ends_with(".tmp") {
-            fs::remove_file(entry.path()).map_err(|_| KernelError::Inconclusive)?;
+        let Some(middle) = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        // `restore_temp_path` writes only decimal digits here, so anything else in
+        // the store root belongs to someone else.
+        if middle.is_empty() || !middle.chars().all(|c| c.is_ascii_digit()) {
+            continue;
         }
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        fs::remove_file(path).map_err(|_| KernelError::Inconclusive)?;
     }
     Ok(())
 }
@@ -1238,6 +1267,22 @@ fn remove_family(path: &Path) -> Result<(), KernelError> {
         }
     }
     sync_parent(path)
+}
+
+struct StagedRestore<'a>(Option<&'a Path>);
+
+impl StagedRestore<'_> {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StagedRestore<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn restore_temp_path(path: &Path) -> PathBuf {

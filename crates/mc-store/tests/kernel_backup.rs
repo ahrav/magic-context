@@ -1286,3 +1286,52 @@ fn restore_verifies_the_staged_copy_so_a_mutated_source_cannot_install() {
         .contains(".restore-")));
     assert_eq!(insert_domain(&store, 3, Sensitivity::Normal), 3);
 }
+
+#[test]
+fn orphan_cleanup_does_not_follow_symlinks_out_of_the_store_root() {
+    let root = private_dir();
+    let outside = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    drop(store);
+
+    // `is_dir` follows symlinks, so a symlinked candidate with a generated-looking
+    // suffix could otherwise redirect the unlinks at another directory.
+    let victim = outside.path().join("core.sqlite");
+    fs::write(&victim, b"someone else's database").unwrap();
+    let victim_wal = outside.path().join("core.sqlite-wal");
+    fs::write(&victim_wal, b"someone else's wal").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path(),
+        root.path().join("core.sqlite.mc-restore-123"),
+    )
+    .unwrap();
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(fs::read(&victim).unwrap(), b"someone else's database");
+    assert_eq!(fs::read(&victim_wal).unwrap(), b"someone else's wal");
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 1);
+}
+
+#[test]
+fn scratch_cleanup_spares_files_the_store_could_not_have_written() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    drop(store);
+
+    // `restore_temp_path` writes only decimal digits between the prefix and suffix.
+    let operator = root.path().join("core.sqlite.restore-incident.tmp");
+    fs::write(&operator, b"operator diagnostic").unwrap();
+    let generated = root.path().join("core.sqlite.restore-4242.tmp");
+    fs::write(&generated, b"leftover staging").unwrap();
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(
+        fs::read(&operator).unwrap(),
+        b"operator diagnostic",
+        "operator file was deleted"
+    );
+    assert!(!generated.exists(), "generated scratch was not reclaimed");
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 1);
+}
