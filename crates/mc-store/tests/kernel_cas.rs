@@ -852,3 +852,58 @@ fn change_payload_redactions_cover_every_emitted_object_field() {
         );
     }
 }
+
+#[test]
+fn oversized_existing_object_is_rejected_during_ingest_verification() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"verification bait".to_vec();
+    let digest = format!("{:x}", Sha256::digest(&payload));
+
+    let shard = root.path().join("artifacts/objects").join(&digest[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    fs::set_permissions(&shard, fs::Permissions::from_mode(0o700)).unwrap();
+    let object = shard.join(&digest[2..]);
+    fs::write(&object, vec![b'z'; 64 * MIB + 1]).unwrap();
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let error = store
+        .ingest_artifact(request("oversize-verify", payload))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::CorruptObject);
+    assert_eq!(reservation_count(root.path()), 0);
+    assert_eq!(staged_entries(root.path()), 0);
+}
+
+#[test]
+fn evidence_metadata_redactions_reach_the_ledger() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    let mut tainted = request("meta-ledger", b"metadata ledger".to_vec());
+    tainted.media_type = format!("text/plain; key={SECRET}");
+    tainted.retention_class = format!("canonical token={SECRET}");
+    let handle = store.ingest_artifact(tainted).unwrap();
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT field_name FROM durable_text_redactions
+             WHERE owner_kind='evidence' AND owner_id=?1 ORDER BY field_name",
+        )
+        .unwrap();
+    let fields = statement
+        .query_map([&handle.evidence_id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect::<Vec<_>>();
+    for expected in ["media_type", "retention_class"] {
+        assert!(
+            fields.iter().any(|field| field == expected),
+            "evidence ledger is missing {expected}: {fields:?}"
+        );
+    }
+}

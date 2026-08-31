@@ -1,5 +1,4 @@
 use std::fs::{self, File};
-use std::io::Read;
 
 use mc_core::redaction::Detection;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -9,8 +8,8 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "test-support")]
 use super::ArtifactIngestFault;
 use super::{
-    is_artifact_digest, ArtifactError, ArtifactErrorKind, ArtifactHandle, ArtifactIngestRequest,
-    ProviderEgress, MAX_PAYLOAD_BYTES,
+    is_artifact_digest, read_capped, ArtifactError, ArtifactErrorKind, ArtifactHandle,
+    ArtifactIngestRequest, ProviderEgress, MAX_PAYLOAD_BYTES,
 };
 use crate::kernel::durable_fs::{
     classify_io, create_new_file, durable_unlink, open_or_create_secure_directory,
@@ -593,6 +592,19 @@ fn insert_reference(
         Some(envelope.commit_seq),
     )?;
     for (name, field) in [
+        ("media_type", &media_type),
+        ("retention_class", &retention_class),
+    ] {
+        record(
+            envelope.tx,
+            "evidence",
+            &evidence_id.text,
+            name,
+            field,
+            Some(envelope.commit_seq),
+        )?;
+    }
+    for (name, field) in [
         ("object_id", &object_id),
         ("object_kind", &object_kind),
         ("domain_id", &domain_id),
@@ -689,12 +701,16 @@ fn artifact_is_reclaiming(
 }
 
 fn verify_object(shard: &File, name: &str, digest: &str) -> Result<(), ArtifactError> {
-    let mut object = open_regular_nofollow(shard, name)
+    let object = open_regular_nofollow(shard, name)
         .map_err(|_| ArtifactError::for_digest(ArtifactErrorKind::MissingObject, digest))?;
-    let mut bytes = Vec::new();
-    object
-        .read_to_end(&mut bytes)
-        .map_err(|_| ArtifactError::for_digest(ArtifactErrorKind::MissingObject, digest))?;
+    let Some(bytes) = read_capped(object)
+        .map_err(|_| ArtifactError::for_digest(ArtifactErrorKind::MissingObject, digest))?
+    else {
+        return Err(ArtifactError::for_digest(
+            ArtifactErrorKind::CorruptObject,
+            digest,
+        ));
+    };
     if format!("{:x}", Sha256::digest(bytes)) != digest {
         return Err(ArtifactError::for_digest(
             ArtifactErrorKind::CorruptObject,
