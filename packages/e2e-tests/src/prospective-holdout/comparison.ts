@@ -1,4 +1,5 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { compareCodeUnits } from "../code-unit-order";
 import type { CohortCloseManifest, ReleaseFreezeManifest } from "./contract";
 import { HoldoutContractError } from "./contract";
 import type { ProspectiveCellResult } from "./runner";
@@ -174,11 +175,15 @@ export function buildPairedFacts(
             status: isCompletePair(chosen) ? "complete" : "incomplete",
         });
     }
-    return facts.sort((left, right) =>
-        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`.localeCompare(
-            `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
-        )
-    );
+    return facts.sort(comparePairedFacts);
+}
+
+// Locale-dependent ordering and `:`-joined keys both let equal-ranking inputs decide order, so each field is compared in sequence.
+export function comparePairedFacts(left: PairedCaseFact, right: PairedCaseFact): number {
+    return compareCodeUnits(left.caseId, right.caseId) ||
+        compareCodeUnits(left.model, right.model) ||
+        compareCodeUnits(`${left.seed}`, `${right.seed}`) ||
+        compareCodeUnits(left.platform, right.platform);
 }
 
 export function assertAaSymmetry(left: ProspectiveCellResult, right: ProspectiveCellResult): void {

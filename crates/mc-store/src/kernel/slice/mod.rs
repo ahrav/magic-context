@@ -1,10 +1,17 @@
+mod alignment;
+mod read;
 mod write;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::Sensitivity;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub use alignment::{AlignmentRebuild, AlignmentRow, AlignmentSnapshot};
+pub use read::{DecisionRow, ObservationRow, SliceSnapshot};
+
+pub(crate) use alignment::{rebuild_alignment_tx, rebuild_alignment_with_writer};
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DecisionPayload {
     pub summary: String,
     pub rationale: String,
@@ -27,7 +34,7 @@ pub struct DecisionSpec {
     pub sensitivity: Sensitivity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ObservationPayload {
     pub summary: String,
     pub classification: String,

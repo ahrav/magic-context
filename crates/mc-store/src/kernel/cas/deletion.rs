@@ -198,9 +198,18 @@ impl KernelStore {
             .lock_writer()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
         let state = load_artifact_state(&writer, &request.identity)?;
+        // Idempotent replays bypass `commit_with_writer`, so check receipt conflicts here.
+        receipt_digest_conflict_free(&writer, &request.intent)?;
 
         if request.kind == ArtifactDeletionKind::Purge && state.tombstoned {
+            let repair = crate::kernel::slice::rebuild_alignment_with_writer(
+                &mut writer,
+                self.lease_epoch(),
+            );
             if state.pending_unlink {
+                // A pending unlink leaves the purge incomplete, so a repair failure is
+                // reportable here.
+                repair.map_err(|_| ArtifactError::new(ArtifactErrorKind::AlignmentRebuild))?;
                 self.complete_pending_purge_locked(&mut writer, &state.digest)?;
             }
             return Ok(result_from_state(&state, request.kind, true));
@@ -212,6 +221,11 @@ impl KernelStore {
                     &state.digest,
                 ));
             }
+            // Do not report a durable deletion as failed when alignment rebuild fails.
+            let _ = crate::kernel::slice::rebuild_alignment_with_writer(
+                &mut writer,
+                self.lease_epoch(),
+            );
             return Ok(result_from_state(&state, request.kind, true));
         }
 
@@ -238,7 +252,7 @@ impl KernelStore {
             })
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::InvalidInput))?;
             line.push(b'\n');
-            receipt_conflict_free(&writer, &request.intent, &state.barrier_id, request.kind)?;
+            receipt_describes_deletion(&writer, &request.intent, &state.barrier_id, request.kind)?;
             let mut log = self
                 .purge_intent_log
                 .lock()
@@ -730,15 +744,37 @@ fn load_artifact_state(
     })
 }
 
-/// Rejects a reused operation key that carries a different request digest, which
-/// the commit refuses after the purge intent would already be durable.
-fn receipt_conflict_free(
+/// Rejects a reused operation key that carries a different request digest.
+fn receipt_digest_conflict_free(
+    connection: &rusqlite::Connection,
+    intent: &CommitIntent,
+) -> Result<(), ArtifactError> {
+    let recorded: Option<String> = connection
+        .query_row(
+            "SELECT request_digest FROM operation_receipts
+             WHERE producer=?1 AND operation_key=?2",
+            params![
+                redact(&intent.producer).text,
+                redact(&intent.operation_key).text
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+    if recorded.is_some_and(|digest| digest != intent.request_digest) {
+        return Err(ArtifactError::new(ArtifactErrorKind::ReferenceCommit));
+    }
+    Ok(())
+}
+
+fn receipt_describes_deletion(
     connection: &rusqlite::Connection,
     intent: &CommitIntent,
     barrier_id: &str,
     kind: ArtifactDeletionKind,
 ) -> Result<(), ArtifactError> {
-    let recorded: Option<(String, String)> = connection
+    // `result_payload` is a BLOB column, so it cannot be read as a `String`.
+    let recorded: Option<(String, Vec<u8>)> = connection
         .query_row(
             "SELECT request_digest,result_payload FROM operation_receipts
              WHERE producer=?1 AND operation_key=?2",
@@ -757,7 +793,7 @@ fn receipt_conflict_free(
         return Err(ArtifactError::new(ArtifactErrorKind::ReferenceCommit));
     }
     // This receipt will be replayed, so it has to describe this deletion.
-    serde_json::from_str::<DeletionReceiptPayload>(&payload)
+    serde_json::from_slice::<DeletionReceiptPayload>(&payload)
         .ok()
         .filter(|stored| stored.barrier_id == barrier_id && stored.kind == kind)
         .map(|_| ())

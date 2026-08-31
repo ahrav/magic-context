@@ -664,46 +664,15 @@ impl KernelStore {
         if rows.is_empty() {
             return Err(KernelError::InvalidInput);
         }
-        let rows = rows
-            .iter()
-            .map(RedactedProjection::new)
-            .collect::<Result<Vec<_>, _>>()?;
+        let generation = rows[0].built_through_commit_seq;
         let mut writer = self.lock_writer()?;
         let tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
         check_fence(&tx, self.lease_epoch())?;
-        let generation = rows[0].built_through_commit_seq;
-        if rows
-            .iter()
-            .any(|row| row.built_through_commit_seq != generation)
-        {
-            return Err(KernelError::InvalidInput);
-        }
-        guard_projection_generation(&tx, generation)?;
-        truncate_alignment_projection(&tx)?;
-        for row in &rows {
-            tx.execute(
-                "INSERT INTO alignment_projection(
-                     decision_id,observation_id,alignment_kind,alignment_payload,
-                     built_through_commit_seq
-                 ) VALUES (?1,?2,?3,?4,?5)",
-                params![
-                    row.decision_id,
-                    row.observation_id,
-                    row.alignment_kind.text,
-                    row.alignment_payload
-                        .as_ref()
-                        .map(|field| field.text.as_bytes()),
-                    row.built_through_commit_seq,
-                ],
-            )
-            .map_err(map_sqlite)?;
-            row.record(&tx)?;
-        }
-        record_projection_generation(&tx, generation)?;
+        let published = replace_alignment_projection_tx(&tx, generation, rows)?;
         tx.commit().map_err(map_sqlite)?;
-        Ok(rows.len())
+        Ok(published)
     }
 
     /// Publishes an empty rebuild, so a rebuild that produced no alignments can retire the previous rows instead of leaving them queryable.
@@ -719,12 +688,63 @@ impl KernelStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite)?;
         check_fence(&tx, self.lease_epoch())?;
-        guard_projection_generation(&tx, built_through_commit_seq)?;
-        let removed = truncate_alignment_projection(&tx)?;
-        record_projection_generation(&tx, built_through_commit_seq)?;
+        let removed = replace_alignment_projection_tx(&tx, built_through_commit_seq, &[])?;
         tx.commit().map_err(map_sqlite)?;
         Ok(removed)
     }
+}
+
+/// `generation` is separate from `rows` because an empty rebuild still has to
+/// order later replacements. Callers that must reject an empty rebuild validate
+/// before calling.
+pub(super) fn replace_alignment_projection_tx(
+    tx: &Transaction<'_>,
+    generation: i64,
+    rows: &[AlignmentProjectionSpec],
+) -> Result<usize, KernelError> {
+    let rows = rows
+        .iter()
+        .map(RedactedProjection::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows
+        .iter()
+        .any(|row| row.built_through_commit_seq != generation)
+    {
+        return Err(KernelError::InvalidInput);
+    }
+    guard_projection_generation(tx, generation)?;
+    let removed = truncate_alignment_projection(tx)?;
+    {
+        let mut statement = tx
+            .prepare(
+                "INSERT INTO alignment_projection(
+                     decision_id,observation_id,alignment_kind,alignment_payload,
+                     built_through_commit_seq
+                 ) VALUES (?1,?2,?3,?4,?5)",
+            )
+            .map_err(map_sqlite)?;
+        for row in &rows {
+            statement
+                .execute(params![
+                    row.decision_id,
+                    row.observation_id,
+                    row.alignment_kind.text,
+                    row.alignment_payload
+                        .as_ref()
+                        .map(|field| field.text.as_bytes()),
+                    row.built_through_commit_seq,
+                ])
+                .map_err(map_sqlite)?;
+        }
+    }
+    for row in &rows {
+        row.record(tx)?;
+    }
+    record_projection_generation(tx, generation)?;
+    if rows.is_empty() {
+        return Ok(removed);
+    }
+    Ok(rows.len())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -760,7 +780,12 @@ fn commit_prepared_with_writer(
         if digest != intent.request_digest {
             return Err(KernelError::Conflict);
         }
+        let repair_alignment = commit_affects_alignment(&tx, commit_seq)?;
         tx.commit().map_err(map_sqlite)?;
+        if repair_alignment {
+            // The commit is already durable, so a repair failure cannot change its outcome.
+            let _ = super::slice::rebuild_alignment_with_writer(writer, lease_epoch);
+        }
         return Ok(CommitReceipt {
             commit_seq,
             result: String::from_utf8(result).map_err(|_| KernelError::Io)?,
@@ -801,6 +826,7 @@ fn commit_prepared_with_writer(
     if let Some(error) = envelope.poisoned {
         return Err(error);
     }
+    let rebuild_alignment = envelope.changes.iter().any(change_affects_alignment);
     let result = redact(&result);
 
     let payloads = envelope
@@ -902,12 +928,45 @@ fn commit_prepared_with_writer(
         &result,
         Some(commit_seq),
     )?;
+    if rebuild_alignment {
+        super::slice::rebuild_alignment_tx(&tx)?;
+    }
     tx.commit().map_err(map_sqlite)?;
     Ok(CommitReceipt {
         commit_seq,
         result: result.text,
         replayed: false,
     })
+}
+
+/// Single source for the pending-change and replay checks below, so a kind added
+/// here cannot reach only one of them.
+const ALIGNMENT_CHANGE_KINDS: &[&str] = &[
+    "decision_insert",
+    "observation_insert",
+    "decision_correct",
+    "observation_correct",
+    "decision_retire",
+    "observation_retire",
+    "artifact_deletion",
+];
+
+fn change_affects_alignment(change: &PendingChange) -> bool {
+    ALIGNMENT_CHANGE_KINDS.contains(&change.kind)
+}
+
+fn commit_affects_alignment(tx: &Transaction<'_>, commit_seq: i64) -> Result<bool, KernelError> {
+    let kinds = serde_json::to_string(ALIGNMENT_CHANGE_KINDS).map_err(|_| KernelError::Io)?;
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM change_event
+             WHERE commit_seq=?1
+               AND change_kind IN (SELECT value FROM json_each(?2))
+         )",
+        params![commit_seq, kinds],
+        |row| row.get(0),
+    )
+    .map_err(|_| KernelError::Io)
 }
 
 pub(super) fn commit_with_writer(
