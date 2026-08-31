@@ -173,7 +173,7 @@ pub(super) fn open_regular_nofollow(directory: &File, name: &str) -> Result<File
     let descriptor = rfs::openat(
         directory,
         name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(classify_errno)?;
