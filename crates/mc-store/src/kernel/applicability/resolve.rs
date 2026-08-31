@@ -52,6 +52,9 @@ enum CommitResolution {
 pub struct ResolutionLadder<'s> {
     snapshot: &'s CheckoutSnapshot,
     budget: &'s EvalBudget,
+    /// A shallow boundary truncates every graph walk, so a negative ancestry commentlint: allow(JUDGE)
+    /// result cannot be trusted. Read once per request. commentlint: allow(JUDGE)
+    shallow: bool,
     ancestry_cache: RefCell<HashMap<(ObjectId, ObjectId), Option<bool>>>,
     window: RefCell<Option<CandidateWindow>>,
     /// A candidate's patch identity depends only on its commit.
@@ -63,6 +66,7 @@ impl<'s> ResolutionLadder<'s> {
         Self {
             snapshot,
             budget,
+            shallow: snapshot.repo().is_shallow(),
             ancestry_cache: RefCell::new(HashMap::new()),
             window: RefCell::new(None),
             patch_id_cache: RefCell::new(HashMap::new()),
@@ -361,6 +365,10 @@ impl<'s> ResolutionLadder<'s> {
     /// `ancestor` is an ancestor of `descendant` exactly when it appears among
     /// their merge bases. Disjoint histories yield no base; lookup failures
     /// return `None`.
+    ///
+    /// A shallow clone also yields no base once the walk reaches a grafted commentlint: allow(JUDGE)
+    /// boundary, which is indistinguishable from disjoint history, so a commentlint: allow(JUDGE)
+    /// negative result there stays unknown. commentlint: allow(JUDGE)
     fn test_ancestry(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
         let repo = self.snapshot.repo();
         if repo.find_commit(descendant).is_err() || repo.find_commit(ancestor).is_err() {
@@ -371,7 +379,11 @@ impl<'s> ResolutionLadder<'s> {
         if self.budget.is_exhausted() {
             return None;
         }
-        Some(bases.iter().any(|base| base.detach() == ancestor))
+        let reachable = bases.iter().any(|base| base.detach() == ancestor);
+        if !reachable && self.shallow {
+            return None;
+        }
+        Some(reachable)
     }
 }
 
@@ -529,7 +541,7 @@ fn file_change_hash(
     budget: &EvalBudget,
 ) -> Result<Option<[u8; 32]>, ResolveObstacle> {
     use gix::object::tree::diff::ChangeDetached as Change;
-    use gix::objs::tree::EntryMode;
+    use gix::objs::tree::{EntryKind, EntryMode};
     type Side = Option<(ObjectId, EntryMode)>;
     let (kind, location, old, new): (&str, _, Side, Side) = match change {
         Change::Addition {
@@ -603,7 +615,13 @@ fn file_change_hash(
                     // Fixed-width inner digests keep content boundaries
                     // unambiguous.
                     let mut content = Sha256::new();
-                    if is_binary(&blob.data) {
+                    if mode.kind() == EntryKind::Link {
+                        // A symlink blob holds a target path, where a space commentlint: allow(JUDGE)
+                        // is part of the name and no NUL marks it binary, so commentlint: allow(JUDGE)
+                        // normalization would fold `a b` into `ab`. commentlint: allow(JUDGE)
+                        content.update(b"symlink\0");
+                        content.update(&blob.data);
+                    } else if is_binary(&blob.data) {
                         content.update(b"binary\0");
                         content.update(&blob.data);
                     } else {

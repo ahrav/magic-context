@@ -1098,3 +1098,112 @@ fn an_unreadable_captured_path_is_uncertain_not_unreachable() {
         "an unreadable captured path cannot yield a reachability verdict"
     );
 }
+
+#[test]
+fn symlink_targets_are_not_whitespace_normalized() {
+    use gix::objs::tree::EntryKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot_with_modes(
+        repo,
+        "main",
+        &[],
+        &[("link", "start", EntryKind::Link)],
+        "base",
+        1,
+    );
+    // A symlink target carries no NUL, so the binary sniff never fires and
+    // these two targets differ only by whitespace.
+    let spaced = commit_snapshot_with_modes(
+        repo,
+        "spaced",
+        &[base],
+        &[("link", "a b", EntryKind::Link)],
+        "spaced",
+        2,
+    );
+    let joined = commit_snapshot_with_modes(
+        repo,
+        "joined",
+        &[base],
+        &[("link", "ab", EntryKind::Link)],
+        "joined",
+        3,
+    );
+
+    let budget = EvalBudget::unbounded();
+    let spaced_id = compute_patch_id(repo, spaced, &budget).unwrap().unwrap();
+    let joined_id = compute_patch_id(repo, joined, &budget).unwrap().unwrap();
+    assert_ne!(
+        spaced_id, joined_id,
+        "`a b` and `ab` are different link targets"
+    );
+
+    // A regular file keeps the normalization the identity relies on.
+    let text_spaced = commit_snapshot(repo, "ts", &[base], &[("f.txt", "a b\n")], "ts", 4);
+    let text_joined = commit_snapshot(repo, "tj", &[base], &[("f.txt", "ab\n")], "tj", 5);
+    assert_eq!(
+        compute_patch_id(repo, text_spaced, &budget).unwrap(),
+        compute_patch_id(repo, text_joined, &budget).unwrap(),
+        "text still ignores whitespace"
+    );
+}
+
+#[test]
+fn shallow_boundaries_make_negative_ancestry_uncertain() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("a.txt", "a\n")], "base", 1);
+    let head = commit_snapshot(repo, "main", &[base], &[("a.txt", "b\n")], "head", 2);
+    // A commit on an unrelated branch is genuinely not an ancestor of HEAD.
+    let foreign = commit_snapshot(repo, "other", &[], &[("z.txt", "z\n")], "foreign", 3);
+
+    let budget = EvalBudget::unbounded();
+    let complete = checkout(&fixture, head);
+    assert_eq!(
+        ResolutionLadder::new(&complete, &budget)
+            .evaluate(&reachable_from(foreign, BTreeMap::new())),
+        GitConditionOutcome::DoesNotHold { historical: false },
+        "a complete history answers definitively"
+    );
+
+    // `.git/shallow` records grafted boundaries, and any non-empty file marks
+    // the repository shallow, so every walk may stop short of real history.
+    std::fs::write(fixture.root.join(".git/shallow"), format!("{base}\n")).unwrap();
+
+    let shallow = snapshot_checkout(&fixture.root, &budget).expect("snapshot succeeds");
+    assert_eq!(
+        ResolutionLadder::new(&shallow, &budget)
+            .evaluate(&reachable_from(foreign, BTreeMap::new())),
+        GitConditionOutcome::Uncertain,
+        "a truncated walk cannot prove non-ancestry"
+    );
+}
+
+#[test]
+fn sha256_length_anchors_stay_uncertain_on_a_sha1_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let head = commit_snapshot(repo, "main", &[], &[("a.txt", "a\n")], "base", 1);
+
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, head);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+
+    // The anchor vocabulary accepts 64-digit ids, and this build's gix carries
+    // only the sha1 backend, so such an id never parses into an object.
+    let sha256_oid = "ab".repeat(32);
+    assert_eq!(sha256_oid.len(), 64);
+    assert_eq!(
+        ladder.evaluate(&GitCondition::ReachableFrom {
+            oid: sha256_oid,
+            captures: BTreeMap::new(),
+        }),
+        GitConditionOutcome::Uncertain,
+        "an id this build cannot resolve is uncertain, never current"
+    );
+}
