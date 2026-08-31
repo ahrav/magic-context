@@ -120,17 +120,42 @@ describe("paired-delta scenario contract", () => {
         ).not.toThrow();
     });
 
-    it("rejects gold that falls outside the rendered field bound", () => {
+    it("rejects a claim that cannot render intact or is ill-formed", () => {
         const base = scenario();
-        const buried = `${"filler ".repeat(200)}alpha-17`;
+        const withClaim = (claim: string): Partial<ScenarioDeclaration> => ({
+            interventions: {
+                ...base.interventions,
+                r2: { memories: [{ claim, evidence: "Remember ID alpha-17." }] },
+            },
+        });
+        /** Past MAX_RENDER_FIELD_BYTES: R1 would receive a truncated claim while R3 gets it whole. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario(withClaim(`alpha-17 ${"filler ".repeat(200)}`))),
+        ).toThrow(/claim: exceeds-render-bound/);
+        /** A lone surrogate freezes but can never be seeded. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario(withClaim("alpha-17 \ud800"))),
+        ).toThrow(/claim: unicode-ill-formed/);
+    });
+
+    it("detects an answer leak across canonically equivalent spellings", () => {
+        const base = scenario();
+        /** Composed gold, decomposed in a post-insertion turn: identical to a reader. commentlint: allow(JUDGE) */
         expect(() =>
             parseScenarioDeclaration(scenario({
+                expectedAnswer: "caf\u00e9",
+                answerMatch: "case-insensitive",
+                turnScript: [
+                    { id: "turn-evidence", role: "user", content: "The venue is caf\u00e9." },
+                    base.turnScript[1]!,
+                    { id: "turn-probe", role: "user", content: "Write cafe\u0301 to the file." },
+                ],
                 interventions: {
                     ...base.interventions,
-                    r2: { memories: [{ claim: buried, evidence: buried }] },
+                    r2: { memories: [{ claim: "The venue is caf\u00e9.", evidence: "e" }] },
                 },
             })),
-        ).toThrow(/r2\.memories: answer-absent/);
+        ).toThrow(/turnScript: post-insertion-answer-leak/);
     });
 
     it("rejects a path answer satisfied only by a longer path", () => {

@@ -63,9 +63,19 @@ export const CHECK_ID_RE = idPattern("check");
 export const TURN_ID_RE = idPattern("turn");
 export const MEMORY_ID_RE = idPattern("mem");
 
+/** Canonical form before folding: composed and decomposed spellings render identically, so a decomposed answer in a turn is a leak of the composed gold. commentlint: allow(JUDGE) */
+const canonicalFold = (value: string): string => value.normalize("NFC").toLowerCase();
+
+/** The production claim encoder rejects a lone surrogate, so a declaration carrying one is unseedable. Uses the runtime predicate where present rather than restating the surrogate ranges. commentlint: allow(JUDGE) */
+function isWellFormedUnicode(value: string): boolean {
+    const wellFormed = (value as { isWellFormed?: () => boolean }).isWellFormed;
+    if (typeof wellFormed === "function") return wellFormed.call(value);
+    return !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(value);
+}
+
 /** A leak asks "could the model read the gold here", so any occurrence counts and case is folded: a model can re-case what it reads. Deliberately wider than the complete-value match used for gold presence, because the two fail safe in opposite directions. Shared so the freeze-time guard and a runner's pre-search gate cannot diverge. commentlint: allow(JUDGE) */
 export function revealsAnswer(expectedAnswer: string, text: string): boolean {
-    return text.toLowerCase().includes(expectedAnswer.toLowerCase());
+    return canonicalFold(text).includes(canonicalFold(expectedAnswer));
 }
 
 export class PairedDeltaContractError extends Error {
@@ -238,7 +248,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     /** Gold presence asks "can the arm derive the exact answer here", so only a complete value counts and a narrower match is the conservative one: `147` does not supply `47`. It also honors the declared casing policy, unlike the leak guard: under `exact` the verifier rejects a differently-cased answer, so folding here would certify gold the arm can never produce. Boundaries are code-point aware through `u`-flag lookaround rather than index arithmetic, which would read one UTF-16 unit and see an astral letter's low surrogate as a separator. Letters, numbers, combining marks, `_`, `-`, `/`, and `\` are value characters, so a longer path cannot satisfy a path answer under either separator; `.`, `;`, and `,` are not, so a trailing sentence period still matches. commentlint: allow(JUDGE) */
     const suppliesAnswer = (text: string): boolean => {
         const fold = (value: string): string =>
-            answerMatch === "exact" ? value : value.toLowerCase();
+            answerMatch === "exact" ? value.normalize("NFC") : canonicalFold(value);
         const escaped = fold(expectedAnswer).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         const valueChar = "[\\p{L}\\p{N}\\p{M}_/\\\\-]";
         /** A `.` bounded by value characters continues the value rather than ending it, so `47.5` does not supply `47`, while a terminal `.` still does. commentlint: allow(JUDGE) */
@@ -303,8 +313,14 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         "scenario.interventions.r2.memories",
     );
     /** R2 seeds these as verified project memory and the `<project-memory>` renderer exposes the claim, not this declaration's `evidence` provenance. With no claim carrying the answer the arm receives no gold and reproduces R1, so `R2 - R1` and `R3 - R2` describe a malformed intervention. One claim suffices: gold may be spread across a multi-locator set. commentlint: allow(JUDGE) */
-    /** Checked against the rendered form: `ctx_search` bounds each field to MAX_RENDER_FIELD_BYTES, so an answer past that cut is never delivered and R1 would fail on truncation rather than retrieval while the row still satisfies the delivery gate by id. commentlint: allow(JUDGE) */
-    if (!memories.some(({ claim }) => suppliesAnswer(boundDynamicField(claim)))) {
+    /** Every claim must survive rendering byte-for-byte. `ctx_search` bounds each field to MAX_RENDER_FIELD_BYTES, so a longer claim reaches R1 truncated while R3 — derived from the raw claims — receives it whole, and the arms then compare different gold. Bounding the claim also keeps it far inside any configured R2 injection budget, which skips a claim it cannot fit rather than truncating it. commentlint: allow(JUDGE) */
+    for (const [index, { claim }] of memories.entries()) {
+        const label = `scenario.interventions.r2.memories[${index}].claim`;
+        if (boundDynamicField(claim) !== claim) p.fail(`${label}: exceeds-render-bound`);
+        /** `seedGoldMemories` writes through the production claim encoder, which rejects a lone surrogate, so an ill-formed claim freezes but can never be seeded. commentlint: allow(JUDGE) */
+        if (!isWellFormedUnicode(claim)) p.fail(`${label}: unicode-ill-formed`);
+    }
+    if (!memories.some(({ claim }) => suppliesAnswer(claim))) {
         p.fail("scenario.interventions.r2.memories: answer-absent");
     }
     /** `r2.memories` is the declaration's only gold, so it is also what a runner seeds and resolves `r1.locatorIds` against. Unequal lengths leave a handle with no `publicClaimId` to map to and make R1 and R2 compare different gold sets; pairing is positional. commentlint: allow(JUDGE) */
