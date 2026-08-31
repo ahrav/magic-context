@@ -51,6 +51,42 @@ missing inputs rather than for a real regression:
 it, so the gate scripts' own unit suites are covered by CI even though the
 artifact and smoke gates are not.
 
+## Secret scanner qualification
+
+Secret scanner authority has a separate retained-artifact gate. Build the exact
+candidate first, retain it, then pass that executable to the qualifier:
+
+```sh
+cargo build -p mc-core --no-default-features --bin qualify-secret-scanner-artifact
+bun run qualify:secret-scanner -- \
+  --seed 1297305419 \
+  --artifact target/debug/qualify-secret-scanner-artifact \
+  --manifest crates/mc-secret-scanner/tests/fixtures/qualification-manifest-v1.json \
+  --out-root docs/evidence/secret-scanner
+```
+
+The runner hashes the executable and manifest, invokes that executable rather
+than rebuilding or substituting another scanner, and writes
+`<out-root>/<artifact-sha256>/qualification-v1.json`. It validates the receipt
+against `docs/schemas/secret-scanner-qualification-v1.schema.json`.
+
+The checked-in manifest is tooling-only. It has one synthetic fixture, zero
+qualification quota, unassessed matrix cells, and no operational review. A
+receipt from it must report `authority_verdict: "refused"`; it is not release or
+operational qualification evidence. Authority can report `qualified` only when
+the runner uses `new_authority_legacy_shadow`, the frozen feasible-cell quotas
+total exactly 300,000, every feasible cell has at least 10,000 scans, impossible
+cells have zero quota, every planned scan ran, all fixture and scanner gates
+pass, and the operational divergence review is complete. Do not fill the matrix
+with duplicated synthetic cases to satisfy the count.
+
+`secret-scanner-upstream-drift` and `cargo-deny` are independent release-blocking
+CI jobs. Upstream fetch failure, a missing pinned/default ref, source-inventory
+mismatch, and default-branch source drift are distinct failures. The drift job
+never updates local source; review and record a disposition in
+`crates/mc-secret-scanner/UPSTREAM-DISPOSITIONS.md` before changing the pin or
+copied files.
+
 ## Release owner checklist
 
 1. Provision the canary environment and export the `MC_HOST_CANARY_*` inputs.

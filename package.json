@@ -4,6 +4,7 @@
     "packages/*"
   ],
   "devDependencies": {
+    "ajv": "8.17.1",
     "typescript": "5.9.3"
   },
   "scripts": {
@@ -38,6 +39,8 @@
     "release:qualify": "bun scripts/run-mc-host-closure-qualification.ts && bun scripts/qualify-mc-host-production-inputs.ts",
     "release:qualify:check": "bun scripts/qualify-mc-host-production-inputs.ts --check",
     "release:qualify:require": "bun scripts/qualify-mc-host-production-inputs.ts --require-qualified --verify-bytes",
+    "qualify:secret-scanner": "bun scripts/qualify-secret-scanner.ts",
+    "check:secret-scanner-upstream": "sh scripts/check-secret-scanner-upstream-drift.sh",
     "release:closures:check": "bun scripts/run-mc-host-closure-qualification.ts",
     "release:retained-fd:smoke": "bun scripts/smoke-mc-host-retained-fd.ts",
     "release:cross-harness:smoke": "bun scripts/smoke-mc-host-cross-harness.ts",

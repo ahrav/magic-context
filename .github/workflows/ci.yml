@@ -603,6 +603,100 @@ jobs:
       - name: mc-core feature-off build
         run: cargo check -p mc-core --no-default-features
 
+  secret-scanner-msrv:
+    name: Secret scanner (Rust 1.93, Linux x64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: rustfmt
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      - name: Build and test supported scanner surfaces
+        run: |
+          cargo test -p mc-secret-scanner
+          cargo check -p mc-core --no-default-features --bin qualify-secret-scanner-artifact
+
+      - name: Pure-Rust scanner check without a native compiler
+        env:
+          CC: /definitely-unavailable/cc
+          CXX: /definitely-unavailable/c++
+          CARGO_TARGET_DIR: target/no-native-compiler
+        run: cargo check -p mc-secret-scanner
+
+  secret-scanner-macos-build:
+    name: Secret scanner build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      - name: Build private scanner crate
+        run: cargo build -p mc-secret-scanner --target "${{ matrix.target }}"
+
+  cargo-deny:
+    name: Cargo dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.93.0
+
+      - uses: taiki-e/install-action@cargo-deny
+
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
+
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny check
+
+  secret-scanner-upstream-drift:
+    name: Secret scanner upstream drift (release blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Compare watched Gossip sources without updating local files
+        run: sh scripts/check-secret-scanner-upstream-drift.sh
+
   benchmark-retrieval-check:
     name: Benchmark (retrieval, deterministic CI profile)
     runs-on: ubuntu-latest
