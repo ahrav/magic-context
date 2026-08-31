@@ -141,6 +141,11 @@ describe("isCredentialBearingConfigKey", () => {
             "verificationToken",
             // An identity token is a credential, whatever the plural suggests.
             "identityTokens",
+            // A trailing descriptor names the field, not the thing.
+            "dbPasswordValue",
+            "masterKeyId",
+            "apiKeyHeader",
+            "accessTokenValue",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(true);
         }
@@ -160,6 +165,9 @@ describe("isCredentialBearingConfigKey", () => {
             "partitionKey",
             "sortKey",
             "hotkey",
+            // Structural keys keep their descriptors too.
+            "primaryKeyId",
+            "foreignKeyValue",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(false);
         }

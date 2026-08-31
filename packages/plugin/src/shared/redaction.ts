@@ -182,13 +182,18 @@ const STRUCTURAL_KEY_QUALIFIERS = [
 
 export function isCredentialBearingConfigKey(key: string): boolean {
     if (isSecretKey(key)) return true;
-    // Separators are dropped rather than split on, so `APIKEY` is judged like `api_key`.
-    const compact = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const segments = key
+    const allSegments = key
         .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
         .toLowerCase()
         .split(/[^a-z0-9]+/)
         .filter(Boolean);
+    /** A trailing descriptor names the field, not the thing: `dbPasswordValue` and `masterKeyId` are the credential their descriptor points at, and `primaryKeyId` is the structural key its descriptor points at. `isSecretKey` reads them the same way. commentlint: allow(JUDGE) */
+    const segments = [...allSegments];
+    while (segments.length > 1 && TRAILING_DESCRIPTORS.has(segments.at(-1) as string)) {
+        segments.pop();
+    }
+    // Separators are dropped rather than split on, so `APIKEY` is judged like `api_key`.
+    const compact = segments.join("");
     // The qualifier is read from the adjacent segment, not from any prefix of the compacted
     // key: `identityTokens` and `idleTokens` both begin with `id`.
     const qualifier = segments.length > 1 ? segments.at(-2) : undefined;

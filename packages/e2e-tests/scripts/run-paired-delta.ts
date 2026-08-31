@@ -211,9 +211,19 @@ function smokeExpectationDrift(
     args: CliArgs,
 ): string[] {
     const drift: string[] = [];
+    /** Keys are sorted before comparing: `exclusionCounts` and `providerCalls` are built in iteration order, so a change in arm scheduling or route resolution would otherwise report drift for identical content. commentlint: allow(JUDGE) */
+    const canonical = (value: unknown): string =>
+        JSON.stringify(value, (_key, nested: unknown) =>
+            nested !== null && typeof nested === "object" && !Array.isArray(nested)
+                ? Object.fromEntries(
+                    Object.entries(nested as Record<string, unknown>).sort(([left], [right]) =>
+                        left < right ? -1 : left > right ? 1 : 0
+                    ),
+                )
+                : nested);
     const expect = (label: string, actual: unknown, expected: unknown): void => {
-        const shown = JSON.stringify(actual);
-        const wanted = JSON.stringify(expected);
+        const shown = canonical(actual);
+        const wanted = canonical(expected);
         if (shown !== wanted) drift.push(`${label}: expected ${wanted}, observed ${shown}`);
     };
     expect("rolloutCount", summary.rolloutCount, SMOKE_EXPECTED_ROLLOUTS);
@@ -321,8 +331,13 @@ async function main(): Promise<void> {
     };
     console.log(JSON.stringify(summary, null, 2));
     const drift = smokeExpectationDrift(summary, args);
+    for (const line of drift) console.error(`smoke expectation: ${line}`);
+    /** A non-completed status outranks drift, because `harness-unreclaimed` means a live harness may still be running and a caller keyed on that code must not lose it: drift gets its own code only when the status itself reports success. commentlint: allow(JUDGE) */
+    if (result.status !== "completed") {
+        process.exitCode = EXIT_CODES[result.status];
+        return;
+    }
     if (drift.length > 0) {
-        for (const line of drift) console.error(`smoke expectation: ${line}`);
         process.exitCode = 4;
         return;
     }
