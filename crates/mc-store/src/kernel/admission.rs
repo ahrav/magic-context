@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "1f79e3f18543eb373baa6f82ef3cecd414213e4877b2347169ec72339688e9e3";
+    "d17b4723f865e93f9288fb098df9fab0f0febc8ff94debe0bf9c332a2fddba15";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -216,9 +216,14 @@ pub struct EvaluationInputs {
     pub prior: Option<PriorDecision>,
     pub candidate_sensitivity: Sensitivity,
     pub predecessor_sensitivity: Option<Sensitivity>,
+    /// Whether the approval cited by *this request* authorizes it.
     pub approval_valid: bool,
-    /// `approval_valid` alone cannot distinguish an absent approval from a rejected one.
-    pub authority_cited: bool,
+    /// Validity of the approval recorded on the *prior* decision, which bought any
+    /// support above the automatic ceiling. `None` when the prior decision cited
+    /// none. A caller's own citation cannot answer this question.
+    pub supporting_authority: Option<bool>,
+    /// Whether the subject is a live `adr_accepted` decision object.
+    pub subject_is_accepted_decision: bool,
     pub event: EventKind,
     pub has_evidence: bool,
 }
@@ -268,18 +273,20 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         .prior
         .map_or(Disposition::Active, |prior| prior.disposition);
     let ceiling = automatic_ceiling(input.source_class, input.taint_class);
-    // An invalid cited approval cannot preserve support above `ceiling`.
-    let carried_effective = if current_effective.rank() > ceiling.rank()
-        && input.authority_cited
-        && !input.approval_valid
-    {
-        ceiling
-    } else {
-        current_effective
-    };
+    // Support above `ceiling` survives only while the approval that granted it does.
+    let carried_effective =
+        if current_effective.rank() > ceiling.rank() && input.supporting_authority == Some(false) {
+            ceiling
+        } else {
+            current_effective
+        };
     let (requested, requested_disposition, requested_outcome) = event_effect(input.event, current);
-    let automatic_target_ceiling =
-        event_automatic_ceiling(input.event, input.source_class, input.taint_class);
+    let automatic_target_ceiling = event_automatic_ceiling(
+        input.event,
+        input.source_class,
+        input.taint_class,
+        input.subject_is_accepted_decision,
+    );
     let raises_support =
         event_can_raise_support(input.event) && requested.rank() > carried_effective.rank();
     // Leaving a restricted disposition makes restricted content searchable.
@@ -334,9 +341,10 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         )
         .max(input.predecessor_sensitivity.unwrap_or(Sensitivity::Normal));
     let visibility = visibility_row(effective, disposition);
-    // Resulting state does not encode which event was denied, so denied events
-    // are never treated as replays.
+    // Resulting state encodes neither which event was denied nor which evidence a
+    // request carried, so neither is treated as a replay.
     let no_op = !denied
+        && !input.has_evidence
         && input.prior.is_some_and(|prior| {
             prior.historical_maturity == historical
                 && prior.effective_maturity == effective
@@ -758,7 +766,18 @@ impl Envelope<'_> {
             audit: Some(revocation_audit),
         });
 
-        self.demote_authority_dependents(&approval_object_id, reason)
+        let audit_position = self.changes.len() - 1;
+        let (decisions, truncated) =
+            self.demote_authority_dependents(&approval_object_id, reason)?;
+        if let Some(audit) = self
+            .changes
+            .get_mut(audit_position)
+            .and_then(|change| change.audit.as_mut())
+        {
+            audit["demoted"] = serde_json::json!(decisions.len());
+            audit["truncated"] = serde_json::json!(truncated);
+        }
+        Ok(decisions)
     }
 
     /// Demotes every subject whose support descends from `authority_object_id`.
@@ -768,15 +787,22 @@ impl Envelope<'_> {
     /// future admissions but leaves C surfaced, so the closure follows dependents
     /// that are themselves approvals until no live authority remains.
     ///
-    /// `visited` bounds the walk over a cyclic authority graph, and each level is
-    /// bounded by [`MAX_APPROVAL_DEPENDENTS`]; together they cap the transaction at
-    /// [`MAX_AUTHORITY_DEMOTIONS`] demotions so revocation always completes in one
-    /// transaction rather than becoming unrevokable.
+    /// `visited` bounds the walk over a cyclic authority graph and each level is
+    /// bounded by [`MAX_APPROVAL_DEPENDENTS`], but neither bounds their product, so
+    /// [`MAX_AUTHORITY_DEMOTIONS`] caps the whole transaction.
+    ///
+    /// Reaching that cap truncates the walk rather than failing. Failing would roll
+    /// back the invalidation that prompted it, leaving the authority active and able
+    /// to grant new admissions, and every retry would meet the same graph — the
+    /// permanently unrevokable state the bound exists to prevent. A truncated walk
+    /// instead leaves descendants at their recorded visibility until their next
+    /// decision, where `evaluate_admission` clamps support to the automatic ceiling.
+    /// The returned flag reports the truncation for the caller's audit.
     fn demote_authority_dependents(
         &mut self,
         authority_object_id: &str,
         reason: &str,
-    ) -> Result<Vec<AdmissionDecision>, KernelError> {
+    ) -> Result<(Vec<AdmissionDecision>, bool), KernelError> {
         let mut decisions = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut frontier = vec![authority_object_id.to_string()];
@@ -789,7 +815,7 @@ impl Envelope<'_> {
                     continue;
                 }
                 if decisions.len() >= MAX_AUTHORITY_DEMOTIONS {
-                    return Err(KernelError::AdmissionPolicy);
+                    return Ok((decisions, true));
                 }
                 let request = AdmissionRequest {
                     candidate_id: None,
@@ -814,7 +840,7 @@ impl Envelope<'_> {
                 }
             }
         }
-        Ok(decisions)
+        Ok((decisions, false))
     }
 
     fn prepare_admission(
@@ -857,6 +883,17 @@ impl Envelope<'_> {
             request.event.approval_object_id.as_deref(),
             facts.subject_object_id(),
         )?;
+        let supporting_authority = match stored
+            .as_ref()
+            .and_then(|stored| stored.approval_object_id.as_deref())
+        {
+            Some(approval) => Some(validate_approval(
+                self,
+                Some(approval),
+                facts.subject_object_id(),
+            )?),
+            None => None,
+        };
         let trigger_valid = validate_trigger(self, &request.event, &facts)?;
         let evaluation = evaluate_admission(EvaluationInputs {
             source_class,
@@ -865,7 +902,11 @@ impl Envelope<'_> {
             candidate_sensitivity: facts.sensitivity,
             predecessor_sensitivity: None,
             approval_valid,
-            authority_cited: request.event.approval_object_id.is_some(),
+            supporting_authority,
+            subject_is_accepted_decision: subject_is_accepted_decision(
+                self,
+                facts.subject_object_id(),
+            )?,
             event: if trigger_valid {
                 request.event.kind
             } else {
@@ -1279,6 +1320,32 @@ fn enforce_approval_dependent_cap(
     Ok(())
 }
 
+/// Whether `subject_object_id` is a live `adr_accepted` decision object, the only
+/// kind that can hold authority.
+fn subject_is_accepted_decision(
+    envelope: &Envelope<'_>,
+    subject_object_id: Option<&str>,
+) -> Result<bool, KernelError> {
+    let Some(subject_object_id) = subject_object_id else {
+        return Ok(false);
+    };
+    envelope
+        .tx
+        .query_row(
+            &format!(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM object_registry o
+                     JOIN decisions d ON d.object_id=o.object_id
+                     WHERE o.object_id=?1 AND {APPROVAL_OBJECT_PREDICATE}
+                 )"
+            ),
+            [subject_object_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(map_sqlite)
+}
+
 /// Subjects whose latest decision still cites `approval_object_id`.
 ///
 /// `LIMIT` exceeds [`MAX_APPROVAL_DEPENDENTS`] by one so the caller can distinguish
@@ -1505,13 +1572,19 @@ const fn disposition_is_restricted(disposition: Disposition) -> bool {
 /// A human-authored accepted ADR roots the approval chain and reaches `Approved` automatically.
 /// Every other route to `Approved` cites an existing approval, which is unavailable before the
 /// first one exists.
+///
+/// `subject_is_accepted_decision` confines the exception to the object kind that can hold
+/// authority; without it any subject submitted as `ExplicitUser`/`UserExplicit` under
+/// `AcceptedAdr` would self-approve.
 const fn event_automatic_ceiling(
     event: EventKind,
     source: SourceClass,
     taint: TaintClass,
+    subject_is_accepted_decision: bool,
 ) -> Maturity {
     let ceiling = automatic_ceiling(source, taint);
-    if matches!(event, EventKind::AcceptedAdr)
+    if subject_is_accepted_decision
+        && matches!(event, EventKind::AcceptedAdr)
         && matches!(source, SourceClass::ExplicitUser)
         && matches!(taint, TaintClass::UserExplicit)
     {
@@ -1685,7 +1758,8 @@ mod tests {
                     candidate_sensitivity: Sensitivity::Normal,
                     predecessor_sensitivity: None,
                     approval_valid: false,
-                    authority_cited: false,
+                    supporting_authority: None,
+                    subject_is_accepted_decision: false,
                     event: EventKind::CodeObserved,
                     has_evidence: true,
                 };
@@ -1710,7 +1784,8 @@ mod tests {
                 assert_eq!(
                     evaluate_admission(EvaluationInputs {
                         approval_valid: true,
-                        authority_cited: true,
+                        supporting_authority: Some(true),
+                        subject_is_accepted_decision: false,
                         ..input
                     })
                     .unwrap()
@@ -1733,7 +1808,8 @@ mod tests {
                 candidate_sensitivity: Sensitivity::Normal,
                 predecessor_sensitivity: None,
                 approval_valid: false,
-                authority_cited: false,
+                supporting_authority: None,
+                subject_is_accepted_decision: false,
                 event: *event,
                 has_evidence: false,
             });
@@ -1756,7 +1832,8 @@ mod tests {
             candidate_sensitivity: Sensitivity::Normal,
             predecessor_sensitivity: None,
             approval_valid: false,
-            authority_cited: false,
+            supporting_authority: None,
+            subject_is_accepted_decision: false,
             event: EventKind::Verify,
             has_evidence: true,
         };
@@ -1771,7 +1848,8 @@ mod tests {
         assert_eq!(
             evaluate_admission(EvaluationInputs {
                 approval_valid: true,
-                authority_cited: true,
+                supporting_authority: Some(true),
+                subject_is_accepted_decision: false,
                 ..base
             })
             .unwrap()
@@ -1797,7 +1875,8 @@ mod tests {
             candidate_sensitivity: Sensitivity::Normal,
             predecessor_sensitivity: None,
             approval_valid: false,
-            authority_cited: false,
+            supporting_authority: None,
+            subject_is_accepted_decision: false,
             event: EventKind::ApprovalRevoked,
             has_evidence: false,
         })
@@ -1824,7 +1903,8 @@ mod tests {
                 candidate_sensitivity: Sensitivity::Normal,
                 predecessor_sensitivity: None,
                 approval_valid: false,
-                authority_cited: false,
+                supporting_authority: None,
+                subject_is_accepted_decision: false,
                 event: EventKind::Other,
                 has_evidence: false,
             }
@@ -1852,7 +1932,8 @@ mod tests {
             candidate_sensitivity: Sensitivity::Normal,
             predecessor_sensitivity: None,
             approval_valid: false,
-            authority_cited: false,
+            supporting_authority: None,
+            subject_is_accepted_decision: false,
             event: EventKind::CodeObserved,
             has_evidence: true,
         })
@@ -1868,7 +1949,8 @@ mod tests {
                 candidate_sensitivity: Sensitivity::Normal,
                 predecessor_sensitivity: None,
                 approval_valid: false,
-                authority_cited: false,
+                supporting_authority: None,
+                subject_is_accepted_decision: false,
                 event: EventKind::Other,
                 has_evidence: false,
             }),
@@ -1890,7 +1972,8 @@ mod tests {
             candidate_sensitivity: Sensitivity::Normal,
             predecessor_sensitivity: None,
             approval_valid: false,
-            authority_cited: false,
+            supporting_authority: None,
+            subject_is_accepted_decision: false,
             event: EventKind::Quarantine,
             has_evidence: false,
         })
@@ -1940,7 +2023,8 @@ mod tests {
                 candidate_sensitivity: Sensitivity::Normal,
                 predecessor_sensitivity: None,
                 approval_valid: false,
-                authority_cited: false,
+                supporting_authority: None,
+                subject_is_accepted_decision: false,
                 event: EventKind::Other,
                 has_evidence: false,
             })
@@ -1970,7 +2054,8 @@ mod tests {
             candidate_sensitivity: Sensitivity::Normal,
             predecessor_sensitivity: None,
             approval_valid: false,
-            authority_cited: false,
+            supporting_authority: None,
+            subject_is_accepted_decision: false,
             event,
             has_evidence: false,
         }
@@ -1981,12 +2066,25 @@ mod tests {
         let rooted = evaluate_admission(EvaluationInputs {
             source_class: SourceClass::ExplicitUser,
             taint_class: TaintClass::UserExplicit,
+            subject_is_accepted_decision: true,
             ..trusted_code_input(EventKind::AcceptedAdr)
         })
         .unwrap();
         assert_eq!(rooted.effective_maturity.get(), Maturity::Approved);
         assert_eq!(rooted.outcome, Outcome::Admit);
         assert_eq!(rooted.visibility, VisibilityRow::Automatic);
+
+        // The exception is confined to accepted-decision objects; any other
+        // subject submitted the same way must still buy authority.
+        let impostor = evaluate_admission(EvaluationInputs {
+            source_class: SourceClass::ExplicitUser,
+            taint_class: TaintClass::UserExplicit,
+            subject_is_accepted_decision: false,
+            ..trusted_code_input(EventKind::AcceptedAdr)
+        })
+        .unwrap();
+        assert_eq!(impostor.outcome, Outcome::Deny);
+        assert!(impostor.effective_maturity.get().rank() < Maturity::Approved.rank());
 
         // Only ExplicitUser/UserExplicit roots authority for an accepted ADR.
         for (source_class, taint_class) in [
@@ -1997,6 +2095,7 @@ mod tests {
             let denied = evaluate_admission(EvaluationInputs {
                 source_class,
                 taint_class,
+                subject_is_accepted_decision: true,
                 ..trusted_code_input(EventKind::AcceptedAdr)
             })
             .unwrap();
@@ -2031,7 +2130,8 @@ mod tests {
 
                 let authorized = evaluate_admission(EvaluationInputs {
                     approval_valid: true,
-                    authority_cited: true,
+                    supporting_authority: Some(true),
+                    subject_is_accepted_decision: false,
                     ..input
                 })
                 .unwrap();
@@ -2048,7 +2148,8 @@ mod tests {
         for event in [EventKind::Approve, EventKind::Enforce] {
             let unauthorized = evaluate_admission(EvaluationInputs {
                 prior: Some(approved_prior()),
-                authority_cited: true,
+                supporting_authority: Some(true),
+                subject_is_accepted_decision: false,
                 has_evidence: true,
                 ..trusted_code_input(event)
             })
@@ -2062,7 +2163,8 @@ mod tests {
     fn revoked_authority_cannot_carry_support_above_the_automatic_ceiling() {
         let input = EvaluationInputs {
             prior: Some(approved_prior()),
-            authority_cited: true,
+            // The prior decision's own approval no longer validates.
+            supporting_authority: Some(false),
             ..trusted_code_input(EventKind::CodeObserved)
         };
         let demoted = evaluate_admission(input).unwrap();
@@ -2071,13 +2173,34 @@ mod tests {
         assert_eq!(demoted.outcome, Outcome::DemoteSupport);
         assert!(!demoted.no_op);
 
+        // A still-valid supporting approval keeps the support it granted.
         let retained = evaluate_admission(EvaluationInputs {
-            approval_valid: true,
+            supporting_authority: Some(true),
             ..input
         })
         .unwrap();
         assert_eq!(retained.effective_maturity.get(), Maturity::Approved);
 
+        // A caller citing a bogus approval cannot demote a subject whose own
+        // supporting approval is untouched.
+        let unforgeable = evaluate_admission(EvaluationInputs {
+            approval_valid: false,
+            supporting_authority: Some(true),
+            ..trusted_code_input(EventKind::Other)
+        })
+        .unwrap();
+        assert_eq!(unforgeable.effective_maturity.get(), Maturity::Candidate);
+        let unforgeable = evaluate_admission(EvaluationInputs {
+            prior: Some(approved_prior()),
+            approval_valid: false,
+            supporting_authority: Some(true),
+            ..trusted_code_input(EventKind::Other)
+        })
+        .unwrap();
+        assert_eq!(unforgeable.effective_maturity.get(), Maturity::Approved);
+        assert_ne!(unforgeable.outcome, Outcome::DemoteSupport);
+
+        // Support never lifted by an approval is not clamped.
         let uncited = evaluate_admission(EvaluationInputs {
             prior: Some(PriorDecision {
                 historical_maturity: Maturity::Verified,

@@ -1828,6 +1828,10 @@ fn a_revocation_reason_survives_without_dependents() {
         payload["audit"]["approval_object_id"], "approval",
         "{payload}"
     );
+    // The fan-out outcome is reported on the approval's own change, so a truncated
+    // walk is observable rather than silent.
+    assert_eq!(payload["audit"]["demoted"], 0, "{payload}");
+    assert_eq!(payload["audit"]["truncated"], false, "{payload}");
     assert!(
         payload.to_string().contains("superseded by policy review"),
         "{payload}"
@@ -1863,5 +1867,137 @@ fn a_candidate_materializes_at_most_one_canonical_object() {
             "SELECT COUNT(*) FROM object_registry WHERE object_id='object-once-again'"
         ),
         0
+    );
+}
+
+#[test]
+fn a_bogus_citation_cannot_demote_a_validly_supported_subject() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "supported");
+    let mut promoted = request("supported");
+    promoted.source_class = Some(SourceClass::ModelInference);
+    promoted.taint_class = Some(TaintClass::AssistantInference);
+    promoted.event.kind = EventKind::Verify;
+    promoted.event.trigger_object_id = None;
+    promoted.event.approval_object_id = Some("approval".to_string());
+    assert_eq!(admit(&store, promoted, "supported", "promote"), "admit");
+
+    // The subject's own approval is untouched, so citing an unrelated object must
+    // not clamp its support.
+    store
+        .commit(intent("bogus-citation"), |envelope| {
+            let mut forged = subject_request("object-supported", EventKind::Other);
+            forged.source_class = Some(SourceClass::ModelInference);
+            forged.taint_class = Some(TaintClass::AssistantInference);
+            forged.event.approval_object_id = Some("approval-domain-object".to_string());
+            envelope.record_admission(forged)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT effective_maturity FROM admission_decisions
+             WHERE subject_object_id='object-supported'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "verified"
+    );
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT visibility FROM admission_decisions
+             WHERE subject_object_id='object-supported'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "automatic"
+    );
+}
+
+#[test]
+fn only_an_accepted_decision_object_self_approves() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    // `approval-domain-object` is a domain, not an `adr_accepted` decision, so the
+    // automatic root exception must not apply to it.
+    store
+        .commit(intent("impostor-adr"), |envelope| {
+            let mut impostor = subject_request("approval-domain-object", EventKind::AcceptedAdr);
+            impostor.source_class = Some(SourceClass::ExplicitUser);
+            impostor.taint_class = Some(TaintClass::UserExplicit);
+            let decision = envelope.record_admission(impostor)?.unwrap();
+            assert_eq!(decision.outcome.as_str(), "deny");
+            assert_ne!(decision.effective_maturity, Maturity::Approved);
+            Ok(String::new())
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_successful_resubmission_with_new_evidence_is_recorded() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "evidenced", "code_present", 1, "evidenced-trigger");
+    assert_eq!(
+        admit(&store, request("evidenced"), "evidenced", "evidenced"),
+        "admit"
+    );
+    let before = inspect(
+        directory.path(),
+        "SELECT COUNT(*) FROM admission_decisions WHERE subject_object_id='object-evidenced'",
+    );
+
+    // Re-observing with evidence attached carries information the resulting state
+    // does not encode, so it must not fold into a replay.
+    {
+        let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=ON;
+                 INSERT INTO object_registry(
+                     object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                     created_commit_seq,sensitivity_class
+                 ) VALUES (
+                     'evidence-object','evidence','trigger-evidenced','repo','evidence',1,1,
+                     'normal'
+                 );
+                 INSERT INTO evidence_meta(
+                     evidence_id,object_id,artifact_reference,artifact_digest,byte_length,
+                     media_type,retention_class,provider_egress_class,redaction_metadata,
+                     created_commit_seq,sensitivity_class
+                 ) VALUES (
+                     'evidence-1','evidence-object','local','digest',1,'text/plain','durable',
+                     'local',X'',1,'normal'
+                 );",
+            )
+            .unwrap();
+    }
+    store
+        .commit(intent("more-evidence"), |envelope| {
+            let mut again = subject_request("object-evidenced", EventKind::CodeObserved);
+            again.event.trigger_object_id = Some("observation-evidenced".to_string());
+            again.event.evidence_id = Some("evidence-1".to_string());
+            assert!(envelope.record_admission(again)?.is_some());
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM admission_decisions WHERE subject_object_id='object-evidenced'"
+        ),
+        before + 1
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM admission_decisions
+             WHERE subject_object_id='object-evidenced' AND evidence_id='evidence-1'"
+        ),
+        1
     );
 }
