@@ -5173,3 +5173,42 @@ fn a_decision_older_than_its_subject_grants_no_standing() {
         );
     }
 }
+
+#[test]
+fn an_invalidated_approval_still_serves_at_its_own_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    let admitted = 1;
+    assert!(store
+        .visible_as_of(Surface::AutoInject, admitted)
+        .unwrap()
+        .rows
+        .iter()
+        .any(|row| row.object.object_id == "approval"));
+    let revoked = store
+        .commit(intent("revoke-for-time-travel"), |envelope| {
+            envelope.revoke_approval("approval", "withdrawn")?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+
+    // Self-authority is a property of the snapshot, not of the latest state, so the
+    // earlier read must not change because the ADR was invalidated later.
+    assert!(
+        store
+            .visible_as_of(Surface::AutoInject, admitted)
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.object.object_id == "approval"),
+        "an ADR invalidated later must still serve at its own snapshot"
+    );
+    assert!(store
+        .visible_as_of(Surface::AutoInject, revoked)
+        .unwrap()
+        .rows
+        .iter()
+        .all(|row| row.object.object_id != "approval"));
+}

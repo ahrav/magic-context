@@ -1993,7 +1993,9 @@ impl KernelStore {
                                 SELECT 1 FROM decisions ad
                                 WHERE ad.object_id=o.object_id
                                   AND ad.decision_kind='adr_accepted'
-                                  AND ad.invalidated_commit_seq IS NULL
+                                  AND ad.created_commit_seq<=:governing_as_of
+                                  AND (ad.invalidated_commit_seq IS NULL
+                                       OR :governing_as_of<ad.invalidated_commit_seq)
                             ) AS accepted_decision
                      FROM object_registry o
                      JOIN admission_decisions d
