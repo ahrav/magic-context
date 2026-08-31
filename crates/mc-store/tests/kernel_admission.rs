@@ -275,7 +275,7 @@ fn missing_classification_rolls_back_commit_and_all_effects() {
 }
 
 #[test]
-fn duplicate_rejection_is_a_no_op_and_keeps_the_first_audit_row() {
+fn duplicate_rejection_appends_and_keeps_the_first_audit_row() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
     stage(&store, "rejected");
@@ -294,7 +294,7 @@ fn duplicate_rejection_is_a_no_op_and_keeps_the_first_audit_row() {
     };
     store
         .commit(intent("reject-1"), |envelope| {
-            assert!(envelope.record_admission(rejected.clone())?.is_some());
+            envelope.record_admission(rejected.clone())?;
             Ok(String::new())
         })
         .unwrap();
@@ -308,10 +308,12 @@ fn duplicate_rejection_is_a_no_op_and_keeps_the_first_audit_row() {
     );
     store
         .commit(intent("reject-2"), |envelope| {
-            assert!(envelope.record_admission(rejected)?.is_none());
+            envelope.record_admission(rejected)?;
             Ok(String::new())
         })
         .unwrap();
+    // The second rejection is a distinct attempt and gets its own row, but the
+    // first row is immutable.
     assert_eq!(
         inspect_text(
             directory.path(),
@@ -319,20 +321,30 @@ fn duplicate_rejection_is_a_no_op_and_keeps_the_first_audit_row() {
                  admission_decision_id,candidate_id,subject_object_id,source_kind,source_id,
                  source_revision,source_class,taint_class,maturity,disposition,visibility,
                  policy_revision,reason,evidence_id,approval_object_id,commit_seq,decided_at
-             ) FROM admission_decisions"
+             ) FROM admission_decisions
+             ORDER BY commit_seq,admission_decision_id LIMIT 1"
         ),
         original
     );
 
     assert_eq!(
         inspect(directory.path(), "SELECT COUNT(*) FROM admission_decisions"),
-        1
+        2
     );
     assert_eq!(
         inspect(directory.path(), "SELECT COUNT(*) FROM change_event"),
-        1
+        2
     );
-    assert_eq!(inspect(directory.path(), "SELECT COUNT(*) FROM outbox"), 1);
+    assert_eq!(inspect(directory.path(), "SELECT COUNT(*) FROM outbox"), 2);
+    // Both rows describe the same rejected state.
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM admission_decisions
+             WHERE disposition='rejected' AND outcome='reject'"
+        ),
+        2
+    );
 }
 
 #[test]
@@ -529,7 +541,7 @@ fn approval_revocation_fans_out_support_demotion_without_rewriting_history() {
             let mut later = subject_request("object-dependent-a", EventKind::Other);
             later.source_class = Some(SourceClass::ModelInference);
             later.taint_class = Some(TaintClass::AssistantInference);
-            let decision = envelope.record_admission(later)?.unwrap();
+            let decision = envelope.record_admission(later)?;
             assert_eq!(decision.historical_maturity.as_str(), "verified");
             assert_eq!(decision.effective_maturity.as_str(), "candidate");
             assert_eq!(decision.visibility.as_str(), "explicit_labeled");
@@ -878,22 +890,25 @@ fn same_envelope_prior_and_double_digit_ordinal_choose_the_last_decision() {
                 } else {
                     EventKind::MarkDisputed
                 };
-                let decision = envelope
-                    .record_admission(subject_request("ordinal-object", event))?
-                    .unwrap();
+                let decision =
+                    envelope.record_admission(subject_request("ordinal-object", event))?;
                 assert_eq!(decision.admission_decision_id, format!("2:{ordinal:020}"));
             }
-            assert!(envelope
-                .record_admission(subject_request("ordinal-object", EventKind::MarkStale,))?
-                .is_none());
+            let repeated = envelope
+                .record_admission(subject_request("ordinal-object", EventKind::MarkStale))?;
+            assert_eq!(
+                repeated.admission_decision_id,
+                format!("2:{:020}", 11),
+                "a repeated event still consumes an ordinal"
+            );
             Ok(String::new())
         })
         .unwrap();
     store
         .commit(intent("ordinal-latest"), |envelope| {
-            assert!(envelope
-                .record_admission(subject_request("ordinal-object", EventKind::MarkStale,))?
-                .is_none());
+            let decision = envelope
+                .record_admission(subject_request("ordinal-object", EventKind::MarkStale))?;
+            assert_eq!(decision.admission_decision_id, "3:00000000000000000000");
             Ok(String::new())
         })
         .unwrap();
@@ -1057,9 +1072,8 @@ fn same_envelope_subject_decision_after_admission_uses_the_recorded_prior() {
                     name: "name-candidate".to_string(),
                 },
             )?;
-            let decision = envelope
-                .record_admission(subject_request("object", EventKind::MarkStale))?
-                .unwrap();
+            let decision =
+                envelope.record_admission(subject_request("object", EventKind::MarkStale))?;
             assert_eq!(decision.historical_maturity, Maturity::Verified);
             assert_eq!(decision.sensitivity, Sensitivity::Normal);
             Ok(String::new())
@@ -1581,7 +1595,7 @@ fn revoking_an_approval_demotes_a_candidate_promoted_before_materialization() {
     approved.event.approval_object_id = Some("approval".to_string());
     store
         .commit(intent("promote-early"), |envelope| {
-            let decision = envelope.record_admission(approved)?.unwrap();
+            let decision = envelope.record_admission(approved)?;
             assert_eq!(decision.effective_maturity, Maturity::Approved);
             Ok(String::new())
         })
@@ -1794,7 +1808,7 @@ fn a_refused_decision_does_not_consume_approval_capacity() {
     refused.event.approval_object_id = Some("approval-domain-object".to_string());
     store
         .commit(intent("refused"), |envelope| {
-            let decision = envelope.record_admission(refused)?.unwrap();
+            let decision = envelope.record_admission(refused)?;
             assert_eq!(decision.outcome.as_str(), "deny");
             Ok(String::new())
         })
@@ -1932,7 +1946,7 @@ fn only_an_accepted_decision_object_self_approves() {
             let mut impostor = subject_request("approval-domain-object", EventKind::AcceptedAdr);
             impostor.source_class = Some(SourceClass::ExplicitUser);
             impostor.taint_class = Some(TaintClass::UserExplicit);
-            let decision = envelope.record_admission(impostor)?.unwrap();
+            let decision = envelope.record_admission(impostor)?;
             assert_eq!(decision.outcome.as_str(), "deny");
             assert_ne!(decision.effective_maturity, Maturity::Approved);
             Ok(String::new())
@@ -1984,7 +1998,7 @@ fn a_successful_resubmission_with_new_evidence_is_recorded() {
             let mut again = subject_request("object-evidenced", EventKind::CodeObserved);
             again.event.trigger_object_id = Some("observation-evidenced".to_string());
             again.event.evidence_id = Some("evidence-1".to_string());
-            assert!(envelope.record_admission(again)?.is_some());
+            envelope.record_admission(again)?;
             Ok(String::new())
         })
         .unwrap();
