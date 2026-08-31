@@ -120,6 +120,27 @@ describe("paired-delta scenario contract", () => {
         ).not.toThrow();
     });
 
+    it("rejects a path answer satisfied only by a longer path", () => {
+        const base = scenario();
+        const withPath = (content: string): Partial<ScenarioDeclaration> => ({
+            expectedAnswer: "db/migrations/x.sql",
+            turnScript: [
+                { id: "turn-evidence", role: "user", content },
+                ...base.turnScript.slice(1),
+            ],
+            interventions: {
+                ...base.interventions,
+                r2: { memories: [{ claim: content, evidence: content }] },
+            },
+        });
+        for (const longer of ["at /srv/db/migrations/x.sql now", "at old/db/migrations/x.sql/backup"]) {
+            expect(() => parseScenarioDeclaration(scenario(withPath(longer))))
+                .toThrow(/answer-absent/);
+        }
+        expect(() => parseScenarioDeclaration(scenario(withPath("write db/migrations/x.sql."))))
+            .not.toThrow();
+    });
+
     it("requires the gold answer as a complete value, not a substring", () => {
         const base = scenario();
         /** `alpha-17` inside `alpha-170` must not count as gold. commentlint: allow(JUDGE) */
@@ -487,5 +508,8 @@ describe("paired-delta manifest contract", () => {
                 scenarios: [{ ...entry, runModes: [] }],
             }),
         ).toThrow(/runModes: empty/);
+        expect(() =>
+            parsePairedDeltaManifest({ schema: PAIRED_DELTA_MANIFEST_SCHEMA, scenarios: [] }),
+        ).toThrow(/manifest\.scenarios: empty/);
     });
 });

@@ -109,15 +109,17 @@ export function dreamerEvalUnitFiles(root: string = E2E_ROOT): string[] {
 
 /** Credential-free paired-delta contract, runner, estimator, and pool tests. */
 export function pairedDeltaUnitFiles(root: string = E2E_ROOT): string[] {
+    const laneFiles = [...new Glob("src/paired-delta/**/*.test.ts").scanSync({
+        cwd: root,
+        onlyFiles: true,
+    })];
+    /** Checked before the helper file is appended: a literal entry would make the total length nonzero forever, so a glob that stopped matching would leave this lane green while running neither the frozen-pool nor the scenario contracts. commentlint: allow(JUDGE) */
+    if (laneFiles.length === 0) throw new Error("paired delta unit selection is empty");
     const files = [
-        ...new Glob("src/paired-delta/**/*.test.ts").scanSync({
-            cwd: root,
-            onlyFiles: true,
-        }),
+        ...laneFiles,
         /** The freeze script's only consumer today, and the `scripts/*.test.ts` glob above reaches this file only through `incident-regression-pool`, which `needs` the plugin checks and skips when they fail. Naming it here keeps the helper's symlink and cleanup guards covered by a job with no `needs`. commentlint: allow(JUDGE) */
         "scripts/atomic-json-write.test.ts",
     ].sort();
-    if (files.length === 0) throw new Error("paired delta unit selection is empty");
     return assertPresent(files, root);
 }
 
