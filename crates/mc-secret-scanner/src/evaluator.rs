@@ -211,7 +211,7 @@ fn evaluate_candidate(
     }
     if let Some(values) = &rule.declaration.value_suppressors_any {
         for item in values {
-            if contains_charged(value, item.as_bytes(), work, limits)? {
+            if contains_charged_ignore_case(value, item.as_bytes(), work, limits)? {
                 return Ok(None);
             }
         }
@@ -323,19 +323,9 @@ fn add_work(total: &mut usize, amount: usize, limit: usize) -> Result<(), Abort>
     Ok(())
 }
 
-fn contains_charged(
-    haystack: &[u8],
-    needle: &[u8],
-    work: &mut usize,
-    limits: ScanLimits,
-) -> Result<bool, Abort> {
-    add_work(work, haystack.len(), limits.max_work_bytes)?;
-    Ok(!needle.is_empty() && memchr::memmem::find(haystack, needle).is_some())
-}
-
-// Corpus rule patterns carry `(?i)`, so a case-sensitive keyword gate drops a
-// secret whose key is spelled in mixed case. Value suppressors stay
-// case-sensitive because widening them would suppress findings instead.
+// Corpus and overlay lists spell each keyword and suppressor in lowercase and
+// uppercase by hand, so a case-sensitive search misses the mixed-case spelling
+// of both: it drops a secret keyed `ApiKey` and reports a value of `ChangeMe`.
 // commentlint: allow(JUDGE)
 fn contains_charged_ignore_case(
     haystack: &[u8],

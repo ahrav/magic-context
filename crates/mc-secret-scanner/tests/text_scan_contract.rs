@@ -625,6 +625,43 @@ fn overlay_keyed_rules_stay_outside_the_upstream_safelists() {
     );
 }
 
+/// The keyed rules have no entropy floor and stay outside the engine safelists,
+/// so their suppressor list is the only thing standing between a placeholder and
+/// a finding.
+#[test]
+fn value_suppressors_match_mixed_case_placeholders() {
+    let scanner = Scanner::new(ScanProfile::Conservative).unwrap();
+    for value in [
+        "placeholder",
+        "PLACEHOLDER",
+        "Placeholder",
+        "changeme",
+        "CHANGEME",
+        "ChangeMe",
+        "Redacted",
+        "Dummy",
+        "ToDo",
+        "Example_Value",
+        "Your_Key_Here",
+        "NotASecret",
+        "XxXx",
+    ] {
+        let report = scanner.scan(&format!("password={value}")).unwrap();
+        assert!(
+            report.findings.is_empty(),
+            "password={value} was reported as a secret"
+        );
+    }
+    assert!(
+        !scanner
+            .scan("password=hunter-two")
+            .unwrap()
+            .findings
+            .is_empty(),
+        "a value matching no suppressor stopped reporting"
+    );
+}
+
 #[test]
 fn maximum_supported_input_has_a_defined_outcome() {
     let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
