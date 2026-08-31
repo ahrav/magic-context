@@ -1,3 +1,4 @@
+mod admission;
 mod backup;
 mod cas;
 mod durable_fs;
@@ -12,6 +13,11 @@ pub mod schema;
 mod scope;
 mod slice;
 
+pub use admission::{
+    evaluate_admission, surface_visibility, AdmissionEvent, Disposition, EffectiveMaturity,
+    Evaluation, EvaluationInputs, EventKind, Maturity, Outcome, PriorDecision, SourceClass,
+    Surface, SurfaceVisibility, TaintClass, VisibilityRow, POLICY_REVISION,
+};
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 pub use backup::filesystem_is_unsafe_for_test;
 #[cfg(all(target_os = "macos", feature = "test-support"))]
