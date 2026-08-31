@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "d23c8da07375faa79be83660c7126c0b722ed588daa4f676d84bd2782b108d6f";
+    "f464ffa934bdaa62f8ded420814d5575a08d51f9e85291bb3e3a0e015fd0b1ac";
 
 /// The enclosing query must bind `o` to `object_registry`.
 /// Serving and approval validation must agree on which decision governs an
@@ -505,8 +505,26 @@ fn latest_lineage_decision_sql(commit_bound: &str) -> String {
     )
 }
 
+/// The enclosing query must bind `o` to `object_registry`.
+/// An object earns standing only from a decision about itself. A lineage
+/// decision can restrict it or govern it, but never stand in for one it lacks.
+fn own_decision_exists_sql(commit_bound: &str) -> String {
+    format!(
+        "EXISTS (
+    SELECT 1 FROM admission_decisions own
+    WHERE own.subject_object_id=o.object_id
+      AND own.source_kind=o.source_kind
+      AND own.source_id=o.source_id
+      AND own.source_revision=o.source_revision
+      AND own.commit_seq IS NOT NULL
+      {commit_bound}
+)"
+    )
+}
+
 fn approval_qualifies_predicate(object_column: &str) -> String {
     let governing = governing_decision_for_object_sql("");
+    let own_decision = own_decision_exists_sql("");
     format!(
         "EXISTS(
              SELECT 1
@@ -515,10 +533,12 @@ fn approval_qualifies_predicate(object_column: &str) -> String {
              JOIN admission_decisions a ON a.admission_decision_id={governing}
              WHERE o.object_id={object_column} AND {APPROVAL_OBJECT_PREDICATE}
                AND a.taint_class='user_explicit'
+               AND a.source_class='explicit_user'
                AND a.effective_maturity IN ('approved','enforced')
                AND a.disposition='active'
                AND a.visibility='automatic'
                AND a.policy_revision={POLICY_REVISION}
+               AND {own_decision}
          )"
     )
 }
@@ -1772,6 +1792,7 @@ impl KernelStore {
     ) -> Result<VisibleAsOf, KernelError> {
         let governing = governing_decision_for_object_sql("AND a.commit_seq<=:governing_as_of");
         let lineage = latest_lineage_decision_sql("AND a.commit_seq<=:governing_as_of");
+        let own_decision = own_decision_exists_sql("AND own.commit_seq<=:governing_as_of");
         let (tip, rows) = self.read_snapshot(requested, |tx| {
             let mut statement = tx
                 .prepare(&format!(
@@ -1795,15 +1816,7 @@ impl KernelStore {
                      WHERE o.created_commit_seq<=:governing_as_of
                        AND (o.invalidated_commit_seq IS NULL
                             OR :governing_as_of<o.invalidated_commit_seq)
-                       AND EXISTS (
-                           SELECT 1 FROM admission_decisions gate
-                           WHERE gate.subject_object_id=o.object_id
-                             AND gate.source_kind=o.source_kind
-                             AND gate.source_id=o.source_id
-                             AND gate.source_revision=o.source_revision
-                             AND gate.commit_seq IS NOT NULL
-                             AND gate.commit_seq<=:governing_as_of
-                       )
+                       AND {own_decision}
                      ORDER BY o.object_id"
                 ))
                 .map_err(map_sqlite)?;

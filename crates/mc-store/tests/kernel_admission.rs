@@ -4079,3 +4079,97 @@ fn retiring_a_dependent_releases_approval_capacity() {
         .unwrap();
     assert_eq!(counted(directory.path()), 0);
 }
+
+#[test]
+fn an_approval_needs_standing_of_its_own_not_its_lineage() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // An accepted ADR with no decision about itself, sharing a lineage with an
+    // approved source-scoped decision, plus one whose own governing decision
+    // pairs a source class the evaluator forbids with `user_explicit`.
+    connection
+        .execute_batch(
+            "INSERT INTO object_registry(
+                 object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                 created_commit_seq,sensitivity_class
+             ) VALUES ('borrowed','decision','approval-domain','fixture','borrowed',1,1,'normal');
+             INSERT INTO decisions(
+                 decision_id,object_id,decision_kind,decision_payload,created_commit_seq,
+                 sensitivity_class
+             ) VALUES ('borrowed-decision','borrowed','adr_accepted',X'7b7d',1,'normal');
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'borrowed-lineage',NULL,'fixture','borrowed',1,'explicit_user','user_explicit',
+                 'other','approved','approved','active','automatic','admit','normal',1,'fixture',
+                 1,1
+             );
+             INSERT INTO object_registry(
+                 object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                 created_commit_seq,sensitivity_class
+             ) VALUES ('illegal','decision','approval-domain','fixture','illegal',1,1,'normal');
+             INSERT INTO decisions(
+                 decision_id,object_id,decision_kind,decision_payload,created_commit_seq,
+                 sensitivity_class
+             ) VALUES ('illegal-decision','illegal','adr_accepted',X'7b7d',1,'normal');
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'illegal-admission','illegal','fixture','illegal',1,'untrusted_web',
+                 'user_explicit','other','approved','approved','active','automatic','admit',
+                 'normal',1,'fixture',1,1
+             );",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    for (authority, candidate, domain, object) in [
+        (
+            "borrowed",
+            "borrows-standing",
+            "borrowed-domain",
+            "borrowed-object",
+        ),
+        (
+            "illegal",
+            "illegal-pairing",
+            "illegal-domain",
+            "illegal-object",
+        ),
+    ] {
+        stage(&store, candidate);
+        let mut approved = request(candidate);
+        approved.source_class = Some(SourceClass::ModelInference);
+        approved.taint_class = Some(TaintClass::AssistantInference);
+        approved.event.kind = EventKind::Verify;
+        approved.event.trigger_object_id = None;
+        approved.event.approval_object_id = Some(authority.to_string());
+        store
+            .commit(intent(candidate), |envelope| {
+                let decision = envelope.admit_domain_candidate(
+                    approved,
+                    AdmissionDomainSpec {
+                        domain_id: domain.to_string(),
+                        object_id: object.to_string(),
+                        name: format!("name-{candidate}"),
+                    },
+                )?;
+                assert_eq!(decision.outcome.as_str(), "deny", "authority {authority}");
+                Ok(String::new())
+            })
+            .unwrap();
+        assert_eq!(
+            inspect(
+                directory.path(),
+                &format!("SELECT COUNT(*) FROM object_registry WHERE object_id='{object}'")
+            ),
+            0
+        );
+    }
+}
