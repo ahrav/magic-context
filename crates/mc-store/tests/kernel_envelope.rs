@@ -520,11 +520,8 @@ fn projection_replace_repeats_when_a_field_carries_a_detected_secret() {
         .unwrap();
     assert_eq!(redactions.len(), 1);
     let (owner_id, field_name, secret_type) = &redactions[0];
-    // owner_id is generation-prefixed, so match the row identity and require the prefix to be
-    // a number rather than pinning the generation the fixture happens to reach.
-    let (generation, row_identity) = owner_id.split_once(':').unwrap();
-    assert!(generation.parse::<i64>().is_ok(), "{owner_id}");
-    assert_eq!(row_identity, "decision:observation");
+    // Prefixing `decision_id` with its length disambiguates ':' in either ID; the prefix does not affect ordering.
+    assert_eq!(owner_id, "8:decision:observation");
     assert_eq!(field_name, "alignment_payload");
     assert_eq!(secret_type, "anthropic_api_key");
     let stored: Vec<u8> = connection
