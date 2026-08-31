@@ -172,11 +172,11 @@ fn seed_approval(root: &std::path::Path) {
              ) VALUES ('approval-decision','approval','adr_accepted',X'7b7d',1,'normal');
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
-                 source_class,taint_class,maturity,disposition,visibility,policy_revision,
-                 reason,commit_seq,decided_at
+                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 policy_revision,reason,commit_seq,decided_at
              ) VALUES (
                  'approval-admission','approval','fixture','approval',1,'explicit_user',
-                 'user_explicit','approved','active','automatic',1,'fixture',1,1
+                 'user_explicit','approved','approved','active','automatic',1,'fixture',1,1
              );",
         )
         .unwrap();
@@ -1160,7 +1160,8 @@ fn malformed_stored_policy_and_sensitivity_fail_closed_without_read_error() {
     connection
         .execute(
             "UPDATE admission_decisions
-             SET maturity='future',disposition='future',visibility='future',policy_revision=0
+             SET maturity='future',effective_maturity='future',disposition='future',
+                 visibility='future',policy_revision=0
              WHERE subject_object_id='object-bad-policy'",
             [],
         )
@@ -1183,12 +1184,12 @@ fn malformed_stored_policy_and_sensitivity_fail_closed_without_read_error() {
              );
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
-                 source_class,taint_class,maturity,disposition,visibility,policy_revision,
-                 reason,commit_seq,decided_at
+                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 policy_revision,reason,commit_seq,decided_at
              ) VALUES (
                  'bad-sensitivity-decision','object-bad-sensitivity','fixture',
-                 'bad-sensitivity',1,'trusted_local_code','current_code','verified','active',
-                 'automatic',1,'fixture',2,2
+                 'bad-sensitivity',1,'trusted_local_code','current_code','verified','verified',
+                 'active','automatic',1,'fixture',2,2
              );
              INSERT INTO object_registry(
                  object_id,object_kind,domain_id,source_kind,source_id,source_revision,
@@ -1199,12 +1200,12 @@ fn malformed_stored_policy_and_sensitivity_fail_closed_without_read_error() {
              );
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
-                 source_class,taint_class,maturity,disposition,visibility,policy_revision,
-                 reason,commit_seq,decided_at
+                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 policy_revision,reason,commit_seq,decided_at
              ) VALUES (
                  'inconsistent-decision','object-inconsistent','fixture','inconsistent',1,
-                 'trusted_local_code','current_code','verified','rejected','automatic',1,
-                 'fixture',2,2
+                 'trusted_local_code','current_code','verified','verified','rejected',
+                 'automatic',1,'fixture',2,2
              );",
         )
         .unwrap();
@@ -1316,5 +1317,150 @@ fn rejection_survives_candidate_retention_and_applies_to_re_staged_source() {
              WHERE source_id='stable-source' AND candidate_id IS NULL"
         ),
         1
+    );
+}
+
+#[test]
+fn source_level_rejection_shadows_a_previously_admitted_object() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_from(&store, "first", "shared-source");
+    let admitted = store
+        .commit(intent("admit-first"), |envelope| {
+            envelope.insert_admission_observation_for_test(
+                "observation-first",
+                "code_present",
+                "domain-shadowed",
+                "repo",
+                "shared-source",
+                1,
+            )?;
+            envelope.admit_domain_candidate(
+                request("first"),
+                AdmissionDomainSpec {
+                    domain_id: "domain-shadowed".to_string(),
+                    object_id: "object-shadowed".to_string(),
+                    name: "name-first".to_string(),
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+    stage_from(&store, "second", "shared-source");
+    let rejected = store
+        .commit(intent("reject-shared"), |envelope| {
+            envelope.record_admission(AdmissionRequest {
+                candidate_id: Some("second".to_string()),
+                subject_object_id: None,
+                source_class: Some(SourceClass::TrustedLocalCode),
+                taint_class: Some(TaintClass::CurrentCode),
+                event: AdmissionEvent {
+                    kind: EventKind::ExplicitReject,
+                    trigger_object_id: None,
+                    approval_object_id: None,
+                    evidence_id: None,
+                    reason: "reject the shared source".to_string(),
+                },
+            })?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+
+    assert!(store
+        .visible_as_of(Surface::AutoInject, admitted)
+        .unwrap()
+        .rows
+        .iter()
+        .any(|row| row.object.object_id == "object-shadowed"));
+    assert!(store
+        .visible_as_of(Surface::AutoInject, rejected)
+        .unwrap()
+        .rows
+        .is_empty());
+    assert!(store
+        .visible_as_of(Surface::ExplicitSearch, rejected)
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+#[test]
+fn superseded_replacement_serves_only_after_its_own_decision() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "original");
+    let admitted = store
+        .commit(intent("original"), |envelope| {
+            envelope.insert_admission_observation_for_test(
+                "observation-original",
+                "code_present",
+                "domain-original",
+                "repo",
+                "source-original",
+                1,
+            )?;
+            envelope.admit_domain_candidate(
+                request("original"),
+                AdmissionDomainSpec {
+                    domain_id: "domain-original".to_string(),
+                    object_id: "object-original".to_string(),
+                    name: "name-original".to_string(),
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+    let replaced = store
+        .commit(intent("replace"), |envelope| {
+            envelope.supersede_domain(
+                subject_request("object-original", EventKind::Replace),
+                AdmissionDomainSpec {
+                    domain_id: "domain-successor".to_string(),
+                    object_id: "object-successor".to_string(),
+                    name: "successor".to_string(),
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+    let observed = store
+        .commit(intent("observe-successor"), |envelope| {
+            let mut request = subject_request("object-successor", EventKind::CodeObserved);
+            request.event.trigger_object_id = Some("observation-original".to_string());
+            envelope.record_admission(request)?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+
+    assert!(store
+        .visible_as_of(Surface::AutoInject, admitted)
+        .unwrap()
+        .rows
+        .iter()
+        .any(|row| row.object.object_id == "object-original"));
+    assert!(store
+        .visible_as_of(Surface::AutoInject, replaced)
+        .unwrap()
+        .rows
+        .is_empty());
+    assert!(store
+        .visible_as_of(Surface::ExplicitSearch, replaced)
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        store
+            .visible_as_of(Surface::AutoInject, observed)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.object.object_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["object-successor"]
     );
 }

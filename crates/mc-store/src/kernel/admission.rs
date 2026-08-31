@@ -7,7 +7,21 @@ use rusqlite::{params, OptionalExtension};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "0034e16f91e7481bd59a6e728d125d7c47dbff1844a0466c39f3e9ef8cc62d1c";
+    "ad9d8ca3e85fa8931340424d9fe156ba06501465662b9df7da59a7960a16b89e";
+
+/// The enclosing query must bind `a` to `admission_decisions`.
+const LATEST_SUBJECT_DECISION_SQL: &str = "NOT EXISTS (
+    SELECT 1 FROM admission_decisions newer
+    WHERE newer.subject_object_id=a.subject_object_id
+      AND newer.commit_seq IS NOT NULL
+      AND (
+          newer.commit_seq>a.commit_seq
+          OR (
+              newer.commit_seq=a.commit_seq
+              AND newer.admission_decision_id>a.admission_decision_id
+          )
+      )
+)";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -601,26 +615,15 @@ impl Envelope<'_> {
         let dependents = {
             let mut statement = self
                 .tx
-                .prepare(
+                .prepare(&format!(
                     "SELECT a.subject_object_id,a.source_class,a.taint_class
                      FROM admission_decisions a
                      WHERE a.approval_object_id=?1
                        AND a.subject_object_id IS NOT NULL
                        AND a.commit_seq IS NOT NULL
-                       AND NOT EXISTS (
-                           SELECT 1 FROM admission_decisions newer
-                           WHERE newer.subject_object_id=a.subject_object_id
-                             AND newer.commit_seq IS NOT NULL
-                             AND (
-                                 newer.commit_seq>a.commit_seq
-                                 OR (
-                                     newer.commit_seq=a.commit_seq
-                                     AND newer.admission_decision_id>a.admission_decision_id
-                                 )
-                             )
-                       )
-                     ORDER BY a.subject_object_id",
-                )
+                       AND {LATEST_SUBJECT_DECISION_SQL}
+                     ORDER BY a.subject_object_id"
+                ))
                 .map_err(map_sqlite)?;
             let rows = statement
                 .query_map([approval_object_id.as_str()], |row| {
@@ -805,9 +808,10 @@ impl Envelope<'_> {
             .execute(
                 "INSERT INTO admission_decisions(
                      admission_decision_id,candidate_id,subject_object_id,source_kind,source_id,
-                     source_revision,source_class,taint_class,maturity,disposition,visibility,
-                     policy_revision,reason,evidence_id,approval_object_id,commit_seq,decided_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                     source_revision,source_class,taint_class,maturity,effective_maturity,
+                     disposition,visibility,policy_revision,reason,evidence_id,approval_object_id,
+                     commit_seq,decided_at
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 params![
                     admission_decision_id,
                     prepared.facts.candidate_id,
@@ -818,6 +822,7 @@ impl Envelope<'_> {
                     prepared.source_class.as_str(),
                     prepared.taint_class.as_str(),
                     prepared.evaluation.historical_maturity.as_str(),
+                    prepared.evaluation.effective_maturity.get().as_str(),
                     prepared.evaluation.disposition.as_str(),
                     prepared.evaluation.visibility.as_str(),
                     POLICY_REVISION,
@@ -983,50 +988,50 @@ fn load_prior_decision(
     if let Some(prior) = envelope.admission_latest.get(&key) {
         return Ok(Some(prior.clone()));
     }
+    let map_row = |row: &rusqlite::Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
+        ))
+    };
     let row = if let Some(subject_object_id) = facts.subject_object_id.as_deref() {
         envelope.tx.query_row(
-            "SELECT admission_decision_id,maturity,disposition,source_class,taint_class,
-                    approval_object_id
+            "SELECT admission_decision_id,maturity,effective_maturity,disposition,source_class,
+                    taint_class,approval_object_id
              FROM admission_decisions
              WHERE subject_object_id=?1 AND commit_seq IS NOT NULL
              ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1",
             [subject_object_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            },
+            map_row,
         )
     } else {
         envelope.tx.query_row(
-            "SELECT admission_decision_id,maturity,disposition,source_class,taint_class,
-                    approval_object_id
+            "SELECT admission_decision_id,maturity,effective_maturity,disposition,source_class,
+                    taint_class,approval_object_id
              FROM admission_decisions
              WHERE source_kind=?1 AND source_id=?2 AND source_revision=?3
                AND commit_seq IS NOT NULL
              ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1",
             params![facts.source_kind, facts.source_id, facts.source_revision],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            },
+            map_row,
         )
     }
     .optional()
     .map_err(map_sqlite)?;
-    let Some((decision_id, maturity, disposition, source_class, taint_class, approval_object_id)) =
-        row
+    let Some((
+        decision_id,
+        maturity,
+        effective_maturity,
+        disposition,
+        source_class,
+        taint_class,
+        approval_object_id,
+    )) = row
     else {
         return Ok(None);
     };
@@ -1055,12 +1060,8 @@ fn load_prior_decision(
         .and_then(|audit| audit.get("sensitivity"))
         .and_then(|value| value.as_str())
         .map_or(Sensitivity::Secret, Sensitivity::from_stored);
-    let effective_maturity = audit
-        .as_ref()
-        .and_then(|audit| audit.get("effective_maturity"))
-        .and_then(|value| value.as_str())
-        .and_then(|value| Maturity::try_from(value).ok())
-        .unwrap_or(Maturity::Candidate);
+    let effective_maturity =
+        Maturity::try_from(effective_maturity.as_str()).unwrap_or(Maturity::Candidate);
     Ok(Some(StoredAdmission {
         decision: PriorDecision {
             historical_maturity: Maturity::try_from(maturity.as_str())
@@ -1117,33 +1118,24 @@ fn validate_approval(
     envelope
         .tx
         .query_row(
-            "SELECT EXISTS(
-                 SELECT 1
-                 FROM object_registry o
-                 JOIN decisions d ON d.object_id=o.object_id
-                 JOIN admission_decisions a ON a.subject_object_id=o.object_id
-                 WHERE o.object_id=?1 AND o.object_kind='decision'
-                   AND o.invalidated_commit_seq IS NULL
-                   AND d.decision_kind='adr_accepted'
-                   AND d.invalidated_commit_seq IS NULL
-                   AND a.taint_class='user_explicit'
-                   AND a.maturity IN ('approved','enforced')
-                   AND a.disposition='active'
-                   AND a.visibility='automatic'
-                   AND a.commit_seq IS NOT NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM admission_decisions newer
-                       WHERE newer.subject_object_id=a.subject_object_id
-                         AND newer.commit_seq IS NOT NULL
-                         AND (
-                             newer.commit_seq>a.commit_seq
-                             OR (
-                                 newer.commit_seq=a.commit_seq
-                                 AND newer.admission_decision_id>a.admission_decision_id
-                             )
-                         )
-                   )
-             )",
+            &format!(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM object_registry o
+                     JOIN decisions d ON d.object_id=o.object_id
+                     JOIN admission_decisions a ON a.subject_object_id=o.object_id
+                     WHERE o.object_id=?1 AND o.object_kind='decision'
+                       AND o.invalidated_commit_seq IS NULL
+                       AND d.decision_kind='adr_accepted'
+                       AND d.invalidated_commit_seq IS NULL
+                       AND a.taint_class='user_explicit'
+                       AND a.maturity IN ('approved','enforced')
+                       AND a.disposition='active'
+                       AND a.visibility='automatic'
+                       AND a.commit_seq IS NOT NULL
+                       AND {LATEST_SUBJECT_DECISION_SQL}
+                 )"
+            ),
             [approval_object_id],
             |row| row.get::<_, bool>(0),
         )
@@ -1201,6 +1193,12 @@ fn validate_trigger(
 
 impl KernelStore {
     /// Serving reads must use this filtered view; `known_as_of` remains an audit/replay view.
+    ///
+    /// An object serves only after it has its own committed decision.
+    /// Visibility uses the latest committed object- or source-level decision
+    /// at or before the snapshot — the same prior the writer evaluates against
+    /// — so a newer source-level rejection overrides an earlier object-level
+    /// admission.
     pub fn visible_as_of(
         &self,
         surface: Surface,
@@ -1211,25 +1209,35 @@ impl KernelStore {
                 .prepare(
                     "SELECT o.object_id,o.object_kind,o.domain_id,o.source_kind,o.source_id,
                             o.source_revision,o.created_commit_seq,NULL,NULL,o.sensitivity_class,
-                            a.maturity,a.disposition,a.visibility,a.taint_class
+                            d.effective_maturity,d.disposition,d.visibility,d.taint_class
                      FROM object_registry o
-                     JOIN admission_decisions a ON a.subject_object_id=o.object_id
+                     JOIN admission_decisions d ON d.admission_decision_id=(
+                         SELECT latest.admission_decision_id FROM (
+                             SELECT a.admission_decision_id,a.commit_seq
+                             FROM admission_decisions a
+                             WHERE a.subject_object_id=o.object_id
+                               AND a.commit_seq IS NOT NULL
+                               AND a.commit_seq<=?1
+                             UNION ALL
+                             SELECT a.admission_decision_id,a.commit_seq
+                             FROM admission_decisions a
+                             WHERE a.subject_object_id IS NULL
+                               AND a.source_kind=o.source_kind
+                               AND a.source_id=o.source_id
+                               AND a.source_revision=o.source_revision
+                               AND a.commit_seq IS NOT NULL
+                               AND a.commit_seq<=?1
+                         ) latest
+                         ORDER BY latest.commit_seq DESC,latest.admission_decision_id DESC
+                         LIMIT 1
+                     )
                      WHERE o.created_commit_seq<=?1
                        AND (o.invalidated_commit_seq IS NULL OR ?1<o.invalidated_commit_seq)
-                       AND a.commit_seq IS NOT NULL
-                       AND a.commit_seq<=?1
-                       AND NOT EXISTS (
-                           SELECT 1 FROM admission_decisions newer
-                           WHERE newer.subject_object_id=a.subject_object_id
-                             AND newer.commit_seq IS NOT NULL
-                             AND newer.commit_seq<=?1
-                             AND (
-                                 newer.commit_seq>a.commit_seq
-                                 OR (
-                                     newer.commit_seq=a.commit_seq
-                                     AND newer.admission_decision_id>a.admission_decision_id
-                                 )
-                             )
+                       AND EXISTS (
+                           SELECT 1 FROM admission_decisions gate
+                           WHERE gate.subject_object_id=o.object_id
+                             AND gate.commit_seq IS NOT NULL
+                             AND gate.commit_seq<=?1
                        )
                      ORDER BY o.object_id",
                 )
@@ -1238,31 +1246,26 @@ impl KernelStore {
                 .query_map([requested], |row| {
                     let mut object = object_row_from(row)?;
                     object.sensitivity =
-                        match TaintClass::try_from(row.get::<_, String>(13)?.as_str()) {
+                        match TaintClass::try_from(row.get::<_, String>("taint_class")?.as_str()) {
                             Ok(taint) => object.sensitivity.max(sensitivity_floor(taint)),
                             Err(_) => Sensitivity::Secret,
                         };
-                    let maturity = Maturity::try_from(row.get::<_, String>(10)?.as_str())
-                        .unwrap_or(Maturity::Candidate);
-                    let disposition = Disposition::try_from(row.get::<_, String>(11)?.as_str())
-                        .unwrap_or(Disposition::Quarantined);
                     let stored_visibility =
-                        VisibilityRow::try_from(row.get::<_, String>(12)?.as_str()).ok();
-                    let expected_visibility = visibility_row(maturity, disposition);
-                    let visibility_row = match (stored_visibility, expected_visibility) {
-                        (None | Some(VisibilityRow::AuditOnly), _)
-                        | (_, VisibilityRow::AuditOnly) => VisibilityRow::AuditOnly,
-                        (Some(VisibilityRow::ReviewOnly), _) | (_, VisibilityRow::ReviewOnly) => {
-                            VisibilityRow::ReviewOnly
+                        VisibilityRow::try_from(row.get::<_, String>("visibility")?.as_str()).ok();
+                    let expected_visibility = match (
+                        Maturity::try_from(row.get::<_, String>("effective_maturity")?.as_str()),
+                        Disposition::try_from(row.get::<_, String>("disposition")?.as_str()),
+                    ) {
+                        (Ok(effective), Ok(disposition)) => {
+                            Some(visibility_row(effective, disposition))
                         }
-                        (Some(VisibilityRow::ExplicitLabeled), _)
-                        | (_, VisibilityRow::ExplicitLabeled) => VisibilityRow::ExplicitLabeled,
-                        (Some(VisibilityRow::Automatic), VisibilityRow::Automatic) => {
-                            VisibilityRow::Automatic
-                        }
+                        _ => None,
                     };
-                    let visibility =
-                        surface_visibility(visibility_row, surface, object.sensitivity);
+                    let visibility = surface_visibility(
+                        served_visibility_row(stored_visibility, expected_visibility),
+                        surface,
+                        object.sensitivity,
+                    );
                     Ok((object, visibility))
                 })
                 .map_err(map_sqlite)?
@@ -1288,6 +1291,27 @@ impl KernelStore {
 }
 
 // policy-digest:tables-start
+pub const fn served_visibility_row(
+    stored: Option<VisibilityRow>,
+    expected: Option<VisibilityRow>,
+) -> VisibilityRow {
+    match (stored, expected) {
+        (None, _) | (_, None) => VisibilityRow::AuditOnly,
+        (Some(stored), Some(expected)) => match (stored, expected) {
+            (VisibilityRow::AuditOnly, _) | (_, VisibilityRow::AuditOnly) => {
+                VisibilityRow::AuditOnly
+            }
+            (VisibilityRow::ReviewOnly, _) | (_, VisibilityRow::ReviewOnly) => {
+                VisibilityRow::ReviewOnly
+            }
+            (VisibilityRow::ExplicitLabeled, _) | (_, VisibilityRow::ExplicitLabeled) => {
+                VisibilityRow::ExplicitLabeled
+            }
+            (VisibilityRow::Automatic, VisibilityRow::Automatic) => VisibilityRow::Automatic,
+        },
+    }
+}
+
 pub const fn surface_visibility(
     row: VisibilityRow,
     surface: Surface,
