@@ -24,6 +24,8 @@ License: MIT. The complete notice is in `NOTICE`.
 | `LICENSE` | `00b501fa03e6a1b190c0a4a2f2ef66fd57431a3c` | `96afec54cd8f9e6497c91826a6f9576e7ae92c3c3dd68c4c0b170d9b996e2e2d` | `crates/mc-secret-scanner/NOTICE` | Verbatim license terms with attribution |
 
 Local overlay: `crates/mc-secret-scanner/conservative_overlay.yaml`, SHA-256
-`8d04fbe0c261ab42bb0370138a42e25437889e8048620b0601bfb9619da140a9`.
+`e85ed1f8ad26fcc7f0f1ee5af5502c9324351e5c3b6ca2f1b2bc6ebfce3e46bb`.
 It is original Magic Context compatibility policy and is not copied from
-Gossip-rs.
+Gossip-rs. Its vendor rules reuse the lengths, alphabets, and offline
+validators of the corpus rule for the same credential, so a credential matched
+by both rule sets resolves to one verdict.

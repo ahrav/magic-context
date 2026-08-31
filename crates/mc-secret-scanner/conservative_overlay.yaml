@@ -1,43 +1,65 @@
 rules:
 - name: magic-anthropic-api-key
-  regex: '\bsk-ant-(?:api03-)?[A-Za-z0-9_-]{32,}'
+  regex: '\bsk-ant-(?:api03|admin01)-[A-Za-z0-9_-]{93}AA\b'
   anchors: [sk-ant-]
   radius: 256
+# The `T3BlbkFJ` marker prevents matches on `sk-ant-` keys and bare `sk-` identifiers.
 - name: magic-openai-api-key
-  regex: '\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}'
-  anchors: [sk-]
+  regex: '\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}T3BlbkFJ[A-Za-z0-9_-]{20,}'
+  anchors: [T3BlbkFJ]
   radius: 256
 - name: magic-github-pat
-  regex: '\bgithub_pat_[A-Za-z0-9_]{20,}'
+  regex: '\bgithub_pat_[A-Za-z0-9_]{82}\b'
   anchors: [github_pat_]
   radius: 256
+  offline_validation:
+    type: github_fine_grained_pat
 - name: magic-github-token
-  regex: '\b(?:gh[opsu]|ghr)_[A-Za-z0-9]{30,}'
+  regex: '\b(?:gh[opsu]|ghr)_[A-Za-z0-9]{36}\b'
   anchors: [ghp_, gho_, ghs_, ghu_, ghr_]
   radius: 256
+  offline_validation:
+    type: crc32_base62
+    prefix_skip: 4
+    payload_len: 30
+    checksum_len: 6
 - name: magic-huggingface-token
-  regex: '\bhf_[A-Za-z0-9]{30,}'
+  regex: '\bhf_[A-Za-z0-9]{34}\b'
   anchors: [hf_]
   radius: 256
+# The 16 characters after the prefix are base32, so `0`, `1`, `8`, and `9` are invalid.
 - name: magic-aws-access-key-id
-  regex: '\b(?:AKIA|ASIA)[0-9A-Z]{16}'
+  regex: '\b(?:AKIA|ASIA)[A-Z2-7]{16}\b'
   anchors: [AKIA, ASIA]
   radius: 256
+  offline_validation:
+    type: aws_access_key
 - name: magic-slack-token
-  regex: '\bxox[abprsuvc]-[A-Za-z0-9-]{10,}'
+  regex: '\bxox[abeoprsuvc]-[A-Za-z0-9-]{8,}'
   anchors: [xox]
   radius: 256
+  offline_validation:
+    type: slack_token
 - name: magic-google-api-key
   regex: '\bAIza[A-Za-z0-9_-]{35}'
   anchors: [AIza]
   radius: 256
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+# Engine context and value safelists run for upstream rules only, so the rules
+# below that match arbitrary text declare their own value_suppressors_any.
 - name: magic-bearer-token
   regex: '(?i)\bAuthorization\s*:\s*Bearer\s+(?P<value>[A-Za-z0-9._~+/=-]{8,})'
   anchors: [Authorization, authorization]
   radius: 256
   value_group: value
+  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
+    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
+    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
 - name: magic-jwt
-  regex: '\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
+  regex: '\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{10,}'
   anchors: [eyJ]
   radius: 256
 - name: magic-keyed-double-quoted
@@ -47,6 +69,9 @@ rules:
   key_group: key
   value_group: value
   reject_scalars: true
+  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
+    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
+    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
 - name: magic-keyed-single-quoted
   regex: '(?i)''(?P<key>[^"'']*(?:key|token|secret|password|auth|bearer|credential)[^"'']*)''\s*:\s*''(?P<value>[^"'']*)'''
   anchors: [key, token, secret, password, auth, bearer, credential]
@@ -54,6 +79,9 @@ rules:
   key_group: key
   value_group: value
   reject_scalars: true
+  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
+    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
+    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
 - name: magic-keyed-double-single
   regex: '(?i)"(?P<key>[^"'']*(?:key|token|secret|password|auth|bearer|credential)[^"'']*)"\s*:\s*''(?P<value>[^"'']*)'''
   anchors: [key, token, secret, password, auth, bearer, credential]
@@ -61,6 +89,9 @@ rules:
   key_group: key
   value_group: value
   reject_scalars: true
+  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
+    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
+    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
 - name: magic-keyed-single-double
   regex: '(?i)''(?P<key>[^"'']*(?:key|token|secret|password|auth|bearer|credential)[^"'']*)''\s*:\s*"(?P<value>[^"'']*)"'
   anchors: [key, token, secret, password, auth, bearer, credential]
@@ -68,6 +99,9 @@ rules:
   key_group: key
   value_group: value
   reject_scalars: true
+  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
+    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
+    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
 - name: magic-keyed-assignment
   regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*(?P<value>[^\s''"`]+)'
   anchors: [key, token, secret, password, auth, bearer, credential]
@@ -75,3 +109,6 @@ rules:
   key_group: key
   value_group: value
   reject_scalars: true
+  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
+    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
+    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
