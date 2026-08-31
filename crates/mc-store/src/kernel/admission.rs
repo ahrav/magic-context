@@ -771,7 +771,6 @@ impl Envelope<'_> {
             .optional()
             .map_err(map_sqlite)?
             .ok_or(KernelError::NotFound)?;
-        let dependents = load_approval_dependents(self, &approval_object_id)?;
         object_write::invalidate(
             self.tx,
             self.commit_seq,
@@ -785,7 +784,6 @@ impl Envelope<'_> {
         let revocation_audit = serde_json::json!({
             "approval_object_id": approval_object_id,
             "reason": revocation_reason.text,
-            "dependents": dependents.len(),
             "policy_revision": POLICY_REVISION,
         });
         self.changes.push(PendingChange {
