@@ -359,11 +359,17 @@ impl KernelStore {
         };
 
         let mut writer = self.lock_writer()?;
+        // Matching `lock_reader`, a poisoned guard is recovered rather than failing
+        // the restore: the connection behind it is replaced immediately below.
         let mut readers = self
             .readers
             .iter()
-            .map(|reader| reader.lock().map_err(|_| KernelError::Io))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|reader| {
+                reader
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect::<Vec<_>>();
         let fence_tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| KernelError::Io)?;
