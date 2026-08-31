@@ -681,6 +681,19 @@ mod tests {
         }
     }
 
+    // `evaluate_candidate` awards `generic-api-key` a confidence bonus by name;
+    // dropping its declared floor would leave that bonus against the generic
+    // fallback minimum.
+    #[test]
+    fn the_rule_the_evaluator_names_declares_its_own_confidence_floor() {
+        let rules = RuleSet::from_embedded().unwrap();
+        let rule = rules
+            .active(ScanProfile::Comprehensive)
+            .find(|rule| rule.declaration.name == "generic-api-key")
+            .expect("generic-api-key is missing from the corpus");
+        assert_eq!(rule.declaration.min_confidence, Some(5));
+    }
+
     #[test]
     fn evaluator_version_changes_semantic_digest() {
         let rules = RuleSet::from_embedded().unwrap();

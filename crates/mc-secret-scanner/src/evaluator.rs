@@ -107,8 +107,12 @@ fn evaluate_candidate(
     limits: ScanLimits,
 ) -> Result<Option<Finding>, Abort> {
     let full_match = captures.get(0).ok_or(ScanError::InvalidSpan)?;
+    // A nonparticipating declared value or key group skips the candidate, rather than aborting the whole scan or silently skipping the gate keyed on that group.
     let value_match = if let Some(name) = rule.declaration.value_group.as_deref() {
-        captures.name(name).ok_or(ScanError::InvalidSpan)?
+        match captures.name(name) {
+            Some(value) => value,
+            None => return Ok(None),
+        }
     } else if let Some(group) = rule.declaration.secret_group {
         captures
             .get(usize::from(group))
@@ -122,11 +126,13 @@ fn evaluate_candidate(
     if value_match.is_empty() {
         return Ok(None);
     }
-    let key_match = rule
-        .declaration
-        .key_group
-        .as_deref()
-        .and_then(|name| captures.name(name));
+    let key_match = match rule.declaration.key_group.as_deref() {
+        Some(name) => match captures.name(name) {
+            Some(key) => Some(key),
+            None => return Ok(None),
+        },
+        None => None,
+    };
 
     let full_span = TextSpan::snapped(input, full_match.start(), full_match.end())?;
     let value_span = TextSpan::snapped(input, value_match.start(), value_match.end())?;
@@ -276,9 +282,7 @@ fn evaluate_candidate(
         confidence += 5;
     }
     let minimum = rule.declaration.min_confidence.unwrap_or_else(|| {
-        if rule.declaration.name == "generic-api-key" {
-            2
-        } else if rule.declaration.keywords_any.is_some() && rule.declaration.entropy.is_some() {
+        if rule.declaration.keywords_any.is_some() && rule.declaration.entropy.is_some() {
             3
         } else {
             0
@@ -891,5 +895,59 @@ mod tests {
     #[test]
     fn crc32_matches_standard_vector() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+
+    fn alternation_rule(declaration: &str) -> Rule {
+        let declaration: crate::rules::RuleDeclaration = serde_json::from_str(declaration).unwrap();
+        let regex = regex::bytes::RegexBuilder::new(&declaration.regex)
+            .unicode(false)
+            .build()
+            .unwrap();
+        Rule {
+            source: RuleSource::ConservativeOverlay,
+            declaration,
+            regex,
+        }
+    }
+
+    fn only_candidate(rule: &Rule, input: &str) -> Result<Option<Finding>, Abort> {
+        let rules = RuleSet::from_embedded().unwrap();
+        let captures = rule.regex.captures(input.as_bytes()).unwrap();
+        let mut work = 0usize;
+        evaluate_candidate(
+            &rules,
+            rule,
+            &captures,
+            input,
+            &mut work,
+            ScanLimits::default(),
+        )
+    }
+
+    #[test]
+    fn a_declared_value_group_that_does_not_participate_skips_the_candidate() {
+        let rule = alternation_rule(
+            r#"{"name":"t-value","regex":"(?:alpha=(?P<value>[A-Za-z0-9]{20})|beta)","anchors":["alpha"],"radius":16,"value_group":"value"}"#,
+        );
+        assert!(matches!(only_candidate(&rule, "beta"), Ok(None)));
+        assert!(matches!(
+            only_candidate(&rule, "alpha=Ab3fGh1jKlMnOpQrStUv"),
+            Ok(Some(_))
+        ));
+    }
+
+    #[test]
+    fn a_declared_key_group_that_does_not_participate_skips_the_candidate() {
+        let rule = alternation_rule(
+            r#"{"name":"t-key","regex":"(?:(?P<key>[a-z_]*token)=[A-Za-z0-9]{20}|beta=[A-Za-z0-9]{20})","anchors":["token"],"radius":16,"key_group":"key"}"#,
+        );
+        assert!(matches!(
+            only_candidate(&rule, "beta=Ab3fGh1jKlMnOpQrStUv"),
+            Ok(None)
+        ));
+        assert!(matches!(
+            only_candidate(&rule, "auth_token=Ab3fGh1jKlMnOpQrStUv"),
+            Ok(Some(_))
+        ));
     }
 }
