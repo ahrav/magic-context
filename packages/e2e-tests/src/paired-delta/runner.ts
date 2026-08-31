@@ -77,6 +77,8 @@ export interface RolloutRecord extends RolloutCoordinate {
     costUsd: number;
     /** Spend on earlier attempts at this coordinate, which replacement would otherwise erase from the file the next resume reconstructs spend from. commentlint: allow(JUDGE) */
     priorAttemptsCostUsd: number;
+    /** The dearest single attempt at this coordinate. The reserve needs the price of one call, which a sum of several cheap failures overstates. commentlint: allow(JUDGE) */
+    maxAttemptCostUsd: number;
     costSource: "observed" | "estimated";
     wallClockMs: number;
     turns: number;
@@ -237,11 +239,11 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
         if (!Number.isFinite(record.costUsd) || (record.costUsd as number) < 0) {
             fail("cost-invalid");
         }
-        if (
-            !Number.isFinite(record.priorAttemptsCostUsd) ||
-            (record.priorAttemptsCostUsd as number) < 0
-        ) {
-            fail("prior-attempts-cost-invalid");
+        for (const [label, value] of [
+            ["prior-attempts-cost", record.priorAttemptsCostUsd],
+            ["max-attempt-cost", record.maxAttemptCostUsd],
+        ] as const) {
+            if (!Number.isFinite(value) || (value as number) < 0) fail(`${label}-invalid`);
         }
         if (record.costSource !== "observed" && record.costSource !== "estimated") {
             fail("cost-source-invalid");
@@ -573,12 +575,11 @@ export async function runPairedDelta(
     for (const record of stored) {
         /** A record from another commit or pinned model priced a different build, so it informs neither this run's reserve nor its spend. commentlint: allow(JUDGE) */
         if (!inMatrix(record) || !bindingMatches(record, options)) continue;
-        const attemptsCostUsd = record.priorAttemptsCostUsd + record.costUsd;
-        /** A replaced attempt's own price survives only in `priorAttemptsCostUsd`, so the floor is taken over the cumulative figure too: a reserve below a demonstrated per-rollout cost would admit a call that overshoots `maxCostUsd`. commentlint: allow(JUDGE) */
-        reserveUsd = Math.max(reserveUsd, record.costUsd, record.priorAttemptsCostUsd);
-        spentUsd += attemptsCostUsd;
-        /** Restored spend is billed spend, so the next rollout meets the cost cap instead of being admitted as this run's first. commentlint: allow(JUDGE) */
-        if (attemptsCostUsd > 0) startedAny = true;
+        /** The reserve is the expected price of the next single call, so it takes the dearest attempt this coordinate has seen — not the cumulative total, which several cheap failures would inflate into a budget the next rollout cannot fit. commentlint: allow(JUDGE) */
+        reserveUsd = Math.max(reserveUsd, record.costUsd, record.maxAttemptCostUsd);
+        spentUsd += record.priorAttemptsCostUsd + record.costUsd;
+        /** A stored attempt means this matrix has already started, whatever it was billed: a zero-cost first arm would otherwise keep the first-rollout exemption and let the next arm start with the reserve already over budget. commentlint: allow(JUDGE) */
+        startedAny = true;
     }
 
     outer:
@@ -592,6 +593,8 @@ export async function runPairedDelta(
                 cells: {},
                 regret: null,
             };
+            /** A completed record from another binding cannot be replaced and the coordinate key carries no binding, so any arm executed beside it could never form a valid comparison; the coordinate stops rather than paying for evidence it cannot use. commentlint: allow(JUDGE) */
+            let coordinateBlocked = false;
             const runArm = async (armId: ArmId): Promise<RolloutRecord | null> => {
                 const coordinate: RolloutCoordinate = {
                     poolManifestFingerprint: options.poolManifestFingerprint,
@@ -606,6 +609,7 @@ export async function runPairedDelta(
                         /** Only completed evidence is immutable: `put` replaces a non-completed record, so a failure left by another commit or model is re-run rather than abandoning the coordinate and leaving the comparison incomplete. commentlint: allow(JUDGE) */
                         if (existing.cell.runHealth === "completed") {
                             invalidStoredCoordinates.push(coordinate);
+                            coordinateBlocked = true;
                             return null;
                         }
                     }
@@ -618,6 +622,7 @@ export async function runPairedDelta(
                         !resumableEvidence(existing, scenario)
                     ) {
                         invalidStoredCoordinates.push(coordinate);
+                        coordinateBlocked = true;
                         return null;
                     }
                     if (boundToRun && isResumable(existing, options)) {
@@ -645,6 +650,9 @@ export async function runPairedDelta(
                 /** Only spend on this run's own binding carries forward; an attempt priced under a different commit or model was never charged to this run's ledger. commentlint: allow(JUDGE) */
                 const priorAttemptsCostUsd = existing && boundToRun
                     ? existing.priorAttemptsCostUsd + existing.costUsd
+                    : 0;
+                const priorMaxAttemptCostUsd = existing && boundToRun
+                    ? Math.max(existing.maxAttemptCostUsd, existing.costUsd)
                     : 0;
                 let handle: RolloutHandle | null = null;
                 let creation: Promise<RolloutHandle> | null = null;
@@ -704,6 +712,7 @@ export async function runPairedDelta(
                         disposed,
                         reserveUsd,
                         priorAttemptsCostUsd,
+                        priorMaxAttemptCostUsd,
                         disposalFailed,
                     )
                     : failedRecord(
@@ -717,6 +726,7 @@ export async function runPairedDelta(
                         failure,
                         reserveUsd,
                         priorAttemptsCostUsd,
+                        priorMaxAttemptCostUsd,
                         disposalFailed,
                     );
                 options.store.put(record);
@@ -735,6 +745,10 @@ export async function runPairedDelta(
 
             for (const armId of PRIMARY_ARM_IDS) {
                 const record = await runArm(armId);
+                if (coordinateBlocked) {
+                    coordinateResult.incomplete = true;
+                    break;
+                }
                 if (status !== "completed") {
                     coordinateResult.incomplete = true;
                     coordinates.push(coordinateResult);
@@ -749,6 +763,10 @@ export async function runPairedDelta(
             ) {
                 for (const armId of REGRET_ARM_IDS.slice(1)) {
                     const rung = await runArm(armId);
+                    if (coordinateBlocked) {
+                        coordinateResult.incomplete = true;
+                        break;
+                    }
                     if (status !== "completed") {
                         coordinateResult.incomplete = true;
                         coordinateResult.regret = computeRegretRungs(
@@ -842,6 +860,7 @@ function completedRecord(
     harnessDisposed: boolean,
     reserveUsd: number,
     priorAttemptsCostUsd: number,
+    priorMaxAttemptCostUsd: number,
     disposalFailed: boolean,
 ): RolloutRecord {
     const identityMatches =
@@ -940,6 +959,7 @@ function completedRecord(
             ? Math.max(reserveUsd, worstCaseUsd(scenario, options.pricesPerMillionTokens))
             : observedCostUsd,
         priorAttemptsCostUsd,
+        maxAttemptCostUsd: Math.max(priorMaxAttemptCostUsd, observedCostUsd ?? 0),
         costSource: usage === null ? "estimated" : "observed",
         wallClockMs,
         turns: Number.isSafeInteger(observation.turns) && observation.turns >= 0
@@ -960,6 +980,7 @@ function failedRecord(
     failure: unknown,
     reserveUsd: number,
     priorAttemptsCostUsd: number,
+    priorMaxAttemptCostUsd: number,
     disposalFailed: boolean,
 ): RolloutRecord {
     /** Reported ahead of the rollout's own failure for the same reason the status is: a timeout bounded this arm, an unreclaimed harness threatens the ones after it. commentlint: allow(JUDGE) */
@@ -998,6 +1019,10 @@ function failedRecord(
         usage: ZERO_USAGE,
         costUsd: providerUnavailable ? reserveUsd : Math.max(reserveUsd, worstCase),
         priorAttemptsCostUsd,
+        maxAttemptCostUsd: Math.max(
+            priorMaxAttemptCostUsd,
+            providerUnavailable ? reserveUsd : Math.max(reserveUsd, worstCase),
+        ),
         costSource: "estimated",
         wallClockMs,
         turns: 0,

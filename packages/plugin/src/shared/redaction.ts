@@ -115,14 +115,11 @@ export function isSecretKey(key: string): boolean {
  */
 const CREDENTIAL_TAIL_WORDS = [
     "key",
-    "keys",
     "secret",
-    "secrets",
     "password",
     "passwd",
     "passphrase",
     "credential",
-    "credentials",
     "cookie",
     "authorization",
     "auth",
@@ -150,11 +147,27 @@ export function isCredentialBearingConfigKey(key: string): boolean {
     if (isSecretKey(key)) return true;
     // Separators are dropped rather than split on, so `APIKEY` is judged like `api_key`.
     const compact = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-    if (CREDENTIAL_TAIL_WORDS.some((word) => compact.endsWith(word))) return true;
-    if (compact.endsWith("token") || compact.endsWith("tokens")) {
-        return TOKEN_CREDENTIAL_QUALIFIERS.some((qualifier) => compact.startsWith(qualifier));
+    // Plurals are derived rather than listed, so `dbPasswords` cannot slip past a singular entry.
+    if (CREDENTIAL_TAIL_WORDS.some((word) => compact.endsWith(word) || compact.endsWith(`${word}s`))) {
+        return true;
     }
-    return false;
+    if (!compact.endsWith("token") && !compact.endsWith("tokens")) return false;
+    const segments = key
+        .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter(Boolean);
+    const last = segments.at(-1);
+    if (last === "token" || last === "tokens") {
+        // The qualifier must be the adjacent segment, not any prefix: `idleTokens` and
+        // `identityTokens` both begin with the `id` qualifier and count things.
+        const qualifier = segments.at(-2);
+        return qualifier !== undefined && TOKEN_CREDENTIAL_QUALIFIERS.includes(qualifier);
+    }
+    // A glued name has no boundary before the token word, so only exact forms qualify.
+    return TOKEN_CREDENTIAL_QUALIFIERS.some((word) =>
+        compact === `${word}token` || compact === `${word}tokens`
+    );
 }
 
 /**

@@ -129,12 +129,25 @@ describe("isCredentialBearingConfigKey", () => {
             "Proxy-Authorization",
             "idToken",
             "accessToken",
+            "dbPasswords",
+            "customCookies",
+            "backupPassphrases",
+            "apitoken",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(true);
         }
 
         // `token` also counts things, so it stays qualified.
-        for (const key of ["maxTokens", "promptTokens", "tokenBudget", "baseURL", "models"]) {
+        for (const key of [
+            "maxTokens",
+            "promptTokens",
+            "tokenBudget",
+            "idleTokens",
+            "identityTokens",
+            "idealTokens",
+            "baseURL",
+            "models",
+        ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(false);
         }
     });

@@ -24,6 +24,8 @@ interface CliArgs {
 }
 
 /** A caller keyed off the exit code has to be able to tell a budget stop from a state that forbids the obvious retry: `harness-unreclaimed` means a live harness may still be running, and `invalid-stored-records` means the records file needs inspection before any `--resume` can be trusted. commentlint: allow(JUDGE) */
+const SMOKE_EXPECTED_ROLLOUTS = 11;
+
 const EXIT_CODES: Record<PairedDeltaRunResult["status"], number> = {
     completed: 0,
     "cost-cap-reached": 1,
@@ -106,16 +108,21 @@ function smokeRepoCommit(recordsPath: string): string {
     const untracked = git(["ls-files", "--others", "--exclude-standard", "-z", "--", ...scope])
         .split("\0")
         .filter(Boolean);
-    const contents = untracked.map((path) => {
+    /** Untracked contents are hashed as raw bytes: decoding to UTF-8 first maps distinct binary payloads onto the same replacement character, and `git status` cannot tell them apart either while `git diff HEAD` omits untracked files entirely. commentlint: allow(JUDGE) */
+    const parts: Uint8Array[] = [
+        Buffer.from(status, "utf8"),
+        Buffer.from(git(["diff", "HEAD", "--", ...scope]), "utf8"),
+    ];
+    for (const path of untracked) {
+        parts.push(Buffer.from(`${path}\n`, "utf8"));
         try {
-            return `${path}\n${readFileSync(resolve(root, path), "utf8")}`;
+            parts.push(readFileSync(resolve(root, path)));
         } catch {
             /** An unreadable path still changes the digest through its own name. commentlint: allow(JUDGE) */
-            return `${path}\n<unreadable>`;
+            parts.push(Buffer.from("<unreadable>", "utf8"));
         }
-    });
-    const pending = [status, git(["diff", "HEAD", "--", ...scope]), ...contents].join("\n");
-    return `${commit}-dirty-${Bun.hash(pending).toString(16)}`;
+    }
+    return `${commit}-dirty-${Bun.hash(Buffer.concat(parts)).toString(16)}`;
 }
 
 function fixtureScenario(
@@ -182,6 +189,48 @@ function smokeObservation(
         baseScriptFingerprint,
         intervention,
     };
+}
+
+/**
+ * The runner's status stays `completed` through a provider-unavailable cell, a malformed
+ * classification, and a ladder that never fired, because none of those are run failures. A
+ * smoke gate has to assert the classifications themselves, or a regression that stops
+ * scheduling the regret arms — or misreads either scripted error — still exits zero.
+ *
+ * A resumed run rehydrates instead of re-executing, so only the counts that survive a resume
+ * are asserted then.
+ */
+function smokeExpectationDrift(
+    summary: {
+        rolloutCount: number;
+        providerCalls: Record<string, number>;
+        completeRegretLadders: number;
+        partialRegretLadders: number;
+        exclusionCounts: PairedDeltaRunResult["exclusionCounts"];
+        invalidStoredCoordinates: readonly unknown[];
+    },
+    args: CliArgs,
+): string[] {
+    const drift: string[] = [];
+    const expect = (label: string, actual: unknown, expected: unknown): void => {
+        const shown = JSON.stringify(actual);
+        const wanted = JSON.stringify(expected);
+        if (shown !== wanted) drift.push(`${label}: expected ${wanted}, observed ${shown}`);
+    };
+    expect("rolloutCount", summary.rolloutCount, SMOKE_EXPECTED_ROLLOUTS);
+    expect("invalidStoredCoordinates", summary.invalidStoredCoordinates.length, 0);
+    /** `smokeObservation` fails mc-on's critical check in both scenarios, so both fire the ladder. `var-smoke-provider-error` loses only mc-off, leaving r1/r2/r3 to complete one full ladder; `var-smoke-failing-verifier` loses r2, so its ladder carries retrieval and stops. commentlint: allow(JUDGE) */
+    expect("completeRegretLadders", summary.completeRegretLadders, 1);
+    expect("partialRegretLadders", summary.partialRegretLadders, 1);
+    expect("exclusionCounts", summary.exclusionCounts, {
+        "mc-off": { "provider-unavailable": 1 },
+        r2: { "provider-unavailable": 1 },
+    });
+    if (!args.resume) {
+        /** Both routes must resolve independently, so each is prompted exactly once. commentlint: allow(JUDGE) */
+        expect("providerCalls", summary.providerCalls, { "mock-anthropic": 1, "mock-live": 1 });
+    }
+    return drift;
 }
 
 async function main(): Promise<void> {
@@ -256,7 +305,7 @@ async function main(): Promise<void> {
         },
     );
 
-    console.log(JSON.stringify({
+    const summary = {
         status: result.status,
         recordsPath: args.recordsPath,
         rolloutCount: result.records.length,
@@ -270,7 +319,14 @@ async function main(): Promise<void> {
             regret !== null &&
             (regret.formation === undefined || regret.representation === undefined)).length,
         exclusionCounts: result.exclusionCounts,
-    }, null, 2));
+    };
+    console.log(JSON.stringify(summary, null, 2));
+    const drift = smokeExpectationDrift(summary, args);
+    if (drift.length > 0) {
+        for (const line of drift) console.error(`smoke expectation: ${line}`);
+        process.exitCode = 4;
+        return;
+    }
     process.exitCode = EXIT_CODES[result.status];
 }
 

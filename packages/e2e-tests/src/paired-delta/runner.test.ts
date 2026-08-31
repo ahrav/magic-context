@@ -236,8 +236,12 @@ describe("paired-delta runner", () => {
             armId: "mc-on",
             replicateIndex: 0,
         });
-        expect(store.records).toHaveLength(3);
+        // The stale completed record cannot be replaced and the coordinate key
+        // carries no binding, so the other arms could never be compared with it:
+        // the run stops the coordinate instead of paying for them.
+        expect(store.records).toHaveLength(1);
         expect(store.records[0]?.echoedModelId).toBe("different-snapshot");
+        expect(result.coordinates[0]?.incomplete).toBe(true);
     });
 
     it("does not charge stale or out-of-matrix records to the resumed run", async () => {
@@ -818,6 +822,7 @@ describe("paired-delta runner", () => {
                 usage: { input: 1, output: 1, cacheCreation: 0, cacheRead: 0 },
                 costUsd: 0.01,
                 priorAttemptsCostUsd: 0,
+                maxAttemptCostUsd: 0.01,
                 costSource: "observed",
                 wallClockMs: 1,
                 turns: 1,
@@ -847,6 +852,75 @@ describe("paired-delta runner", () => {
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
+    });
+
+    it("reserves the dearest attempt, not the sum of cheap ones", async () => {
+        const store = new MemoryStore();
+        const cheap = {
+            ...options(store),
+            deskCostCeilingUsd: 0,
+            pricesPerMillionTokens: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+        };
+        // Three cheap failures at one coordinate, each priced from the scenario's
+        // context limit at a nominal price.
+        for (let attempt = 0; attempt < 3; attempt++) {
+            await runPairedDelta(
+                {
+                    ...cheap,
+                    pricesPerMillionTokens: {
+                        input: 0.001,
+                        output: 0,
+                        cacheCreation: 0,
+                        cacheRead: 0,
+                    },
+                },
+                dependencies((armId) =>
+                    armId === "mc-off" ? new Error("still failing") : observation(armId)),
+            );
+        }
+        const failed = store.records.find(({ armId }) => armId === "mc-off");
+        if (!failed) throw new Error("missing failed record");
+
+        expect(failed.priorAttemptsCostUsd).toBeGreaterThan(failed.maxAttemptCostUsd);
+
+        const resumed = await runPairedDelta(
+            {
+                ...cheap,
+                pricesPerMillionTokens: { input: 0.001, output: 0, cacheCreation: 0, cacheRead: 0 },
+            },
+            dependencies(),
+        );
+
+        // The cumulative total would have inflated the reserve into a budget the
+        // next rollout cannot fit.
+        expect(resumed.reserveUsd).toBeCloseTo(failed.maxAttemptCostUsd, 12);
+        expect(resumed.reserveUsd).toBeLessThan(failed.priorAttemptsCostUsd);
+    });
+
+    it("counts a zero-cost stored attempt as a started matrix", async () => {
+        const store = new MemoryStore();
+        const free = {
+            ...options(store),
+            deskCostCeilingUsd: 0,
+            pricesPerMillionTokens: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+        };
+        const first = await runPairedDelta(free, dependencies());
+
+        expect(first.records.every(({ costUsd }) => costUsd === 0)).toBe(true);
+
+        // Drop one arm so the resumed run has work, and give it a reserve the cap
+        // cannot accommodate.
+        store.records.splice(store.records.findIndex(({ armId }) => armId === "compaction"), 1);
+        const events: string[] = [];
+        const resumed = await runPairedDelta(
+            { ...free, deskCostCeilingUsd: 5, maxCostUsd: 1 },
+            dependencies(undefined, events),
+        );
+
+        // A zero-cost history is still a started matrix, so the first-rollout
+        // exemption is spent.
+        expect(resumed.status).toBe("cost-cap-reached");
+        expect(events).not.toContain("create:compaction");
     });
 
     it("classifies a malformed check vector as an exclusion and continues", async () => {
