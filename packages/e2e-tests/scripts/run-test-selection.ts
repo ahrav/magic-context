@@ -114,9 +114,11 @@ export function pairedDeltaUnitFiles(root: string = E2E_ROOT): string[] {
             cwd: root,
             onlyFiles: true,
         }),
+        /** The freeze script's only consumer today, and the `scripts/*.test.ts` glob above reaches this file only through `incident-regression-pool`, which `needs` the plugin checks and skips when they fail. Naming it here keeps the helper's symlink and cleanup guards covered by a job with no `needs`. commentlint: allow(JUDGE) */
+        "scripts/atomic-json-write.test.ts",
     ].sort();
     if (files.length === 0) throw new Error("paired delta unit selection is empty");
-    return files;
+    return assertPresent(files, root);
 }
 
 /**
