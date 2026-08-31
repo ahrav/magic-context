@@ -211,8 +211,11 @@ impl<'s> ResolutionLadder<'s> {
         let Some(tree_oid) = capture.tree_oid.as_deref() else {
             return unmatched;
         };
+        // A stored tree id this build cannot parse is uninterpretable fallback commentlint: allow(JUDGE)
+        // data, exactly like an unsupported patch algorithm, and commentlint: allow(JUDGE)
+        // `window_scan_complete` counts the field as present either way. commentlint: allow(JUDGE)
         let Ok(tree) = ObjectId::from_hex(tree_oid.as_bytes()) else {
-            return unmatched;
+            return WindowMatch::Unreadable;
         };
         match self.match_candidates(|candidate| {
             let commit = self

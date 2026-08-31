@@ -1423,3 +1423,36 @@ fn a_reached_end_closes_the_window_despite_an_unresolved_start() {
         GitConditionOutcome::Uncertain
     );
 }
+
+#[test]
+fn a_malformed_tree_capture_is_uncertain_not_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("a.txt", "a\n")], "base", 1);
+    // Present in the odb but not reachable from HEAD, so the fallback rungs
+    // decide the verdict.
+    let anchored = commit_snapshot(
+        repo,
+        "topic",
+        &[base],
+        &[("a.txt", "a\nb\n")],
+        "anchored",
+        2,
+    );
+    let head = commit_snapshot(repo, "main", &[base], &[("z.txt", "z\n")], "head", 3);
+
+    let mut captures = captures_for(repo, &[anchored]);
+    let capture = captures.get_mut(&anchored.to_string()).unwrap();
+    // A stored tree id this build cannot parse, with no patch id to match.
+    capture.tree_oid = Some("not-a-tree-oid".to_string());
+    capture.patch_id = None;
+
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, head);
+    assert_eq!(
+        ResolutionLadder::new(&snapshot, &budget).evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::Uncertain,
+        "an uninterpretable tree capture cannot yield a definite verdict"
+    );
+}

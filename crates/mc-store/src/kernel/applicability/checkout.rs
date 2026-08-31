@@ -334,8 +334,8 @@ pub fn snapshot_checkout(
             "HEAD moved during the status scan".to_string(),
         ));
     }
-    let sparse_state = sparse_state(&repo, &ctx)?;
-    let dirty_fingerprint = fingerprint_entries(&dirty_entries, &sparse_state);
+    let repository_state = repository_state(&repo, &ctx)?;
+    let dirty_fingerprint = fingerprint_entries(&dirty_entries, &repository_state);
     // Stop the watchdog before the last check, so neither the fingerprint nor commentlint: allow(JUDGE)
     // the watchdog's own teardown can carry a cacheable snapshot past the commentlint: allow(JUDGE)
     // deadline that the scan's final poll still satisfied. commentlint: allow(JUDGE)
@@ -693,12 +693,10 @@ fn contained_path(workdir: &Path, rela_path: &Path) -> Option<PathBuf> {
     Some(joined)
 }
 
-fn fingerprint_entries(entries: &[DirtyEntry], sparse_state: &[u8; 32]) -> String {
+fn fingerprint_entries(entries: &[DirtyEntry], repository_state: &[u8; 32]) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"mc-dirty-fingerprint-v4\0");
-    // Sparse state distinguishes layouts that materialize different files
-    // from the same HEAD.
-    hash.update(sparse_state);
+    hash.update(b"mc-dirty-fingerprint-v5\0");
+    hash.update(repository_state);
     for entry in entries {
         // Length prefixes make adjacent fields unambiguous.
         for field in [
@@ -734,10 +732,10 @@ fn submodule_hash(path: &Path, ctx: &ScanCtx<'_>) -> Result<String, SnapshotErro
         Err(_) => "unborn".to_string(),
     };
     let entries = scan_dirty_entries(&submodule, &nested)?;
-    let sparse_state = sparse_state(&submodule, &nested)?;
+    let state = repository_state(&submodule, &nested)?;
     Ok(format!(
         "gitlink:{head}:{}",
-        fingerprint_entries(&entries, &sparse_state)
+        fingerprint_entries(&entries, &state)
     ))
 }
 
@@ -774,33 +772,24 @@ fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
     "file"
 }
 
-/// Sparse-checkout configuration and patterns determine which paths
-/// materialize. The pattern file is folded into the digest chunk by chunk so commentlint: allow(JUDGE)
-/// its size bounds neither the working set nor the returned value. commentlint: allow(JUDGE)
-fn sparse_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32], SnapshotError> {
-    let config = repo.config_snapshot();
-    let mut hash = Sha256::new();
-    hash.update(b"mc-sparse-state-v1\0");
-    hash.update([
-        config.boolean("core.sparseCheckout").unwrap_or(false) as u8,
-        config.boolean("core.sparseCheckoutCone").unwrap_or(false) as u8,
-    ]);
-    let patterns_path = repo.git_dir().join("info/sparse-checkout");
-    // Opening a FIFO here can block indefinitely.
-    let is_regular = std::fs::symlink_metadata(&patterns_path)
+/// Folds `path`'s bytes into `hash` chunk by chunk, so a large file bounds commentlint: allow(JUDGE)
+/// neither the working set nor the digest. Anything other than a regular file commentlint: allow(JUDGE)
+/// counts as absent, since opening a FIFO can block indefinitely. commentlint: allow(JUDGE)
+fn fold_file(hash: &mut Sha256, path: &Path, ctx: &ScanCtx<'_>) -> Result<(), SnapshotError> {
+    let is_regular = std::fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_file())
         .unwrap_or(false);
     if !is_regular {
         hash.update(b"absent\0");
-        return Ok(hash.finalize().into());
+        return Ok(());
     }
-    let mut file = match std::fs::File::open(&patterns_path) {
+    let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
-        // A file removed between the stat and the open leaves no patterns; commentlint: allow(JUDGE)
-        // any other failure hides a pattern set that is still in force. commentlint: allow(JUDGE)
+        // A file removed between the stat and the open is genuinely gone; any commentlint: allow(JUDGE)
+        // other failure hides content that still governs the checkout. commentlint: allow(JUDGE)
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             hash.update(b"absent\0");
-            return Ok(hash.finalize().into());
+            return Ok(());
         }
         Err(error) => return Err(SnapshotError::Scan(error.to_string())),
     };
@@ -812,9 +801,30 @@ fn sparse_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32], S
             Ok(0) => break,
             Ok(read) => hash.update(&buffer[..read]),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            // A prefix would key as a genuinely shorter pattern file. commentlint: allow(JUDGE)
+            // A prefix would key as a genuinely shorter file. commentlint: allow(JUDGE)
             Err(error) => return Err(SnapshotError::Scan(error.to_string())),
         }
     }
+    Ok(())
+}
+
+/// Repository state beyond HEAD and the dirty set that changes what the engine commentlint: allow(JUDGE)
+/// can see: which paths materialize, and how far history reaches. commentlint: allow(JUDGE)
+///
+/// Sparse configuration and patterns decide materialization. The shallow commentlint: allow(JUDGE)
+/// boundary decides whether an ancestry walk can reach a conclusion at all, so commentlint: allow(JUDGE)
+/// unshallowing has to move the generation. commentlint: allow(JUDGE)
+fn repository_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32], SnapshotError> {
+    let config = repo.config_snapshot();
+    let mut hash = Sha256::new();
+    hash.update(b"mc-repo-state-v1\0");
+    hash.update([
+        config.boolean("core.sparseCheckout").unwrap_or(false) as u8,
+        config.boolean("core.sparseCheckoutCone").unwrap_or(false) as u8,
+    ]);
+    hash.update(b"sparse\0");
+    fold_file(&mut hash, &repo.git_dir().join("info/sparse-checkout"), ctx)?;
+    hash.update(b"shallow\0");
+    fold_file(&mut hash, &repo.shallow_file(), ctx)?;
     Ok(hash.finalize().into())
 }

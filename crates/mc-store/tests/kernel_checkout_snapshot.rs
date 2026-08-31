@@ -845,3 +845,42 @@ fn a_finite_deadline_does_not_add_watchdog_latency() {
         "armed {armed:?} exceeded {ceiling:?} (unbounded baseline {unarmed:?})"
     );
 }
+
+#[test]
+fn shallow_boundaries_alter_the_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let base = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "base", 1);
+    let head = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[base],
+        &[("a.txt", "b\n")],
+        "head",
+        2,
+    );
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let budget = EvalBudget::unbounded();
+    let complete = snapshot_checkout(dir.path(), &budget).unwrap();
+
+    // Resolution branches on the shallow boundary, so it has to reach the
+    // generation: HEAD and the worktree are untouched here.
+    let shallow_file = fixture.root.join(".git/shallow");
+    std::fs::write(&shallow_file, format!("{base}\n")).unwrap();
+    let shallow = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(
+        complete.dirty_fingerprint(),
+        shallow.dirty_fingerprint(),
+        "becoming shallow must move the key"
+    );
+
+    // Unshallowing has to move it back rather than reuse the shallow verdict.
+    std::fs::remove_file(&shallow_file).unwrap();
+    let unshallowed = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_eq!(
+        complete.dirty_fingerprint(),
+        unshallowed.dirty_fingerprint()
+    );
+}
