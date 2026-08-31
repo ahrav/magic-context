@@ -1,4 +1,5 @@
 mod anchor;
+pub mod applicability;
 mod backup;
 mod cas;
 mod durable_fs;

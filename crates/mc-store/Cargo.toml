@@ -33,5 +33,8 @@ test-support = []
 [dev-dependencies]
 # Self dev-dependency so integration tests see the `test-support` fixtures.
 mc-store = { path = ".", features = ["test-support"] }
+# Fixture repositories are written with gix object APIs; no git CLI, even in
+# tests.
+gix = { workspace = true }
 proptest = "1"
 tempfile = "3"
