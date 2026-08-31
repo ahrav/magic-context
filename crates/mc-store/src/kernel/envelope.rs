@@ -725,28 +725,40 @@ impl KernelStore {
         }
         let existing_candidate = tx
             .query_row(
-                "SELECT extraction_run_id,sensitivity_class,redaction_metadata,terminal_state
+                "SELECT extraction_run_id,sensitivity_class,candidate_kind,payload,
+                        redaction_metadata,terminal_state
                  FROM candidates WHERE candidate_id=?1",
                 [spec.candidate_id.as_str()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
             .optional()
             .map_err(map_sqlite)?;
-        if let Some((run_id, stored_class, stored_metadata, candidate_terminal)) =
-            existing_candidate
+        if let Some((
+            run_id,
+            stored_class,
+            stored_kind,
+            stored_payload,
+            stored_metadata,
+            candidate_terminal,
+        )) = existing_candidate
         {
-            let stored_digest = stored_request_digest(&stored_metadata);
+            let incoming_redacted = self_detections(&spec);
             if run_id != spec.extraction_run_id
                 || stored_class != candidate_sensitivity.as_str()
-                || stored_digest.as_deref() != Some(spec.request_digest.as_str())
+                || stored_kind != spec.candidate_kind.text
                 || candidate_terminal.is_some()
+                || incoming_redacted
+                || stored_had_detections(&stored_metadata)
+                || stored_payload != spec.payload.text.as_bytes()
             {
                 return Err(KernelError::Conflict);
             }
@@ -1111,12 +1123,10 @@ struct RedactedCandidate {
     provenance: Option<(String, String)>,
     recorded_at: i64,
     lease_expires_at: i64,
-    request_digest: String,
 }
 
 impl RedactedCandidate {
     fn new(spec: StagingCandidateSpec) -> Result<Self, KernelError> {
-        let request_digest = request_digest(&spec);
         let lease_ceiling = spec
             .recorded_at
             .checked_add(MAX_STAGING_LEASE_MS)
@@ -1161,7 +1171,6 @@ impl RedactedCandidate {
                 .transpose()?,
             recorded_at: spec.recorded_at,
             lease_expires_at: spec.lease_expires_at,
-            request_digest,
         })
     }
 
@@ -1211,11 +1220,6 @@ impl RedactedCandidate {
         fields: Vec<(&'static str, &RedactedField)>,
     ) -> Result<Vec<u8>, KernelError> {
         #[derive(Serialize)]
-        struct Envelope<'a> {
-            request_digest: &'a str,
-            detections: Vec<Metadata<'a>>,
-        }
-        #[derive(Serialize)]
         struct Metadata<'a> {
             field: &'a str,
             detector_id: &'a str,
@@ -1235,11 +1239,7 @@ impl RedactedCandidate {
                 })
             })
             .collect::<Vec<_>>();
-        serde_json::to_vec(&Envelope {
-            request_digest: &self.request_digest,
-            detections: metadata,
-        })
-        .map_err(|_| KernelError::InvalidInput)
+        serde_json::to_vec(&metadata).map_err(|_| KernelError::InvalidInput)
     }
 
     fn candidate_detection_json(&self) -> Result<Vec<u8>, KernelError> {
@@ -1322,42 +1322,99 @@ impl RedactedProjection {
     }
 }
 
-/// Digests the request before redaction, so two payloads that redact alike stay distinguishable.
-fn request_digest(spec: &StagingCandidateSpec) -> String {
-    let mut hash = Sha256::new();
-    hash.update(b"mc-kernel-staging-request-v1\0");
-    let provenance = spec
-        .provenance
-        .as_ref()
-        .map(|value| (value.repository_id.as_str(), value.revision.as_str()));
-    for component in [
-        spec.extraction_run_id.as_str(),
-        spec.candidate_id.as_str(),
-        spec.extractor.as_str(),
-        spec.source_kind.as_str(),
-        spec.source_id.as_str(),
-        spec.candidate_kind.as_str(),
-        spec.payload.as_str(),
-        provenance.map(|value| value.0).unwrap_or(""),
-        provenance.map(|value| value.1).unwrap_or(""),
-    ] {
-        hash.update(
-            u64::try_from(component.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
-        hash.update(component.as_bytes());
-    }
-    hash.update(spec.source_revision.to_be_bytes());
-    format!("{:x}", hash.finalize())
+/// A redacted payload is lossy, so an unchanged retry cannot be proven from stored data without keeping secret-derived material.
+fn self_detections(spec: &RedactedCandidate) -> bool {
+    spec.candidate_fields()
+        .into_iter()
+        .any(|(_, field)| !field.detections.is_empty())
 }
 
-fn stored_request_digest(metadata: &[u8]) -> Option<String> {
-    serde_json::from_slice::<serde_json::Value>(metadata)
-        .ok()?
-        .get("request_digest")?
-        .as_str()
-        .map(str::to_string)
+fn stored_had_detections(metadata: &[u8]) -> bool {
+    match legacy_detections(metadata) {
+        Some(entries) => !entries.is_empty(),
+        None => true,
+    }
+}
+
+/// Reads the detection array from the current bare-array form or the parent build's `{request_digest, detections}` object.
+fn legacy_detections(metadata: &[u8]) -> Option<Vec<serde_json::Value>> {
+    let value: serde_json::Value = serde_json::from_slice(metadata).ok()?;
+    match value {
+        serde_json::Value::Array(entries) => Some(entries),
+        serde_json::Value::Object(fields) => match fields.get("detections") {
+            Some(serde_json::Value::Array(entries)) => Some(entries.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Rewrites any candidate metadata still carrying the parent build's digest, which is an offline verifier for the redacted payload.
+///
+/// `candidates` is bounded only by retention, so the rewrite runs in committed
+/// batches rather than loading the table into one transaction. `secure_delete`
+/// zeroes the freed pages and the WAL is truncated afterwards, which shrinks the
+/// residue but does not by itself prove the old bytes are unrecoverable.
+pub(super) fn strip_legacy_candidate_verifiers(
+    conn: &mut rusqlite::Connection,
+) -> Result<usize, KernelError> {
+    const BATCH: usize = 256;
+    let restore_secure_delete: i64 = conn
+        .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+        .map_err(map_sqlite)?;
+    conn.pragma_update(None, "secure_delete", "ON")
+        .map_err(map_sqlite)?;
+    let mut rewritten = 0;
+    loop {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
+        let mut statement = tx
+            .prepare(
+                "SELECT candidate_id,redaction_metadata FROM candidates
+                 WHERE substr(CAST(redaction_metadata AS TEXT),1,1)='{'
+                 LIMIT ?1",
+            )
+            .map_err(map_sqlite)?;
+        let batch = statement
+            .query_map([i64::try_from(BATCH).unwrap_or(i64::MAX)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(map_sqlite)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_sqlite)?;
+        drop(statement);
+        if batch.is_empty() {
+            tx.commit().map_err(map_sqlite)?;
+            break;
+        }
+        for (candidate_id, metadata) in &batch {
+            let detections = legacy_detections(metadata).unwrap_or_default();
+            let replacement = serde_json::to_vec(&detections).map_err(|_| KernelError::Io)?;
+            tx.execute(
+                "UPDATE candidates SET redaction_metadata=?1 WHERE candidate_id=?2",
+                params![replacement, candidate_id],
+            )
+            .map_err(map_sqlite)?;
+        }
+        rewritten += batch.len();
+        tx.commit().map_err(map_sqlite)?;
+    }
+    if rewritten > 0 {
+        conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")
+            .map_err(map_sqlite)?;
+    }
+    conn.pragma_update(
+        None,
+        "secure_delete",
+        if restore_secure_delete == 0 {
+            "OFF"
+        } else {
+            "ON"
+        },
+    )
+    .map_err(map_sqlite)?;
+    Ok(rewritten)
 }
 
 pub(super) fn check_fence(tx: &Transaction<'_>, expected: u64) -> Result<(), KernelError> {

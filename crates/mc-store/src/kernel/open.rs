@@ -165,6 +165,9 @@ impl KernelStore {
 
         activate_wal(&writer)?;
         stamp_writer_fence(&mut writer, lease_epoch)?;
+        // A store written by the parent build retains a digest of pre-redaction
+        // candidate input, so it is rewritten before the store is handed out.
+        super::envelope::strip_legacy_candidate_verifiers(&mut writer)?;
         // Two hardening passes are required because the family grows between
         // them. WAL activation creates `-wal` and `-shm` under the process umask,
         // so the first pass restricts them as early as possible; a read-only open
