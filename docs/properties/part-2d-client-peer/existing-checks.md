@@ -112,16 +112,18 @@ observation in this file is structural rather than measured.
 ## Integration tests
 
 **`crates/mc-host/tests/client.rs` holds 6 tests in 243 lines, and the binary is
-named in CI three times.** This makes 2d better covered at the integration layer
+named in CI twice at HEAD.** The third site counted at authoring, a "Fixed-ring
+contracts (macOS)" step, was removed with every other macOS job by PR #131
+(merge `5d638e3e8`); `ci.yml` now contains only `ubuntu-latest` jobs. This
+makes 2d better covered at the integration layer
 than its siblings: 2b has no integration binary dedicated to it at all, while 2d
 has one whose whole subject is this file. Every command below was printed from
 `ci.yml` and confirmed.
 
 | Workflow site | Command | Platform and job |
 | --- | --- | --- |
-| `ci.yml:132` | `cargo nextest run -p mc-host --test client`, step "Mandatory ring client suite" (`:131`) | Linux, job `shm-crash-recovery` (`:111`) |
-| `ci.yml:178-179` | `cargo nextest run -p mc-host \` / `--test client --test lifecycle`, one wrapped command | `if: runner.os == 'Linux'`, job `shm-source-build` (`:137`) |
-| `ci.yml:187` | `cargo nextest run -p mc-host --test client --test lifecycle`, step "Fixed-ring contracts (macOS)" (`:181`) | `if: runner.os == 'macOS'`, same job |
+| `ci.yml:119` | `cargo nextest run -p mc-host --test client`, step "Mandatory ring client suite" (`:117`) | Linux, job `shm-crash-recovery` (`:92`) |
+| `ci.yml:168-169` | `cargo nextest run -p mc-host \` / `--test client --test lifecycle`, one wrapped command | Linux (`runs-on: ubuntu-latest`), job `shm-source-build` (`:131`) |
 
 **Peer role versus fixture role: 6 of 6 exercise the client as a peer; 0 use it
 purely as a fixture.** Every test constructs
@@ -389,11 +391,16 @@ Six, recorded because each is held by discipline rather than by a build step.
    Nothing asserts either number, so a runtime configured with a smaller blocking
    pool silently invalidates the argument, and nothing tests that a detached
    worker holds its permit.
-6. **The 50-microsecond bridge poll is a bare literal.** `client.rs:1886` is
-   `Duration::from_micros(50)`, not a named constant, and it is numerically the
-   same value as `POLL_INTERVAL` (`ring_transport.rs:33`), which the 2b inventory
-   records as one literal already serving three different waits. This is a fourth
-   use with no shared definition.
+6. **Historical: the polling-era bridge used a bare 50-microsecond literal.** At
+   authoring, `client.rs:1886` was `Duration::from_micros(50)`, not a named
+   constant, and numerically the same value as the then-existing
+   `POLL_INTERVAL` in `ring_transport.rs`, which the 2b inventory records as
+   one literal already serving three different waits. PR #131 (merge
+   `5d638e3e8`) replaced the polling bridge with eventfd waits: at HEAD neither
+   literal exists in `client.rs` or `ring_transport.rs`, the test
+   `shared_memory_workers_have_no_periodic_polling` (`ring_transport.rs:798-806`)
+   pins their absence, and `POLL_INTERVAL` survives only as a test-support
+   constant (`crates/mc-host/tests/support/process_resources.rs:75`).
 
 ## Suspiciously quiet areas
 

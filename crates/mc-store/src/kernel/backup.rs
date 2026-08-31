@@ -276,11 +276,6 @@ impl KernelStore {
             params![released_at, capture_pin_id],
         )
         .map_err(|_| KernelError::Io)?;
-        tx.execute(
-            "DELETE FROM capture_pin_refs WHERE capture_pin_id=?1",
-            [capture_pin_id],
-        )
-        .map_err(|_| KernelError::Io)?;
         tx.commit().map_err(|_| KernelError::Io)
     }
 
@@ -297,18 +292,22 @@ impl KernelStore {
         )
         .map_err(|_| KernelError::Io)?;
         tx.execute(
-            "UPDATE capture_pin_refs SET released_at=?1 WHERE released_at IS NULL
-             AND capture_pin_id IN (
-                 SELECT capture_pin_id FROM capture_pins WHERE released_at IS NOT NULL
-             )",
-            [now_ms],
-        )
-        .map_err(|_| KernelError::Io)?;
-        tx.execute(
-            "DELETE FROM capture_pin_refs WHERE capture_pin_id IN (
+            "UPDATE capture_pin_refs
+             SET released_at=(SELECT released_at FROM capture_pins
+                              WHERE capture_pin_id=capture_pin_refs.capture_pin_id)
+             WHERE released_at IS NULL AND capture_pin_id IN (
                  SELECT capture_pin_id FROM capture_pins WHERE released_at IS NOT NULL
              )",
             [],
+        )
+        .map_err(|_| KernelError::Io)?;
+        // Past the reclaim grace a released reference no longer affects eligibility,
+        // and reclamation only prunes references for artifacts it removes, so pins on
+        // still-live artifacts accumulate without this.
+        let horizon = now_ms.saturating_sub(crate::kernel::cas::gc::REFERENCED_GRACE_MS);
+        tx.execute(
+            "DELETE FROM capture_pin_refs WHERE released_at IS NOT NULL AND released_at<=?1",
+            [horizon],
         )
         .map_err(|_| KernelError::Io)?;
         tx.commit().map_err(|_| KernelError::Io)

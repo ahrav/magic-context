@@ -144,7 +144,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "3a5c71434cd3409219f92a06099c5e4bbd9e9786e39113d5426f192f9e2ef05d";
+    "fdef9cbd068fdbdc600f7f7105a39521311fb43b7f52f7bf38ee96a8cb7c0a59";
 
 #[test]
 fn cas_control_tables_and_lookup_indexes_are_frozen() {
@@ -623,10 +623,11 @@ fn candidate_delete_cascades_scores_but_preserves_admission_audit() {
     conn.execute(
         "INSERT INTO admission_decisions(
              admission_decision_id, candidate_id, source_kind, source_id, source_revision,
-             source_class, taint_class, maturity, effective_maturity, disposition, visibility,
-             sensitivity_class, policy_revision, reason, decided_at
+             source_class, taint_class, event_kind, maturity, effective_maturity, disposition, visibility,
+             outcome, sensitivity_class, policy_revision, reason, decided_at
          ) VALUES ('admission-1', 'candidate-1', 'test', 'root', 1, 'test', 'test',
-                   'candidate', 'candidate', 'accepted', 'explicit', 'normal', 1, 'fixture', 5)",
+                   'other', 'candidate', 'candidate', 'accepted', 'explicit', 'admit',
+                   'normal', 1, 'fixture', 5)",
         [],
     )
     .unwrap();
