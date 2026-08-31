@@ -95,7 +95,9 @@ export interface FamilyDeltaAnalysis extends LaneBinding {
     analyzableFamilyCount: number;
     evidenceSufficient: boolean;
     endpoints: EndpointEstimate[];
+    /** Aggregate regret carries the clustered-bootstrap interval and noise-floor comparison of a primary delta; the non-inferential label belongs to the per-coordinate `rawRegretRecords`, not to these estimates. */
     liveRegret: EndpointEstimate[];
+    /** The retrieval rung compares a mock-served intervention arm, so its interval is provider-mixed evidence and is kept out of `liveRegret`. */
     providerMixedRegret: EndpointEstimate[];
     rawRegretRecords: RawRegretRecord[];
 }
@@ -252,6 +254,7 @@ export function estimateFamilyDeltas(input: {
     }
 
     const coordinateKeys = new Set<string>();
+    const familyByCoordinate = new Map<string, string>();
     for (const observation of input.observations) {
         if (!DECLARED_ENDPOINTS.has(observation.endpoint)) {
             throw new PairedDeltaEstimatorError(
@@ -273,6 +276,14 @@ export function estimateFamilyDeltas(input: {
             throw new PairedDeltaEstimatorError(`observation: duplicate-${key}`);
         }
         coordinateKeys.add(key);
+        // One coordinate under two families would join two bootstrap clusters, so the family assignment must agree across endpoints.
+        const family = familyByCoordinate.get(observation.coordinateId);
+        if (family !== undefined && family !== observation.familyId) {
+            throw new PairedDeltaEstimatorError(
+                `observation: family-conflict-${observation.coordinateId}`,
+            );
+        }
+        familyByCoordinate.set(observation.coordinateId, observation.familyId);
     }
 
     const noiseFloors = new Map<string, FamilyNoiseFloor>();
@@ -313,15 +324,13 @@ export function estimateFamilyDeltas(input: {
         ));
     const endpoints = estimates.filter(({ endpoint }) =>
         PRIMARY_ENDPOINTS.includes(endpoint as PrimaryEndpoint));
-    const familyCountByEndpoint = new Map(
-        endpoints.map(({ endpoint, familyCount }) => [endpoint, familyCount]),
-    );
-    // Every primary endpoint constrains the count; a primary endpoint with no
-    // observations contributes zero analyzable families rather than dropping
-    // out of the minimum.
-    const analyzableFamilyCount = Math.min(
-        ...PRIMARY_ENDPOINTS.map((endpoint) => familyCountByEndpoint.get(endpoint) ?? 0),
-    );
+    const familiesByPrimaryEndpoint = PRIMARY_ENDPOINTS.map((endpoint) => new Set(
+        endpoints.find((estimate) => estimate.endpoint === endpoint)
+            ?.families.map(({ familyId }) => familyId) ?? [],
+    ));
+    // Equal-sized but disjoint family sets carry no paired evidence, so the count is the intersection across every primary endpoint rather than the smallest set.
+    const analyzableFamilyCount = [...familiesByPrimaryEndpoint[0]!].filter((familyId) =>
+        familiesByPrimaryEndpoint.every((families) => families.has(familyId))).length;
     return {
         poolManifestFingerprint: input.lane.poolManifestFingerprint,
         pinnedSnapshotId: input.lane.pinnedSnapshotId,
@@ -384,12 +393,9 @@ export function createFamilyEstimatorAdapter(input: {
             if (pairedFactsFingerprint(pairs) !== input.analysis.pairedFactsFingerprint) {
                 throw new PairedDeltaEstimatorError("adapter: paired-facts-fingerprint-mismatch");
             }
-            const evidenceSufficient =
-                input.analysis.analyzableFamilyCount >=
-                input.analysis.minimumAnalyzableFamilyCount;
             const result = {
                 direction: projectedDirection(input.analysis),
-                evidenceSufficient,
+                evidenceSufficient: input.analysis.evidenceSufficient,
                 completeFamilyCount: completeFamilyCount(pairs),
                 resultFingerprint: canonicalFingerprint({
                     poolManifestFingerprint: input.poolManifestFingerprint,

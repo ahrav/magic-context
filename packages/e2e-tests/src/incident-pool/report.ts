@@ -10,8 +10,8 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync } from "node:fs";
+import { publishJsonAtomically } from "../atomic-publish";
 import { rowDigest } from "./history";
 import {
     ADJUDICATION_EVENT_ID_RE,
@@ -679,15 +679,6 @@ export function parseIncidentReport(raw: unknown): IncidentPoolReport {
         evaluation_complete: evaluationComplete,
         completion_marker: true,
     };
-}
-
-export function publishJsonAtomically(value: unknown, path: string): void {
-    mkdirSync(dirname(path), { recursive: true });
-    const temp = `${path}.tmp-${randomBytes(6).toString("hex")}`;
-    writeFileSync(temp, `${JSON.stringify(value, null, 4)}\n`, {
-        mode: 0o644,
-    });
-    renameSync(temp, path);
 }
 
 /** The final rename prevents readers from observing a partially written report.

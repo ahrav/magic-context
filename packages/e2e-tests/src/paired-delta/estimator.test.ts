@@ -164,6 +164,33 @@ describe("family-clustered delta estimator", () => {
         })).toThrow(/observation: endpoint-undeclared-latency/);
     });
 
+    it("rejects one coordinate assigned to two families", () => {
+        expect(() => estimate({
+            observations: [
+                ...observations,
+                { ...observations[0]!, endpoint: "retrieval", familyId: "fam-z" },
+            ],
+        })).toThrow(/observation: family-conflict-var-a:0/);
+    });
+
+    it("counts only families with evidence at every primary endpoint", () => {
+        // Equal-sized but disjoint family sets carry no paired evidence.
+        const disjoint = estimate({
+            minimumAnalyzableFamilyCount: 2,
+            observations: observations.map((row) => row.endpoint === "mc-on-vs-compaction"
+                ? { ...row, familyId: `${row.familyId}-alt`, coordinateId: `${row.coordinateId}-alt` }
+                : row),
+            noiseFloors: undefined,
+        });
+        expect(disjoint.endpoints.map(({ familyCount }) => familyCount)).toEqual([5, 5]);
+        expect(disjoint.analyzableFamilyCount).toBe(0);
+        expect(disjoint.evidenceSufficient).toBe(false);
+
+        const overlapping = estimate({ minimumAnalyzableFamilyCount: 2, noiseFloors: undefined });
+        expect(overlapping.analyzableFamilyCount).toBe(5);
+        expect(overlapping.evidenceSufficient).toBe(true);
+    });
+
     it("reports a malformed noise floor as an estimator error", () => {
         expect(() => estimate({
             noiseFloors: [{ familyId: "fam-a", value: 0.2, interval: undefined as never }],
@@ -255,6 +282,12 @@ describe("bound prospective estimator adapter", () => {
             })),
         })).analyze(pairs, H3);
         expect(mixed.direction).toBe("no-change");
+    });
+
+    it("reports the analysis gate verbatim", () => {
+        const analysis = estimate({ minimumAnalyzableFamilyCount: 1 });
+        expect(adapter(analysis).analyze(pairs, H3).evidenceSufficient)
+            .toBe(analysis.evidenceSufficient);
     });
 
     it("keeps direction unresolved when only one family excludes zero", () => {

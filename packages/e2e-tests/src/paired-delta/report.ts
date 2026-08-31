@@ -1,5 +1,5 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { publishJsonAtomically } from "../incident-pool/report";
+import { publishJsonAtomically } from "../atomic-publish";
 import { parsePolicyOwnerDocument } from "../prospective-holdout/contract";
 import { ARM_IDS, REASON_CODES, type ArmId, type ReasonCode } from "./contract";
 import type { EndpointEstimate, FamilyDeltaAnalysis, RawRegretRecord } from "./estimator";
