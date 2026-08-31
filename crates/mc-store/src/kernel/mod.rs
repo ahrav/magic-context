@@ -15,9 +15,10 @@ mod scope;
 mod slice;
 
 pub use admission::{
-    evaluate_admission, surface_visibility, AdmissionEvent, Disposition, EffectiveMaturity,
-    Evaluation, EvaluationInputs, EventKind, Maturity, Outcome, PriorDecision, SourceClass,
-    Surface, SurfaceVisibility, TaintClass, VisibilityRow, POLICY_REVISION,
+    evaluate_admission, surface_visibility, AdmissionDecision, AdmissionDomainSpec, AdmissionEvent,
+    AdmissionRequest, Disposition, EffectiveMaturity, Evaluation, EvaluationInputs, EventKind,
+    Maturity, Outcome, PriorDecision, SourceClass, Surface, SurfaceVisibility, TaintClass,
+    VisibilityRow, POLICY_REVISION,
 };
 pub use anchor::{
     encode_anchor_captures, evaluate_non_git, AnchorCapture, AnchorCondition, AnchorDecodeError,
