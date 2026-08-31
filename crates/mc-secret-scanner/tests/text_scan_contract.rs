@@ -61,12 +61,17 @@ fn empty_keyed_values_and_secret_substrings_are_not_findings() {
     let scanner = Scanner::new(ScanProfile::Conservative).unwrap();
     for input in [
         r#"{"password":""}"#,
+        r#"{"password":"   "}"#,
         "'api_token': ''",
+        "'api_token': '  '",
         "password=",
         "author=hunter-two",
         "keywords=hunter-two",
         "tokenizer=hunter-two",
         "secretary=hunter-two",
+        "monkey=hunter-two",
+        "turkey=hunter-two",
+        "keyboard=hunter-two",
     ] {
         assert!(scanner.scan(input).unwrap().findings.is_empty(), "{input}");
     }
@@ -76,6 +81,31 @@ fn empty_keyed_values_and_secret_substrings_are_not_findings() {
         r#"{"clientSecret":"hunter-two"}"#,
     ] {
         assert!(!scanner.scan(input).unwrap().findings.is_empty(), "{input}");
+    }
+}
+
+#[test]
+fn undelimited_secret_key_names_are_gated_like_their_delimited_spelling() {
+    let scanner = Scanner::new(ScanProfile::Conservative).unwrap();
+    let value = "Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24Tv68Wt-Q";
+    for key in [
+        "api_key",
+        "apiKey",
+        "APIKEY",
+        "APIKEYS",
+        "AUTHTOKEN",
+        "clientsecret",
+        "CLIENTSECRET",
+        "secretkey",
+        "privatekey",
+        "accesstoken",
+        "refreshtoken",
+    ] {
+        let report = scanner.scan(&format!("{key}={value}")).unwrap();
+        assert!(
+            !report.findings.is_empty(),
+            "{key} produced no finding while api_key did"
+        );
     }
 }
 

@@ -384,6 +384,40 @@ fn has_secret_key_token(key: &[u8]) -> bool {
         b"bearer",
         b"credential",
         b"credentials",
+        // Use exact token matches to avoid matching unrelated identifiers such as `monkey`, `turkey`, `keyboard`, `author`, `secretary`, and `tokenizer`.
+        b"apikey",
+        b"apikeys",
+        b"apisecret",
+        b"apitoken",
+        b"apitokens",
+        b"authkey",
+        b"authsecret",
+        b"authtoken",
+        b"accesskey",
+        b"accesskeys",
+        b"accesssecret",
+        b"accesstoken",
+        b"accesstokens",
+        b"appkey",
+        b"appsecret",
+        b"apptoken",
+        b"bearertoken",
+        b"clientkey",
+        b"clientsecret",
+        b"clienttoken",
+        b"encryptionkey",
+        b"privatekey",
+        b"privatekeys",
+        b"refreshtoken",
+        b"refreshtokens",
+        b"secretkey",
+        b"secretkeys",
+        b"secrettoken",
+        b"sessionkey",
+        b"sessionsecret",
+        b"sessiontoken",
+        b"signingkey",
+        b"signingsecret",
     ];
     key_tokens(key).any(|token| TOKENS.iter().any(|word| token.eq_ignore_ascii_case(word)))
 }
@@ -500,7 +534,7 @@ fn is_scalar(value: &[u8]) -> bool {
         return true;
     }
     if text.is_empty() {
-        return false;
+        return true;
     }
     let bytes = text.as_bytes();
     let mut index = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
@@ -829,11 +863,28 @@ mod tests {
 
     #[test]
     fn scalar_classifier_is_closed() {
-        for scalar in ["0", "-1.5", "+2e10", "true", "false", "null", "undefined"] {
-            assert!(is_scalar(scalar.as_bytes()));
+        for scalar in [
+            "0",
+            "-1.5",
+            "+2e10",
+            "true",
+            "false",
+            "null",
+            "undefined",
+            "True",
+            "FALSE",
+            "None",
+            "nil",
+            "NaN",
+            "~",
+            "",
+            "   ",
+            "\t\n",
+        ] {
+            assert!(is_scalar(scalar.as_bytes()), "{scalar:?}");
         }
-        for secret in ["", "12x", "hunter2", "true-blue"] {
-            assert!(!is_scalar(secret.as_bytes()));
+        for secret in ["12x", "hunter2", "true-blue", "nilpotent", "nonement"] {
+            assert!(!is_scalar(secret.as_bytes()), "{secret:?}");
         }
     }
 
