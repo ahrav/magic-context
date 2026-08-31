@@ -6,5 +6,6 @@ export const compactionDeployRegion = defineScenario({
     title: "Recover a deployment region buried by compaction",
     evidence: "The approved deployment region is eu-west-1; do not use the old us-east-1 default.",
     answer: "eu-west-1",
+    answerMatch: "case-insensitive",
     locatorId: "mem-deploy-region",
 });

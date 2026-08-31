@@ -6,5 +6,6 @@ export const rejectedQueue = defineScenario({
     title: "Prefer the chosen queue over a rejected alternative",
     evidence: "We rejected an unbounded in-memory queue because restart durability is required; use SQS.",
     answer: "SQS",
+    answerMatch: "case-insensitive",
     locatorId: "mem-queue-choice",
 });

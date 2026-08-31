@@ -6,5 +6,6 @@ export const exactSymbol = defineScenario({
     title: "Recall an exact symbol name",
     evidence: "The compatibility entry point is reconcilePendingLeaseV3 with that exact casing.",
     answer: "reconcilePendingLeaseV3",
+    answerMatch: "exact",
     locatorId: "mem-exact-symbol",
 });

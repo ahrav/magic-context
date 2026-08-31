@@ -17,6 +17,7 @@ function scenario(overrides: Partial<ScenarioDeclaration> = {}): ScenarioDeclara
         familyId: "fam-demo",
         title: "Recall the buried identifier",
         expectedAnswer: "alpha-17",
+        answerMatch: "exact",
         checks: ["check-shared"],
         criticalCheckIds: ["check-shared"],
         turnScript: [

@@ -55,6 +55,22 @@ describe("paired-delta authored scenarios", () => {
             }
         });
 
+        it(`${scenario.scenarioId} applies its declared answer-casing policy`, async () => {
+            const root = mkdtempSync(join(tmpdir(), "paired-delta-scenario-"));
+            try {
+                mkdirSync(join(root, "result"), { recursive: true });
+                const swapped = scenario.expectedAnswer.toUpperCase() === scenario.expectedAnswer
+                    ? scenario.expectedAnswer.toLowerCase()
+                    : scenario.expectedAnswer.toUpperCase();
+                writeFileSync(join(root, "result", "answer.txt"), swapped);
+                const checks = await scenario.verifier({ armId: "mc-on", workspacePath: root });
+                const passed = checks.find(({ id }) => id === "check-answer")?.passed;
+                expect(passed).toBe(scenario.answerMatch === "case-insensitive");
+            } finally {
+                rmSync(root, { recursive: true, force: true });
+            }
+        });
+
         it(`${scenario.scenarioId} gates R1 wire delivery outside the scored checks`, async () => {
             const root = mkdtempSync(join(tmpdir(), "paired-delta-scenario-"));
             try {

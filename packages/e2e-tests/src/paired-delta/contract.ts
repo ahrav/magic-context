@@ -6,7 +6,6 @@ import { normalizeMemoryContent } from "../../../plugin/src/features/magic-conte
 export const ARM_IDS = ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"] as const;
 export type ArmId = (typeof ARM_IDS)[number];
 export const PRIMARY_ARM_IDS = ["mc-on", "mc-off", "compaction"] as const;
-export type PrimaryArmId = (typeof PRIMARY_ARM_IDS)[number];
 export const REGRET_ARM_IDS = ["mc-on", "r1", "r2", "r3"] as const;
 
 export const RUN_HEALTHS = ["completed", "timeout", "crash", "malformed", "unavailable"] as const;
@@ -38,6 +37,9 @@ const REASON_CODE_HEALTHS: Readonly<Record<ReasonCode, readonly RunHealth[]>> = 
     "harness-failure": NON_COMPLETED_HEALTHS,
     "absence-precondition-unmet": NON_COMPLETED_HEALTHS,
 };
+
+export const ANSWER_MATCHES = ["exact", "case-insensitive"] as const;
+export type AnswerMatch = (typeof ANSWER_MATCHES)[number];
 
 export const RUN_MODES = ["calibration", "weekly", "release"] as const;
 export type RunMode = (typeof RUN_MODES)[number];
@@ -111,6 +113,8 @@ export interface ScenarioDeclaration {
     familyId: string;
     title: string;
     expectedAnswer: string;
+    /** Whether reproducing the answer's exact casing is part of the gold. */
+    answerMatch: AnswerMatch;
     checks: string[];
     criticalCheckIds: string[];
     turnScript: TurnDeclaration[];
@@ -164,6 +168,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         "familyId",
         "title",
         "expectedAnswer",
+        "answerMatch",
         "checks",
         "criticalCheckIds",
         "turnScript",
@@ -208,8 +213,12 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     if (expectedAnswer !== expectedAnswer.trim()) {
         p.fail("scenario.expectedAnswer: not-trimmed");
     }
-    /** Case-folded for the same reason the query guard is, and bounded so the answer counts only as a complete value: an unbounded search accepts `47` inside `147`, letting an arm's intervention carry a different identifier while the gold check passes. `.`, `;`, and `,` are not value characters, so a trailing sentence period still matches. commentlint: allow(JUDGE) */
-    const answerBearing = (text: string): boolean => {
+    const answerMatch = p.enumeration(root.answerMatch, ANSWER_MATCHES, "scenario.answerMatch");
+    /** Deliberately the opposite bound from `suppliesAnswer` below, because the two guards fail safe in opposite directions. A leak asks "could the model read the gold here", so any occurrence counts and a wider match is the conservative one: `alpha-170` exposes `alpha-17`. commentlint: allow(JUDGE) */
+    const revealsAnswer = (text: string): boolean =>
+        text.toLowerCase().includes(expectedAnswer.toLowerCase());
+    /** Gold presence asks "can the arm derive the exact answer here", so only a complete value counts and a narrower match is the conservative one: `147` does not supply `47`. Letters, digits, underscore, and hyphen are value characters; `.`, `;`, and `,` are not, so a trailing sentence period still matches. commentlint: allow(JUDGE) */
+    const suppliesAnswer = (text: string): boolean => {
         const haystack = text.toLowerCase();
         const needle = expectedAnswer.toLowerCase();
         const valueChar = /[0-9a-z_-]/;
@@ -222,7 +231,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     };
     const r1Query = p.string(r1.query, "scenario.interventions.r1.query");
     /** `scriptedCtxSearchTurn` interpolates the query into the model-visible prompt, so a query containing the expected answer lets R1 pass its critical check with no retrieval. Case-folded because a model reads `sqlite` and `SQLite` as the same token. commentlint: allow(JUDGE) */
-    if (r1Query.toLowerCase().includes(expectedAnswer.toLowerCase())) {
+    if (revealsAnswer(r1Query)) {
         p.fail("scenario.interventions.r1.query: contains-answer");
     }
     const insertAfterTurnId = p.staticId(
@@ -241,8 +250,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     /** From the insertion turn inclusive: the ballast precedes that turn, so an answer repeated there is not buried either and stays visible to every arm. Runs after the ordering and evidence-gold rules so a misplaced evidence turn reports its own diagnostic instead of surfacing here. commentlint: allow(JUDGE) */
     const postInsertionLeak = (): void => {
         if (
-            turnScript.slice(insertIndex).some(({ content }) =>
-                content.toLowerCase().includes(expectedAnswer.toLowerCase()))
+            turnScript.slice(insertIndex).some(({ content }) => revealsAnswer(content))
         ) {
             p.fail("scenario.turnScript: post-insertion-answer-leak");
         }
@@ -279,7 +287,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         "scenario.interventions.r2.memories",
     );
     /** R2 seeds these as verified project memory and the `<project-memory>` renderer exposes the claim, not this declaration's `evidence` provenance. With no claim carrying the answer the arm receives no gold and reproduces R1, so `R2 - R1` and `R3 - R2` describe a malformed intervention. One claim suffices: gold may be spread across a multi-locator set. commentlint: allow(JUDGE) */
-    if (!memories.some(({ claim }) => answerBearing(claim))) {
+    if (!memories.some(({ claim }) => suppliesAnswer(claim))) {
         p.fail("scenario.interventions.r2.memories: answer-absent");
     }
     const r3 = p.record(interventions.r3, "scenario.interventions.r3");
@@ -290,7 +298,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     p.exact(r3, ["evidence"], "scenario.interventions.r3");
     const r3Evidence = p.string(r3.evidence, "scenario.interventions.r3.evidence");
     /** R3 is the oracle upper bound and this string is the only gold it receives verbatim. Without the answer in it the arm cannot produce `expectedAnswer` at all, so `R3 - R2` would report missing gold as representation regret. commentlint: allow(JUDGE) */
-    if (!answerBearing(r3Evidence)) {
+    if (!suppliesAnswer(r3Evidence)) {
         p.fail("scenario.interventions.r3.evidence: answer-absent");
     }
 
@@ -314,7 +322,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         p.fail("scenario.absencePrecondition.evidenceTurnId: not-before-r1-insertion");
     }
     /** The mc-on arm forms and later retrieves memory from this turn alone, so an evidence turn that does not carry the answer leaves it nothing to preserve — its failures would measure a missing premise rather than preservation or retrieval. commentlint: allow(JUDGE) */
-    if (!answerBearing(turnScript[evidenceIndex]!.content)) {
+    if (!suppliesAnswer(turnScript[evidenceIndex]!.content)) {
         p.fail("scenario.absencePrecondition.evidenceTurnId: answer-absent");
     }
     postInsertionLeak();
@@ -349,6 +357,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         familyId: p.staticId(root.familyId, "scenario.familyId", FAMILY_ID_RE),
         title: p.string(root.title, "scenario.title"),
         expectedAnswer,
+        answerMatch,
         checks,
         criticalCheckIds,
         turnScript,

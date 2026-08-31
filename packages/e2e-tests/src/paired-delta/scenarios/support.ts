@@ -1,7 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { isValidPublicClaimId } from "../../../../plugin/src/features/magic-context/memory/claim-operation-contract";
-import type { ScenarioDeclaration, VerifierContext } from "../contract";
+import type { AnswerMatch, ScenarioDeclaration, VerifierContext } from "../contract";
 
 interface ScenarioSpec {
     scenarioId: string;
@@ -9,6 +9,8 @@ interface ScenarioSpec {
     title: string;
     evidence: string;
     answer: string;
+    /** `exact` only where reproducing the answer's casing is itself the thing under test. */
+    answerMatch: AnswerMatch;
     locatorId: string;
 }
 
@@ -26,6 +28,14 @@ export function r1WireDelivered(
     return resolved.every((id) => wire.includes(`id=${id}`));
 }
 
+/** Casing is part of the gold only for scenarios that say so. Elsewhere a strict comparison would fail an agent that recalled the fact and transcribed it differently, scoring output formatting instead of the retrieval the lane measures. commentlint: allow(JUDGE) */
+function answerMatches(actual: string | null, spec: ScenarioSpec): boolean {
+    if (actual === null) return false;
+    return spec.answerMatch === "exact"
+        ? actual === spec.answer
+        : actual.toLowerCase() === spec.answer.toLowerCase();
+}
+
 export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
     const verifier = (context: VerifierContext) => {
         const answerPath = join(context.workspacePath, "result", "answer.txt");
@@ -40,7 +50,7 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
         }
         return [
             { id: "check-file", passed: actual !== null },
-            { id: "check-answer", passed: actual === spec.answer },
+            { id: "check-answer", passed: answerMatches(actual, spec) },
         ];
     };
 
@@ -49,6 +59,7 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
         familyId: spec.familyId,
         title: spec.title,
         expectedAnswer: spec.answer,
+        answerMatch: spec.answerMatch,
         checks: ["check-file", "check-answer"],
         criticalCheckIds: ["check-answer"],
         turnScript: [
