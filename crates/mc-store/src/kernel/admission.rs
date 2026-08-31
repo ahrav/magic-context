@@ -3,7 +3,7 @@ use super::{KernelError, Sensitivity};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "63aa7b552fe115e4ecf82d09cdab925fd22d2682dee74345b112bfcfa5b5b244";
+    "7f6ff2b4084f57290e6db25a90575ae2baf550d6c2a29e5d98a46d75354790e0";
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -155,6 +155,7 @@ pub struct EvaluationInputs {
     pub approval_valid: bool,
     pub event: EventKind,
     pub has_evidence: bool,
+    pub remaining_support: Option<Maturity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +208,17 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
     let current_disposition = input
         .prior
         .map_or(Disposition::Active, |prior| prior.disposition);
+    let remaining_support = match (input.event, input.remaining_support) {
+        (EventKind::ApprovalRevoked, Some(remaining))
+            if remaining.rank() <= current_effective.rank() =>
+        {
+            remaining
+        }
+        (EventKind::ApprovalRevoked, _) | (_, Some(_)) => {
+            return Err(KernelError::AdmissionPolicy);
+        }
+        (_, None) => current_effective,
+    };
     let ceiling = automatic_ceiling(input.source_class, input.taint_class);
     let (requested, requested_disposition, requested_outcome) = event_effect(input.event, current);
     let raises_support =
@@ -228,7 +240,7 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
     let target = if denied { current } else { requested };
     let historical = current.max(target);
     let supported = if input.event == EventKind::ApprovalRevoked {
-        current_effective.min(ceiling)
+        remaining_support
     } else if raises_support && !denied {
         requested
     } else {
@@ -256,6 +268,7 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
             && prior.effective_maturity == effective
             && prior.disposition == disposition
             && prior.sensitivity == sensitivity
+            && same_event_effect(prior.outcome, requested_outcome)
     });
 
     let outcome = if denied {
@@ -271,8 +284,7 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
     } else {
         requested_outcome
     };
-    let no_op =
-        state_unchanged && !denied && input.prior.is_some_and(|prior| prior.outcome == outcome);
+    let no_op = state_unchanged && !denied;
 
     let visibility = visibility_row(effective, disposition);
 
@@ -362,6 +374,18 @@ const fn event_effect(
         EventKind::Quarantine => (current, Some(Disposition::Quarantined), Outcome::Quarantine),
         EventKind::Other => (current, None, Outcome::Deny),
     }
+}
+
+const fn same_event_effect(prior: Outcome, requested: Outcome) -> bool {
+    matches!(
+        (prior, requested),
+        (Outcome::Admit | Outcome::Promote, Outcome::Promote)
+            | (Outcome::DemoteSupport, Outcome::DemoteSupport)
+            | (Outcome::Reject, Outcome::Reject)
+            | (Outcome::Correct, Outcome::Correct)
+            | (Outcome::Replace, Outcome::Replace)
+            | (Outcome::Quarantine, Outcome::Quarantine)
+    )
 }
 
 const fn disposition_restrictiveness(disposition: Disposition) -> u8 {
@@ -550,6 +574,7 @@ mod tests {
                     approval_valid: false,
                     event: EventKind::CodeObserved,
                     has_evidence: true,
+                    remaining_support: None,
                 };
                 let automatic = evaluate_admission(input).unwrap();
                 let expected = match (source_class, taint_class) {
@@ -596,6 +621,7 @@ mod tests {
                 approval_valid: true,
                 event,
                 has_evidence: true,
+                remaining_support: None,
             };
             assert_eq!(
                 evaluate_admission(missing),
@@ -635,6 +661,7 @@ mod tests {
             approval_valid: false,
             event: EventKind::Approve,
             has_evidence: true,
+            remaining_support: None,
         })
         .unwrap();
         assert_eq!(denied.outcome, Outcome::Deny);
@@ -657,6 +684,7 @@ mod tests {
             approval_valid: false,
             event: EventKind::Approve,
             has_evidence: true,
+            remaining_support: None,
         })
         .unwrap();
         assert_eq!(repeated.outcome, Outcome::Deny);
@@ -674,6 +702,7 @@ mod tests {
             approval_valid: false,
             event: EventKind::Other,
             has_evidence: true,
+            remaining_support: None,
         };
         let settled = PriorDecision {
             historical_maturity: Maturity::Approved,
@@ -726,6 +755,8 @@ mod tests {
                 approval_valid: false,
                 event: *event,
                 has_evidence: true,
+                remaining_support: (*event == EventKind::ApprovalRevoked)
+                    .then_some(Maturity::Candidate),
             });
             let result = result.unwrap();
             let admitted = matches!(
@@ -751,6 +782,7 @@ mod tests {
             approval_valid: false,
             event: EventKind::AcceptedAdr,
             has_evidence: true,
+            remaining_support: None,
         })
         .unwrap();
         assert_eq!(deterministic.historical_maturity, Maturity::Approved);
@@ -767,6 +799,7 @@ mod tests {
             approval_valid: false,
             event: EventKind::AcceptedAdr,
             has_evidence: true,
+            remaining_support: None,
         })
         .unwrap();
         assert_eq!(inferred.historical_maturity, Maturity::Candidate);
@@ -784,6 +817,7 @@ mod tests {
             approval_valid: false,
             event: EventKind::Verify,
             has_evidence: true,
+            remaining_support: None,
         };
         assert_eq!(
             evaluate_admission(base).unwrap().historical_maturity,
@@ -823,6 +857,7 @@ mod tests {
             approval_valid: false,
             event: EventKind::ApprovalRevoked,
             has_evidence: false,
+            remaining_support: Some(Maturity::Candidate),
         })
         .unwrap();
         assert_eq!(result.historical_maturity, Maturity::Approved);
@@ -849,6 +884,7 @@ mod tests {
                 approval_valid: false,
                 event: EventKind::Other,
                 has_evidence: false,
+                remaining_support: None,
             }
         })
         .unwrap();
@@ -876,6 +912,7 @@ mod tests {
             approval_valid: false,
             event: EventKind::CodeObserved,
             has_evidence: true,
+            remaining_support: None,
         })
         .unwrap();
         assert_eq!(observed.disposition, Disposition::Rejected);
@@ -891,6 +928,7 @@ mod tests {
                 approval_valid: false,
                 event: EventKind::Other,
                 has_evidence: false,
+                remaining_support: None,
             }),
             Err(KernelError::AdmissionPolicy)
         );
@@ -912,6 +950,7 @@ mod tests {
             approval_valid: false,
             event: EventKind::Quarantine,
             has_evidence: false,
+            remaining_support: None,
         })
         .unwrap();
         assert_eq!(quarantined.disposition, Disposition::Quarantined);
@@ -961,6 +1000,7 @@ mod tests {
                 approval_valid: false,
                 event: EventKind::Other,
                 has_evidence: false,
+                remaining_support: None,
             })
             .unwrap();
             assert!(result.sensitivity >= Sensitivity::Sensitive);
@@ -993,6 +1033,8 @@ mod tests {
                     approval_valid: false,
                     event: *event,
                     has_evidence: true,
+                    remaining_support: (*event == EventKind::ApprovalRevoked)
+                        .then_some(Maturity::Candidate),
                 })
                 .unwrap();
                 assert!(
@@ -1021,6 +1063,7 @@ mod tests {
             approval_valid: true,
             event: EventKind::MarkStale,
             has_evidence: false,
+            remaining_support: None,
         })
         .unwrap();
         assert_eq!(approved.disposition, Disposition::Stale);
@@ -1046,6 +1089,7 @@ mod tests {
                 approval_valid: false,
                 event: EventKind::Enforce,
                 has_evidence: false,
+                remaining_support: None,
             }),
             Err(KernelError::AdmissionPolicy)
         );
@@ -1070,9 +1114,82 @@ mod tests {
             approval_valid: false,
             event: EventKind::ApprovalRevoked,
             has_evidence: false,
+            remaining_support: Some(Maturity::Candidate),
         })
         .unwrap();
         assert_eq!(result.effective_maturity.get(), Maturity::Candidate);
+    }
+
+    #[test]
+    fn approval_revocation_requires_and_preserves_remaining_support() {
+        let base = EvaluationInputs {
+            source_class: SourceClass::TrustedLocalCode,
+            taint_class: TaintClass::CurrentCode,
+            prior: Some(PriorDecision {
+                historical_maturity: Maturity::Approved,
+                effective_maturity: Maturity::Approved,
+                disposition: Disposition::Active,
+                outcome: Outcome::Promote,
+                source_class: SourceClass::TrustedLocalCode,
+                taint_class: TaintClass::CurrentCode,
+                sensitivity: Sensitivity::Normal,
+            }),
+            candidate_sensitivity: Sensitivity::Normal,
+            predecessor_sensitivity: None,
+            approval_valid: false,
+            event: EventKind::ApprovalRevoked,
+            has_evidence: false,
+            remaining_support: None,
+        };
+        assert_eq!(evaluate_admission(base), Err(KernelError::AdmissionPolicy));
+
+        let unsupported = evaluate_admission(EvaluationInputs {
+            remaining_support: Some(Maturity::Enforced),
+            ..base
+        });
+        assert_eq!(unsupported, Err(KernelError::AdmissionPolicy));
+
+        for remaining in [Maturity::Candidate, Maturity::Corroborated] {
+            let result = evaluate_admission(EvaluationInputs {
+                remaining_support: Some(remaining),
+                ..base
+            })
+            .unwrap();
+            assert_eq!(result.effective_maturity.get(), remaining);
+            assert_eq!(result.outcome, Outcome::DemoteSupport);
+            assert!(!result.no_op);
+        }
+    }
+
+    #[test]
+    fn correction_and_replacement_are_distinct_effects() {
+        for (prior_outcome, event, expected) in [
+            (Outcome::Correct, EventKind::Replace, Outcome::Replace),
+            (Outcome::Replace, EventKind::Correct, Outcome::Correct),
+        ] {
+            let result = evaluate_admission(EvaluationInputs {
+                source_class: SourceClass::TrustedLocalCode,
+                taint_class: TaintClass::CurrentCode,
+                prior: Some(PriorDecision {
+                    historical_maturity: Maturity::Verified,
+                    effective_maturity: Maturity::Candidate,
+                    disposition: Disposition::Superseded,
+                    outcome: prior_outcome,
+                    source_class: SourceClass::TrustedLocalCode,
+                    taint_class: TaintClass::CurrentCode,
+                    sensitivity: Sensitivity::Normal,
+                }),
+                candidate_sensitivity: Sensitivity::Normal,
+                predecessor_sensitivity: Some(Sensitivity::Normal),
+                approval_valid: false,
+                event,
+                has_evidence: false,
+                remaining_support: None,
+            })
+            .unwrap();
+            assert_eq!(result.outcome, expected);
+            assert!(!result.no_op);
+        }
     }
 
     #[test]
@@ -1086,6 +1203,7 @@ mod tests {
             approval_valid: false,
             event: EventKind::CodeObserved,
             has_evidence: true,
+            remaining_support: None,
         })
         .unwrap();
         assert_eq!(first.outcome, Outcome::Admit);
@@ -1108,6 +1226,7 @@ mod tests {
             approval_valid: false,
             event: EventKind::CodeObserved,
             has_evidence: true,
+            remaining_support: None,
         })
         .unwrap();
         assert!(replay.no_op);
@@ -1127,6 +1246,7 @@ mod tests {
                     approval_valid,
                     event: EventKind::Enforce,
                     has_evidence: false,
+                    remaining_support: None,
                 }),
                 Err(KernelError::AdmissionPolicy),
                 "approval_valid={approval_valid}"
@@ -1151,6 +1271,7 @@ mod tests {
             approval_valid: true,
             event: EventKind::Enforce,
             has_evidence: true,
+            remaining_support: None,
         };
         assert!(evaluate_admission(replay).unwrap().no_op);
 
@@ -1158,6 +1279,7 @@ mod tests {
         assert_eq!(
             evaluate_admission(EvaluationInputs {
                 has_evidence: false,
+                remaining_support: None,
                 ..replay
             }),
             Err(KernelError::AdmissionPolicy)
@@ -1177,6 +1299,7 @@ mod tests {
                 }),
                 approval_valid: false,
                 has_evidence: false,
+                remaining_support: None,
                 ..replay
             }),
             Err(KernelError::AdmissionPolicy)
@@ -1202,6 +1325,7 @@ mod tests {
             approval_valid: true,
             event: EventKind::Enforce,
             has_evidence: true,
+            remaining_support: None,
         })
         .unwrap();
         assert_eq!(promoted.historical_maturity, Maturity::Enforced);
