@@ -69,17 +69,25 @@ disposition_recorded() {
     ' "$dispositions"
 }
 
-recorded_digest() {
-    awk -F'|' -v path="$1" '
+recorded_field() {
+    awk -F'|' -v path="$1" -v field="$2" '
         $0 ~ /^\|/ {
             gsub(/[ `]/, "", $2)
             if ($2 == path) {
-                gsub(/[ `]/, "", $4)
-                print $4
+                gsub(/[ `]/, "", $field)
+                print $field
                 exit
             }
         }
     ' "$inventory"
+}
+
+recorded_digest() {
+    recorded_field "$1" 4
+}
+
+recorded_blob() {
+    recorded_field "$1" 3
 }
 
 [ -f "$inventory" ] || fail source-inventory-mismatch "missing $inventory"
@@ -110,6 +118,9 @@ fi
 for source in $watched_sources; do
     if [ -z "$(recorded_digest "$source")" ]; then
         fail source-inventory-mismatch "no digest recorded for $source"
+    fi
+    if [ -z "$(recorded_blob "$source")" ]; then
+        fail source-inventory-mismatch "no blob ID recorded for $source"
     fi
 done
 
@@ -150,6 +161,11 @@ for source in $watched_sources; do
     pinned_digest=$(upstream_digest "$pinned_head" "$source")
     if [ "$pinned_digest" != "$expected" ]; then
         fail source-inventory-mismatch "$source at $pinned_commit hashes to $pinned_digest"
+    fi
+    expected_blob=$(recorded_blob "$source")
+    pinned_blob=$(git rev-parse --verify --quiet "$pinned_head:$source" 2>/dev/null || echo absent)
+    if [ "$pinned_blob" != "$expected_blob" ]; then
+        fail source-inventory-mismatch "$source at $pinned_commit is blob $pinned_blob"
     fi
     watched_digest=$(upstream_digest "$watched_head" "$source")
     if [ "$watched_digest" != "$expected" ]; then

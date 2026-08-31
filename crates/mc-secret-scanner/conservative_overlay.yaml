@@ -70,7 +70,6 @@ rules:
     max_len: 256
   offline_validation:
     type: slack_token
-# Without a closing boundary an overlong identifier still reports a truncated prefix.
 - name: magic-google-api-key
   regex: '\bAIza[A-Za-z0-9_-]{35}\b'
   anchors: [AIza]
@@ -83,12 +82,13 @@ rules:
 # below that match arbitrary text declare their own value_suppressors_any.
 - name: magic-bearer-token
   regex: '(?i)\bAuthorization\s*:\s*Bearer\s+(?P<value>[A-Za-z0-9._~+/=-]{8,})'
-  anchors: [Authorization, authorization]
+  anchors: [authorization]
   radius: 256
   value_group: value
-  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
-    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
-    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
+  value_suppressors_any: &overlay_value_suppressors ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE',
+    'changeme', 'CHANGEME', 'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX',
+    'your-', 'your_', 'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME',
+    '${', '{{']
 - name: magic-jwt
   regex: '\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{10,}'
   anchors: [eyJ]
@@ -96,57 +96,47 @@ rules:
 # A non-delimiting quote is content, and a backslash-escaped delimiter is content;
 # a value class that stopped at either would report a truncated secret span.
 - name: magic-keyed-double-quoted
-  regex: '(?i)"(?P<key>[^"]*(?:key|token|secret|password|auth|bearer|credential)[^"]*)"\s*:\s*"(?P<value>(?:[^"\\]|\\.)*)"'
+  regex: '(?i)"(?P<key>(?:[^"\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^"\\]|\\.)*)"\s*:\s*"(?P<value>(?:[^"\\]|\\.)*)"'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   key_group: key
   value_group: value
   reject_scalars: true
-  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
-    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
-    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
+  value_suppressors_any: *overlay_value_suppressors
 - name: magic-keyed-single-quoted
-  regex: '(?i)''(?P<key>[^'']*(?:key|token|secret|password|auth|bearer|credential)[^'']*)''\s*:\s*''(?P<value>(?:[^''\\]|\\.)*)'''
+  regex: '(?i)''(?P<key>(?:[^''\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^''\\]|\\.)*)''\s*:\s*''(?P<value>(?:[^''\\]|\\.)*)'''
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   key_group: key
   value_group: value
   reject_scalars: true
-  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
-    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
-    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
+  value_suppressors_any: *overlay_value_suppressors
 - name: magic-keyed-double-single
-  regex: '(?i)"(?P<key>[^"]*(?:key|token|secret|password|auth|bearer|credential)[^"]*)"\s*:\s*''(?P<value>(?:[^''\\]|\\.)*)'''
+  regex: '(?i)"(?P<key>(?:[^"\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^"\\]|\\.)*)"\s*:\s*''(?P<value>(?:[^''\\]|\\.)*)'''
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   key_group: key
   value_group: value
   reject_scalars: true
-  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
-    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
-    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
+  value_suppressors_any: *overlay_value_suppressors
 - name: magic-keyed-single-double
-  regex: '(?i)''(?P<key>[^'']*(?:key|token|secret|password|auth|bearer|credential)[^'']*)''\s*:\s*"(?P<value>(?:[^"\\]|\\.)*)"'
+  regex: '(?i)''(?P<key>(?:[^''\\]|\\.)*(?:key|token|secret|password|auth|bearer|credential)(?:[^''\\]|\\.)*)''\s*:\s*"(?P<value>(?:[^"\\]|\\.)*)"'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   key_group: key
   value_group: value
   reject_scalars: true
-  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
-    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
-    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
+  value_suppressors_any: *overlay_value_suppressors
 # Rust regex has no backreference, so one rule cannot pair its own quotes; a shared
 # optional quote instead truncates a quoted value at its first space.
 - name: magic-keyed-assignment
-  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*(?P<value>[^\s''"`]+)'
+  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*(?P<value>[^\s''"`;&|<>()$]+)'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   key_group: key
   value_group: value
   reject_scalars: true
-  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
-    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
-    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
+  value_suppressors_any: *overlay_value_suppressors
 - name: magic-keyed-assignment-double-quoted
   regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*"(?P<value>(?:[^"\\]|\\.)*)"'
   anchors: [key, token, secret, password, auth, bearer, credential]
@@ -154,9 +144,7 @@ rules:
   key_group: key
   value_group: value
   reject_scalars: true
-  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
-    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
-    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
+  value_suppressors_any: *overlay_value_suppressors
 - name: magic-keyed-assignment-single-quoted
   regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*''(?P<value>(?:[^''\\]|\\.)*)'''
   anchors: [key, token, secret, password, auth, bearer, credential]
@@ -164,6 +152,4 @@ rules:
   key_group: key
   value_group: value
   reject_scalars: true
-  value_suppressors_any: ['placeholder', 'PLACEHOLDER', 'example', 'EXAMPLE', 'changeme', 'CHANGEME',
-    'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
-    'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
+  value_suppressors_any: *overlay_value_suppressors
