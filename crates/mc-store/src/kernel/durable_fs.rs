@@ -178,12 +178,13 @@ pub(super) fn open_or_create_append_file(
             let file = File::from(descriptor);
             let metadata = file.metadata().map_err(classify_io)?;
             if !metadata.is_file()
+                || metadata.nlink() != 1
                 || metadata.uid() != rustix::process::geteuid().as_raw()
                 || metadata.permissions().mode() & 0o777 != 0o600
             {
                 return Err(classify_io(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "append file is not owner-only",
+                    "append file is not an exclusive owner-only regular file",
                 )));
             }
             Ok(file)

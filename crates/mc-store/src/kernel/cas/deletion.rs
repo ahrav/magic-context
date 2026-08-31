@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 
+use super::MAX_TEXT_FIELD_BYTES;
 use super::{is_artifact_digest, ArtifactError, ArtifactErrorKind};
 use crate::kernel::durable_fs::{
     append_and_sync, classify_io, durable_unlink, open_secure_directory, StorageError,
@@ -578,6 +579,9 @@ fn load_artifact_state(
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
         ArtifactDeletionIdentity::EvidenceId(evidence_id) if !evidence_id.trim().is_empty() => {
+            if evidence_id.len() > MAX_TEXT_FIELD_BYTES {
+                return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
+            }
             let evidence_id = redact(evidence_id).text;
             let stored: String = connection
                 .query_row(

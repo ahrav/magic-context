@@ -131,7 +131,11 @@ impl Envelope<'_> {
                 return Err(KernelError::NotFound);
             }
         }
-        let abandonment_id = format!("{}:{}", self.commit_seq, consumer_id.text);
+        let abandonment_id = format!(
+            "{}-{}",
+            self.commit_seq,
+            crate::kernel::durable_fs::next_unique_id()
+        );
         // Deleting `outbox_consumers` removes the consumer checkpoint. Record one
         // abandonment per blocked barrier so each can still satisfy its
         // `required_checkpoint_commit_seq`.
@@ -142,7 +146,7 @@ impl Envelope<'_> {
                      abandonment_id,consumer_id,barrier_id,operator_id,
                      last_checkpoint_commit_seq,reason,abandoned_at,commit_seq
                  )
-                 SELECT ?1 || ':' || bc.barrier_id,?2,bc.barrier_id,?3,?4,?5,?6,?7
+                 SELECT ?1 || '-' || CAST(bc.rowid AS TEXT),?2,bc.barrier_id,?3,?4,?5,?6,?7
                  FROM deletion_backfill_barrier_consumers bc
                  JOIN deletion_backfill_barriers b USING(barrier_id)
                  WHERE bc.consumer_id=?2

@@ -1292,3 +1292,81 @@ fn a_delete_receipt_cannot_authorize_a_purge_unlink() {
         )
         .unwrap());
 }
+
+#[test]
+fn an_oversized_evidence_identity_is_rejected_before_lookup() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    ingest(&store, "bounded-id", b"bounded-id");
+
+    assert_eq!(
+        store
+            .delete_artifact(ArtifactDeletionRequest {
+                intent: intent("delete-oversized"),
+                identity: ArtifactDeletionIdentity::EvidenceId("e".repeat(4096)),
+                kind: ArtifactDeletionKind::Delete,
+                operator_id: None,
+                target_locator: None,
+                reason: None,
+                deleted_at: 42,
+            })
+            .unwrap_err()
+            .kind(),
+        ArtifactErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn abandoning_two_colliding_consumer_ids_in_one_commit_succeeds() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "collide", b"collide");
+    let barrier_consumer = "x";
+    store
+        .commit(intent("register-collide"), |envelope| {
+            envelope.register_outbox_consumer(barrier_consumer, 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+    let deletion = store
+        .delete_artifact(delete_request(
+            "collide",
+            &handle.digest,
+            ArtifactDeletionKind::Delete,
+        ))
+        .unwrap();
+    // A consumer whose id is the delimiter-join of the first consumer and the barrier.
+    let colliding = format!("{barrier_consumer}:{}", deletion.barrier_id);
+    store
+        .commit(intent("register-colliding"), |envelope| {
+            envelope.register_outbox_consumer(&colliding, 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+
+    store
+        .commit(intent("abandon-both"), |envelope| {
+            for id in [barrier_consumer, colliding.as_str()] {
+                envelope.abandon_outbox_consumer(
+                    id,
+                    ConsumerAbandonment {
+                        operator_id: "operator-1".to_string(),
+                        reason: "retired".to_string(),
+                        abandoned_at: 20,
+                        barrier_id: None,
+                    },
+                )?;
+            }
+            Ok("abandoned".to_string())
+        })
+        .unwrap();
+
+    assert!(
+        store
+            .deletion_barrier(&deletion.barrier_id)
+            .unwrap()
+            .cleared
+    );
+}
