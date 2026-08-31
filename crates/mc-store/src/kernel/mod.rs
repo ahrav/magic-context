@@ -3,11 +3,14 @@ mod cas;
 mod durable_fs;
 mod envelope;
 mod facts;
+mod object_write;
 mod open;
 mod outbox;
 mod redaction;
 mod retention;
 pub mod schema;
+mod scope;
+mod slice;
 
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 pub use backup::filesystem_is_unsafe_for_test;
@@ -39,6 +42,12 @@ pub use facts::{ArtifactBudgetFacts, KernelFacts, MAIN_FILE_WARN_BYTES};
 pub use open::{KernelError, KernelStore};
 pub use outbox::{ConsumerAbandonment, OutboxPruneResult};
 pub use retention::{StagingMaintenanceResult, StagingTerminalState, STAGING_RETENTION_MS};
+pub use scope::{ScopeSpec, ScopeTermSpec, ScopeWriteOutcome};
+pub use slice::{
+    DecisionEventOutcome, DecisionEventPayload, DecisionEventSpec, DecisionPayload, DecisionSpec,
+    DecisionWriteOutcome, ObservationDependencySpec, ObservationPayload, ObservationSpec,
+    ObservationWriteOutcome, RetirementOutcome,
+};
 
 /// A constraint violation is permanent and a lock wait is retryable, so collapsing both into `Io` would make either untreatable.
 pub(crate) fn map_sqlite(error: rusqlite::Error) -> KernelError {
