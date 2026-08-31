@@ -15,41 +15,44 @@ slowdown.
 ## Evidence trail
 
 Ownership is established in four steps, all inside `prepare`
-(`ring_transport.rs:233-313`).
+(`ring_transport.rs:217-303`).
 
-1. The OS thread is spawned at `:254-256` with the name
-   `mc-host-shm-endpoint`. Everything from `:257` to `:292` is inside that
+1. The OS thread is spawned at `:238-240` with the name
+   `mc-host-shm-endpoint`. Everything from `:241` to `:277` is inside that
    closure.
-2. `DuplexRing::create(&profile)` runs at `:263`, inside the closure. The only
-   thing the caller supplies is `Arc<TargetProfile>`, cloned at `:249`.
-3. `rings` is moved by value into `run_endpoint(rings, ...)` at `:280`.
+2. `DuplexRing::create(&profile)` runs at `:248`, inside the closure. The only
+   thing the caller supplies is `Arc<TargetProfile>`, cloned at `:234`.
+3. `rings` is moved by value into `run_endpoint(rings, ...)` at `:265`.
    `run_endpoint`'s signature takes `rings: DuplexRing` by value
-   (`:365`), so the value is dropped when `run_endpoint` returns, still inside
-   the closure and still inside the `catch_unwind` at `:279-290`.
+   (`:359-368`), so the value is dropped when `run_endpoint` returns, still inside
+   the closure and still inside the `catch_unwind` at `:264-275`.
 4. What crosses the thread boundary is a `std::sync::mpsc::sync_channel(1)`
-   created at `:247` and carrying
-   `Result<(serde_json::Value, [OwnedFd; 2]), RingUnavailable>`, sent at `:276`
-   and received at `:297`. No ring, no mapping pointer, no arena reference.
+   created at `:231` and carrying
+   `Result<(serde_json::Value, [OwnedFd; RING_DESCRIPTOR_COUNT]), RingUnavailable>`
+   — six descriptors post-#131 (three per direction: mapping, data doorbell,
+   capacity doorbell), up from two — sent at `:261`
+   and received at `:282`. No ring, no mapping pointer, no arena reference.
 
-`PreparedRing` (`:103-111`) is the handle the connection task receives. Its
-seven fields are `descriptor: serde_json::Value`, `descriptors: [OwnedFd; 2]`,
-`sender: FrameSender`, `receiver: BoxedReceiver`, `io: Pin<Box<dyn Future>>`,
+`PreparedRing` (`:93-101`) is the handle the connection task receives. Its
+seven fields are `descriptor: serde_json::Value`,
+`descriptors: [OwnedFd; RING_DESCRIPTOR_COUNT]`,
+`sender: FrameSender`, `receiver: ShmReceiver`, `io: Pin<Box<dyn Future>>`,
 `root: CancellationToken`, `read_cancel: CancellationToken`. None owns a `Ring`.
 
 Two independent structural reinforcements:
 
-- `Ring` is `!Send`. `RingClientEndpoint`'s doc at `:626` says
+- `Ring` is `!Send`. `RingClientEndpoint`'s doc at `:650` says
   "Thread-confined", and the peer side in `client.rs:1842-1893` likewise
   constructs its endpoint inside its own thread closure at `client.rs:1855`.
   A direct move of a `Ring` across a thread boundary would not compile.
-- `crates/mc-host/src/lib.rs:8` is `#![deny(unsafe_code)]`, with the doc comment
-  at `:2-7` recording that the one permitted `unsafe` block in the crate is a
+- `crates/mc-host/src/lib.rs:5` is `#![deny(unsafe_code)]`, with the doc comment
+  at `:1-4` recording that the one permitted `unsafe` block in the crate is a
   `pre_exec` hook in the Broca subprocess spawner. So there is currently no
   route in `mc-host` for smuggling a raw pointer into the arena past the
   `!Send` bound.
 
 The inline test `construction_has_no_ring_side_effects`
-(`:770-775`) asserts the process-level half: a freshly constructed
+(`:851-856`) asserts the process-level half: a freshly constructed
 `RingTransport` has `accounting.active == ResourceCharges::ZERO` and
 `accounting.quarantined == ResourceCharges::ZERO`, so no ring exists before
 `prepare`.
@@ -64,20 +67,20 @@ is a future change that keeps the types legal while breaking confinement:
 - A `ReceiveLease` or a span pointer is returned from the endpoint thread
   through a channel that carries a raw address as an integer, which no type
   system catches.
-- The endpoint thread's current-thread Tokio runtime (`:257-259`) is changed to
+- The endpoint thread's current-thread Tokio runtime (`:242-246`) is changed to
   a multi-thread runtime, at which point `run_endpoint`'s futures could migrate
   between worker threads. `run_endpoint` holds `&rings` across `await` points
-  (`:381-391`, `:447`), so a multi-thread runtime would immediately require
+  (`:386-397`, `:479-484`), so a multi-thread runtime would immediately require
   `DuplexRing: Send` and fail to compile — but only as long as the ring is held
   across an await, which is an incidental rather than a stated invariant.
 
 If confinement broke, the observable consequence would be descriptor validation
-failures on `try_receive` (`ring.rs:803-812`) leading to quarantine, or torn
+failures on `try_receive` (`ring.rs:1093-1100`) leading to quarantine, or torn
 payload delivery with a valid descriptor, depending on which cursor raced.
 
 ## Timing windows and dependencies
 
-The window is the entire connection lifetime, from `:263` to `run_endpoint`
+The window is the entire connection lifetime, from `:248` to `run_endpoint`
 returning. There is no narrow interleaving to hit; the property is structural.
 
 Dependencies: Part 1's transport-side properties all assume single-threaded
@@ -112,10 +115,10 @@ Neither runs in CI today: every `-p mc-host` invocation in `ci.yml` carries a
 
 ### Q: Should `PreparedRing` carry a negative marker or a compile-fail doctest so confinement is enforced rather than reviewed?
 
-- Sources examined: `ring_transport.rs:103-111` (`PreparedRing` fields),
-  `:254-292` (thread closure), `:365` (`run_endpoint` signature),
+- Sources examined: `ring_transport.rs:93-101` (`PreparedRing` fields),
+  `:238-277` (thread closure), `:359-368` (`run_endpoint` signature),
   `frame_channel.rs:296-308` (the two existing compile-fail doctests on
-  `ReceiveLease`), `lib.rs:8` (`deny(unsafe_code)`).
+  `ReceiveLease`; not re-swept post-#131), `lib.rs:5` (`deny(unsafe_code)`).
 - Findings: the crate already uses compile-fail doctests for exactly this kind
   of confinement claim, on `ReceiveLease`, where the two doctests assert
   `!Send` and `!'static`. So the technique is established in this codebase and
@@ -131,10 +134,10 @@ Neither runs in CI today: every `-p mc-host` invocation in `ci.yml` carries a
 
 ### Q: Does the current-thread runtime choice at `:257-259` carry part of the confinement guarantee?
 
-- Sources examined: `ring_transport.rs:257-259`
-  (`Builder::new_current_thread().enable_time().build()`), `:378-452`
-  (`run_endpoint`'s loop, which holds `&rings` across awaits at `:381-391` and
-  uses `&rings.first` at `:447`).
+- Sources examined: `ring_transport.rs:242-246`
+  (`Builder::new_current_thread().enable_io().enable_time().build()`), `:359-485`
+  (`run_endpoint`'s loop, which holds `&rings` across awaits at `:386-397` and
+  uses `&rings.first` at `:479-484`).
 - Findings: yes, incidentally. Because `run_endpoint` holds a `&DuplexRing`
   across `.await`, switching to a multi-thread runtime would require the future
   to be `Send`, which `DuplexRing` is not. So the current-thread choice is
@@ -143,4 +146,4 @@ Neither runs in CI today: every `-p mc-host` invocation in `ci.yml` carries a
 - Missing evidence: none needed.
 - Conclusion: resolved. The confinement is compiler-enforced today through the
   combination of `!Send` and the current-thread runtime, but the coupling is
-  undocumented, so a comment at `:257` would be the cheapest hardening.
+  undocumented, so a comment at `:242` would be the cheapest hardening.
