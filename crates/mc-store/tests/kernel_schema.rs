@@ -144,7 +144,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "712b1c7afa34647e01619e4fd633e48a041e710986b5dc3a9aca48e8cf8c33da";
+    "0ba154ed8894bb37d797bed095e0d72c99b6643c671740c725fdca4aecfcc95a";
 
 #[test]
 fn cas_control_tables_and_lookup_indexes_are_frozen() {
@@ -446,6 +446,22 @@ fn cas_control_rows_preserve_reclaim_purge_and_backfill_state() {
                  created_at,heartbeat_at,lease_expires_at
              ) VALUES ('revive-purged','digest','fresh-ref','Live',7,9,9,10)",
             [],
+        )
+        .is_err());
+    conn.execute(
+        "INSERT INTO artifact_ingestion_reservations(
+             reservation_id,artifact_digest,artifact_reference,state,writer_epoch,
+             created_at,heartbeat_at,lease_expires_at
+         ) VALUES ('live-4','digest-4','ref-4','Live',7,9,9,10)",
+        [],
+    )
+    .unwrap();
+    assert!(conn
+        .execute(
+            "INSERT INTO artifact_purge_tombstones(
+                 artifact_digest,artifact_reference,operator_id,reason,purged_at,commit_seq
+             ) VALUES ('digest-4','ref-4','operator-1','secret',9,?1)",
+            [commit_seq],
         )
         .is_err());
     assert!(conn

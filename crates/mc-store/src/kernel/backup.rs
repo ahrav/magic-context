@@ -225,13 +225,18 @@ impl KernelStore {
         })();
 
         if result.is_err() {
-            cleanup_backup_family(&destination, &temp_name);
+            let mut cleaned = cleanup_backup_family(&destination, &temp_name);
             if published {
-                cleanup_backup_family(&destination, &final_name);
+                cleaned &= cleanup_backup_family(&destination, &final_name);
             }
             let _ = destination.sync_all();
-            if let Some(pin_id) = capture.pin_id.as_deref() {
-                rollback_capture_pin(&mut writer, self.lease_epoch(), pin_id);
+            // Keep the pin until cleanup succeeds: retention could reap
+            // evidence still referenced by a lingering artifact. The pin's
+            // own expiry reclaims it when cleanup never succeeds.
+            if cleaned {
+                if let Some(pin_id) = capture.pin_id.as_deref() {
+                    rollback_capture_pin(&mut writer, self.lease_epoch(), pin_id);
+                }
             }
         }
         result
@@ -747,15 +752,17 @@ fn rollback_capture_pin(writer: &mut Connection, lease_epoch: u64, pin_id: &str)
     }
 }
 
-fn cleanup_backup_family(directory: &File, name: &str) {
+fn cleanup_backup_family(directory: &File, name: &str) -> bool {
+    let mut cleaned = true;
     for candidate in [
         name.to_string(),
         format!("{name}-journal"),
         format!("{name}-wal"),
         format!("{name}-shm"),
     ] {
-        let _ = durable_unlink(directory, &candidate);
+        cleaned &= durable_unlink(directory, &candidate).is_ok();
     }
+    cleaned
 }
 
 fn sensitivity_bearing_tables(tx: &rusqlite::Transaction<'_>) -> Result<Vec<String>, KernelError> {
