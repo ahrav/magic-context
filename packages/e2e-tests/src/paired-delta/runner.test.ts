@@ -372,6 +372,78 @@ describe("paired-delta runner", () => {
         });
     });
 
+    it("counts only the rollouts it reports when the cap stops the run", async () => {
+        const store = new MemoryStore();
+        const seeded = await runPairedDelta(options(store), dependencies());
+
+        expect(seeded.records).toHaveLength(3);
+
+        // Drop the first arm so the resumed run must execute before it reaches
+        // the two stored coordinates behind it.
+        store.records.splice(store.records.findIndex(({ armId }) => armId === "mc-on"), 1);
+        const spentBefore = store.records.reduce((sum, { costUsd }) => sum + costUsd, 0);
+        const resumed = await runPairedDelta(
+            { ...options(store), maxCostUsd: spentBefore },
+            dependencies(),
+        );
+
+        expect(resumed.status).toBe("cost-cap-reached");
+        expect(resumed.observedCostRollouts + resumed.estimatedCostRollouts)
+            .toBe(resumed.records.length);
+    });
+
+    it("keeps a replaced attempt's price as a reserve floor across resumes", async () => {
+        const store = new MemoryStore();
+        // Prices that put the failure estimate above the desk ceiling, so the
+        // floor cannot come from `deskCostCeilingUsd` instead.
+        const expensive = {
+            ...options(store),
+            pricesPerMillionTokens: { input: 100, output: 200, cacheCreation: 1, cacheRead: 1 },
+        };
+        await runPairedDelta(
+            expensive,
+            dependencies((armId) =>
+                armId === "mc-off" ? new Error("first attempt failed") : observation(armId)),
+        );
+        const failedEstimate = store.records.find(({ armId }) => armId === "mc-off")?.costUsd;
+        if (failedEstimate === undefined) throw new Error("missing failed record");
+
+        expect(failedEstimate).toBeGreaterThan(expensive.deskCostCeilingUsd);
+
+        // The retry is cheaper, so after replacement the expensive attempt's
+        // price survives only in `priorAttemptsCostUsd`.
+        const second = await runPairedDelta(expensive, dependencies());
+        const retried = second.records.find(({ armId }) => armId === "mc-off");
+        const third = await runPairedDelta(expensive, dependencies());
+
+        expect(retried?.costUsd).toBeLessThan(failedEstimate);
+        expect(second.reserveUsd).toBeGreaterThanOrEqual(failedEstimate);
+        expect(third.reserveUsd).toBeGreaterThanOrEqual(failedEstimate);
+    });
+
+    it("records an uncanonicalizable intervention instead of losing the rollout", async () => {
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => {
+                const value = observation(armId);
+                if (armId === "mc-off") {
+                    value.intervention = { kind: "none", value: 1n as unknown as null };
+                }
+                return value;
+            }),
+        );
+        const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+        expect(result.status).toBe("completed");
+        expect(malformed?.cell).toMatchObject({
+            runHealth: "malformed",
+            reasonCode: "invalid-result",
+        });
+        expect(store.records.filter(({ armId }) => armId === "mc-off")).toHaveLength(1);
+        expect(result.exclusionCounts["mc-off"]?.["invalid-result"]).toBe(1);
+    });
+
     it("classifies a malformed check vector as an exclusion and continues", async () => {
         const result = await runPairedDelta(
             options(),
@@ -776,6 +848,51 @@ describe("file rollout store", () => {
                 }]),
             );
             expect(() => new FileRolloutStore(path).list()).toThrow(/run-health-invalid/);
+
+            writeFileSync(path, JSON.stringify([{ ...record, priorAttemptsCostUsd: -1 }]));
+            expect(() => new FileRolloutStore(path).list())
+                .toThrow(/prior-attempts-cost-invalid/);
+
+            // A completed cell suppresses its live rollout, so an impossible one
+            // must not be accepted as evidence.
+            for (const cell of [
+                { armId: "r2" },
+                { invalidSuccess: "yes" },
+                { checksTotal: -1 },
+                { checksPassed: 99 },
+                { criticalPassed: 99 },
+            ]) {
+                writeFileSync(
+                    path,
+                    JSON.stringify([{ ...record, cell: { ...record.cell, ...cell } }]),
+                );
+                expect(() => new FileRolloutStore(path).list()).toThrow(/cell-invalid/);
+            }
+
+            writeFileSync(
+                path,
+                JSON.stringify([{ ...record, cell: { ...record.cell, reasonCode: "made-up" } }]),
+            );
+            expect(() => new FileRolloutStore(path).list()).toThrow(/reason-code-invalid/);
+
+            for (const checks of [
+                "none",
+                [{ id: "check-ladder" }],
+                [{ id: "check-ladder", passed: true }, { id: "check-ladder", passed: true }],
+            ]) {
+                writeFileSync(path, JSON.stringify([{ ...record, checks }]));
+                expect(() => new FileRolloutStore(path).list()).toThrow(/checks-invalid/);
+            }
+
+            for (const patch of [
+                { cell: { ...record.cell, reasonCode: "harness-failure" } },
+                { cell: { ...record.cell, checksTotal: 0, checksPassed: 0 } },
+                { checks: [] as typeof record.checks },
+            ]) {
+                writeFileSync(path, JSON.stringify([{ ...record, ...patch }]));
+                expect(() => new FileRolloutStore(path).list())
+                    .toThrow(/completed-cell-invalid|cell-invalid/);
+            }
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

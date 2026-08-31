@@ -6,6 +6,7 @@ import {
     PRIMARY_ARM_IDS,
     PairedDeltaContractError,
     r3PromptEvidence,
+    REASON_CODES,
     REGRET_ARM_IDS,
     RUN_HEALTHS,
     validateCheckVector,
@@ -183,6 +184,7 @@ export async function verifyDualMockResolution(input: {
 
 const RUN_HEALTH_SET: ReadonlySet<string> = new Set(RUN_HEALTHS);
 const ARM_ID_SET: ReadonlySet<string> = new Set(ARM_IDS);
+const REASON_CODE_SET: ReadonlySet<string> = new Set(REASON_CODES);
 
 /**
  * Stored records control spend caps and resume behavior. A record with a
@@ -232,6 +234,56 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
             !RUN_HEALTH_SET.has(cell.runHealth)
         ) {
             fail("run-health-invalid");
+        }
+        const armedCell = cell as ArmedCellResult;
+        const counts = [
+            armedCell.checksPassed,
+            armedCell.checksTotal,
+            armedCell.criticalPassed,
+            armedCell.criticalTotal,
+        ];
+        if (
+            armedCell.armId !== record.armId ||
+            typeof armedCell.invalidSuccess !== "boolean" ||
+            counts.some((value) => !Number.isSafeInteger(value) || value < 0) ||
+            armedCell.checksPassed > armedCell.checksTotal ||
+            armedCell.criticalPassed > armedCell.criticalTotal
+        ) {
+            fail("cell-invalid");
+        }
+        if (
+            armedCell.reasonCode !== null &&
+            (
+                typeof armedCell.reasonCode !== "string" ||
+                !REASON_CODE_SET.has(armedCell.reasonCode)
+            )
+        ) {
+            fail("reason-code-invalid");
+        }
+        const checks = record.checks ?? null;
+        if (
+            !Array.isArray(checks) ||
+            checks.some((check) =>
+                check === null ||
+                typeof check !== "object" ||
+                typeof (check as CheckResult).id !== "string" ||
+                typeof (check as CheckResult).passed !== "boolean"
+            ) ||
+            new Set(checks.map((check) => (check as CheckResult).id)).size !== checks.length
+        ) {
+            fail("checks-invalid");
+        }
+        /** A completed record suppresses its live rollout, so its cell must be a shape a completed rollout could actually produce: a reason code, a zero denominator, or a check vector that disagrees with the counts marks storage that was corrupted or hand-edited, and regret scoring would divide by it. commentlint: allow(JUDGE) */
+        const vector = checks as CheckResult[];
+        if (armedCell.runHealth === "completed") {
+            if (
+                armedCell.reasonCode !== null ||
+                armedCell.checksTotal === 0 ||
+                vector.length !== armedCell.checksTotal ||
+                vector.filter((check) => check.passed).length !== armedCell.checksPassed
+            ) {
+                fail("completed-cell-invalid");
+            }
         }
     });
     return raw as RolloutRecord[];
@@ -379,19 +431,16 @@ export async function runPairedDelta(
         }
     }
 
-    /** Spend and rollout counts answer different questions, so the pre-scan keeps them apart: every attempt that already ran was billed and counts against the lifetime cap, while the counters describe the records this run reports. Adding a re-run coordinate to the counters would push `observedCostRollouts + estimatedCostRollouts` past `records.length`; dropping its cost would let a failure/retry cycle spend past `maxCostUsd`. commentlint: allow(JUDGE) */
+    /** The pre-scan restores spend and the reserve floor only. The rollout counters are incremented where a record enters `records` — at rehydration or after a rollout runs — because a run that stops at the cap or the deadline never reaches its later coordinates, and counting them here would report rollouts absent from the result. commentlint: allow(JUDGE) */
     for (const record of stored) {
         /** A record from another commit or pinned model priced a different build, so it informs neither this run's reserve nor its spend. commentlint: allow(JUDGE) */
         if (!inMatrix(record) || !bindingMatches(record, options)) continue;
-        /** A failed attempt was priced by `failedRecord` at the scenario's worst case, so its cost is a valid reserve floor even though the retry replaces the record. commentlint: allow(JUDGE) */
-        reserveUsd = Math.max(reserveUsd, record.costUsd);
         const attemptsCostUsd = record.priorAttemptsCostUsd + record.costUsd;
+        /** A replaced attempt's own price survives only in `priorAttemptsCostUsd`, so the floor is taken over the cumulative figure too: a reserve below a demonstrated per-rollout cost would admit a call that overshoots `maxCostUsd`. commentlint: allow(JUDGE) */
+        reserveUsd = Math.max(reserveUsd, record.costUsd, record.priorAttemptsCostUsd);
         spentUsd += attemptsCostUsd;
         /** Restored spend is billed spend, so the next rollout meets the cost cap instead of being admitted as this run's first. commentlint: allow(JUDGE) */
         if (attemptsCostUsd > 0) startedAny = true;
-        if (!isResumable(record, options)) continue;
-        if (record.costSource === "observed") observedCostRollouts++;
-        else estimatedCostRollouts++;
     }
 
     outer:
@@ -427,6 +476,8 @@ export async function runPairedDelta(
                     if (isResumable(existing, options)) {
                         resumedRollouts++;
                         records.push(existing);
+                        if (existing.costSource === "observed") observedCostRollouts++;
+                        else estimatedCostRollouts++;
                         coordinateResult.cells[armId] = existing;
                         return existing;
                     }
@@ -580,6 +631,14 @@ export async function runPairedDelta(
     };
 }
 
+function canonicalizes(observed: unknown, expected: InterventionDescriptor): boolean {
+    try {
+        return canonicalFingerprint(observed) === canonicalFingerprint(expected);
+    } catch {
+        return false;
+    }
+}
+
 function completedRecord(
     options: RunPairedDeltaOptions,
     coordinate: RolloutCoordinate,
@@ -595,10 +654,12 @@ function completedRecord(
     const identityMatches =
         observation.echoedProviderId === options.pinnedProviderId &&
         observation.echoedModelId === options.pinnedSnapshotId;
-    const declarationMatches =
-        observation.baseScriptFingerprint === expectedFingerprint &&
-        canonicalFingerprint(observation.intervention) ===
-            canonicalFingerprint(expectedIntervention);
+    /** The intervention comes back from the rollout adapter, so it can hold a value `canonicalFingerprint` refuses; a throw here would escape `runArm` after the provider call and lose the paid coordinate instead of recording it. commentlint: allow(JUDGE) */
+    const declarationMatches = observation.baseScriptFingerprint === expectedFingerprint &&
+        canonicalizes(
+            observation.intervention,
+            expectedIntervention,
+        );
     const usage = finiteUsage(observation.usage);
     /** A harness that would not dispose may still be running and contaminating later arms, so its result cannot stand as evidence however well the rollout itself went. Non-finite usage is checked next because a cost derived from it would poison `spentUsd` for every later cap comparison. commentlint: allow(JUDGE) */
     let reasonCode: ReasonCode | null = !harnessDisposed
