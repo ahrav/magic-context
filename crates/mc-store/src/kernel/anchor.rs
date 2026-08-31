@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::scope::coerce_version;
+use super::scope::{coerce_version, is_lower_hex_oid};
 
 /// Schema tag for capture-time anchor representations stored in the frozen
 /// `anchors.payload` BLOB. The fallback ladder matches a fresh checkout
@@ -175,13 +175,6 @@ impl std::fmt::Display for AnchorDecodeError {
 }
 
 impl std::error::Error for AnchorDecodeError {}
-
-fn is_lower_hex_oid(value: &str) -> bool {
-    (value.len() == 40 || value.len() == 64)
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
 
 fn decode_captures(payload: Option<&[u8]>) -> BTreeMap<String, AnchorCapture> {
     // A missing or unreadable capture payload only disables the fallback

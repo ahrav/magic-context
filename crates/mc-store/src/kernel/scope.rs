@@ -532,7 +532,7 @@ impl CanonicalScope {
     }
 }
 
-fn is_lower_hex_oid(value: &str) -> bool {
+pub(super) fn is_lower_hex_oid(value: &str) -> bool {
     (value.len() == 40 || value.len() == 64)
         && value
             .bytes()
@@ -882,10 +882,6 @@ impl VersionInterval {
     }
 }
 
-fn next_major(v: u64) -> Option<u64> {
-    v.checked_add(1)
-}
-
 /// Maps one comparator (with empty pre-release) to an interval. `None` when
 /// the comparator shape has no interval reading, which routes callers into
 /// the approximation rule.
@@ -911,7 +907,7 @@ fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterva
             },
             (None, _) => VersionInterval {
                 lo: Some((version(major, 0, 0), true)),
-                hi: Some((version(next_major(major)?, 0, 0), false)),
+                hi: Some((version(major.checked_add(1)?, 0, 0), false)),
             },
         },
         Op::Greater => match (minor, patch) {
@@ -924,7 +920,7 @@ fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterva
                 hi: None,
             },
             (None, _) => VersionInterval {
-                lo: Some((version(next_major(major)?, 0, 0), true)),
+                lo: Some((version(major.checked_add(1)?, 0, 0), true)),
                 hi: None,
             },
         },
@@ -947,7 +943,7 @@ fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterva
             },
             (None, _) => VersionInterval {
                 lo: None,
-                hi: Some((version(next_major(major)?, 0, 0), false)),
+                hi: Some((version(major.checked_add(1)?, 0, 0), false)),
             },
         },
         Op::Tilde => match (minor, patch) {
@@ -957,12 +953,12 @@ fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterva
             },
             (None, _) => VersionInterval {
                 lo: Some((lo_exact, true)),
-                hi: Some((version(next_major(major)?, 0, 0), false)),
+                hi: Some((version(major.checked_add(1)?, 0, 0), false)),
             },
         },
         Op::Caret => {
             let hi = if major > 0 || minor.is_none() {
-                version(next_major(major)?, 0, 0)
+                version(major.checked_add(1)?, 0, 0)
             } else if minor != Some(0) || patch.is_none() {
                 version(0, minor?.checked_add(1)?, 0)
             } else {

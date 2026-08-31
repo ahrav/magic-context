@@ -214,6 +214,10 @@ fn scan_dirty_entries(
         .status(gix::progress::Discard)
         .map_err(|error| SnapshotError::Scan(error.to_string()))?
         .should_interrupt_owned(budget.interrupt_flag())
+        // Each untracked file is emitted individually: a collapsed
+        // directory entry would keep one fingerprint across edits beneath
+        // it.
+        .untracked_files(gix::status::UntrackedFiles::Files)
         // Rename tracking would fold a delete+add pair into one entry;
         // the fingerprint wants the raw path set.
         .index_worktree_rewrites(None)
@@ -282,15 +286,13 @@ fn index_worktree_entry(
                 return Ok(None);
             }
             if entry.disk_kind.is_some_and(|kind| kind.is_dir()) {
-                // An untracked directory stands for its contents; the walk
-                // collapsed them, so the fingerprint must digest the files
-                // beneath it or edits inside the directory would keep the
-                // same cache key.
-                let path = entry.rela_path.to_string();
+                // The walk emits untracked files individually; a directory
+                // entry can still appear when it is empty and carries no
+                // content of its own.
                 return Ok(Some(DirtyEntry {
-                    content_hash: untracked_directory_hash(repo, &path, budget)?,
-                    path,
+                    path: entry.rela_path.to_string(),
                     status: "untracked",
+                    content_hash: "empty-directory".to_string(),
                 }));
             }
             let path = entry.rela_path.to_string();
@@ -327,51 +329,6 @@ fn tree_index_entry(change: &gix::diff::index::Change) -> DirtyEntry {
         status,
         content_hash: id,
     }
-}
-
-/// Digest over an untracked directory's files: sorted (relative path,
-/// content hash) pairs, budget-checked per file, so any edit beneath a
-/// collapsed directory moves the fingerprint.
-fn untracked_directory_hash(
-    repo: &gix::Repository,
-    rela_path: &str,
-    budget: &EvalBudget,
-) -> Result<String, SnapshotError> {
-    let Some(workdir) = repo.workdir() else {
-        return Ok("no-worktree".to_string());
-    };
-    let root = workdir.join(rela_path);
-    let mut files = Vec::new();
-    let mut pending = vec![root.clone()];
-    while let Some(dir) = pending.pop() {
-        budget.check()?;
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            match entry.file_type() {
-                Ok(kind) if kind.is_dir() => pending.push(path),
-                Ok(_) => files.push(path),
-                Err(_) => {}
-            }
-        }
-    }
-    files.sort();
-    let mut hash = Sha256::new();
-    hash.update(b"mc-untracked-dir-v1\0");
-    for path in files {
-        budget.check()?;
-        let relative = path.strip_prefix(workdir).unwrap_or(&path);
-        hash.update(relative.to_string_lossy().as_bytes());
-        hash.update(b"\0");
-        match std::fs::read(&path) {
-            Ok(bytes) => hash.update(Sha256::digest(&bytes)),
-            Err(_) => hash.update(b"unreadable"),
-        }
-        hash.update(b"\n");
-    }
-    Ok(format!("{:x}", hash.finalize()))
 }
 
 /// Content hash of a worktree file, so the fingerprint changes exactly when

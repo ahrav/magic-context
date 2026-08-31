@@ -1,23 +1,20 @@
 //! Resolution ladder proofs: ancestry against HEAD, patch-ID and tree-hash
 //! fallbacks over rebase/cherry-pick fixtures, and stop-on-ambiguity.
 
+#[path = "support/applicability_fixtures.rs"]
+mod applicability_fixtures;
 #[path = "support/git_fixtures.rs"]
 mod git_fixtures;
 
 use std::collections::BTreeMap;
 
-use git_fixtures::{commit_snapshot, init_repo, materialize, set_head_detached, FixtureRepo};
+use applicability_fixtures::checkout;
+use git_fixtures::{commit_snapshot, init_repo};
 use mc_store::kernel::applicability::{
-    capture_anchor_representation, compute_patch_id, snapshot_checkout, CheckoutSnapshot,
-    EvalBudget, GitConditionOutcome, ResolutionLadder,
+    capture_anchor_representation, compute_patch_id, EvalBudget, GitConditionOutcome,
+    ResolutionLadder,
 };
 use mc_store::kernel::{AnchorCapture, GitCondition};
-
-fn checkout(fixture: &FixtureRepo, commit: gix::ObjectId) -> CheckoutSnapshot {
-    set_head_detached(&fixture.repo, commit);
-    materialize(&fixture.repo, commit);
-    snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).expect("snapshot succeeds")
-}
 
 fn captures_for(
     repo: &gix::Repository,

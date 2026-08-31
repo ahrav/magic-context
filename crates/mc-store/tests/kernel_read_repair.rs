@@ -4,6 +4,8 @@
 
 #![cfg(feature = "test-support")]
 
+#[path = "support/applicability_fixtures.rs"]
+mod applicability_fixtures;
 #[path = "support/git_fixtures.rs"]
 mod git_fixtures;
 
@@ -27,13 +29,7 @@ const TARGET_OBJECT: &str = "target-object";
 const DOMAIN: &str = "domain";
 
 fn intent(key: &str, digest: char) -> CommitIntent {
-    CommitIntent {
-        producer: "read-repair-test".to_string(),
-        operation_key: key.to_string(),
-        request_digest: digest.to_string().repeat(64),
-        actor: "test".to_string(),
-        cause: "proof".to_string(),
-    }
+    applicability_fixtures::intent("read-repair-test", key, digest)
 }
 
 fn seed_store(root: &std::path::Path) -> KernelStore {

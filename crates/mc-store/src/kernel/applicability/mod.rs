@@ -18,9 +18,7 @@ use super::anchor::QueryContext;
 use super::scope::ScopeMatchContext;
 use super::{KernelError, KernelStore};
 
-pub use checkout::{
-    open_isolated, snapshot_checkout, CheckoutSnapshot, DirtyEntry, EvalBudget, SnapshotError,
-};
+pub use checkout::{snapshot_checkout, CheckoutSnapshot, DirtyEntry, EvalBudget, SnapshotError};
 pub use checks::{run_cheap_check, CheckOutcome};
 pub use engine::{
     ApplicabilityCandidate, ApplicabilityEngine, ApplicabilityState, BatchEvaluation,
@@ -122,7 +120,7 @@ impl ApplicabilityEngine {
         let mut appends = Vec::new();
         // One committed tip for the whole batch: every block-state read in
         // this request sees the same snapshot of the observation log.
-        let tip = store_tip(store)?;
+        let tip = store.known_as_of(0)?.tip;
         for object in &batch.objects {
             // Only stale classifications and current re-evaluations earn
             // durable appends; the other states are recomputable in-request
@@ -167,10 +165,6 @@ impl ApplicabilityEngine {
             appends,
         })
     }
-}
-
-fn store_tip(store: &KernelStore) -> Result<i64, KernelError> {
-    Ok(store.known_as_of(0)?.tip)
 }
 
 fn uncertain_batch(

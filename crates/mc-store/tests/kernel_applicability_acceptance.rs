@@ -20,34 +20,31 @@
 
 #![cfg(feature = "test-support")]
 
+#[path = "support/applicability_fixtures.rs"]
+mod applicability_fixtures;
 #[path = "support/git_fixtures.rs"]
 mod git_fixtures;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use applicability_fixtures::{candidate, reachable_anchor};
 use git_fixtures::{
-    commit_snapshot, init_repo, materialize, set_head_detached, write_worktree_file, FixtureRepo,
+    commit_snapshot, init_repo, materialize, set_head_detached, write_worktree_file,
 };
 use mc_store::kernel::applicability::{
-    capture_anchor_representation, AppendOutcome, ApplicabilityCandidate, ApplicabilityEngine,
-    ApplicabilityRequest, ApplicabilityState, CheckSpec, EvalBudget, ObjectApplicabilitySpec,
+    AppendOutcome, ApplicabilityCandidate, ApplicabilityEngine, ApplicabilityRequest,
+    ApplicabilityState, CheckSpec, EvalBudget, ObjectApplicabilitySpec,
 };
 use mc_store::kernel::{
-    encode_anchor_captures, AnchorRowSpec, CommitIntent, DecisionPayload, DecisionSpec, DomainSpec,
-    KernelStore, QueryContext, ScopeMatchContext, ScopeTermSpec, Sensitivity,
+    AnchorRowSpec, CommitIntent, DecisionPayload, DecisionSpec, DomainSpec, KernelStore,
+    QueryContext, ScopeMatchContext, ScopeTermSpec, Sensitivity,
 };
 
 const DOMAIN: &str = "domain";
 
 fn intent(key: &str, digest: char) -> CommitIntent {
-    CommitIntent {
-        producer: "acceptance-test".to_string(),
-        operation_key: key.to_string(),
-        request_digest: digest.to_string().repeat(64),
-        actor: "test".to_string(),
-        cause: "proof".to_string(),
-    }
+    applicability_fixtures::intent("acceptance-test", key, digest)
 }
 
 fn seed_store(root: &std::path::Path, object_ids: &[&str]) -> KernelStore {
@@ -92,30 +89,6 @@ fn seed_store(root: &std::path::Path, object_ids: &[&str]) -> KernelStore {
             .unwrap();
     }
     store
-}
-
-fn reachable_anchor(
-    fixture: &FixtureRepo,
-    anchor_id: &str,
-    commit: gix::ObjectId,
-) -> AnchorRowSpec {
-    let capture = capture_anchor_representation(&fixture.repo, commit, &EvalBudget::unbounded())
-        .expect("capture builds");
-    AnchorRowSpec {
-        anchor_id: anchor_id.to_string(),
-        anchor_kind: "reachable_from".to_string(),
-        reachable_from_oid: Some(commit.to_string()),
-        payload: Some(encode_anchor_captures(&[capture])),
-        ..AnchorRowSpec::default()
-    }
-}
-
-fn candidate(object_id: &str) -> ApplicabilityCandidate {
-    ApplicabilityCandidate {
-        object_id: object_id.to_string(),
-        object_revision: 1,
-        ..ApplicabilityCandidate::default()
-    }
 }
 
 #[test]

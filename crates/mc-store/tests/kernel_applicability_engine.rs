@@ -1,52 +1,22 @@
 //! Applicability evaluator proofs: per-object classification, generation
 //! caches, and the zero-repo-access-on-hit guarantee.
 
+#[path = "support/applicability_fixtures.rs"]
+mod applicability_fixtures;
 #[path = "support/git_fixtures.rs"]
 mod git_fixtures;
 
 use std::time::{Duration, Instant};
 
+use applicability_fixtures::{candidate, checkout, reachable_anchor};
 use git_fixtures::{
     commit_snapshot, init_repo, materialize, set_head_detached, write_worktree_file, FixtureRepo,
 };
 use mc_store::kernel::applicability::{
-    capture_anchor_representation, snapshot_checkout, ApplicabilityCandidate, ApplicabilityEngine,
-    ApplicabilityState, CheckSpec, CheckoutSnapshot, EvalBudget, ObjectApplicabilitySpec,
+    snapshot_checkout, ApplicabilityCandidate, ApplicabilityEngine, ApplicabilityState, CheckSpec,
+    EvalBudget, ObjectApplicabilitySpec,
 };
-use mc_store::kernel::{
-    encode_anchor_captures, AnchorRowSpec, Dimension, QueryContext, ScopeMatchContext,
-    ScopeTermSpec,
-};
-
-fn checkout(fixture: &FixtureRepo, commit: gix::ObjectId) -> CheckoutSnapshot {
-    set_head_detached(&fixture.repo, commit);
-    materialize(&fixture.repo, commit);
-    snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).expect("snapshot succeeds")
-}
-
-fn reachable_anchor(
-    fixture: &FixtureRepo,
-    anchor_id: &str,
-    commit: gix::ObjectId,
-) -> AnchorRowSpec {
-    let capture = capture_anchor_representation(&fixture.repo, commit, &EvalBudget::unbounded())
-        .expect("capture builds");
-    AnchorRowSpec {
-        anchor_id: anchor_id.to_string(),
-        anchor_kind: "reachable_from".to_string(),
-        reachable_from_oid: Some(commit.to_string()),
-        payload: Some(encode_anchor_captures(&[capture])),
-        ..AnchorRowSpec::default()
-    }
-}
-
-fn candidate(object_id: &str) -> ApplicabilityCandidate {
-    ApplicabilityCandidate {
-        object_id: object_id.to_string(),
-        object_revision: 1,
-        ..ApplicabilityCandidate::default()
-    }
-}
+use mc_store::kernel::{AnchorRowSpec, Dimension, QueryContext, ScopeMatchContext, ScopeTermSpec};
 
 fn seeded_repo(dir: &std::path::Path) -> (FixtureRepo, gix::ObjectId, gix::ObjectId) {
     let fixture = init_repo(dir);

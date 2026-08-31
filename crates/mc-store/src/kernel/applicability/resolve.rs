@@ -197,14 +197,18 @@ impl<'s> ResolutionLadder<'s> {
                 .snapshot
                 .repo()
                 .find_commit(candidate)
-                .map_err(|_| Budget)?;
-            Ok(commit.tree_id().map_err(|_| Budget)?.detach() == tree)
+                .map_err(|_| BudgetExhaustedInResolve)?;
+            Ok(commit
+                .tree_id()
+                .map_err(|_| BudgetExhaustedInResolve)?
+                .detach()
+                == tree)
         })
     }
 
     fn match_candidates(
         &self,
-        mut matches: impl FnMut(ObjectId) -> Result<bool, Budget>,
+        mut matches: impl FnMut(ObjectId) -> Result<bool, BudgetExhaustedInResolve>,
     ) -> WindowMatch {
         let Some(window) = self.candidate_window() else {
             return WindowMatch::Budget;
@@ -221,7 +225,7 @@ impl<'s> ResolutionLadder<'s> {
                     }
                 }
                 Ok(false) => {}
-                Err(Budget) => return WindowMatch::Budget,
+                Err(BudgetExhaustedInResolve) => return WindowMatch::Budget,
             }
         }
         match found {
@@ -332,8 +336,6 @@ enum WindowMatch {
     Budget,
 }
 
-struct Budget;
-
 impl GraphOracle for ResolutionLadder<'_> {
     fn is_ancestor_or_equal(&self, ancestor: &str, descendant: &str) -> Option<bool> {
         let ancestor = ObjectId::from_hex(ancestor.as_bytes()).ok()?;
@@ -393,18 +395,19 @@ pub fn compute_patch_id(
             *byte ^= file_byte;
         }
     }
-    Ok(Some(hex(&combined)))
+    use std::fmt::Write;
+    Ok(Some(combined.iter().fold(
+        String::with_capacity(64),
+        |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        },
+    )))
 }
 
 /// Typed budget signal raised from inside patch-ID computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetExhaustedInResolve;
-
-impl From<BudgetExhaustedInResolve> for Budget {
-    fn from(_: BudgetExhaustedInResolve) -> Self {
-        Budget
-    }
-}
 
 fn file_change_hash(
     repo: &gix::Repository,
@@ -455,14 +458,6 @@ fn normalized_content(bytes: &[u8]) -> Vec<u8> {
         .copied()
         .filter(|byte| !byte.is_ascii_whitespace())
         .collect()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes.iter().fold(String::new(), |mut out, byte| {
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
 }
 
 /// Builds the capture-time representation of `commit` that anchor authoring

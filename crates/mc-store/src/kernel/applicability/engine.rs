@@ -19,7 +19,7 @@ use super::cache::{TwoGenerationCache, GENERATION_CAP};
 use super::checkout::{CheckoutSnapshot, EvalBudget};
 use super::checks::{run_cheap_check, CheckOutcome};
 use super::payloads::{CheckSpec, ObjectApplicabilitySpec};
-use super::resolve::{GitConditionOutcome, ResolutionLadder, PATCH_ID_ALGORITHM};
+use super::resolve::{GitConditionOutcome, ResolutionLadder};
 
 /// Applicability state of one object at one checkout. Everything except
 /// `Current` is blocked from auto-injection and reachable only through an
@@ -128,7 +128,6 @@ struct AnchorCacheKey {
     anchor_id: String,
     payload_digest: String,
     head: String,
-    patch_id_algorithm: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -205,7 +204,6 @@ impl ApplicabilityEngine {
                         ApplicabilityState::LifecycleInvalidated,
                         "object lifecycle-invalidated before applicability evaluation",
                     ),
-                    false,
                 ));
                 continue;
             }
@@ -217,7 +215,6 @@ impl ApplicabilityEngine {
                         ApplicabilityState::Uncertain,
                         "evaluation budget exhausted before this object",
                     ),
-                    true,
                 ));
                 continue;
             }
@@ -255,8 +252,7 @@ impl ApplicabilityEngine {
                     },
                 );
             }
-            let append_pending = classification.state.blocks_auto_injection();
-            objects.push(finished(candidate, token, classification, append_pending));
+            objects.push(finished(candidate, token, classification));
         }
         // Read the counter once for the whole batch so hit paths cannot hide
         // graph work behind branch placement.
@@ -413,7 +409,6 @@ impl ApplicabilityEngine {
             anchor_id: anchor.anchor_id.clone(),
             payload_digest: digest_optional(anchor.payload.as_deref()),
             head: snapshot.head().to_string(),
-            patch_id_algorithm: PATCH_ID_ALGORITHM,
         };
         let outcome = if let Some(outcome) = batch_anchor_memo.get(&key) {
             *outcome
@@ -541,15 +536,18 @@ fn finished(
     candidate: &ApplicabilityCandidate,
     token: ClassificationToken,
     classification: Classification,
-    append_pending: bool,
 ) -> ObjectApplicability {
+    // Lifecycle invalidation is a store-side verdict with no checkout
+    // evidence to append; every other blocking state starts append-pending.
+    let append_pending = classification.state.blocks_auto_injection()
+        && classification.state != ApplicabilityState::LifecycleInvalidated;
     ObjectApplicability {
         object_id: candidate.object_id.clone(),
         object_revision: candidate.object_revision,
         state: classification.state,
         evidence: classification.evidence,
         failed_check: classification.failed_check,
-        append_pending: append_pending && classification.state.blocks_auto_injection(),
+        append_pending,
         token,
     }
 }
