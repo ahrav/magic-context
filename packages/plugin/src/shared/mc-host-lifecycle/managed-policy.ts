@@ -9,7 +9,6 @@ import {
     type HostStatusSnapshot,
     McHostClient,
     type McHostClientOptions,
-    processMcHostClient,
     sameDaemonId,
 } from "../mc-host-client";
 import { BootstrapError, checkPlatform, type PlatformReaders, parseTrustIndex } from "./bootstrap";
@@ -30,6 +29,7 @@ import {
     type LifecyclePolicyOptions,
     McHostLifecyclePolicy,
     type ObservationalHealth,
+    ReadinessProbeControlError,
 } from "./policy";
 
 const MAX_PARENT_WALK = 8;
@@ -264,6 +264,7 @@ async function probeManagedCompatibility(
         connectionFile: connectionFilePath(root),
         handshakeTimeoutMs: Math.max(1, budgetMs),
         requestTimeoutMs: Math.max(1, budgetMs),
+        shutdownDeadlineMs: Math.max(1, budgetMs),
     });
     try {
         return await readCompatibilityProbe(client, deadline, signal);
@@ -274,17 +275,28 @@ async function probeManagedCompatibility(
 
 async function probeManagedReadiness(root: string, budgetMs: number): Promise<ObservationalHealth> {
     const deadline = Date.now() + budgetMs;
-    const client = await processMcHostClient({
+    // A private client, like the storage probe's. The residual budget varies per
+    // call and `ownerKey` includes the timeouts, so a shared owner would cache a
+    // new client — and prefault another ring — on every status or doctor, until
+    // admission is exhausted.
+    const client = await McHostClient.connect({
         connectionFile: connectionFilePath(root),
         handshakeTimeoutMs: Math.max(1, budgetMs),
         requestTimeoutMs: Math.max(1, budgetMs),
-        identity: {
-            project_root: root,
-            harness: "mc-host-lifecycle",
-            session: "compatibility",
-        },
     });
-    const { snapshot: compatibility, status } = await readCompatibilityProbe(client, deadline);
+    let probe: CompatibilityProbeResult;
+    try {
+        probe = await readCompatibilityProbe(client, deadline);
+    } catch (error) {
+        if (client.isClosed || client.authenticated === null) throw error;
+        throw new ReadinessProbeControlError(error);
+    } finally {
+        // Teardown is not part of the observation, and `closeAsync` opens its own
+        // shutdown deadline, so awaiting it here could settle this promise after
+        // the lifecycle command's aggregate expired.
+        void client.closeAsync().catch(() => undefined);
+    }
+    const { snapshot: compatibility, status } = probe;
     if (status === null) {
         // The probe short-circuited at the daemon or module stage, so
         // `host.status` never ran and storage and Synapse were never

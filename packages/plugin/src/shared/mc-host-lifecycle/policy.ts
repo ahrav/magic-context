@@ -80,6 +80,14 @@ export interface ObservationalHealth extends CompatibilitySnapshot {
     readiness: DaemonReadiness;
 }
 
+/** Thrown after ring attachment and authentication when a control probe fails. */
+export class ReadinessProbeControlError extends Error {
+    constructor(cause: unknown) {
+        super("readiness control probe failed", { cause });
+        this.name = "ReadinessProbeControlError";
+    }
+}
+
 function compatibilityInput(snapshot: CompatibilitySnapshot): CompatibilityInput {
     return {
         authenticatedPeer: snapshot.authenticatedPeer,
@@ -789,12 +797,6 @@ export class McHostLifecyclePolicy {
             const checks = [...checksById.values()].sort((left, right) =>
                 left.id.localeCompare(right.id),
             );
-            // The check list is ordered by id because the v1 result requires
-            // lexicographically sorted unique check ids. The reported reason is
-            // NOT that order: the release contract ships one precedence list for
-            // failing reasons, and a lower-precedence readiness failure must
-            // never mask a higher-precedence one just because its check id
-            // sorts earlier (`readiness.storage` before `readiness.transport`).
             checks.sort((left, right) => left.id.localeCompare(right.id));
             const failed = checks
                 .filter((check) => check.status === "fail")

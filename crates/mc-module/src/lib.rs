@@ -30595,6 +30595,17 @@ mod release_contract_tests {
 
     #[test]
     fn pre_build_contract_carries_no_binary_model_or_payload_hashes() {
+        /// Matching any word merely beginning with `sha` would also reject
+        /// contract keys such as `shared_memory`, which carry no digest.
+        fn names_a_digest(word: &str) -> bool {
+            match word {
+                "hash" | "digest" => true,
+                _ => word
+                    .strip_prefix("sha")
+                    .is_some_and(|width| width.bytes().all(|byte| byte.is_ascii_digit())),
+            }
+        }
+
         fn assert_no_hashes(value: &Value, path: &str) {
             match value {
                 Value::String(text) => {
@@ -30612,9 +30623,7 @@ mod release_contract_tests {
                     for (key, child) in map {
                         let lowered = key.to_ascii_lowercase();
                         assert!(
-                            !(lowered.split('_').any(|part| part == "hash"
-                                || part == "digest"
-                                || part.starts_with("sha"))),
+                            !lowered.split('_').any(names_a_digest),
                             "hash-bearing key at {path}.{key}"
                         );
                         assert_no_hashes(child, &format!("{path}.{key}"));

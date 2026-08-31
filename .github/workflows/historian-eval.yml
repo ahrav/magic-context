@@ -21,12 +21,40 @@ on:
         options:
           - dev
         default: dev
+      metamorphic_scenario:
+        description: Scenario for the bounded live metamorphic pair
+        type: string
+        default: hse-webhook-docs-injection
+      metamorphic_transform:
+        description: Transform for the bounded live metamorphic pair
+        type: choice
+        options:
+          - reorder-independent-turns
+          - paraphrase-irrelevant
+          - move-accepted-decision
+          - duplicate-rejected-proposal
+          - rename-unrelated-symbols
+        default: paraphrase-irrelevant
   schedule:
     # Weekly, offset from the retrieval-benchmark schedule.
     - cron: "41 4 * * 2"
 
 permissions:
   contents: read
+
+# Workflow-level, NOT per-job, and the placement is load-bearing. Both live lanes
+# previously declared this same group per-job: within one run that made one lane
+# run while the other sat PENDING, and GitHub keeps only one running plus one
+# pending member per concurrency group — a newly queued member evicts the
+# existing pending one even under `cancel-in-progress: false`. Any schedule tick
+# or operator dispatch overlapping a run in flight (the live step alone is
+# bounded at 300 minutes) therefore cancelled the queued lane, and the run
+# published one report instead of two with nothing marking the loss. Grouping the
+# RUN makes the unit of exclusion the whole run, so a run already in flight is
+# never partially discarded; the lanes serialize inside the run through `needs`.
+concurrency:
+  group: historian-eval-live
+  cancel-in-progress: false
 
 jobs:
   live-lane:
@@ -47,9 +75,6 @@ jobs:
     # ABOVE the step bound plus worst-case setup, or it fires first and cancels
     # the job before the archive step can upload anything.
     timeout-minutes: 360
-    concurrency:
-      group: historian-eval-live
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
         with:
@@ -146,5 +171,91 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: historian-eval-report
+          path: packages/e2e-tests/artifacts/
+          if-no-files-found: warn
+
+  live-metamorphic:
+    # Sequential after `live-lane`, not parallel with it: both lanes spend the
+    # same Anthropic key on the same model, and the runner treats a rate-limited
+    # slow response as `run-never-fired` — an invalidated experiment rather than a
+    # retry. `!cancelled()` rather than a bare `needs` or `always()`: a red
+    # `live-lane` must not skip this independent lane (the short-circuit ci.yml
+    # documents at length), but an operator cancelling the run must not leave this
+    # lane starting up to spend tokens anyway.
+    needs: live-lane
+    if: >-
+      ${{ !cancelled() &&
+      (github.event_name == 'schedule' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Install opencode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve the corpus selection
+        env:
+          CORPUS_INPUT: ${{ inputs.scenarios }}
+        run: |
+          case "${CORPUS_INPUT:-dev}" in
+            dev) SELECT_PATH=packages/e2e-tests/historian-eval/dev ;;
+            *) echo "unknown corpus: $CORPUS_INPUT" >&2; exit 1 ;;
+          esac
+          echo "SELECT_PATH=$SELECT_PATH" >> "$GITHUB_ENV"
+
+      - name: Gate the base corpus without credentials
+        run: |
+          bun packages/e2e-tests/scripts/run-historian-eval.ts --lint --scenarios "$SELECT_PATH"
+          bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations --scenarios "$SELECT_PATH"
+
+      - name: Run the live metamorphic pair
+        # Same nesting as the historian lane above:
+        #   script --deadline-minutes 290  <  this step 300  <  job 360
+        # Two properties make 290 sufficient rather than merely smaller than 300.
+        # The script anchors its deadline at process START, so its own preamble
+        # (corpus load, selection, `opencode --version`, commit resolution) is
+        # inside the 290 rather than pushing it past the step bound. And it
+        # RESERVES one role's full wall clock before admitting a role, where a
+        # role's cost is every prompt it sends — transcript, per-run triggers and
+        # probes, each bounded only by the harness prompt timeout — plus the run
+        # completion and quiescence waits. A bare `now >= deadline` check would
+        # admit a role at minute 289 that legitimately needs two hours, and this
+        # step's timeout would then kill the process before it wrote the final
+        # report, losing the artifact the deadline exists to protect.
+        timeout-minutes: 300
+        env:
+          NODE_ENV: ""
+          ANTHROPIC_API_KEY: ${{ secrets.HISTORIAN_EVAL_ANTHROPIC_API_KEY }}
+          HISTORIAN_EVAL_MODEL: anthropic/claude-sonnet-4-5
+          HISTORIAN_EVAL_PROBE_MODEL: anthropic/claude-haiku-4-5
+          METAMORPHIC_SCENARIO: ${{ inputs.metamorphic_scenario }}
+          METAMORPHIC_TRANSFORM: ${{ inputs.metamorphic_transform }}
+        run: |
+          bun packages/e2e-tests/scripts/run-metamorphic-eval.ts --live \
+            --scenarios "$SELECT_PATH" \
+            --scenario "${METAMORPHIC_SCENARIO:-hse-webhook-docs-injection}" \
+            --transform "${METAMORPHIC_TRANSFORM:-paraphrase-irrelevant}" \
+            --deadline-minutes 290 \
+            --report packages/e2e-tests/artifacts/metamorphic-eval-live-report.json
+
+      - name: Archive the metamorphic report and run records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: historian-eval-metamorphic-report
           path: packages/e2e-tests/artifacts/
           if-no-files-found: warn

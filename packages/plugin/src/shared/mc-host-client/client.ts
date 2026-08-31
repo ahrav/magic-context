@@ -103,7 +103,6 @@ export interface McHostDiagnosticsEvent {
     readonly daemonVer?: string;
     readonly pid?: number;
     readonly reason?: string;
-    /** Sole application transport. */
     readonly transport?: "shm";
 }
 
@@ -142,8 +141,6 @@ interface ActiveConnection {
     readonly token: object;
     readonly snapshot: ConnectionSnapshot;
     readonly liveRoutes: Map<number, RouteHandle>;
-    /** Sole application transport. */
-    transport: "shm";
 }
 
 interface CachedManagedRoute {
@@ -428,6 +425,11 @@ export class McHostClient {
         const active = this.active;
         if (!active) return null;
         return { daemonVer: active.snapshot.daemonVer, pid: active.snapshot.pid };
+    }
+
+    /** True after irreversible owner close begins. */
+    get isClosed(): boolean {
+        return this.closeStarted;
     }
 
     /**
@@ -789,7 +791,6 @@ export class McHostClient {
             token: newConnectionToken(),
             snapshot,
             liveRoutes: new Map(),
-            transport: "shm",
         };
         try {
             await generation.start(stage);
@@ -895,7 +896,7 @@ export class McHostClient {
             type: "connected",
             daemonVer: conn.snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
             pid: conn.snapshot.pid,
-            transport: conn.transport,
+            transport: "shm",
         });
     }
 
