@@ -1822,3 +1822,236 @@ fn serving_reads_seek_source_decisions_by_lineage_not_by_null_subject() {
         "source-level lookup must not scan: {plan:?}"
     );
 }
+
+#[test]
+fn source_level_rejection_strips_an_approval_of_its_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // A source-level rejection on the approval's own lineage ('fixture','approval',1).
+    // Staging cannot produce this row: `validate_provenance` refuses `explicit_user`
+    // for both witness kinds, and any other class would drift from the approval's
+    // prior. A restored or imported database can still hold it.
+    connection
+        .execute(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'approval-lineage-rejection',NULL,'fixture','approval',1,'explicit_user',
+                 'user_explicit','approved','approved','rejected','review_only','normal',1,
+                 'fixture',1,2
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    stage(&store, "blocked-by-source-rejection");
+    let mut approved = request("blocked-by-source-rejection");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("approval".to_string());
+    store
+        .commit(intent("blocked-by-source-rejection"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "source-rejected-domain".to_string(),
+                    object_id: "source-rejected-object".to_string(),
+                    name: "name-blocked-by-source-rejection".to_string(),
+                },
+            )?;
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='source-rejected-object'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_demoted_approval_can_no_longer_authorize() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // A second approval whose own approved standing rests on the first one.
+    connection
+        .execute_batch(
+            "INSERT INTO object_registry(
+                 object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                 created_commit_seq,sensitivity_class
+             ) VALUES ('derived','decision','approval-domain','fixture','derived',1,1,'normal');
+             INSERT INTO decisions(
+                 decision_id,object_id,decision_kind,decision_payload,created_commit_seq,
+                 sensitivity_class
+             ) VALUES ('derived-decision','derived','adr_accepted',X'7b7d',1,'normal');
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 sensitivity_class,policy_revision,reason,approval_object_id,commit_seq,decided_at
+             ) VALUES (
+                 'derived-admission','derived','fixture','derived',1,'explicit_user',
+                 'user_explicit','approved','approved','active','automatic','normal',1,'fixture',
+                 'approval',1,1
+             );",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("revoke-backing-approval"), |envelope| {
+            envelope.revoke_approval("approval", "backing approval withdrawn")?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // History is preserved; only support is demoted, and the registry row for
+    // the derived approval is untouched.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT maturity||'/'||effective_maturity||'/'||disposition||'/'||visibility
+             FROM admission_decisions WHERE subject_object_id='derived'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "approved/verified/active/automatic"
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry
+             WHERE object_id='derived' AND invalidated_commit_seq IS NULL"
+        ),
+        1
+    );
+
+    stage(&store, "blocked-by-demotion");
+    let mut approved = request("blocked-by-demotion");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("derived".to_string());
+    store
+        .commit(intent("blocked-by-demotion"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "demoted-domain".to_string(),
+                    object_id: "demoted-object".to_string(),
+                    name: "name-blocked-by-demotion".to_string(),
+                },
+            )?;
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='demoted-object'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn the_writer_refuses_priors_it_cannot_interpret_or_place() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    insert_subject(
+        &store,
+        "future-prior",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    insert_subject(
+        &store,
+        "alien-prior",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    drop(store);
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE admission_decisions SET policy_revision=99
+             WHERE subject_object_id='object-future-prior'",
+            [],
+        )
+        .unwrap();
+    // Bound to the object but to a lineage the registry does not name.
+    connection
+        .execute_batch(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'alien-prior-decision','object-alien-prior','fixture','somewhere-else',4,
+                 'trusted_local_code','current_code','enforced','enforced','active','automatic',
+                 'normal',1,'fixture',2,2
+             );",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    // An unimplemented revision must stop the event, not be reinterpreted and
+    // rewritten at the current revision.
+    let error = store
+        .commit(intent("rewrite-future-prior"), |envelope| {
+            let mut request = subject_request("object-future-prior", EventKind::CodeObserved);
+            request.event.trigger_object_id = Some("observation-future-prior".to_string());
+            envelope.record_admission(request)?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert!(matches!(error, KernelError::AdmissionPolicy), "{error:?}");
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM admission_decisions
+             WHERE subject_object_id='object-future-prior'"
+        ),
+        1
+    );
+
+    // The foreign-lineage row must not become the prior, so the correctly bound
+    // history still governs and the enforced row never takes effect.
+    let observed = store
+        .commit(intent("ignore-alien-prior"), |envelope| {
+            let mut request = subject_request("object-alien-prior", EventKind::CodeObserved);
+            request.event.trigger_object_id = Some("observation-alien-prior".to_string());
+            envelope.record_admission(request)?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT maturity FROM admission_decisions
+             WHERE subject_object_id='object-alien-prior'
+               AND source_id='source-alien-prior'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "verified"
+    );
+    assert!(store
+        .visible_as_of(Surface::AutoInject, observed)
+        .unwrap()
+        .rows
+        .iter()
+        .any(|row| row.object.object_id == "object-alien-prior"));
+}
