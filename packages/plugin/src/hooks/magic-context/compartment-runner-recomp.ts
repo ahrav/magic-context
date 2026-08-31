@@ -15,28 +15,23 @@ import {
     summarizeImportance,
     tallyFactsByCategory,
 } from "../../features/magic-context/storage-historian-runs";
-import {
-    clearCachedM0M1,
-    clearPendingCompactionMarkerStateIf,
-    getPendingCompactionMarkerState,
-    updateSessionMeta,
-} from "../../features/magic-context/storage-meta";
-import { normalizeSDKResponse } from "../../shared";
+import { clearCachedM0M1, updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { getErrorMessage } from "../../shared/error-message";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
+import { advanceCompactionMarkerAndClearStalePending } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
-import { cleanupHistorianStateFile } from "./compartment-runner-incremental";
+import { resolveSessionDirectory } from "./compartment-runner-mapping";
 import type { CandidateCompartment, CompartmentRunnerDeps } from "./compartment-runner-types";
 import {
     getReducedRecompTokenBudget,
     validateChunkCoverage,
     validateStoredCompartments,
 } from "./compartment-runner-validation";
+import { cleanupHistorianStateFile } from "./historian-state-file";
 import { clearInjectionCache } from "./inject-compartments";
 import {
     createDefaultBoundarySnapshotForTests,
@@ -172,15 +167,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         if (rawMessageCount <= 0) {
             return "## Magic Recomp\n\nNo raw history exists, so nothing was rebuilt.";
         }
-        const parentSessionResponse = await client.session
-            .get({ path: { id: sessionId } })
-            .catch(() => null);
-        const parentSession = normalizeSDKResponse(
-            parentSessionResponse,
-            null as { directory?: string } | null,
-            { preferResponseOnMissingData: true },
-        );
-        const sessionDirectory = parentSession?.directory ?? directory;
+        const sessionDirectory = await resolveSessionDirectory(client, sessionId, directory);
 
 
         const existingStaging = getRecompStaging(db, sessionId);
@@ -264,18 +251,12 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
             deps.onCompartmentStatePublished?.(sessionId);
 
             if (lastCompartmentEnd > 0) {
-                const markerUpdated = updateCompactionMarkerAfterPublication(
+                advanceCompactionMarkerAndClearStalePending(
                     db,
                     sessionId,
                     lastCompartmentEnd,
                     deps.directory,
                 );
-                if (markerUpdated) {
-                    const stalePending = getPendingCompactionMarkerState(db, sessionId);
-                    if (stalePending) {
-                        clearPendingCompactionMarkerStateIf(db, sessionId, stalePending);
-                    }
-                }
             }
 
             return [
@@ -504,18 +485,12 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         }
 
         if (lastCompartmentEnd > 0) {
-            const markerUpdated = updateCompactionMarkerAfterPublication(
+            advanceCompactionMarkerAndClearStalePending(
                 db,
                 sessionId,
                 lastCompartmentEnd,
                 deps.directory,
             );
-            if (markerUpdated) {
-                const stalePending = getPendingCompactionMarkerState(db, sessionId);
-                if (stalePending) {
-                    clearPendingCompactionMarkerStateIf(db, sessionId, stalePending);
-                }
-            }
         }
 
         return [

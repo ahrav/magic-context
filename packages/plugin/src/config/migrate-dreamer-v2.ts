@@ -29,7 +29,10 @@
 const OLD_VERIFY_TASK = "verify";
 const OLD_CURATE_TASKS = ["consolidate", "archive-stale", "improve"] as const;
 const RETIRED_OBJECT_MEMORY_TASKS = ["maintain-memory", ...OLD_CURATE_TASKS] as const;
-const CANONICAL = [
+/** Every v2 dreamer task. Exported so the doctor's coverage test can assert
+ *  the on-disk migration emits an entry for every task in this list; the
+ *  doctor derives its schedule set from here rather than a second list. */
+export const CANONICAL_DREAMER_TASKS = [
     "map-memories",
     "verify",
     "verify-broad",
@@ -225,7 +228,7 @@ export function migrateDreamerV2(
             });
         }
 
-        for (const task of CANONICAL) {
+        for (const task of CANONICAL_DREAMER_TASKS) {
             if (!tasks[task]) {
                 const schedule =
                     task === "verify" || task === "curate" || task === "verify-broad"

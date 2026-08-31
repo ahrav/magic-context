@@ -49,17 +49,3 @@ export interface Memory {
     mergedFrom: string | null; // JSON array
     metadataJson: string | null;
 }
-
-export interface MemoryInput {
-    projectPath: string;
-    category: MemoryCategory;
-    content: string;
-    importance?: number | null;
-    sourceSessionId?: string;
-    sourceType?: MemorySourceType;
-    expiresAt?: number | null;
-    metadataJson?: string | null;
-    /**
-     *  after insert. */
-    nowMs?: number;
-}

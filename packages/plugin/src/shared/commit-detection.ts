@@ -1,5 +1,7 @@
 //     (read-session-formatting.ts),
 //
+// Keeping the patterns here stops drift between the three sites: change them
+// once and every site follows.
 //
 
 /**
@@ -14,9 +16,12 @@ export const COMMIT_HASH_TEST_PATTERN = new RegExp(`\\b${HASH_HEX}\\b`, "i");
 /**
  * Word boundaries exclude substrings such as `commitment` and `merger`.
  *
- * Only `commit`, `cherry-pick`, `merge`, and `rebase` establish commit context.
- * Bare `hash` and `sha` do not establish commit context.
- * `hash <hex>` alone does not establish commit context.
+ * Scope decision: this is the commit-action set the OpenCode + Pi note-nudge
+ * detectors used and pin in tests ("commit/cherry-pick/merge/rebase"). It does
+ * NOT include the bare nouns "hash"/"sha" — a parity test asserts
+ * "hash <hex>" alone must NOT count as a commit,
+ * and those nouns only ever gated a cosmetic hash-strip in historian summaries
+ * (never a trigger), so unifying to the action set is behavior-preserving where
  * it matters.
  */
 export const COMMIT_VERB_PATTERN =

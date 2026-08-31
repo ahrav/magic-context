@@ -1,4 +1,5 @@
 /**
+ * Compaction-off mode transitions.
  *
  * A session transitions only on its first transform pass after a restart changes the resolved mode.
  * Each session reconciles its durable mode record with the resolved mode.
@@ -63,8 +64,11 @@ import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 let loggedUnverifiedMarkerCleanupRetry = false;
 
 /**
- * The caller delivers the flip-off notice out of band only when the transition removes MC-owned compaction markers.
- * Removing MC's markers exposes the history hidden solely by MC.
+ * Flip-off unfold notice. Delivered out of band on the transition pass that
+ * actually cleared something. The one-cycle warning wording is contractual
+ * (per the compaction-off spec): removing MC's markers exposes the history hidden solely by
+ * MC, and on a long session that expansion can exceed the model window once
+ * before native compaction reacts. Docs quote this same constant.
  */
 export const COMPACTION_OFF_FLIP_NOTICE = [
     "## Magic Context — compaction-off mode is now active",

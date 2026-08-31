@@ -177,10 +177,14 @@ async function sendIgnoredMessageNow(
     }
     const c = client;
 
-    // Unresolved prompt context is pinned to the latest real turn so the noReply user row cannot change the next turn's active agent or model.
-    // createUserMessage records prompt context on the appended noReply user message, making it active for the next real turn.
-    // Without pinned context, OpenCode records the default agent and model.
-    // The default agent and model become active on the user's next turn.
+    // Pin the prompt context (agent + model + variant) to the session's most
+    // recent real turn. WHY: even though this is `noReply: true` (no assistant
+    // turn fires now), OpenCode's createUserMessage RECORDS prompt context on
+    // the appended user message, and THAT becomes the session's active
+    // model/agent for the NEXT real turn. Passing nothing makes OpenCode record
+    // the DEFAULT agent/model — which then switches the model on the user's
+    // next turn and busts the provider prefix cache the prior turn warmed.
+    // Mirrors AFT's notifications.ts.
     //
     // Caller-supplied params win; otherwise resolve them from the last assistant message.
     // The code pins only values resolved from real messages; it never pins synthesized defaults.

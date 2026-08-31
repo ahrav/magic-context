@@ -14,8 +14,15 @@
 import { Database } from "bun:sqlite";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { storageSubtreePath } from "@magic-context/core/shared/data-path";
+import { managedSubtreePath } from "@magic-context/core/shared/mc-host-lifecycle/paths";
 import { ballastProse } from "./ballast";
-import { MockProvider, type MockResponse } from "./mock-provider/server";
+import {
+    DEFAULT_MOCK_RESPONSE,
+    type SdkClientCore,
+    type SharedHarnessOptions,
+} from "./harness-primitives";
+import { MockProvider } from "./mock-provider/server";
 import type { VerifiedReleaseRoot } from "./prospective-holdout/release-root";
 import {
     createIsolatedEnv,
@@ -30,15 +37,9 @@ import {
     type RustModePrereqs,
 } from "./rust-runner/hermetic-mc-host";
 
-export interface RustTestHarnessOptions {
-    /** USER-tier magic-context config overrides. */
+export interface RustTestHarnessOptions extends SharedHarnessOptions {
+    /** magic-context USER-tier config overrides (thresholds, memory, etc.). */
     magicContextConfig?: Record<string, unknown>;
-    /** Extra opencode.json config. Merged onto test defaults. */
-    openCodeConfigExtra?: Record<string, unknown>;
-    /** Override the mock model's context token limit. Default 200000. */
-    modelContextLimit?: number;
-    /** Default response used when the mock queue is empty. */
-    mockDefault?: MockResponse;
     /**
      * Starts OpenCode in TS mode instead of Rust mode.
      * The direct host continues running, so `restart({ rust: true })` can switch modes against the same data directory.
@@ -50,39 +51,14 @@ export interface RustTestHarnessOptions {
     releaseRoot?: VerifiedReleaseRoot;
 }
 
-export interface SdkClient {
-    session: {
-        create: (opts: {
-            query: { directory: string };
-            body?: { parentID?: string; title?: string };
-        }) => Promise<{ data?: { id: string } }>;
-        prompt: (opts: {
-            path: { id: string };
-            body: {
-                model: { providerID: string; modelID: string };
-                parts: Array<{ type: "text"; text: string }>;
-                agent?: string;
-            };
-        }) => Promise<{ data?: unknown }>;
+export interface SdkClient extends SdkClientCore {
+    session: SdkClientCore["session"] & {
         revert: (opts: {
             path: { id: string };
             body: { messageID: string; partID?: string };
         }) => Promise<{ data?: unknown }>;
-        messages: (opts: {
-            path: { id: string };
-        }) => Promise<{ data?: unknown }>;
     };
 }
-
-const DEFAULT_MOCK_RESPONSE: MockResponse = {
-    text: "ok",
-    usage: {
-        input_tokens: 100,
-        output_tokens: 20,
-        cache_creation_input_tokens: 100,
-        cache_read_input_tokens: 0,
-    },
-};
 
 /** One parsed `rust pass:` diagnostic line. */
 export interface RustPassLine {
@@ -178,7 +154,7 @@ export class RustTestHarness {
             fixtureBin,
         });
 
-        const logPath = join(env.dataDir, "cortexkit", "magic-context-e2e.log");
+        const logPath = join(managedSubtreePath(env.dataDir), "magic-context-e2e.log");
 
         let opencode: SpawnedOpencode;
         try {
@@ -599,12 +575,7 @@ export class RustTestHarness {
 
 
     private contextDbPath(): string {
-        return join(
-            this.env.dataDir,
-            "cortexkit",
-            "magic-context",
-            "context.db",
-        );
+        return join(storageSubtreePath(this.env.dataDir), "context.db");
     }
 
     contextDb(): Database {
@@ -624,7 +595,7 @@ export class RustTestHarness {
     }
 
     readModuleTodoState(sessionId: string): RustModuleTodoState | null {
-        const path = join(this.env.dataDir, "cortexkit", "magic-context", "store.db");
+        const path = join(storageSubtreePath(this.env.dataDir), "store.db");
         if (!existsSync(path)) return null;
         const db = new Database(path, { readonly: true });
         try {

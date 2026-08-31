@@ -1,13 +1,15 @@
 import { homedir, userInfo } from "node:os";
 
-function escapeRegex(value: string): string {
+/** Escape a literal string for interpolation into a RegExp. */
+export function escapeRegex(value: string): string {
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// A key must contain a secret word as a complete separator-delimited segment.
-// Substring matching would redact benign keys such as `pin_key_files`.
-// `pin_key_files`, `token_budget`, and `injection_budget_tokens` must not be redacted.
-const SECRET_WORDS = [
+// Whole-segment match: the key (or its components when split on common
+// separators) must BE one of these words, not merely contain them as a
+// substring. Bare substring matching wrongly redacts benign fields like
+// `pin_key_files`, `token_budget`, and `injection_budget_tokens`.
+export const SECRET_WORDS = [
     "key",
     "token",
     "secret",
@@ -24,12 +26,18 @@ const SECRET_SEGMENT_PATTERN = new RegExp(
 const TRAILING_DESCRIPTORS = new Set(["id", "ids", "value", "values", "header", "headers"]);
 
 function redactionTypeForKey(key: string): string {
-    const normalized = key
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9_.-]+/g, "_");
-    const suffix = normalized.split(".").filter(Boolean).at(-1) ?? normalized;
-    return suffix || "secret";
+    return (
+        key
+            // `apiKey` needs camel-case splitting; lowercasing first produces
+            // `apikey`, which no vocabulary word matches.
+            .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+            .toLowerCase()
+            .split(/[^a-z0-9]+/)
+            .filter(
+                (segment) => SECRET_SEGMENT_PATTERN.test(segment) || SECRET_QUALIFIERS.has(segment),
+            )
+            .join("_") || "secret"
+    );
 }
 
 // Do not redact numeric, boolean, null, or undefined values solely because their key contains a secret word.
@@ -39,7 +47,7 @@ function isNonSecretScalarValue(value: string): boolean {
     return /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v);
 }
 
-const SECRET_QUALIFIERS = new Set([
+export const SECRET_QUALIFIERS = new Set([
     "api",
     "access",
     "private",
@@ -146,7 +154,7 @@ const SECRET_TEXT_PATTERNS: Array<{
         replacement: "<HUGGINGFACE_TOKEN_REDACTED>",
     },
     {
-        pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+        pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g,
         replacement: "<AWS_ACCESS_KEY_ID_REDACTED>",
     },
     {
@@ -154,7 +162,7 @@ const SECRET_TEXT_PATTERNS: Array<{
         replacement: "<SLACK_TOKEN_REDACTED>",
     },
     {
-        pattern: /\bAIza[A-Za-z0-9_-]{35}\b/g,
+        pattern: /\bAIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9])/g,
         replacement: "<GOOGLE_API_KEY_REDACTED>",
     },
     {

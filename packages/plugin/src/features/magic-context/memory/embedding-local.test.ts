@@ -97,6 +97,7 @@ describe("LocalEmbeddingProvider dtype threading (#259)", () => {
             model: "Xenova/bge-small-en-v1.5",
         });
         expect(provider.modelId).toBe(expected);
+        expect(provider.isLoaded()).toBe(false);
     });
 
     test("explicit fp32 dtype matches the default identity (fp32 is the default)", () => {

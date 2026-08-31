@@ -19,7 +19,6 @@ import type {
     UnifiedSearchOptions,
     UnifiedSearchResult,
 } from "../../features/magic-context/search";
-import { unifiedSearch } from "../../features/magic-context/search";
 import {
     type AutoSearchHintDecision,
     type AutoSearchHintNoHintReason,
@@ -34,48 +33,14 @@ import {
     AUTO_SEARCH_SOURCES,
     extractBoundedAutoSearchQuery,
 } from "./auto-search-prompt";
+import {
+    AUTO_SEARCH_TIMEOUT_MS,
+    hasStackedAugmentation,
+    unifiedSearchWithTimeout,
+} from "./auto-search-shared";
 import { hasMeaningfulUserText } from "./read-session-formatting";
 import { appendReminderToUserMessageById } from "./transform-message-helpers";
 import type { MessageLike } from "./transform-operations";
-
-/** The transform limits auto-search to 3 seconds so a slow embedding provider cannot block it.
- * On timeout, the transform skips the current turn and retries on the next user turn; auto-search must not block the transform. */
-const AUTO_SEARCH_TIMEOUT_MS = 3_000;
-
-/** `unifiedSearchWithTimeout` returns search results on success and `null` on timeout.
- * On timeout, the timer calls `controller.abort()`, which requests cancellation of the embedding request.
- * */
-async function unifiedSearchWithTimeout(
-    db: Database,
-    sessionId: string,
-    projectPath: string,
-    prompt: string,
-    options: UnifiedSearchOptions,
-    timeoutMs: number,
-): Promise<UnifiedSearchResult[] | null> {
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeoutPromise = new Promise<null>((resolve) => {
-        timer = setTimeout(() => {
-            controller.abort();
-            resolve(null);
-        }, timeoutMs);
-    });
-    try {
-        return await Promise.race([
-            unifiedSearch(db, sessionId, projectPath, prompt, {
-                ...options,
-                signal: controller.signal,
-                // `unifiedSearchWithTimeout` sets `countRetrievals` to `false` because unconsumed auto-surfaced hints would inflate retrieval-based promotion signals.
-                countRetrievals: false,
-                memoryPolicySurface: "auto_search",
-            }),
-            timeoutPromise,
-        ]);
-    } finally {
-        if (timer !== undefined) clearTimeout(timer);
-    }
-}
 
 export type AutoSearchOutcome =
     | { ok: true }
@@ -210,16 +175,6 @@ export function collectUserPromptParts(message: MessageLike): string {
         collected += (collected.length > 0 ? "\n" : "") + p.text;
     }
     return collected;
-}
-
-/** The transform skips auto-search when raw text contains an augmentation tag to prevent duplicate augmentation.
- * */
-export function hasStackedAugmentation(rawText: string): boolean {
-    return (
-        rawText.includes("<sidekick-augmentation>") ||
-        rawText.includes("<ctx-search-hint>") ||
-        rawText.includes("<ctx-search-auto>")
-    );
 }
 
 function extractUserPromptText(message: MessageLike): string {
@@ -410,9 +365,6 @@ export async function runAutoSearchHint(args: {
     return AUTO_SEARCH_OK;
 }
 
-export function _resetAutoSearchCache(): void {
-}
-
-/* */
+/** Session cleanup hook — call on session.deleted. */
 export function clearAutoSearchForSession(_sessionId: string): void {
 }

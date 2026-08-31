@@ -1,10 +1,10 @@
 import {
     NativeChannel,
-    type NativeDescriptor,
     type NativeProducerReservation,
     type NativeReceiveLease,
+    type NativeSetupOptions,
     type ProducerCursor,
-} from "@magic-context/mc-shm-native";
+} from "@cortexkit/mc-shm-native";
 import type { Deadline } from "./deadline";
 import { McHostCallError } from "./errors";
 import {
@@ -16,19 +16,66 @@ import {
     type FrameChannelStats,
     type FrameSendHooks,
     type FrameSendTicket,
+    headerViolation,
     type OutboundFrame,
     type ProducerFrameHeader,
     ReceiveLease,
     type SetupFrameChannel,
 } from "./frame-channel";
-import { decodeHeader, type EnvelopeHeader, encodeHeader, HEADER_LEN } from "./protocol";
+import {
+    decodeHeader,
+    type EnvelopeHeader,
+    encodeHeader,
+    HEADER_LEN,
+    PROTOCOL_VERSION,
+} from "./protocol";
+
+class InboundFrameError extends Error {
+    constructor(
+        readonly reason: "protocol_violation" | "role_violation",
+        message: string,
+    ) {
+        super(message);
+    }
+}
 
 export interface ShmFrameChannelOptions {
-    descriptor?: NativeDescriptor;
+    /** Injected only by unit tests; production attaches through `setup`. */
     nativeChannel?: NativeChannel;
+    setup?: NativeSetupOptions;
     budget: ByteBudget;
     maxBodyLen: number;
     handlers: FrameChannelHandlers;
+}
+
+/**
+ * Longest a single publication may block the event loop waiting for ring
+ * capacity. The native reservation is synchronous, and this thread is also the
+ * only consumer of the inbound ring, so waiting a request deadline here stops
+ * the drain that would free the capacity being waited on.
+ */
+const MAX_RESERVATION_BLOCK_MS = 5;
+
+/** A full ring is backpressure, so callers may retry rather than fail the route. */
+function ringFullError(cause: unknown): McHostCallError {
+    return new McHostCallError(
+        "not_sent",
+        "shared-memory ring has no capacity for this frame",
+        "ring_full",
+        cause,
+    );
+}
+
+function isRingFull(error: unknown): boolean {
+    return error instanceof Error && error.message === "shared-memory ring is full";
+}
+
+/** Never waits past the caller's deadline, and never longer than the loop bound. */
+function reservationBlockMs(deadline?: Deadline): number {
+    const remaining = deadline?.remainingMs();
+    if (remaining === undefined) return MAX_RESERVATION_BLOCK_MS;
+    if (remaining <= 0) return 0;
+    return Math.min(MAX_RESERVATION_BLOCK_MS, Math.ceil(remaining));
 }
 
 export class ShmFrameChannel implements SetupFrameChannel {
@@ -41,12 +88,9 @@ export class ShmFrameChannel implements SetupFrameChannel {
     private heldBytes = 0;
 
     constructor(private readonly options: ShmFrameChannelOptions) {
-        if (!options.nativeChannel && !options.descriptor) {
+        if (!options.nativeChannel && !options.setup) {
             throw new Error("shared-memory channel requires an attachment");
         }
-        // start() rejects attachment when the deadline has already expired.
-        // The constructor records a descriptor without attaching it.
-        // A pre-attached channel is adopted without attachment I/O.
         this.native = options.nativeChannel ?? null;
     }
 
@@ -55,10 +99,15 @@ export class ShmFrameChannel implements SetupFrameChannel {
             throw new McHostCallError("not_sent", "shared-memory channel closed");
         }
         if (!this.native) {
+            const setup = this.options.setup;
+            if (!setup) throw new Error("shared-memory setup is missing");
             if (deadline.remainingMs() <= 0) {
                 throw new McHostCallError("not_sent", "shared-memory setup deadline expired");
             }
-            this.native = NativeChannel.attach(this.options.descriptor as NativeDescriptor);
+            this.native = NativeChannel.connectSetup({
+                ...setup,
+                timeoutMs: Math.max(1, Math.ceil(deadline.remainingMs())),
+            });
         }
     }
 
@@ -75,8 +124,11 @@ export class ShmFrameChannel implements SetupFrameChannel {
     ): FrameSendTicket {
         if (this.closed) throw new McHostCallError("not_sent", "shared-memory channel closed");
         this.assertBodyBounds(body.byteLength);
-        // The native ring capacity does not enforce the aggregate memory cap.
-        // Admission uses the shared budget and rejects over-cap bodies with memory_cap.
+        // The native ring's fixed capacity is not the configured aggregate
+        // cap: admission consults the shared budget so an over-cap body is
+        // refused with `memory_cap`. The
+        // charge covers the synchronous publication window and is returned
+        // once the ring owns the bytes.
         const reservedBytes = HEADER_LEN + body.byteLength;
         this.admitPublication(reservedBytes);
         try {
@@ -99,9 +151,10 @@ export class ShmFrameChannel implements SetupFrameChannel {
         this.admitPublication(reservedBytes);
         let reservation: NativeProducerReservation;
         try {
-            reservation = this.attached().reserve(capacity);
+            reservation = this.attached().reserve(capacity, MAX_RESERVATION_BLOCK_MS);
         } catch (error) {
             this.releasePublication(reservedBytes);
+            if (isRingFull(error)) throw ringFullError(error);
             throw error;
         }
         let held = true;
@@ -244,20 +297,25 @@ export class ShmFrameChannel implements SetupFrameChannel {
     ): FrameSendTicket {
         if (this.closed) throw new McHostCallError("not_sent", "shared-memory channel closed");
         let published = false;
-        this.attached().produce(
-            encodeHeader({ ...header, len: body.byteLength }),
-            body.byteLength,
-            (cursor: ProducerCursor) => body.fill(cursor),
-            () => {
-                published = true;
-                try {
-                    hooks?.onPublish?.();
-                } catch {
-                    // Send hooks cannot change publication.
-                }
-            },
-            deadline?.remainingMs() ?? 0,
-        );
+        try {
+            this.attached().produce(
+                encodeHeader({ ...header, len: body.byteLength }),
+                body.byteLength,
+                (cursor: ProducerCursor) => body.fill(cursor),
+                () => {
+                    published = true;
+                    try {
+                        hooks?.onPublish?.();
+                    } catch {
+                        // Send hooks cannot change publication.
+                    }
+                },
+                reservationBlockMs(deadline),
+            );
+        } catch (error) {
+            if (isRingFull(error)) throw ringFullError(error);
+            throw error;
+        }
         try {
             hooks?.onComplete?.();
         } catch {
@@ -293,6 +351,22 @@ export class ShmFrameChannel implements SetupFrameChannel {
             while (
                 this.attached().poll((nativeLease: NativeReceiveLease) => {
                     const header = decodeHeader(nativeLease.header);
+                    const violation = headerViolation(header);
+                    const structuralError =
+                        header.ver !== PROTOCOL_VERSION
+                            ? "unsupported protocol version"
+                            : header.len !== nativeLease.byteLength
+                              ? "ring frame length mismatch"
+                              : header.len > this.options.maxBodyLen
+                                ? "ring frame exceeds configured body limit"
+                                : null;
+                    if (structuralError !== null || violation !== null) {
+                        nativeLease.release();
+                        throw new InboundFrameError(
+                            violation?.reason ?? "protocol_violation",
+                            structuralError ?? violation?.detail ?? "invalid ring frame",
+                        );
+                    }
                     const segments = Array.from({ length: nativeLease.segmentCount }, (_, index) =>
                         nativeLease.segment(index),
                     );
@@ -319,8 +393,21 @@ export class ShmFrameChannel implements SetupFrameChannel {
                     }
                 })
             ) {}
+            // The loop checks peerClosed() after draining so a graceful Goodbye reaches the dispatcher before the connection retires. Rings cannot express peer death on their own: a host that exits without a Goodbye leaves them looking idle, so every later poll would return no frames while the generation stayed live.
+            if (this.attached().peerClosed()) {
+                this.options.handlers.onClosed("eof", undefined);
+                try {
+                    this.close();
+                } catch {
+                    // close() rethrows on quarantined leases; an interval
+                    // callback has no caller to observe the throw.
+                }
+            }
         } catch (error) {
-            this.options.handlers.onClosed("protocol_violation", error);
+            this.options.handlers.onClosed(
+                error instanceof InboundFrameError ? error.reason : "protocol_violation",
+                error,
+            );
             try {
                 this.close();
             } catch {

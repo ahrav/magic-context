@@ -4,6 +4,7 @@ import {
     DREAMER_MUTATION_CLASSES,
     EXPECTED_MUTATION_OUTCOMES,
     runMutationBattery,
+    trackedFixtureUniverse,
 } from "./mutations";
 import { dreamerScorerFixture, exitCodeForScore } from "./scorer.test";
 import { scoreVerifyManifest } from "./scorer";
@@ -33,6 +34,7 @@ describe("dreamer manifest mutation battery", () => {
 </verify>`,
             dreamerScorerFixture.pool,
             dreamerScorerFixture.verifyGold,
+            trackedFixtureUniverse(dreamerScorerFixture),
         );
         expect(exitCodeForScore(score)).toBe(2);
     });

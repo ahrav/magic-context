@@ -3,6 +3,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
+import { isHistorianRequest } from "../src/cache-analysis";
 
 /**
  * Historian persists pending marker state during publication and defers marker advancement to materialization.
@@ -17,29 +18,7 @@ import { buildMockHistorianPayload } from "../src/mock-historian";
  *
  */
 
-const HISTORIAN_SYSTEM_MARKER =
-    "the hippocampus of a long-running coding agent";
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    const system = body.system;
-    if (typeof system === "string")
-        return system.includes(HISTORIAN_SYSTEM_MARKER);
-    if (Array.isArray(system)) {
-        for (const block of system) {
-            if (block && typeof block === "object") {
-                const text = (block as { text?: unknown }).text;
-                if (
-                    typeof text === "string" &&
-                    text.includes(HISTORIAN_SYSTEM_MARKER)
-                ) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
 
 function findOrdinalRange(
     body: Record<string, unknown>,

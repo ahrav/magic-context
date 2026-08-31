@@ -28,18 +28,7 @@ export const CLAIMS_AND_EVIDENCE_TABLES = [
     "verification_events",
 ] as const;
 
-/** The database rejects UPDATE and DELETE on rows in these tables. */
-export const APPEND_ONLY_CLAIMS_TABLES = [
-    "episodes",
-    "source_spans",
-    "observations",
-    "claim_revisions",
-    "claim_evidence",
-    "claim_conflicts",
-    "verification_events",
-] as const;
-
-/* */
+/** Full v82 object graph: tables from the dependency roots outward, then indexes and guards. */
 export function createClaimsAndEvidenceSchema(db: Database): void {
     db.exec(`
     CREATE TABLE projects (
@@ -332,17 +321,4 @@ export function createClaimsAndEvidenceSchema(db: Database): void {
     )
     BEGIN SELECT RAISE(ABORT, 'verification_events observation must belong to the revision project'); END;
     `);
-}
-
-/**
- */
-export function assertClaimsSchemaForeignKeys(db: Database): void {
-    const violations: string[] = [];
-    for (const table of CLAIMS_AND_EVIDENCE_TABLES) {
-        const rows = db.prepare(`PRAGMA foreign_key_check(${table})`).all() as unknown[];
-        if (rows.length > 0) violations.push(`${table}: ${rows.length} violation(s)`);
-    }
-    if (violations.length > 0) {
-        throw new Error(`v82 foreign_key_check failed: ${violations.join("; ")}`);
-    }
 }

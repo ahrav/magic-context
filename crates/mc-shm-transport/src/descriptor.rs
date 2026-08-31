@@ -4,49 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::arena::{ArenaSpan, MAX_FRAME_BYTES};
 
-pub const DESCRIPTOR_SCHEMA_VERSION: u16 = 1;
-/// Wire v2 fixes the header at 21 bytes.
+/// Shared descriptor schema version.
+pub const DESCRIPTOR_SCHEMA_VERSION: u16 = 2;
+/// Frozen wire-v2 header length.
 pub const WIRE_V2_HEADER_BYTES: usize = 21;
 /// A complete-frame descriptor contains at most two shared spans.
 pub const MAX_SPANS: usize = 2;
 
-/// Admission requires a preselected backend.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendId {
-    /// Ring uses a custom descriptor ring.
-    Ring,
-    /// Iceoryx uses iceoryx2 0.9.3 publish-subscribe samples.
-    Iceoryx,
-}
-
-/// Admission requires a preselected payload-arena layout.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryLayout {
-    /// Wrapped frames may contain at most two spans.
-    TwoSpanWrap,
-    /// Wrapped allocations consume tail padding and remain contiguous.
-    ContiguousPadWrap,
-    /// One iceoryx2 sample owns each complete frame.
-    IceoryxSample,
-}
-
-/// Admission requires preselected producer and receiver ownership.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OwnershipMode {
-    /// Producer writes shared storage and receiver leases it.
-    DirectLeased,
-    /// Producer copies into transport storage and receiver leases it.
-    CopiedProducerLeasedReceiver,
-    /// Producer writes shared storage and receiver copies it.
-    DirectProducerCopiedReceiver,
-    /// Both terminal boundaries copy transport bytes.
-    Copied,
-}
-
-/// Admission requires a preselected worker scheduling mode.
+/// Worker scheduling selected before admission.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SchedulingMode {
@@ -56,36 +21,7 @@ pub enum SchedulingMode {
     ColdParkWake,
 }
 
-/// The descriptor freezes the workload class used to select one profile.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkloadClass {
-    SmallLatency,
-    /// Large-frame throughput.
-    LargeThroughput,
-    MixedDuplex,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeKind {
-    /// Rust supports only Rust endpoint pairs.
-    Rust,
-    /// Node24 supports Node 24 through N-API 8.
-    Node24,
-    /// Bun supports N-API 8.
-    Bun,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlatformKind {
-    /// Linux.
-    Linux,
-    /// macOS.
-    Macos,
-}
-
+/// Validated opaque hardware-profile identifier.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HardwareProfileId(String);
@@ -115,43 +51,20 @@ impl fmt::Debug for HardwareProfileId {
     }
 }
 
+/// Fixed ring profile identity carried by an authenticated grant.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TransportDescriptor {
     schema_version: u16,
-    backend: BackendId,
-    memory_layout: MemoryLayout,
-    ownership: OwnershipMode,
     scheduling: SchedulingMode,
-    workload: WorkloadClass,
-    platform: PlatformKind,
-    runtime: RuntimeKind,
     hardware: HardwareProfileId,
 }
 
 impl TransportDescriptor {
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "every immutable grant dimension is required"
-    )]
-    pub fn new(
-        backend: BackendId,
-        memory_layout: MemoryLayout,
-        ownership: OwnershipMode,
-        scheduling: SchedulingMode,
-        workload: WorkloadClass,
-        platform: PlatformKind,
-        runtime: RuntimeKind,
-        hardware: HardwareProfileId,
-    ) -> Self {
+    /// Constructs the current ring descriptor.
+    pub const fn new(scheduling: SchedulingMode, hardware: HardwareProfileId) -> Self {
         Self {
             schema_version: DESCRIPTOR_SCHEMA_VERSION,
-            backend,
-            memory_layout,
-            ownership,
             scheduling,
-            workload,
-            platform,
-            runtime,
             hardware,
         }
     }
@@ -161,41 +74,12 @@ impl TransportDescriptor {
         self.schema_version
     }
 
-    /// Selected backend.
-    pub const fn backend(&self) -> BackendId {
-        self.backend
-    }
-
-    /// Selected layout.
-    pub const fn memory_layout(&self) -> MemoryLayout {
-        self.memory_layout
-    }
-
-    /// Selected ownership.
-    pub const fn ownership(&self) -> OwnershipMode {
-        self.ownership
-    }
-
     /// Selected scheduling.
     pub const fn scheduling(&self) -> SchedulingMode {
         self.scheduling
     }
 
-    /// Selected workload.
-    pub const fn workload(&self) -> WorkloadClass {
-        self.workload
-    }
-
-    /// Selected platform.
-    pub const fn platform(&self) -> PlatformKind {
-        self.platform
-    }
-
-    /// Selected runtime.
-    pub const fn runtime(&self) -> RuntimeKind {
-        self.runtime
-    }
-
+    /// Tests equality with expected hardware-profile identifier.
     pub fn hardware_matches(&self, expected: &str) -> bool {
         self.hardware.matches(expected)
     }

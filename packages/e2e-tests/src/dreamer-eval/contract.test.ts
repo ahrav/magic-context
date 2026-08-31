@@ -4,8 +4,11 @@ import { sha256Utf8Hex } from "../../../plugin/src/features/magic-context/memory
 import {
     DREAMER_EVAL_REPORT_SCHEMA,
     DREAMER_EVAL_SCENARIO_SCHEMA,
+    DREAMER_TASKS,
     DreamerEvalContractError,
+    MAX_POOL_CLAIMS,
     RUN_FATAL_FAIL_REASONS,
+    TASK_BATCH_SIZE,
     dreamerEvalExitCode,
     parseRunReport,
     parseScenario,
@@ -35,6 +38,7 @@ function validScenarioRaw(): Record<string, unknown> {
         schema: DREAMER_EVAL_SCENARIO_SCHEMA,
         id: "dme-core-pool",
         title: "Core dreamer maintenance pool",
+        pressureRoles: [],
         pool: { claims },
         tasks: [
             {
@@ -109,6 +113,18 @@ function expectDiagnostic(edit: (raw: Record<string, unknown>) => void, diagnost
 }
 
 describe("dreamer eval scenario contract", () => {
+    test("every task's production batch size covers the largest declarable pool", () => {
+        // The runner matches a task's child sessions by finding every in-scope
+        // public claim id in one transcript, so it can only score a task
+        // production dispatches as a single batch. In-scope ids are a subset of
+        // the pool, so this bound is what keeps every accepted scenario
+        // single-batch — and `partition-unsupported` is the refusal that fires if
+        // it ever stops holding.
+        for (const task of DREAMER_TASKS) {
+            expect(MAX_POOL_CLAIMS).toBeLessThanOrEqual(TASK_BATCH_SIZE[task]);
+        }
+    });
+
     test("full valid scenario round-trips unchanged", () => {
         const raw = validScenarioRaw();
         const parsed = parseScenario(raw);
@@ -155,6 +171,24 @@ describe("dreamer eval scenario contract", () => {
             const claims = (raw.pool as { claims: unknown[] }).claims;
             for (let index = 11; index <= 51; index += 1) claims.push(claim(index));
         }, "scenario.pool.claims: count-invalid");
+    });
+
+    test("pressure roles enforce singleton and pair cardinality", () => {
+        expectDiagnostic((raw) => {
+            raw.pressureRoles = [{ role: "stale", claimIds: ["claim-1", "claim-2"] }];
+        }, "scenario.pressureRoles[0].claimIds: role-cardinality-invalid");
+        expectDiagnostic((raw) => {
+            raw.pressureRoles = [{ role: "semantic-duplicate-pair", claimIds: ["claim-1"] }];
+        }, "scenario.pressureRoles[0].claimIds: role-cardinality-invalid");
+        expectDiagnostic((raw) => {
+            raw.pressureRoles = [{ role: "stale", claimIds: ["claim-missing"] }];
+        }, "scenario.pressureRoles[0].claimIds[0]: unknown-claim");
+        expectDiagnostic((raw) => {
+            raw.pressureRoles = [
+                { role: "stale", claimIds: ["claim-1"] },
+                { role: "stale", claimIds: ["claim-2"] },
+            ];
+        }, "scenario.pressureRoles: duplicate");
     });
 
     test("verify gold ties the reported backing set to the verdict", () => {
@@ -611,8 +645,13 @@ describe("dreamer eval report contract", () => {
             bunVersion: "1.3.11",
             opencodeVersion: "1.0.0",
             modelId: "model",
+            platform: "linux",
             parserImpl: "ts",
+            pluginEntry: "src",
+            runtimeDigest: "d".repeat(64),
         },
+        trackedFiles: ["src/cache.ts"],
+        fixtureRoot: "/fixture-worktree",
         poolBefore: POOL_CAPTURE,
         poolAfter: POOL_CAPTURE,
         rawManifest: rawVerify(VERIFY_EVIDENCE),
@@ -627,6 +666,29 @@ describe("dreamer eval report contract", () => {
         expect(() => parseRunReport({ ...baseReport, status: "FAIL", reason: "unknown" })).toThrow(
             /reason: enum-invalid/,
         );
+    });
+
+    test("parsed manifest retains array-shaped map and classify output", () => {
+        // Map and classify parse to one entry per claim, so their evidence is an
+        // array where verify's is a record of verdict lists. Both must survive the
+        // report, with the bytes that produce them.
+        const mapEvidence = [{ publicClaimId: OBSERVED_ID, files: ["src/a.ts"], independent: false }];
+        expect(
+            parseRunReport({
+                ...baseReport,
+                task: "map-memories",
+                rawManifest: rawMap(mapEvidence),
+                parsedManifest: mapEvidence,
+            }).parsedManifest,
+        ).toEqual(mapEvidence);
+        expect(
+            parseRunReport({
+                ...baseReport,
+                task: "classify-memories",
+                rawManifest: rawClassify(CLASSIFY_EVIDENCE),
+                parsedManifest: CLASSIFY_EVIDENCE,
+            }).parsedManifest,
+        ).toEqual(CLASSIFY_EVIDENCE);
     });
 
     test("exit mapping is 0 for PASS, 1 for ordinary red, and 2 for wrong archival", () => {

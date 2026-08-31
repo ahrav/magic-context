@@ -658,7 +658,7 @@ pub struct PublicationSummary {
     pub daemon_id: String,
     pub daemon_ver: String,
     pub pid: u32,
-    pub port: u16,
+    pub setup_socket: String,
 }
 
 /// `ProbeFreshness::window` limits how long `Starting` and `Stopping` evidence remains credible.
@@ -781,9 +781,8 @@ fn publication_summary(bytes: &[u8]) -> Option<PublicationSummary> {
     let info: ConnectionInfo = serde_json::from_slice(bytes).ok()?;
     info.validate().ok()?;
 
-    let endpoint = info.endpoints.first()?;
-    if endpoint.host != "127.0.0.1"
-        || endpoint.port == 0
+    if info.setup_socket.is_empty()
+        || !Path::new(&info.setup_socket).is_absolute()
         || info.daemon_ver.is_empty()
         || info.key.len() != KEY_LEN
     {
@@ -793,7 +792,7 @@ fn publication_summary(bytes: &[u8]) -> Option<PublicationSummary> {
         daemon_id: hex(&info.daemon_id),
         daemon_ver: info.daemon_ver,
         pid: info.pid,
-        port: endpoint.port,
+        setup_socket: info.setup_socket,
     })
 }
 
@@ -1340,7 +1339,9 @@ mod tests {
             .expect("starting");
         assert_eq!(probe(root.path()).state, LifecycleState::Starting);
 
-        guard.publish(43123, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         guard
             .write_lifecycle_record(LifecyclePhase::Running)
             .expect("running");
@@ -1413,7 +1414,9 @@ mod tests {
         guard
             .write_lifecycle_record(LifecyclePhase::Running)
             .expect("running");
-        guard.publish(43123, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         let publication = guard.dir_path().join(CONNECTION_FILE_NAME);
         let bytes = std::fs::read(&publication).expect("read publication");
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
@@ -1429,7 +1432,9 @@ mod tests {
             .expect("mode");
         assert_eq!(probe(root.path()).state, LifecycleState::Wedged);
 
-        guard.publish(43123, "mc-host/test").expect("republish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("republish");
         std::fs::set_permissions(&publication, std::fs::Permissions::from_mode(0o644))
             .expect("loosen publication");
         assert_eq!(probe(root.path()).state, LifecycleState::Wedged);
@@ -1455,7 +1460,9 @@ mod tests {
             guard
                 .write_lifecycle_record(LifecyclePhase::Running)
                 .expect("running");
-            guard.publish(43123, "mc-host/test").expect("publish");
+            guard
+                .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+                .expect("publish");
             publication = guard.dir_path().join(CONNECTION_FILE_NAME);
             // The test rewrites the publication under a foreign daemon ID so fenced `Drop` cleanup leaves it behind, simulating a crash.
             let bytes = std::fs::read(&publication).expect("read");
@@ -1485,8 +1492,12 @@ mod tests {
         guard
             .write_lifecycle_record(LifecyclePhase::Starting)
             .expect("starting");
-        // A crashed predecessor can leave a well-formed foreign-daemon publication for its successor to overwrite at `publish`.
-        guard.publish(43123, "mc-host/test").expect("publish");
+        // Plant a crashed predecessor's leftover: a well-formed publication
+        // under a foreign daemon ID, exactly what a SIGKILLed incarnation
+        // leaves behind for its successor to overwrite at `publish`.
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         let publication = guard.dir_path().join(CONNECTION_FILE_NAME);
         let bytes = std::fs::read(&publication).expect("read");
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
@@ -1720,48 +1731,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_discarded_writer_drops_the_hook_unrun_and_reopens_the_latch() {
-        let latch = std::sync::Arc::new(ShutdownLatch::new());
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        assert_eq!(latch.try_own(), LatchDecision::Owner);
-        let commit = CommitOnAck::new(std::sync::Arc::clone(&latch), shutdown.clone());
-
-        let (server, client) = tokio::io::duplex(64);
-        let generation = tokio_util::sync::CancellationToken::new();
-        let (handle, task) = crate::tcp_frame_channel::spawn_writer(
-            server,
-            2,
-            generation.clone(),
-            std::time::Duration::from_secs(5),
-        );
-        handle
-            .send(crate::frame_channel::OutboundFrame {
-                bytes: vec![0u8; 8],
-                tail: Vec::new(),
-                direct: None,
-                charge: crate::wire::ByteCharge::none(),
-                written: Some(Box::new(move |_at| commit.acknowledge())),
-            })
-            .await
-            .expect("queued");
-        // Discarding the writer before it writes a queued frame drops the frame's hook without running it.
-        handle.discard();
-        drop(handle);
-        task.await.expect("writer task");
-        drop(client);
-
-        assert!(!shutdown.is_cancelled(), "an unwritten frame cannot commit");
-        assert_eq!(
-            latch.try_own(),
-            LatchDecision::Owner,
-            "ownership reopened for a later requester"
-        );
-        CommitOnAck::new(std::sync::Arc::clone(&latch), shutdown.clone()).acknowledge();
-        assert!(shutdown.is_cancelled());
-        assert_eq!(latch.try_own(), LatchDecision::Committed);
-    }
-
-    #[tokio::test]
     async fn latch_waiters_wake_on_reopen_and_commit() {
         for (finish, expected) in [("reopen", "owner"), ("commit", "committed")] {
             let latch = std::sync::Arc::new(ShutdownLatch::new());
@@ -1934,7 +1903,9 @@ mod tests {
         // The fixture creates valid publication bytes, then strands them without a lock holder to simulate a crashed daemon.
         let (publication_bytes, daemon_hex) = {
             let mut guard = acquire(&root_path);
-            guard.publish(43123, "mc-host/test").expect("publish");
+            guard
+                .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+                .expect("publish");
             let bytes = std::fs::read(guard.dir_path().join(CONNECTION_FILE_NAME)).expect("read");
             (bytes, hex(guard.daemon_id()))
         };
@@ -2059,7 +2030,9 @@ mod tests {
         guard
             .write_lifecycle_record(LifecyclePhase::Running)
             .expect("running");
-        guard.publish(43123, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
 
         let cortexkit = root.path().join("cortexkit");
         std::fs::rename(&cortexkit, root.path().join("cortexkit-old"))
@@ -2100,7 +2073,9 @@ mod tests {
         guard
             .write_lifecycle_record(LifecyclePhase::Running)
             .expect("running");
-        guard.publish(43123, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         assert_eq!(probe(root.path()).state, LifecycleState::Running);
 
         let path = record_path(&guard);
@@ -2174,7 +2149,9 @@ mod tests {
             guard
                 .write_lifecycle_record(LifecyclePhase::Running)
                 .expect("running");
-            guard.publish(43123, "mc-host/test").expect("publish");
+            guard
+                .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+                .expect("publish");
         }
         // release would.
         let dir_path = runtime_dir_path(Some(root.path())).expect("path");
@@ -2205,7 +2182,9 @@ mod tests {
             guard
                 .write_lifecycle_record(LifecyclePhase::Running)
                 .expect("running");
-            guard.publish(43123, "mc-host/test").expect("publish");
+            guard
+                .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+                .expect("publish");
             let record_file = record_path(&guard);
             let publication_file = guard.dir_path().join(CONNECTION_FILE_NAME);
             let record_bytes = std::fs::read(&record_file).expect("read record");

@@ -5,7 +5,7 @@ import { appendCompartments } from "@magic-context/core/features/magic-context/c
 import { getPendingPiCompactionMarkerState } from "@magic-context/core/features/magic-context/storage";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { queueAndApplyPiRecompMarker } from "./pi-recomp-marker";
-import { createTestDb } from "./test-utils.test";
+import { createTestDb } from "./test-utils";
 
 /**
  * The branch must contain the entry at the marker boundary.

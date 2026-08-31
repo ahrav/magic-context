@@ -2,7 +2,37 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { hasShareabilitySensitiveText, redactSecretText } from "./redaction";
+import vocabulary from "./fixtures/redaction-vocabulary-v1.json";
+import {
+    hasShareabilitySensitiveText,
+    redactSecretText,
+    SECRET_QUALIFIERS,
+    SECRET_WORDS,
+} from "./redaction";
+
+describe("redaction vocabulary fixture", () => {
+    test("matches the cross-runtime label vocabulary", () => {
+        expect(SECRET_WORDS).toEqual(vocabulary.label_words);
+        expect([...SECRET_QUALIFIERS]).toEqual(vocabulary.label_qualifiers);
+    });
+
+    test("matches the cross-runtime redacted output", () => {
+        for (const fixture of vocabulary.cases) {
+            expect(redactSecretText(fixture.input)).toBe(fixture.expected_redacted);
+            for (const detection of fixture.detections) {
+                const bytes = Buffer.from(fixture.input, "utf8");
+                expect(detection.offset + detection.length).toBeLessThanOrEqual(bytes.length);
+                expect(detection.secret_type.length).toBeGreaterThan(0);
+            }
+        }
+    });
+
+    test("preserves scalar exemptions and documents known misses", () => {
+        for (const unchanged of [...vocabulary.exemptions, ...vocabulary.known_misses]) {
+            expect(redactSecretText(unchanged)).toBe(unchanged);
+        }
+    });
+});
 
 describe("redactSecretText — token counts and scalar diagnostics stay visible", () => {
     test("keeps numeric/boolean values whose key merely contains a secret word", () => {

@@ -1,9 +1,10 @@
 //! This module centralizes measurement rules shared by the mc-host performance harness.
 //!
-//! The performance harness uses this module only for timing, percentiles, workload identity, and outcome accounting.
-//! `examples/perf_load.rs`, the `ipc_budget` benchmark, and their tests use this module.
-//! `RTT` spans issue through validated terminal outcome.
-//! Every scheduled slot resolves to exactly one terminal outcome.
+//! Pure timing, percentile, workload, and outcome-accounting logic used by
+//! the `ipc_budget` benchmark and its tests.
+//! Contract: issue-to-validated-terminal is the RTT boundary, scheduled
+//! time exists only for open-loop accounting, and every scheduled slot must
+//! resolve to exactly one terminal outcome.
 
 #![allow(dead_code)]
 

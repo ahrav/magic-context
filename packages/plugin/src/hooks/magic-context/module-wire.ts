@@ -860,18 +860,31 @@ function isSyntheticWireMessage(message: MessageLike): boolean {
 }
 
 /**
- * The module addresses messages by absolute ordinal.
+ * The session's durable ordinal-memo state, passed as one bundle. Callers
+ * project their session-state fields into this shape exactly once so the
+ * field-to-field rename map cannot drift between call sites. The resolver
+ * mutates `entries` in place (clear/set): pass the live session Map, never
+ * a copy, or resolved ordinals silently detach from the session state.
+ */
+export interface ModuleOrdinalMemo {
+    generation: number;
+    memoGeneration: number;
+    entries: Map<string, number>;
+    anchor?: RawMessageOrdinalAnchor | null;
+    storedCount?: number | null;
+    canonicalCount?: number;
+}
+
+/**
+ * Resolve OpenCode message ids to the absolute ordinals used by the module.
+ * The module and shadow lanes must see the same provisional suffix behavior, so
+ * this is shared rather than reimplemented by the authority adapter.
  */
 export async function resolveOrdinalsForModule(args: {
     sessionId: string;
     messages: MessageLike[];
-    generation: number;
-    memoGeneration: number;
-    memo: Map<string, number>;
-    memoAnchor?: RawMessageOrdinalAnchor | null;
-    memoStoredCount?: number | null;
-    memoCanonicalCount?: number;
-    /** The anchor is the absolute ordinal immediately before the sliced unresolved tail. */
+    memo: ModuleOrdinalMemo;
+    /** Absolute ordinal immediately before a sliced unresolved tail. */
     provisionalBase?: number;
 }): Promise<
     | {
@@ -891,13 +904,13 @@ export async function resolveOrdinalsForModule(args: {
           messageRole?: string;
       }
 > {
-    const memo = args.memo;
-    const generationChanged = args.memoGeneration !== args.generation;
+    const memo = args.memo.entries;
+    const generationChanged = args.memo.memoGeneration !== args.memo.generation;
     if (generationChanged) memo.clear();
 
-    let anchor = generationChanged ? null : (args.memoAnchor ?? null);
-    let storedCount = generationChanged ? null : (args.memoStoredCount ?? null);
-    let canonicalCount = generationChanged ? 0 : (args.memoCanonicalCount ?? 0);
+    let anchor = generationChanged ? null : (args.memo.anchor ?? null);
+    let storedCount = generationChanged ? null : (args.memo.storedCount ?? null);
+    let canonicalCount = generationChanged ? 0 : (args.memo.canonicalCount ?? 0);
     const priming = storedCount === null;
     if (priming) {
         memo.clear();
@@ -1045,7 +1058,7 @@ export async function resolveOrdinalsForModule(args: {
     return {
         ok: true,
         annotatedInput: annotated,
-        memoGeneration: args.generation,
+        memoGeneration: args.memo.generation,
         memoAnchor: anchor,
         memoStoredCount: storedCount,
         memoCanonicalCount: canonicalCount,
@@ -1053,8 +1066,8 @@ export async function resolveOrdinalsForModule(args: {
     };
 }
 
-/** The module expects the builder fields in a top-level wire envelope. */
-export function toFlatModuleWireBody(payload: {
+/** Flatten the typed builder shape to the module's top-level wire envelope. */
+function toFlatModuleWireBody(payload: {
     method: string;
     params: Record<string, unknown>;
 }): Record<string, unknown> {
@@ -1519,3 +1532,109 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
         };
     });
 }
+
+/**
+ * Authority + mirror wire methods the transport routes through its serialized
+ * authority lane. `authority.drain_flip` is deliberately absent: the drain
+ * flip is issued through the general `call` path, not the authority helper.
+ */
+export type ModuleAuthorityMethod =
+    | "authority.status"
+    | "authority.prepare"
+    | "authority.seed"
+    | "authority.drain.begin"
+    | "authority.drain.finish"
+    | "authority.drain_seed"
+    | "authority.drain_memories"
+    | "authority.drain_notes"
+    | "authority.drain_compartments"
+    | "authority.drain_reconcile"
+    | "authority.drain_verify"
+    | "authority.drain_finish"
+    | "mirror.pull";
+
+/** Every method name the module transport can carry on the wire. */
+export type ModuleMethod =
+    | ModuleAuthorityMethod
+    | "authority.drain_flip"
+    | "state_sync"
+    | "transform"
+    | "session.status"
+    | "session.delete"
+    | "session.flush"
+    | "session.recomp"
+    | "session.wrapup"
+    | "todo_state.set"
+    | "agent_drops.append"
+    | "ctx_note"
+    | "ctx_memory"
+    | "claim.intent.stage"
+    | "claim.intent.inspect"
+    | "claim.intent.ack"
+    | "claim.effects.apply"
+    | "claim.mirror.replace"
+    | "claim.mirror.apply"
+    | "note.evaluate"
+    | "note.evaluation.register"
+    | "note.evaluation.heartbeat"
+    | "note.evaluation.unregister"
+    | "note.evaluation.next"
+    | "note.evaluation.renew"
+    | "note.evaluation.complete"
+    | "note.evaluation.abandon"
+    | "transform.ack"
+    | "transform.nack"
+    | "dreamer.run_task"
+    | "memory.set_classification";
+
+/**
+ * Subset a state-sync client may issue. `Extract` ties each member to
+ * {@link ModuleMethod}: a name that leaves the transport union silently drops
+ * out of this subset, so client code issuing it fails typecheck instead of
+ * the client accepting a method the transport cannot carry.
+ */
+export type ModuleStateSyncMethod = Extract<
+    ModuleMethod,
+    | "state_sync"
+    | "transform"
+    | "session.status"
+    | "session.delete"
+    | "session.flush"
+    | "session.recomp"
+    | "session.wrapup"
+    | "todo_state.set"
+    | "agent_drops.append"
+    | "ctx_note"
+    | "ctx_memory"
+    | "note.evaluate"
+    | "transform.ack"
+    | "transform.nack"
+>;
+
+// Compile-time guards, checked by `tsc --noEmit` because this is a source
+// file (test files are excluded from the typecheck project). Erased at
+// runtime.
+type _MethodUnionAssertTrue<T extends true> = T;
+// The state-sync subset admits no authority-lane method.
+type _StateSyncExcludesAuthority = _MethodUnionAssertTrue<
+    Extract<ModuleStateSyncMethod, ModuleAuthorityMethod> extends never ? true : false
+>;
+// No expected state-sync member silently dropped out of the `Extract`.
+type _StateSyncMembersCarried = _MethodUnionAssertTrue<
+        | "state_sync"
+        | "transform"
+        | "session.status"
+        | "session.delete"
+        | "session.flush"
+        | "session.recomp"
+        | "session.wrapup"
+        | "todo_state.set"
+        | "agent_drops.append"
+        | "ctx_note"
+        | "ctx_memory"
+        | "note.evaluate"
+        | "transform.ack"
+        | "transform.nack" extends ModuleStateSyncMethod
+        ? true
+        : false
+>;

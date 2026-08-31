@@ -19,6 +19,8 @@ import {
 } from "../../features/magic-context/compaction-marker";
 import { getCompartmentsByEndMessageId } from "../../features/magic-context/compartment-storage";
 import {
+    clearPendingCompactionMarkerStateIf,
+    getPendingCompactionMarkerState,
     getPersistedCompactionMarkerState,
     type PendingCompactionMarker,
     type PersistedCompactionMarkerState,
@@ -636,4 +638,27 @@ export function checkCompactionMarkerConsistency(db: Database): void {
             // ignore
         }
     }
+}
+/**
+ * Advance the compaction marker after an explicit (eager-cache-clear) publish
+ * and CAS-clear any stale pending marker blob a prior in-flight incremental
+ * publish may have left behind. The pending blob is cleared ONLY when the
+ * boundary actually advanced: on a failed update it is preserved so the
+ * deferred drain keeps its durable retry path. Returns whether the boundary
+ * advanced.
+ */
+export function advanceCompactionMarkerAndClearStalePending(
+    db: Database,
+    sessionId: string,
+    ordinal: number,
+    directory: string,
+): boolean {
+    const markerUpdated = updateCompactionMarkerAfterPublication(db, sessionId, ordinal, directory);
+    if (markerUpdated) {
+        const stalePending = getPendingCompactionMarkerState(db, sessionId);
+        if (stalePending) {
+            clearPendingCompactionMarkerStateIf(db, sessionId, stalePending);
+        }
+    }
+    return markerUpdated;
 }

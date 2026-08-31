@@ -14,7 +14,6 @@ export const MURAL_WIDTH = 1_092;
 export const MURAL_HEIGHT = 1_092;
 /** Anthropic vision image-token tiles are 28 pixels on each side. */
 export const MURAL_VISION_TILE = 28;
-export const MURAL_FONT = "spleen-5x8";
 /** Spleen's 5px cell includes its own blank right-side column for letter spacing. */
 export const MURAL_CELL_WIDTH = MURAL_FONT_CELL_WIDTH;
 export const MURAL_CELL_HEIGHT = MURAL_FONT_CELL_HEIGHT;
@@ -26,7 +25,6 @@ const MURAL_MIN_ROOM_WIDTH = 40;
 /** The 72-character maximum preserves compatibility with the single-column line-width limit. */
 export const MURAL_ROOM_WIDTH = 72;
 export const MURAL_ROWS = Math.floor(MURAL_HEIGHT / MURAL_LINE_PITCH);
-export const MURAL_LINE_CAPACITY = MURAL_COLUMNS * MURAL_ROWS;
 
 export type MuralCategory = string;
 
@@ -610,8 +608,3 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
 export function muralImageTokenEstimateForDimensions(width: number, height: number): number {
     return Math.ceil(width / MURAL_VISION_TILE) * Math.ceil(height / MURAL_VISION_TILE);
 }
-
-export const muralImageTokenEstimate = muralImageTokenEstimateForDimensions(
-    MURAL_WIDTH,
-    MURAL_HEIGHT,
-);

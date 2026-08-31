@@ -408,7 +408,7 @@ async fn ping_and_consumer_correlations_do_not_cross_settle() {
         .expect("route");
 
     let corr = client.next_corr();
-    assert_eq!(corr, 3);
+    assert_eq!(corr, 2);
     client
         .send_frame(
             TY_REQUEST,
@@ -453,6 +453,11 @@ async fn ping_and_consumer_correlations_do_not_cross_settle() {
         .frames_until_corr(corr, BUDGET)
         .await
         .expect("consumer terminal");
+    assert_eq!(
+        frame.ty,
+        support::raw_client::TY_ERROR,
+        "unexpected consumer frame: {frame:?}"
+    );
     assert_eq!(frame.error_code(), "cancelled");
 
     // An unmatched Pong is dropped without disturbing the generation.
@@ -1358,8 +1363,8 @@ async fn a_publication_failure_runs_the_shutdown_callback_before_lock_release() 
     let result = task.await.expect("run task joins");
 
     assert!(
-        matches!(result, Err(HostError::Instance(_))),
-        "a removed runtime directory fails publication, got {result:?}"
+        matches!(result, Err(HostError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound),
+        "a removed runtime directory fails setup before publication, got {result:?}"
     );
     assert!(
         handler.events().contains(&Event::Initialized),
@@ -1416,25 +1421,47 @@ async fn host_shutdown_commits_after_the_full_response_and_stops_gracefully() {
 /// Each racing request receives one parseable response, and the host cancels once.
 #[tokio::test]
 async fn concurrent_shutdown_requests_each_settle_exactly_once() {
-    let host = TestHost::start().await;
+    // Hold the winning response between ring publication and its completion
+    // hook so both requests reach the shutdown latch before it commits.
+    let response_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let hook_release = Arc::clone(&response_release);
+    let host = TestHost::start_with_publish_hook(Arc::new(move |ty, channel| {
+        if ty as u8 == TY_RESPONSE && channel == 0 {
+            let (released, changed) = &*hook_release;
+            let mut released = released.lock().expect("response gate lock");
+            while !*released {
+                released = changed.wait(released).expect("response gate wait");
+            }
+        }
+    }))
+    .await;
     let mut first = host.client().await;
     let mut second = host.client().await;
 
+    let shutdown_request = serde_json::json!({"op": "host.shutdown"});
     let first_corr = first
-        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .control(&shutdown_request)
         .await
         .expect("first shutdown");
     let second_corr = second
-        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .control(&shutdown_request)
         .await
         .expect("second shutdown");
+    {
+        let (released, changed) = &*response_release;
+        *released.lock().expect("response gate lock") = true;
+        changed.notify_all();
+    }
 
     // Each request correlation must receive exactly one non-ping terminal.
-    for (client, corr) in [(&mut first, first_corr), (&mut second, second_corr)] {
+    for (requester, client, corr) in [
+        ("first", &mut first, first_corr),
+        ("second", &mut second, second_corr),
+    ] {
         let (skipped, response) = client
             .frames_until_corr(corr, BUDGET)
             .await
-            .expect("each requester settles");
+            .unwrap_or_else(|error| panic!("{requester} requester settles: {error}"));
         assert_eq!(response.ty, TY_RESPONSE);
         assert_eq!(response.json()["op"], "host.shutdown");
         let trailing = client.drain_until_close(BUDGET).await;
@@ -1584,7 +1611,7 @@ async fn shutdown_requires_authentication_and_a_valid_shape() {
 
     let mut raw = raw_client::connect_unauthenticated(&host.info)
         .await
-        .expect("tcp connect");
+        .expect("setup socket connect");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let frame = {
         let body = br#"{"op":"host.shutdown"}"#;
@@ -1603,9 +1630,12 @@ async fn shutdown_requires_authentication_and_a_valid_shape() {
     let mut byte = [0u8; 1];
     let read = tokio::time::timeout(BUDGET, raw.read(&mut byte))
         .await
-        .expect("the failed handshake closes within its deadline")
-        .expect("read");
-    assert_eq!(read, 0, "no byte may reach an unauthenticated socket");
+        .expect("the failed handshake closes within its deadline");
+    assert!(
+        matches!(read, Ok(0))
+            || matches!(read, Err(ref error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+        "no byte may reach an unauthenticated socket: {read:?}"
+    );
     drop(raw);
 
     let mut client = host.client().await;
@@ -1651,7 +1681,7 @@ async fn probe_observes_running_then_stopped_across_an_incarnation() {
     assert_eq!(observed.state, mc_host::LifecycleState::Running);
     assert!(!observed.instance_lock_free);
     let summary = observed.publication.expect("publication summary");
-    assert_eq!(summary.port, host.info.port);
+    assert!(std::path::Path::new(&summary.setup_socket).is_absolute());
 
     let mut client = host.client().await;
     let corr = client
@@ -1675,61 +1705,12 @@ async fn probe_observes_running_then_stopped_across_an_incarnation() {
     );
 }
 
-/// Host shutdown interrupts mid-activation setup, releasing both channels, registry membership, its connection permit, and its task.
-/// shutdown result.
-#[tokio::test]
-async fn shutdown_during_candidate_setup_reaps_both_channels() {
-    use support::fake_transport::{FakeProvider, RawCandidate, FAKE_TRANSPORT};
+// --- stable coordination fences (plan U1) ---
 
-    let (provider, mut peers) = FakeProvider::install(1, serde_json::json!({}), 64 * 1024);
-    let registry = FakeProvider::registry(&provider);
-    let host = TestHost::start_with(move |config| {
-        config.transport_providers = registry;
-        // Shutdown must interrupt setup rather than wait for the deadline.
-        config.timing.transport_setup_deadline = Duration::from_secs(30);
-    })
-    .await;
-
-    let mut client = host.setup_client().await;
-    let corr = client
-        .control(&serde_json::json!({
-            "op": "transport.negotiate",
-            "negotiation_version": 1,
-            "offers": [
-                {"transport": FAKE_TRANSPORT, "capability_version": 1},
-                {"transport": "tcp", "capability_version": 1}
-            ]
-        }))
-        .await
-        .expect("send negotiation");
-    let grant = client.frame_within(BUDGET).await.expect("grant response");
-    assert_eq!(grant.corr, corr);
-    let token = grant.json()["activation_token"]
-        .as_str()
-        .expect("token")
-        .to_owned();
-    let peer = peers.recv().await.expect("candidate peer");
-    let mut candidate = RawCandidate::new(peer);
-    let activate = format!(
-        r#"{{"op":"transport.activate","negotiation_version":1,"activation_token":"{token}"}}"#
-    );
-    candidate
-        .send_frame(TY_REQUEST, FLAGS_INTERACTIVE, 0, 0, 1, activate.as_bytes())
-        .await
-        .expect("send activate");
-    let response = candidate
-        .frame_within(BUDGET)
-        .await
-        .expect("activation response");
-    assert_eq!((response.ty, response.corr), (TY_RESPONSE, 1));
-
-    // The shutdown request arrives after activation and before commit.
-    host.shutdown().await.expect("graceful shutdown");
-    assert!(candidate.closed_within(BUDGET).await);
-    assert!(client.closed_within(BUDGET).await);
-}
-
-/// Replacing the managed `cortexkit` subtree isolates descriptor-owned evidence, but the stable lifetime fence keeps probes `wedged` and blocks successors until teardown.
+/// Replacing the whole managed `cortexkit` subtree while a host serves leaves
+/// its descriptor-owned evidence isolated, but the stable lifetime fence still
+/// names the live incarnation: probes report `wedged`, never `stopped`, and a
+/// successor cannot start until the first daemon fully tears down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replaced_cortexkit_subtree_cannot_admit_an_overlapping_incarnation() {
     let data_root = tempfile::tempdir().expect("temp root");

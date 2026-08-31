@@ -9,6 +9,8 @@ pub mod harness;
 pub mod lease;
 pub mod lifecycle;
 pub mod profile;
+/// Setup-handshake proof transcript shared by both peers.
+pub mod setup_auth;
 
 pub use arena::{MAX_FRAME_BYTES, MIN_ARENA_BYTES};
 pub use descriptor::{Incarnation, ReleaseIdentity, WIRE_V2_HEADER_BYTES};

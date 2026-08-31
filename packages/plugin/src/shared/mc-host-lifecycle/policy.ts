@@ -14,6 +14,8 @@
  */
 
 import type { AuthenticatedPeer, CatalogEntry } from "../mc-host-client";
+import { classifySharedMemoryFailure } from "../mc-host-client/shared-memory-failure";
+import type { SharedMemoryDiagnostics, SharedMemoryResourceCounts } from "../mc-host-client/types";
 import { checkPlatform, type LifecycleFailureReason, type PlatformReaders } from "./bootstrap";
 import {
     COMPATIBILITY_STAGES,
@@ -87,6 +89,16 @@ export interface CompatibilitySnapshot {
 
 export interface ObservationalHealth extends CompatibilitySnapshot {
     readiness: DaemonReadiness;
+    /** Present when `host.status` completed and returned ring diagnostics. */
+    sharedMemory?: SharedMemoryDiagnostics;
+}
+
+/** Thrown after ring attachment and authentication when a control probe fails. */
+export class ReadinessProbeControlError extends Error {
+    constructor(cause: unknown) {
+        super("readiness control probe failed", { cause });
+        this.name = "ReadinessProbeControlError";
+    }
 }
 
 function compatibilityInput(snapshot: CompatibilitySnapshot): CompatibilityInput {
@@ -190,6 +202,7 @@ function localResult(
                 ? { stop_committed: false, start_committed: false }
                 : null,
         readiness: null,
+        shared_memory: null,
         checks: [],
         versions: {
             release: releaseContract.release.version,
@@ -714,15 +727,39 @@ export class McHostLifecyclePolicy {
             let observed: ObservationalHealth;
             try {
                 observed = await this.readinessProbe(remaining);
-            } catch {
-                return relabeled;
+            } catch (error) {
+                if (error instanceof ReadinessProbeControlError) return relabeled;
+                const failed: DaemonCheck = {
+                    id: "readiness.shared_memory",
+                    status: "fail",
+                    reason: "native_probe_unavailable",
+                    remediation: remediationForReason("native_probe_unavailable"),
+                };
+                return {
+                    ...relabeled,
+                    ok: false,
+                    reason: failed.reason,
+                    remediation: failed.remediation,
+                    readiness: {
+                        shared_memory: {
+                            state: "unavailable",
+                            reason: failed.reason,
+                        },
+                    },
+                    shared_memory: terminalSharedMemoryDiagnostics(
+                        classifySharedMemoryFailure(error),
+                    ),
+                    checks: [...relabeled.checks, failed].sort((left, right) =>
+                        left.id.localeCompare(right.id),
+                    ),
+                };
             }
             const { result: compatible } = this.applyCompatibility(relabeled, observed);
             const checksById = new Map(
                 compatible.checks.map((check) => [check.id, check] as const),
             );
             const addCheck = (
-                id: "readiness.transport" | "readiness.storage" | "readiness.synapse",
+                id: "readiness.shared_memory" | "readiness.storage" | "readiness.synapse",
                 record: NonNullable<DaemonReadiness[keyof DaemonReadiness]>,
             ): void => {
                 const status =
@@ -738,8 +775,8 @@ export class McHostLifecyclePolicy {
                     remediation: remediationForReason(record.reason),
                 });
             };
-            if (observed.readiness.transport) {
-                addCheck("readiness.transport", observed.readiness.transport);
+            if (observed.readiness.shared_memory) {
+                addCheck("readiness.shared_memory", observed.readiness.shared_memory);
             }
             if (observed.readiness.storage) {
                 addCheck("readiness.storage", observed.readiness.storage);
@@ -750,9 +787,12 @@ export class McHostLifecyclePolicy {
             const checks = [...checksById.values()].sort((left, right) =>
                 left.id.localeCompare(right.id),
             );
-            // The v1 result requires lexicographically sorted unique check IDs.
-            // The reported reason uses the failure-reason precedence list, not check-ID order.
-            // A lower-precedence readiness failure cannot mask a higher-precedence failure.
+            // The check list is ordered by id because the v1 result requires
+            // lexicographically sorted unique check ids. The reported reason is
+            // NOT that order: the release contract ships one precedence list for
+            // failing reasons, and a lower-precedence readiness failure must
+            // never mask a higher-precedence one just because its check id
+            // sorts earlier (`readiness.shared_memory` before `readiness.storage`).
             checks.sort((left, right) => left.id.localeCompare(right.id));
             const failed = checks
                 .filter((check) => check.status === "fail")
@@ -769,6 +809,7 @@ export class McHostLifecyclePolicy {
                 reason: failed?.reason ?? "healthy",
                 remediation: failed?.remediation ?? null,
                 readiness: observed.readiness,
+                shared_memory: observed.sharedMemory ?? null,
                 checks,
             };
         } catch (error) {
@@ -884,4 +925,24 @@ export class McHostLifecyclePolicy {
         }
         return localResult(command, false, state, "internal_error");
     }
+}
+
+function terminalSharedMemoryDiagnostics(
+    errorClass: SharedMemoryDiagnostics["error_class"],
+): SharedMemoryDiagnostics {
+    return {
+        state: "terminal",
+        error_class: errorClass,
+        artifact: {
+            profile: "mc-host-test-ring-v1",
+            wire_version: 2,
+            descriptor_schema: 2,
+        },
+        bounds: null,
+        accounting: null,
+        activation: { completed: 0 },
+        peer_death: { observed: errorClass === "peer_death" ? 1 : 0 },
+        reclamation: { completed: 0 },
+        exhaustion: { observed: errorClass === "resource_exhaustion" ? 1 : 0 },
+    };
 }

@@ -7,45 +7,28 @@ import {
 } from "./project-security";
 
 describe("stripUnsafeProjectConfigFields", () => {
-    it("strips auto_update from project config", () => {
-        const raw: Record<string, unknown> = { auto_update: false, dreamer: { model: "x" } };
+    // Each row plants one user-tier-only field in a project config and proves
+    // the strip removes exactly that key, preserves siblings, and warns on it.
+    it.each([
+        ["strips auto_update from project config", "auto_update", false],
+        [
+            "strips fail_closed_blocking from project config (user-tier only)",
+            "fail_closed_blocking",
+            false,
+        ],
+        [
+            "strips allow_home_project from project config (user-tier only)",
+            "allow_home_project",
+            true,
+        ],
+        ["strips output_reserve from project config", "output_reserve", 0],
+        ["strips language from project config", "language", "tr"],
+    ] as Array<[string, string, unknown]>)("%s", (_title, field, value) => {
+        const raw: Record<string, unknown> = { [field]: value, dreamer: { model: "x" } };
         const warnings = stripUnsafeProjectConfigFields(raw);
-        expect("auto_update" in raw).toBe(false);
+        expect(field in raw).toBe(false);
         expect(raw.dreamer).toEqual({ model: "x" });
-        expect(warnings.some((w) => w.includes("auto_update"))).toBe(true);
-    });
-
-    it("strips fail_closed_blocking from project config (user-tier only)", () => {
-        const raw: Record<string, unknown> = {
-            fail_closed_blocking: false,
-            dreamer: { model: "x" },
-        };
-        const warnings = stripUnsafeProjectConfigFields(raw);
-        expect("fail_closed_blocking" in raw).toBe(false);
-        expect(raw.dreamer).toEqual({ model: "x" });
-        expect(warnings.some((w) => w.includes("fail_closed_blocking"))).toBe(true);
-    });
-
-    it("strips allow_home_project from project config (user-tier only)", () => {
-        const raw: Record<string, unknown> = {
-            allow_home_project: true,
-            dreamer: { model: "x" },
-        };
-        const warnings = stripUnsafeProjectConfigFields(raw);
-        expect("allow_home_project" in raw).toBe(false);
-        expect(raw.dreamer).toEqual({ model: "x" });
-        expect(warnings.some((w) => w.includes("allow_home_project"))).toBe(true);
-    });
-
-    it("strips output_reserve from project config", () => {
-        const raw: Record<string, unknown> = {
-            output_reserve: 0,
-            dreamer: { model: "x" },
-        };
-        const warnings = stripUnsafeProjectConfigFields(raw);
-        expect("output_reserve" in raw).toBe(false);
-        expect(raw.dreamer).toEqual({ model: "x" });
-        expect(warnings.some((w) => w.includes("output_reserve"))).toBe(true);
+        expect(warnings.some((w) => w.includes(field))).toBe(true);
     });
 
     it("strips prompt-surface text overrides but keeps project routing", () => {
@@ -66,14 +49,6 @@ describe("stripUnsafeProjectConfigFields", () => {
         });
         expect(warnings).toHaveLength(1);
         expect(warnings[0]).toContain("prompt_surface.guidance_override_path/tool_descriptions");
-    });
-
-    it("strips language from project config", () => {
-        const raw: Record<string, unknown> = { language: "tr", dreamer: { model: "x" } };
-        const warnings = stripUnsafeProjectConfigFields(raw);
-        expect("language" in raw).toBe(false);
-        expect(raw.dreamer).toEqual({ model: "x" });
-        expect(warnings.some((w) => w.includes("language"))).toBe(true);
     });
 
     it("allows project transform_mode while still stripping project subc routing", () => {

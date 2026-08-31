@@ -77,6 +77,12 @@ const pool: PoolDescriptor = {
     ],
 };
 
+// The fixture repository an observed mapping path is resolved against: a root, and
+// the paths it tracks. The scorers resolve against this the way production resolves
+// against the session directory and `git ls-files`.
+const FIXTURE_ROOT = "/fixture-worktree";
+const tracked = { root: FIXTURE_ROOT, files: [...new Set(pool.claims.flatMap((claim) => claim.files))] };
+
 const verifyGold = { kind: "verify" as const, claims: [
     {
         claimId: "claim-true",
@@ -142,8 +148,13 @@ export function exitCodeForScore(result: ManifestScore): 0 | 1 | 2 {
             bunVersion: "test",
             opencodeVersion: "test",
             modelId: "test/model",
+            platform: "linux",
             parserImpl: "ts",
+            pluginEntry: "src",
+            runtimeDigest: "d".repeat(64),
         },
+        trackedFiles: [],
+        fixtureRoot: "/fixture-worktree",
         poolBefore: [],
         poolAfter: [],
         rawManifest: null,
@@ -154,16 +165,138 @@ export function exitCodeForScore(result: ManifestScore): 0 | 1 | 2 {
 
 describe("dreamer manifest scorers", () => {
     test("correct verify, map, and classify manifests pass", () => {
-        expect(scoreVerifyManifest(correctVerify, pool, verifyGold)).toMatchObject({ stage: "scored", status: "PASS" });
-        expect(scoreMapManifest(correctMap, pool, mapGold)).toMatchObject({ stage: "scored", status: "PASS" });
+        expect(scoreVerifyManifest(correctVerify, pool, verifyGold, tracked)).toMatchObject({ stage: "scored", status: "PASS" });
+        expect(scoreMapManifest(correctMap, pool, mapGold, tracked)).toMatchObject({ stage: "scored", status: "PASS" });
         expect(scoreClassifyManifest(correctClassify, pool, classifyGold)).toMatchObject({ stage: "scored", status: "PASS" });
+    });
+
+    test("a case variant of a tracked path scores as the tracked path", () => {
+        // gitTrackedPath falls back to a case-insensitive match and
+        // normalizeVerificationFiles stores the tracked spelling, so production
+        // applies exactly the gold mapping for this manifest.
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="SRC/CACHE.ts,src/config.ts"'),
+                pool,
+                mapGold, tracked,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
+        expect(
+            scoreVerifyManifest(
+                correctVerify.replace('<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/>', '<verified claim="mcm_true" files="SRC/CACHE.ts,src/config.ts"/>'),
+                pool,
+                verifyGold, tracked,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
+    });
+
+    test("an absolute path inside the fixture resolves to its tracked path", () => {
+        // normalizeVerificationFiles resolves the candidate against the session
+        // directory and converts it back with path.relative, so production accepts
+        // this and stores src/cache.ts.
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', `files="${FIXTURE_ROOT}/src/cache.ts,src/config.ts"`),
+                pool,
+                mapGold,
+                tracked,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
+        // One that resolves outside the fixture is skipped by production, not
+        // resolved inward, so it must not bind to a tracked path.
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="/elsewhere/src/cache.ts,src/config.ts"'),
+                pool,
+                mapGold,
+                tracked,
+            ),
+        ).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-mapping" });
+    });
+
+    test("a dotted filename's absolute path is not read as an escape", () => {
+        // path.relative returns `..config` for this, which is a legitimate tracked
+        // name rather than an escape — production only refuses `../`.
+        const dotted = {
+            root: FIXTURE_ROOT,
+            files: [...tracked.files, "..config"],
+        };
+        const poolWithDotted = {
+            ...pool,
+            claims: pool.claims.map((claim) =>
+                claim.claimId === "claim-true" ? { ...claim, files: ["..config"] } : claim,
+            ),
+        };
+        const goldWithDotted = {
+            ...mapGold,
+            claims: mapGold.claims.map((entry) =>
+                entry.claimId === "claim-true" ? { ...entry, files: ["..config"] } : entry,
+            ),
+        };
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', `files="${FIXTURE_ROOT}/..config"`),
+                poolWithDotted,
+                goldWithDotted,
+                dotted,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
+    });
+
+    test("a case collision resolves to the first tracked spelling, as production does", () => {
+        // gitTrackedPath takes the first case-insensitive match from ls-files order
+        // instead of skipping an ambiguous path, so a third casing still applies.
+        const colliding = {
+            root: FIXTURE_ROOT,
+            files: ["src/cache.ts", "SRC/cache.ts", "src/config.ts", "src/queue.ts"],
+        };
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="Src/Cache.ts,src/config.ts"'),
+                pool,
+                mapGold,
+                colliding,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
+    });
+
+    test("an untracked extra path is dropped, a tracked one is not", () => {
+        // normalizeVerificationFiles skips a path it cannot bind to a tracked
+        // file, so the applied mapping is exactly gold and the run passes.
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="src/cache.ts,src/config.ts,docs/notes.md"'),
+                pool,
+                mapGold,
+                tracked,
+            ),
+        ).toMatchObject({ stage: "scored", status: "PASS" });
+        // A tracked extra IS applied, so the mapping really differs from gold.
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="src/cache.ts,src/config.ts,src/queue.ts"'),
+                pool,
+                mapGold,
+                tracked,
+            ),
+        ).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-mapping" });
+    });
+
+    test("a case variant matching no tracked path still fails", () => {
+        expect(
+            scoreMapManifest(
+                correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="SRC/MISSING.ts,src/config.ts"'),
+                pool,
+                mapGold, tracked,
+            ),
+        ).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-mapping" });
     });
 
     test("wrong archival of a gold-true claim is run-fatal", () => {
         const result = scoreVerifyManifest(
             correctVerify.replace('<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/>', '<archive claim="mcm_true" reason="wrong"/>'),
             pool,
-            verifyGold,
+            verifyGold, tracked,
         );
         expect(result).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-archival", runFatal: true });
         expect(exitCodeForScore(result)).toBe(2);
@@ -174,14 +307,14 @@ describe("dreamer manifest scorers", () => {
             scoreVerifyManifest(
                 correctVerify.replace('<archive claim="mcm_false" reason="queue removed"/>', '<verified claim="mcm_false" files="src/queue.ts"/>'),
                 pool,
-                verifyGold,
+                verifyGold, tracked,
             ),
         ).toMatchObject({ status: "FAIL", reason: "missed-archival", runFatal: false });
         expect(
             scoreVerifyManifest(
                 correctVerify.replace('<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/>', '<update claim="mcm_true" files="src/cache.ts,src/config.ts">still true</update>'),
                 pool,
-                verifyGold,
+                verifyGold, tracked,
             ),
         ).toMatchObject({ status: "FAIL", reason: "wrong-verdict", runFatal: false });
     });
@@ -194,8 +327,8 @@ describe("dreamer manifest scorers", () => {
             kind: "verify" as const,
             claims: [...verifyGold.claims].reverse() satisfies VerifyGoldClaim[],
         };
-        expect(scoreVerifyManifest(manifest, pool, verifyGold)).toMatchObject({ reason: "missed-archival" });
-        expect(scoreVerifyManifest(manifest, pool, reordered)).toMatchObject({ reason: "missed-archival" });
+        expect(scoreVerifyManifest(manifest, pool, verifyGold, tracked)).toMatchObject({ reason: "missed-archival" });
+        expect(scoreVerifyManifest(manifest, pool, reordered, tracked)).toMatchObject({ reason: "missed-archival" });
     });
 
     test("a narrowed backing set on a retained claim is a wrong mapping", () => {
@@ -203,24 +336,24 @@ describe("dreamer manifest scorers", () => {
             scoreVerifyManifest(
                 correctVerify.replace('<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/>', '<verified claim="mcm_true" files="src/cache.ts"/>'),
                 pool,
-                verifyGold,
+                verifyGold, tracked,
             ),
         ).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-mapping", runFatal: false });
         expect(
             scoreVerifyManifest(
                 correctVerify.replace('<update claim="mcm_update" files="src/cache.ts">', '<update claim="mcm_update" files="src/other.ts">'),
                 pool,
-                verifyGold,
+                verifyGold, tracked,
             ),
         ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
     });
 
     test("update anchors are case-insensitive and reject missing or stale content", () => {
         expect(
-            scoreVerifyManifest(correctVerify.replace("4096 ENTRIES", "8192 entries"), pool, verifyGold),
+            scoreVerifyManifest(correctVerify.replace("4096 ENTRIES", "8192 entries"), pool, verifyGold, tracked),
         ).toMatchObject({ status: "FAIL", reason: "wrong-update-content" });
         expect(
-            scoreVerifyManifest(correctVerify.replace("4096 ENTRIES.", "4096 entries; formerly 2048 entries."), pool, verifyGold),
+            scoreVerifyManifest(correctVerify.replace("4096 ENTRIES.", "4096 entries; formerly 2048 entries."), pool, verifyGold, tracked),
         ).toMatchObject({ status: "FAIL", reason: "wrong-update-content" });
     });
 
@@ -235,13 +368,13 @@ describe("dreamer manifest scorers", () => {
             ) satisfies VerifyGoldClaim[],
         };
         const updateEntry = '<update claim="mcm_update" files="src/cache.ts">Uses a BOUNDED CACHE with 4096 ENTRIES.</update>';
-        expect(scoreVerifyManifest(correctVerify, pool, gold)).toMatchObject({ stage: "scored", status: "PASS" });
+        expect(scoreVerifyManifest(correctVerify, pool, gold, tracked)).toMatchObject({ stage: "scored", status: "PASS" });
         for (const body of ["", "   \n  ", "x".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH + 1)]) {
             expect(
                 scoreVerifyManifest(
                     correctVerify.replace(updateEntry, `<update claim="mcm_update" files="src/cache.ts">${body}</update>`),
                     pool,
-                    gold,
+                    gold, tracked,
                 ),
             ).toMatchObject({ stage: "scored", status: "FAIL", reason: "wrong-update-content" });
         }
@@ -252,17 +385,17 @@ describe("dreamer manifest scorers", () => {
                     `<update claim="mcm_update" files="src/cache.ts">${"x".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH)}</update>`,
                 ),
                 pool,
-                gold,
+                gold, tracked,
             ),
         ).toMatchObject({ stage: "scored", status: "PASS" });
     });
 
     test("mapping compares file sets and independence separately", () => {
         expect(
-            scoreMapManifest(correctMap.replace('files="src/cache.ts,src/config.ts"', 'independent="true"'), pool, mapGold),
+            scoreMapManifest(correctMap.replace('files="src/cache.ts,src/config.ts"', 'independent="true"'), pool, mapGold, tracked),
         ).toMatchObject({ status: "FAIL", reason: "wrong-independence" });
         expect(
-            scoreMapManifest(correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="src/cache.ts"'), pool, mapGold),
+            scoreMapManifest(correctMap.replace('files="src/cache.ts,src/config.ts"', 'files="src/cache.ts"'), pool, mapGold, tracked),
         ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
     });
 
@@ -333,7 +466,7 @@ describe("dreamer manifest scorers", () => {
 <update claim="mcm_update" files="src/cache.ts">one shared body</update>
 <archive claim="mcm_false" reason="queue removed"/>
 </verify>`;
-        expect(scoreVerifyManifest(converging, pool, twoUpdates)).toMatchObject({
+        expect(scoreVerifyManifest(converging, pool, twoUpdates, tracked)).toMatchObject({
             status: "FAIL",
             reason: "wrong-update-content",
         });
@@ -342,14 +475,15 @@ describe("dreamer manifest scorers", () => {
             '<update claim="mcm_update" files="src/cache.ts">one shared body</update>',
             '<update claim="mcm_update" files="src/cache.ts">another shared body</update>',
         );
-        expect(scoreVerifyManifest(distinct, pool, twoUpdates)).toMatchObject({ status: "PASS", reason: null });
-        // A later update may use an identity that an earlier update in the same batch vacated.
+        expect(scoreVerifyManifest(distinct, pool, twoUpdates, tracked)).toMatchObject({ status: "PASS", reason: null });
+        // An update may take an identity an earlier update in the same batch
+        // vacated, which a snapshot-only check would have refused.
         const handoff = `<verify>
 <update claim="mcm_true" files="src/cache.ts,src/config.ts">shared moved along</update>
 <update claim="mcm_update" files="src/cache.ts">The cache limit is 4096 entries.  shared</update>
 <archive claim="mcm_false" reason="queue removed"/>
 </verify>`;
-        expect(scoreVerifyManifest(handoff, pool, twoUpdates)).toMatchObject({ status: "PASS", reason: null });
+        expect(scoreVerifyManifest(handoff, pool, twoUpdates, tracked)).toMatchObject({ status: "PASS", reason: null });
     });
 
     test("an update colliding with another live claim is not appliable", () => {
@@ -366,7 +500,7 @@ describe("dreamer manifest scorers", () => {
             "Uses a BOUNDED CACHE with 4096 ENTRIES.",
             "  the REMOVED QUEUE still exists.  ",
         );
-        expect(scoreVerifyManifest(collision, pool, collidingGold)).toMatchObject({
+        expect(scoreVerifyManifest(collision, pool, collidingGold, tracked)).toMatchObject({
             status: "FAIL",
             reason: "wrong-update-content",
         });
@@ -377,7 +511,7 @@ describe("dreamer manifest scorers", () => {
                 claim.claimId === "claim-false" ? { ...claim, lifecycleState: "archived" as const } : claim,
             ),
         };
-        expect(scoreVerifyManifest(collision, archivedSibling, collidingGold)).toMatchObject({
+        expect(scoreVerifyManifest(collision, archivedSibling, collidingGold, tracked)).toMatchObject({
             status: "PASS",
             reason: null,
         });
@@ -386,23 +520,23 @@ describe("dreamer manifest scorers", () => {
     test("a canonicalizable alias of a gold path scores as that path", () => {
         // Production resolves a manifest path before matching it to a tracked file.
         expect(
-            scoreVerifyManifest(correctVerify.replace("src/cache.ts,src/config.ts", "src/./cache.ts,src/sub/../config.ts"), pool, verifyGold),
+            scoreVerifyManifest(correctVerify.replace("src/cache.ts,src/config.ts", "src/./cache.ts,src/sub/../config.ts"), pool, verifyGold, tracked),
         ).toMatchObject({ status: "PASS", reason: null });
         expect(
-            scoreMapManifest(correctMap.replace("src/cache.ts,src/config.ts", "src/./cache.ts,src/sub/../config.ts"), pool, mapGold),
+            scoreMapManifest(correctMap.replace("src/cache.ts,src/config.ts", "src/./cache.ts,src/sub/../config.ts"), pool, mapGold, tracked),
         ).toMatchObject({ status: "PASS", reason: null });
         // Production drops paths that leave the project instead of resolving them to tracked paths.
         expect(
-            scoreMapManifest(correctMap.replace("src/cache.ts", "../src/cache.ts"), pool, mapGold),
+            scoreMapManifest(correctMap.replace("src/cache.ts", "../src/cache.ts"), pool, mapGold, tracked),
         ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
         expect(
-            scoreMapManifest(correctMap.replace("src/cache.ts", "/src/cache.ts"), pool, mapGold),
+            scoreMapManifest(correctMap.replace("src/cache.ts", "/src/cache.ts"), pool, mapGold, tracked),
         ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
         // Production uses platform-specific path separators.
         // On POSIX, backslashes are ordinary filename characters; production drops the resulting untracked path.
         if (sep === "/") {
             expect(
-                scoreMapManifest(correctMap.replace("src/cache.ts", "src\\cache.ts"), pool, mapGold),
+                scoreMapManifest(correctMap.replace("src/cache.ts", "src\\cache.ts"), pool, mapGold, tracked),
             ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
         }
     });
@@ -414,7 +548,7 @@ describe("dreamer manifest scorers", () => {
             correctVerify.replace("mcm_true", "mcm_unknown"),
             correctVerify.replace("</verify>", '<verified claim="mcm_true" files="src/cache.ts,src/config.ts"/></verify>'),
         ]) {
-            expect(scoreVerifyManifest(manifest, pool, verifyGold)).toMatchObject({
+            expect(scoreVerifyManifest(manifest, pool, verifyGold, tracked)).toMatchObject({
                 stage: "validation-rejected",
                 status: "FAIL",
                 reason: "invalid-output",
@@ -424,7 +558,7 @@ describe("dreamer manifest scorers", () => {
 
     test("production infra predicates run before model-quality scoring", () => {
         const lengthCapped = [{ finish_reason: "length" }];
-        expect(scoreVerifyManifest(correctVerify, pool, verifyGold, { messages: lengthCapped })).toMatchObject({
+        expect(scoreVerifyManifest(correctVerify, pool, verifyGold, tracked, { messages: lengthCapped })).toMatchObject({
             stage: "infra-rejected",
             status: "ERROR",
             reason: "output-length-capped",
@@ -439,17 +573,17 @@ describe("dreamer manifest scorers", () => {
                 tokens: { output: 8, reasoning: 0 },
             },
         }];
-        expect(scoreVerifyManifest("provider outage", pool, verifyGold, { messages: providerCompletion })).toMatchObject({
+        expect(scoreVerifyManifest("provider outage", pool, verifyGold, tracked, { messages: providerCompletion })).toMatchObject({
             stage: "infra-rejected",
             status: "ERROR",
             reason: "provider-failure",
         });
-        expect(scoreVerifyManifest("provider outage", pool, verifyGold)).toMatchObject({
+        expect(scoreVerifyManifest("provider outage", pool, verifyGold, tracked)).toMatchObject({
             stage: "validation-rejected",
             status: "FAIL",
             reason: "invalid-output",
         });
-        expect(scoreVerifyManifest("", pool, verifyGold)).toMatchObject({
+        expect(scoreVerifyManifest("", pool, verifyGold, tracked)).toMatchObject({
             stage: "infra-rejected",
             status: "ERROR",
             reason: "provider-failure",

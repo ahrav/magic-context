@@ -18,6 +18,7 @@ import {
     type TrustIndexEntry,
 } from "./bootstrap";
 import { releaseContract } from "./generated-contract";
+import { managedSubtreePath } from "./paths";
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const MAX_METADATA_BYTES = 1024 * 1024;
@@ -200,7 +201,7 @@ function selectEntry(
 }
 
 function bootstrapDir(dataRoot: string): string {
-    return join(dataRoot, "cortexkit", "mc-host-bootstrap", releaseContract.release.version);
+    return join(managedSubtreePath(dataRoot), "mc-host-bootstrap", releaseContract.release.version);
 }
 
 function retainedTarget(

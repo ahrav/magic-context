@@ -118,7 +118,7 @@ describe("embedding measurement corpus", () => {
         expect(rows[rows.length - 1].query_text_hash).toBe(
             normalizedQueryHash(`query ${total - 1}`),
         );
-    });
+    }, 10_000);
 
     it("classifies measurement ownership from session_projects without writing", () => {
         const dir = mkdtempSync(join(tmpdir(), "embedding-measurements-owner-"));

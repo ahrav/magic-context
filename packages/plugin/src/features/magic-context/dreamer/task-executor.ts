@@ -8,7 +8,10 @@ import {
 } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import type { DreamingTask } from "../../../config/schema/magic-context";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import {
+    childSessionMessagesFetcher,
+    createChildSessionWithFence,
+} from "../../../hooks/magic-context/child-session-spawn";
 import type { RawMessageProvider } from "../../../hooks/magic-context/read-session-chunk";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
@@ -514,6 +517,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             before: ReturnType<typeof censusProjectMemoryClaims>,
         ): DreamRunMemoryChanges | null {
             const after = censusProjectMemoryClaims(db, projectIdentity);
+            // Capture the exact changed ids — count === array length.
             // Claims are append-only, so deletedIds stays empty outside a reset;
             // "merged" reports newly retired claims (merge retires its sources).
             const writtenIds = newIds(before.ids, after.ids);
@@ -1088,15 +1092,12 @@ async function runRetrospectiveTask(
                     signal: abortController.signal,
                     fallbackModels: config.fallbackModels,
                     callContext: "dreamer:retrospective",
-                    fetchOutput: async () => {
-                        const messagesResponse = await deps.client.session.messages({
-                            path: { id: sessionId },
-                            query: { directory: deps.sessionDirectory, limit: 50 },
-                        });
-                        return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                            preferResponseOnMissingData: true,
-                        });
-                    },
+                    fetchOutput: childSessionMessagesFetcher(
+                        deps.client,
+                        sessionId,
+                        deps.sessionDirectory,
+                        50,
+                    ),
                     validateOutput: (outputMessages) => {
                         const text = extractLatestAssistantText(outputMessages);
                         if (!text) throw new Error("Retrospective child returned no output.");
@@ -1361,15 +1362,7 @@ async function runAgenticTask(
                 signal: abortController.signal,
                 fallbackModels: config.fallbackModels,
                 callContext: `dreamer:${task}`,
-                fetchOutput: async () => {
-                    const messagesResponse = await deps.client.session.messages({
-                        path: { id: sessionId },
-                        query: { directory: docsDir, limit: 50 },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
+                fetchOutput: childSessionMessagesFetcher(deps.client, sessionId, docsDir, 50),
                 validateOutput: (messages) => {
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("Dreamer returned no assistant output.");

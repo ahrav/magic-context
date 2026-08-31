@@ -2,10 +2,6 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { resolveCortexKitUserConfigPath } from "@magic-context/core/config/migrate-config-location";
-import {
-    getMagicContextHistorianDir as getMagicContextHistorianDirCore,
-    getMagicContextLogPath as getMagicContextLogPathCore,
-} from "@magic-context/core/shared/data-path";
 import type { HarnessId } from "@magic-context/core/shared/harness";
 
 // ============================================================================
@@ -114,12 +110,7 @@ export function getPiAgentDir(): string {
     return join(envFirstHomeDir(), ".pi", "agent");
 }
 
-/* */
-export function getPiAgentConfigDir(): string {
-    return getPiAgentDir();
-}
-
-/* */
+/** Pi session JSONL root (`<agentDir>/sessions`). */
 export function getPiSessionsRoot(): string {
     return join(getPiAgentDir(), "sessions");
 }
@@ -129,8 +120,8 @@ export function getPiCacheRoot(): string {
     return join(dirname(getPiAgentDir()), "cache");
 }
 
-/** Magic Context stores its shared user config independently of the Pi agent settings directory. */
-export function getPiUserConfigPath(): string {
+/** Shared Magic Context user config, independent of any harness agent settings dir. */
+export function getSharedUserConfigPath(): string {
     return resolveCortexKitUserConfigPath();
 }
 
@@ -138,7 +129,7 @@ export function getPiUserConfigPath(): string {
  * Pi persists extension package sources in `settings.json`'s `packages` array.
  */
 export function getPiUserExtensionsPath(): string {
-    return join(getPiAgentConfigDir(), "settings.json");
+    return join(getPiAgentDir(), "settings.json");
 }
 
 // ============================================================================
@@ -255,23 +246,13 @@ export function getOmpPluginsLockPath(): string {
     return join(resolveOmpPaths().pluginsDir, "omp-plugins.lock.json");
 }
 
-/** OMP's Pi-compatible extension uses this shared Magic Context config. */
-export function getOmpUserConfigPath(): string {
-    return resolveCortexKitUserConfigPath();
-}
-
 // ============================================================================
 // ============================================================================
 
-/** The harness stores plugin logs under its scoped temp directory. */
-export function getMagicContextLogPath(harness: HarnessId): string {
-    return getMagicContextLogPathCore(harness);
-}
-
-/** Historian stores dumps and state files under the harness-scoped temp directory. */
-export function getMagicContextHistorianDir(harness: HarnessId): string {
-    return getMagicContextHistorianDirCore(harness);
-}
+export {
+    getMagicContextHistorianDir,
+    getMagicContextLogPath,
+} from "@magic-context/core/shared/data-path";
 
 /**
  * OpenCode stores installed plugin packages in this cache directory.

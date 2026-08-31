@@ -14,6 +14,7 @@ mc-core = { workspace = true }
 cortexkit-cache-core = { workspace = true }
 cortexkit-store = { workspace = true }
 cortexkit-store-types = { workspace = true }
+cortexkit-lease = { workspace = true }
 rusqlite = { workspace = true, features = ["functions"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,4 +26,6 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 test-support = []
 
 [dev-dependencies]
+# Self dev-dependency so integration tests see the `test-support` fixtures.
+mc-store = { path = ".", features = ["test-support"] }
 tempfile = "3"

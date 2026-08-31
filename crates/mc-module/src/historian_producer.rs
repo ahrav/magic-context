@@ -385,26 +385,6 @@ impl HistorianProducerError {
         self.heuristic_decision()
     }
 
-    pub fn is_retryable_model_failure(&self) -> bool {
-        if let Some(classification) = self.classification() {
-            return classification.class == ErrorClass::Transient;
-        }
-        if self.has_class_field() {
-            return false;
-        }
-        self.heuristic_decision().retryable_model_failure
-    }
-
-    pub fn is_abort_or_overflow(&self) -> bool {
-        if let Some(classification) = self.classification() {
-            return classification.class == ErrorClass::ContextOverflow;
-        }
-        if self.has_class_field() {
-            return false;
-        }
-        self.heuristic_decision().abort_or_overflow
-    }
-
     fn heuristic_decision(&self) -> DeprecatedHeuristicDecision {
         match self {
             Self::CleanupFailed {

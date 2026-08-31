@@ -523,7 +523,9 @@ export function seedApplicabilityBaselines(db: Database, nowMs: number): void {
 }
 
 /**
- * The migration validates foreign keys only for newly created tables.
+ * Targeted per-new-table foreign-key validation, so unrelated legacy
+ * corruption cannot turn
+ * this migration into a whole-database repair gate.
  */
 export function assertClaimApplicabilitySchemaForeignKeys(db: Database): void {
     const violations: string[] = [];
@@ -537,7 +539,11 @@ export function assertClaimApplicabilitySchemaForeignKeys(db: Database): void {
 }
 
 /**
- * The v85 replay guard checks the required non-table objects.
+ * Non-table objects `createClaimApplicabilitySchema` creates, absent from
+ * `sqlite_master`. Detects a database whose tables survived but whose view,
+ * indexes, or guard triggers did not (for example one created by an earlier
+ * draft of the schema). The name list below mirrors the DDL and must be
+ * updated together with it.
  */
 export function missingClaimApplicabilitySchemaObjects(db: Database): string[] {
     const required: Array<[type: string, name: string]> = [
@@ -590,6 +596,10 @@ export function missingClaimApplicabilitySchemaObjects(db: Database): string[] {
 }
 
 export function dropClaimApplicabilityObjectsForTests(db: Database): void {
+    // The observations.source_trust_class column cannot be dropped here, so
+    // callers must also drop and recreate `observations` before rerunning
+    // migrations; otherwise the v85 replay guard refuses the half-dropped
+    // shape.
     db.exec(`
         DROP VIEW IF EXISTS claim_revision_applicability_intervals;
         DROP TABLE IF EXISTS claim_revision_applicability_symbols;

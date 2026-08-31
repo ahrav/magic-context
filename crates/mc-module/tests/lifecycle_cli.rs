@@ -526,7 +526,7 @@ async fn full_dev_mode_lifecycle_roundtrip() {
     assert_result(&value, "start", true, "running", "started");
     assert_eq!(value["remediation"], Value::Null);
     assert_eq!(value["effects"], Value::Null);
-    assert_eq!(value["readiness"]["transport"]["state"], "ready");
+    assert_eq!(value["readiness"]["shared_memory"]["state"], "ready");
     assert_eq!(value["versions"]["proof"], "current");
     assert_eq!(value["versions"]["daemon"], "mc-host/0.1.0");
 

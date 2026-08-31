@@ -13,7 +13,7 @@ use rustix::fs::{
     flock, fsync, mkdirat, openat, renameat, unlinkat, AtFlags, FlockOperation, Mode, OFlags, CWD,
 };
 
-use crate::connection_file::{ConnectionInfo, Endpoint, DAEMON_ID_LEN, KEY_LEN, SCHEMA_VERSION};
+use crate::connection_file::{ConnectionInfo, DAEMON_ID_LEN, KEY_LEN, SCHEMA_VERSION};
 
 /// `CONNECTION_FILE_NAME` names the canonical publication file inside the runtime directory.
 pub const CONNECTION_FILE_NAME: &str = "subc-connection.json";
@@ -136,6 +136,11 @@ pub fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Instan
         path.is_absolute().then_some(path)
     }
     match data_dir_override {
+        // The setup socket path uses this directory; `ConnectionInfo::validate` rejects relative `setup_socket` paths.
+        Some(dir) if !dir.is_absolute() => Err(InstanceError::Insecure {
+            what: "data directory override is not absolute",
+            path: dir.to_path_buf(),
+        }),
         Some(dir) => Ok(dir.to_path_buf()),
         None => match std::env::var_os("XDG_DATA_HOME").and_then(absolute) {
             Some(dir) => Ok(dir),
@@ -150,14 +155,19 @@ pub fn data_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Instan
 /// The managed-subtree constant defines the only managed segment; every managed path derives from it so a rename cannot leave part of the tree behind.
 pub const MANAGED_DIR_NAME: &str = "cortexkit";
 
-/// The managed subtree at `${dataDir}/cortexkit` holds the runtime directory, lifecycle root, and module storage.
+/// The runtime-directory segment under the managed subtree, holding the
+/// publication and lock files.
+pub const RUNTIME_DIR_NAME: &str = "run";
+
+/// Resolves `${dataDir}/cortexkit`: the replaceable managed subtree that
+/// holds the runtime directory, the lifecycle root, and module storage.
 pub fn managed_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
     Ok(data_dir_path(data_dir_override)?.join(MANAGED_DIR_NAME))
 }
 
 /// order.
 pub fn runtime_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
-    Ok(managed_dir_path(data_dir_override)?.join("run"))
+    Ok(managed_dir_path(data_dir_override)?.join(RUNTIME_DIR_NAME))
 }
 
 /// An `InstanceGuard` represents one secured host incarnation.
@@ -176,8 +186,10 @@ pub struct InstanceGuard {
     launch_id: [u8; 16],
     payload_manifest_digest: String,
     publication: Option<PublicationIdentity>,
-    /// Declare the stable incarnation fence after `dir` so `dir` closes before the fence.
-    /// The lifetime fence outlives descriptor-relative cleanup.
+    setup_socket: Option<PathBuf>,
+    /// The stable incarnation fence, declared after `dir` so the runtime
+    /// lock releases first and the lifetime fence outlives every
+    /// descriptor-relative cleanup step.
     _lifetime: crate::lifecycle::LifetimeLock,
 }
 
@@ -243,6 +255,7 @@ impl InstanceGuard {
             launch_id,
             payload_manifest_digest: payload_manifest_digest.to_owned(),
             publication: None,
+            setup_socket: None,
             _lifetime: lifetime,
         })
     }
@@ -271,17 +284,25 @@ impl InstanceGuard {
         &self.dir_path
     }
 
-    /// `publish` atomically publishes the schema-1 connection file for this incarnation.
-    /// The owner-only `O_EXCL` temporary file and rename over the canonical name use the pinned directory descriptor.
-    /// Using the pinned directory descriptor keeps the rename on one filesystem and prevents link traversal.
-    pub fn publish(&mut self, port: u16, daemon_ver: &str) -> Result<(), InstanceError> {
+    pub(crate) fn register_setup_socket(&mut self, path: PathBuf) {
+        self.setup_socket = Some(path);
+    }
+
+    /// Atomically publishes the schema-1 connection file for this incarnation
+    /// (protocol §4.1, §4.2). The owner-only `O_EXCL` temp file and the rename
+    /// over the canonical name both stay relative to the pinned directory
+    /// descriptor, so the swap cannot cross filesystems or follow links.
+    pub fn publish(&mut self, setup_socket: &Path, daemon_ver: &str) -> Result<(), InstanceError> {
         let info = ConnectionInfo {
             schema: SCHEMA_VERSION,
             wire_version: crate::wire::PROTOCOL_VERSION,
-            endpoints: vec![Endpoint {
-                host: "127.0.0.1".to_owned(),
-                port,
-            }],
+            setup_socket: setup_socket
+                .to_str()
+                .ok_or_else(|| InstanceError::Insecure {
+                    what: "non-UTF-8 setup socket path",
+                    path: setup_socket.to_path_buf(),
+                })?
+                .to_owned(),
             key: self.key.0.to_vec(),
             daemon_id: self.daemon_id,
             pid: std::process::id(),
@@ -354,6 +375,11 @@ impl InstanceGuard {
 
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
+        if let Some(path) = self.setup_socket.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        // Idempotent: the graceful path already removed the publication and
+        // took the retained identity, making this a no-op. The same
         // best-effort identity checks run before unlink on the drop path.
         self.remove_publication();
         self.remove_lifecycle_record();
@@ -639,6 +665,10 @@ pub(crate) const S_IFDIR: u32 = 0o040000;
 pub(crate) const S_IFREG: u32 = 0o100000;
 pub(crate) const S_IFLNK: u32 = 0o120000;
 
+pub(crate) fn owner_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
     u32::from(stat.st_mode)
@@ -790,6 +820,8 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
     const TEST_DIGEST: &str = "3d7f9a1c5b2e8f0a6d4c7b9e1f3a5c8d2b4e6f0a1c3d5e7f9b0d2f4a6c8e0b1d";
@@ -876,7 +908,9 @@ mod tests {
     fn permissive_umask_still_yields_owner_only_dir_and_file() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(43123, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
 
         assert_eq!(mode_of(guard.dir_path()), 0o700);
         let file = published(&guard);
@@ -884,6 +918,21 @@ mod tests {
         let meta = std::fs::symlink_metadata(&file).expect("stat file");
         assert!(meta.file_type().is_file());
         assert_eq!(meta.uid(), rustix::process::geteuid().as_raw());
+    }
+
+    #[test]
+    fn publication_rejects_non_utf8_setup_socket_path() {
+        let root = temp_root();
+        let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/mc-host-\xff.sock".to_vec()));
+        assert!(matches!(
+            guard.publish(&path, "mc-host/test"),
+            Err(InstanceError::Insecure {
+                what: "non-UTF-8 setup socket path",
+                ..
+            })
+        ));
+        assert!(!published(&guard).exists());
     }
 
     #[test]
@@ -920,18 +969,25 @@ mod tests {
     }
 
     #[test]
-    fn publication_matches_schema_1_shape() {
+    fn publication_matches_schema_2_shape() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(43123, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
 
         let bytes = std::fs::read(published(&guard)).expect("read publication");
         let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
-        assert_eq!(json["schema"], 1);
+        assert_eq!(json["schema"], 2);
         assert_eq!(json["wire_version"], 2);
-        assert_eq!(json["endpoints"].as_array().expect("endpoints").len(), 1);
-        assert_eq!(json["endpoints"][0]["host"], "127.0.0.1");
-        assert_eq!(json["endpoints"][0]["port"], 43123);
+        assert_eq!(
+            json["setup_socket"],
+            guard
+                .dir_path()
+                .join("setup.sock")
+                .to_string_lossy()
+                .as_ref()
+        );
         assert_eq!(json["key"].as_array().expect("key").len(), 32);
         assert_eq!(json["daemon_id"].as_array().expect("daemon_id").len(), 16);
         assert_eq!(json["pid"], std::process::id());
@@ -943,7 +999,9 @@ mod tests {
         let root = temp_root();
         let mut first =
             InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("first acquire");
-        first.publish(1111, "mc-host/first").expect("publish");
+        first
+            .publish(&first.dir_path().join("setup.sock"), "mc-host/first")
+            .expect("publish");
         let before = std::fs::read(published(&first)).expect("read first");
 
         let err =
@@ -959,7 +1017,9 @@ mod tests {
         let root = temp_root();
         let mut first =
             InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("first acquire");
-        first.publish(1111, "mc-host/first").expect("publish");
+        first
+            .publish(&first.dir_path().join("setup.sock"), "mc-host/first")
+            .expect("publish");
         let before = std::fs::read(published(&first)).expect("read first");
 
         let moved = root.path().join("cortexkit").join("run-moved");
@@ -1040,7 +1100,9 @@ mod tests {
         std::fs::create_dir(dir.join(CONNECTION_FILE_NAME)).expect("plant directory");
 
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        assert!(guard.publish(4321, "mc-host/test").is_err());
+        assert!(guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .is_err());
         assert!(
             std::fs::symlink_metadata(dir.join(CONNECTION_FILE_NAME))
                 .expect("stat")
@@ -1061,7 +1123,9 @@ mod tests {
         symlink(&victim, dir.join(CONNECTION_FILE_NAME)).expect("plant symlink");
 
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(2222, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
 
         // rename(2) replaces the link itself, so the outside target is intact.
         assert_eq!(
@@ -1079,7 +1143,9 @@ mod tests {
     fn cleanup_removes_only_our_own_publication() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(3333, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         let file = published(&guard);
         assert!(file.exists());
         guard.remove_publication();
@@ -1090,7 +1156,9 @@ mod tests {
     fn replaced_inode_prevents_unlink() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(4444, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         let file = published(&guard);
 
         // A successor publishes over the path: same name, different inode.
@@ -1107,7 +1175,9 @@ mod tests {
     fn mismatched_daemon_id_prevents_unlink() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(5555, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         let file = published(&guard);
 
         // Same inode, rewritten daemon ID: an old incarnation must not delete a credential it no longer owns.
@@ -1127,7 +1197,9 @@ mod tests {
     fn hard_linked_publication_prevents_unlink() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(6666, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         let file = published(&guard);
         std::fs::hard_link(&file, guard.dir_path().join("extra-link")).expect("hard link");
 
@@ -1142,17 +1214,27 @@ mod tests {
     fn publication_survives_and_replaces_across_republish() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(7777, "mc-host/test").expect("first publish");
+        guard
+            .publish(&guard.dir_path().join("setup-1.sock"), "mc-host/test")
+            .expect("first publish");
         let first: serde_json::Value =
             serde_json::from_slice(&std::fs::read(published(&guard)).expect("read"))
                 .expect("parse");
-        guard.publish(8888, "mc-host/test").expect("second publish");
+        guard
+            .publish(&guard.dir_path().join("setup-2.sock"), "mc-host/test")
+            .expect("second publish");
         let second: serde_json::Value =
             serde_json::from_slice(&std::fs::read(published(&guard)).expect("read"))
                 .expect("parse");
 
-        assert_eq!(first["endpoints"][0]["port"], 7777);
-        assert_eq!(second["endpoints"][0]["port"], 8888);
+        assert!(first["setup_socket"]
+            .as_str()
+            .unwrap()
+            .ends_with("setup-1.sock"));
+        assert!(second["setup_socket"]
+            .as_str()
+            .unwrap()
+            .ends_with("setup-2.sock"));
         // Credentials belong to the incarnation, not the publish call.
         assert_eq!(first["key"], second["key"]);
         guard.remove_publication();
@@ -1196,7 +1278,9 @@ mod tests {
         assert!(!stale.exists(), "a stale temp must be swept");
         assert!(fresh.exists(), "an in-flight temp must be spared");
         assert!(unrelated.exists(), "age alone must not condemn other files");
-        guard.publish(9999, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
         assert!(published(&guard).exists(), "publication must still land");
     }
 
@@ -1204,7 +1288,9 @@ mod tests {
     fn no_temp_files_remain_after_a_successful_publish() {
         let root = temp_root();
         let mut guard = InstanceGuard::acquire(Some(root.path()), TEST_DIGEST).expect("acquire");
-        guard.publish(1234, "mc-host/test").expect("publish");
+        guard
+            .publish(&guard.dir_path().join("setup.sock"), "mc-host/test")
+            .expect("publish");
 
         let prefix = format!(".{CONNECTION_FILE_NAME}.");
         let leftovers: Vec<_> = std::fs::read_dir(guard.dir_path())

@@ -176,6 +176,15 @@ export async function maybeDeliverChannel2(
 
         const body: Record<string, unknown> = {
             noReply: false,
+            // synthetic: true — this is an agent-directed nudge, not a real user
+            // turn. It still drives the run loop and reaches the model (OpenCode
+            // serializes on !ignored && text!=="", and MessageV2.latest/the run
+            // loop ignore `synthetic`), but it (a) skips OpenCode's queued-message
+            // `<system-reminder>…Please address…` wrapper — which would otherwise
+            // double-wrap our reminder AND flip wrapped↔unwrapped as lastFinished
+            // advances, busting the prefix cache — and (b)
+            // drops out of the TUI user-message render. MUST NOT be paired with
+            // `ignored: true` (that would strip it from the model call).
             parts: [{ type: "text", text: reminder, synthetic: true }],
         };
         if (promptContext?.agent) body.agent = promptContext.agent;

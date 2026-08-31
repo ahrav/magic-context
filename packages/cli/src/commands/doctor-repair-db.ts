@@ -38,6 +38,7 @@ import { inspectLivePiProcesses } from "@magic-context/core/shared/rpc-utils";
 import { Database, type Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 
 import { DATABASE_RESET_COMMAND } from "../lib/database-repair-guidance";
+import { reportDatabaseHolderRefusal, timestamp } from "../lib/db-maintenance";
 import { type PromptIO, promptIO } from "../lib/prompts";
 
 const ROW_COUNT_TABLES = ["tags", "compartments", "claims", "notes", "dream_runs"] as const;
@@ -148,10 +149,6 @@ const DEFAULT_DEPS: RepairDbDeps = {
     sqliteExecutable: defaultSqliteExecutable(),
     inspectHolders: defaultInspectHolders,
 };
-
-function timestamp(date: Date): string {
-    return date.toISOString().replaceAll("-", "").replaceAll(":", "").replace(".", "");
-}
 
 function uniqueBase(preferred: string): string {
     if (!DATABASE_SUFFIXES.some((suffix) => existsSync(`${preferred}${suffix}`))) return preferred;
@@ -476,12 +473,11 @@ function reportSafetyRefusal(
     inspection: DatabaseHolderInspection,
     backupBase?: string,
 ): RepairDbExitCode {
-    prompts.log.error(`Refusing to repair the live database: ${dbPath}`);
-    if (inspection.blockers.length > 0) {
-        prompts.log.error(`Active database holder(s): ${inspection.blockers.join(", ")}`);
-    }
-    if (inspection.uncertainty) prompts.log.error(inspection.uncertainty);
-    prompts.log.info("Close every OpenCode, Pi, and OMP process, then run the command again.");
+    reportDatabaseHolderRefusal(
+        prompts,
+        `Refusing to repair the live database: ${dbPath}`,
+        inspection,
+    );
     if (backupBase) prompts.log.info(`Backup base: ${backupBase}`);
     else prompts.log.info("Backup: not created (repair refused before database access)");
     prompts.outro("Database repair refused; the original database files were not modified");

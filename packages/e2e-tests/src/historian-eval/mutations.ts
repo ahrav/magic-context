@@ -89,7 +89,7 @@ function goldSatisfyingFacts(scenario: HistorianEvalScenario): MockHistorianFact
  * A baseline failure prevents scenario promotion before mutations run.
  * The count is clamped to the message count because each segment covers at least one message.
  */
-function baselineCompartments(scenario: HistorianEvalScenario): MockHistorianCompartment[] {
+export function baselineCompartments(scenario: HistorianEvalScenario): MockHistorianCompartment[] {
     const messageCount = scenario.transcript.turns.length * 2;
     const count = Math.max(1, Math.min(scenario.gold.compartments.minCount, messageCount));
     const span = Math.floor(messageCount / count);
@@ -117,7 +117,7 @@ function baselineCompartments(scenario: HistorianEvalScenario): MockHistorianCom
  * A `gold.compartments.minCount` above one is unpromotable.
  * `compartment-count` measures only compartments over authored content.
  */
-function batteryScoringOptions(scenario: HistorianEvalScenario): {
+export function batteryScoringOptions(scenario: HistorianEvalScenario): {
     chunkStartOrdinal: number;
     chunkEndOrdinal: number;
     authoredStartOrdinal: number;

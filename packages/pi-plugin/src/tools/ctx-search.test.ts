@@ -3,7 +3,7 @@ import { resolveProjectIdentity } from "@magic-context/core/features/magic-conte
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
-import { createTestDb, fakeContext } from "../test-utils.test";
+import { createTestDb, fakeContext } from "../test-utils";
 import { createCtxSearchTool } from "./ctx-search";
 
 describe("createCtxSearchTool", () => {

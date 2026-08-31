@@ -98,3 +98,22 @@ export function providerOutputFailureFromInvalidManifest(
         responseText,
     );
 }
+
+/**
+ * Runs a manifest validator and, when it rejects, reclassifies the failure as a
+ * provider outage when the transcript carries the near-zero-output signature;
+ * otherwise the validator's own error propagates unchanged.
+ */
+export function rethrowInvalidManifestAsProviderFailure(
+    messages: unknown,
+    responseText: string,
+    validate: () => void,
+): void {
+    try {
+        validate();
+    } catch (error) {
+        const providerFailure = providerOutputFailureFromInvalidManifest(messages, responseText);
+        if (providerFailure) throw providerFailure;
+        throw error;
+    }
+}

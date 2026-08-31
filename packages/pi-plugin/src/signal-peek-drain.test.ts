@@ -25,7 +25,7 @@ import {
 	signalPiSystemPromptRefreshForProject,
 	trackSessionForProject,
 } from "./context-handler";
-import { createTestDb } from "./test-utils.test";
+import { createTestDb } from "./test-utils";
 
 const CONTEXT_HANDLER_SRC = readFileSync(
 	join(import.meta.dir, "context-handler.ts"),

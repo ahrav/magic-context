@@ -895,6 +895,9 @@ export function createMagicContextCommandHandler(deps: {
                         result = `## Magic Recomp — Failed\n\n${error instanceof Error ? error.message : String(error)}`;
                     }
                 } else if (isTuiConnected(sessionId)) {
+                    // In TUI, push an RPC action so the TUI poller shows a confirmation dialog.
+                    // Partial-range args fall through to the full-recomp dialog — the TUI
+                    // has no range UI; typed args are ignored here.
                     pushNotification("action", { action: "show-recomp-dialog" }, sessionId);
                     sessionLog(sessionId, "command ctx-recomp: pushed show-recomp-dialog to TUI");
                     throwSentinel(input.command);

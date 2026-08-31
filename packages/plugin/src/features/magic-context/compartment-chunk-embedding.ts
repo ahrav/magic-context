@@ -599,11 +599,13 @@ export function chunkCanonicalText(
         const lineEnd = range?.end ?? lineStart;
         const lineTokens = estimateTokens(line);
 
-        // A single canonical U:/A: line can exceed the per-window token budget.
-        // Packing flushes only between lines, so an oversized line cannot be reduced by normal packing.
-        // A line larger than effectiveMax would otherwise form an oversized window.
-        // The window builder splits oversized lines before packing so each slice is estimated at no more than effectiveMax tokens.
-        // The window builder emits each oversized-line slice as a separate window with the source line's ordinal range.
+        // A single canonical line (one U:/A: span) can itself exceed the per-window
+        // budget — e.g. a span containing a large file dump or paste rendered into
+        // one line. Packing only flushes BETWEEN lines, so such a line would be
+        // emitted as one oversized window and blow past the provider's hard context
+        // window (jina returned 400 exceed_context_size for a 51774-token
+        // window against an 8192 ceiling). Split the line down to budget first, and
+        // emit each sub-slice as its own window carrying this line's ordinal range.
         if (lineTokens > effectiveMax) {
             flush();
             for (const slice of splitOversizedLine(line, effectiveMax)) {
@@ -953,6 +955,31 @@ function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCand
         }));
 }
 
+/**
+ * Shared body of the "unembedded session compartment" queries: the candidate
+ * SELECTs and the `/ctx-embed-history` progress COUNT interpolate this same
+ * predicate, so the progress total and the actual work can never disagree.
+ * Compile-time constant; binds are positional (`project_path`, `session_id`,
+ * then any inline exclusion-id binds, then the NOT EXISTS `project_path`,
+ * `model_id`).
+ */
+const UNEMBEDDED_SESSION_COMPARTMENT_FROM_WHERE = `FROM compartments c
+             JOIN session_projects sp
+               ON sp.session_id = c.session_id
+              AND sp.harness = c.harness
+              AND sp.project_path = ?
+             WHERE c.session_id = ?
+               AND c.start_message IS NOT NULL
+               AND c.end_message IS NOT NULL`;
+
+const UNEMBEDDED_COMPARTMENT_NOT_EXISTS = `AND NOT EXISTS (
+                   SELECT 1
+                   FROM compartment_chunk_embeddings current
+                   WHERE current.compartment_id = c.id
+                     AND current.project_path = ?
+                     AND current.model_id = ?
+               )`;
+
 const sessionBackfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
 
 /**
@@ -977,22 +1004,9 @@ export function loadUnembeddedSessionChunkCandidates(
                     c.end_message AS endMessage,
                     c.title AS title,
                     c.created_at AS createdAt
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL
+             ${UNEMBEDDED_SESSION_COMPARTMENT_FROM_WHERE}
                AND c.id NOT IN (${placeholders})
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )
+               ${UNEMBEDDED_COMPARTMENT_NOT_EXISTS}
              ORDER BY c.start_message ASC, c.id ASC
              LIMIT ?`,
         );
@@ -1015,21 +1029,8 @@ export function loadUnembeddedSessionChunkCandidates(
                     c.end_message AS endMessage,
                     c.title AS title,
                     c.created_at AS createdAt
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )
+             ${UNEMBEDDED_SESSION_COMPARTMENT_FROM_WHERE}
+               ${UNEMBEDDED_COMPARTMENT_NOT_EXISTS}
              ORDER BY c.start_message ASC, c.id ASC
              LIMIT ?`,
         );
@@ -1056,21 +1057,8 @@ export function countUnembeddedSessionCompartments(
     const row = db
         .prepare(
             `SELECT COUNT(*) AS n
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )`,
+             ${UNEMBEDDED_SESSION_COMPARTMENT_FROM_WHERE}
+               ${UNEMBEDDED_COMPARTMENT_NOT_EXISTS}`,
         )
         .get(projectPath, sessionId, projectPath, modelId) as { n?: number } | undefined;
     return typeof row?.n === "number" ? row.n : 0;

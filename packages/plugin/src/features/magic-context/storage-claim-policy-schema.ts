@@ -87,11 +87,9 @@ export const DISPOSITION_KINDS = ["stale", "disputed", "rejected", "quarantined"
 export type DispositionKind = (typeof DISPOSITION_KINDS)[number];
 
 export const DISPOSITION_ACTIONS = ["assert", "clear"] as const;
-export type DispositionAction = (typeof DISPOSITION_ACTIONS)[number];
 
 /** Approval actions record host-recorded human authority. */
 export const APPROVAL_ACTIONS = ["approve", "revoke"] as const;
-export type ApprovalAction = (typeof APPROVAL_ACTIONS)[number];
 
 /** Artifact kinds identify content-addressed enforcement artifacts. */
 export const ENFORCEMENT_ARTIFACT_KINDS = ["test", "policy", "config"] as const;

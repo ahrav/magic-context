@@ -45,6 +45,45 @@ describe("provider modelId matches canonical identity (write/read must agree)", 
             expect(provider.modelId).toBe(getEmbeddingProviderIdentity(c.config));
         });
     }
+
+    test("endpoint trailing slash is normalized out of the identity", () => {
+        const provider = new OpenAICompatibleEmbeddingProvider({
+            endpoint: "http://localhost:1234/v1/",
+            model: "text-embedding-3-small",
+            apiKey: "secret",
+        });
+
+        expect(provider.modelId).toBe(
+            getEmbeddingProviderIdentity({
+                provider: "openai-compatible",
+                endpoint: "http://localhost:1234/v1",
+                model: "text-embedding-3-small",
+                api_key: "present",
+            }),
+        );
+        expect(provider.isLoaded()).toBe(false);
+    });
+
+    test("identity tracks api-key presence but not the secret value", () => {
+        const first = new OpenAICompatibleEmbeddingProvider({
+            endpoint: "http://localhost:1234/v1/",
+            model: "text-embedding-3-small",
+            apiKey: "secret-one",
+        });
+        const rotated = new OpenAICompatibleEmbeddingProvider({
+            endpoint: "http://localhost:1234/v1",
+            model: "text-embedding-3-small",
+            apiKey: "secret-two",
+        });
+        const anonymous = new OpenAICompatibleEmbeddingProvider({
+            endpoint: "http://localhost:1234/v1",
+            model: "text-embedding-3-small",
+        });
+
+        expect(first.modelId).toBe(rotated.modelId);
+        expect(first.modelId).not.toBe(anonymous.modelId);
+        expect(first.modelId).not.toContain("secret");
+    });
 });
 
 describe("embeddingModelsMatch token-boundary semantics", () => {

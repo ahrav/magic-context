@@ -1,10 +1,15 @@
 import { existsSync, readFileSync } from "node:fs";
 
-import { detectConfigFile, isPrototypePollutionKey, parseJsonc } from "../shared/jsonc-parser";
+import {
+    detectConfigFile,
+    isPrototypePollutionKey,
+    parseConfigJsonc,
+} from "../shared/jsonc-parser";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
 import { setWindowOverlayPath } from "../shared/window-geometry";
 import { isCompactionEnabled, migrateLegacyAgentEnabledInMemory } from "./agent-disable";
+import type { LoadOutcome } from "./load-outcome";
 import {
     cortexKitProjectConfigBasePath,
     cortexKitUserConfigBasePath,
@@ -23,6 +28,8 @@ import { pruneNestedConfigLeaf } from "./prune-config-leaf";
 import { type MagicContextConfig, MagicContextConfigSchema } from "./schema/magic-context";
 import { resolveTransformMode } from "./transform-mode";
 import { substituteConfigVariables } from "./variable";
+
+export type { LoadOutcome } from "./load-outcome";
 
 export interface MagicContextPluginConfig extends MagicContextConfig {
     disabled_hooks?: string[];
@@ -62,14 +69,6 @@ interface LoadedConfigFile {
     /** The loader prefixes {env:} and {file:} substitution warnings with the config path. */
     warnings: string[];
 }
-
-export type LoadOutcome =
-    | "ok"
-    | "project-file-parse-error"
-    | "project-file-io-error"
-    | "legacy-config-unmigrated"
-    | "schema-recovery"
-    | "substitution-failure";
 
 export interface LoadResultDetailed {
     config: MagicContextPluginConfig & { configWarnings?: string[] };
@@ -118,7 +117,7 @@ function loadConfigFileDetailed(
             isProjectConfig: source === "project",
         });
         const rejectedKeyPaths: string[] = [];
-        const config = parseJsonc<Record<string, unknown>>(substituted.text, {
+        const config = parseConfigJsonc<Record<string, unknown>>(substituted.text, {
             onRejectedKey: (path) => rejectedKeyPaths.push(path.join(".")),
         });
         const unsafeKeyWarnings = rejectedKeyPaths.map(

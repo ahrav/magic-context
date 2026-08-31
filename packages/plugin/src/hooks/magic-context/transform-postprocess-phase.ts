@@ -583,6 +583,12 @@ interface RunPostTransformPhaseArgs {
     sessionMeta: SessionMeta;
     currentTurnId: string | null;
     /**
+     * Persistent signal that pending ops + heuristics need to materialize.
+     * Survives across defer passes when `compartmentRunning` blocks the
+     * heuristic pass. Drained ONLY after `shouldRunHeuristics` succeeds —
+     * preserving `/ctx-flush` intent across blocked passes is the entire
+     * reason for the three-set split (see the lifetime notes on
+     * `hook-handlers.ts`).
      */
     pendingMaterializationSessions: Set<string>;
     deferredHistoryRefreshSessions: Set<string>;
@@ -824,6 +830,17 @@ export async function runPostTransformPhase(
         activeCompartmentRun !== undefined;
     const deferredMaterialize = args.canConsumeDeferredLate && deferredMaterializationWasPending;
     const materializationRequested = isExplicitFlush || deferredMaterialize;
+    // A HARD decision alone is not a cache bust. Execute it off-wire first, then
+    // let pending drops and heuristics ride the bust only when persistence reports
+    // that m[0] actually materialized. A contention fallback or failed attempt
+    // leaves the mutation gates closed, preserving byte-identical defer replay.
+    // injectM0M1 still rechecks later, so a cross-process marker bump after this
+    // pre-execution can fold safely without retroactively authorizing mutations.
+    // Re-gated for compaction-off mode: injection runs when the
+    // memory/docs identity is present AND (fullFeatureMode || compactionOff),
+    // so the mode cannot swallow m[0]/m[1] delivery — and a compaction-off
+    // SUBAGENT session receives the additive blocks too (injectM0M1's
+    // isSubagent skip is lifted by the same flag).
     const m0M1EnabledForFold =
         args.m0M1 !== undefined &&
         (!!args.m0M1.projectPath || !!args.m0M1.projectDirectory) &&

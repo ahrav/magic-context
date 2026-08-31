@@ -478,16 +478,6 @@ export function getActivePrimers(
     return primers;
 }
 
-export function getAllPrimers(db: Database, projectPath?: string): Primer[] {
-    const sql = projectPath
-        ? `SELECT * FROM primers WHERE project_path = ? ORDER BY status ASC, COALESCE(last_observed_at, created_at) DESC, id ASC`
-        : `SELECT * FROM primers ORDER BY project_path ASC, status ASC, COALESCE(last_observed_at, created_at) DESC, id ASC`;
-    const rows = (
-        projectPath ? db.prepare(sql).all(projectPath) : db.prepare(sql).all()
-    ) as PrimerRow[];
-    return rows.map(toPrimer);
-}
-
 export function createPrimer(
     db: Database,
     input: {
@@ -596,31 +586,4 @@ export function updatePrimerAnswer(
     db.prepare(
         "UPDATE primers SET answer = ?, answer_refreshed_at = ?, updated_at = ? WHERE id = ?",
     ).run(answer, refreshedAt, refreshedAt, primerId);
-}
-
-export function pruneExpiredPrimerCandidates(
-    db: Database,
-    now = Date.now(),
-    ttlMs = PRIMER_CANDIDATE_TTL_MS,
-    maxAgeMs = PRIMER_CANDIDATE_MAX_AGE_MS,
-): number {
-    const activePrimers = getAllPrimers(db).filter((primer) => primer.status === "active");
-    const protectedIds = new Set<number>();
-    for (const primer of activePrimers) {
-        for (const id of primer.sourceCandidateIds) protectedIds.add(id);
-    }
-    const oldRows = db
-        .prepare(
-            "SELECT id, source_message_time FROM primer_candidates WHERE source_message_time < ?",
-        )
-        .all(now - ttlMs) as Array<{ id: number; source_message_time: number }>;
-    const toDelete = oldRows
-        .filter((row) => !protectedIds.has(row.id) || row.source_message_time < now - maxAgeMs)
-        .map((row) => row.id);
-    if (toDelete.length === 0) return 0;
-    const stmt = db.prepare("DELETE FROM primer_candidates WHERE id = ?");
-    db.transaction(() => {
-        for (const id of toDelete) stmt.run(id);
-    })();
-    return toDelete.length;
 }

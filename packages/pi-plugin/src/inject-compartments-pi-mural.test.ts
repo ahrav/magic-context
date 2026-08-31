@@ -16,7 +16,7 @@ import {
 	injectM0M1Pi,
 	type PiM0M1State,
 } from "./inject-compartments-pi";
-import { createTestDb, textOf, userMessage } from "./test-utils.test";
+import { createTestDb, textOf, userMessage } from "./test-utils";
 
 const SESSION_ID = "ses_pi_mural_inject";
 

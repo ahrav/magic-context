@@ -10,8 +10,8 @@ import * as path from "node:path";
 import { getTestBackstopDataRoot } from "../data-path";
 import { releaseContract } from "./generated-contract";
 
-/* */
-export const CONNECTION_FILE_NAME = "subc-connection.json";
+/** Canonical publication filename (version-2 `subc` literal, R45). */
+export const CONNECTION_FILE_NAME = releaseContract.layout.connection_file;
 
 export type DataRootResolution = { ok: true; root: string } | { ok: false; reason: "no_data_dir" };
 
@@ -41,11 +41,11 @@ export function coordinationDirPath(dataRoot: string): string {
 }
 
 export function managedSubtreePath(dataRoot: string): string {
-    return path.join(dataRoot, "cortexkit");
+    return path.join(dataRoot, releaseContract.layout.managed_subtree);
 }
 
 export function runtimeDirPath(dataRoot: string): string {
-    return path.join(managedSubtreePath(dataRoot), "run");
+    return path.join(managedSubtreePath(dataRoot), releaseContract.layout.runtime_directory);
 }
 
 export function connectionFilePath(dataRoot: string): string {

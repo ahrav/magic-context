@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { assistantMessages } from "../dreamer/dreamer-test-support";
 import { acquireLease } from "../dreamer/lease";
 import { createAntiMemory } from "../memory/storage-anti-memory";
 import {
@@ -25,15 +26,6 @@ import {
 } from "./compress-cues";
 import { validateCue } from "./cue-validation";
 import { claimNeedsCue, getClaimMuralCueStates } from "./storage-mural-cues";
-
-function assistantMessages(text: string) {
-    return [
-        {
-            info: { role: "assistant", time: { created: Date.now() } },
-            parts: [{ type: "text", text }],
-        },
-    ];
-}
 
 function poolIdsFromPrompt(prompt: string): string[] {
     return [...prompt.matchAll(/^\[([^\]]+)\]/gm)].map((match) => match[1] ?? "");

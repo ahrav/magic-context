@@ -1,6 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { sanitizeParsedJson } from "@magic-context/core/shared/jsonc-parser";
-import { parse as parseJsonc } from "comment-json";
+import { parseConfigJsonc } from "@magic-context/core/shared/jsonc-parser";
 
 export type JsoncReadResult =
     | { kind: "missing" }
@@ -50,10 +49,15 @@ function parseErrorLocation(content: string, error: unknown): { line: number; co
 export function readJsoncConfig(path: string): JsoncReadResult {
     if (!existsSync(path)) return { kind: "missing" };
 
-    const content = readFileSync(path, "utf-8");
+    // The read stays inside the failure boundary: a path that exists but
+    // cannot be read (permissions, a directory, deleted between the existsSync
+    // probe and the read) reports as parse-error instead of throwing, so
+    // lenient diagnostic callers can explain the bad file rather than abort.
+    let content = "";
     try {
+        content = readFileSync(path, "utf-8");
         const rejectedKeyPaths: string[] = [];
-        const parsed = sanitizeParsedJson(parseJsonc(content), {
+        const parsed = parseConfigJsonc(content, {
             onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
         });
         if (rejectedKeyPaths.length > 0) {
@@ -80,4 +84,21 @@ export function assertJsoncConfigsParseable(paths: readonly string[]): void {
         const result = readJsoncConfig(path);
         if (result.kind === "parse-error") throw result.error;
     }
+}
+
+/**
+ * Lenient JSONC read for diagnostics surfaces: a missing file is an empty
+ * config, and a parse failure — including a non-object document root — is
+ * reported as a string instead of thrown.
+ */
+export function readJsoncLenient(path: string): {
+    value: Record<string, unknown>;
+    parseError?: string;
+} {
+    const result = readJsoncConfig(path);
+    if (result.kind === "missing") return { value: {} };
+    if (result.kind === "parse-error") {
+        return { value: {}, parseError: result.error.message };
+    }
+    return { value: result.value };
 }

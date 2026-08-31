@@ -8,6 +8,7 @@ import {
     type CatalogEntry,
     type HostStatusSnapshot,
     McHostClient,
+    type McHostClientOptions,
     sameDaemonId,
 } from "../mc-host-client";
 import { BootstrapError, checkPlatform, type PlatformReaders, parseTrustIndex } from "./bootstrap";
@@ -28,6 +29,7 @@ import {
     type LifecyclePolicyOptions,
     McHostLifecyclePolicy,
     type ObservationalHealth,
+    ReadinessProbeControlError,
 } from "./policy";
 
 const MAX_PARENT_WALK = 8;
@@ -91,13 +93,15 @@ async function probeManagedStorage(
     expectedDaemonId?: Uint8Array,
 ): Promise<"ready" | "starting" | "unavailable"> {
     const deadline = Date.now() + budgetMs;
-    let client: McHostClient | null = null;
+    const options: McHostClientOptions = {
+        connectionFile: connectionFilePath(root),
+        handshakeTimeoutMs: Math.max(1, budgetMs),
+        requestTimeoutMs: Math.max(1, budgetMs),
+    };
+    // A cached client is shared; closing it would disconnect a concurrent probe for the same root and budget, which would report a healthy daemon as unavailable.
+    let client: McHostClient | undefined;
     try {
-        client = await McHostClient.connect({
-            connectionFile: connectionFilePath(root),
-            handshakeTimeoutMs: Math.max(1, budgetMs),
-            requestTimeoutMs: Math.max(1, budgetMs),
-        });
+        client = await McHostClient.connect(options);
         assertStorageProbePeer(client, expectedDaemonId);
         for (;;) {
             const snapshot = await client.hostStatus({
@@ -117,7 +121,8 @@ async function probeManagedStorage(
         if (error instanceof StorageProbeDaemonMismatchError) throw error;
         return Date.now() >= deadline ? "starting" : "unavailable";
     } finally {
-        await client?.closeAsync().catch(() => {});
+        // The connected channel holds a referenced interval, so a one-shot caller stays alive until this client closes.
+        if (client !== undefined) await client.closeAsync().catch(() => undefined);
     }
 }
 
@@ -237,6 +242,7 @@ async function probeManagedCompatibility(
         connectionFile: connectionFilePath(root),
         handshakeTimeoutMs: Math.max(1, budgetMs),
         requestTimeoutMs: Math.max(1, budgetMs),
+        shutdownDeadlineMs: Math.max(1, budgetMs),
     });
     try {
         return await readCompatibilityProbe(client, deadline, signal);
@@ -247,64 +253,92 @@ async function probeManagedCompatibility(
 
 async function probeManagedReadiness(root: string, budgetMs: number): Promise<ObservationalHealth> {
     const deadline = Date.now() + budgetMs;
+    // A private client, like the storage probe's. The residual budget varies per
+    // call and `ownerKey` includes the timeouts, so a shared owner would cache a
+    // new client — and prefault another ring — on every status or doctor, until
+    // admission is exhausted.
     const client = await McHostClient.connect({
         connectionFile: connectionFilePath(root),
         handshakeTimeoutMs: Math.max(1, budgetMs),
         requestTimeoutMs: Math.max(1, budgetMs),
-        identity: {
-            project_root: root,
-            harness: "mc-host-lifecycle",
-            session: "compatibility",
-        },
     });
+    let probe: CompatibilityProbeResult;
     try {
-        const { snapshot: compatibility, status } = await readCompatibilityProbe(client, deadline);
-        if (status === null) {
-            return {
-                ...compatibility,
-                readiness: { transport: { state: "ready", reason: "healthy" } },
-            };
-        }
-        const components = asRecord(status.metrics.components);
-        const storage = storageState(status.metrics);
-        const synapseMetrics = asRecord(asRecord(components?.synapse)?.metrics);
-        const synapseState = synapseMetrics?.synapse_state;
-        const synapse =
-            synapseState === "ready"
-                ? { state: "ready" as const, reason: "healthy" as const }
-                : synapseState === "unsupported"
-                  ? {
+        probe = await readCompatibilityProbe(client, deadline);
+    } catch (error) {
+        if (client.isClosed || client.authenticated === null) throw error;
+        throw new ReadinessProbeControlError(error);
+    } finally {
+        // Teardown is not part of the observation, and `closeAsync` opens its own
+        // shutdown deadline, so awaiting it here could settle this promise after
+        // the lifecycle command's aggregate expired.
+        void client.closeAsync().catch(() => undefined);
+    }
+    const { snapshot: compatibility, status } = probe;
+    if (status === null) {
+        // The probe short-circuited at the daemon or module stage, so
+        // `host.status` never ran and storage and Synapse were never
+        // observed. Report only what the handshake proved and leave the
+        // unobserved components absent rather than asserting failures that
+        // would point remediation away from the version mismatch.
+        return {
+            ...compatibility,
+            readiness: { shared_memory: { state: "ready", reason: "healthy" } },
+        };
+    }
+    const components = asRecord(status.metrics.components);
+    const storage = storageState(status.metrics);
+    const synapseMetrics = asRecord(asRecord(components?.synapse)?.metrics);
+    const synapseState = synapseMetrics?.synapse_state;
+    const synapse =
+        synapseState === "ready"
+            ? { state: "ready" as const, reason: "healthy" as const }
+            : synapseState === "unsupported"
+              ? {
+                    state: "unsupported" as const,
+                    reason: "synapse_unsupported" as const,
+                }
+              : synapseState === "starting"
+                ? { state: "starting" as const, reason: "synapse_starting" as const }
+                : synapseState === undefined
+                  ? // The status payload omits a component whose state it
+                    // cannot report: the daemon skips any module missing from
+                    // `components`, missing a usable `status`, or missing its
+                    // state key. Absence means the lane is not offered, so it
+                    // reports `unsupported` — the one non-failing readiness
+                    // state, which `addCheck` maps to a skipped check. Calling
+                    // it `degraded` would make `status` and `doctor` answer
+                    // `ok: false` for a daemon that is serving correctly and
+                    // simply has no Synapse lane, which is the normal shape on
+                    // every platform the model lane does not cover.
+                    {
                         state: "unsupported" as const,
                         reason: "synapse_unsupported" as const,
                     }
-                  : synapseState === "starting"
-                    ? { state: "starting" as const, reason: "synapse_starting" as const }
-                    : synapseState === undefined
-                      ? // The status payload omits a component whose state it
-                        {
-                            state: "unsupported" as const,
-                            reason: "synapse_unsupported" as const,
-                        }
-                      : { state: "degraded" as const, reason: "synapse_degraded" as const };
-        return {
-            ...compatibility,
-            readiness: {
-                transport: { state: "ready", reason: "healthy" },
-                storage: {
-                    state: storage,
-                    reason:
-                        storage === "ready"
-                            ? "healthy"
-                            : storage === "starting"
-                              ? "storage_starting"
-                              : "storage_unavailable",
-                },
-                synapse,
+                  : { state: "degraded" as const, reason: "synapse_degraded" as const };
+    return {
+        ...compatibility,
+        sharedMemory: status.sharedMemory,
+        readiness: {
+            shared_memory: {
+                state: status.sharedMemory.state === "healthy" ? "ready" : "unavailable",
+                reason:
+                    status.sharedMemory.state === "healthy"
+                        ? "healthy"
+                        : "native_probe_unavailable",
             },
-        };
-    } finally {
-        await client.closeAsync().catch(() => {});
-    }
+            storage: {
+                state: storage,
+                reason:
+                    storage === "ready"
+                        ? "healthy"
+                        : storage === "starting"
+                          ? "storage_starting"
+                          : "storage_unavailable",
+            },
+            synapse,
+        },
+    };
 }
 
 export interface ManagedLifecyclePolicyOptions

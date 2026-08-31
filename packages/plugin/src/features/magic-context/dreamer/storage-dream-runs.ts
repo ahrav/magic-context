@@ -23,11 +23,12 @@ export interface DreamRunMemoryChanges {
     deleted: number;
     archived: number;
     merged: number;
-    // Each array contains the exact IDs changed in its bucket.
-    // The fields are persisted in `memory_changes_json`.
-    // Consumers use these IDs to report the exact memories a run touched instead of reconstructing them from an approximate `created_at`/`updated_at` time window.
-    // Older rows and the manual `/ctx-dream` summary path provide counts only.
-    // When arrays are present, each count equals its array's length.
+    // Exact ids of the memories changed in each bucket. Persisted in the
+    // same `memory_changes_json` blob (no schema migration) so a drill-down
+    // consumer can show EXACTLY which memories a run touched instead of
+    // reconstructing them with an approximate created_at/updated_at time-window
+    // query. Optional: older rows + the manual /ctx-dream summary path carry
+    // counts only. Each count stays === its array length when arrays are present.
     //
     // These are legacy numeric IDs from the `memories` table.
     // Claim-native writers must leave all four legacy numeric ID arrays absent rather than emit empty arrays.

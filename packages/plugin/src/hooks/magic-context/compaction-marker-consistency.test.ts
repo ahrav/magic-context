@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
 import { setPersistedCompactionMarkerState } from "../../features/magic-context/storage-meta-persisted";
-import { Database } from "../../shared/sqlite";
+import { createOpenCodeTestDb } from "../../features/magic-context/test-database";
+import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { checkCompactionMarkerConsistency } from "./compaction-marker-manager";
 
@@ -21,19 +22,6 @@ function useTempDataHome(prefix: string): string {
     mkdirSync(join(dir, "opencode"), { recursive: true });
     mkdirSync(join(dir, "cortexkit", "magic-context"), { recursive: true });
     return dir;
-}
-
-function createOpenCodeDb(dataHome: string): Database {
-    const dbPath = join(dataHome, "opencode", "opencode.db");
-    const db = new Database(dbPath);
-    db.exec("PRAGMA journal_mode=WAL");
-    db.exec(
-        "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
-    );
-    db.exec(
-        "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
-    );
-    return db;
 }
 
 function insertMessage(db: Database, id: string): void {
@@ -68,7 +56,7 @@ afterEach(() => {
 describe("checkCompactionMarkerConsistency", () => {
     it("is a no-op when there is no persisted state", () => {
         const dataHome = useTempDataHome("consistency-empty-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
         closeQuietly(opencodeDb);
 
         const db = openDatabase();
@@ -77,7 +65,7 @@ describe("checkCompactionMarkerConsistency", () => {
 
     it("clears persisted state when any referenced row is missing", () => {
         const dataHome = useTempDataHome("consistency-orphan-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
 
         insertMessage(opencodeDb, "msg-boundary");
         insertPart(opencodeDb, "prt-compaction");
@@ -104,7 +92,7 @@ describe("checkCompactionMarkerConsistency", () => {
 
     it("preserves persisted state when all referenced rows are present", () => {
         const dataHome = useTempDataHome("consistency-healthy-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
 
         insertMessage(opencodeDb, "msg-boundary");
         insertMessage(opencodeDb, "msg-summary");
@@ -134,7 +122,7 @@ describe("checkCompactionMarkerConsistency", () => {
 
     it("reconciles multiple sessions in one pass", () => {
         const dataHome = useTempDataHome("consistency-multi-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
 
         // ses-1 has all referenced rows and must retain its marker state.
         insertMessage(opencodeDb, "msg-boundary-1");
@@ -178,7 +166,7 @@ describe("checkCompactionMarkerConsistency", () => {
 
     it("is idempotent — running twice produces the same result", () => {
         const dataHome = useTempDataHome("consistency-idempotent-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
         insertMessage(opencodeDb, "msg-boundary");
         // Any missing referenced row clears the marker state.
         closeQuietly(opencodeDb);

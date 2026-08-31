@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+use cortexkit_store_types::StorageDescriptor;
 use mc_core::claim_operation::{
     canonical_json_encode, sha256_hex_utf8, ClaimCommandIdentity, ClaimIntentAckKind,
     ClaimIntentBinding, SnapshotVector,
@@ -18,14 +18,7 @@ const CLAIM_A: &str = "mcm_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CLAIM_B: &str = "mcm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
-    StorageDescriptor {
-        module_id: "magic-context-claim-mirror-test".to_string(),
-        storage_namespace: "mc_cache".to_string(),
-        isolation: Isolation::Module,
-        backend: StorageBackend::Sqlite {
-            path: dir.join("store.db").to_string_lossy().into_owned(),
-        },
-    }
+    McStore::test_descriptor(dir, "magic-context-claim-mirror-test")
 }
 
 fn vector(incarnation: &str, generations: &[(i64, i64)]) -> SnapshotVector {

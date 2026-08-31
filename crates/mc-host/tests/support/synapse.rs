@@ -317,6 +317,25 @@ pub async fn call(
     method: &str,
     params: serde_json::Value,
 ) -> RawFrame {
+    let corr = send_call(client, channel, epoch, method, params).await;
+    // Correlation-filtered so unsolicited frames (e.g. liveness pings) can
+    // never be mistaken for the terminal.
+    let (_skipped, frame) = client
+        .frames_until_corr(corr, BUDGET)
+        .await
+        .expect("terminal");
+    frame
+}
+
+/// Publishes one application call and returns its correlation without waiting
+/// for the terminal.
+pub async fn send_call(
+    client: &mut raw_client::RawClient,
+    channel: u16,
+    epoch: u32,
+    method: &str,
+    params: serde_json::Value,
+) -> u64 {
     let corr = client.next_corr();
     let body = serde_json::to_vec(&serde_json::json!({"method": method, "params": params}))
         .expect("request serializes");
@@ -331,12 +350,7 @@ pub async fn call(
         )
         .await
         .expect("send request");
-    // The helper filters by correlation so unsolicited frames cannot be mistaken for the terminal frame.
-    let (_skipped, frame) = client
-        .frames_until_corr(corr, BUDGET)
-        .await
-        .expect("terminal");
-    frame
+    corr
 }
 
 pub fn sha256_hex(text: &str) -> String {

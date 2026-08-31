@@ -282,37 +282,35 @@ pub fn render_decayed_compartments(
     }
     let mut tiers = compute_tiers(compartments, history_budget_tokens);
 
-    let render = |tiers: &[u8]| -> String {
-        let mut parts = Vec::new();
-        for (i, c) in compartments.iter().enumerate() {
-            let rendered = render_one_compartment(c, tiers[i]);
-            if !rendered.is_empty() {
-                parts.push(rendered);
-            }
-        }
+    // Each demotion changes one tier, so rerender only that compartment.
+    let mut rendered: Vec<String> = compartments
+        .iter()
+        .zip(&tiers)
+        .map(|(c, t)| render_one_compartment(c, *t))
+        .collect();
+    let join_body = |rendered: &[String]| -> String {
+        let parts: Vec<&str> = rendered
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(String::as_str)
+            .collect();
         parts.join("\n\n")
     };
 
-    let mut body = render(&tiers);
-    // Estimator drift or a tight budget can overshoot the curve's target budget.
-    // The guard demotes oldest compartments first while the estimated output exceeds the budget.
+    let mut body = join_body(&rendered);
+    // Budget guard: the curve already targets the budget, but estimate drift or a very
+    // tight budget can overshoot. Demote oldest-first until it fits.
     let mut guard = compartments.len() * 5;
     while history_budget_tokens > 0.0
         && estimate_tokens(&body) as f64 > history_budget_tokens
         && guard > 0
     {
-        let mut demoted = false;
-        for t in tiers.iter_mut() {
-            if *t < 5 {
-                *t += 1;
-                demoted = true;
-                break;
-            }
-        }
-        if !demoted {
+        let Some(i) = tiers.iter().position(|t| *t < 5) else {
             break;
-        }
-        body = render(&tiers);
+        };
+        tiers[i] += 1;
+        rendered[i] = render_one_compartment(&compartments[i], tiers[i]);
+        body = join_body(&rendered);
         guard -= 1;
     }
     body

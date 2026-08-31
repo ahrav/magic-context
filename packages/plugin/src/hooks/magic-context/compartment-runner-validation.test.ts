@@ -88,83 +88,69 @@ function buildChunk(
 
 describe("healCompartmentGaps via validateHistorianOutput", () => {
     describe("tool-only gap healing (any size)", () => {
-        test("heals a 20-message tool-only gap", () => {
+        // Each row authors two compartments with a gap between them, marks the
+        // given range tool-only, and asserts the first compartment absorbs the
+        // gap while the second keeps its authored start.
+        test.each([
+            ["heals a 20-message tool-only gap", 10, 31, 40, { start: 11, end: 30 }],
+            [
+                "heals 50-message tool-only gap (long debug-loop chain)",
+                100,
+                151,
+                200,
+                { start: 101, end: 150 },
+            ],
+            [
+                "heals 200-message tool-only gap (extreme autonomous loop)",
+                100,
+                301,
+                400,
+                { start: 101, end: 300 },
+            ],
+        ] as Array<
+            [string, number, number, number, { start: number; end: number }]
+        >)("%s", (_title, firstEnd, secondStart, lastEnd, toolOnly) => {
             const xml = buildXml([
-                { start: 1, end: 10, title: "work A" },
-                { start: 31, end: 40, title: "work B" },
+                { start: 1, end: firstEnd, title: "work A" },
+                { start: secondStart, end: lastEnd, title: "work B" },
             ]);
-            const chunk = buildChunk(1, 40, [{ start: 11, end: 30 }]);
+            const chunk = buildChunk(1, lastEnd, [toolOnly]);
             const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
             expect(result.ok).toBe(true);
             if (result.ok) {
-                expect(result.compartments[0].endMessage).toBe(30);
-                expect(result.compartments[1].startMessage).toBe(31);
-            }
-        });
-
-        test("heals 50-message tool-only gap (long debug-loop chain)", () => {
-            const xml = buildXml([
-                { start: 1, end: 100, title: "work A" },
-                { start: 151, end: 200, title: "work B" },
-            ]);
-            const chunk = buildChunk(1, 200, [{ start: 101, end: 150 }]);
-            const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
-            expect(result.ok).toBe(true);
-            if (result.ok) {
-                expect(result.compartments[0].endMessage).toBe(150);
-            }
-        });
-
-        test("heals 200-message tool-only gap (extreme autonomous loop)", () => {
-            const xml = buildXml([
-                { start: 1, end: 100, title: "work A" },
-                { start: 301, end: 400, title: "work B" },
-            ]);
-            const chunk = buildChunk(1, 400, [{ start: 101, end: 300 }]);
-            const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
-            expect(result.ok).toBe(true);
-            if (result.ok) {
-                expect(result.compartments[0].endMessage).toBe(300);
+                expect(result.compartments[0].endMessage).toBe(toolOnly.end);
+                expect(result.compartments[1].startMessage).toBe(secondStart);
             }
         });
     });
 
     describe("non-tool-only gaps reject at every size", () => {
-        test("rejects a 5-message narrative gap", () => {
+        // Each row leaves a gap that is not (fully) covered by a tool-only
+        // range; healing must refuse regardless of gap size. Partial overlap
+        // cannot prove that the remaining messages are safe to absorb.
+        test.each([
+            ["rejects a 5-message narrative gap", 10, 16, 20, []],
+            [
+                "rejects a gap only partially covered by a tool-only range",
+                100,
+                117,
+                200,
+                [{ start: 101, end: 108 }],
+            ],
+            ["rejects 30-msg gap with no tool-only coverage", 100, 131, 200, []],
+        ] as Array<
+            [string, number, number, number, Array<{ start: number; end: number }>]
+        >)("%s", (_title, firstEnd, secondStart, lastEnd, toolOnly) => {
             const xml = buildXml([
-                { start: 1, end: 10, title: "work A" },
-                { start: 16, end: 20, title: "work B" },
+                { start: 1, end: firstEnd, title: "work A" },
+                { start: secondStart, end: lastEnd, title: "work B" },
             ]);
-            const chunk = buildChunk(1, 20, []);
+            const chunk = buildChunk(1, lastEnd, toolOnly);
             const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
             expect(result.ok).toBe(false);
             if (!result.ok) {
                 expect(result.error).toContain("gap");
             }
-        });
-
-        test("rejects a gap only partially covered by a tool-only range", () => {
-            // Partial overlap cannot prove that the remaining messages are safe to absorb.
-            const xml = buildXml([
-                { start: 1, end: 100, title: "work A" },
-                { start: 117, end: 200, title: "work B" },
-            ]);
-            const chunk = buildChunk(1, 200, [{ start: 101, end: 108 }]);
-            const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
-            expect(result.ok).toBe(false);
-            if (!result.ok) {
-                expect(result.error).toContain("gap");
-            }
-        });
-
-        test("rejects 30-msg gap with no tool-only coverage", () => {
-            const xml = buildXml([
-                { start: 1, end: 100, title: "work A" },
-                { start: 131, end: 200, title: "work B" },
-            ]);
-            const chunk = buildChunk(1, 200, []);
-            const result = validateHistorianOutput(xml, "ses-test", chunk, [], 0);
-            expect(result.ok).toBe(false);
         });
     });
 

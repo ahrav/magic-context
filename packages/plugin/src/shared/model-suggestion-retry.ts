@@ -109,7 +109,7 @@ function extractMessage(error: unknown): string {
     }
 }
 
-export function parseModelSuggestion(error: unknown): ModelSuggestionInfo | null {
+function parseModelSuggestion(error: unknown): ModelSuggestionInfo | null {
     if (!error) return null;
 
     if (typeof error === "object" && error !== null) {

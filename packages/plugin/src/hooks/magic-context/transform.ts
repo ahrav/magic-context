@@ -480,6 +480,10 @@ export interface TransformDeps {
     /* */
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
     /**
+     * One-shot signal that `<session-history>` injection cache is stale and
+     * `prepareCompartmentInjection` should rebuild on this pass. Drained
+     * after the rebuild so subsequent defer passes hit the fresh cache.
+     * The three-set split rationale is written out in `hook-handlers.ts`.
      */
     historyRefreshSessions: Set<string>;
     deferredHistoryRefreshSessions?: Set<string>;
@@ -496,8 +500,9 @@ export interface TransformDeps {
     memoryConfig?: {
         enabled: boolean;
         injectionBudgetTokens: number;
-        /**
-         * */
+        /** When true, historian/recomp auto-promote eligible session facts
+         *  to project memories. When false, promotion is skipped — agents can
+         *  still write memories explicitly via `ctx_memory write`. */
         autoPromote: boolean;
     };
     /* */
@@ -515,10 +520,15 @@ export interface TransformDeps {
     /** Historian-backed child agents are blocked when historian.disable=true. */
     historianRunnable?: boolean;
     /**
-     * Compaction-off mode is boot-resolved and process-stable.
-     * `compactionOff` preserves memory and docs injection while disabling mutating compaction.
-     * `compactionOff` disables every mutating compaction gate, including subagent gates.
-     * `compactionOff` preserves `m[0]`/`m[1]` injection even when `fullFeatureMode` is false.
+     * Compaction-off mode, boot-resolved and process-stable.
+     * When true the transform runs additive-only: m[0]/m[1] memory/docs
+     * injection, measurement and identity recording stay; every mutating
+     * compaction gate (historian, drops, strips, nudges, emergency, markers,
+     * tag writes) is off. Precedence: every mutating gate becomes
+     * `existingGate && !compactionOff` — the mode wins over both the primary
+     * and the subagent path. It does NOT alias fullFeatureMode=false: the
+     * m[0]/m[1] injection gate is re-expressed as identity-present AND
+     * (fullFeatureMode || compactionOff) so the mode cannot swallow memory
      * delivery.
      */
     compactionOff?: boolean;
@@ -753,9 +763,11 @@ export function createTransform(deps: TransformDeps) {
 
         const reducedMode = sessionMeta.isSubagent;
         const fullFeatureMode = !reducedMode;
-        // Compaction-off mode is independent of subagent mode.
-        // `m[0]/m[1]` injection requires identity and `(fullFeatureMode || compactionOff)`.
-        // `compactionOff` preserves memory delivery.
+        // Compaction-off mode is a THIRD flag, orthogonal to the
+        // subagent split above: every mutating gate below becomes
+        // `existingGate && !compactionOff`, and the m[0]/m[1] injection gate
+        // is re-expressed as identity-present AND (fullFeatureMode ||
+        // compactionOff) so the mode cannot swallow memory delivery.
 
         // `ctxReduceCallable` gates the §N§ prefix, `ctx_reduce`, and Channel 1.
         // `ctxReduceCallable` does not depend on subagent status.
@@ -1266,6 +1278,8 @@ export function createTransform(deps: TransformDeps) {
                 experimentalUserMemories: deps.experimentalUserMemories,
                 experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
                 historianTwoPass: deps.historianTwoPass,
+                // Gate historian-driven memory promotion so users
+                // who disable the feature actually see no memories created.
                 memoryEnabled: deps.memoryConfig?.enabled,
                 autoPromote: deps.memoryConfig?.autoPromote,
                 ensureProjectRegistered: deps.ensureProjectRegistered,
@@ -1523,8 +1537,13 @@ export function createTransform(deps: TransformDeps) {
         }
 
         let taggingSucceeded = false;
-        // Compaction-off mode writes no tag rows and emits no `§N§` prefixes.
-        // When compactionOff becomes false, tagMessages assigns tags to untagged messages.
+        // Compaction-off mode: the tagger writes ZERO tag rows and emits no
+        // §N§ prefixes (compaction-off spec). Every consumer of the tag
+        // walk's outputs (drops, heuristics, nudges, caveman, flushed-status
+        // replay) is itself gated off in this mode, so the whole walk is
+        // skipped — no rows, no prefixes, no commit scan. Flip-back
+        // self-heals: the tagger lazily mints on first observation of
+        // untagged wire content once this gate reopens.
         if (!compactionOff) {
             try {
                 const t0 = performance.now();
@@ -1725,6 +1744,8 @@ export function createTransform(deps: TransformDeps) {
             experimentalUserMemories: deps.experimentalUserMemories,
             experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
             historianTwoPass: deps.historianTwoPass,
+            // Forward memory gating so the normal historian path
+            // (not just the recovery path above) honors memory.enabled and
             // memory.auto_promote.
             memoryEnabled: deps.memoryConfig?.enabled,
             autoPromote: deps.memoryConfig?.autoPromote,
@@ -1740,6 +1761,10 @@ export function createTransform(deps: TransformDeps) {
         sessionMeta = { ...sessionMeta, compartmentInProgress };
         logTransformTiming(sessionId, "compartmentPhase", tCompartmentPhase);
 
+        // Layer-B fallback: the injection stayed degraded and no durable
+        // compartment boundary is visible, so there was no safe re-anchor splice.
+        // Queue a fresh materialization so the baseline is re-cut on the next
+        // bust instead of the session silently looping in degraded mode.
         if (pendingCompartmentInjection?.needsFreshMaterialization) {
             deps.pendingMaterializationSessions.add(sessionId);
             deferredMaterializationSessions.add(sessionId);
@@ -2021,7 +2046,10 @@ export function createTransform(deps: TransformDeps) {
         }
         logTransformTiming(sessionId, "postTransformPhase", tPostProcess);
 
-        // The sidebar attributes inputTokens across System, Tool Definitions, and Conversation.
+        // Estimate the total token size of the transformed messages array so
+        // the sidebar can attribute inputTokens between System
+        // (from system.transform), Tool Definitions (inferred as the
+        // remainder), and Conversation (actual messages minus injected
         // compartments/facts/memories).
         //
         // The token count includes text, reasoning, tool inputs, tool outputs, and tool_result content from every Anthropic message-part type.

@@ -1,4 +1,7 @@
 /**
+ * Pure direct-format classification, the database-incarnation identity, and
+ * the direct-format marker vocabulary shared with the Rust runtimes
+ * (mc-store and the dashboard).
  *
  * `PRAGMA application_id` uses `MC_APPLICATION_ID` (`"MCTX"`).
  * `PRAGMA user_version` uses `DIRECT_FORMAT_EPOCH`.
@@ -36,8 +39,8 @@ export const DIRECT_FORMAT_MARKER_TABLE = "mc_format_marker";
 export const FORMAT_MARKER_DIGEST_PROTOCOL = "mc-direct-format-marker-v1";
 
 /**
- * Classification rejects database families containing a `.mc-reset` sidecar.
- * reset artifact.
+ * Sidecar suffix for the interruption-safe reset marker; classification
+ * refuses a family with a pending reset artifact.
  */
 export const DATABASE_RESET_MARKER_SUFFIX = ".mc-reset";
 

@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from "bun:test";
 import { DREAMER_REVIEWER_AGENT } from "../../../agents/dreamer";
 import type { Database } from "../../../shared/sqlite";
 import { dreamerManifestIdentity, readDreamerProjectClaims } from "../dreamer/claim-manifest";
+import { assistantMessages } from "../dreamer/dreamer-test-support";
 import { acquireLeaseWithAcquisition, releaseLease } from "../dreamer/lease";
 import { claimEffectMemoryChanges } from "../dreamer/storage-dream-runs";
 import { createDirectTestDatabase } from "../test-database";
@@ -42,15 +43,6 @@ function acquire(db: Database, holderId = "holder") {
     const acquisition = acquireLeaseWithAcquisition(db, holderId, LEASE);
     if (!acquisition) throw new Error("test lease unavailable");
     return acquisition;
-}
-
-function assistantMessages(text: string) {
-    return [
-        {
-            info: { role: "assistant", time: { created: Date.now() } },
-            parts: [{ type: "text", text }],
-        },
-    ];
 }
 
 function reviewClient(text: string, beforeMessages?: () => void) {

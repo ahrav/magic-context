@@ -98,6 +98,7 @@ import {
     type ClaimMirrorSnapshotRequest,
     type ClaimMirrorSnapshotResponse,
     encodeOpenCodeMessagesToCk,
+    type ModuleOrdinalMemo,
     resolveOrdinalsForModule,
 } from "./module-wire";
 import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
@@ -1480,6 +1481,17 @@ export function createRustModeTransform(
         state.ordinalMemoCanonicalCount = 0;
     };
 
+    // The single projection from session state to the resolver's memo bundle;
+    // evaluated at call time so a preceding resetOrdinalMemo is observed.
+    const ordinalMemoOf = (state: RustSessionState): ModuleOrdinalMemo => ({
+        generation: state.moduleGeneration,
+        memoGeneration: state.idOrdinalMemoGeneration,
+        entries: state.idOrdinalMemo,
+        anchor: state.ordinalMemoAnchor,
+        storedCount: state.ordinalMemoStoredCount,
+        canonicalCount: state.ordinalMemoCanonicalCount,
+    });
+
     const invalidateWireState = (sessionId: string): void => {
         wireCaches.delete(sessionId);
         const state = states.get(sessionId);
@@ -2108,12 +2120,7 @@ export function createRustModeTransform(
             let resolved = await resolveOrdinalsForModule({
                 sessionId,
                 messages: ordinalMessages,
-                generation: state.moduleGeneration,
-                memoGeneration: state.idOrdinalMemoGeneration,
-                memo: state.idOrdinalMemo,
-                memoAnchor: state.ordinalMemoAnchor,
-                memoStoredCount: state.ordinalMemoStoredCount,
-                memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                memo: ordinalMemoOf(state),
                 provisionalBase,
             });
             logStage(sessionId, "ordinalResolve", ordinalStartedAt, timings);
@@ -2124,12 +2131,7 @@ export function createRustModeTransform(
                 resolved = await resolveOrdinalsForModule({
                     sessionId,
                     messages,
-                    generation: state.moduleGeneration,
-                    memoGeneration: state.idOrdinalMemoGeneration,
-                    memo: state.idOrdinalMemo,
-                    memoAnchor: state.ordinalMemoAnchor,
-                    memoStoredCount: state.ordinalMemoStoredCount,
-                    memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                    memo: ordinalMemoOf(state),
                     provisionalBase: state.ordinalContinuationBase ?? undefined,
                 });
                 logStage(
@@ -2299,18 +2301,12 @@ export function createRustModeTransform(
                           agentName: deps.getNotificationParams?.(sessionId)?.agent,
                       })
                     : undefined;
-            let body = buildTransformBody({
+            // Fields both the first attempt and the full-wire retry forward
+            // unchanged. `fullArrayFingerprint` stays per-site: the retry
+            // rebuilds `pendingWireCache` before its call and must read the
+            // rebuilt fingerprint.
+            const transformBodyBase = {
                 sessionId,
-                input: encodedInput,
-                nativeMessages: wireDelta ? messages.slice(wireDelta.rawStart) : messages,
-                fullArrayFingerprint: pendingWireCache.fingerprint,
-                tailDelta: wireDelta
-                    ? {
-                          after: wireDelta.after,
-                          replaceFrom: wireDelta.wireStart,
-                          nativeReplaceFrom: wireDelta.rawStart,
-                      }
-                    : undefined,
                 passInputs,
                 usage: {
                     ...passUsage(usage, contextLimit),
@@ -2328,6 +2324,19 @@ export function createRustModeTransform(
                 requestObservedAtMs,
                 channel2NudgeState: String(passInputs.channel2_nudge_state ?? ""),
                 emergencyRecoveryArmed: passInputs.emergency_recovery_armed === true,
+            };
+            let body = buildTransformBody({
+                ...transformBodyBase,
+                input: encodedInput,
+                nativeMessages: wireDelta ? messages.slice(wireDelta.rawStart) : messages,
+                fullArrayFingerprint: pendingWireCache.fingerprint,
+                tailDelta: wireDelta
+                    ? {
+                          after: wireDelta.after,
+                          replaceFrom: wireDelta.wireStart,
+                          nativeReplaceFrom: wireDelta.rawStart,
+                      }
+                    : undefined,
             });
             logStage(
                 sessionId,
@@ -2451,12 +2460,7 @@ export function createRustModeTransform(
                     let retryResolved = await resolveOrdinalsForModule({
                         sessionId,
                         messages,
-                        generation: state.moduleGeneration,
-                        memoGeneration: state.idOrdinalMemoGeneration,
-                        memo: state.idOrdinalMemo,
-                        memoAnchor: state.ordinalMemoAnchor,
-                        memoStoredCount: state.ordinalMemoStoredCount,
-                        memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                        memo: ordinalMemoOf(state),
                         provisionalBase: state.ordinalContinuationBase ?? undefined,
                     });
                     logStage(
@@ -2471,12 +2475,7 @@ export function createRustModeTransform(
                         retryResolved = await resolveOrdinalsForModule({
                             sessionId,
                             messages,
-                            generation: state.moduleGeneration,
-                            memoGeneration: state.idOrdinalMemoGeneration,
-                            memo: state.idOrdinalMemo,
-                            memoAnchor: state.ordinalMemoAnchor,
-                            memoStoredCount: state.ordinalMemoStoredCount,
-                            memoCanonicalCount: state.ordinalMemoCanonicalCount,
+                            memo: ordinalMemoOf(state),
                         });
                     }
                     if (!retryResolved.ok) {
@@ -2514,29 +2513,10 @@ export function createRustModeTransform(
                     };
                     const retryWireBuildStartedAt = performance.now();
                     body = buildTransformBody({
-                        sessionId,
+                        ...transformBodyBase,
                         input: retryEncodedInput,
                         nativeMessages: messages,
                         fullArrayFingerprint: pendingWireCache.fingerprint,
-                        passInputs,
-                        usage: {
-                            ...passUsage(usage, contextLimit),
-                            final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
-                            final_wire_trusted: finalWireEstimate?.trusted === true,
-                        },
-                        geometry: transformGeometry,
-                        modelKey: modelKey ?? null,
-                        providerId: model?.providerID ?? null,
-                        systemPromptHash: sessionMeta.systemPromptHash ?? "",
-                        upgradeState: String(passInputs.upgrade_state ?? ""),
-                        midTurn,
-                        prevResponseCompletedAtMs:
-                            sessionMeta.lastResponseTime > 0
-                                ? sessionMeta.lastResponseTime
-                                : undefined,
-                        requestObservedAtMs,
-                        channel2NudgeState: String(passInputs.channel2_nudge_state ?? ""),
-                        emergencyRecoveryArmed: passInputs.emergency_recovery_armed === true,
                     });
                     logStage(
                         sessionId,
@@ -2895,16 +2875,6 @@ export function createRustModeTransform(
             };
         },
     };
-}
-
-export async function runRustModeTransform(
-    transform: ReturnType<typeof createRustModeTransform>,
-    sessionId: string,
-    messages: MessageLike[],
-    output: { messages: unknown[] },
-    sessionMeta: ReturnType<typeof getOrCreateSessionMeta>,
-): Promise<void> {
-    await transform.run(sessionId, messages, output, sessionMeta);
 }
 
 export const __rustModeTransformTest = {

@@ -825,7 +825,7 @@ describe("sqlite runtime gate", () => {
                 "2024-05-23 13:25:27 96c92aba00c8375bc32fafcdf12429c58bd8aabfcadab6683e35bbb9cdebf19e",
         });
         expect(result.ok).toBe(false);
-        expect(result.reasons).toEqual(["SQLite 3.46.0 predates the WAL-reset fix in 3.47.1"]);
+        expect(result.reasons).toEqual(["SQLite 3.46.0 is below the supported floor 3.51.3"]);
     });
 
     it("fails an unknown SQLite source identity", () => {

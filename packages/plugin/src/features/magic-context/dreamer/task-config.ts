@@ -56,21 +56,7 @@ export function userMemoryCollectionEnabled(dreamer: DreamerConfig | undefined):
     return typeof schedule === "string" && schedule.trim() !== "";
 }
 
-/* */
-export function userMemoryPromotionThreshold(dreamer: DreamerConfig | undefined): number {
-    return dreamer?.tasks?.["review-user-memories"]?.promotion_threshold ?? 3;
-}
-
-/* */
-export function dreamTaskScheduled(
-    dreamer: DreamerConfig | undefined,
-    task: keyof NonNullable<DreamerConfig["tasks"]>,
-): boolean {
-    const schedule = dreamer?.tasks?.[task]?.schedule;
-    return typeof schedule === "string" && schedule.trim() !== "";
-}
-
-/* */
+/** Names of the tasks the user has scheduled (schedule != ""), in canonical order. */
 export function enabledDreamTasks(dreamer: DreamerConfig | undefined): DreamTaskName[] {
     if (!dreamer?.tasks) return [];
     return CANONICAL_DREAM_TASKS.filter((t) => dreamer.tasks[t]?.schedule?.trim());

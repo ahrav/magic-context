@@ -61,11 +61,6 @@ describe("compaction.enabled accessor exclusivity (issue #266)", () => {
         expect(offenders).toEqual([]);
     });
 
-    it("isCompactionEnabled is exported from the accessor module", async () => {
-        const mod = await import("../config/agent-disable");
-        expect(typeof mod.isCompactionEnabled).toBe("function");
-    });
-
     it("isCompactionEnabled resolves default-on for absent block and explicit true, off for false", async () => {
         const { isCompactionEnabled } = await import("../config/agent-disable");
         expect(isCompactionEnabled({})).toBe(true);

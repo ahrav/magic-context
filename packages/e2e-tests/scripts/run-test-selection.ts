@@ -47,9 +47,25 @@ export function prospectiveUnitFiles(root: string = E2E_ROOT): string[] {
 }
 
 /**
- * The OpenCode standalone list contains harness-booting historian-eval tests so Rust and Pi modes never run them.
+ * Pure-data historian-eval lane tests (contract, scorer, mutation battery,
+ * promote) and the metamorphic lane built on them. Harness-booting lane tests
+ * live in the OpenCode standalone list instead, so they never run under rust or
+ * pi modes.
+ *
+ * The metamorphic directory belongs here rather than in `standaloneUnitFiles`:
+ * its transforms, invariants, and canary are credential-free and boot nothing,
+ * and `historian-eval-contracts` is the job that exists so a deterministic
+ * historian gate cannot be skipped by an unrelated failure. Classified as a
+ * standalone unit, it ran only inside the host-mode suites and never in that job,
+ * because `--historian-eval-unit` selects no standalone files at all.
  */
 export function historianEvalUnitFiles(root: string = E2E_ROOT): string[] {
+    // Historian only. The metamorphic suite is owned by `metamorphicEvalUnitFiles`
+    // and runs in its own CI job; globbing it here as well ran every metamorphic
+    // test twice per PR and made a metamorphic-only regression fail the HISTORIAN
+    // status, which contradicts that job being the single owner.
+    // `assertSrcTestsClassified` already claims those files through
+    // `metamorphicEvalUnitFiles`, so dropping them here leaves nothing unclassified.
     const files = [
         ...new Glob("src/historian-eval/**/*.test.ts").scanSync({
             cwd: root,
@@ -62,7 +78,19 @@ export function historianEvalUnitFiles(root: string = E2E_ROOT): string[] {
     return files;
 }
 
-/** These tests validate the credential-free dreamer manifest contract and scorer. */
+/** Credential-free metamorphic transform and invariant tests. */
+export function metamorphicEvalUnitFiles(root: string = E2E_ROOT): string[] {
+    const files = [
+        ...new Glob("src/metamorphic-eval/**/*.test.ts").scanSync({
+            cwd: root,
+            onlyFiles: true,
+        }),
+    ].sort();
+    if (files.length === 0) throw new Error("metamorphic eval unit selection is empty");
+    return files;
+}
+
+/** Credential-free dreamer manifest contract and scorer tests. */
 export function dreamerEvalUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
         ...new Glob("src/dreamer-eval/**/*.test.ts").scanSync({
@@ -129,6 +157,7 @@ export function assertSrcTestsClassified(root: string = E2E_ROOT): void {
         ...incidentUnitFiles(root).filter((file) => file.startsWith("src/")),
         ...prospectiveUnitFiles(root).filter((file) => file.startsWith("src/")),
         ...historianEvalUnitFiles(root),
+        ...metamorphicEvalUnitFiles(root),
         ...dreamerEvalUnitFiles(root),
         ...standaloneUnitFiles(root),
         ...tsOpenCodeStandaloneFiles(root),
@@ -183,42 +212,49 @@ export function standaloneFilesForSelection(
     ];
 }
 
+const UNIT_SELECTIONS = {
+    "--incident-unit": incidentUnitFiles,
+    "--prospective-unit": prospectiveUnitFiles,
+    "--historian-eval-unit": historianEvalUnitFiles,
+    "--metamorphic-eval-unit": metamorphicEvalUnitFiles,
+    "--dreamer-eval-unit": dreamerEvalUnitFiles,
+} as const;
+
+type UnitSelectionFlag = keyof typeof UNIT_SELECTIONS;
+type TestSelection =
+    | { kind: "unit"; flag: UnitSelectionFlag }
+    | { kind: "mode"; mode: Mode };
+
 interface CliArgs {
-    incidentUnit: boolean;
-    prospectiveUnit: boolean;
-    historianEvalUnit: boolean;
-    dreamerEvalUnit: boolean;
-    mode: Mode | null;
+    selection: TestSelection;
     harness: GreenHarness;
     timeoutMs: number;
     maxConcurrency: number | null;
 }
 
-function parseArgs(args: string[]): CliArgs {
-    let incidentUnit = false;
-    let prospectiveUnit = false;
-    let historianEvalUnit = false;
-    let dreamerEvalUnit = false;
-    let mode: Mode | null = null;
+export function parseArgs(args: string[]): CliArgs {
+    let selection: TestSelection | null = null;
+    let selectionConflict = false;
     let harness: GreenHarness = "all";
     let timeoutMs = 120_000;
     let maxConcurrency: number | null = null;
     for (let index = 0; index < args.length; index += 1) {
         const arg = args[index];
-        if (arg === "--incident-unit") {
-            incidentUnit = true;
-        } else if (arg === "--prospective-unit") {
-            prospectiveUnit = true;
-        } else if (arg === "--historian-eval-unit") {
-            historianEvalUnit = true;
-        } else if (arg === "--dreamer-eval-unit") {
-            dreamerEvalUnit = true;
+        if (Object.hasOwn(UNIT_SELECTIONS, arg)) {
+            const next = { kind: "unit", flag: arg as UnitSelectionFlag } as const;
+            selectionConflict ||= selection !== null &&
+                (selection.kind !== "unit" || selection.flag !== next.flag);
+            selection ??= next;
         } else if (arg === "--mode") {
             const value = args[++index];
             if (value !== "ts" && value !== "rust") {
                 throw new Error("--mode requires ts or rust");
             }
-            mode = value;
+            selectionConflict ||= selection !== null &&
+                (selection.kind !== "mode" || selection.mode !== value);
+            if (selection === null || selection.kind === "mode") {
+                selection = { kind: "mode", mode: value };
+            }
         } else if (arg === "--harness") {
             const value = args[++index];
             if (value !== "all" && value !== "opencode" && value !== "pi") {
@@ -241,39 +277,31 @@ function parseArgs(args: string[]): CliArgs {
             maxConcurrency = value;
         } else if (arg === "--help" || arg === "-h") {
             console.log(
-                "Usage: run-test-selection.ts (--incident-unit | --prospective-unit | --historian-eval-unit | --dreamer-eval-unit | --mode ts|rust [--harness all|opencode|pi]) [--timeout <ms>] [--max-concurrency <n>]",
+                "Usage: run-test-selection.ts (--incident-unit | --prospective-unit | --historian-eval-unit | --metamorphic-eval-unit | --dreamer-eval-unit | --mode ts|rust [--harness all|opencode|pi]) [--timeout <ms>] [--max-concurrency <n>]",
             );
             process.exit(0);
         } else {
             throw new Error(`unknown argument: ${arg}`);
         }
     }
-    const selectionCount =
-        Number(incidentUnit) + Number(prospectiveUnit) + Number(historianEvalUnit) + Number(dreamerEvalUnit) + Number(mode !== null);
-    if (selectionCount !== 1) {
+    if (selection === null || selectionConflict) {
         throw new Error(
-            "select exactly one of --incident-unit, --prospective-unit, --historian-eval-unit, --dreamer-eval-unit, or --mode",
+            "select exactly one of --incident-unit, --prospective-unit, --historian-eval-unit, --metamorphic-eval-unit, --dreamer-eval-unit, or --mode",
         );
     }
-    if ((incidentUnit || prospectiveUnit || historianEvalUnit || dreamerEvalUnit) && harness !== "all") {
+    if (selection.kind === "unit" && harness !== "all") {
         throw new Error("--harness does not apply to unit test selections");
     }
-    return { incidentUnit, prospectiveUnit, historianEvalUnit, dreamerEvalUnit, mode, harness, timeoutMs, maxConcurrency };
+    return { selection, harness, timeoutMs, maxConcurrency };
 }
 
 async function main(): Promise<number> {
     const args = parseArgs(Bun.argv.slice(2));
     assertSrcTestsClassified();
-    const files = args.incidentUnit
-        ? incidentUnitFiles()
-        : args.prospectiveUnit
-          ? prospectiveUnitFiles()
-          : args.historianEvalUnit
-            ? historianEvalUnitFiles()
-            : args.dreamerEvalUnit
-              ? dreamerEvalUnitFiles()
-            : greenTestFiles(args.mode!, args.harness);
-    if (args.mode === "rust") {
+    const files = args.selection.kind === "unit"
+        ? UNIT_SELECTIONS[args.selection.flag]()
+        : greenTestFiles(args.selection.mode, args.harness);
+    if (args.selection.kind === "mode" && args.selection.mode === "rust") {
         const prerequisite = detectRustPrerequisites();
         if (!prerequisite.ok) {
             throw new Error(
@@ -282,10 +310,12 @@ async function main(): Promise<number> {
         }
     }
     const wrapper = "tests/incident-pool-green.test.ts";
-    const standalone =
-        args.incidentUnit || args.prospectiveUnit || args.historianEvalUnit || args.dreamerEvalUnit
-            ? []
-            : standaloneFilesForSelection(args.mode!, args.harness);
+    // The wrapper drives the whole pool in-process, so it runs alone in a
+    // second phase. Hermetic standalone units ride the first phase; the
+    // Cargo-fixture ones join only when Rust prerequisites were proven above.
+    const standalone = args.selection.kind === "unit"
+        ? []
+        : standaloneFilesForSelection(args.selection.mode, args.harness);
     const selected = [...files, ...standalone];
     const groups = selected.includes(wrapper)
         ? [selected.filter((file) => file !== wrapper), [wrapper]]
@@ -309,7 +339,7 @@ async function main(): Promise<number> {
             cwd: resolve(E2E_ROOT),
             env: {
                 ...process.env,
-                ...(args.mode ? { MC_E2E_MODE: args.mode } : {}),
+                ...(args.selection.kind === "mode" ? { MC_E2E_MODE: args.selection.mode } : {}),
             },
             stdin: "inherit",
             stdout: "inherit",

@@ -764,9 +764,11 @@ describe("module compartment ordinal serialization", () => {
         const wire = await resolveOrdinalsForModule({
             sessionId,
             messages: [inputMessage],
-            generation: state.moduleGeneration,
-            memoGeneration: state.idOrdinalMemoGeneration,
-            memo: state.idOrdinalMemo,
+            memo: {
+                generation: state.moduleGeneration,
+                memoGeneration: state.idOrdinalMemoGeneration,
+                entries: state.idOrdinalMemo,
+            },
         });
         expect(wire).toEqual(
             expect.objectContaining({
@@ -813,11 +815,13 @@ describe("module compartment ordinal serialization", () => {
         const result = await resolveOrdinalsForModule({
             sessionId,
             messages: [wireMessage(sessionId, "m2")],
-            generation: state.moduleGeneration,
-            memoGeneration: state.idOrdinalMemoGeneration,
-            memo: state.idOrdinalMemo,
-            memoStoredCount: 3,
-            memoCanonicalCount: 0,
+            memo: {
+                generation: state.moduleGeneration,
+                memoGeneration: state.idOrdinalMemoGeneration,
+                entries: state.idOrdinalMemo,
+                storedCount: 3,
+                canonicalCount: 0,
+            },
         });
 
         expect(result).toEqual(expect.objectContaining({ ok: false, reason: "mismatch" }));
@@ -882,9 +886,7 @@ describe("module compartment ordinal serialization", () => {
                 wireMessage(sessionId, "m2"),
                 wireMessage(sessionId, "m3"),
             ],
-            generation: 1,
-            memoGeneration: 1,
-            memo: new Map(),
+            memo: { generation: 1, memoGeneration: 1, entries: new Map() },
         });
 
         expect(result).toEqual(
@@ -918,9 +920,7 @@ describe("module compartment ordinal serialization", () => {
                 },
                 wireMessage(sessionId, "m2"),
             ],
-            generation: 1,
-            memoGeneration: 1,
-            memo: new Map(),
+            memo: { generation: 1, memoGeneration: 1, entries: new Map() },
         });
 
         expect(result).toEqual(

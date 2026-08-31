@@ -109,22 +109,6 @@ function extractTier(inner: string, index: number): string | undefined {
     return unescapeXml(body.trim());
 }
 
-/**
- */
-export function extractTiersFromInner(inner: string): {
-    p1?: string;
-    p2?: string;
-    p3?: string;
-    p4?: string;
-} {
-    return {
-        p1: extractTier(inner, 0),
-        p2: extractTier(inner, 1),
-        p3: extractTier(inner, 2),
-        p4: extractTier(inner, 3),
-    };
-}
-
 export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
     const compartments: ParsedCompartment[] = [];
     const facts: ParsedFact[] = [];

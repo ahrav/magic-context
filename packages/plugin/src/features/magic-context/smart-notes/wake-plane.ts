@@ -1,6 +1,6 @@
 import { statSync } from "node:fs";
 import { getDataDir } from "../../../shared/data-path";
-import { McHostClient } from "../../../shared/mc-host-client";
+import { processMcHostClient } from "../../../shared/mc-host-client";
 import { defaultConnectionFilePath } from "../../../shared/mc-host-lifecycle/paths";
 
 /** `wake.create` indicates that scheduled wakes own condition evaluation. */
@@ -47,16 +47,13 @@ function readDaemonPublication(): string | null {
 }
 
 async function probeWakePlaneCatalog(): Promise<readonly CatalogEntry[]> {
-    const client = await McHostClient.connect({
+    // `requestTimeoutMs` is part of the process-client cache key. Setting it here buys this probe its own client and its own ring mappings; the per-call timeout reaches the same deadline on the shared client.
+    const client = await processMcHostClient({
         connectionFile: connectionFile(),
         handshakeTimeoutMs: WAKE_PLANE_HANDSHAKE_TIMEOUT_MS,
-        requestTimeoutMs: WAKE_PLANE_CATALOG_TIMEOUT_MS,
+        credentialSource: process.env,
     });
-    try {
-        return await client.catalogList();
-    } finally {
-        await client.closeAsync().catch(() => undefined);
-    }
+    return client.catalogList({ timeoutMs: WAKE_PLANE_CATALOG_TIMEOUT_MS });
 }
 
 function catalogHasWakePlane(entries: readonly CatalogEntry[]): boolean {
@@ -76,7 +73,15 @@ async function probeStatus(): Promise<WakePlaneStatus> {
 }
 
 /**
- * An affirmative answer is reusable only while its daemon retains the publication.
+ * Every retained answer is bound to the daemon publication it was proved
+ * against. An affirmative answer may only
+ * be reused while that daemon still owns the publication, so a replacement can
+ * never inherit the capability. A negative or unknown answer is bound the same
+ * way: under lazy demand-start the common case is a passive probe that runs
+ * BEFORE the first Rust or Synapse demand, and the managed start that follows
+ * publishes a new connection file. Without this binding that answer would keep
+ * standalone evaluation on for the rest of its TTL while the daemon already
+ * owns scheduled wakes, so both planes would evaluate the same conditions.
  */
 function isRetainedAnswerUsable(cache: WakePlaneStatusCache): boolean {
     // `present` with no readable publication is never reusable.

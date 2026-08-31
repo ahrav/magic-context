@@ -16,7 +16,6 @@ import {
     assertMutationReplayResults,
     changedVerifiers,
     crossCheckEvidenceInventory,
-    deferralPermittedFor,
     E2E_ROOT,
     EXPECTED_MUTATION_ARTIFACTS,
     EXPECTED_MUTATION_RECORDS,
@@ -197,16 +196,8 @@ describe("source inventory completeness (R1)", () => {
     });
 });
 
-describe("deferred hardening records (merge gate)", () => {
-    it("are permitted only while the matrix is unresolved", () => {
-        expect(deferralPermittedFor("unresolved")).toBe(true);
-        expect(deferralPermittedFor("valid")).toBe(false);
-        expect(deferralPermittedFor("invalid")).toBe(false);
-    });
-});
-
 describe("mutation evidence normalization (R11)", () => {
-    it("derives the accepted 20-artifact/27-record snapshot from live files", () => {
+    it("derives the accepted artifact and record snapshot from live files", () => {
         const view = committedView();
         assertEvidenceSnapshot(view);
         expect(view.artifacts).toHaveLength(EXPECTED_MUTATION_ARTIFACTS);

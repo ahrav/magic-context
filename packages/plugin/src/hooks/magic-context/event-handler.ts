@@ -1,6 +1,9 @@
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
-import { detectOverflow } from "../../features/magic-context/overflow-detection";
+import {
+    detectOverflow,
+    type OverflowDetection,
+} from "../../features/magic-context/overflow-detection";
 import {
     clearHistorianFailureState,
     clearPendingCompactionMarkerStateIf,
@@ -81,7 +84,10 @@ export interface EventHandlerDeps {
     contextUsageMap: Map<string, ContextUsageEntry>;
     compactionHandler: ReturnType<typeof createCompactionHandler>;
     /**
-     * Boot-resolved compaction-off mode records the provider limit without arming overflow recovery or Channel 2; disabling compaction clears persisted intent.
+     * Compaction-off mode, boot-resolved. Overflow recovery is
+     * never armed in this mode (record the provider-reported limit only, so
+     * raw-usage math stays accurate) and Channel-2 delivery stays silent;
+     * the off-transition clears any persisted intent.
      */
     compactionOff?: boolean;
     onSessionCacheInvalidated?: (sessionId: string) => void;
@@ -233,6 +239,33 @@ function cleanupRemovedMessageState(
     })();
 }
 
+/** Record a provider-reported context limit without arming overflow recovery. */
+function recordLimitWithoutArming(
+    db: Parameters<typeof recordDetectedContextLimit>[0],
+    sessionId: string,
+    detection: Pick<
+        OverflowDetection,
+        "reportedLimit" | "reportedLimitProvenance" | "matchedPattern"
+    >,
+    modelKey: string | undefined,
+    logSuffix: string,
+    note?: string,
+): void {
+    if (typeof detection.reportedLimit === "number" && detection.reportedLimit > 0) {
+        recordDetectedContextLimit(
+            db,
+            sessionId,
+            detection.reportedLimit,
+            modelKey,
+            detection.reportedLimitProvenance,
+        );
+    }
+    sessionLog(
+        sessionId,
+        `overflow detected ${logSuffix}: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only${note ? ` (${note})` : ""}`,
+    );
+}
+
 export function createEventHandler(deps: EventHandlerDeps) {
     return async (input: { event: { type: string; properties?: unknown } }): Promise<void> => {
         evictExpiredUsageEntries(deps.contextUsageMap);
@@ -291,45 +324,35 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 });
                 const sessionMeta = getOrCreateSessionMeta(deps.db, errInfo.sessionID);
                 if (sessionMeta.isSubagent) {
-                    // Subagents skip recovery because they cannot run historian.
-                    if (
-                        typeof detection.reportedLimit === "number" &&
-                        detection.reportedLimit > 0
-                    ) {
-                        recordDetectedContextLimit(
-                            deps.db,
-                            errInfo.sessionID,
-                            detection.reportedLimit,
-                            undefined,
-                            detection.reportedLimitProvenance,
-                        );
-                    }
-                    sessionLog(
+                    // Subagents can't run historian, so we skip the recovery
+                    // flag — but the reported limit is still useful data for
+                    // pressure math (consumed by resolveContextLimit via
+                    // getOverflowState). Record it without arming recovery.
+                    recordLimitWithoutArming(
+                        deps.db,
                         errInfo.sessionID,
-                        `overflow detected on subagent: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only (subagents cannot run historian)`,
+                        detection,
+                        undefined,
+                        "on subagent",
+                        "subagents cannot run historian",
                     );
                     return;
                 }
                 const existing = getOverflowState(deps.db, errInfo.sessionID);
                 if (deps.compactionOff) {
-                    // Compaction-off mode never arms MC emergency recovery.
-                    // Disabling compaction clears any persisted latch.
-                    // Disabling compaction clears any persisted latch.
-                    if (
-                        typeof detection.reportedLimit === "number" &&
-                        detection.reportedLimit > 0
-                    ) {
-                        recordDetectedContextLimit(
-                            deps.db,
-                            errInfo.sessionID,
-                            detection.reportedLimit,
-                            undefined,
-                            detection.reportedLimitProvenance,
-                        );
-                    }
-                    sessionLog(
+                    // Compaction-off: never arm MC emergency recovery — the
+                    // latch machinery is gated off and the off-transition
+                    // clears any persisted latch. The provider-reported limit
+                    // is still useful for raw-usage math (the sidebar's only
+                    // numeric source in this mode), so record it without
+                    // arming, exactly like the subagent path above.
+                    recordLimitWithoutArming(
+                        deps.db,
                         errInfo.sessionID,
-                        `overflow detected in compaction-off mode: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only (recovery disarmed; native compaction owns the window)`,
+                        detection,
+                        undefined,
+                        "in compaction-off mode",
+                        "recovery disarmed; native compaction owns the window",
                     );
                     return;
                 }
@@ -420,39 +443,25 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         const overflowModelKey = resolveModelKey(info.providerID, info.modelID);
                         const metaForOverflow = getOrCreateSessionMeta(deps.db, info.sessionID);
                         if (metaForOverflow.isSubagent) {
-                            if (
-                                typeof detection.reportedLimit === "number" &&
-                                detection.reportedLimit > 0
-                            ) {
-                                recordDetectedContextLimit(
-                                    deps.db,
-                                    info.sessionID,
-                                    detection.reportedLimit,
-                                    overflowModelKey,
-                                    detection.reportedLimitProvenance,
-                                );
-                            }
-                            sessionLog(
+                            // Still record the detected limit (useful for
+                            // pressure math), but don't arm recovery — see
+                            // session.error path above.
+                            recordLimitWithoutArming(
+                                deps.db,
                                 info.sessionID,
-                                `overflow detected on subagent via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only`,
+                                detection,
+                                overflowModelKey,
+                                "on subagent via message.updated",
                             );
                         } else if (deps.compactionOff) {
-                            // Compaction-off mode records the limit without arming recovery.
-                            if (
-                                typeof detection.reportedLimit === "number" &&
-                                detection.reportedLimit > 0
-                            ) {
-                                recordDetectedContextLimit(
-                                    deps.db,
-                                    info.sessionID,
-                                    detection.reportedLimit,
-                                    overflowModelKey,
-                                    detection.reportedLimitProvenance,
-                                );
-                            }
-                            sessionLog(
+                            // Compaction-off: record the limit only, never arm
+                            // recovery (mirrors the session.error path above).
+                            recordLimitWithoutArming(
+                                deps.db,
                                 info.sessionID,
-                                `overflow detected in compaction-off mode via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only`,
+                                detection,
+                                overflowModelKey,
+                                "in compaction-off mode via message.updated",
                             );
                         } else {
                             dropSlot(info.sessionID, "overflow-recovery-arm");

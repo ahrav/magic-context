@@ -96,7 +96,13 @@ export function getTaskScheduleStatesForProject(
 }
 
 /**
- * `last_run_at` records the last actual task run, successful or failed.
+ * Most recent successful Dreamer task run for a project, as an epoch-ms value,
+ * or null if no task has run yet. `last_run_at` advances only on task success
+ * (see the scheduler), so this is "last successful dreamer activity", the
+ * meaning the V1 `dream_state['last_dream_at:<project>']` field carried before
+ * Dreamer V2 retired it. Used by the OpenCode sidebar RPC and Pi's /ctx-status
+ * so the displayed "last run" reflects V2 per-task execution instead of a frozen
+ * V1 migration-seed timestamp.
  */
 export function getMostRecentTaskRunAt(db: Database, projectPath: string): number | null {
     const row = db

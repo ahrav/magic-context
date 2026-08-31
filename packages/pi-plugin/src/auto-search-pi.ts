@@ -5,16 +5,19 @@
  * The hint omits retrieved data.
  * The hint directs the agent to call `ctx_search` for full context.
  *
+ * ## Per-turn dedup
  *
- * Pi can re-fire `pi.on("context", ...)` multiple times for the same user message.
- * An empty cached hint records that the turn was evaluated and skipped.
- * A non-empty cached hint is appended only when the message lacks a `<ctx-search-hint>` block.
- * The process-local cache expires when a different latest user-message ID is observed or `clearAutoSearchForPiSession()` runs.
+ * Pi can re-fire `pi.on("context", ...)` multiple times for the same user
+ * turn. Auto-search decisions are persisted in `session_meta`, so a turn that
+ * was already evaluated is skipped and a non-empty hint replays through the
+ * same idempotent append guard.
  *
  * ## Timeout
  *
- * Embedding searches time out after 3000 ms.
- * On timeout, the `AbortController` aborts `unifiedSearch()`'s embedding fetch.
+ * The LLM-bound context path must not hang on embedding providers. We use
+ * the same cap as OpenCode's `auto-search-runner.ts`. On
+ * timeout the `AbortController` is fired so `unifiedSearch()` can cancel
+ * the underlying embedding fetch.
  *
  *
  * The runner mutates only the targeted latest user message in place.
@@ -24,9 +27,13 @@
  * was added.
  *
  *
- * The runner does not append a hint when the target message already contains a `<ctx-search-hint>` block.
- * The runner skips searching when raw user text contains `<sidekick-augmentation>`, `<ctx-search-hint>`, or `<ctx-search-auto>`.
- * Prompt extraction strips Magic Context markers and prior plugin blocks before embedding.
+ * Before appending, we check whether the target message already contains
+ * the exact hint or any `<ctx-search-hint>` block. Before searching, we
+ * skip if raw user text already contains `<sidekick-augmentation>`,
+ * `<ctx-search-hint>`, or `<ctx-search-auto>`, matching OpenCode's stacked
+ * augmentation guard (`auto-search-runner.ts`'s `hasStackedAugmentation`).
+ * Prompt extraction strips Magic Context markers and prior plugin blocks
+ * before embedding, matching OpenCode's prompt extraction.
  */
 
 import type { ContextEvent } from "@earendil-works/pi-coding-agent";
@@ -52,6 +59,11 @@ import {
 	packAutoSearchHint,
 } from "@magic-context/core/hooks/magic-context/auto-search-hint";
 import { extractBoundedAutoSearchQuery } from "@magic-context/core/hooks/magic-context/auto-search-prompt";
+import {
+	AUTO_SEARCH_TIMEOUT_MS,
+	hasStackedAugmentation,
+	unifiedSearchWithTimeout,
+} from "@magic-context/core/hooks/magic-context/auto-search-shared";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
@@ -73,42 +85,8 @@ export interface PiAutoSearchOptions {
 	projectPath: string;
 }
 
-const AUTO_SEARCH_TIMEOUT_MS = 3_000;
 const DEFAULT_SCORE_THRESHOLD = 0.55;
 const DEFAULT_MIN_PROMPT_CHARS = 20;
-
-async function unifiedSearchWithTimeout(
-	db: Database,
-	sessionId: string,
-	projectPath: string,
-	prompt: string,
-	options: UnifiedSearchOptions,
-	timeoutMs: number,
-): Promise<UnifiedSearchResult[] | null> {
-	const controller = new AbortController();
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const timeoutPromise = new Promise<null>((resolve) => {
-		timer = setTimeout(() => {
-			controller.abort();
-			resolve(null);
-		}, timeoutMs);
-	});
-
-	try {
-		return await Promise.race([
-			unifiedSearch(db, sessionId, projectPath, prompt, {
-				...options,
-				signal: controller.signal,
-				// Auto hints set `countRetrievals` to `false` because they are plugin-internal rather than explicit agent retrievals.
-				countRetrievals: false,
-				memoryPolicySurface: "auto_search",
-			}),
-			timeoutPromise,
-		]);
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-	}
-}
 
 function collectUserPromptParts(message: UserMessage): string {
 	const { content } = message;
@@ -121,14 +99,6 @@ function collectUserPromptParts(message: UserMessage): string {
 		}
 	}
 	return collected;
-}
-
-function hasStackedAugmentation(rawText: string): boolean {
-	return (
-		rawText.includes("<sidekick-augmentation>") ||
-		rawText.includes("<ctx-search-hint>") ||
-		rawText.includes("<ctx-search-auto>")
-	);
 }
 
 function extractUserPromptText(message: UserMessage): string {
@@ -276,7 +246,8 @@ export async function runAutoSearchHintForPi(args: {
 		}
 	};
 
-	// The runner checks raw text before stripping because stripping removes signal tags.
+	// Suppression check runs on raw text before stripping; OpenCode does the
+	// same because stripping removes the signal tags.
 	const rawPartsText = collectUserPromptParts(userMsg);
 	if (hasStackedAugmentation(rawPartsText)) {
 		sessionLog(
@@ -317,6 +288,8 @@ export async function runAutoSearchHintForPi(args: {
 				return result?.vector ?? null;
 			},
 			isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
+			// Primers v1 are cache-neutral: explicit ctx_search only,
+			// never transform-time auto-search prompt hints.
 			sources: ["memory", "message", "git_commit"],
 		};
 		results = await unifiedSearchWithTimeout(
@@ -365,6 +338,8 @@ export async function runAutoSearchHintForPi(args: {
 		return messages;
 	}
 
+	// Prefix with double newline so the hint is a separate block, matching
+	// OpenCode's auto-search runner.
 	const payload = `\n\n${packed.text}`;
 	const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
 		packed.delivered,
@@ -392,6 +367,8 @@ export async function runAutoSearchHintForPi(args: {
 }
 
 /**
+ * Session cleanup hook. No-op: auto-search decisions live in `session_meta`
+ * and are cleared by `clearSession()`.
  */
 export function clearAutoSearchForPiSession(_sessionId: string): void {
 }

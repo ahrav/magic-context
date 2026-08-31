@@ -8,6 +8,8 @@ import {
     assertSrcTestsClassified,
     historianEvalUnitFiles,
     incidentUnitFiles,
+    metamorphicEvalUnitFiles,
+    parseArgs,
     prospectiveUnitFiles,
     standaloneFilesForSelection,
     tsOpenCodeStandaloneFiles,
@@ -205,6 +207,37 @@ describe("mode manifest validator", () => {
         }
     });
 
+    it("runs the metamorphic lane in its own gate, not the host-mode suites", () => {
+        // `assertSrcTestsClassified` is satisfied by any claimant, so moving these
+        // into `standaloneUnitFiles` would pass it while removing them from the
+        // dedicated `metamorphic-eval-contracts` job — the job whose whole point is
+        // that a deterministic metamorphic gate cannot be skipped by an unrelated
+        // failure. No unit selection picks up standalone files, so that move is
+        // silent non-enforcement.
+        const metamorphic = metamorphicEvalUnitFiles();
+        expect(metamorphic).toContain("src/metamorphic-eval/transforms.test.ts");
+        expect(metamorphic).toContain("src/metamorphic-eval/invariants.test.ts");
+        expect(metamorphic).toContain("src/metamorphic-eval/injection-canary.test.ts");
+
+        // Owned by exactly one gate. The historian selection used to glob these too,
+        // which ran every metamorphic test twice per PR and made a metamorphic-only
+        // regression fail the historian status as well.
+        const historian = historianEvalUnitFiles();
+        for (const file of metamorphic) {
+            expect(historian).not.toContain(file);
+        }
+
+        for (const file of metamorphic) {
+            for (const selection of [
+                standaloneFilesForSelection("ts", "opencode"),
+                standaloneFilesForSelection("ts", "pi"),
+                standaloneFilesForSelection("rust", "all"),
+            ]) {
+                expect(selection).not.toContain(file);
+            }
+        }
+    });
+
     it("claims a historian-eval harness test in the OpenCode selection once it exists", () => {
         // The isolated root lets this test materialize HISTORIAN_EVAL_HARNESS_TESTS without adding repository files.
         const root = mkdtempSync(join(tmpdir(), "hse-selection-"));
@@ -239,6 +272,16 @@ describe("mode manifest validator", () => {
         );
     });
 
+    it("requires the metamorphic unit selection script", () => {
+        const pkg = JSON.parse(
+            readFileSync(resolve(E2E_ROOT, "package.json"), "utf8"),
+        ) as { scripts: Record<string, string> };
+        delete pkg.scripts["test:metamorphic-unit"];
+        expect(() => validateGreenPackageScripts(pkg)).toThrow(
+            /test:metamorphic-unit/,
+        );
+    });
+
     it("rejects invalid tiers and a both-modes entry missing an invocation", () => {
         const entries = validation.manifest.entries;
         expect(() =>
@@ -266,5 +309,38 @@ describe("mode manifest validator", () => {
                 validation.files,
             ),
         ).toThrow(/invocation disagrees with both-modes/);
+    });
+});
+
+describe("test selection arguments", () => {
+    it("accepts exactly one mode", () => {
+        expect(parseArgs(["--mode", "ts"]).selection).toEqual({ kind: "mode", mode: "ts" });
+    });
+
+    it("rejects two different modes", () => {
+        // Previously only a preceding UNIT selection counted as a conflict, so the
+        // second --mode silently overwrote the first and the run proceeded as rust.
+        expect(() => parseArgs(["--mode", "ts", "--mode", "rust"])).toThrow(
+            /select exactly one/,
+        );
+    });
+
+    it("accepts a repeated identical mode", () => {
+        // Symmetric with the unit branch, which only conflicts on a DIFFERENT flag.
+        expect(parseArgs(["--mode", "ts", "--mode", "ts"]).selection).toEqual({
+            kind: "mode",
+            mode: "ts",
+        });
+    });
+
+    it("rejects a mode combined with a unit selection, in either order", () => {
+        expect(() => parseArgs(["--incident-unit", "--mode", "ts"])).toThrow(/select exactly one/);
+        expect(() => parseArgs(["--mode", "ts", "--incident-unit"])).toThrow(/select exactly one/);
+    });
+
+    it("rejects two different unit selections", () => {
+        expect(() => parseArgs(["--incident-unit", "--prospective-unit"])).toThrow(
+            /select exactly one/,
+        );
     });
 });

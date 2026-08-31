@@ -369,7 +369,7 @@ function collectPluginEntries(directory: string): string[] {
  *
  *
  */
-export const OMO_PACKAGE_NAMES = new Set(["oh-my-opencode", "oh-my-openagent"]);
+const OMO_PACKAGE_NAMES = new Set(["oh-my-opencode", "oh-my-openagent"]);
 
 function checkOmoHooks(directory: string): {
     preemptiveCompaction: boolean;

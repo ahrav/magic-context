@@ -21,11 +21,12 @@
 
 import { constants as fsConstants } from "node:fs";
 import { type FileHandle, lstat, open } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import type { Deadline } from "./deadline";
 
 /** The wire protocol caps snapshots at 65,536 bytes. */
 export const MAX_CONNECTION_FILE_LEN = 65_536;
-export const CONNECTION_FILE_SCHEMA = 1;
+export const CONNECTION_FILE_SCHEMA = 2;
 export const KEY_LEN = 32;
 export const DAEMON_ID_LEN = 16;
 /** The reader rejects every wire-version value other than 2. */
@@ -46,7 +47,7 @@ export type ConnectionFileErrorCode =
     | "invalid_json"
     | "invalid_schema"
     | "invalid_wire_version"
-    | "invalid_endpoint"
+    | "invalid_setup_socket"
     | "invalid_key"
     | "invalid_daemon_id"
     | "invalid_pid"
@@ -66,8 +67,8 @@ export class ConnectionFileError extends Error {
 
 /* */
 export interface ConnectionSnapshot {
-    readonly endpoint: { readonly host: string; readonly port: number };
-    /** Callers must treat the 32-byte key as a bearer capability and never log it. */
+    readonly setupSocket: string;
+    /** Exactly 32 key bytes. Bearer capability; must never be logged. */
     readonly key: Uint8Array;
     /** The daemon ID contains exactly 16 bytes. */
     readonly daemonId: Uint8Array;
@@ -281,6 +282,10 @@ function invalid(code: ConnectionFileErrorCode, message: string): ConnectionFile
 }
 
 /**
+ * Validate the decoded JSON against wire doc Section 4.1: schema 2,
+ * a required wire version of exactly 2, an absolute setup-socket path,
+ * exactly 32 key bytes, exactly 16 daemon-ID bytes, a safe
+ * integer PID, and a nonempty daemon version. No coercion anywhere.
  */
 function validateSnapshotJson(parsed: unknown): ConnectionSnapshot {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -296,25 +301,11 @@ function validateSnapshotJson(parsed: unknown): ConnectionSnapshot {
             `connection file wire_version must be exactly ${WIRE_VERSION}`,
         );
     }
-    const endpoints = record.endpoints;
-    if (!Array.isArray(endpoints) || endpoints.length === 0) {
-        throw invalid("invalid_endpoint", "connection file must include at least one endpoint");
-    }
-    const first: unknown = endpoints[0];
-    if (typeof first !== "object" || first === null || Array.isArray(first)) {
-        throw invalid("invalid_endpoint", "connection file endpoints[0] must be an object");
-    }
-    const { host, port } = first as Record<string, unknown>;
-    if (host !== "127.0.0.1") {
+    const setupSocket = record.setup_socket;
+    if (typeof setupSocket !== "string" || setupSocket.length === 0 || !isAbsolute(setupSocket)) {
         throw invalid(
-            "invalid_endpoint",
-            "connection file endpoint host must be exactly 127.0.0.1",
-        );
-    }
-    if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65_535) {
-        throw invalid(
-            "invalid_endpoint",
-            "connection file endpoint port must be an integer in 1..=65535",
+            "invalid_setup_socket",
+            "connection file setup_socket must be an absolute path",
         );
     }
     const key = toExactByteArray(record.key, KEY_LEN);
@@ -340,7 +331,7 @@ function validateSnapshotJson(parsed: unknown): ConnectionSnapshot {
         throw invalid("invalid_daemon_ver", "connection file daemon_ver must be a nonempty string");
     }
     return Object.freeze({
-        endpoint: Object.freeze({ host: "127.0.0.1", port }),
+        setupSocket,
         key,
         daemonId,
         pid,

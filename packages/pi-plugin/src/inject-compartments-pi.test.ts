@@ -36,7 +36,7 @@ import {
 	renderM0Pi,
 	renderM1Pi,
 } from "./inject-compartments-pi";
-import { createTestDb, textOf, userMessage } from "./test-utils.test";
+import { createTestDb, textOf, userMessage } from "./test-utils";
 
 const seededClaims = new WeakMap<
 	ReturnType<typeof createTestDb>,

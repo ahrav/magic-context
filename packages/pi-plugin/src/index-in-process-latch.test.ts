@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import magicContextPiExtension, { __test } from "./index";
 import { MAGIC_CONTEXT_PI_SUBAGENT_ENV } from "./subagent-runner";
+import { createCountingPi } from "./test-utils";
 
 const originalEnv = {
 	MAGIC_CONTEXT_PI_SUBAGENT: process.env.MAGIC_CONTEXT_PI_SUBAGENT,
@@ -23,37 +23,6 @@ function isolateXdgEnv() {
 	const root = mkdtempSync(join(tmpdir(), "magic-context-pi-latch-test-"));
 	process.env.XDG_CONFIG_HOME = join(root, "config");
 	process.env.XDG_DATA_HOME = join(root, "data");
-}
-
-/**
- */
-function createCountingPi() {
-	const events: string[] = [];
-	const tools: string[] = [];
-	const flags: string[] = [];
-	const commands: string[] = [];
-	const entryRenderers: string[] = [];
-	const pi = {
-		on: mock((event: string) => {
-			events.push(event);
-		}),
-		registerTool: mock((tool: { name?: string }) => {
-			tools.push(tool.name ?? "<unnamed>");
-		}),
-		registerFlag: mock((name: string) => {
-			flags.push(name);
-		}),
-		registerCommand: mock((name: string) => {
-			commands.push(name);
-		}),
-		registerEntryRenderer: mock((customType: string) => {
-			entryRenderers.push(customType);
-		}),
-		appendEntry: mock(() => undefined),
-		sendMessage: mock(() => undefined),
-		sendUserMessage: mock(() => undefined),
-	} as unknown as ExtensionAPI;
-	return { pi, events, tools, flags, commands, entryRenderers };
 }
 
 afterEach(() => {

@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { getStrippedPlaceholderIds } from "@magic-context/core/features/magic-context/storage";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
-import { assistantMessage, createTestDb, userMessage } from "./test-utils.test";
+import { assistantMessage, createTestDb, userMessage } from "./test-utils";
 
 describe("stripPiDroppedPlaceholderMessages", () => {
 	it("discovers and removes ONLY assistant placeholder-only messages, never user-role", () => {

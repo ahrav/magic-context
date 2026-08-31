@@ -1,18 +1,10 @@
 import { embedAndStoreCompartmentChunks } from "../../features/magic-context/compartment-embedding";
 import { insertCompartmentEvents } from "../../features/magic-context/compartment-events";
+import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
 import {
     appendCompartments,
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
-import { cleanupHistorianStateFile } from "./historian-state-file";
-
-export {
-    cleanupHistorianStateFile,
-    HISTORIAN_STATE_INLINE_THRESHOLD,
-    maybeWriteHistorianStateFile,
-} from "./historian-state-file";
-
-import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
 import { promoteSessionFactsDurable } from "../../features/magic-context/memory";
 import {
     readAuthorizedClaimMemorySnapshot,
@@ -43,13 +35,13 @@ import { updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { insertPrimerCandidates } from "../../features/magic-context/storage-primers";
 import { getLatestHistorianInvocationId } from "../../features/magic-context/storage-subagent-invocations";
 import { insertUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
-import { normalizeSDKResponse } from "../../shared";
 import { describeError } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
+import { resolveSessionDirectory } from "./compartment-runner-mapping";
 import type { CompartmentRunnerDeps } from "./compartment-runner-types";
 import {
     buildHistorianFailureNotice,
@@ -58,6 +50,7 @@ import {
     validateChunkCoverage,
     validateStoredCompartments,
 } from "./compartment-runner-validation";
+import { cleanupHistorianStateFile } from "./historian-state-file";
 import { clearInjectionCache } from "./inject-compartments";
 import { onNoteTrigger } from "./note-nudger";
 import {
@@ -85,11 +78,6 @@ function shouldSuppressHistorianAlert(sessionId: string): boolean {
     }
     lastHistorianAlertBySession.set(sessionId, Date.now());
     return false;
-}
-
-/** Session deletion removes module-level historian alert state. */
-export function clearHistorianAlertState(sessionId: string): void {
-    lastHistorianAlertBySession.delete(sessionId);
 }
 
 export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<void> {
@@ -391,15 +379,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             sessionCompartments: priorCompartments,
         });
 
-        const parentSessionResponse = await client.session
-            .get({ path: { id: sessionId } })
-            .catch(() => null);
-        const parentSession = normalizeSDKResponse(
-            parentSessionResponse,
-            null as { directory?: string } | null,
-            { preferResponseOnMissingData: true },
-        );
-        const sessionDirectory = parentSession?.directory ?? directory;
+        const sessionDirectory = await resolveSessionDirectory(client, sessionId, directory);
 
         const memorySnapshot = readAuthorizedClaimMemorySnapshot(db, {
             authorizedIdentities: [projectPath],

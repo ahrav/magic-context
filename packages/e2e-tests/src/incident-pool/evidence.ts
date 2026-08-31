@@ -39,8 +39,8 @@ import { validateCommittedMatrix } from "../../scripts/validate-shm-hardening-ma
 export const E2E_ROOT = resolve(import.meta.dir, "..", "..");
 export const REPO_ROOT = resolve(E2E_ROOT, "..", "..");
 
-export const EXPECTED_MUTATION_ARTIFACTS = 20;
-export const EXPECTED_MUTATION_RECORDS = 27;
+export const EXPECTED_MUTATION_ARTIFACTS = 13;
+export const EXPECTED_MUTATION_RECORDS = 21;
 
 export const AUDIT_SOURCE_PATH = "docs/AUDIT-KNOWN-ISSUES.md";
 export const AUDITOR_SOURCE_PATH = "AUDITOR.md";
@@ -108,22 +108,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/**
- * `invalid` outcomes do not permit deferrals.
- * */
-export function deferralPermittedFor(
-    outcome: ReturnType<typeof validateCommittedMatrix>["outcome"],
-): boolean {
-    return outcome === "unresolved";
-}
-
-/**
- * assertDeferralStillPermitted re-reads the matrix for each deferred record because a cached verdict becomes stale when the matrix freezes.
- *  freezes. */
+/** Fail closed because the fixed-ring matrix has no unresolved state. */
 function assertDeferralStillPermitted(label: string): void {
-    if (deferralPermittedFor(validateCommittedMatrix().outcome)) return;
+    const outcome = validateCommittedMatrix().outcome;
     throw new Error(
-        `${label} is deferred, but the failure_hardening matrix is no longer unresolved: freezing it unblocks tuple execution, so this claim needs a real mutation record instead of a deferral`,
+        `${label} is deferred, but the fixed-ring matrix is ${outcome}: this claim needs a real mutation record instead of a deferral`,
     );
 }
 

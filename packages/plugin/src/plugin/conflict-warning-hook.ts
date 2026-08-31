@@ -7,10 +7,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
+import { sendIgnoredMessage } from "../hooks/magic-context/send-session-notification";
 import type { ConflictResult } from "../shared/conflict-detector";
 import { formatConflictShort } from "../shared/conflict-detector";
 import { log } from "../shared/logger";
-import { waitForSafeNotificationTarget } from "../shared/safe-notification-target";
 
 const CONFLICT_WARNING_MARKER = "⚠️ Magic Context is disabled due to conflicting configuration:";
 const SCHEMA_FENCE_MARKER = "⚠️ Magic Context is disabled — database is newer than this version";
@@ -190,50 +190,19 @@ export async function sendConflictWarning(
         return;
     }
 
-    // A non-synthetic user message in an untitled session permanently suppresses OpenCode title generation.
-    // The plugin retries a skipped notification on the next launch.
-    if ((await waitForSafeNotificationTarget(client, sessionId)) === "skip") return;
-
     const warningText = formatConflictShort(conflictResult);
 
     log(
         `[magic-context] sending conflict warning to session ${sessionId}: ${conflictResult.reasons.join(", ")}`,
     );
 
-    try {
-        const c = client as {
-            session?: {
-                prompt?: (input: unknown) => unknown;
-                promptAsync?: (input: unknown) => unknown;
-            };
-        };
-
-        const promptInput = {
-            path: { id: sessionId },
-            body: {
-                noReply: true,
-                parts: [
-                    {
-                        type: "text",
-                        text: warningText,
-                        ignored: true,
-                    },
-                ],
-            },
-        };
-
-        if (typeof c.session?.prompt === "function") {
-            await Promise.resolve(c.session.prompt(promptInput));
-        } else if (typeof c.session?.promptAsync === "function") {
-            await c.session.promptAsync(promptInput);
-        } else {
-            log("[magic-context] conflict-warning: session prompt API unavailable");
-        }
-    } catch (error: unknown) {
-        log(
-            `[magic-context] conflict-warning: failed to send: ${error instanceof Error ? error.message : String(error)}`,
-        );
-    }
+    // forcePersist: the warning describes a blocking state the user must act
+    // on, and cleanupConflictWarnings deletes the persisted row once the
+    // conflict is resolved — a transient toast would satisfy neither. The
+    // helper owns the title-safety guard, the mid-turn queue, and prompt-
+    // context pinning; conflict detection re-fires on every startup, so a
+    // skipped delivery retries on the next launch.
+    await sendIgnoredMessage(client, sessionId, warningText, {}, true);
 }
 
 /**
@@ -298,33 +267,18 @@ export async function cleanupConflictWarnings(
         }
     }
 
-    // The plugin sends an "enabled" confirmation so the user sees that the conflict is resolved.
-    // The plugin always runs warning cleanup; it may skip only the confirmation.
-    if ((await waitForSafeNotificationTarget(client, sessionId)) === "skip") return;
+    // Send a brief "enabled" confirmation so the user sees the conflict is
+    // resolved. The confirmation is transient by design (the timer below
+    // removes a persisted copy after a second), so the helper's toast-first
+    // path is the right surface when a TUI is connected; the warning cleanup
+    // above already ran — only the confirmation is skippable.
     const enabledText = `${ENABLED_MARKER}. Enjoy! ✨`;
-    try {
-        const c = client as {
-            session?: {
-                prompt?: (input: unknown) => unknown;
-                promptAsync?: (input: unknown) => unknown;
-            };
-        };
-
-        const promptInput = {
-            path: { id: sessionId },
-            body: {
-                noReply: true,
-                parts: [{ type: "text", text: enabledText, ignored: true }],
-            },
-        };
-
-        if (typeof c.session?.prompt === "function") {
-            await Promise.resolve(c.session.prompt(promptInput));
-        } else if (typeof c.session?.promptAsync === "function") {
-            await c.session.promptAsync(promptInput);
-        }
-    } catch {
-    }
+    const disposition = await sendIgnoredMessage(client, sessionId, enabledText, {});
+    // Schedule the auto-remove only for a confirmed persisted post: a toast
+    // leaves no row, and a queued/skipped delivery has no row yet — a copy
+    // flushed later is reclaimed by cleanupEnabledMessages on the next
+    // startup instead.
+    if (disposition !== "sent") return;
 
     // The plugin removes the "enabled" message after 1 second so it does not persist across restarts.
     // The plugin identifies enabled confirmations by ENABLED_MARKER and the ignored flag to avoid deleting user messages.
@@ -405,10 +359,6 @@ export async function sendSchemaFenceWarning(
     const { sessionId } = getDesktopState(directory);
     if (!sessionId) return;
 
-    // The schema fence retries at every startup while the version mismatch persists.
-    // If the title-safety guard skips the fence notification, the plugin retries on the next launch.
-    if ((await waitForSafeNotificationTarget(client, sessionId)) === "skip") return;
-
     const text = [
         `${SCHEMA_FENCE_MARKER}`,
         "",
@@ -425,25 +375,17 @@ export async function sendSchemaFenceWarning(
         "Your data is safe; nothing is disabled permanently.",
     ].join("\n");
 
-    try {
-        const c = client as {
-            session?: {
-                prompt?: (input: unknown) => unknown;
-                promptAsync?: (input: unknown) => unknown;
-            };
-        };
-        const promptInput = {
-            path: { id: sessionId },
-            body: { noReply: true, parts: [{ type: "text", text, ignored: true }] },
-        };
-        if (typeof c.session?.prompt === "function") {
-            await Promise.resolve(c.session.prompt(promptInput));
-        } else if (typeof c.session?.promptAsync === "function") {
-            await c.session.promptAsync(promptInput);
-        }
-    } catch {
-        return;
-    }
+    log(
+        `[magic-context] sending schema-fence warning to session ${sessionId}: v${detail.persistedVersion} > supported v${detail.supportedVersion}`,
+    );
+
+    // forcePersist: a fail-closed schema fence is a blocking state the user
+    // must act on, so the notice stays in scrollback rather than flashing as
+    // a toast. The helper owns the title-safety guard, the mid-turn queue,
+    // and prompt-context pinning; the fence re-fires on every startup while
+    // the version mismatch persists, so a skipped delivery retries next
+    // launch.
+    await sendIgnoredMessage(client, sessionId, text, {}, true);
 }
 
 /**
@@ -465,13 +407,23 @@ export async function sendStartupAnnouncement(
         return;
     }
 
+    // TUI owns its own announcement surface: the TUI plugin shows a DialogAlert
+    // via the get-announcement / mark-announced RPC. This server-side path is the
+    // Desktop/Web fallback ONLY. Without this gate both fire for a TUI session —
+    // the ignored message lands in the scrollback AND stamps last_announced_version,
+    // which then suppresses (or races) the dialog. The send below passes
+    // forcePersist, which makes the helper skip its own isTuiConnected toast
+    // check, so this gate is the only TUI suppression on this path.
     //
     const { isTuiConnected } = await import("../shared/rpc-notifications");
     if (isTuiConnected(sessionId) || isTuiConnected()) return;
 
-    // A skipped target must remain unmarked to allow retry.
-    if ((await waitForSafeNotificationTarget(client, sessionId)) === "skip") return;
-
+    // NOTE: OpenCode Desktop renders user messages through HighlightedText
+    // (packages/ui/src/components/message-part.tsx ~L1184), which is plain
+    // <span> text — not Markdown, no URL auto-linking. So `[url](url)` would
+    // show as literal text, and bare URLs don't get linkified either. We
+    // leave URLs as plain text so the user can copy them; clickable rendering
+    // requires upstream OpenCode to add URL detection to HighlightedText.
     const bullets = features.map((line) => `  • ${line}`).join("\n");
     const sections = [`${ANNOUNCEMENT_MARKER} v${version}:`, "", bullets];
     if (footer && footer.trim().length > 0) {
@@ -481,38 +433,16 @@ export async function sendStartupAnnouncement(
 
     log(`[magic-context] sending startup announcement for v${version} to session ${sessionId}`);
 
-    try {
-        const c = client as {
-            session?: {
-                prompt?: (input: unknown) => unknown;
-                promptAsync?: (input: unknown) => unknown;
-            };
-        };
+    // forcePersist: release notes are multi-line reference content, not a
+    // five-second toast (and the TUI gate above already returned for any
+    // toast-capable surface). The helper owns the title-safety guard, the
+    // mid-turn queue, and prompt-context pinning.
+    const disposition = await sendIgnoredMessage(client, sessionId, text, {}, true);
 
-        const promptInput = {
-            path: { id: sessionId },
-            body: {
-                noReply: true,
-                parts: [{ type: "text", text, ignored: true }],
-            },
-        };
-
-        if (typeof c.session?.prompt === "function") {
-            await Promise.resolve(c.session.prompt(promptInput));
-        } else if (typeof c.session?.promptAsync === "function") {
-            await c.session.promptAsync(promptInput);
-        } else {
-            log("[magic-context] announcement: session prompt API unavailable");
-            return;
-        }
-    } catch (error: unknown) {
-        log(
-            `[magic-context] announcement: failed to send: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        return;
-    }
-
-    // The version is marked seen only after the prompt succeeds, so delivery errors remain eligible for retry.
-    // delivery error.
-    markSeen(version);
+    // Persist the dismissal only on confirmed delivery, so a skipped, failed,
+    // or mid-turn-queued announcement is never silently suppressed; the next
+    // startup retries. A queued copy that still flushes later duplicates the
+    // notice (once per startup that deferred), which beats stamping a version
+    // the user never saw.
+    if (disposition === "sent") markSeen(version);
 }

@@ -6,7 +6,7 @@ import {
 import { computeSyntheticCallId } from "@magic-context/core/hooks/magic-context/todo-view";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
-import { assistantMessage, createTestDb } from "./test-utils.test";
+import { assistantMessage, createTestDb } from "./test-utils";
 
 /**
  * An assistant message is omitted when it yields zero output items; a toolResult message always emits a function_call_output.

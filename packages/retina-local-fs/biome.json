@@ -35,7 +35,7 @@
         }
     },
     "files": {
-        "includes": ["src/**/*.ts", "examples/**/*.ts"]
+        "includes": ["src/**/*.ts", "examples/**/*.ts", "!src/generated-layout.ts"]
     },
     "overrides": [
         {

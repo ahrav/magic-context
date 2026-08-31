@@ -15,7 +15,7 @@ import {
 	clearAutoSearchForPiSession,
 	runAutoSearchHintForPi,
 } from "./auto-search-pi";
-import { createTestDb, textOf, userMessage } from "./test-utils.test";
+import { createTestDb, textOf, userMessage } from "./test-utils";
 
 const baseOptions = {
 	enabled: true,

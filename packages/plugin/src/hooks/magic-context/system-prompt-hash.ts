@@ -27,7 +27,7 @@ const SYSTEM_PROMPT_GUIDANCE_SEPARATOR = "\n\n";
 // The `session.deleted` handler clears cached entries to bound cache growth.
 /**
  */
-export function clearSystemPromptHashSession(
+function clearSystemPromptHashSession(
     sessionId: string,
     handleMaps: {
         stickyDateBySession: Map<string, string>;
@@ -373,7 +373,9 @@ export function createSystemPromptHashHandler(deps: {
         // The handler retains a flag added after the adjunct read for the next pass.
         //    forever.
         //
-        //
+        // Early returns at lines 375 / 388 also benefit: they preserve
+        // any pre-existing flag set by `/ctx-flush` or variant change so
+        // the next valid pass can consume it.
         if (isCacheBusting) {
             deps.systemPromptRefreshSessions.delete(sessionId);
         }

@@ -1,18 +1,22 @@
-//! This module defines factory-parameterized semantic contract tests for frame channels.
+//! Semantic contract suite for the mandatory shared-memory frame channel.
 //!
-//! Every scenario exercises `FrameSender`, `FrameReceiver`, lifecycle tokens, and byte-charge ownership only through `ChannelFactory`.
-//! `frame_channel_contract_suite!` lets providers register a factory for the same scenario inventory.
-//! Adapter tests cover transport-specific behavior instead of this suite.
+//! Every scenario exercises only the neutral boundary — [`FrameSender`],
+//! the concrete `ShmReceiver` receive side, shared lifecycle tokens, and
+//! byte-charge ownership —
+//! through a [`ChannelFactory`]. The sole instantiation below uses the
+//! production ring transport. The in-process ownership tests remain local to
+//! this module and cannot be selected as a production transport.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use tokio::time::{Duration, Instant};
 
 use crate::wire::{EnvelopeHeader, Flags, FrameType};
 use tokio_util::sync::CancellationToken;
 
-use crate::frame_channel::{FrameReceiver, FrameSender, InboundEvent, OutboundFrame, ReadClose};
+use crate::frame_channel::{FrameSender, InboundEvent, OutboundFrame};
+use crate::ring_transport::ShmReceiver;
 use crate::wire::{encode_frame, pure_header_flags, response_flags, ByteBudget, FrameId};
 
 /// `ChannelFactory` maps scenario-controlled channel dimensions onto its transport.
@@ -22,9 +26,7 @@ pub(crate) struct ContractConfig {
     pub write_deadline: Duration,
     /// `budget_bytes` backs every inbound and test-created outbound charge.
     pub budget_bytes: u64,
-    /// `transport_buffer_bytes` bounds outbound buffering between the channel and peer.
-    /// Scenarios that need backpressure set `transport_buffer_bytes` small so unread frames stall publication.
-    pub transport_buffer_bytes: usize,
+    pub publish_hook: Option<crate::ring_transport::PublishHook>,
 }
 
 impl Default for ContractConfig {
@@ -33,16 +35,16 @@ impl Default for ContractConfig {
             queue_frames: 8,
             write_deadline: Duration::from_secs(5),
             budget_bytes: 1 << 20,
-            transport_buffer_bytes: 1 << 20,
+            publish_hook: None,
         }
     }
 }
 
 /// `Harness` contains the channel under test and an independent peer for its far side.
 /// far side.
-pub(crate) struct Harness<C, P> {
+pub(crate) struct Harness<P> {
     pub sender: FrameSender,
-    pub channel: C,
+    pub channel: ShmReceiver,
     pub peer: P,
     /// `generation` is the engine-side retirement root shared with the channel.
     pub generation: CancellationToken,
@@ -51,29 +53,29 @@ pub(crate) struct Harness<C, P> {
     pub io_task: tokio::task::JoinHandle<()>,
 }
 
-/// `PeerDriver` represents the channel's frame-level far end and encodes and decodes independently of the channel.
-pub(crate) trait PeerDriver: Send {
+/// Frame-level far end of the channel under test. Implementations must
+/// encode and decode independently of the channel so the suite never uses
+/// the implementation to verify itself.
+pub(crate) trait PeerDriver {
+    /// Injects one complete inbound frame toward the channel.
     fn send_frame(
         &mut self,
         ty: FrameType,
         flags: Flags,
         id: FrameId,
         body: Vec<u8>,
-    ) -> impl Future<Output = ()> + Send;
-    /// `recv_frame` returns `None` after the channel closes its outbound side.
-    fn recv_frame(&mut self) -> impl Future<Output = Option<(EnvelopeHeader, Vec<u8>)>> + Send;
-    /// `PeerDriver::close` closes the peer cleanly at a frame boundary.
-    fn close(self) -> impl Future<Output = ()> + Send;
+    ) -> impl Future<Output = ()>;
+    /// Yields the next complete frame the channel published, or `None` once
+    /// the channel closed its outbound side.
+    fn recv_frame(&mut self) -> impl Future<Output = Option<(EnvelopeHeader, Vec<u8>)>>;
+    /// Closes the peer cleanly at a frame boundary.
+    fn close(self) -> impl Future<Output = ()>;
 }
 
 /// Each provider supplies one factory, while the scenarios remain identical across providers.
 pub(crate) trait ChannelFactory {
-    type Channel: FrameReceiver;
     type Peer: PeerDriver;
-    fn connect(
-        &self,
-        cfg: ContractConfig,
-    ) -> impl Future<Output = Harness<Self::Channel, Self::Peer>> + Send;
+    fn connect(&self, cfg: ContractConfig) -> impl Future<Output = Harness<Self::Peer>>;
 }
 
 fn request_id(corr: u64) -> FrameId {
@@ -146,35 +148,40 @@ pub(crate) async fn saturation_holds_at_frame_bound_and_spares_control_capacity<
     let h = factory
         .connect(ContractConfig {
             queue_frames: 1,
-            transport_buffer_bytes: 1,
             ..ContractConfig::default()
         })
         .await;
     // Charge-free frames remain admissible when the entire byte pool is held.
     let held = h.budget.try_charge(h.budget.available()).expect("pool");
+    let control = || OutboundFrame {
+        bytes: encode_frame(
+            FrameType::Goodbye,
+            pure_header_flags(),
+            FrameId::control(0),
+            &[],
+        )
+        .expect("header-only frame encodes"),
+        tail: Vec::new(),
+        direct: None,
+        charge: crate::wire::ByteCharge::none(),
+        written: None,
+    };
+    for _ in 0..8 {
+        h.sender
+            .send(control())
+            .await
+            .expect("ring slot admits with the byte pool exhausted");
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
     h.sender
-        .send(OutboundFrame {
-            bytes: encode_frame(
-                FrameType::Goodbye,
-                pure_header_flags(),
-                FrameId::control(0),
-                &[],
-            )
-            .expect("header-only frame encodes"),
-            tail: Vec::new(),
-            direct: None,
-            charge: crate::wire::ByteCharge::none(),
-            written: None,
-        })
+        .send(control())
         .await
-        .expect("control frame admits with the byte pool exhausted");
-    h.sender.send(outbound(1, b"x")).await.expect("queued");
+        .expect("writer blocks at ring bound");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.sender.send(control()).await.expect("one frame queues");
     let deadline = Instant::now() + Duration::from_millis(50);
     assert!(
-        h.sender
-            .send_before(outbound(2, b"x"), deadline)
-            .await
-            .is_err(),
+        h.sender.send_before(control(), deadline).await.is_err(),
         "a saturated frame queue must reject past the admission deadline"
     );
     assert!(
@@ -238,7 +245,6 @@ pub(crate) async fn cancellation_before_admission_leaves_the_frame_unpublished<
     let mut h = factory.connect(ContractConfig::default()).await;
     h.sender.discard();
     h.io_task.await.expect("transport task");
-    assert!(h.sender.is_retired());
     assert!(
         h.sender.send(outbound(1, b"never")).await.is_err(),
         "a discarded channel refuses admission"
@@ -254,12 +260,23 @@ pub(crate) async fn cancellation_before_admission_leaves_the_frame_unpublished<
 pub(crate) async fn failure_after_publication_begins_retires_without_replay<F: ChannelFactory>(
     factory: &F,
 ) {
-    let h = factory.connect(ContractConfig::default()).await;
+    let h = factory
+        .connect(ContractConfig {
+            queue_frames: 2,
+            write_deadline: Duration::from_millis(50),
+            ..ContractConfig::default()
+        })
+        .await;
     let baseline = h.budget.available();
-    // The peer disappears mid-connection; the next publication fails.
-    h.peer.close().await;
+    for corr in 1..=8 {
+        h.sender
+            .send(outbound(corr, b"fill"))
+            .await
+            .expect("ring slot admits");
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
     let charge = h.budget.try_charge(4096).expect("charge");
-    let mut frame = outbound(1, &vec![0u8; 4096]);
+    let mut frame = outbound(9, &vec![0u8; 4096]);
     frame.charge = charge;
     // After the peer disconnects, admission may succeed, but publication must fail.
     // Publication failure retires the channel rather than retrying.
@@ -275,7 +292,7 @@ pub(crate) async fn failure_after_publication_begins_retires_without_replay<F: C
         baseline,
         "a failed frame's charge is released, not retained for replay"
     );
-    assert!(h.sender.send(outbound(2, b"late")).await.is_err());
+    assert!(h.sender.send(outbound(10, b"late")).await.is_err());
 }
 
 pub(crate) async fn graceful_finish_drains_admitted_frames_before_close<F: ChannelFactory>(
@@ -304,9 +321,17 @@ pub(crate) async fn graceful_finish_drains_admitted_frames_before_close<F: Chann
 pub(crate) async fn discard_drops_queued_frames_and_releases_charges<F: ChannelFactory>(
     factory: &F,
 ) {
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let hook_release = Arc::clone(&release);
     let h = factory
         .connect(ContractConfig {
-            transport_buffer_bytes: 1,
+            publish_hook: Some(Arc::new(move |_, _| {
+                let (released, changed) = &*hook_release;
+                let mut released = released.lock().expect("publication gate lock");
+                while !*released {
+                    released = changed.wait(released).expect("publication gate wait");
+                }
+            })),
             ..ContractConfig::default()
         })
         .await;
@@ -319,8 +344,12 @@ pub(crate) async fn discard_drops_queued_frames_and_releases_charges<F: ChannelF
     }
     assert!(h.budget.available() < baseline);
     h.sender.discard();
+    {
+        let (released, changed) = &*release;
+        *released.lock().expect("publication gate lock") = true;
+        changed.notify_all();
+    }
     h.io_task.await.expect("transport task");
-    assert!(h.sender.is_retired());
     assert_eq!(
         h.budget.available(),
         baseline,
@@ -360,7 +389,9 @@ pub(crate) async fn inbound_payload_ownership_travels_with_the_frame<F: ChannelF
     );
 }
 
-pub(crate) async fn clean_close_at_a_frame_boundary_is_orderly<F: ChannelFactory>(factory: &F) {
+/// In-band Goodbye remains a complete frame at the ring boundary. Transport
+/// loss is never reclassified as an orderly application shutdown.
+pub(crate) async fn goodbye_at_a_frame_boundary_is_delivered<F: ChannelFactory>(factory: &F) {
     let mut h = factory.connect(ContractConfig::default()).await;
     h.peer
         .send_frame(
@@ -372,15 +403,23 @@ pub(crate) async fn clean_close_at_a_frame_boundary_is_orderly<F: ChannelFactory
         .await;
     let event = h.channel.recv().await.expect("frame before close");
     assert!(matches!(event, InboundEvent::Frame(_)));
+    h.peer
+        .send_frame(
+            FrameType::Goodbye,
+            pure_header_flags(),
+            FrameId::control(0),
+            Vec::new(),
+        )
+        .await;
+    let event = h.channel.recv().await.expect("Goodbye frame");
+    let InboundEvent::Frame(frame) = event else {
+        panic!("expected Goodbye frame");
+    };
+    assert_eq!(frame.header.ty, FrameType::Goodbye);
     h.peer.close().await;
-    let err = h.channel.recv().await.err().expect("close");
-    assert!(
-        matches!(err, ReadClose::CleanEof),
-        "a boundary close must be classified as orderly"
-    );
 }
 
-/// stay untouched.
+/// Instantiates the full semantic inventory against one factory expression.
 macro_rules! frame_channel_contract_suite {
     ($factory:expr) => {
         #[tokio::test]
@@ -424,15 +463,76 @@ macro_rules! frame_channel_contract_suite {
         }
 
         #[tokio::test]
-        async fn contract_clean_close_at_a_frame_boundary_is_orderly() {
-            $crate::frame_channel::contract_tests::clean_close_at_a_frame_boundary_is_orderly(&$factory).await;
+        async fn contract_goodbye_at_a_frame_boundary_is_delivered() {
+            $crate::frame_channel::contract_tests::goodbye_at_a_frame_boundary_is_delivered(&$factory).await;
         }
     };
 }
 
-mod tcp {
-    frame_channel_contract_suite!(crate::tcp_frame_channel::TcpChannelFactory);
+struct RingFactory;
+
+struct RingPeer(crate::ring_transport::RingClientEndpoint);
+
+impl PeerDriver for RingPeer {
+    async fn send_frame(&mut self, ty: FrameType, flags: Flags, id: FrameId, body: Vec<u8>) {
+        self.0
+            .send(
+                EnvelopeHeader {
+                    len: body.len() as u32,
+                    ver: crate::wire::PROTOCOL_VERSION,
+                    ty,
+                    flags,
+                    channel: id.channel,
+                    epoch: id.epoch,
+                    corr: id.corr,
+                },
+                &body,
+                std::time::Instant::now() + Duration::from_secs(2),
+            )
+            .expect("peer publishes frame");
+    }
+
+    async fn recv_frame(&mut self) -> Option<(EnvelopeHeader, Vec<u8>)> {
+        self.0.recv(Duration::from_secs(2)).ok()
+    }
+
+    async fn close(self) {
+        drop(self);
+    }
 }
+
+impl ChannelFactory for RingFactory {
+    type Peer = RingPeer;
+
+    async fn connect(&self, cfg: ContractConfig) -> Harness<Self::Peer> {
+        let budget = ByteBudget::new(cfg.budget_bytes);
+        let transport = crate::ring_transport::RingTransport::for_ring_profile(
+            crate::ring_transport::per_connection_limits(),
+        );
+        if let Some(hook) = cfg.publish_hook {
+            transport.set_publish_hook(hook);
+        }
+        let prepared = transport
+            .prepare(budget.clone(), cfg.queue_frames, cfg.write_deadline)
+            .expect("production ring prepares");
+        let peer = crate::ring_transport::RingClientEndpoint::attach_with_descriptors(
+            &prepared.descriptor,
+            prepared.descriptors,
+        )
+        .expect("peer attaches to production ring");
+        let io_task = tokio::spawn(prepared.io);
+        Harness {
+            sender: prepared.sender,
+            channel: prepared.receiver,
+            peer: RingPeer(peer),
+            generation: prepared.root,
+            budget,
+            io_task,
+        }
+    }
+}
+
+frame_channel_contract_suite!(RingFactory);
 
 mod ownership_contract {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -608,27 +708,5 @@ mod ownership_contract {
         drop(lease);
         assert_eq!(tracker.active(), 0);
         assert_eq!(tracker.close(), LeaseClose::Quarantined);
-    }
-
-    #[tokio::test]
-    async fn tcp_owned_adapter_moves_contiguous_storage() {
-        let mut h = crate::tcp_frame_channel::TcpChannelFactory
-            .connect(ContractConfig::default())
-            .await;
-        h.peer
-            .send_frame(
-                FrameType::Request,
-                response_flags(false, true),
-                request_id(1),
-                b"copy".to_vec(),
-            )
-            .await;
-        let InboundEvent::Frame(frame) = h.channel.recv().await.expect("frame") else {
-            panic!("expected frame");
-        };
-        let copies = frame.copy_counter();
-        let owned = frame.into_owned();
-        assert_eq!(owned.body, b"copy");
-        assert_eq!(copies.copies(), 0);
     }
 }

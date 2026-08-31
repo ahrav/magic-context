@@ -15,6 +15,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { getErrorMessage } from "@magic-context/core/shared/error-message";
 import { CTX_REDUCE_DESCRIPTION } from "@magic-context/core/tools/ctx-reduce/constants";
+import { formatIds } from "@magic-context/core/tools/ctx-reduce/tools";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
@@ -41,10 +42,6 @@ function err(text: string) {
 		details: undefined,
 		isError: true,
 	};
-}
-
-function formatIds(ids: number[]): string {
-	return ids.map((id) => `§${id}§`).join(", ");
 }
 
 export interface CtxReduceToolDeps {

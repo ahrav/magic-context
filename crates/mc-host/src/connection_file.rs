@@ -22,23 +22,17 @@ use crate::{
     wire::PROTOCOL_VERSION,
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const MIN_KEY_LEN: usize = 32;
 pub const KEY_LEN: usize = 32;
 pub const DAEMON_ID_LEN: usize = 16;
 pub const MAX_CONNECTION_FILE_LEN: usize = 65_536;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Endpoint {
-    pub host: String,
-    pub port: u16,
-}
-
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     pub schema: u32,
     pub wire_version: u8,
-    pub endpoints: Vec<Endpoint>,
+    pub setup_socket: String,
     pub key: Vec<u8>,
     pub daemon_id: [u8; DAEMON_ID_LEN],
     pub pid: u32,
@@ -50,7 +44,7 @@ impl fmt::Debug for ConnectionInfo {
         f.debug_struct("ConnectionInfo")
             .field("schema", &self.schema)
             .field("wire_version", &self.wire_version)
-            .field("endpoints", &self.endpoints)
+            .field("setup_socket", &self.setup_socket)
             .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
             .field("daemon_id", &self.daemon_id)
             .field("pid", &self.pid)
@@ -73,12 +67,8 @@ impl ConnectionInfo {
                 supported: PROTOCOL_VERSION,
             });
         }
-        let endpoint = self
-            .endpoints
-            .first()
-            .ok_or(ConnectionFileError::Invalid("missing endpoint"))?;
-        if endpoint.host != "127.0.0.1" || endpoint.port == 0 {
-            return Err(ConnectionFileError::Invalid("invalid loopback endpoint"));
+        if self.setup_socket.is_empty() || !Path::new(&self.setup_socket).is_absolute() {
+            return Err(ConnectionFileError::Invalid("invalid setup socket path"));
         }
         if self.key.len() != KEY_LEN {
             return Err(ConnectionFileError::InvalidKeyLength {
@@ -363,10 +353,7 @@ mod tests {
         ConnectionInfo {
             schema: SCHEMA_VERSION,
             wire_version: PROTOCOL_VERSION,
-            endpoints: vec![Endpoint {
-                host: "127.0.0.1".to_owned(),
-                port: 1,
-            }],
+            setup_socket: "/tmp/mc-host.sock".to_owned(),
             key: vec![7; KEY_LEN],
             daemon_id: [8; DAEMON_ID_LEN],
             pid: 9,

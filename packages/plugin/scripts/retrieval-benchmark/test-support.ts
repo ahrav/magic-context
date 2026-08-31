@@ -55,7 +55,7 @@ export function makeDocument(
     };
 }
 
-export function makeQuery(
+function makeQuery(
     slug: string,
     category: QueryScenario["category"],
     partition: QueryScenario["partition"],
@@ -77,8 +77,8 @@ export function makeQuery(
     };
 }
 
-/* */
-export function makeValidCorpus(): CorpusArtifact {
+/** One query + one graded document per category per partition. */
+function makeValidCorpus(): CorpusArtifact {
     const queries: QueryScenario[] = [];
     const documents: CorpusDocument[] = [];
     QUERY_CATEGORIES.forEach((category, c) => {
@@ -100,7 +100,7 @@ export function makeValidCorpus(): CorpusArtifact {
     return { schemaVersion: CORPUS_SCHEMA_VERSION, queries, documents };
 }
 
-export function makeValidJudgments(corpus: CorpusArtifact): JudgmentsArtifact {
+function makeValidJudgments(corpus: CorpusArtifact): JudgmentsArtifact {
     return {
         schemaVersion: JUDGMENTS_SCHEMA_VERSION,
         rubricVersion: RUBRIC_VERSION,

@@ -5,9 +5,13 @@
 // The build emits no `dist/emscripten-module.wasm`, so the default variant fails with `ENOENT`.
 // The capability API requires the ASYNCIFY variant because the sandbox installs asynchronous host functions.
 //
-// The SINGLEFILE variant inlines ~2.6 MB of base64 WASM.
-// A top-level import parses the inlined base64 WASM during cold start.
-// Deferring the import to the first smart-note evaluation keeps the variant in a separate chunk outside the cold-start parse.
+// These two modules are imported LAZILY inside getAsyncModule() (below), not at
+// the top of this file. The singlefile variant inlines ~2.6MB of base64 WASM into
+// the bundle; a top-level import forced the JS engine to parse that blob on every
+// plugin load — and on every subagent child spawn — adding hundreds of ms.
+// Deferring the import to the first smart-note evaluation splits the variant
+// into its own chunk that stays out of the cold-start parse. The type-only import
+// below is erased at build time and pulls in no runtime code.
 import type {
     QuickJSAsyncContext,
     QuickJSAsyncWASMModule,

@@ -14,17 +14,13 @@ import {
 } from "../../features/magic-context/compartment-storage";
 import { clearCompressionDepthRange } from "../../features/magic-context/compression-depth-storage";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
-import {
-    clearPendingCompactionMarkerStateIf,
-    getPendingCompactionMarkerState,
-    updateSessionMeta,
-} from "../../features/magic-context/storage-meta";
-import { normalizeSDKResponse } from "../../shared";
+import { updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
-import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
+import { advanceCompactionMarkerAndClearStalePending } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
+import { resolveSessionDirectory } from "./compartment-runner-mapping";
 import { promoteRecompStagingWithM0Mutation } from "./compartment-runner-recomp";
 import type { CandidateCompartment, CompartmentRunnerDeps } from "./compartment-runner-types";
 import {
@@ -184,15 +180,8 @@ export async function executePartialRecompInternal(
         // Partial recomp passes an empty fact list because session facts are not a render source.
         const stagedFacts: { category: string; content: string }[] = [];
 
-        const parentSessionResponse = await client.session
-            .get({ path: { id: sessionId } })
-            .catch(() => null);
-        const parentSession = normalizeSDKResponse(
-            parentSessionResponse,
-            null as { directory?: string } | null,
-            { preferResponseOnMissingData: true },
-        );
-        const sessionDirectory = parentSession?.directory ?? directory;
+        // ── Resolve project memories for historian fact dedup context ─────
+        const sessionDirectory = await resolveSessionDirectory(client, sessionId, directory);
 
 
         //
@@ -267,7 +256,10 @@ export async function executePartialRecompInternal(
 
             // `validateStoredCompartments` requires the merged compartments to be contiguous from message 1.
             // Sequences are 0-indexed (continuing from candidateCompartments.length).
-            // Starting tail sequences at candidateCompartments.length preserves MAX(sequence) = count - 1 and prevents sequenceOffset collisions.
+            // Starting exactly at candidateCompartments.length keeps the set
+            // gapless, preserving the invariant MAX(sequence) = count - 1 that
+            // incremental historian's sequenceOffset relies on; a gap would
+            // collide sequences and produce UNIQUE constraint failures.
             const merged: CompartmentInput[] = [
                 ...candidateCompartments,
                 ...tailCompartments.map((c, idx) =>
@@ -321,19 +313,7 @@ export async function executePartialRecompInternal(
             const lastEnd = merged[merged.length - 1]?.endMessage ?? snapEnd;
             // Partial recomp CAS-clears a stale pending blob because it owns the boundary through `lastEnd`.
             if (lastEnd > 0) {
-                const markerUpdated = updateCompactionMarkerAfterPublication(
-                    db,
-                    sessionId,
-                    lastEnd,
-                    deps.directory,
-                );
-                // Clear the stale pending blob only after the boundary advances so deferred-drain retries retain it after failure.
-                if (markerUpdated) {
-                    const stalePending = getPendingCompactionMarkerState(db, sessionId);
-                    if (stalePending) {
-                        clearPendingCompactionMarkerStateIf(db, sessionId, stalePending);
-                    }
-                }
+                advanceCompactionMarkerAndClearStalePending(db, sessionId, lastEnd, deps.directory);
             }
             return { compartmentCount: merged.length, lastEndMessage: lastEnd };
         }

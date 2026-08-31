@@ -18,11 +18,7 @@ import {
 } from "./compartment-chunk-embedding";
 import { appendCompartments, getCompartments } from "./compartment-storage";
 import { upsertCommits } from "./git-commits";
-import {
-    _resetEmbeddingConfigForTests,
-    embedTextForProject,
-    initializeEmbedding,
-} from "./memory/embedding";
+import { embedTextForProject } from "./memory/embedding";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import { createAntiMemory, readAntiMemory } from "./memory/storage-anti-memory";
 import * as claimCurrentState from "./memory/storage-claim-current-state";
@@ -76,6 +72,13 @@ const embedQuery = async (text: string) => {
     return queryEmbedding ? new Float32Array(queryEmbedding) : null;
 };
 const isEmbeddingRuntimeEnabled = () => true;
+
+/** unifiedSearch has no default embedding lane; tests that only exercise
+ *  lexical surfaces pass this inert lane explicitly. */
+const noEmbedding = {
+    embedQuery: async () => null,
+    isEmbeddingRuntimeEnabled: () => true,
+};
 
 function seedCompartmentChunkEmbedding(
     db: Database,
@@ -205,6 +208,7 @@ describe("unifiedSearch", () => {
         });
 
         const results = await unifiedSearch(db, "session-1", "git:test", "cache system primers", {
+            ...noEmbedding,
             sources: ["primer"],
             limit: 5,
             memoryEnabled: true,
@@ -269,6 +273,7 @@ describe("unifiedSearch", () => {
         const anti = seedAntiMemory(db, project, "active");
 
         const matching = await unifiedSearch(db, "session-anti", project, "Redis session caching", {
+            ...noEmbedding,
             sources: ["memory"],
             memoryEnabled: true,
             embeddingEnabled: false,
@@ -285,6 +290,7 @@ describe("unifiedSearch", () => {
         });
         expect(
             await unifiedSearch(db, "session-anti", project, "button colors", {
+                ...noEmbedding,
                 sources: ["memory"],
                 memoryEnabled: true,
                 embeddingEnabled: false,
@@ -325,6 +331,7 @@ describe("unifiedSearch", () => {
         }).immediate();
         expect(
             await unifiedSearch(db, "session-anti", project, "Redis session caching", {
+                ...noEmbedding,
                 sources: ["memory"],
                 memoryEnabled: true,
                 embeddingEnabled: false,
@@ -414,6 +421,7 @@ describe("unifiedSearch", () => {
         };
 
         const automatic = await unifiedSearch(db, "session-anti-limit", project, query, {
+            ...noEmbedding,
             ...options,
             memoryPolicySurface: "auto_search",
         });
@@ -431,6 +439,7 @@ describe("unifiedSearch", () => {
         expect(packed.text).toContain("⚠ Previously rejected: Redis");
 
         const explicit = await unifiedSearch(db, "session-anti-limit", project, query, {
+            ...noEmbedding,
             ...options,
             limit: 4,
             memoryPolicySurface: "explicit_search",
@@ -509,6 +518,7 @@ describe("unifiedSearch", () => {
         expect(expired.publicClaimId).not.toBe(stale.publicClaimId);
 
         const explicit = await unifiedSearch(db, "session-anti", project, "Redis session caching", {
+            ...noEmbedding,
             sources: ["memory"],
             memoryEnabled: true,
             embeddingEnabled: false,
@@ -526,6 +536,7 @@ describe("unifiedSearch", () => {
             project,
             "Redis session caching",
             {
+                ...noEmbedding,
                 sources: ["memory"],
                 memoryEnabled: true,
                 embeddingEnabled: false,
@@ -536,6 +547,7 @@ describe("unifiedSearch", () => {
 
         expect(
             await unifiedSearch(db, "session-anti", project, "Memcached session cache expiry", {
+                ...noEmbedding,
                 sources: ["memory"],
                 memoryEnabled: true,
                 embeddingEnabled: false,
@@ -563,6 +575,7 @@ describe("unifiedSearch", () => {
                 project,
                 "Redis session caching",
                 {
+                    ...noEmbedding,
                     sources: ["memory"],
                     memoryEnabled: true,
                     embeddingEnabled: false,
@@ -596,6 +609,7 @@ describe("unifiedSearch", () => {
                 project,
                 "single ephemeral preview box deployment",
                 {
+                    ...noEmbedding,
                     sources: ["memory"],
                     memoryEnabled: true,
                     embeddingEnabled: false,
@@ -610,6 +624,7 @@ describe("unifiedSearch", () => {
             project,
             "Redis session caching",
             {
+                ...noEmbedding,
                 sources: ["memory"],
                 memoryEnabled: true,
                 embeddingEnabled: false,
@@ -656,6 +671,7 @@ describe("unifiedSearch", () => {
         const query = "caching ownership alpha bravo charlie delta echo foxtrot golf hotel";
 
         const lexicalOnly = await unifiedSearch(db, "session-anti", project, query, {
+            ...noEmbedding,
             sources: ["memory"],
             memoryEnabled: true,
             embeddingEnabled: false,
@@ -936,6 +952,7 @@ describe("unifiedSearch", () => {
         );
 
         const results = await unifiedSearch(db, "ses-note", "git:test", "queue drain shipped", {
+            ...noEmbedding,
             limit: 5,
             memoryEnabled: false,
             embeddingEnabled: false,
@@ -982,6 +999,7 @@ describe("unifiedSearch", () => {
             "git:test",
             "telemetry noisy fallback",
             {
+                ...noEmbedding,
                 limit: 5,
                 memoryEnabled: false,
                 embeddingEnabled: false,
@@ -994,6 +1012,7 @@ describe("unifiedSearch", () => {
             "git:test",
             "deploy window closes",
             {
+                ...noEmbedding,
                 limit: 5,
                 memoryEnabled: false,
                 embeddingEnabled: false,
@@ -1036,6 +1055,7 @@ describe("unifiedSearch", () => {
         });
 
         const results = await unifiedSearch(db, "ses-scope", "git:own", "scope marker", {
+            ...noEmbedding,
             limit: 10,
             memoryEnabled: false,
             embeddingEnabled: false,
@@ -1070,6 +1090,7 @@ describe("unifiedSearch", () => {
             "/repo/project",
             "broad recall marker",
             {
+                ...noEmbedding,
                 limit: 10,
                 memoryEnabled: true,
                 embeddingEnabled: false,
@@ -1085,6 +1106,7 @@ describe("unifiedSearch", () => {
             "/repo/project",
             "broad recall marker",
             {
+                ...noEmbedding,
                 limit: 10,
                 memoryEnabled: true,
                 embeddingEnabled: false,
@@ -1679,7 +1701,7 @@ describe("unifiedSearch hard bounds (R34, R37)", () => {
         const counting = countingDatabase(db);
         const query = Array.from({ length: 65 }, (_, index) => `atom${index}`).join(" ");
         await expect(
-            unifiedSearch(counting.db, "session-1", "git:test", query, {}),
+            unifiedSearch(counting.db, "session-1", "git:test", query, { ...noEmbedding }),
         ).rejects.toBeInstanceOf(QueryBoundsError);
         expect(counting.executions).toHaveLength(0);
     });
@@ -1693,6 +1715,7 @@ describe("unifiedSearch hard bounds (R34, R37)", () => {
             "git:test",
             'bounded topic message "bounded topic" number-1 number_2 someCamelCase probe.name',
             {
+                ...noEmbedding,
                 limit: 10_000,
                 memoryEnabled: true,
                 embeddingEnabled: false,
@@ -1726,6 +1749,7 @@ describe("unifiedSearch hard bounds (R34, R37)", () => {
         seedMessages("session-default", 20);
         const counting = countingDatabase(db);
         await unifiedSearch(counting.db, "session-default", "git:test", "bounded topic", {
+            ...noEmbedding,
             memoryEnabled: true,
             embeddingEnabled: false,
             sources: ["message"],
@@ -1748,6 +1772,7 @@ describe("unifiedSearch hard bounds (R34, R37)", () => {
             "git:test",
             'bounded "topic one" probe-two probe_three probe.four probeFive probe-six',
             {
+                ...noEmbedding,
                 limit: 50,
                 memoryEnabled: false,
                 embeddingEnabled: false,
@@ -1779,94 +1804,72 @@ describe("unifiedSearch hard bounds (R34, R37)", () => {
 
 describe("query-purpose provider boundary (U30)", () => {
     let db: Database;
-    let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">>;
+    let embedCalls: { text: string; purpose: EmbeddingPurpose | undefined }[] = [];
+
+    const recordingEmbedQuery = async (
+        text: string,
+        _signal?: AbortSignal,
+        purpose?: EmbeddingPurpose,
+    ) => {
+        embedCalls.push({ text, purpose });
+        return new Float32Array([1, 0]);
+    };
 
     beforeEach(() => {
         db = createTestDb();
-        fetchSpy = spyOn(globalThis, "fetch");
-        fetchSpy.mockImplementation(
-            (async () =>
-                new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), {
-                    headers: { "content-type": "application/json" },
-                })) as unknown as typeof fetch,
-        );
-        initializeEmbedding({
-            provider: "openai-compatible",
-            model: "nvidia/nv-embed",
-            endpoint: "http://127.0.0.1:65535",
-            input_type: "passage",
-            query_input_type: "query",
-        });
+        embedCalls = [];
     });
 
     afterEach(() => {
-        _resetEmbeddingConfigForTests();
-        fetchSpy.mockRestore();
         closeQuietly(db);
     });
 
-    function sentInputTypes(): unknown[] {
-        return fetchSpy.mock.calls.map((call) => {
-            const init = call[1] as RequestInit;
-            return (JSON.parse(init.body as string) as Record<string, unknown>).input_type;
-        });
-    }
-
-    it("sends the query input type when no embedQuery override is supplied (AE1)", async () => {
-        await unifiedSearch(db, "ses-purpose", "/repo/project", "queue saturation design", {
-            limit: 5,
-            memoryEnabled: true,
-            embeddingEnabled: true,
-        });
-
-        expect(sentInputTypes()).toEqual(["query"]);
-    });
-
-    it("runs a supplied override once across semantic lanes and never the default provider (AE2)", async () => {
-        const overrideQueries: string[] = [];
+    it("embeds with the query purpose exactly once across semantic lanes (AE1, AE2)", async () => {
+        // gitCommitsEnabled adds a second embed-needing branch; the query is
+        // still embedded exactly once and always with the "query" purpose.
         await unifiedSearch(db, "ses-purpose", "/repo/project", "queue saturation design", {
             limit: 5,
             memoryEnabled: true,
             embeddingEnabled: true,
             gitCommitsEnabled: true,
-            embedQuery: async (text) => {
-                overrideQueries.push(text);
-                return new Float32Array([1, 0]);
-            },
+            embedQuery: recordingEmbedQuery,
+            isEmbeddingRuntimeEnabled: () => true,
         });
 
-        expect(overrideQueries).toEqual(["queue saturation design"]);
-        expect(fetchSpy.mock.calls).toHaveLength(0);
+        expect(embedCalls).toEqual([{ text: "queue saturation design", purpose: "query" }]);
     });
 
-    it("never calls the provider when embedding is off, the runtime is off, or only non-semantic lanes run (AE3)", async () => {
+    it("never embeds when embedding is off, the runtime is off, or only non-semantic lanes run (AE3)", async () => {
         await unifiedSearch(db, "ses-purpose", "/repo/project", "anything", {
             memoryEnabled: true,
             embeddingEnabled: false,
+            embedQuery: recordingEmbedQuery,
+            isEmbeddingRuntimeEnabled: () => true,
         });
         await unifiedSearch(db, "ses-purpose", "/repo/project", "anything", {
             memoryEnabled: true,
             embeddingEnabled: true,
+            embedQuery: recordingEmbedQuery,
             isEmbeddingRuntimeEnabled: () => false,
         });
         await unifiedSearch(db, "ses-purpose", "/repo/project", "anything", {
             memoryEnabled: true,
             embeddingEnabled: true,
             sources: ["note"],
+            embedQuery: recordingEmbedQuery,
+            isEmbeddingRuntimeEnabled: () => true,
         });
         await unifiedSearch(db, "ses-purpose", "/repo/project", "   ", {
             memoryEnabled: true,
             embeddingEnabled: true,
+            embedQuery: recordingEmbedQuery,
+            isEmbeddingRuntimeEnabled: () => true,
         });
 
-        expect(fetchSpy.mock.calls).toHaveLength(0);
+        expect(embedCalls).toHaveLength(0);
     });
 
-    it("degrades semantic lanes without surfacing an exception when the provider fails", async () => {
-        fetchSpy.mockImplementation((async () => {
-            throw new Error("embedding endpoint down");
-        }) as unknown as typeof fetch);
-
+    it("degrades semantic lanes without surfacing an exception when the embedder fails", async () => {
         const results = await unifiedSearch(
             db,
             "ses-purpose",
@@ -1876,6 +1879,10 @@ describe("query-purpose provider boundary (U30)", () => {
                 limit: 5,
                 memoryEnabled: true,
                 embeddingEnabled: true,
+                embedQuery: async () => {
+                    throw new Error("embedding endpoint down");
+                },
+                isEmbeddingRuntimeEnabled: () => true,
             },
         );
 
@@ -2231,6 +2238,7 @@ describe("message search fragments (R34)", () => {
         ensureMessagesIndexed(db, "ses-frag", readMessages);
 
         const results = await unifiedSearch(db, "ses-frag", "git:frag", "sentinel", {
+            ...noEmbedding,
             limit: 5,
             memoryEnabled: false,
             embeddingEnabled: false,
@@ -2281,6 +2289,7 @@ describe("message search fragments (R34)", () => {
             "git:verbatim",
             "earlyMarker and sentinelToken",
             {
+                ...noEmbedding,
                 limit: 10,
                 memoryEnabled: false,
                 embeddingEnabled: false,
@@ -2313,6 +2322,7 @@ describe("message search fragments (R34)", () => {
         ensureMessagesIndexed(db, "ses-roleonly", readMessages);
 
         const results = await unifiedSearch(db, "ses-roleonly", "git:role", "assistant", {
+            ...noEmbedding,
             limit: 5,
             memoryEnabled: false,
             embeddingEnabled: false,
@@ -2338,6 +2348,7 @@ describe("message search fragments (R34)", () => {
         for (const explicitSearch of [false, true]) {
             const counter = countingDatabase(db);
             await unifiedSearch(counter.db, "ses-spy", "git:spy", "spyToken", {
+                ...noEmbedding,
                 limit: 5,
                 memoryEnabled: false,
                 embeddingEnabled: false,
@@ -2368,6 +2379,7 @@ describe("message search fragments (R34)", () => {
         ensureMessagesIndexed(db, "ses-cut", readMessages);
 
         const results = await unifiedSearch(db, "ses-cut", "git:cut", "cutoffToken", {
+            ...noEmbedding,
             limit: 2,
             memoryEnabled: false,
             embeddingEnabled: false,
@@ -2986,6 +2998,7 @@ function seedNoteCorpus(db: Database) {
 }
 
 const noteSearchOptions = (explicit = false) => ({
+    ...noEmbedding,
     limit: 10,
     memoryEnabled: false,
     embeddingEnabled: false,

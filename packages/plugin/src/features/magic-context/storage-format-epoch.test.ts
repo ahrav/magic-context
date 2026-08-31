@@ -20,7 +20,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { Database } from "../../shared/sqlite";
+import {
+    Database,
+    MIN_SUPPORTED_BUN_VERSION,
+    MIN_SUPPORTED_NODE_VERSION,
+    MIN_SUPPORTED_SQLITE_VERSION,
+} from "../../shared/sqlite";
 import vocabulary from "./fixtures/direct-format-vocabulary-v1.json";
 import { DIRECT_FORMAT_FENCE_MIGRATION_VERSION } from "./migrations";
 import {
@@ -84,6 +89,9 @@ describe("cross-runtime direct-format vocabulary", () => {
         expect(DIRECT_FORMAT_MARKER_TABLE).toBe(vocabulary.markerTable);
         expect(FORMAT_MARKER_DIGEST_PROTOCOL).toBe(vocabulary.markerDigestProtocol);
         expect(SCHEMA_MANIFEST_PROTOCOL).toBe(vocabulary.manifestProtocol);
+        expect(MIN_SUPPORTED_SQLITE_VERSION).toBe(vocabulary.minSqliteVersion);
+        expect(MIN_SUPPORTED_NODE_VERSION).toBe(vocabulary.minNodeVersion);
+        expect(MIN_SUPPORTED_BUN_VERSION).toBe(vocabulary.minBunVersion);
     });
 
     it("builds exactly the fixture's component manifest and digest", () => {

@@ -4,7 +4,7 @@ import { createCompactionHandler } from "../../features/magic-context/compaction
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { createScheduler } from "../../features/magic-context/scheduler";
 import { createTagger } from "../../features/magic-context/tagger";
-import { createMagicContextHook, createMagicContextHookAsync } from "../../hooks/magic-context";
+import { createMagicContextHookAsync } from "../../hooks/magic-context";
 import type { LiveSessionState } from "../../hooks/magic-context/live-session-state";
 import type { RustModeModuleClient } from "../../hooks/magic-context/rust-mode-transform";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
@@ -18,44 +18,6 @@ export function buildMagicContextHookConfig(pluginConfig: MagicContextPluginConf
         protected_tags: pluginConfig.protected_tags ?? DEFAULT_PROTECTED_TAGS,
         execute_threshold_percentage:
             pluginConfig.execute_threshold_percentage ?? DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
-    };
-}
-
-export function createSessionHooks(args: {
-    ctx: PluginContext;
-    pluginConfig: MagicContextPluginConfig;
-    liveSessionState: LiveSessionState;
-    rustModeModuleClient?: RustModeModuleClient;
-    promptSurfaceRuntime?: PromptSurfaceRuntime;
-}) {
-    const { ctx, pluginConfig, liveSessionState } = args;
-
-    if (pluginConfig.enabled !== true) {
-        return { magicContext: null, rustToolBackends: undefined };
-    }
-
-    const tagger = createTagger();
-    const scheduler = createScheduler({
-        executeThresholdPercentage:
-            pluginConfig.execute_threshold_percentage ?? DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
-        executeThresholdTokens: pluginConfig.execute_threshold_tokens,
-    });
-    const compactionHandler = createCompactionHandler();
-    const hookResult = createMagicContextHook({
-        client: ctx.client,
-        directory: ctx.directory,
-        tagger,
-        scheduler,
-        compactionHandler,
-        liveSessionState,
-        rustModeModuleClient: args.rustModeModuleClient,
-        promptSurfaceRuntime: args.promptSurfaceRuntime,
-        config: buildMagicContextHookConfig(pluginConfig),
-    });
-
-    return {
-        magicContext: hookResult,
-        rustToolBackends: hookResult?.rustToolBackends,
     };
 }
 

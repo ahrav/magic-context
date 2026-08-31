@@ -1,16 +1,13 @@
 #![allow(clippy::duplicate_mod)]
 
-#[path = "support/raw_client.rs"]
-mod raw_client;
-
 #[path = "support/perf_measurement.rs"]
 mod perf_measurement;
 
 #[path = "../benches/support/evidence.rs"]
 mod evidence;
 
-#[path = "../benches/support/tcp.rs"]
-mod tcp;
+#[path = "../benches/support/ring.rs"]
+mod ring;
 
 #[path = "support/echo_host.rs"]
 mod echo_host;
@@ -39,9 +36,9 @@ fn script_text() -> String {
 fn budget_arms() -> Vec<String> {
     [
         evidence::ARM_ATOMIC,
-        evidence::ARM_TCP_SERIAL,
-        evidence::ARM_TCP_OPEN,
-        evidence::ARM_TCP_THROUGHPUT,
+        evidence::ARM_RING_SERIAL,
+        evidence::ARM_RING_OPEN,
+        evidence::ARM_RING_THROUGHPUT,
     ]
     .iter()
     .map(|s| s.to_string())
@@ -49,7 +46,7 @@ fn budget_arms() -> Vec<String> {
 }
 
 fn cross_arms() -> Vec<String> {
-    [evidence::ARM_ATOMIC, evidence::ARM_TCP_SERIAL]
+    [evidence::ARM_ATOMIC, evidence::ARM_RING_SERIAL]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -132,30 +129,31 @@ fn plan_blocks_expand_rates_and_cross_numa_tail() {
         odd,
         [
             "atomic-floor@same-l3",
-            "tcp-serial@same-l3",
-            "tcp-open@same-l3:r20000",
-            "tcp-open@same-l3:r50000",
-            "tcp-open@same-l3:r80000",
-            "tcp-throughput@same-l3",
+            "ring-serial@same-l3",
+            "ring-open@same-l3:r20000",
+            "ring-open@same-l3:r50000",
+            "ring-open@same-l3:r80000",
+            "ring-throughput@same-l3",
             "atomic-floor@cross-numa",
-            "tcp-serial@cross-numa",
+            "ring-serial@cross-numa",
         ]
     );
 
     // Even blocks reverse the same-L3 arm order and the cross-NUMA tail
-    // The `tcp-open` rate fan-out preserves the script's `$rates` order.
+    // (matching the script's `arms` and `cross` arrays); the rate
+    // fan-out inside ring-open keeps the script's `for rate in
     // $BUDGET_RATES` order.
     let even = ipc_budget::plan_block_entries(&same_l3[1], &cross[1], &rates);
     assert_eq!(
         even,
         [
-            "tcp-throughput@same-l3",
-            "tcp-open@same-l3:r20000",
-            "tcp-open@same-l3:r50000",
-            "tcp-open@same-l3:r80000",
-            "tcp-serial@same-l3",
+            "ring-throughput@same-l3",
+            "ring-open@same-l3:r20000",
+            "ring-open@same-l3:r50000",
+            "ring-open@same-l3:r80000",
+            "ring-serial@same-l3",
             "atomic-floor@same-l3",
-            "tcp-serial@cross-numa",
+            "ring-serial@cross-numa",
             "atomic-floor@cross-numa",
         ]
     );
@@ -187,17 +185,17 @@ fn open_loop_preserves_schedule_and_records_missed_slots() {
     let data_dir = tempfile::tempdir().unwrap();
     let host = echo_host::InProcessHost::start(data_dir.path());
 
-    // A one-deep in-flight cap with an interval below loopback RTT forces slot misses; the absolute schedule must not burst to catch up.
-    // A one-deep in-flight cap with an interval below loopback RTT forces slot misses.
-    // The absolute schedule must keep counting slots after a miss.
-    let cfg = tcp::OpenLoopConfig {
+    // A one-deep in-flight cap at an interval far below loopback RTT
+    // forces slot misses; the absolute schedule must keep counting slots
+    // rather than bursting to catch up.
+    let cfg = ring::OpenLoopConfig {
         rate_per_sec: 50_000,
         warmup: Duration::from_millis(200),
         measure: Duration::from_millis(800),
         inflight_cap: 1,
         histogram: HistogramConfig::default(),
     };
-    let result = tcp::run_open_loop(&host.publication, &cfg).unwrap();
+    let result = ring::run_open_loop(&host.publication, &cfg).unwrap();
     assert!(!result.truncated, "healthy host must complete the window");
 
     // For each `(rate, window)`, the measured slot count equals `measure / interval` regardless of completions.
@@ -240,14 +238,14 @@ fn open_loop_separates_lag_from_server_latency() {
     let data_dir = tempfile::tempdir().unwrap();
     let host = echo_host::InProcessHost::start(data_dir.path());
 
-    let cfg = tcp::OpenLoopConfig {
+    let cfg = ring::OpenLoopConfig {
         rate_per_sec: 500,
         warmup: Duration::from_millis(200),
         measure: Duration::from_millis(800),
         inflight_cap: 64,
         histogram: HistogramConfig::default(),
     };
-    let result = tcp::run_open_loop(&host.publication, &cfg).unwrap();
+    let result = ring::run_open_loop(&host.publication, &cfg).unwrap();
     assert!(!result.truncated, "healthy host must complete the window");
     assert!(result.outcomes.success > 0);
     assert!(result.outcomes.conserved(result.scheduled_slots));
@@ -267,12 +265,12 @@ fn throughput_arm_reports_rates_separately() {
     let data_dir = tempfile::tempdir().unwrap();
     let host = echo_host::InProcessHost::start(data_dir.path());
 
-    let cfg = tcp::ThroughputConfig {
+    let cfg = ring::ThroughputConfig {
         depth: 16,
         warmup: Duration::from_millis(200),
         measure: Duration::from_millis(800),
     };
-    let result = tcp::run_throughput(&host.publication, &cfg).unwrap();
+    let result = ring::run_throughput(&host.publication, &cfg).unwrap();
     assert!(!result.truncated, "healthy host must complete the window");
     assert!(result.successful > 0);
     assert_eq!(result.successful, result.outcomes.success);
@@ -296,12 +294,12 @@ fn serial_arm_stays_one_in_flight() {
     let data_dir = tempfile::tempdir().unwrap();
     let host = echo_host::InProcessHost::start(data_dir.path());
 
-    let cfg = tcp::SerialConfig {
+    let cfg = ring::SerialConfig {
         warmup_ops: 10,
         measured_ops: 200,
         histogram: HistogramConfig::default(),
     };
-    let result = tcp::run_serial(&host.publication, &cfg).unwrap();
+    let result = ring::run_serial(&host.publication, &cfg).unwrap();
     assert_eq!(result.outcomes.success, 200);
     assert!(result.outcomes.conserved(result.scheduled));
     // With one request in flight, elapsed wall time must be at least the sum of recorded RTTs.
@@ -329,14 +327,14 @@ fn host_death_mid_run_conserves_outcomes() {
         drop(host);
     });
 
-    let cfg = tcp::OpenLoopConfig {
+    let cfg = ring::OpenLoopConfig {
         rate_per_sec: 2_000,
         warmup: Duration::from_millis(100),
         measure: Duration::from_secs(5),
         inflight_cap: 64,
         histogram: HistogramConfig::default(),
     };
-    let result = tcp::run_open_loop(&publication, &cfg).unwrap();
+    let result = ring::run_open_loop(&publication, &cfg).unwrap();
     killer.join().unwrap();
 
     // Exact completion counts are not guaranteed after a dead-host break.

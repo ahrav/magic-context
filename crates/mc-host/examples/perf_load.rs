@@ -1,4 +1,6 @@
-//! This binary drives the perf-harness host over loopback TCP.
+//! This binary drives the perf-harness host over the mandatory ring.
+//! docs/perf/mc-host-baseline.md defines the historical benchmark arms;
+//! the shared measurement contract lives in
 //! `tests/support/perf_measurement.rs`.
 //!
 //! The sender captures issue time after admission, immediately before frame construction.
@@ -143,19 +145,17 @@ struct ConnResult {
 async fn open_route(
     info: &raw_client::Discovered,
     session: &str,
-) -> (tokio::net::TcpStream, u16, u32) {
+) -> (tokio::net::UnixStream, u16, u32) {
     let mut client = RawClient::connect(info).await.expect("auth");
     let (channel, epoch) = client
         .route_open(MODULE_ID, "/perf", "perf", session)
         .await
         .expect("route");
-    let stream = client.into_stream();
-    stream.set_nodelay(true).expect("client nodelay");
-    (stream, channel, epoch)
+    (client.into_stream(), channel, epoch)
 }
 
 async fn run_conn(
-    conn: (tokio::net::TcpStream, u16, u32),
+    conn: (tokio::net::UnixStream, u16, u32),
     idx: usize,
     opts: Opts,
     start: Instant,

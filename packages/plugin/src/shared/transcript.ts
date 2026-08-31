@@ -187,15 +187,3 @@ export interface Transcript {
      */
     commit(): void;
 }
-
-/**
- * `STRUCTURAL_SENTINEL_KIND` excludes marked transcript parts from downstream transform stages.
- * Marked parts bypass tagging, drops, and indexing.
- * Adapters mark structural artifacts such as OpenCode's `step-start` and `step-finish` parts.
- * `step-start`/`step-finish`).
- *
- * `STRUCTURAL_SENTINEL_KIND` lets harness adapters mark synthetic parts.
- * `STRUCTURAL_SENTINEL_KIND` lets test fixtures construct synthetic transcripts.
- * Test fixtures can construct synthetic transcripts without real OpenCode or Pi structures.
- */
-export const STRUCTURAL_SENTINEL_KIND: TranscriptPartKind = "structural";

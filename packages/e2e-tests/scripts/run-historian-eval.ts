@@ -175,7 +175,7 @@ function runMutations(scenarios: readonly HistorianEvalScenario[]): number {
     return 0;
 }
 
-function liveModeFromEnv(): LiveHistorianMode {
+export function liveModeFromEnv(): LiveHistorianMode {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     const historianModel = process.env.HISTORIAN_EVAL_MODEL;
     const probeModel = process.env.HISTORIAN_EVAL_PROBE_MODEL;
@@ -202,7 +202,7 @@ function liveModeFromEnv(): LiveHistorianMode {
  * Without the OpenCode release, runs that differ only by harness runtime have identical system identities.
  * Reports from different harness runtimes are not longitudinally comparable.
  */
-function opencodeVersion(): string | null {
+export function opencodeVersion(): string | null {
     try {
         const version = execSync("opencode --version", { encoding: "utf8" }).trim();
         return version.length > 0 ? version : null;
@@ -215,7 +215,7 @@ function opencodeVersion(): string | null {
  * The runner applies the same corpus gate and mutation battery before each live run.
  *
  */
-function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number {
+export function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number {
     const diagnostics = corpusDiagnostics(scenarios);
     if (diagnostics.length > 0) {
         for (const diagnostic of diagnostics) console.error(`live admission: ${diagnostic}`);
@@ -249,7 +249,7 @@ function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number 
  * Building makes the loaded bytes current regardless of checkout metadata.
  * `spawn.ts` resolves the plugin entry for each spawn, so subsequent spawns use the bundle built here.
  */
-function buildPluginBundle(): number {
+export function buildPluginBundle(): number {
     const repoRoot = resolve(E2E_ROOT, "..", "..");
     console.log("building the plugin bundle the harness loads...");
     // Without removal, the build inherits the live credential from `process.env`.

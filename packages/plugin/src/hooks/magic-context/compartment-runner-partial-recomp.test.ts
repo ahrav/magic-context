@@ -99,70 +99,48 @@ describe("snapRangeToCompartments", () => {
         });
     });
 
-    test("range exactly matches one compartment boundary", () => {
-        const result = snapRangeToCompartments(threeCompartments, { start: 1, end: 100 });
-        expect(result).toMatchObject({
-            snapStart: 1,
-            snapEnd: 100,
-        });
+    // Each row snaps one requested message range against `threeCompartments`
+    // (1-100, 101-500, 501-1000) and asserts the snapped bounds plus how the
+    // compartments partition into prior / range / tail.
+    test.each([
+        ["range exactly matches one compartment boundary", 1, 100, 1, 100, 0, 1, 2, 1],
+        [
+            "range within single compartment snaps to that compartment's full bounds",
+            50,
+            75,
+            1,
+            100,
+            0,
+            1,
+            2,
+            null,
+        ],
+        ["range spans multiple compartments snaps outward", 50, 600, 1, 1000, 0, 3, 0, null],
+        ["range fully inside middle compartment", 200, 400, 101, 500, 1, 1, 1, 2],
+        ["range spans compartment boundary (e.g. 80-150)", 80, 150, 1, 500, 0, 2, 1, null],
+        [
+            "range touches the very last compartment's end exactly",
+            900,
+            1000,
+            501,
+            1000,
+            2,
+            1,
+            0,
+            null,
+        ],
+    ] as Array<
+        [string, number, number, number, number, number, number, number, number | null]
+    >)("%s", (_title, start, end, snapStart, snapEnd, prior, range, tail, firstSequence) => {
+        const result = snapRangeToCompartments(threeCompartments, { start, end });
+        expect(result).toMatchObject({ snapStart, snapEnd });
         if ("priorCompartments" in result) {
-            expect(result.priorCompartments).toHaveLength(0);
-            expect(result.rangeCompartments).toHaveLength(1);
-            expect(result.rangeCompartments[0].sequence).toBe(1);
-            expect(result.tailCompartments).toHaveLength(2);
-        }
-    });
-
-    test("range within single compartment snaps to that compartment's full bounds", () => {
-        const result = snapRangeToCompartments(threeCompartments, { start: 50, end: 75 });
-        expect(result).toMatchObject({
-            snapStart: 1,
-            snapEnd: 100,
-        });
-        if ("rangeCompartments" in result) {
-            expect(result.rangeCompartments).toHaveLength(1);
-            expect(result.priorCompartments).toHaveLength(0);
-            expect(result.tailCompartments).toHaveLength(2);
-        }
-    });
-
-    test("range spans multiple compartments snaps outward", () => {
-        const result = snapRangeToCompartments(threeCompartments, { start: 50, end: 600 });
-        expect(result).toMatchObject({
-            snapStart: 1, // expanded out to compartment 1's start
-            snapEnd: 1000, // expanded out to compartment 3's end (since 600 falls within compartment 3)
-        });
-        if ("rangeCompartments" in result) {
-            expect(result.rangeCompartments).toHaveLength(3);
-            expect(result.priorCompartments).toHaveLength(0);
-            expect(result.tailCompartments).toHaveLength(0);
-        }
-    });
-
-    test("range fully inside middle compartment", () => {
-        const result = snapRangeToCompartments(threeCompartments, { start: 200, end: 400 });
-        expect(result).toMatchObject({
-            snapStart: 101,
-            snapEnd: 500,
-        });
-        if ("rangeCompartments" in result) {
-            expect(result.rangeCompartments).toHaveLength(1);
-            expect(result.rangeCompartments[0].sequence).toBe(2);
-            expect(result.priorCompartments).toHaveLength(1);
-            expect(result.tailCompartments).toHaveLength(1);
-        }
-    });
-
-    test("range spans compartment boundary (e.g. 80-150)", () => {
-        const result = snapRangeToCompartments(threeCompartments, { start: 80, end: 150 });
-        expect(result).toMatchObject({
-            snapStart: 1, // compartment 1 contains message 80
-            snapEnd: 500, // compartment 2 contains message 150
-        });
-        if ("rangeCompartments" in result) {
-            expect(result.rangeCompartments).toHaveLength(2);
-            expect(result.priorCompartments).toHaveLength(0);
-            expect(result.tailCompartments).toHaveLength(1);
+            expect(result.priorCompartments).toHaveLength(prior);
+            expect(result.rangeCompartments).toHaveLength(range);
+            expect(result.tailCompartments).toHaveLength(tail);
+            if (firstSequence !== null) {
+                expect(result.rangeCompartments[0].sequence).toBe(firstSequence);
+            }
         }
     });
 
@@ -173,18 +151,6 @@ describe("snapRangeToCompartments", () => {
             snapStart: 101,
             snapEnd: 500,
         });
-    });
-
-    test("range touches the very last compartment's end exactly", () => {
-        const result = snapRangeToCompartments(threeCompartments, { start: 900, end: 1000 });
-        expect(result).toMatchObject({
-            snapStart: 501,
-            snapEnd: 1000,
-        });
-        if ("priorCompartments" in result) {
-            expect(result.priorCompartments).toHaveLength(2);
-            expect(result.tailCompartments).toHaveLength(0);
-        }
     });
 });
 

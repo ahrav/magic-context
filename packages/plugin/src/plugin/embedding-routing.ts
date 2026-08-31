@@ -5,7 +5,6 @@ import type {
 } from "../config/schema/magic-context";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../config/schema/magic-context";
 import {
-    getSynapseLaneIdentity,
     SYNAPSE_DEFAULT_MODEL,
     SYNAPSE_MAX_INPUT_BYTES,
     SYNAPSE_MAX_INPUT_TOKENS,
@@ -143,11 +142,4 @@ export async function resolveEmbeddingRouting(args: {
         shadow: null,
         warnings,
     };
-}
-
-export function getResolvedSynapseProviderIdentity(config: ResolvedSynapseEmbeddingConfig): string {
-    if (!config.synapse_fingerprint) {
-        throw new Error("deferred Synapse intent has no resolved provider identity");
-    }
-    return getSynapseLaneIdentity(config.model, config.synapse_fingerprint);
 }

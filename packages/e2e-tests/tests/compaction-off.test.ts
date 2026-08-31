@@ -19,6 +19,7 @@ import { seedProjectMemoryClaim } from "../../plugin/src/features/magic-context/
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { TestHarness } from "../src/harness";
 import { openTestDb } from "../src/test-db";
+import { isHistorianRequest } from "../src/cache-analysis";
 
 let h: TestHarness;
 
@@ -112,11 +113,10 @@ describe("compaction-off mode (issue #266 S3)", () => {
 
             let mainCalls = 0;
             h.mock.addMatcher((body) => {
-                const sys = body.system;
-                const sysText =
-                    sys === undefined || sys === null ? "" : JSON.stringify(sys);
-                // The historian route prevents unexpected historian requests from consuming the main-agent usage sequence.
-                if (sysText.includes("the hippocampus of a long-running coding agent")) {
+                // Route hidden MC children (historian) away; in off mode they
+                // never fire, but keep the guard so an unexpected spawn can't
+                // poison the main-agent usage ramp.
+                if (isHistorianRequest(body)) {
                     return null;
                 }
                 mainCalls += 1;

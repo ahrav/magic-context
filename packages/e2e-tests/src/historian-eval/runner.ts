@@ -26,7 +26,7 @@ import {
     MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES,
 } from "../../../plugin/src/hooks/magic-context/internal-agent-signatures";
 import { openTestDb } from "../test-db";
-import { TestHarness, type TestHarnessOptions } from "../harness";
+import { DEFAULT_PROMPT_TIMEOUT_MS, TestHarness, type TestHarnessOptions } from "../harness";
 import { MockProvider, type MockResponse } from "../mock-provider/server";
 import {
     EXECUTE_THRESHOLD_PERCENTAGE,
@@ -459,8 +459,100 @@ export interface RunScenarioOptions {
  *
  * The live budget allows two prompt attempts plus overhead.
  */
-function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
+export function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
     return mode.kind === "live" ? 2 * DEFAULT_HISTORIAN_TIMEOUT_MS + LIVE_HISTORIAN_OVERHEAD_MS : 90_000;
+}
+
+/** A probe is asked once, then re-asked at most once when its envelope is malformed. */
+export const MAX_PROBE_ATTEMPTS = 2;
+
+
+/**
+ * Harness-owned turns the runner prepends and appends around the authored
+ * transcript. Pure functions of the scenario, and exported for that reason:
+ * anything budgeting a role's wall clock must count the SAME turns the run will
+ * send, and a second copy of these rules drifts from them silently.
+ */
+export function fillerTurnCountFor(scenario: HistorianEvalScenario): number {
+    return Math.max(0, MIN_BUILD_TURNS - scenario.transcript.turns.length);
+}
+
+export function paddingTurnCountFor(scenario: HistorianEvalScenario): number {
+        const trigger = scenario.trigger;
+        const target = deriveProtectedTailTokenTarget({
+            contextLimit: trigger.modelContextLimit,
+            executeThresholdPercentage: EXECUTE_THRESHOLD_PERCENTAGE,
+            usagePercentage: (trigger.spikeUsageTokens / trigger.modelContextLimit) * 100,
+        });
+        // Sized from the ballast the padding turns actually carry. Assuming a
+        // 100-token floor over-counted every turn's contribution whenever the
+        // recipe configured less (the contract admits zero), so the padding came
+        // out short, the protected tail still covered the authored gold, and the
+        // scenario ended as `run-never-fired` or `probe-gold-uncovered` instead of
+        // evaluating anything. The prose itself is a few tokens, which is not
+        // enough to close that gap and is deliberately not counted as if it were.
+        const tokensPerTurn = Math.max(1, trigger.ballastTokensPerTurn);
+        // One extra turn absorbs rounding; the spike turn itself also carries
+        // ballast and joins the tail. Capped so degenerate pressure numbers
+        // (huge context limits push the tail target to its 96K ceiling)
+        // cannot stretch a scenario into hundreds of padding turns.
+        // The cap can still leave the tail short; `lintScenario` reports that at
+        // freeze time, where it does not pre-empt the runtime diagnostics a
+        // genuinely unreachable trigger produces on its own.
+        return Math.min(MAX_PADDING_TURNS, Math.ceil(target.N / tokensPerTurn) + 1);
+    }
+
+/** Trigger turns per declared historian run: one spike, one kick. */
+export const TRIGGER_TURNS_PER_HISTORIAN_RUN = 2;
+
+/**
+ * Every prompt one role sends, derived from the scenario rather than listed by
+ * hand.
+ *
+ * The role's wall clock is dominated by prompts, and each one the runner sends
+ * without an explicit `timeoutMs` is bounded only by `DEFAULT_PROMPT_TIMEOUT_MS`.
+ * Counting them phase by phase is what went wrong three times: the transcript
+ * turns, then the probe re-asks, then the per-run trigger turns were each missed
+ * in turn, and every omission silently under-reserved the deadline. Deriving the
+ * count from the scenario covers all of them at once, and
+ * `sends no more prompts than the role budget counts` pins it against a real run
+ * so a newly added prompt fails loudly instead of shrinking the reserve.
+ */
+export function liveRolePromptCount(scenario: HistorianEvalScenario): number {
+    const transcript = fillerTurnCountFor(scenario)
+        + scenario.transcript.turns.length
+        + paddingTurnCountFor(scenario);
+    const triggers = scenario.trigger.expectedHistorianRuns * TRIGGER_TURNS_PER_HISTORIAN_RUN;
+    const probes = scenario.probes.length * MAX_PROBE_ATTEMPTS;
+    return transcript + triggers + probes;
+}
+
+/**
+ * Upper bound on ONE scenario role's wall clock, for callers that must decide
+ * whether to START a role under an external kill bound.
+ *
+ * Two kinds of wait, and both are counted:
+ *
+ *   - every prompt the role sends (`liveRolePromptCount`), each bounded only by
+ *     `DEFAULT_PROMPT_TIMEOUT_MS` because the runner passes no `timeoutMs`;
+ *   - the completion wait after each declared historian run, plus the
+ *     post-probe quiescence wait, each bounded by `historianWaitBudgetMs`.
+ *
+ * `historianWaitBudgetMs` alone is NOT this bound. It covers only the run
+ * completion waits, so a caller reserving just that admits a role that then
+ * spends the whole transcript, trigger, and probe prompt sequence beyond it.
+ *
+ * This is an upper bound on waits, not a prediction: a healthy role finishes far
+ * inside it. Callers wanting the smaller number should measure, not shrink this.
+ */
+export function liveRoleWallClockBudgetMs(
+    scenario: HistorianEvalScenario,
+    mode: RunScenarioOptions["mode"],
+): number {
+    const historianWait = historianWaitBudgetMs(mode);
+    const prompts = liveRolePromptCount(scenario) * DEFAULT_PROMPT_TIMEOUT_MS;
+    const completionWaits = (scenario.trigger.expectedHistorianRuns + 1) * historianWait;
+    return prompts + completionWaits;
 }
 
 /**
@@ -929,26 +1021,14 @@ class ScenarioRunner {
     }
 
     private fillerCount(): number {
-        return Math.max(0, MIN_BUILD_TURNS - this.scenario.transcript.turns.length);
+        return fillerTurnCountFor(this.scenario);
     }
 
     /**
      * Harness-owned padding turns after the authored epilogue are excluded from gold and the fingerprint.
      */
     private paddingTurnCount(): number {
-        const trigger = this.scenario.trigger;
-        const target = deriveProtectedTailTokenTarget({
-            contextLimit: trigger.modelContextLimit,
-            executeThresholdPercentage: EXECUTE_THRESHOLD_PERCENTAGE,
-            usagePercentage: (trigger.spikeUsageTokens / trigger.modelContextLimit) * 100,
-        });
-        // The padding calculation uses each turn's actual ballast because the recipe permits fewer than 100 tokens, including zero.
-        // Ballast excludes prose tokens.
-        const tokensPerTurn = Math.max(1, trigger.ballastTokensPerTurn);
-        // The extra turn absorbs rounding; the spike turn's ballast joins the tail.
-        // `MAX_PADDING_TURNS` prevents a 96K tail target from creating hundreds of padding turns.
-        // `lintScenario` reports a short tail at freeze time without suppressing runtime diagnostics for an unreachable trigger.
-        return Math.min(MAX_PADDING_TURNS, Math.ceil(target.N / tokensPerTurn) + 1);
+        return paddingTurnCountFor(this.scenario);
     }
 
     private systemTuple(): SystemVersionTuple {

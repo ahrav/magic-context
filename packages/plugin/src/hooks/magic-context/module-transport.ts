@@ -16,11 +16,14 @@ import {
     BROCA_CREDENTIAL_VALUE_CAP_BYTES,
     DAEMON_GENERATION_CHANGED_CODE,
     Deadline,
+    evictProcessMcHostClient,
     isConsumerReconnectTransient,
     isMcHostCallError,
     McHostCallError,
-    McHostClient,
+    type McHostClient,
+    type McHostClientOptions,
     Priority,
+    processMcHostClient,
     type RouteHandle,
     type RouteTarget,
     SocketClosedError,
@@ -64,6 +67,8 @@ import {
     decodeClaimIntentStageResponse,
     decodeClaimMirrorReceiptResponse,
     decodeClaimMirrorSnapshotResponse,
+    type ModuleAuthorityMethod,
+    type ModuleMethod,
 } from "./module-wire";
 
 const DEFAULT_MODULE_ID = "magic-context";
@@ -448,6 +453,7 @@ export class McHostModuleTransport {
     private readonly requestTimeoutMs: number;
     private readonly routeSessionPrefix: string;
     private client: McHostClient | null = null;
+    private clientCacheOptions: McHostClientOptions | null = null;
     private routes = new Map<string, CachedRoute>();
     private routeOpenings = new Map<string, OpeningRoute>();
     private canonicalRootCache = new Map<string, string>();
@@ -693,50 +699,7 @@ export class McHostModuleTransport {
     async call(args: {
         sessionId: string;
         projectRoot: string;
-        method:
-            | "state_sync"
-            | "transform"
-            | "session.status"
-            | "session.delete"
-            | "session.flush"
-            | "session.recomp"
-            | "session.wrapup"
-            | "todo_state.set"
-            | "agent_drops.append"
-            | "authority.status"
-            | "authority.prepare"
-            | "authority.seed"
-            | "authority.drain.begin"
-            | "authority.drain.finish"
-            | "authority.drain_seed"
-            | "authority.drain_memories"
-            | "authority.drain_notes"
-            | "authority.drain_compartments"
-            | "authority.drain_reconcile"
-            | "authority.drain_verify"
-            | "authority.drain_flip"
-            | "authority.drain_finish"
-            | "mirror.pull"
-            | "ctx_note"
-            | "ctx_memory"
-            | "claim.intent.stage"
-            | "claim.intent.inspect"
-            | "claim.intent.ack"
-            | "claim.effects.apply"
-            | "claim.mirror.replace"
-            | "claim.mirror.apply"
-            | "note.evaluate"
-            | "note.evaluation.register"
-            | "note.evaluation.heartbeat"
-            | "note.evaluation.unregister"
-            | "note.evaluation.next"
-            | "note.evaluation.renew"
-            | "note.evaluation.complete"
-            | "note.evaluation.abandon"
-            | "transform.ack"
-            | "transform.nack"
-            | "dreamer.run_task"
-            | "memory.set_classification";
+        method: ModuleMethod;
         body: unknown;
         signal?: AbortSignal;
         /** `call()` does not retry after reconnecting; callers rebuild for the new connection. */
@@ -903,20 +866,7 @@ export class McHostModuleTransport {
     private async authorityRequest(
         sessionId: string,
         projectRoot: string,
-        method:
-            | "authority.status"
-            | "authority.prepare"
-            | "authority.seed"
-            | "authority.drain.begin"
-            | "authority.drain.finish"
-            | "authority.drain_seed"
-            | "authority.drain_memories"
-            | "authority.drain_notes"
-            | "authority.drain_compartments"
-            | "authority.drain_reconcile"
-            | "authority.drain_verify"
-            | "authority.drain_finish"
-            | "mirror.pull",
+        method: ModuleAuthorityMethod,
         body: Record<string, unknown>,
     ): Promise<Record<string, unknown>> {
         const response = (await this.call({
@@ -1279,17 +1229,17 @@ export class McHostModuleTransport {
         return resolved;
     }
 
-    private connectClient(deadline?: Deadline): Promise<McHostClient> {
-        // The handshake stage preserves the 2-second handshake budget within the operation deadline.
-        // The handshake stage preserves the 2-second handshake budget within the operation deadline.
+    private clientOptions(deadline?: Deadline): McHostClientOptions {
+        // Derive the handshake stage from the operation deadline without ever
+        // extending the preserved 2-second handshake budget (plan KTD5).
         const handshakeTimeoutMs = deadline
             ? Math.max(1, deadline.stageBudgetMs(HANDSHAKE_TIMEOUT_MS))
             : HANDSHAKE_TIMEOUT_MS;
-        return McHostClient.connect({
+        return {
             connectionFile: this.connectionFile,
             handshakeTimeoutMs,
             credentialSource: process.env,
-        });
+        };
     }
 
     private async demandManagedReadiness(
@@ -1403,27 +1353,32 @@ export class McHostModuleTransport {
         const connecting = (async (): Promise<CertifiedConnection> => {
             let candidate: McHostClient | null = null;
             try {
-                candidate = await this.connectClient(deadline);
+                const options = this.clientOptions(deadline);
+                candidate = await processMcHostClient(options);
                 if (
                     expectedDaemonId !== undefined &&
                     !sameDaemonId(candidate.authenticated?.daemonId, expectedDaemonId)
                 ) {
+                    // The owner cache retains this resolved client; closing it without eviction serves a closed instance to later callers under the same key.
+                    await evictProcessMcHostClient(options, candidate);
                     candidate.close();
                     throw this.connectionChangedError(
                         "daemon changed after lifecycle compatibility validation",
                     );
                 }
                 if (generation !== this.connectionGeneration) {
+                    // On generation mismatch, the catch skips `invalidateConnection`, so this branch evicts and closes `candidate`.
+                    await evictProcessMcHostClient(options, candidate);
                     candidate.close();
                     throw this.connectionChangedError("subc connection attempt was superseded");
                 }
                 this.client = candidate;
+                this.clientCacheOptions = options;
                 this.routes.clear();
                 this.backoffMs = CONNECT_BACKOFF_INITIAL_MS;
                 this.nextProbeMs = 0;
                 return { client: candidate, ...certification };
             } catch (error) {
-                candidate?.close();
                 if (generation === this.connectionGeneration) this.invalidateConnection();
                 this.nextProbeMs = Date.now() + this.backoffMs;
                 this.backoffMs = Math.min(this.backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
@@ -1451,10 +1406,19 @@ export class McHostModuleTransport {
         this.connectionGeneration += 1;
         this.connectionCertification = null;
         this.invalidateStateSyncCapabilities();
+        const superseded = this.client;
+        const supersededOptions = this.clientCacheOptions;
         this.client = null;
+        this.clientCacheOptions = null;
         this.routes.clear();
         this.routeOpenings.clear();
-        client?.close();
+        // A retained entry holds a resolved client whose channel owns a polling interval and two ring mappings, and `handshakeTimeoutMs` is deadline-derived, so reconnects do not reuse one entry.
+        if (superseded && supersededOptions) {
+            void evictProcessMcHostClient(supersededOptions, superseded).then(
+                () => superseded.closeAsync().catch(() => undefined),
+                () => undefined,
+            );
+        }
     }
 }
 

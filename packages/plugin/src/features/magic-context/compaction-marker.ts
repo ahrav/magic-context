@@ -24,6 +24,7 @@ import { getDataDir } from "../../shared/data-path";
 import { log } from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { tableColumnSet } from "./storage-schema-helpers";
 
 
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -97,16 +98,8 @@ function isOpenCodeSchemaCompatible(db: Database, dbPath: string): boolean {
     }
 
     try {
-        const messageCols = new Set(
-            (db.prepare("PRAGMA table_info(message)").all() as Array<{ name?: string }>)
-                .map((r) => r.name ?? "")
-                .filter((n) => n.length > 0),
-        );
-        const partCols = new Set(
-            (db.prepare("PRAGMA table_info(part)").all() as Array<{ name?: string }>)
-                .map((r) => r.name ?? "")
-                .filter((n) => n.length > 0),
-        );
+        const messageCols = tableColumnSet(db, "message");
+        const partCols = tableColumnSet(db, "part");
 
         const missingMessage = REQUIRED_MESSAGE_COLUMNS.filter((c) => !messageCols.has(c));
         const missingPart = REQUIRED_PART_COLUMNS.filter((c) => !partCols.has(c));
@@ -365,6 +358,30 @@ function removeLegacyMarkerLineageRows(
     ).run(args.sessionId, args.boundaryMessageId, args.compactionPartId);
 }
 
+/** Upsert one `part` row by deterministic id; retries rewrite the exact canonical row. */
+function upsertPartRow(
+    db: Database,
+    row: {
+        id: string;
+        messageId: string;
+        sessionId: string;
+        timeCreated: number;
+        timeUpdated: number;
+        data: string;
+    },
+): void {
+    db.prepare(
+        `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+             message_id = excluded.message_id,
+             session_id = excluded.session_id,
+             time_created = excluded.time_created,
+             time_updated = excluded.time_updated,
+             data = excluded.data`,
+    ).run(row.id, row.messageId, row.sessionId, row.timeCreated, row.timeUpdated, row.data);
+}
+
 /**
  * Returns null when the schema is incompatible or no boundary exists.
  */
@@ -421,24 +438,16 @@ export function injectCompactionMarker(
                 compactionPartId,
             });
 
-            // Deterministic IDs make retries upserts, and rewriting canonical rows repairs partial or stale writes.
-            db.prepare(
-                `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     message_id = excluded.message_id,
-                     session_id = excluded.session_id,
-                     time_created = excluded.time_created,
-                     time_updated = excluded.time_updated,
-                     data = excluded.data`,
-            ).run(
-                compactionPartId,
-                boundary.id,
-                args.sessionId,
-                boundaryTime,
-                boundaryTime,
-                '{"type":"compaction","auto":true}',
-            );
+            // Deterministic IDs make this transaction an upsert on retry. Rewriting
+            // the exact canonical row also repairs a partial or stale prior write.
+            upsertPartRow(db, {
+                id: compactionPartId,
+                messageId: boundary.id,
+                sessionId: args.sessionId,
+                timeCreated: boundaryTime,
+                timeUpdated: boundaryTime,
+                data: '{"type":"compaction","auto":true}',
+            });
 
             db.prepare(
                 `INSERT INTO message (id, session_id, time_created, time_updated, data)
@@ -450,23 +459,14 @@ export function injectCompactionMarker(
                      data = excluded.data`,
             ).run(summaryMsgId, args.sessionId, boundaryTime + 1, boundaryTime + 1, summaryMsgData);
 
-            db.prepare(
-                `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                     message_id = excluded.message_id,
-                     session_id = excluded.session_id,
-                     time_created = excluded.time_created,
-                     time_updated = excluded.time_updated,
-                     data = excluded.data`,
-            ).run(
-                summaryPartId,
-                summaryMsgId,
-                args.sessionId,
-                boundaryTime + 1,
-                boundaryTime + 1,
-                JSON.stringify({ type: "text", text: args.summaryText }),
-            );
+            upsertPartRow(db, {
+                id: summaryPartId,
+                messageId: summaryMsgId,
+                sessionId: args.sessionId,
+                timeCreated: boundaryTime + 1,
+                timeUpdated: boundaryTime + 1,
+                data: JSON.stringify({ type: "text", text: args.summaryText }),
+            });
         })();
 
         log(
@@ -487,7 +487,7 @@ export function injectCompactionMarker(
     }
 }
 
-// Foreign-marker scan
+// ── Foreign-marker scan (fork-orphan hygiene) ─────────────
 
 /**
  *
@@ -508,12 +508,12 @@ export interface SessionCompactionMarkerRows {
 
 /**
  *
- * OpenCode's `/fork` copies the parent session's message rows.
- * OpenCode's `/fork` copies the parent session's compaction-marker rows into the fork.
- * OpenCode's `/fork` does not copy magic-context's durable marker state from `context.db`.
- * A fork can contain copied marker rows that its durable marker state does not contain.
- * The scan enumerates all marker rows, including rows absent from durable marker state.
- * The caller diffs scanned markers against persisted state and repairs markers absent from that state.
+ * Used by the fork-orphan hygiene pass: OpenCode's `/fork` copies the
+ * parent session's message rows — including this plugin's compaction marker
+ * rows — into the fork, while magic-context's durable marker state (context.db)
+ * is NOT inherited (PARITY.md gap #25). The fork then owns marker rows its
+ * state knows nothing about. This scan enumerates all markers so the caller can
+ * diff them against the persisted state and repair the ones it does not own.
  *
  * The hygiene pass retries scan failures later instead of treating them as fatal transform errors.
  */
@@ -596,8 +596,10 @@ export function removeForeignCompactionMarker(
 
 
 /**
- * The cleanup result covers one session's `opencode.db`.
- * `removedRows` counts individual message and part rows.
+ * Result of the compaction-off flip cleanup over one session's opencode.db
+ * rows. Counts are row-level so the transition can both gate
+ * the flip notice ("cleared something") and prove idempotence (a second run
+ * reports zero removed rows).
  */
 export interface McOwnedMarkerCleanupResult {
     /**
@@ -649,10 +651,18 @@ function isMcCanonicalCompactionPartData(data: unknown): boolean {
 }
 
 /**
- * `removeMcOwnedCompactionMarkers` deletes MC-owned compaction-marker lineages unless preflight retains them.
- * When MC stops injecting `<session-history>`, a surviving MC marker would hide pre-boundary history.
- * Older markers inside the retained tail do not define the boundary.
- * Native compaction rows are never matched; ownership requires session identity and MC-specific signatures.
+ * Delete every Magic Context-owned compaction-marker lineage for a session
+ * from opencode.db. This is the flip-off transition's primary mechanism:
+ * with MC no longer injecting `<session-history>`,
+ * a surviving MC marker would keep `filterCompacted` hiding pre-boundary
+ * history with nothing to replace it — orphaned context. Deleting the MC
+ * pairs lets OpenCode recompute filtering live from the surviving rows, as if
+ * the MC markers never existed (peer-verified newest-completed-summary
+ * semantics; older markers inside the retained tail do not define the
+ * boundary). Native compaction rows are never matched: ownership keys on
+ * MC-specific signatures (the `magic-context` provider identity on summary
+ * messages, the exact MC marker summary text for legacy lineages, and the
+ * MC canonical compaction-part shape) plus session identity.
  *
  * The transaction atomically removes each compaction part with its summary lineage.
  * Deleting only the compaction part would leave its summary message in model history.

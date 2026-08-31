@@ -4,7 +4,6 @@ use std::fmt;
 use std::fs::File;
 use std::marker::PhantomData;
 use std::mem::size_of;
-#[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -17,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use crate::arena::{prefault, ArenaCounts, ArenaError, ArenaSpan, SpanPlan, MAX_FRAME_BYTES};
 use crate::descriptor::{
-    BackendId, DescriptorCounts, DescriptorError, FrameDescriptor, Incarnation, MemoryLayout,
-    ReleaseIdentity, SchedulingMode, DESCRIPTOR_SCHEMA_VERSION, MAX_SPANS, WIRE_V2_HEADER_BYTES,
+    DescriptorCounts, DescriptorError, FrameDescriptor, Incarnation, ReleaseIdentity,
+    SchedulingMode, DESCRIPTOR_SCHEMA_VERSION, MAX_SPANS, WIRE_V2_HEADER_BYTES,
 };
 use crate::lease::{LeaseError, LeaseSpan, ReceiveLease};
 use crate::profile::TargetProfile;
@@ -206,7 +205,6 @@ fn residency_vector_len(mapping_len: usize, page_size: usize) -> usize {
 }
 
 struct Mapping {
-    #[cfg(target_os = "linux")]
     fd: OwnedFd,
     base: NonNull<u8>,
     len: usize,
@@ -236,14 +234,7 @@ impl Mapping {
             return Err(RingError::ObjectSetupFailed);
         }
         let base = NonNull::new(mapped.cast()).ok_or(RingError::ObjectSetupFailed)?;
-        #[cfg(target_os = "macos")]
-        drop(fd);
-        Ok(Self {
-            #[cfg(target_os = "linux")]
-            fd,
-            base,
-            len,
-        })
+        Ok(Self { fd, base, len })
     }
 
     fn attach(fd: OwnedFd, len: usize) -> Result<Self, RingError> {
@@ -265,17 +256,9 @@ impl Mapping {
             return Err(RingError::ObjectSetupFailed);
         }
         let base = NonNull::new(mapped.cast()).ok_or(RingError::ObjectSetupFailed)?;
-        #[cfg(target_os = "macos")]
-        drop(fd);
-        Ok(Self {
-            #[cfg(target_os = "linux")]
-            fd,
-            base,
-            len,
-        })
+        Ok(Self { fd, base, len })
     }
 
-    #[cfg(target_os = "linux")]
     const fn fd(&self) -> &OwnedFd {
         &self.fd
     }
@@ -405,6 +388,19 @@ pub struct RingGrant {
     total_bytes: u64,
 }
 
+/// Mapping geometry carried by an authenticated ring grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingGeometry {
+    /// Descriptor slots in one direction.
+    pub descriptor_depth: u64,
+    /// Payload arena bytes in one direction.
+    pub arena_bytes: u64,
+    /// Concurrent receive leases in one direction.
+    pub max_leases: u64,
+    /// Complete mapping length, including control pages and alignment.
+    pub mapping_bytes: u64,
+}
+
 impl RingGrant {
     /// Encodes grant for authenticated bootstrap transport.
     pub fn encode(self) -> [u8; GRANT_BYTES] {
@@ -481,6 +477,16 @@ impl RingGrant {
     pub const fn encoded_len() -> usize {
         GRANT_BYTES
     }
+
+    /// Returns validated mapping geometry from the grant itself.
+    pub const fn geometry(self) -> RingGeometry {
+        RingGeometry {
+            descriptor_depth: self.descriptor_depth,
+            arena_bytes: self.arena_bytes,
+            max_leases: self.max_leases,
+            mapping_bytes: self.total_bytes,
+        }
+    }
 }
 
 impl fmt::Debug for RingGrant {
@@ -489,14 +495,13 @@ impl fmt::Debug for RingGrant {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Ring attachment handle.
 pub struct RingAttachment {
     fd: OwnedFd,
     grant: RingGrant,
     scheduling: SchedulingMode,
 }
 
-#[cfg(target_os = "linux")]
 impl RingAttachment {
     /// Attaches ring.
     pub fn attach(self) -> Result<Ring, RingError> {
@@ -507,9 +512,13 @@ impl RingAttachment {
     pub const fn grant(&self) -> RingGrant {
         self.grant
     }
+
+    /// Splits the transferable descriptor from its authenticated grant.
+    pub fn into_parts(self) -> (OwnedFd, RingGrant, SchedulingMode) {
+        (self.fd, self.grant, self.scheduling)
+    }
 }
 
-#[cfg(target_os = "linux")]
 impl fmt::Debug for RingAttachment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("RingAttachment(<redacted>)")
@@ -536,17 +545,21 @@ impl Ring {
     }
 
     /// Creates ring using already validated candidate runtime directory.
+    ///
+    /// Profile identity is enforced upstream by `TargetProfile::new`; only span geometry is re-checked here because it constrains this ring's wrap behavior.
     pub fn create_in(
         profile: &TargetProfile,
         lane: u32,
         runtime: &RuntimeDir,
     ) -> Result<Self, RingError> {
         runtime.validate()?;
-        // Reservations crossing the arena end wrap into two spans, so a profile advertising fewer spans per frame cannot be honored.
-        if profile.descriptor().backend() != BackendId::Ring
-            || profile.descriptor().memory_layout() != MemoryLayout::TwoSpanWrap
-            || profile.max_spans() < MAX_SPANS
-        {
+        debug_assert_eq!(
+            profile.descriptor().schema_version(),
+            DESCRIPTOR_SCHEMA_VERSION
+        );
+        // Reservations crossing the arena end wrap into two spans, so a
+        // profile advertising fewer spans per frame cannot be honored.
+        if profile.max_spans() < MAX_SPANS {
             return Err(RingError::ProfileMismatch);
         }
         let layout = Layout::new(profile.descriptor_depth(), profile.arena_bytes())?;
@@ -609,13 +622,12 @@ impl Ring {
         self.grant
     }
 
-    /// SharedObjectDescriptor transfers a shared object through authenticated transport.
-    #[cfg(target_os = "linux")]
+    /// Shared object descriptor for authenticated transfer.
     pub fn raw_fd(&self) -> RawFd {
         self.mapping.fd.as_raw_fd()
     }
 
-    #[cfg(target_os = "linux")]
+    /// Duplicates attachment handle.
     pub fn attachment(&self) -> Result<RingAttachment, RingError> {
         // SAFETY: F_DUPFD_CLOEXEC duplicates owned valid descriptor.
         let raw = unsafe { libc::fcntl(self.raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
@@ -632,7 +644,6 @@ impl Ring {
     }
 
     /// Controls close-on-exec for child re-exec tests and handle transfer.
-    #[cfg(target_os = "linux")]
     pub fn set_inheritable(&self, inheritable: bool) -> Result<(), RingError> {
         // SAFETY: F_GETFD reads flags from owned valid fd.
         let current = unsafe { libc::fcntl(self.raw_fd(), libc::F_GETFD) };
@@ -1653,13 +1664,13 @@ fn validate_object(fd: &OwnedFd, expected_len: usize) -> Result<(), RingError> {
     }
     // SAFETY: geteuid has no preconditions.
     let current_uid = unsafe { libc::geteuid() };
-    // Darwin sets `st_mode` for `shm_open` descriptors from the creation mode without file-type bits; apply the regular-file check only to Linux `memfd` objects.
-    // Darwin sets `st_mode` for `shm_open` descriptors from the creation mode without file-type bits; apply the regular-file check only to Linux `memfd` objects.
-    let type_valid = if cfg!(target_os = "linux") {
-        stat.st_mode & libc::S_IFMT == libc::S_IFREG
-    } else {
-        true
-    };
+    #[cfg(target_os = "linux")]
+    let type_valid = stat.st_mode & libc::S_IFMT == libc::S_IFREG;
+    // Darwin POSIX shared-memory descriptors do not provide a portable
+    // regular-file type bit. Size, owner, permissions, and ring identity
+    // validate the unlinked object instead.
+    #[cfg(target_os = "macos")]
+    let type_valid = true;
     if stat.st_uid != current_uid
         || stat.st_size < 0
         || stat.st_size as usize != expected_len
@@ -1721,7 +1732,9 @@ fn seal_object(fd: &OwnedFd) -> Result<(), RingError> {
 
 #[cfg(target_os = "macos")]
 fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
-    let mut random = [0u8; 16];
+    // Darwin limits POSIX shared-memory names to 31 bytes. Prefix plus 80 bits
+    // of random identity remains below that limit; O_EXCL rejects collisions.
+    let mut random = [0u8; 10];
     getrandom::getrandom(&mut random).map_err(|_| RingError::ObjectSetupFailed)?;
     let name = random
         .iter()
@@ -1735,7 +1748,7 @@ fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
     let raw = unsafe {
         libc::shm_open(
             name.as_ptr(),
-            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_CLOEXEC,
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
             0o600,
         )
     };
@@ -1744,8 +1757,15 @@ fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
     }
     // SAFETY: successful shm_open returns newly owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // macOS rejects O_CLOEXEC in shm_open flags, so a fork+exec racing
+    // fcntl can inherit the descriptor. Set FD_CLOEXEC immediately after
+    // shm_open to minimize that inheritance window.
+    // SAFETY: fd is owned and F_SETFD changes only its descriptor flags.
+    let cloexec = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    // An un-unlinked name persists in the kernel until reboot, so the unlink runs before either result is reported.
     // SAFETY: name.as_ptr() remains valid for the call; shm_unlink removes the name immediately.
-    if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
+    let unlinked = unsafe { libc::shm_unlink(name.as_ptr()) };
+    if cloexec < 0 || unlinked != 0 {
         return Err(RingError::ObjectSetupFailed);
     }
     let len = libc::off_t::try_from(len).map_err(|_| RingError::ArithmeticOverflow)?;

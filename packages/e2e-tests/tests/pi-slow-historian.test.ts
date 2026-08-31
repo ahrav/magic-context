@@ -2,16 +2,9 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
+import { isHistorianRequest } from "../src/cache-analysis";
 
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 const HISTORIAN_DELAY_MS = 8_000;
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    const system = body.system;
-    if (system === undefined || system === null) return false;
-    const asString = typeof system === "string" ? system : JSON.stringify(system);
-    return asString.includes(HISTORIAN_SYSTEM_MARKER);
-}
 
 let h: PiTestHarness;
 

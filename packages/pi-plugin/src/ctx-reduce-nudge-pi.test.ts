@@ -15,7 +15,7 @@ import {
 	maybeDeliverChannel2Pi,
 	setPiChannel1Baseline,
 } from "./ctx-reduce-nudge-pi";
-import { createTestDb } from "./test-utils.test";
+import { createTestDb } from "./test-utils";
 
 function channel2BaselineFields(baselineU: number, baselineT: number) {
 	return {

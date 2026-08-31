@@ -21,7 +21,7 @@ import {
 	measurePiTailHygiene,
 	refreshPiTailHygieneBaseline,
 } from "./tail-hygiene-walk-pi";
-import { createTestDb } from "./test-utils.test";
+import { createTestDb } from "./test-utils";
 
 function tag(
 	tagNumber: number,

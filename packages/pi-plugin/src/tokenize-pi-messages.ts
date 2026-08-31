@@ -4,6 +4,9 @@
  * `conversation` counts user and assistant text, assistant thinking, and user and tool-result images.
  * `toolCall` counts tool invocation names, arguments, and result text.
  *
+ * The result is persisted to `session_meta.{conversation_tokens,tool_call_tokens}`
+ * so `/ctx-status` can render an accurate breakdown
+ * bar that sums to the wire `inputTokens` (give or take provider
  * tokenizer drift).
  *
  *

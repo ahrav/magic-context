@@ -52,11 +52,9 @@ jobs:
         working-directory: packages/e2e-tests
         run: bun test scripts/validate-shm-hardening-matrix.test.ts
 
-      # `--allow-unresolved` leaves unresolved manifests nonfatal; FROZEN manifests remain strictly validated.
-      # workflow edit.
-      - name: Validate hardening matrix (strict when frozen)
+      - name: Validate fixed ring manifest
         working-directory: packages/e2e-tests
-        run: bun scripts/validate-shm-hardening-matrix.ts --allow-unresolved
+        run: bun scripts/validate-shm-hardening-matrix.ts
 
   release-contract-gate:
     name: mc-host release contract drift gate
@@ -83,7 +81,7 @@ jobs:
         run: bun run release:contract:check
 
   shm-crash-recovery:
-    name: SHM crash isolation + recovery (Linux, provisional ring tuple)
+    name: Mandatory ring unit and client suites (Linux)
     runs-on: ubuntu-latest
     needs: [shm-hardening-gate]
     timeout-minutes: 45
@@ -101,13 +99,24 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
-      # The full soak is opt-in through `shm-hardening-optin.yml`, and this job uploads no artifacts.
-      # The `--lib` pass runs `provider_recovery` controller unit tests that no integration binary exercises.
-      # The `provider_recovery` controller tests cover stale retries, deadline isolation, and wedged cleanup.
-      # The `provider_recovery` controller tests cover late-result fencing, inbox bounds, and custody accounting.
-      - name: Crash, recovery, and soak-smoke suites
+      # The unit suites carry the setup-socket handshake, ring transport, and
+      # control-response coverage. Without them a proof-transcript or
+      # response-shape change reaches the only supported transport unchecked.
+      - name: Mandatory ring unit suite
+        run: cargo nextest run -p mc-host -p mc-shm-transport --lib
+
+      - name: Mandatory ring client suite
         run: |
-          cargo nextest run -p mc-host --lib \
+          cargo nextest run -p mc-host --test client
+          cargo test -p mc-host --test shm_failure_modes -- --test-threads=1
+          cargo test -p mc-host --test shm_soak \
+            short_soak_keeps_fd_mapping_thread_and_rss_envelopes_bounded -- --exact
+
+      # The long soak has `#[ignore]`; this command excludes it without
+      # `--run-ignored`.
+      - name: Crash reclamation and bounded-resource suites
+        run: |
+          cargo nextest run -p mc-host \
             --test shm_failure_modes --test shm_soak
 
   shm-source-build:
@@ -117,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, macos-15-intel]
     steps:
       - uses: actions/checkout@v5
 
@@ -139,30 +148,29 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
-      # The metadata-only stubs cannot support `mc-module`, because its dependencies import real types from the `../commons` cortexkit crates.
-      # `mc-module` depends on `mc-core` and `mc-store`, which import real types from the `../commons` cortexkit crates.
-      # `mc-host-lifecycle` checks out sibling sources because `mc-module` requires real `../commons` types.
-      - name: Source-build transport, host, addon, and iceoryx
-        run: |
-          cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
-          cargo check -p mc-shm-transport --features iceoryx
+      # mc-module is absent here on purpose. It depends on mc-core and
+      # mc-store, which import real types from the ../commons cortexkit
+      # crates; the stubs above are metadata-only, so anything that COMPILES
+      # mc-module fails to resolve those imports. The ck-mc-host binary build
+      # and the lifecycle_cli contract run in the mc-host-lifecycle job, which
+      # checks out the sibling sources instead of stubbing them.
+      - name: Source-build transport, host, and addon
+        run: cargo build -p mc-shm-transport -p mc-host -p mc-shm-native
 
       - name: Rust contracts and lifecycle (Linux)
         if: runner.os == 'Linux'
         run: |
           cargo nextest run -p mc-shm-native -p mc-shm-transport
           cargo nextest run -p mc-host \
-            --test shm_transport --test transport_negotiation
+            --test client --test lifecycle
 
-      # macOS retains no provider because cfg omits the Linux-only crash and soak harnesses.
-      - name: Contracts, observer self-tests, and omission proof (macOS)
+      - name: Fixed-ring contracts (macOS)
         if: runner.os == 'macOS'
         run: |
+          cargo nextest run -p mc-shm-native
           cargo nextest run -p mc-shm-transport \
             --test contract --test fuzz_corpus
-          cargo nextest run -p mc-host --test shm_soak
-          cargo test -p mc-host --lib \
-            shm_provider::tests::platform_preflight_is_side_effect_free
+          cargo nextest run -p mc-host --test client --test lifecycle
 
       - name: Rust lease non-escape
         run: cargo test -p mc-host --doc
@@ -171,21 +179,22 @@ jobs:
         run: bun run --cwd packages/mc-shm-native build:source
 
       - name: Native behavior (Bun)
+        env:
+          MC_SHM_NATIVE_CLAIMED_TARGET: "1"
         run: bun run --cwd packages/mc-shm-native test:bun
 
       - name: Native behavior (Node 24)
+        env:
+          MC_SHM_NATIVE_CLAIMED_TARGET: "1"
         run: bun run --cwd packages/mc-shm-native test:node
 
-      - name: Capability activation or clean omission (Bun and Node 24)
+      - name: Mandatory capability activation (Bun and Node 24)
         run: |
           bun run --cwd packages/mc-shm-native test:capability:bun
           bun run --cwd packages/mc-shm-native test:capability:node
 
       - name: Plugin shared-memory contracts (Bun)
         run: bun test packages/plugin/src/shared/mc-host-client
-
-      - name: Plugin shared-memory lifetime (Node 24)
-        run: bun run --cwd packages/plugin test:mc-shm:node
 
       - name: Plugin typecheck
         run: bun run --cwd packages/plugin typecheck
@@ -216,11 +225,16 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: ahrav/commons
-          ref: d2208eda95d845193d84199dbfd0781a1f479291
+          ref: 77cd36b9cb8bde762d2b39d4807bb1c0338ed927
           path: commons
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Store tests against real commons
+        run: cargo test -p mc-store
 
       - name: Host lifecycle and closure proofs (Linux)
         if: runner.os == 'Linux'
@@ -230,6 +244,25 @@ jobs:
             --test broca_subprocess \
             --test harness_closure \
             --test protocol_vectors
+
+      # token_cache::test_cache_guard serializes the tests that share the
+      # process-global cache, so this suite is correct under either runner.
+      - name: Module transform and token-cache proofs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo nextest run -p mc-module --lib
+          cargo nextest run -p mc-module \
+            --test historian_truncate_differential \
+            --test caveman_differential \
+            --test selection_differential
+
+      - name: Module differential contracts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo nextest run -p mc-module \
+            --test caveman_differential \
+            --test historian_truncate_differential \
+            --test selection_differential
 
       - name: Native module adapter and CLI lifecycle (Linux)
         if: runner.os == 'Linux'
@@ -434,11 +467,15 @@ jobs:
   # Neither `test:e2e` nor `test:opencode-e2e` invokes `historianEvalUnitFiles()`.
   # The `historian-eval-contracts` job runs the historian contract and freeze lint independently so other jobs cannot mask their regressions.
   #
-  # The `historian-eval-contracts` job has no `needs` so its gates still run when `check-plugin` fails.
-  # A job downstream of `check-plugin` is skipped when `check-plugin` fails.
-  # Contract lint, scorer tests, freeze lint, and mutations run on every PR without credentials or live model calls.
-  # Live scenario runs run only through scheduled or manually dispatched `historian-eval.yml` workflows.
-  # historian-eval.yml only.
+  # Every deterministic historian-eval gate lives HERE, and the job declares no
+  # `needs`, for the same reason: a gate placed in a separate job downstream of
+  # check-plugin is skipped whenever check-plugin fails, which reproduces the
+  # silent non-enforcement one job away. Contract lint, scorer tests, the freeze
+  # lint, and mutation battery all run per-PR with no live model calls or
+  # credentials; live scenario runs are scheduled or dispatched through
+  # historian-eval.yml only. The metamorphic lane is the one deliberate exception
+  # to "HERE": it keeps its own job below, because in-job step order made it
+  # unreachable behind a red historian gate.
   historian-eval-contracts:
     name: Historian eval lane contracts
     runs-on: ubuntu-latest
@@ -466,8 +503,53 @@ jobs:
       - name: Run the invalid-state mutation battery
         run: bun packages/e2e-tests/scripts/run-historian-eval.ts --mutations
 
-  # The `dreamer-eval-contracts` job has no `needs` so an earlier job failure cannot skip it.
-  # A gate in the same job as an earlier failing step is skipped.
+  # Its own job with no `needs`, for the reason both neighbouring lanes state: a
+  # gate placed as a step in another job is skipped whenever an earlier step
+  # fails. As steps of historian-eval-contracts these two gates were exactly
+  # that — a red historian contract, freeze lint, or mutation battery skipped
+  # both the metamorphic unit contracts and the deterministic invariant run, so a
+  # PR that broke BOTH lanes reported only the historian half and produced no
+  # metamorphic report to debug the rest from. Deterministic and credential-free
+  # like the lanes it sits beside; live metamorphic pairs are scheduled or
+  # dispatched through historian-eval.yml only.
+  metamorphic-eval-contracts:
+    name: Metamorphic eval lane contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Metamorphic eval unit contracts
+        run: bun run test:metamorphic-unit
+
+      - name: Run deterministic metamorphic invariants
+        run: >-
+          bun packages/e2e-tests/scripts/run-metamorphic-eval.ts
+          --report packages/e2e-tests/artifacts/metamorphic-eval-ci-report.json
+
+      - name: Archive deterministic metamorphic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metamorphic-eval-ci-report
+          path: packages/e2e-tests/artifacts/metamorphic-eval-ci-report.json
+          if-no-files-found: warn
+
+  # Its own job with no `needs`, for the reasons spelled out above the historian
+  # lane: a gate placed as a step in another job is skipped whenever an earlier
+  # step fails, and a gate placed downstream of check-plugin is skipped whenever
+  # check-plugin fails — both reproduce silent non-enforcement one hop away.
   #
   # Neither `test:e2e` nor `test:opencode-e2e` invokes `test:dreamer-eval-unit`.
   # Neither `test:e2e` nor `test:opencode-e2e` reaches `dreamerEvalUnitFiles()`.
@@ -513,12 +595,17 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Adversarial scenarios (Bun)
-        working-directory: packages/plugin
-        run: bun scripts/run-mc-host-client-adversarial.ts
+      - name: Provision metadata-only sibling stubs
+        run: sh scripts/provision-rust-ci-stubs.sh
 
-      - name: Adversarial scenarios (Node 24)
-        run: bun run --cwd packages/plugin test:mc-host-client:node
+      - name: Build shared-memory addon from source
+        run: bun run --cwd packages/mc-shm-native build:source
+
+      - name: Shared-memory client smoke (Bun)
+        run: bun run --cwd packages/plugin smoke:mc-host-client:bun
+
+      - name: Shared-memory capability preflight (Node 24)
+        run: bun run --cwd packages/mc-shm-native test:capability:node
 
   check-rust:
     name: Check (Rust fmt + mc-core features)
@@ -621,6 +708,9 @@ jobs:
       - name: Install workspace deps
         run: bun install --frozen-lockfile
 
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
+
       - name: Build OpenCode plugin
         run: bun run --cwd packages/plugin build
 
@@ -652,6 +742,9 @@ jobs:
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
+
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build Pi plugin
         run: bun run --cwd packages/pi-plugin build
@@ -686,6 +779,9 @@ jobs:
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
+
+      - name: Build shared-memory package loader
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build Pi-compatible plugin and OMP argv renderer
         run: |
@@ -785,6 +881,11 @@ jobs:
       - name: Verify opencode on PATH
         run: opencode --version
 
+      # The parent builds mark the addon --external, so its generated entry
+      # point must exist before any Node-runtime import resolves it.
+      - name: Build shared-memory addon entry point
+        run: bun run --cwd packages/mc-shm-native build:js
+
       - name: Build Pi plugin
         run: bun run --cwd packages/pi-plugin build
 
@@ -828,6 +929,11 @@ jobs:
         run: |
           curl -fsSL https://opencode.ai/install | bash
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      # The parent builds mark the addon --external, so its generated entry
+      # point must exist before any Node-runtime import resolves it.
+      - name: Build shared-memory addon entry point
+        run: bun run --cwd packages/mc-shm-native build:js
 
       - name: Build supported TS harness plugins
         run: |

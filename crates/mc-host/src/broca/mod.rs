@@ -95,10 +95,6 @@ impl BrocaComponent {
         Arc::clone(&self.supervisor)
     }
 
-    pub fn route_index(&self) -> Arc<Mutex<HashMap<RouteHandle, SessionKey>>> {
-        Arc::clone(&self.routes)
-    }
-
     fn key_of_route(&self, route: RouteHandle) -> Option<SessionKey> {
         self.routes
             .lock()

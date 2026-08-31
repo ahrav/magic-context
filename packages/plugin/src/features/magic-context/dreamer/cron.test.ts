@@ -103,37 +103,43 @@ describe("matchesCron — dom/dow OR semantics", () => {
 });
 
 describe("nextOccurrence", () => {
-    it("is strictly after, even when `after` sits exactly on a match", () => {
-        const c = parsed("0 3 * * *");
-        const next = nextOccurrence(c, local(2026, 1, 1, 3, 0));
-        expect(next).not.toBeNull();
-        expect(next?.getTime()).toBe(local(2026, 1, 2, 3, 0).getTime());
-    });
-    it("nightly from midday → same-or-next day 03:00", () => {
-        const c = parsed("0 3 * * *");
-        const next = nextOccurrence(c, local(2026, 1, 1, 12, 0));
-        expect(next?.getTime()).toBe(local(2026, 1, 2, 3, 0).getTime());
-    });
-    it("hourly */15", () => {
-        const c = parsed("*/15 * * * *");
-        const next = nextOccurrence(c, local(2026, 1, 1, 3, 7));
-        expect(next?.getTime()).toBe(local(2026, 1, 1, 3, 15).getTime());
-    });
-    it("weekly Sunday 03:00", () => {
-        const c = parsed("0 3 * * 0");
-        const next = nextOccurrence(c, local(2026, 6, 8, 12, 0));
-        expect(next?.getDay()).toBe(0);
-        expect(next?.getTime()).toBe(local(2026, 6, 14, 3, 0).getTime());
-    });
-    it("leap-year Feb 29 resolves", () => {
+    // Each row asks for the next occurrence of one cron expression after one
+    // instant and pins the exact civil time (or null for an impossible cron).
+    it.each([
+        // `after` sits exactly on a match: strictly-after must advance a day.
+        [
+            "is strictly after, even when `after` sits exactly on a match",
+            "0 3 * * *",
+            [2026, 1, 1, 3, 0],
+            [2026, 1, 2, 3, 0],
+        ],
+        [
+            "nightly from midday resolves to the next day 03:00",
+            "0 3 * * *",
+            [2026, 1, 1, 12, 0],
+            [2026, 1, 2, 3, 0],
+        ],
+        ["hourly */15", "*/15 * * * *", [2026, 1, 1, 3, 7], [2026, 1, 1, 3, 15]],
+        // From Mon 2026-06-08, next Sunday is 2026-06-14 (dow 0).
+        ["weekly Sunday 03:00", "0 3 * * 0", [2026, 6, 8, 12, 0], [2026, 6, 14, 3, 0]],
         // 2028 is a leap year.
-        const c = parsed("0 0 29 2 *");
-        const next = nextOccurrence(c, local(2026, 3, 1, 0, 0));
-        expect(next?.getTime()).toBe(local(2028, 2, 29, 0, 0).getTime());
-    });
-    it("impossible cron (Feb 31) → null", () => {
-        const c = parsed("0 0 31 2 *");
-        expect(nextOccurrence(c, local(2026, 1, 1, 0, 0))).toBeNull();
+        ["leap-year Feb 29 resolves", "0 0 29 2 *", [2026, 3, 1, 0, 0], [2028, 2, 29, 0, 0]],
+        ["impossible cron (Feb 31) resolves to null", "0 0 31 2 *", [2026, 1, 1, 0, 0], null],
+    ] as Array<
+        [
+            string,
+            string,
+            [number, number, number, number, number],
+            [number, number, number, number, number] | null,
+        ]
+    >)("%s", (_title, expression, after, expected) => {
+        const c = parsed(expression);
+        const next = nextOccurrence(c, local(...after));
+        if (expected === null) {
+            expect(next).toBeNull();
+        } else {
+            expect(next?.getTime()).toBe(local(...expected).getTime());
+        }
     });
     it("excludeCivilMinute skips a matching candidate (DST double-fire guard)", () => {
         const c = parsed("30 1 * * *"); // 01:30 daily

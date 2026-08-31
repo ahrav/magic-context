@@ -31,21 +31,34 @@ export function findLastUserMessageId(messages: MessageLike[]): string | null {
     return null;
 }
 
+/**
+ * The meaningful user message that anchors a reminder: the latest one when
+ * `messageId` is omitted, else the message with that exact id.
+ */
+function findMeaningfulUserAnchor(messages: MessageLike[], messageId?: string): MessageLike | null {
+    if (messageId === undefined) {
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+            const message = messages[index];
+            if (isMeaningfulUserMessage(message)) return message;
+        }
+        return null;
+    }
+    for (const message of messages) {
+        if (message.info.id === messageId && isMeaningfulUserMessage(message)) {
+            return message;
+        }
+    }
+    return null;
+}
+
 export function appendReminderToLatestUserMessage(
     messages: MessageLike[],
     reminder: string,
 ): string | null {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const message = messages[index];
-        if (!isMeaningfulUserMessage(message)) {
-            continue;
-        }
-
-        appendReminderToUserMessage(message, reminder);
-        return typeof message.info.id === "string" ? message.info.id : null;
-    }
-
-    return null;
+    const message = findMeaningfulUserAnchor(messages);
+    if (!message) return null;
+    appendReminderToUserMessage(message, reminder);
+    return typeof message.info.id === "string" ? message.info.id : null;
 }
 
 export function appendReminderToUserMessageById(
@@ -53,25 +66,10 @@ export function appendReminderToUserMessageById(
     messageId: string,
     reminder: string,
 ): boolean {
-    for (const message of messages) {
-        if (message.info.id !== messageId || !isMeaningfulUserMessage(message)) {
-            continue;
-        }
-
-        appendReminderToUserMessage(message, reminder);
-        return true;
-    }
-
-    return false;
-}
-
-export function countMessagesSinceLastUser(messages: MessageLike[]): number {
-    let messagesSinceLastUser = 0;
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-        if (isMeaningfulUserMessage(messages[i])) break;
-        messagesSinceLastUser += 1;
-    }
-    return messagesSinceLastUser;
+    const message = findMeaningfulUserAnchor(messages, messageId);
+    if (!message) return false;
+    appendReminderToUserMessage(message, reminder);
+    return true;
 }
 
 /**
@@ -87,13 +85,19 @@ export function injectToolPartIntoLatestAssistant(
         if (message.info.role !== "assistant") continue;
         if (typeof message.info.id !== "string") continue;
         if (!isReplayableAssistantAnchor(message)) continue;
-        if (hasToolPartWithCallId(message, part.callID)) {
-            return message.info.id;
-        }
-        message.parts.push(part);
+        injectToolPartIntoAnchor(message, part);
         return message.info.id;
     }
     return null;
+}
+
+/** Idempotent on `callID`: pushes the part unless it is already present. */
+function injectToolPartIntoAnchor(message: MessageLike, part: { callID: string }): void {
+    if (hasToolPartWithCallId(message, part.callID)) {
+        // Already present — idempotent no-op for cache stability.
+        return;
+    }
+    message.parts.push(part);
 }
 
 /**
@@ -109,8 +113,7 @@ export function injectToolPartIntoAssistantById(
         if (message.info.id !== messageId) continue;
         if (message.info.role !== "assistant") continue;
         if (!isReplayableAssistantAnchor(message)) return false;
-        if (hasToolPartWithCallId(message, part.callID)) return true;
-        message.parts.push(part);
+        injectToolPartIntoAnchor(message, part);
         return true;
     }
     return false;

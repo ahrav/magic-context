@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use tokio::net::TcpListener;
+use tokio::net::UnixListener;
 use tokio::sync::Semaphore;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{timeout, timeout_at, Instant};
@@ -93,7 +93,7 @@ pub struct HostShared<H> {
     /// health_snapshot stores the last completed sanitized component-health report.
     /// `host.status` reads health_snapshot without invoking a lifecycle callback.
     pub health_snapshot: RwLock<HealthReport>,
-    pub providers: crate::transport_provider::TransportProviders,
+    pub ring: Arc<crate::ring_transport::RingTransport>,
     pub registry: RouteRegistry,
     /// Only inbound frame bodies may use this blocking budget because their lifetimes do not outlive the request.
     pub ingress_budget: ByteBudget,
@@ -539,8 +539,20 @@ fn build_target_index(
 /// After publication, `guard` drops only after `shared.tracker` drains.
 pub async fn run<H: McHostHandler>(
     handler: H,
+    config: HostConfig,
+    shutdown: CancellationToken,
+) -> Result<(), HostError> {
+    run_with_publish_hook(handler, config, shutdown, None).await
+}
+
+/// Runs a host with a frame-publication observer used by transport contract
+/// tests to hold a write before its completion hook fires.
+#[doc(hidden)]
+pub async fn run_with_publish_hook<H: McHostHandler>(
+    handler: H,
     mut config: HostConfig,
     shutdown: CancellationToken,
+    publish_hook: Option<crate::ring_transport::PublishHook>,
 ) -> Result<(), HostError> {
     crate::panic_boundary::install();
     config.validate().map_err(HostError::Config)?;
@@ -686,22 +698,24 @@ pub async fn run<H: McHostHandler>(
         if shutdown.is_cancelled() {
             return Ok(None);
         }
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .map_err(HostError::Io)?;
-        let port = listener.local_addr().map_err(HostError::Io)?.port();
+        let setup_socket = cleanup.guard_mut().dir_path().join("setup.sock");
+        let listener =
+            crate::setup_socket::bind_owner_only(&setup_socket).map_err(HostError::Io)?;
         cleanup
             .guard_mut()
-            .publish(port, &config.daemon_ver)
+            .register_setup_socket(setup_socket.clone());
+        cleanup
+            .guard_mut()
+            .publish(&setup_socket, &config.daemon_ver)
             .map_err(HostError::Instance)?;
         // A failed lifecycle-phase rewrite does not tear down an already published transport.
         let _ = cleanup
             .guard_mut()
             .write_lifecycle_record(crate::lifecycle::LifecyclePhase::Running);
-        Ok(Some(listener))
+        Ok(Some((listener, setup_socket)))
     }
     .await;
-    let listener = match setup {
+    let (listener, setup_socket) = match setup {
         Ok(Some(listener)) => listener,
         Ok(None) => {
             cleanup.finish().await;
@@ -720,6 +734,16 @@ pub async fn run<H: McHostHandler>(
 
     drop(manifests);
 
+    let ring_limits = crate::ring_transport::process_limits(config.limits.max_connections)
+        .ok_or_else(|| {
+            HostError::InitFailed("shared-memory resource limits overflow".to_owned())
+        })?;
+    let ring = Arc::new(crate::ring_transport::RingTransport::for_ring_profile(
+        ring_limits,
+    ));
+    if let Some(hook) = publish_hook {
+        ring.set_publish_hook(hook);
+    }
     let shared = Arc::new(HostShared {
         handler,
         limits: config.limits.clone(),
@@ -732,7 +756,7 @@ pub async fn run<H: McHostHandler>(
             detail: None,
             metrics: Some(serde_json::json!({"components": {}})),
         }),
-        providers: config.transport_providers.clone(),
+        ring,
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(
             config.limits.max_resident_bytes
@@ -773,6 +797,7 @@ pub async fn run<H: McHostHandler>(
     spawn_activation_task(&shared);
     spawn_health_task(&shared);
     accept_loop(&shared, listener).await;
+    let _ = std::fs::remove_file(setup_socket);
     let graceful = shutdown_sequence(&shared, abandon_guard.guard_mut()).await;
     let guard = abandon_guard.disarm();
 
@@ -837,8 +862,11 @@ fn spawn_activation_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
     });
 }
 
-/// Register each accepted connection task before the next await so shutdown can close its socket.
-async fn accept_loop<H: McHostHandler>(shared: &Arc<HostShared<H>>, listener: TcpListener) {
+/// Accepts sockets until shutdown. Each accept result is synchronously
+/// registered with the task tracker before the next await — the
+/// accepted-socket linearization point — so shutdown always finds and closes
+/// it (plan KTD10).
+async fn accept_loop<H: McHostHandler>(shared: &Arc<HostShared<H>>, listener: UnixListener) {
     loop {
         let accepted = tokio::select! {
             biased;
@@ -997,9 +1025,7 @@ async fn shutdown_sequence<H: McHostHandler>(
             gen.read_tasks.wait().await;
         }
 
-        for gen in &generations {
-            send_connection_goodbye(gen).await;
-        }
+        send_connection_goodbyes(&generations, deadline).await;
         for gen in &generations {
             gen.token.cancel();
         }
@@ -1042,8 +1068,19 @@ async fn shutdown_sequence<H: McHostHandler>(
     run_handler_shutdown(shared).await && drained_in_time
 }
 
-/// `run_handler_shutdown` invokes the handler shutdown callback once after route cleanup.
-/// Deadline expiry never aborts the callback; it trips the fatal latch and returns non-graceful while the tracked task retains handler ownership.
+async fn send_connection_goodbyes(generations: &[Arc<GenerationCore>], deadline: Instant) {
+    let mut sends = tokio::task::JoinSet::new();
+    for gen in generations {
+        let gen = Arc::clone(gen);
+        sends.spawn(async move { send_connection_goodbye(gen, deadline).await });
+    }
+    while sends.join_next().await.is_some() {}
+}
+
+/// Runs the handler shutdown callback exactly once, after route cleanup.
+/// The callback is never aborted: a deadline overrun trips the fatal latch
+/// and returns non-graceful while the still-tracked task keeps running, so
+/// the handler stays owned until it actually stops.
 async fn run_handler_shutdown<H: McHostHandler>(shared: &Arc<HostShared<H>>) -> bool {
     // `run_handler_shutdown` uses first-caller-wins because abandon cleanup can run after a dropped `run` future while the original shutdown callback still runs.
     if shared
@@ -1076,6 +1113,53 @@ async fn run_handler_shutdown<H: McHostHandler>(shared: &Arc<HostShared<H>>) -> 
                 "shutdown callback deadline expired".to_owned(),
             );
             false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame_channel::{frame_sender, SenderQueue};
+    use std::collections::HashMap;
+
+    fn stalled_generation(id: u64) -> (Arc<GenerationCore>, SenderQueue) {
+        let token = CancellationToken::new();
+        let (writer, queue) = frame_sender(1, token.clone(), Duration::from_secs(1));
+        (
+            Arc::new(GenerationCore {
+                id,
+                token: token.clone(),
+                read_cancel: token.child_token(),
+                read_tasks: TaskTracker::new(),
+                shutdown_complete: CancellationToken::new(),
+                writer,
+                membership: std::sync::Mutex::new(HashMap::new()),
+                pending: std::sync::Mutex::new(HashMap::new()),
+                pings: std::sync::Mutex::new(HashMap::new()),
+                busy_rejects: Arc::new(tokio::sync::Semaphore::new(1)),
+                next_ping_corr: std::sync::atomic::AtomicU64::new(1),
+            }),
+            queue,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_generations_share_one_shutdown_goodbye_deadline() {
+        let (first, mut first_queue) = stalled_generation(1);
+        let (second, mut second_queue) = stalled_generation(2);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(250);
+
+        send_connection_goodbyes(&[first, second], deadline).await;
+
+        assert_eq!(
+            Instant::now().duration_since(started),
+            Duration::from_millis(250)
+        );
+        for queue in [&mut first_queue, &mut second_queue] {
+            let frame = queue.try_recv().expect("Goodbye was queued concurrently");
+            assert_eq!(frame.frame.bytes[5], crate::wire::FrameType::Goodbye as u8);
         }
     }
 }

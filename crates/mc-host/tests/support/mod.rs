@@ -3,11 +3,9 @@
 #![allow(dead_code)]
 
 pub mod broca;
-pub mod fake_transport;
+pub mod echo_host;
 pub mod process_resources;
 pub mod raw_client;
-#[cfg(target_os = "linux")]
-pub mod shm_process;
 pub mod synapse;
 
 use std::path::{Path, PathBuf};
@@ -589,10 +587,24 @@ impl TestHost {
             .expect("host must publish")
     }
 
-    /// `start` returns the harness after `handler`'s publication appears.
+    pub async fn start_with_publish_hook(hook: mc_host::ring_transport::PublishHook) -> Self {
+        Self::try_start_with_publish_hook(TestHandler::new(), |_config| {}, Some(hook))
+            .await
+            .expect("host must publish")
+    }
+
+    /// Starts `handler`, returning the harness once the publication appears.
     pub async fn try_start_with(
         handler: TestHandler,
         tweak: impl FnOnce(&mut HostConfig),
+    ) -> Result<Self, HostError> {
+        Self::try_start_with_publish_hook(handler, tweak, None).await
+    }
+
+    async fn try_start_with_publish_hook(
+        handler: TestHandler,
+        tweak: impl FnOnce(&mut HostConfig),
+        publish_hook: Option<mc_host::ring_transport::PublishHook>,
     ) -> Result<Self, HostError> {
         let data_root = tempfile::tempdir().expect("temp data root");
         let mut config = HostConfig {
@@ -620,14 +632,16 @@ impl TestHost {
                 .expect("the harness always configures a data root"),
         );
 
+        // A predecessor may already have published at this path, so a
+        // pre-existing snapshot must not be mistaken for this host's own.
+        let existing = std::fs::read(&publication).ok();
         let shutdown = CancellationToken::new();
         let run_handler = handler.runtime_clone();
         let run_shutdown = shutdown.clone();
-        let join =
-            tokio::spawn(async move { mc_host::run(run_handler, config, run_shutdown).await });
+        let join = tokio::spawn(async move {
+            mc_host::run_with_publish_hook(run_handler, config, run_shutdown, publish_hook).await
+        });
 
-        // A pre-existing publication snapshot cannot identify this host because a predecessor may have published at the same path.
-        let existing = std::fs::read(&publication).ok();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             // If `join` has finished, return its error before accepting a stale publication.

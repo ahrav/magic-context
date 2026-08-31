@@ -15,27 +15,23 @@
  */
 
 import { Database } from "bun:sqlite";
+import { storageSubtreePath } from "../../plugin/src/shared/data-path";
 import { existsSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { ballastProse } from "./ballast";
-import { MockProvider, type MockResponse } from "./mock-provider/server";
+import {
+    DEFAULT_MOCK_RESPONSE,
+    type SdkClientCore,
+    type SharedHarnessOptions,
+} from "./harness-primitives";
+import { MockProvider } from "./mock-provider/server";
 import {
     spawnOpencode,
     type SpawnedOpencode,
     type SpawnOptions,
 } from "./opencode-runner/spawn";
 
-export interface TestHarnessOptions {
-    /** `magicContextConfig` overrides test defaults. */
-    magicContextConfig?: Record<string, unknown>;
-    /** `openCodeConfigExtra` overrides test defaults. */
-    openCodeConfigExtra?: Record<string, unknown>;
-    /** `modelContextLimit` overrides the mock model's 200000-token context limit. */
-    modelContextLimit?: number;
-    /**
-     * `mockDefault` supplies responses after the mock queue is empty, so tests can send unscripted prompts.
-     */
-    mockDefault?: MockResponse;
+export interface TestHarnessOptions extends SharedHarnessOptions {
     /**
      * `extraEnv` overrides the fake API key after test defaults are merged.
      * Secret-bearing `extraEnv` requires `hostname: "127.0.0.1"`.
@@ -45,34 +41,20 @@ export interface TestHarnessOptions {
     hostname?: SpawnOptions["hostname"];
 }
 
-export interface SdkClient {
-    session: {
-        create: (opts: {
-            query: { directory: string };
-            body?: { parentID?: string; title?: string };
-        }) => Promise<{ data?: { id: string } }>;
-        prompt: (opts: {
-            path: { id: string };
-            body: {
-                model: { providerID: string; modelID: string };
-                parts: Array<{ type: "text"; text: string }>;
-                agent?: string;
-            };
-        }) => Promise<{ data?: unknown }>;
-        messages: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
+export interface SdkClient extends SdkClientCore {
+    session: SdkClientCore["session"] & {
         children: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
     };
 }
 
-const DEFAULT_MOCK_RESPONSE: MockResponse = {
-    text: "ok",
-    usage: {
-        input_tokens: 100,
-        output_tokens: 20,
-        cache_creation_input_tokens: 100,
-        cache_read_input_tokens: 0,
-    },
-};
+/**
+ * Wall-clock ceiling for one `sendPrompt` when the caller names none.
+ *
+ * Exported because callers that must BUDGET for a prompt they do not time
+ * themselves need the same number the call enforces — a local copy silently
+ * drifts from it and under-reserves.
+ */
+export const DEFAULT_PROMPT_TIMEOUT_MS = 180_000;
 
 export class TestHarness {
     readonly mock: MockProvider;
@@ -228,7 +210,12 @@ export class TestHarness {
             timeoutMs?: number;
         } = {},
     ): Promise<unknown> {
-        const timeoutMs = options.timeoutMs ?? 180_000;
+        // Default bumped from 30s → 180s. CI runners (GitHub-hosted ubuntu)
+        // can take 10-30s just for opencode serve to process a single prompt
+        // when historian/compressor work is involved. 180s leaves room for
+        // multi-step assistant turns while still catching genuinely stuck
+        // prompts. Individual tests can still pass a smaller timeoutMs.
+        const timeoutMs = options.timeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
         const promptPromise = this.client.session.prompt({
             path: { id: sessionId },
             body: {
@@ -268,12 +255,9 @@ export class TestHarness {
 
     /* */
     contextDbPath(): string {
-        return join(
-            this.opencode.env.dataDir,
-            "cortexkit",
-            "magic-context",
-            "context.db",
-        );
+        // The shared cortexkit/magic-context path lets OpenCode and Pi share
+        // state. See packages/plugin/src/shared/data-path.ts.
+        return join(storageSubtreePath(this.opencode.env.dataDir), "context.db");
     }
 
     /* */

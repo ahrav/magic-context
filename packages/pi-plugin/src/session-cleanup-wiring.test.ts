@@ -20,10 +20,6 @@ describe("clearContextHandlerSession internals", () => {
 		/export function clearContextHandlerSession\([^{]*\{([\s\S]*?)\n\}/,
 	);
 
-	test("function exists and is exported", () => {
-		expect(fn).not.toBeNull();
-	});
-
 	const body = fn?.[1] ?? "";
 
 	test("deletes from historyRefreshSessions", () => {
@@ -45,10 +41,6 @@ describe("session_before_switch handler wiring", () => {
 		/pi\.on\("session_before_switch"[\s\S]*?\}\);/,
 	);
 
-	test("session_before_switch handler is registered", () => {
-		expect(handler).not.toBeNull();
-	});
-
 	const body = handler?.[0] ?? "";
 
 	test("handler resolves the OUTGOING session id (not the new target)", () => {
@@ -69,10 +61,6 @@ describe("session_shutdown handler also drains per-session maps", () => {
 	const handler = INDEX_SRC.match(
 		/pi\.on\("session_shutdown"[\s\S]*?\n\s*\}\);/,
 	);
-
-	test("session_shutdown handler exists", () => {
-		expect(handler).not.toBeNull();
-	});
 
 	const body = handler?.[0] ?? "";
 

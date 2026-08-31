@@ -192,8 +192,9 @@ export interface MagicContextDeps {
         };
         transform_mode?: ResolvedTransformMode;
         subc?: { connection_file: string };
-        /** `createMagicContextHook` calls `isCompactionEnabled` once at construction and passes its result to transform phases.
-         * */
+        /** Compaction-off mode gate. Resolved ONCE here at the
+         *  session-hook construction boundary via isCompactionEnabled; the
+         *  resolved boolean is threaded to the transform phases. */
         compaction?: { enabled?: boolean };
         mural?: { enabled: boolean; model?: string };
     };
@@ -416,7 +417,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const dreamerRunnable = isDreamerRunnable(deps.config);
     const dreamerConfig = dreamerRunnable ? deps.config.dreamer : undefined;
     const historianRunnable = isHistorianRunnable(deps.config);
-    // `createMagicContextHook` resolves `compactionOff` once so phases receive a boolean without rereading configuration.
+    // Compaction-off mode, resolved once at this construction
+    // boundary and threaded to every phase as a boolean — internal phases
+    // never re-read the config path.
     const compactionOff = !isCompactionEnabled(deps.config);
 
     // `/ctx-recomp`, `/ctx-session-upgrade`, and RPC dialogs share one recomp/upgrade context.
@@ -1400,7 +1403,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             systemPromptRefreshSessions.add(sessionId);
             pendingMaterializationSessions.add(sessionId);
         },
-        // runManagedRecomp and runManagedUpgrade give command paths the same model fallback, live progress, and terminal state as RPC dialog paths.
+        // E3 (recomp) + /ctx-session-upgrade: both run through the SHARED
+        // orchestrator (runManagedRecomp / runManagedUpgrade) so the command
+        // paths get identical model fallback + live progress + terminal state as
+        // the RPC dialog paths, so neither path can drift to fallback without
+        // progress (sidebar stuck on a stale "failed") or progress without
+        // fallback (failing on an empty primary model).
         executeWrapup: historianRunnable
             ? async (sessionId, options) =>
                   runManagedWrapup(buildManagedWrapupCtx(sessionId), sessionId, options)

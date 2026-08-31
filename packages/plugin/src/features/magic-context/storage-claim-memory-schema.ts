@@ -55,7 +55,6 @@ export type ClaimEffectChangeKind = (typeof CLAIM_EFFECT_CHANGE_KINDS)[number];
 /** Receipt outcomes record applied effects, a stale claim-local token, or a semantic no-op.
  * All receipt outcomes persist for replay. */
 export const CLAIM_OPERATION_OUTCOMES = ["applied", "stale", "noop"] as const;
-export type ClaimOperationOutcome = (typeof CLAIM_OPERATION_OUTCOMES)[number];
 
 /* */
 export const CLAIM_DERIVATION_RELATIONS = ["copied_from", "moved_from"] as const;

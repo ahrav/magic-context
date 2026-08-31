@@ -66,8 +66,13 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
     }
 
     const truncate = config.provider === "openai-compatible" ? config.truncate?.trim() : undefined;
-    // A quantized ONNX model can emit vectors that differ from fp32.
-    // Changing `local_dtype` between a non-`"fp32"` value and `"fp32"` or unset re-embeds vectors.
+    // local_dtype changes the produced vectors (a quantized ONNX model emits
+    // different embeddings than fp32), so a non-default dtype MUST fold into the
+    // model identity — switching dtype re-embeds rather than mixing vector
+    // spaces. Spread CONDITIONALLY and EXCLUDE the default "fp32": omitting the
+    // term when unset OR when set to the default keeps the identity byte-
+    // identical for the common config, so adding this field does not force a
+    // global re-embed on upgrade. Mirrors the truncate fold above.
     const localDtype =
         config.provider === "local" && config.local_dtype && config.local_dtype !== "fp32"
             ? config.local_dtype

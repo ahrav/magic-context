@@ -8,7 +8,7 @@ import { getSourceContents } from "@magic-context/core/features/magic-context/st
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
-import { assistantMessage, createTestDb, userMessage } from "./test-utils.test";
+import { assistantMessage, createTestDb, userMessage } from "./test-utils";
 import { createPiTranscript } from "./transcript-pi";
 
 describe("tagTranscript source_contents persistence", () => {

@@ -119,6 +119,19 @@ export type RawOutputStageResult =
     | { stage: "authored-evidence-unprocessed"; error: string }
     | { stage: "scored"; score: ScenarioScore };
 
+export interface RawOutputScoringOptions {
+    nowMs?: number;
+    chunkStartOrdinal?: number;
+    chunkEndOrdinal?: number;
+    authoredStartOrdinal?: number;
+    authoredEndOrdinal?: number;
+}
+
+export interface RawOutputScoringRead {
+    result: RawOutputStageResult;
+    injectedClaims: InjectedClaimRecord[];
+}
+
 interface FactsScore {
     precision: number | null;
     recall: number | null;
@@ -127,6 +140,20 @@ interface FactsScore {
     visibleClaimsMatched: number;
     visibleClaimsTotal: number;
     falseAuthoritativeMatches: string[];
+}
+
+export type ExpectationGoldMatchPredicates = Record<string, boolean>;
+
+/** Independent match predicate per gold expectation; no matching assignment is consulted. */
+export function expectationGoldMatchPredicates(
+    scenario: HistorianEvalScenario,
+    visible: ReadonlyArray<{ category: string; content: string }>,
+): ExpectationGoldMatchPredicates {
+    return Object.fromEntries(
+        scenario.gold.expectedClaims
+            .map((expected) => [expected.id, visible.some((claim) => matchesGold(expected, claim))] as const)
+            .sort(([left], [right]) => left.localeCompare(right)),
+    );
 }
 
 /**
@@ -255,12 +282,7 @@ function structuralFindingsFromRows(
 }
 
 /**
- *
- * Any later successful run marks a discarded provisional last compartment as healed.
- * Validation must inspect every run because later successful runs do not repair kept provisional boundaries.
- * A discarded provisional last compartment remains unhealed when no later run succeeds.
- */
-/**
+ * Runs whose discarded provisional compartment no later successful run healed.
  *
  * `healingFindings` reports unhealed discarded runs, and the probe-coverage gate excludes them.
  * `unhealedDiscardRuns` derives unhealed discarded runs from `runs` so `healingFindings` and the probe-coverage gate remain aligned when finding messages change.
@@ -334,9 +356,7 @@ function goldAnswerStatedInCompartments(probe: Probe, exchange: ProbeExchange): 
     );
 }
 
-
-
-/* */
+/** Resolve a gold expected-claim reference to concrete injected claims. */
 function claimsMatchingGold(claim: ExpectedClaim, items: readonly InjectedClaimRecord[]): InjectedClaimRecord[] {
     return items.filter((item) => matchesGold(claim, item));
 }
@@ -504,6 +524,11 @@ export function freshScoringDatabase(): Database {
 }
 
 /**
+ * Primary scorer entry point: raw historian output artifact →
+ * parse → validate → publish into a fresh temp DB → score. Validation
+ * rejection is a stage outcome the mutation battery asserts on; it never
+ * appears as a live scenario verdict (live all-attempts-invalid is
+ * FAIL:invalid-output via `scoreRunRecord`).
  *
  *
  * A replayed runtime chunk includes harness-owned filler.
@@ -512,17 +537,11 @@ export function freshScoringDatabase(): Database {
  * Without bounds, the two entry points can score the same output differently.
  * An authored chunk needs no explicit span.
  */
-export function scoreRawOutput(
+export function scoreRawOutputWithInjectedClaims(
     rawOutput: string,
     scenario: HistorianEvalScenario,
-    options: {
-        nowMs?: number;
-        chunkStartOrdinal?: number;
-        chunkEndOrdinal?: number;
-        authoredStartOrdinal?: number;
-        authoredEndOrdinal?: number;
-    } = {},
-): RawOutputStageResult {
+    options: RawOutputScoringOptions = {},
+): RawOutputScoringRead {
     const nowMs = options.nowMs ?? Date.now();
     const hasRange = options.chunkStartOrdinal !== undefined || options.chunkEndOrdinal !== undefined;
     if (hasRange && (options.chunkStartOrdinal === undefined || options.chunkEndOrdinal === undefined)) {
@@ -563,7 +582,7 @@ export function scoreRawOutput(
         : { startMessage: chunk.startIndex, endMessage: chunk.endIndex };
     const validated = validateHistorianOutput(rawOutput, RAW_OUTPUT_SESSION_ID, chunk, [], 1);
     if (!validated.ok) {
-        return { stage: "validation-rejected", error: validated.error };
+        return { result: { stage: "validation-rejected", error: validated.error }, injectedClaims: [] };
     }
 
     // A valid output may stop early by emitting `<unprocessed_from>`.
@@ -584,16 +603,11 @@ export function scoreRawOutput(
         (earliest, compartment) => Math.min(earliest, compartment.startMessage),
         Number.POSITIVE_INFINITY,
     );
-    if (emittedReach < authoredSpan.endMessage || emittedStart > authoredSpan.startMessage) {
-        const covered = Number.isFinite(emittedStart) ? `${emittedStart}-${emittedReach}` : "nothing";
-        return {
-            stage: "authored-evidence-unprocessed",
-            error: `output covers ${covered}, which does not span the authored ordinals ${authoredSpan.startMessage}-${authoredSpan.endMessage}; gold and absence checks over the uncovered part would pass vacuously`,
-        };
-    }
-
-    // This scorer persists only compartments that production would publish.
-    // Without this gating, the scorer could promote facts that production would discard.
+    // Mirror production's publish gating (compartment-runner-incremental):
+    // a provisional last compartment inside the healing slack is discarded
+    // and unanchored promotion is skipped for the whole pass, so this seam
+    // persists exactly what production would persist. Without the mirror, a
+    // crafted output production would strip scores as if it published.
     const discardLast = shouldDiscardLastHistorianCompartment(validated.compartments, chunk);
     const persisted = discardLast ? validated.compartments.slice(0, -1) : validated.compartments;
 
@@ -615,30 +629,51 @@ export function scoreRawOutput(
         if (visible === null) {
             throw new Error("historian-eval scorer: temp-DB claim snapshot unexpectedly stale");
         }
+        if (emittedReach < authoredSpan.endMessage || emittedStart > authoredSpan.startMessage) {
+            const covered = Number.isFinite(emittedStart) ? `${emittedStart}-${emittedReach}` : "nothing";
+            return {
+                result: {
+                    stage: "authored-evidence-unprocessed",
+                    error: `output covers ${covered}, which does not span the authored ordinals ${authoredSpan.startMessage}-${authoredSpan.endMessage}; gold and absence checks over the uncovered part would pass vacuously`,
+                },
+                injectedClaims: visible,
+            };
+        }
         const rows = persisted.map((compartment) => ({
             startMessage: compartment.startMessage,
             endMessage: compartment.endMessage,
         }));
         return {
-            stage: "scored",
-            score: assembleScore({
-                scenarioId: scenario.id,
-                facts: scoreFacts(scenario, visible),
-                structuralFindings: structuralFindingsFromRows(
-                    rows,
-                    scenario.gold.compartments.minCount,
-                    chunk.startIndex > 1 ? { startMessage: 1, endMessage: chunk.startIndex - 1 } : null,
-                    authoredSpan,
-                ),
-                probeVerdicts: [],
-                anyRunInvalid: false,
-                system: null,
-                source: "raw-output",
-            }),
+            result: {
+                stage: "scored",
+                score: assembleScore({
+                    scenarioId: scenario.id,
+                    facts: scoreFacts(scenario, visible),
+                    structuralFindings: structuralFindingsFromRows(
+                        rows,
+                        scenario.gold.compartments.minCount,
+                        chunk.startIndex > 1 ? { startMessage: 1, endMessage: chunk.startIndex - 1 } : null,
+                        authoredSpan,
+                    ),
+                    probeVerdicts: [],
+                    anyRunInvalid: false,
+                    system: null,
+                    source: "raw-output",
+                }),
+            },
+            injectedClaims: visible,
         };
     } finally {
         db.close();
     }
+}
+
+export function scoreRawOutput(
+    rawOutput: string,
+    scenario: HistorianEvalScenario,
+    options: RawOutputScoringOptions = {},
+): RawOutputStageResult {
+    return scoreRawOutputWithInjectedClaims(rawOutput, scenario, options).result;
 }
 
 function errorScore(

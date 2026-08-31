@@ -2,13 +2,17 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadPluginConfigDetailed } from "../config";
 import {
     _resetProjectEmbeddingRegistryForTests,
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { closeDatabase, openDatabase } from "../features/magic-context/storage";
-import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
+import {
+    ensureProjectRegisteredFromOpenCodeDirectory,
+    registerProjectEmbeddingFromDetailedLoad,
+} from "./embedding-bootstrap";
 
 const tempDirs: string[] = [];
 const originalHome = process.env.HOME;
@@ -53,5 +57,28 @@ describe("ensureProjectRegisteredFromOpenCodeDirectory", () => {
         const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
         expect(snapshot?.enabled).toBe(true);
         expect(snapshot?.runtimeFingerprint).not.toStartWith("observation:");
+    });
+
+    it("latches instead of registering when the detailed load is untrusted", async () => {
+        const projectDir = tempDir("mc-untrusted-boot-");
+        process.env.HOME = tempDir("mc-untrusted-home-");
+        process.env.XDG_CONFIG_HOME = tempDir("mc-untrusted-config-");
+        process.env.XDG_DATA_HOME = tempDir("mc-untrusted-data-");
+        writeFileSync(join(projectDir, "magic-context.jsonc"), '{"embedding": {');
+        const db = openDatabase();
+        const projectIdentity = resolveProjectIdentity(projectDir);
+        const detailed = loadPluginConfigDetailed(projectDir);
+
+        const registered = await registerProjectEmbeddingFromDetailedLoad({
+            db,
+            directory: projectDir,
+            projectIdentity,
+            detailed,
+            logPrefix: "[magic-context]",
+        });
+
+        expect(registered).toBe(false);
+        const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+        expect(snapshot?.runtimeFingerprint).toStartWith("observation:");
     });
 });

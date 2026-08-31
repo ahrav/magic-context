@@ -58,7 +58,10 @@ export type AgentBySession = Map<string, string>;
 
 /**
  *
- * Each set has one consumer and one lifetime.
+ * Three separate sets keep three independent lifetimes apart; one shared
+ * flag would let defer passes blocked by an in-progress historian keep
+ * re-firing the same flush signal across multiple turns. Each set has
+ * exactly one consumer and one lifetime.
  *
  * Producers add each session to every set whose consumer must react.
  * Consumers drain their sets after consuming the signal.
@@ -111,11 +114,6 @@ export type PendingMaterializationSessions = Set<string>;
 
 /** `DeferredMaterializationSessions` persists deferred drop-materialization signals from background historian publication. */
 export type DeferredMaterializationSessions = Set<string>;
-
-/**
- * `FlushedSessions` is deprecated; use `HistoryRefreshSessions`, `SystemPromptRefreshSessions`, or `PendingMaterializationSessions` directly.
- */
-export type FlushedSessions = Set<string>;
 
 export type LastHeuristicsTurnId = Map<string, string>;
 

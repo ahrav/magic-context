@@ -12,12 +12,7 @@ import { isValidPublicClaimId, parseRevisionLocator } from "./memory/claim-opera
 import { CLAIM_POLICY_VERSION } from "./memory/claim-visibility-policy";
 import { ANTI_MEMORY_CATEGORY } from "./memory/constants";
 import { cosineSimilarity } from "./memory/cosine-similarity";
-import {
-    embedBatchForProject,
-    embedText,
-    getProjectEmbeddingSnapshot,
-    isEmbeddingEnabled,
-} from "./memory/embedding";
+import { embedBatchForProject, getProjectEmbeddingSnapshot } from "./memory/embedding";
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
 import {
     listActiveAntiMemoryPublicIds,
@@ -154,7 +149,11 @@ export interface UnifiedSearchOptions {
     embeddingEnabled?: boolean;
     /** Message search does not read raw messages on the hot path. */
     readMessages?: (sessionId: string) => unknown[];
-    embedQuery?: (
+    /** Required — there is deliberately no default embedder. Production
+     *  callers route through the project embedding registry
+     *  (`embedTextForProject`), which owns provider normalization; a
+     *  default here would bypass that lane. */
+    embedQuery: (
         text: string,
         signal?: AbortSignal,
         purpose?: EmbeddingPurpose,
@@ -164,8 +163,10 @@ export interface UnifiedSearchOptions {
         signal?: AbortSignal,
         purpose?: EmbeddingPurpose,
     ) => Promise<(Float32Array | null)[]>;
-    isEmbeddingRuntimeEnabled?: () => boolean;
-    /** The search returns only hits with ordinal ≤ this value; -1 or omission searches all messages. */
+    /** Required for the same reason as `embedQuery`: runtime availability
+     *  is a property of the caller's embedding lane, not module state. */
+    isEmbeddingRuntimeEnabled: () => boolean;
+    /** Only return message-history hits with ordinal ≤ this value (e.g. last compartment end). -1 or omit to search all. */
     maxMessageOrdinal?: number;
     /** When enabled, the search includes indexed git commits; the default is false.
      * The `experimental.git_commit_indexing` configuration gates git-commit search. */
@@ -1815,7 +1816,7 @@ export async function unifiedSearch(
     sessionId: string,
     projectPath: string,
     query: string,
-    options: UnifiedSearchOptions = {},
+    options: UnifiedSearchOptions,
 ): Promise<UnifiedSearchResult[]> {
     const prepared = prepareExplicitQuery(query);
     if (!prepared.ok) {
@@ -1876,14 +1877,14 @@ async function executeUnifiedSearch(args: {
     const tierLimit =
         args.candidateDepth ??
         Math.min(Math.max(limit * 3, DEFAULT_SEARCH_RESULT_LIMIT), MAX_LANE_CANDIDATES);
-    // `requestedK` and `effectiveK` share one value, so their equality cannot detect per-lane clamping.
-    // TODO: Expose per-lane executed bounds to detect internal clamping.
+    // requestedK and effectiveK are emitted from this one variable, so the
+    // candidate-depth assertion over these counters checks plumbing
+    // identity only; it cannot see a lane that internally clamped its
+    // executed bound.
     const laneDepth = { requestedK: tierLimit, effectiveK: tierLimit };
 
     const filterSpan = trace?.begin("filter_construction", "unified", { parent: rootId }) ?? null;
     const embeddingEnabled = options.embeddingEnabled ?? true;
-    const embedQuery = options.embedQuery ?? embedText;
-    const isEmbeddingRuntimeEnabled = options.isEmbeddingRuntimeEnabled ?? isEmbeddingEnabled;
     const gitCommitsEnabled = options.gitCommitsEnabled ?? false;
     const activeSources = resolveSources(options.sources);
 
@@ -1906,7 +1907,7 @@ async function executeUnifiedSearch(args: {
     const needsEmbedding =
         (runGitCommits || runCompartmentChunks || runPrimers || antiMemorySemanticEnabled) &&
         embeddingEnabled &&
-        isEmbeddingRuntimeEnabled();
+        options.isEmbeddingRuntimeEnabled();
 
     const embedSpan =
         trace && needsEmbedding
@@ -1917,7 +1918,7 @@ async function executeUnifiedSearch(args: {
     }
     const queryEmbeddingPromise: Promise<CapturedQueryEmbedding | Float32Array | null> =
         needsEmbedding
-            ? embedQuery(trimmedQuery, options.signal, "query").then(
+            ? options.embedQuery(trimmedQuery, options.signal, "query").then(
                   (captured) => {
                       embedSpan?.end("ok");
                       return captured;
@@ -2145,34 +2146,28 @@ async function executeUnifiedSearch(args: {
         return results;
     };
 
+    const vectorLaneArgs = (
+        onVectorLoad: VectorLoadObserver | undefined,
+        stages: HybridLaneStageMarks | undefined,
+    ) => ({
+        db,
+        projectPath,
+        query: trimmedQuery,
+        limit: tierLimit,
+        queryEmbedding,
+        queryModelId: embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
+        onVectorLoad,
+        stages,
+    });
+
     const runGitCommitLane = (): GitCommitSearchResult[] =>
         runVectorLane("git_commit", (onVectorLoad, stages) =>
-            searchGitCommits({
-                db,
-                projectPath,
-                query: trimmedQuery,
-                limit: tierLimit,
-                queryEmbedding,
-                queryModelId:
-                    embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
-                onVectorLoad,
-                stages,
-            }),
+            searchGitCommits(vectorLaneArgs(onVectorLoad, stages)),
         );
 
     const runPrimerLane = (): PrimerSearchResult[] =>
         runVectorLane("primer", (onVectorLoad, stages) =>
-            searchPrimers({
-                db,
-                projectPath,
-                query: trimmedQuery,
-                limit: tierLimit,
-                queryEmbedding,
-                queryModelId:
-                    embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
-                onVectorLoad,
-                stages,
-            }),
+            searchPrimers(vectorLaneArgs(onVectorLoad, stages)),
         );
 
     const runNoteLane = (): NoteSearchResult[] => {

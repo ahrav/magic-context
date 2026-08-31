@@ -32,6 +32,7 @@ import {
     OUTPUT_PATHS,
     PAYLOAD_TARGETS,
     type PayloadManifest,
+    NATIVE_ADDON_PATH,
     packProductionPayload,
     type ReleaseContext,
     payloadManifestDigest,
@@ -211,6 +212,12 @@ function targetFor(name: string) {
     const target = PAYLOAD_TARGETS.find((t) => t.target === name);
     if (target === undefined) throw new Error(`missing target ${name}`);
     return target;
+}
+
+function nativeAddon(root: string): string {
+    const path = join(root, "mc_shm_native.node");
+    writeFileSync(path, "release native addon bytes\n");
+    return path;
 }
 
 function devManifest(): PayloadManifest {
@@ -871,6 +878,7 @@ describe("production payload assembly", () => {
                 outDir: join(root, "out"),
                 sources: {
                     binaryPath: binary,
+                    nativeAddonPath: nativeAddon(root),
                     qualifiedInputs,
                     qualifiedInputExpectations,
                 },
@@ -881,6 +889,7 @@ describe("production payload assembly", () => {
         expect(result.manifest.files.map((entry) => entry.path)).toEqual(
             [
                 LAUNCHER_PATH,
+                NATIVE_ADDON_PATH,
                 ...Object.values(LINUX_PRODUCTION_PAYLOAD_SLOTS),
             ].sort(),
         );
@@ -907,6 +916,7 @@ describe("production payload assembly", () => {
                     outDir: join(root, "mutated"),
                     sources: {
                         binaryPath: binary,
+                        nativeAddonPath: nativeAddon(root),
                         qualifiedInputs,
                         qualifiedInputExpectations,
                     },
@@ -926,14 +936,25 @@ describe("production payload assembly", () => {
             targetFor("darwin-arm64"),
             {
                 outDir: join(root, "out"),
-                sources: { binaryPath: binary },
+                sources: {
+                    binaryPath: binary,
+                    nativeAddonPath: nativeAddon(root),
+                },
             },
         );
 
         expect(result.manifest.files.map((entry) => entry.path)).toEqual([
             LAUNCHER_PATH,
+            NATIVE_ADDON_PATH,
         ]);
         expect(result.manifest.synapse).toBe("unsupported");
+        writeFileSync(
+            join(result.outDir, NATIVE_ADDON_PATH),
+            "release native addon byteS\n",
+        );
+        expect(() => verifyPayloadDir(result.outDir, result.manifest)).toThrow(
+            /digest drift/,
+        );
     });
 
     test("source pathname replacement after open cannot change copied bytes", () => {
@@ -965,6 +986,7 @@ describe("production payload assembly", () => {
                 outDir: join(root, "out"),
                 sources: {
                     binaryPath: binary,
+                    nativeAddonPath: nativeAddon(root),
                     qualifiedInputs,
                     qualifiedInputExpectations,
                     afterSourceOpenForTest(relative, sourcePath) {
@@ -1006,7 +1028,10 @@ describe("production payload assembly", () => {
                     "packages",
                     "mc-host-darwin-x64",
                 ),
-                sources: { binaryPath: binary },
+                sources: {
+                    binaryPath: binary,
+                    nativeAddonPath: nativeAddon(root),
+                },
             },
         );
 
@@ -1017,6 +1042,7 @@ describe("production payload assembly", () => {
         const names = listing.stdout.toString("utf8");
         expect(names).toContain("package/payload-manifest.json");
         expect(names).toContain("package/payload/bin/ck-mc-host");
+        expect(names).toContain("package/payload/native/mc_shm_native.node");
         expect(() =>
             packProductionPayload(
                 { ...result, releaseQualified: false },
@@ -1037,7 +1063,10 @@ describe("production payload assembly", () => {
                 targetFor("darwin-x64"),
                 {
                 outDir: join(root, "unqualified"),
-                sources: { binaryPath: binary },
+                sources: {
+                    binaryPath: binary,
+                    nativeAddonPath: nativeAddon(root),
+                },
                 },
             ),
         ).toThrow(/production-qualified/);
@@ -1047,7 +1076,10 @@ describe("production payload assembly", () => {
                 targetFor("linux-x64-gnu"),
                 {
                     outDir: join(root, "missing"),
-                    sources: { binaryPath: binary },
+                    sources: {
+                        binaryPath: binary,
+                        nativeAddonPath: nativeAddon(root),
+                    },
                 },
             ),
         ).toThrow(/missing qualified/);
@@ -1071,6 +1103,7 @@ describe("production payload assembly", () => {
                 outDir,
                 sources: {
                     binaryPath: binary,
+                    nativeAddonPath: nativeAddon(root),
                     ...(target.synapse === "certified_cpu"
                         ? { qualifiedInputs }
                         : {}),
@@ -1109,6 +1142,10 @@ describe("dev payload build", () => {
     }
 
     test("a Linux host that cannot prove glibc is refused, not labeled -gnu", () => {
+        if (process.platform === "linux" && process.arch !== "x64") {
+            expect(() => hostTarget()).toThrow(/no payload target/);
+            return;
+        }
         if (process.platform !== "linux") {
             // The gate only guards the matrix's `-gnu` target.
             expect(hostTarget().target).not.toMatch(/-gnu$/);

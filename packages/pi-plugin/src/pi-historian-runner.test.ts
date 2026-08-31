@@ -32,7 +32,7 @@ import {
 	clearPiHistorianAlertState,
 	runPiHistorian,
 } from "./pi-historian-runner";
-import { createTestDb } from "./test-utils.test";
+import { createTestDb } from "./test-utils";
 
 describe("buildPiCompactionSummary", () => {
 	const mk = (title: string) => ({ title, startMessage: 1, endMessage: 2 });

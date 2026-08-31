@@ -1,8 +1,7 @@
 /**
  * TUI data layer — pure RPC client, no direct SQLite access.
  */
-import os from "node:os";
-import path from "node:path";
+import { getMagicContextStorageDir } from "../../shared/data-path";
 import { MagicContextRpcClient } from "../../shared/rpc-client";
 import type { EmbedDetail, SidebarSnapshot, StatusDetail } from "../../shared/rpc-types";
 
@@ -11,15 +10,12 @@ export type { EmbedDetail, SidebarSnapshot, StatusDetail };
 let rpcClient: MagicContextRpcClient | null = null;
 let rpcGeneration = 0;
 
-function getStorageDir(): string {
-    // discovery convention.
-    const dataDir = process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share");
-    return path.join(dataDir, "cortexkit", "magic-context");
-}
-
-/* */
+/** Initialize the RPC client. Call once on TUI startup. */
 export function initRpcClient(directory: string): void {
-    const storageDir = getStorageDir();
+    const storageDir = getMagicContextStorageDir();
+    // Bump the generation before replacing the client so late notification
+    // responses from a disposed client are ignored (the WS socket observes the
+    // new generation and abandons its in-flight connect).
     rpcGeneration += 1;
     rpcClient = new MagicContextRpcClient(storageDir, directory);
 }

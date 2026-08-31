@@ -19,6 +19,7 @@ import {
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
+import { createOpenCodeTestDb } from "../../features/magic-context/test-database";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -41,19 +42,6 @@ function useTempDataHome(prefix: string): string {
     mkdirSync(join(dir, "opencode"), { recursive: true });
     mkdirSync(join(dir, "cortexkit", "magic-context"), { recursive: true });
     return dir;
-}
-
-function createOpenCodeDb(dataHome: string): Database {
-    const dbPath = join(dataHome, "opencode", "opencode.db");
-    const db = new Database(dbPath);
-    db.exec("PRAGMA journal_mode=WAL");
-    db.exec(
-        "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
-    );
-    db.exec(
-        "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
-    );
-    return db;
 }
 
 function insertUserMessage(db: Database, id: string, sessionId: string, timeCreated: number): void {
@@ -187,7 +175,7 @@ afterEach(() => {
 describe("applyDeferredCompactionMarker — outcomes", () => {
     it("returns `applied` on the happy path (no existing marker)", () => {
         const dataHome = useTempDataHome("apply-deferred-applied-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-1", 1_000);
         closeQuietly(opencodeDb);
 
@@ -209,7 +197,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
     it("retries a post-insert state failure without minting duplicate marker rows", () => {
         const dataHome = useTempDataHome("apply-deferred-post-insert-retry-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-retry", 1_000);
         insertMessage(opencodeDb, "legacy-summary", "ses-retry", 1_001, "assistant");
         opencodeDb.prepare("UPDATE message SET data = ? WHERE id = 'legacy-summary'").run(
@@ -313,7 +301,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
     it("returns `already-current` when persisted boundary >= pending ordinal", () => {
         const dataHome = useTempDataHome("apply-deferred-current-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-1", 1_000);
         closeQuietly(opencodeDb);
 
@@ -343,8 +331,8 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
     it("returns `stale-skip / compartment-removed` when raw OpenCode message is gone", () => {
         const dataHome = useTempDataHome("apply-deferred-msg-gone-");
-        const opencodeDb = createOpenCodeDb(dataHome);
-        // The fixture omits `msg-boundary` to simulate cleanup.
+        const opencodeDb = createOpenCodeTestDb(dataHome);
+        // Intentionally do NOT insert msg-boundary — simulates revert/cleanup
         closeQuietly(opencodeDb);
 
         const db = openDatabase();
@@ -361,7 +349,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
     it("returns `stale-skip / compartment-removed` when local compartment row is gone", () => {
         const dataHome = useTempDataHome("apply-deferred-compart-gone-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-1", 1_000);
         closeQuietly(opencodeDb);
 
@@ -379,7 +367,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
     it("returns `stale-skip / target-superseded` when compartment ordinal advanced past pending", () => {
         const dataHome = useTempDataHome("apply-deferred-superseded-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-1", 1_000);
         closeQuietly(opencodeDb);
 
@@ -408,10 +396,10 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         // An assistant boundary makes findBoundaryUserMessage return null.
         // The marker injector returns `null`, mapping to retryable failure.
         const dataHome = useTempDataHome("apply-deferred-retryable-");
-        const opencodeDb = createOpenCodeDb(dataHome);
-        // getOpenCodeMessageById validates only message existence; the marker injector requires a user-role boundary anchor.
-        // The marker injector requires a user-role boundary anchor even though `getOpenCodeMessageById` only checks message existence.
-        // The marker injector requires a user-role boundary anchor even though `getOpenCodeMessageById` only checks message existence; otherwise `inject` returns `null`.
+        const opencodeDb = createOpenCodeTestDb(dataHome);
+        // Insert msg-boundary as an ASSISTANT message — passes validation
+        // (getOpenCodeMessageById only checks existence) but the marker
+        // injector requires a user-role boundary anchor, so inject returns null.
         opencodeDb
             .prepare(
                 "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
@@ -451,7 +439,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
     it("preserves an existing marker when the new target has no user boundary", () => {
         const dataHome = useTempDataHome("apply-deferred-no-boundary-preserve-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
         insertMessage(opencodeDb, "msg-boundary", "ses-1", 1_000, "assistant");
         const oldState: PersistedCompactionMarkerState = {
             boundaryMessageId: "msg-old-missing-boundary",
@@ -478,7 +466,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
     it("repairs an equal-ordinal marker whose boundary is after the target endMessageId", () => {
         const dataHome = useTempDataHome("apply-deferred-repair-overextended-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
         insertUserMessage(opencodeDb, "msg_009_prior_user", "ses-1", 900);
         insertMessage(opencodeDb, "msg_010_target", "ses-1", 1_000, "assistant");
         insertUserMessage(opencodeDb, "msg_020_after_user", "ses-1", 2_000);
@@ -512,7 +500,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
     it("direct publication path resolves the compartment endMessageId instead of ordinal", () => {
         const dataHome = useTempDataHome("direct-marker-end-id-");
-        const opencodeDb = createOpenCodeDb(dataHome);
+        const opencodeDb = createOpenCodeTestDb(dataHome);
         insertUserMessage(opencodeDb, "msg_001_deleted_user", "ses-1", 100);
         insertMessage(opencodeDb, "msg_002_deleted_assistant", "ses-1", 200, "assistant");
         insertUserMessage(opencodeDb, "msg_003_prior_user", "ses-1", 300);

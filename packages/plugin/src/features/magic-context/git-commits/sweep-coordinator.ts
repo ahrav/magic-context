@@ -1,4 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
+import { runImmediate } from "../../../shared/sqlite";
 
 export const GIT_SWEEP_COOLDOWN_MS = 10 * 60 * 1000;
 // Commit indexing can require two embedding drains: the indexer drain and the timer follow-up drain.
@@ -63,25 +64,6 @@ export interface AcquireGitSweepLeaseOptions {
      * The backlog-drain path leaves dream-timer cooldown tracking unchanged.
      */
     ignoreCooldown?: boolean;
-}
-
-function runImmediate<T>(db: Database, body: () => T): T {
-    db.exec("BEGIN IMMEDIATE");
-    let committed = false;
-    try {
-        const result = body();
-        db.exec("COMMIT");
-        committed = true;
-        return result;
-    } finally {
-        if (!committed) {
-            try {
-                db.exec("ROLLBACK");
-            } catch {
-                // SQLite may reject ROLLBACK when no transaction remains active.
-            }
-        }
-    }
 }
 
 function rowToState(row: GitSweepCoordinatorRow): GitSweepCoordinatorState {

@@ -1,5 +1,7 @@
 //! These tests use paused Tokio time and backend gates to verify deterministic Broca supervisor behavior without wall-clock sleeps.
 
+// Broca conformance drives a Synapse primary, which ships only for `linux-x64-gnu`.
+#![cfg(target_os = "linux")]
 mod support;
 
 use std::sync::Arc;

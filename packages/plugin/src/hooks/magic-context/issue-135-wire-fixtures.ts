@@ -1,4 +1,6 @@
 /**
+ * Captured openai-compat wire fixtures from the orphan-tool pinning harness
+ * (case 1c): `[dropped]` assistant between tool_calls and its tool result.
  */
 import type { OpenAiCompatWireMessage } from "./openai-compat-adjacency";
 

@@ -207,7 +207,7 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
     });
 }
 
-function formatIds(ids: number[]): string {
+export function formatIds(ids: number[]): string {
     return ids.map((id) => `§${id}§`).join(", ");
 }
 

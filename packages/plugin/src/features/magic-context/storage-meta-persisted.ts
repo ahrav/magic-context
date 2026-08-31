@@ -1323,16 +1323,29 @@ export function recordAutoSearchHintNativeBlockId(
     );
 }
 
+const CAS_JSON_ARRAY_COLUMNS = [
+    "note_nudge_anchors",
+    "auto_search_hint_decisions",
+    "merged_reasoning_stripped_ids",
+    "stale_reduce_stripped_ids",
+    "processed_image_stripped_ids",
+] as const;
+
+type CasJsonArrayColumn = (typeof CAS_JSON_ARRAY_COLUMNS)[number];
+
 function casUpdateJsonArrayColumn<T>(
     db: Database,
     sessionId: string,
-    column: "note_nudge_anchors" | "auto_search_hint_decisions",
+    column: CasJsonArrayColumn,
     validator: (value: unknown) => value is T,
     mutate: (current: T[]) => T[] | null,
     options?: { ensureRow?: boolean },
 ): boolean {
-    // The validator rejects columns outside the allow-set before SQL interpolation.
-    if (column !== "note_nudge_anchors" && column !== "auto_search_hint_decisions") {
+    // Runtime allow-set guard. `column` is string-interpolated into SELECT/
+    // UPDATE SQL below; the TS union is the only compile-time guard, so a
+    // future JS-interop or untyped caller could otherwise inject SQL. Throw on
+    // any column outside the known set so interpolation is always safe.
+    if (!CAS_JSON_ARRAY_COLUMNS.includes(column)) {
         throw new Error(`casUpdateJsonArrayColumn: refusing unknown column "${column}"`);
     }
     if (options?.ensureRow === false) {
@@ -2072,42 +2085,50 @@ export function getMergedReasoningStrippedIds(db: Database, sessionId: string): 
 /**
  * Callers must persist newly detected IDs before mutating messages so defer passes can reproduce the bytes after a fresh rebuild.
  */
+
+function isStrippedId(value: unknown): value is string {
+    return typeof value === "string";
+}
+
+/**
+ * CAS-merge message ids into a frozen-set column, retrying on a concurrent
+ * write so sibling processes sharing the session DB merge instead of
+ * clobbering. Insertion order is preserved: existing ids keep their stored
+ * order and new ids append. Returns true when the set ended in the intended
+ * state (incl. no-op), false only when retries were exhausted.
+ */
+function casMergeStrippedIds(
+    db: Database,
+    sessionId: string,
+    column: Extract<
+        CasJsonArrayColumn,
+        | "merged_reasoning_stripped_ids"
+        | "stale_reduce_stripped_ids"
+        | "processed_image_stripped_ids"
+    >,
+    ids: Iterable<string>,
+): boolean {
+    const add = [...ids];
+    if (add.length === 0) return true;
+    return casUpdateJsonArrayColumn(db, sessionId, column, isStrippedId, (current) => {
+        const merged = new Set(current);
+        let changed = false;
+        for (const id of add) {
+            if (!merged.has(id)) {
+                merged.add(id);
+                changed = true;
+            }
+        }
+        return changed ? [...merged] : null;
+    });
+}
+
 export function addMergedReasoningStrippedIds(
     db: Database,
     sessionId: string,
     ids: Iterable<string>,
 ): boolean {
-    const add = [...ids];
-    if (add.length === 0) return true;
-    ensureSessionMetaRow(db, sessionId);
-
-    for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
-        const row = db
-            .prepare("SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?")
-            .get(sessionId) as { merged_reasoning_stripped_ids?: string | null } | undefined;
-        const rawStored = row ? (row.merged_reasoning_stripped_ids ?? null) : null;
-        const current = new Set<string>(parseStrippedBlob(rawStored));
-        let changed = false;
-        for (const id of add) {
-            if (!current.has(id)) {
-                current.add(id);
-                changed = true;
-            }
-        }
-        if (!changed) return true;
-        const nextBlob = JSON.stringify([...current]);
-        const result = db
-            .prepare(
-                "UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ? AND merged_reasoning_stripped_ids IS ?",
-            )
-            .run(nextBlob, sessionId, rawStored);
-        if (result.changes > 0) return true;
-    }
-    sessionLog(
-        sessionId,
-        `merged_reasoning_stripped_ids CAS: ${CAS_RETRY_LIMIT} retries exhausted`,
-    );
-    return false;
+    return casMergeStrippedIds(db, sessionId, "merged_reasoning_stripped_ids", ids);
 }
 
 // The persisted map is a frozen replay map for trailing assistant blank decisions.
@@ -2223,34 +2244,7 @@ export function addStaleReduceStrippedIds(
     sessionId: string,
     ids: Iterable<string>,
 ): boolean {
-    const add = [...ids];
-    if (add.length === 0) return true;
-    ensureSessionMetaRow(db, sessionId);
-
-    for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
-        const row = db
-            .prepare("SELECT stale_reduce_stripped_ids FROM session_meta WHERE session_id = ?")
-            .get(sessionId) as { stale_reduce_stripped_ids?: string | null } | undefined;
-        const rawStored = row ? (row.stale_reduce_stripped_ids ?? null) : null;
-        const current = new Set<string>(parseStrippedBlob(rawStored));
-        let changed = false;
-        for (const id of add) {
-            if (!current.has(id)) {
-                current.add(id);
-                changed = true;
-            }
-        }
-        if (!changed) return true;
-        const nextBlob = JSON.stringify([...current]);
-        const result = db
-            .prepare(
-                "UPDATE session_meta SET stale_reduce_stripped_ids = ? WHERE session_id = ? AND stale_reduce_stripped_ids IS ?",
-            )
-            .run(nextBlob, sessionId, rawStored);
-        if (result.changes > 0) return true;
-    }
-    sessionLog(sessionId, `stale_reduce_stripped_ids CAS: ${CAS_RETRY_LIMIT} retries exhausted`);
-    return false;
+    return casMergeStrippedIds(db, sessionId, "stale_reduce_stripped_ids", ids);
 }
 
 /**
@@ -2278,34 +2272,7 @@ export function addProcessedImageStrippedIds(
     sessionId: string,
     ids: Iterable<string>,
 ): boolean {
-    const add = [...ids];
-    if (add.length === 0) return true;
-    ensureSessionMetaRow(db, sessionId);
-
-    for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
-        const row = db
-            .prepare("SELECT processed_image_stripped_ids FROM session_meta WHERE session_id = ?")
-            .get(sessionId) as { processed_image_stripped_ids?: string | null } | undefined;
-        const rawStored = row ? (row.processed_image_stripped_ids ?? null) : null;
-        const current = new Set<string>(parseStrippedBlob(rawStored));
-        let changed = false;
-        for (const id of add) {
-            if (!current.has(id)) {
-                current.add(id);
-                changed = true;
-            }
-        }
-        if (!changed) return true;
-        const nextBlob = JSON.stringify([...current]);
-        const result = db
-            .prepare(
-                "UPDATE session_meta SET processed_image_stripped_ids = ? WHERE session_id = ? AND processed_image_stripped_ids IS ?",
-            )
-            .run(nextBlob, sessionId, rawStored);
-        if (result.changes > 0) return true;
-    }
-    sessionLog(sessionId, `processed_image_stripped_ids CAS: ${CAS_RETRY_LIMIT} retries exhausted`);
-    return false;
+    return casMergeStrippedIds(db, sessionId, "processed_image_stripped_ids", ids);
 }
 
 

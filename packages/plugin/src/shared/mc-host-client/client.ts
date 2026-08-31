@@ -18,7 +18,6 @@ import { access } from "node:fs/promises";
 import {
     type ConnectionDiagnosticEvent,
     ConnectionGeneration,
-    type ConnectionGenerationOptions,
     type JsonReceiveBody,
     type PendingRequest,
     type RequestTerminal,
@@ -40,7 +39,7 @@ import {
     SocketTimeoutError,
 } from "./errors";
 import { bytesFrameBody, type DirectFrameBody, ReceiveLease, utf8FrameBody } from "./frame-channel";
-import { flagsBinary } from "./protocol";
+import { PROTOCOL_VERSION } from "./protocol";
 import {
     belongsToConnection,
     createRouteHandle,
@@ -48,25 +47,7 @@ import {
     type RouteHandle,
     StaleRouteHandleError,
 } from "./route-handle";
-import {
-    ACTIVATION_CORRELATION,
-    commitRequestJson,
-    decodeActivateResponse,
-    decodeCommitResponse,
-    decodeNegotiateResponse,
-    encodeActivateRequest,
-    encodeNegotiateRequest,
-    type FallbackReason,
-    NEGOTIATION_VERSION,
-    type NegotiateResponse,
-    NegotiationError,
-    TRANSPORT_TCP,
-} from "./transport-negotiation";
-import {
-    type ClientTransportProvider,
-    ClientTransportRegistry,
-    sanitizedCandidateFactory,
-} from "./transport-provider";
+import { classifySharedMemoryFailure } from "./shared-memory-failure";
 import type {
     AuthenticatedPeer,
     BindIdentity,
@@ -80,10 +61,16 @@ import type {
     PublicationDiagnostics,
     RequestOptions,
     RouteTarget,
+    SharedMemoryDiagnostics,
+    SharedMemoryResourceCounts,
+    SharedMemoryTerminalClass,
 } from "./types";
 import { sameDaemonId } from "./types";
 
-/** `DEFAULT_HANDSHAKE_TIMEOUT_MS` applies to the TypeScript handshake. */
+const QUALIFIED_TEST_PROFILE = "mc-host-test-ring-v1" as const;
+const DESCRIPTOR_SCHEMA_VERSION = 2 as const;
+
+/** Preserves the repo's current 2-second TypeScript handshake budget. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 2_000;
 /* */
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -91,8 +78,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_ROUTE_OPEN_DEADLINE_MS = 30_000;
 /** `shutdown()` uses a separate deadline for route and connection Goodbye. */
 const DEFAULT_SHUTDOWN_DEADLINE_MS = 5_000;
-export const DEFAULT_RECOVERY_DEADLINE_MS = 30_000;
-/** `MAX_CONTROL_BODY_LEN` keeps channel-0 control bodies below the frame limit. */
+/** Channel-0 control bodies are capped below the frame limit (wire doc 7.1). */
 const MAX_CONTROL_BODY_LEN = 65_536;
 /**
  * `SETUP_RETRY_*` governs allowlisted `route.open` retries and stale-success replacement pacing in both setup loops.
@@ -123,10 +109,13 @@ export interface McHostDiagnosticsEvent {
     readonly daemonVer?: string;
     readonly pid?: number;
     readonly reason?: string;
-    /** `connected` events include the negotiated transport name. */
-    readonly transport?: string;
-    /** `connected` events include a closed-set TCP fallback reason when one exists. */
-    readonly fallbackReason?: FallbackReason;
+    readonly health?: "healthy" | "terminal";
+    readonly errorClass?: SharedMemoryTerminalClass;
+    readonly artifact?: Readonly<{
+        profile: typeof QUALIFIED_TEST_PROFILE;
+        wireVersion: typeof PROTOCOL_VERSION;
+        descriptorSchema: typeof DESCRIPTOR_SCHEMA_VERSION;
+    }>;
 }
 
 export type McHostDiagnosticsObserver = (event: McHostDiagnosticsEvent) => void;
@@ -152,22 +141,6 @@ export interface McHostClientOptions extends ConnectOptions {
      */
     diagnostics?: McHostDiagnosticsObserver;
     maxDiagnosticEventsPerSecond?: number;
-    /** Tests can override bounded generation policy, including queue caps and deadlines. */
-    generationOptions?: Partial<
-        Pick<
-            ConnectionGenerationOptions,
-            | "frameDeadlineMs"
-            | "maxBodyLen"
-            | "memoryCapBytes"
-            | "maxQueuedFrames"
-            | "maxQueuedBytes"
-            | "controlReserveFrames"
-            | "cleanupTicketMs"
-            | "generateNonce"
-        >
-    >;
-    /** @internal Not part of the consumer contract. */
-    transportProviders?: readonly ClientTransportProvider[];
 }
 
 interface ActiveConnection {
@@ -176,27 +149,7 @@ interface ActiveConnection {
     readonly token: object;
     readonly snapshot: ConnectionSnapshot;
     readonly liveRoutes: Map<number, RouteHandle>;
-    /** The selected transport remains fixed from publication until retirement. */
-    transport: string;
-    /** `fallbackReason` records a closed-set reason only when selection is an explicit TCP fallback. */
-    fallbackReason?: FallbackReason;
-    role?: "shadow";
 }
-
-/**
- * A re-upgrade episode is fenced to its source primary and immutable deadline; cancellation releases every shadow permit when the owner closes or the primary retires.
- */
-interface RecoveryEpisode {
-    readonly source: ActiveConnection;
-    readonly deadline: Deadline;
-    cancelled: boolean;
-    readonly shadowGenerations: Set<ConnectionGeneration>;
-}
-
-type ShadowOutcome =
-    | { kind: "promote"; conn: ActiveConnection }
-    | { kind: "retry" }
-    | { kind: "stop" };
 
 interface CachedManagedRoute {
     readonly target: Extract<RouteTarget, { kind: ManagedRouteKind }>;
@@ -303,10 +256,6 @@ interface RequestParams {
     /** The ceiling limits retained items for each stream-mode request. */
     maxStreamItems?: number;
     binary?: boolean;
-    /**
-     * Only negotiation requests retain the raw wire Error terminal because legacy-fallback classification requires its exact bytes.
-     */
-    captureErrorTerminal?: boolean;
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -352,7 +301,7 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
         return err.kind === "not_sent" || err.kind === "outcome_unknown";
     }
     const name = err instanceof Error ? err.name : undefined;
-    if (name === "SocketClosedError" || name === "SocketTimeoutError" || name === "AuthError") {
+    if (name === "SocketClosedError" || name === "SocketTimeoutError") {
         return true;
     }
     if (name === "McHostCallError") {
@@ -371,25 +320,8 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
 }
 
 /**
- * Shadow recovery retries discovery and dial failures only.
- * Authentication and protocol failures stop the recovery episode permanently.
- * classifies correctly.
- */
-function isShadowDialTransient(err: unknown): boolean {
-    const name = err instanceof Error ? err.name : undefined;
-    if (name === "AuthError") return false;
-    if (name === "SocketClosedError" || name === "SocketTimeoutError") return true;
-    const code = errorCode(err);
-    return (
-        code === "ECONNREFUSED" ||
-        code === "ECONNRESET" ||
-        code === "EPIPE" ||
-        code === "ETIMEDOUT" ||
-        code === "ENOENT"
-    );
-}
-
-/**
+ * The consumer-facing client: connect, route open, raw request, managed
+ * call, catalog, and bounded close over one active connection generation.
  */
 export class McHostClient {
     private readonly connectionFile: string;
@@ -397,34 +329,24 @@ export class McHostClient {
     private readonly requestTimeoutMs: number;
     private readonly routeOpenDeadlineMs: number;
     private readonly shutdownDeadlineMs: number;
-    private readonly recoveryDeadlineMs = DEFAULT_RECOVERY_DEADLINE_MS;
     private readonly defaultIdentity: BindIdentity | undefined;
     private readonly defaultTargetKind: ManagedRouteKind;
     private readonly credentialSource: Record<string, string | undefined> | undefined;
     private readonly clock: MonotonicClock | undefined;
     private readonly sleep: (ms: number) => Promise<void>;
     private readonly connectionFileAfterOpen: (() => void | Promise<void>) | undefined;
-    private readonly generationOptions: McHostClientOptions["generationOptions"];
     private readonly diagnostics: McHostDiagnosticsObserver | undefined;
     private readonly maxDiagnosticEventsPerSecond: number;
-    private readonly transportRegistry: ClientTransportRegistry;
 
     private active: ActiveConnection | null = null;
     private connecting: SetupFlight<ActiveConnection> | null = null;
-    /** The draining generation slot remains occupied from promotion until drain completes. */
-    private predecessor: ActiveConnection | null = null;
-    /** The client runs at most one recovery episode at a time. */
-    private recovery: RecoveryEpisode | null = null;
-    /** The managed-route cache owns these `RouteHandle`s; callers own raw handles. On pending-zero, drain closes orphaned managed handles but waits for callers to close raw handles. */
+    /** Route handles opened by the managed-route cache. */
     private readonly managedHandles = new WeakSet<RouteHandle>();
     private readonly routes = new Map<string, CachedManagedRoute>();
     /** Owner close bounds draining in-flight `route.open` attempts. */
     private readonly pendingRouteOpens = new Set<Promise<void>>();
-    /**
-     * The pending set prevents retirement between a `route.open` terminal and insertion of its handle into `liveRoutes`.
-     */
-    private readonly routeOpenCounts = new Map<ActiveConnection, number>();
     private closeStarted = false;
+    private retirementEmitted = false;
     private closePromise: Promise<void> | null = null;
 
     private diagWindowStartMs = 0;
@@ -443,11 +365,9 @@ export class McHostClient {
         this.sleep =
             options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
         this.connectionFileAfterOpen = options.connectionFileAfterOpen;
-        this.generationOptions = options.generationOptions;
         this.diagnostics = options.diagnostics;
         this.maxDiagnosticEventsPerSecond =
             options.maxDiagnosticEventsPerSecond ?? DEFAULT_MAX_DIAGNOSTIC_EVENTS_PER_SECOND;
-        this.transportRegistry = new ClientTransportRegistry(options.transportProviders ?? []);
     }
 
     /**
@@ -455,8 +375,19 @@ export class McHostClient {
      */
     static async connect(options: McHostClientOptions): Promise<McHostClient> {
         const client = new McHostClient(options);
-        await client.ensureConnection(Deadline.start(client.handshakeTimeoutMs, client.clock));
-        return client;
+        try {
+            await client.ensureConnection(Deadline.start(client.handshakeTimeoutMs, client.clock));
+            return client;
+        } catch (error) {
+            if (!client.retirementEmitted) {
+                client.emitDiagnostics({
+                    type: "retired",
+                    health: "terminal",
+                    errorClass: classifySharedMemoryFailure(error),
+                });
+            }
+            throw error;
+        }
     }
 
     /* */
@@ -475,7 +406,7 @@ export class McHostClient {
         if (daemonVer === null || daemonId === null) return null;
         return {
             daemonVer,
-            // The client copies `daemonId` so callers cannot mutate the retained identity used for compatibility and fencing.
+            // Callers must not mutate the retained identity used for fencing.
             daemonId: daemonId.slice(),
             proof: "current",
         };
@@ -488,6 +419,11 @@ export class McHostClient {
         const active = this.active;
         if (!active) return null;
         return { daemonVer: active.snapshot.daemonVer, pid: active.snapshot.pid };
+    }
+
+    /** True after irreversible owner close begins. */
+    get isClosed(): boolean {
+        return this.closeStarted;
     }
 
     /**
@@ -702,7 +638,6 @@ export class McHostClient {
         }
         conn.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
         await conn.generation.flushWrites(Deadline.start(this.shutdownDeadlineMs, this.clock));
-        if (this.predecessor === conn) this.maybeRetirePredecessor();
     }
 
     /**
@@ -807,8 +742,7 @@ export class McHostClient {
         let conn: ActiveConnection | null = null;
         let retiredReason: RetirementReason | null = null;
         const generation = new ConnectionGeneration({
-            host: snapshot.endpoint.host,
-            port: snapshot.endpoint.port,
+            setupSocket: snapshot.setupSocket,
             credentials: {
                 key: snapshot.key,
                 daemonId: snapshot.daemonId,
@@ -821,23 +755,16 @@ export class McHostClient {
             onRouteGoodbye: (channel, epoch) => {
                 if (conn) this.onRouteGoodbye(conn, channel, epoch);
             },
-            onPendingZero: () => {
-                if (conn) this.onPendingDrained(conn);
-            },
-            onLeaseReleased: () => {
-                if (conn) this.onPendingDrained(conn);
-            },
-            // An absent observer avoids per-frame event allocation.
+            // Skip per-frame event allocation entirely when no observer is
+            // configured; the generation's hook check short-circuits on
             // undefined.
             onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
-            ...this.generationOptions,
         });
         conn = {
             generation,
             token: newConnectionToken(),
             snapshot,
             liveRoutes: new Map(),
-            transport: TRANSPORT_TCP,
         };
         try {
             await generation.start(stage);
@@ -851,319 +778,56 @@ export class McHostClient {
             generation.retire("owner_close");
             throw new McHostClientError("client closed", "client_closed");
         }
-        // A generation retired during setup skips negotiation; `ensureConnection` recovers under the caller's unchanged stage.
-        // A Goodbye coalesced into the final handshake chunk can retire the generation during setup.
+        // A generation that retires during setup is never published.
         if (generation.isRetired()) return conn;
-        // `negotiateTransport` runs on authenticated channel 0 before publication, so no caller observes a generation without a selection.
-        let selection: NegotiateResponse;
-        try {
-            selection = await this.negotiateTransport(generation, stage);
-        } catch (error) {
-            generation.retire("negotiation_failed", error);
-            // Negotiation expiry on the owner's setup stage makes `flight` replaceable; survivors may coalesce one replacement.
-            // replacement.
-            if (stage.isExpired()) flight.replaceable = true;
-            throw error;
-        }
-        if (this.closeStarted) {
-            generation.retire("owner_close");
-            throw new McHostClientError("client closed", "client_closed");
-        }
-        if (selection.kind === "grant") {
-            try {
-                return await this.activateCandidate(conn, selection, stage);
-            } catch (error) {
-                // Activation expiry on the owner's setup stage makes `flight` replaceable; survivors may coalesce one replacement.
-                if (stage.isExpired()) flight.replaceable = true;
-                throw error;
-            }
-        }
-        // The frame pump can retire the generation in the batch that resolves negotiation, so a retired generation must not be published or reported connected.
-        // A coalesced Goodbye or EOF can retire the generation in the batch that resolves negotiation.
-        if (generation.isRetired()) return conn;
-        conn.fallbackReason = selection.reason;
         this.active = conn;
-        this.emitConnected(conn, conn.fallbackReason);
-        // Only exact `unavailable` starts an automatic shared-memory recovery probe; every other reason and reasonless TCP remain sticky.
-        if (conn.fallbackReason === "unavailable") this.startRecovery(conn);
-        return conn;
-    }
-
-    /**
-     * `negotiateTransport` sends the versioned offer as the generation's first channel-0 request.
-     * Only a strictly decoded selection continues; every failure, including a wire `Error` terminal, propagates so setup fails closed without same-generation TCP fallback.
-     */
-    private async negotiateTransport(
-        generation: ConnectionGeneration,
-        stage: Deadline,
-    ): Promise<NegotiateResponse> {
-        const offers = this.transportRegistry.offers();
-        const body = encodeNegotiateRequest({ negotiationVersion: NEGOTIATION_VERSION, offers });
-        let terminal: RequestTerminal;
-        try {
-            terminal = await this.awaitRequest(generation, {
-                channel: 0,
-                epoch: 0,
-                body,
-                deadline: stage,
-                options: {},
-                captureErrorTerminal: true,
-            });
-        } catch (error) {
-            if (
-                error instanceof McHostCallError &&
-                error.kind === "terminal" &&
-                error.errorTerminal !== undefined
-            ) {
-                // Every `Error` terminal fails closed with a bounded error.
-                // The raw body's message must not enter caller-visible error graphs.
-                // The decoder uses `host_negotiation_rejected` to distinguish negotiation rejection.
-                throw new McHostCallError(
-                    "terminal",
-                    "transport negotiation failed: host returned an error terminal (host may predate transport negotiation; restart or upgrade the mc-host daemon)",
-                    "host_negotiation_rejected",
-                );
-            }
-            throw error;
-        }
-        try {
-            // The decoder rejects selections absent from the sent offers so an invalid selection cannot enable fallback.
-            // Version and field violations are malformed, not fallback evidence.
-            // Negotiation responses require UTF-8 JSON with `binary = 0`.
-            if (flagsBinary(terminal.flags)) {
-                throw new NegotiationError("malformed_json", "flags");
-            }
-            return decodeNegotiateResponse(
-                requireJsonReceiveBody(terminal.body).text ?? "",
-                offers,
-            );
-        } catch (error) {
-            throw wrapNegotiationError(error);
-        }
-    }
-
-    /**
-     * Any failure retires the candidate and bootstrap without publishing either.
-     */
-    private async activateCandidate(
-        bootstrap: ActiveConnection,
-        grant: Extract<NegotiateResponse, { kind: "grant" }>,
-        stage: Deadline,
-    ): Promise<ActiveConnection> {
-        const conn = await this.prepareCandidate(bootstrap, grant, stage);
-        this.active = conn;
-        bootstrap.generation.retire("owner_close");
         this.emitConnected(conn);
         return conn;
     }
 
-    /**
-     * Any failure retires the candidate and bootstrap without publishing either.
-     * Any failure retires the candidate and bootstrap without publishing either.
-     * A shadow caller passes its episode's `shadow` set so candidate retirement callbacks remain episode-internal until promotion clears the shadow role.
-     * A shadow caller passes its episode's `shadow` set so candidate retirement callbacks remain episode-internal until promotion clears the shadow role.
-     */
-    private async prepareCandidate(
-        bootstrap: ActiveConnection,
-        grant: Extract<NegotiateResponse, { kind: "grant" }>,
-        stage: Deadline,
-        shadow?: Set<ConnectionGeneration>,
-    ): Promise<ActiveConnection> {
-        const provider = this.transportRegistry.find(
-            grant.selected.transport,
-            grant.selected.capabilityVersion,
-        );
-        if (!provider) {
-            // The sent-offers guard fails closed when a selection is absent from the sent offers.
-            const failure = new McHostCallError(
-                "terminal",
-                "host granted a transport with no installed provider",
-                "negotiation_failed",
-            );
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        const snapshot = bootstrap.snapshot;
-        // A candidate channel performs no handshake; it inherits the bootstrap's authority.
-        // The candidate inherits the bootstrap's authority across activation and commit.
-        // The candidate inherits the bootstrap identity instead of adopting the channel-reported identity.
-        // The candidate inherits the bootstrap identity instead of adopting the channel-reported identity.
-        const inheritedDaemonVer = bootstrap.generation.daemonVer;
-        const inheritedDaemonId = bootstrap.generation.authenticatedDaemonId;
-        if (inheritedDaemonVer === null || inheritedDaemonId === null) {
-            // `activateCandidate` fails closed if the bootstrap identity is unauthenticated.
-            // proved.
-            const failure = new McHostCallError(
-                "terminal",
-                "transport promotion requires an authenticated bootstrap identity",
-                "negotiation_failed",
-            );
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        let conn: ActiveConnection | null = null;
-        let candidate: ConnectionGeneration;
-        try {
-            // The `ConnectionGeneration` constructor invokes the channel factory synchronously.
-            // The `ConnectionGeneration` constructor invokes `provider.connect()` synchronously.
-            // The activation `try` cannot retire channels created before the constructor throws.
-            candidate = new ConnectionGeneration({
-                host: snapshot.endpoint.host,
-                port: snapshot.endpoint.port,
-                credentials: {
-                    key: snapshot.key,
-                    daemonId: snapshot.daemonId,
-                    daemonVer: snapshot.daemonVer,
-                },
-                channelFactory: sanitizedCandidateFactory(
-                    grant.selected.transport,
-                    provider,
-                    grant.descriptor,
-                    // A provider that mutates its retained array cannot mutate the candidate's inherited identity.
-                    // candidate inherits.
-                    inheritedDaemonId.slice(),
-                ),
-                inheritedIdentity: {
-                    daemonVer: inheritedDaemonVer,
-                    daemonId: inheritedDaemonId,
-                },
-                firstCorrelation: ACTIVATION_CORRELATION,
-                onRetired: (info) => {
-                    if (conn) this.onGenerationRetired(conn, info);
-                },
-                onRouteGoodbye: (channel, epoch) => {
-                    if (conn) this.onRouteGoodbye(conn, channel, epoch);
-                },
-                onPendingZero: () => {
-                    if (conn) this.onPendingDrained(conn);
-                },
-                onLeaseReleased: () => {
-                    if (conn) this.onPendingDrained(conn);
-                },
-                onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
-                ...this.generationOptions,
-            });
-        } catch (error) {
-            const failure = wrapNegotiationError(error);
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        shadow?.add(candidate);
-        conn = {
-            generation: candidate,
-            token: newConnectionToken(),
-            snapshot,
-            liveRoutes: new Map(),
-            transport: grant.selected.transport,
-            ...(shadow !== undefined ? { role: "shadow" as const } : {}),
-        };
-        try {
-            await candidate.start(stage);
-            const activate = await this.awaitRequest(candidate, {
-                channel: 0,
-                epoch: 0,
-                body: encodeActivateRequest(grant.activationToken),
-                deadline: stage,
-                options: {},
-                captureErrorTerminal: true,
-            });
-            // Negotiation-family responses must be UTF-8 JSON with `binary = 0`.
-            // promotion evidence.
-            if (flagsBinary(activate.flags)) {
-                throw new NegotiationError("malformed_json", "flags");
-            }
-            decodeActivateResponse(requireJsonReceiveBody(activate.body).text ?? "");
-            const commit = await this.awaitRequest(candidate, {
-                channel: 0,
-                epoch: 0,
-                body: commitRequestJson(),
-                deadline: stage,
-                options: {},
-                captureErrorTerminal: true,
-            });
-            if (flagsBinary(commit.flags)) {
-                throw new NegotiationError("malformed_json", "flags");
-            }
-            decodeCommitResponse(requireJsonReceiveBody(commit.body).text ?? "");
-        } catch (error) {
-            const failure = boundedNegotiationFailure(error);
-            candidate.retire("negotiation_failed", failure);
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        if (this.closeStarted || candidate.isRetired()) {
-            const failure = this.closeStarted
-                ? new McHostClientError("client closed", "client_closed")
-                : new McHostCallError(
-                      "not_sent",
-                      "candidate channel retired before promotion",
-                      "negotiation_failed",
-                  );
-            const reason = this.closeStarted ? "owner_close" : "negotiation_failed";
-            candidate.retire(reason, failure);
-            bootstrap.generation.retire(reason, failure);
-            throw failure;
-        }
-        return conn;
-    }
-
     private onGenerationRetired(conn: ActiveConnection, info: RetirementInfo): void {
-        // Shadow teardown is episode-internal; the recovery loop owns it.
-        if (conn.role === "shadow") return;
-        if (this.predecessor === conn) {
-            // Drain completion and a failed predecessor are internal handoff states.
-            // Drain completion and a failed predecessor never emit client-level `retired` while a primary is live.
-            this.predecessor = null;
-            return;
-        }
         if (this.active === conn) {
             this.active = null;
             for (const cached of this.routes.values()) {
                 cached.handle = null;
             }
-            // The episode is fenced to this exact source primary.
-            // The client cancels the fenced episode so in-flight shadow permits are released.
-            if (this.recovery !== null && this.recovery.source === conn) {
-                this.cancelRecovery(this.recovery);
-            }
-        } else if (this.active !== null) {
-            // The client does not emit `retired` when a non-active generation retires after another connection is published.
-            // The bootstrap can retire after a candidate is promoted.
-            // Emitting `retired` for the bootstrap would interleave a spurious client-level event with the candidate's `connected` event.
-            // Setup failures emit `retired` because no connection is published during setup.
-            return;
         }
-        this.emitDiagnostics({ type: "retired", reason: info.reason });
+        const terminalClass =
+            info.reason === "setup_failed" || info.reason === "setup_deadline"
+                ? classifySharedMemoryFailure(info.error)
+                : terminalRetirementClass(info.reason);
+        this.retirementEmitted = true;
+        this.emitDiagnostics({
+            type: "retired",
+            reason: info.reason,
+            ...(terminalClass === undefined
+                ? {}
+                : { health: "terminal" as const, errorClass: terminalClass }),
+        });
     }
 
     private onRouteGoodbye(conn: ActiveConnection, channel: number, epoch: number): void {
-        if (this.active !== conn && this.predecessor !== conn) return;
+        if (this.active !== conn) return;
         const handle = conn.liveRoutes.get(channel);
         if (!handle || handle.epoch !== epoch) return;
         conn.liveRoutes.delete(channel);
         this.detachCachedHandle(handle);
-        if (this.predecessor === conn) this.maybeRetirePredecessor();
     }
 
-    /** The primary or draining predecessor owns `handle`. */
+    /** Returns the live mandatory-ring connection owning `handle`. */
     private connectionFor(handle: RouteHandle): ActiveConnection | null {
-        for (const conn of [this.active, this.predecessor]) {
-            if (
-                conn !== null &&
-                !conn.generation.isRetired() &&
-                belongsToConnection(handle, conn.token) &&
-                conn.liveRoutes.get(handle.channel) === handle
-            ) {
-                return conn;
-            }
-        }
-        return null;
+        const conn = this.active;
+        return conn !== null &&
+            !conn.generation.isRetired() &&
+            belongsToConnection(handle, conn.token) &&
+            conn.liveRoutes.get(handle.channel) === handle
+            ? conn
+            : null;
     }
 
     /**
-     * Only the primary may serve a cached managed handle.
-     * New managed acquisitions never use a draining connection.
-     * predecessor (R10).
+     * Managed-route cache eligibility: only the primary may serve a cached
+     * managed handle.
      */
     private isPrimaryLiveHandle(handle: RouteHandle): boolean {
         const conn = this.connectionFor(handle);
@@ -1211,227 +875,18 @@ export class McHostClient {
         return detached;
     }
 
-    private emitConnected(conn: ActiveConnection, fallbackReason?: FallbackReason): void {
+    private emitConnected(conn: ActiveConnection): void {
         this.emitDiagnostics({
             type: "connected",
             daemonVer: conn.snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
             pid: conn.snapshot.pid,
-            transport: conn.transport,
-            ...(fallbackReason !== undefined ? { fallbackReason } : {}),
-        });
-    }
-
-    // ------------------------------------------------------------------
-    // Fresh generations can re-upgrade from TCP to shared memory.
-    // ------------------------------------------------------------------
-
-    /**
-     * The client begins one recovery episode fenced to `source`.
-     * Only an exact `unavailable` TCP fallback starts recovery.
-     * The recovery deadline is created once and is not reset by retries.
-     */
-    private startRecovery(source: ActiveConnection): void {
-        if (this.closeStarted) return;
-        const prior = this.recovery;
-        // The client cancels the prior episode so its shadow permits are released before the new episode dials.
-        if (prior !== null) this.cancelRecovery(prior);
-        const episode: RecoveryEpisode = {
-            source,
-            deadline: Deadline.start(this.recoveryDeadlineMs, this.clock),
-            cancelled: false,
-            shadowGenerations: new Set(),
-        };
-        this.recovery = episode;
-        void this.runRecoveryEpisode(episode)
-            .catch(() => {})
-            .finally(() => {
-                if (this.recovery === episode) this.recovery = null;
-            });
-    }
-
-    private cancelRecovery(episode: RecoveryEpisode): void {
-        episode.cancelled = true;
-        for (const generation of [...episode.shadowGenerations]) {
-            generation.retire("owner_close");
-        }
-    }
-
-    private recoveryStopped(episode: RecoveryEpisode): boolean {
-        return (
-            episode.cancelled ||
-            this.closeStarted ||
-            this.active !== episode.source ||
-            episode.source.generation.isRetired()
-        );
-    }
-
-    private async runRecoveryEpisode(episode: RecoveryEpisode): Promise<void> {
-        let delayMs = SETUP_RETRY_BASE_MS;
-        const pace = async (): Promise<void> => {
-            await this.sleep(episode.deadline.stageBudgetMs(delayMs));
-            delayMs = Math.min(delayMs * 2, SETUP_RETRY_CAP_MS);
-        };
-        for (;;) {
-            if (this.recoveryStopped(episode) || episode.deadline.isExpired()) return;
-            // The recovery loop creates no candidate while two generations drain, so a third generation and extra connection permit cannot exist.
-            if (this.predecessor !== null) {
-                await pace();
-                continue;
-            }
-            const outcome = await this.shadowAttempt(episode);
-            if (outcome.kind === "promote") {
-                this.finishPromotion(episode, outcome.conn);
-                return;
-            }
-            if (outcome.kind === "stop") return;
-            await pace();
-        }
-    }
-
-    /**
-     * The episode deadline bounds all retries.
-     * The episode retries discovery and dial transients and repeated exact `unavailable`; it stops for every other outcome.
-     */
-    private async shadowAttempt(episode: RecoveryEpisode): Promise<ShadowOutcome> {
-        const stage = episode.deadline.stage(this.handshakeTimeoutMs);
-        let snapshot: ConnectionSnapshot;
-        try {
-            snapshot = await readConnectionFile(this.connectionFile, {
-                deadline: stage,
-            });
-        } catch (error) {
-            // The episode retries `deadline_expired` because the episode deadline bounds subsequent attempts.
-            // classification (KTD6).
-            if (
-                error instanceof ConnectionFileError &&
-                (error.code === "not_found" ||
-                    error.code === "replaced_during_read" ||
-                    error.code === "deadline_expired")
-            ) {
-                return { kind: "retry" };
-            }
-            return { kind: "stop" };
-        }
-        const generation = new ConnectionGeneration({
-            host: snapshot.endpoint.host,
-            port: snapshot.endpoint.port,
-            credentials: {
-                key: snapshot.key,
-                daemonId: snapshot.daemonId,
-                daemonVer: snapshot.daemonVer,
+            health: "healthy",
+            artifact: {
+                profile: QUALIFIED_TEST_PROFILE,
+                wireVersion: PROTOCOL_VERSION,
+                descriptorSchema: DESCRIPTOR_SCHEMA_VERSION,
             },
-            ...this.generationOptions,
         });
-        episode.shadowGenerations.add(generation);
-        try {
-            try {
-                await generation.start(stage);
-            } catch (error) {
-                return { kind: isShadowDialTransient(error) ? "retry" : "stop" };
-            }
-            if (this.recoveryStopped(episode)) {
-                generation.retire("owner_close");
-                return { kind: "stop" };
-            }
-            if (generation.isRetired()) return { kind: "retry" };
-            let selection: NegotiateResponse;
-            try {
-                selection = await this.negotiateTransport(generation, stage);
-            } catch (error) {
-                // Malformed negotiation and host-error terminals stop the episode; they are never fallback or retry evidence.
-                generation.retire("negotiation_failed", error);
-                return { kind: "stop" };
-            }
-            if (selection.kind === "tcp") {
-                generation.retire("owner_close");
-                // Repeated exact `unavailable` keeps the episode alive under its original deadline; a reasonless selection, legacy fallback, or other reason stops the episode.
-                return { kind: selection.reason === "unavailable" ? "retry" : "stop" };
-            }
-            const bootstrap: ActiveConnection = {
-                generation,
-                token: newConnectionToken(),
-                snapshot,
-                liveRoutes: new Map(),
-                transport: TRANSPORT_TCP,
-                role: "shadow",
-            };
-            let conn: ActiveConnection;
-            try {
-                conn = await this.prepareCandidate(
-                    bootstrap,
-                    selection,
-                    stage,
-                    episode.shadowGenerations,
-                );
-            } catch {
-                // Grant attachment, activation, and commit failures stop recovery.
-                // `prepareCandidate` has already retired the source and candidate channels, releasing their shadow permits.
-                return { kind: "stop" };
-            }
-            // The host replaces the bootstrap at commit; only the committed candidate reaches the promotion fence.
-            generation.retire("owner_close");
-            return { kind: "promote", conn };
-        } finally {
-            episode.shadowGenerations.delete(generation);
-        }
-    }
-
-    /**
-     * The promotion path publishes the shadow commit only while the exact source primary remains published and the predecessor slot is free; otherwise it retires the candidate.
-     */
-    private finishPromotion(episode: RecoveryEpisode, conn: ActiveConnection): void {
-        episode.shadowGenerations.delete(conn.generation);
-        if (
-            this.recoveryStopped(episode) ||
-            this.predecessor !== null ||
-            conn.generation.isRetired()
-        ) {
-            conn.generation.retire("owner_close");
-            return;
-        }
-        conn.role = undefined;
-        this.predecessor = episode.source;
-        this.active = conn;
-        this.emitConnected(conn);
-        this.maybeRetirePredecessor();
-    }
-
-    private onPendingDrained(conn: ActiveConnection): void {
-        if (this.predecessor === conn) this.maybeRetirePredecessor();
-    }
-
-    /**
-     * The client retires the draining predecessor only after pending work and live route handles reach zero.
-     * Caller-owned raw handles keep the drain open until their explicit close.
-     */
-    private maybeRetirePredecessor(): void {
-        const pred = this.predecessor;
-        if (pred === null) return;
-        if (pred.generation.isRetired()) {
-            this.predecessor = null;
-            return;
-        }
-        const stats = pred.generation.stats();
-        if (stats.pendingRequests > 0) return;
-        // The continuation may not yet have recorded the handle; keep the drain open until its completion re-invokes this check.
-        if ((this.routeOpenCounts.get(pred) ?? 0) > 0) return;
-        // A settled binary or stream terminal transfers its ReceiveLease to the caller; its storage aliases the channel until explicit release.
-        // The drain remains open while live leases remain; each release re-invokes this check.
-        if (stats.activeReceiveLeases > 0) return;
-        for (const [channel, handle] of [...pred.liveRoutes]) {
-            if (!this.managedHandles.has(handle)) continue;
-            pred.liveRoutes.delete(channel);
-            pred.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
-            this.detachCachedHandle(handle);
-        }
-        if (pred.liveRoutes.size > 0) return;
-        this.predecessor = null;
-        const generation = pred.generation;
-        generation.enqueueConnectionGoodbye();
-        void generation
-            .flushWrites(Deadline.start(this.shutdownDeadlineMs, this.clock))
-            .catch(() => {})
-            .finally(() => generation.retire("owner_close"));
     }
 
     // ------------------------------------------------------------------
@@ -1475,15 +930,6 @@ export class McHostClient {
             if (terminal.kind === "error") {
                 const errorBody = requireJsonReceiveBody(terminal.body);
                 const failure = terminalFromErrorBody(errorBody);
-                if (params.captureErrorTerminal === true) {
-                    failure.errorTerminal = {
-                        bodyText: errorBody.text,
-                        flags: terminal.flags,
-                        // A stream frame before the terminal proves that the host produced response data, so it cannot establish a no-dispatch rejection.
-                        // The terminal handler reads the arrival flag rather than `stream`: unary mode drains stream bodies privately and reports an empty array.
-                        streamed: terminal.sawStream,
-                    };
-                }
                 throw failure;
             }
             return terminal;
@@ -1561,14 +1007,8 @@ export class McHostClient {
             () => undefined,
         );
         this.pendingRouteOpens.add(tracked);
-        this.routeOpenCounts.set(active, (this.routeOpenCounts.get(active) ?? 0) + 1);
         void tracked.finally(() => {
             this.pendingRouteOpens.delete(tracked);
-            const remaining = (this.routeOpenCounts.get(active) ?? 1) - 1;
-            if (remaining <= 0) this.routeOpenCounts.delete(active);
-            else this.routeOpenCounts.set(active, remaining);
-            // The settled continuation may release the last obligation holding a draining predecessor open, so the client re-evaluates the predecessor.
-            if (this.predecessor === active) this.maybeRetirePredecessor();
         });
         return run;
     }
@@ -1585,7 +1025,9 @@ export class McHostClient {
         try {
             parsed = await this.controlRequest(active, bodyText, "route.open", deadline);
         } catch (error) {
-            // An ambiguous channel-0 `route.open` may have been sent but has no terminal or handle; because Cancel is illegal on channel 0, the client retires the generation before recovery.
+            // KTD9: an ambiguous channel-0 route.open (possible send, no
+            // terminal) has no handle and Cancel is illegal on channel 0,
+            // so retire the generation before reconnecting.
             if (error instanceof McHostCallError && error.kind === "outcome_unknown") {
                 active.generation.retire("ambiguous_route_open", error);
             }
@@ -1665,7 +1107,7 @@ export class McHostClient {
                 };
                 this.routes.set(key, cached);
             }
-            // Only the primary serves cached managed handles: a handle left on a draining predecessor is stale for new managed acquisitions even while raw callers still use it.
+            // Only the active generation serves cached managed handles.
             if (cached.handle && this.isPrimaryLiveHandle(cached.handle)) {
                 const active = this.active;
                 // Without a live connection, the identity cannot be refreshed, so the cached handle remains authoritative for its channel.
@@ -1842,8 +1284,6 @@ export class McHostClient {
 
     private async runClose(): Promise<void> {
         const deadline = Deadline.start(this.shutdownDeadlineMs, this.clock);
-        // Cancelling shadow publication before waiting for a connection prevents a racing commit from publishing and releases every shadow-connection permit.
-        if (this.recovery !== null) this.cancelRecovery(this.recovery);
         if (this.connecting) {
             try {
                 await this.connecting.promise;
@@ -1866,9 +1306,8 @@ export class McHostClient {
                 cancelWait?.();
             }
         }
-        const conns = [this.active, this.predecessor].filter(
-            (conn): conn is ActiveConnection => conn !== null && !conn.generation.isRetired(),
-        );
+        const conns =
+            this.active !== null && !this.active.generation.isRetired() ? [this.active] : [];
         for (const conn of conns) conn.generation.enqueueConnectionGoodbye();
         await Promise.all(conns.map((conn) => conn.generation.flushWrites(deadline)));
         for (const conn of conns) conn.generation.retire("owner_close");
@@ -2047,15 +1486,6 @@ function requireOpArray(value: unknown, field: string, allowEmpty: boolean): str
 }
 
 function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSnapshot {
-    const keys = Object.keys(parsed).sort();
-    const expected = ["health", "metrics", "op"];
-    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
-        throw new McHostCallError(
-            "terminal",
-            "host.status response rejected: unexpected shape",
-            "malformed_control_response",
-        );
-    }
     if (parsed.op !== "host.status") {
         throw new McHostCallError(
             "terminal",
@@ -2082,10 +1512,192 @@ function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSna
             "malformed_control_response",
         );
     }
+    const sharedMemory = parsed.shared_memory;
+    if (
+        sharedMemory !== undefined &&
+        (sharedMemory === null || typeof sharedMemory !== "object" || Array.isArray(sharedMemory))
+    ) {
+        throw new McHostCallError(
+            "terminal",
+            "host.status response rejected: shared_memory is not an object",
+            "malformed_control_response",
+        );
+    }
     return {
         health,
         metrics: parsed.metrics as Record<string, unknown>,
+        sharedMemory: parseSharedMemoryDiagnostics(sharedMemory),
     };
+}
+
+const RESOURCE_FIELDS = [
+    "arena_bytes",
+    "client_instances",
+    "descriptors",
+    "file_descriptors",
+    "leases",
+    "mappings",
+    "pinned_workers",
+    "workers",
+] as const;
+
+function requireRecord(value: unknown, what: string): Record<string, unknown> {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw malformedStatus(`${what} is not an object`);
+    }
+    return value as Record<string, unknown>;
+}
+
+function exactKeys(
+    record: Record<string, unknown>,
+    expected: readonly string[],
+    what: string,
+): void {
+    const keys = Object.keys(record).sort();
+    const sorted = [...expected].sort();
+    if (keys.length !== sorted.length || keys.some((key, index) => key !== sorted[index])) {
+        throw malformedStatus(`${what} has an unexpected shape`);
+    }
+}
+
+function boundedCount(value: unknown, what: string): number {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        throw malformedStatus(`${what} is not a nonnegative safe integer`);
+    }
+    return value;
+}
+
+function parseResourceCounts(value: unknown, what: string): SharedMemoryResourceCounts {
+    const record = requireRecord(value, what);
+    exactKeys(record, RESOURCE_FIELDS, what);
+    return Object.fromEntries(
+        RESOURCE_FIELDS.map((field) => [field, boundedCount(record[field], `${what}.${field}`)]),
+    ) as unknown as SharedMemoryResourceCounts;
+}
+
+function parseCounter(value: unknown, field: "completed" | "observed", what: string) {
+    const record = requireRecord(value, what);
+    exactKeys(record, [field], what);
+    return { [field]: boundedCount(record[field], `${what}.${field}`) } as
+        | { completed: number }
+        | { observed: number };
+}
+
+function malformedStatus(detail: string): McHostCallError {
+    return new McHostCallError(
+        "terminal",
+        `host.status response rejected: ${detail}`,
+        "malformed_control_response",
+    );
+}
+
+export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagnostics {
+    const record = requireRecord(value, "shared_memory");
+    exactKeys(
+        record,
+        [
+            "state",
+            "error_class",
+            "artifact",
+            "bounds",
+            "accounting",
+            "activation",
+            "peer_death",
+            "reclamation",
+            "exhaustion",
+        ],
+        "shared_memory",
+    );
+    const terminalClasses = new Set<SharedMemoryTerminalClass>([
+        "missing_addon",
+        "identity_mismatch",
+        "setup_failure",
+        "peer_death",
+        "resource_exhaustion",
+    ]);
+    const state = record.state;
+    const errorClass = record.error_class;
+    if (
+        (state !== "healthy" && state !== "terminal") ||
+        (state === "healthy" && errorClass !== null) ||
+        (state === "terminal" &&
+            (typeof errorClass !== "string" ||
+                !terminalClasses.has(errorClass as SharedMemoryTerminalClass)))
+    ) {
+        throw malformedStatus("shared_memory state contradicts its error class");
+    }
+    // Healthy is reported only after a successful accounting snapshot, and bounds
+    // are always concrete, so a healthy record withholding either describes
+    // resources it never observed.
+    if (state === "healthy" && (record.bounds === null || record.accounting === null)) {
+        throw malformedStatus("healthy shared_memory withholds observed resource data");
+    }
+    const artifact = requireRecord(record.artifact, "shared_memory.artifact");
+    exactKeys(artifact, ["profile", "wire_version", "descriptor_schema"], "shared_memory.artifact");
+    if (
+        artifact.profile !== QUALIFIED_TEST_PROFILE ||
+        artifact.wire_version !== PROTOCOL_VERSION ||
+        artifact.descriptor_schema !== DESCRIPTOR_SCHEMA_VERSION
+    ) {
+        throw malformedStatus("shared_memory artifact identity mismatch");
+    }
+    let accounting: SharedMemoryDiagnostics["accounting"] = null;
+    if (record.accounting !== null) {
+        const raw = requireRecord(record.accounting, "shared_memory.accounting");
+        exactKeys(raw, ["active", "quarantined"], "shared_memory.accounting");
+        accounting = {
+            active: parseResourceCounts(raw.active, "shared_memory.accounting.active"),
+            quarantined: parseResourceCounts(
+                raw.quarantined,
+                "shared_memory.accounting.quarantined",
+            ),
+        };
+    }
+    return {
+        state,
+        error_class: errorClass as SharedMemoryTerminalClass | null,
+        artifact: {
+            profile: QUALIFIED_TEST_PROFILE,
+            wire_version: PROTOCOL_VERSION,
+            descriptor_schema: DESCRIPTOR_SCHEMA_VERSION,
+        },
+        bounds:
+            record.bounds === null
+                ? null
+                : parseResourceCounts(record.bounds, "shared_memory.bounds"),
+        accounting,
+        activation: parseCounter(record.activation, "completed", "shared_memory.activation") as {
+            completed: number;
+        },
+        peer_death: parseCounter(record.peer_death, "observed", "shared_memory.peer_death") as {
+            observed: number;
+        },
+        reclamation: parseCounter(record.reclamation, "completed", "shared_memory.reclamation") as {
+            completed: number;
+        },
+        exhaustion: parseCounter(record.exhaustion, "observed", "shared_memory.exhaustion") as {
+            observed: number;
+        },
+    };
+}
+
+function terminalRetirementClass(reason: RetirementReason): SharedMemoryTerminalClass | undefined {
+    switch (reason) {
+        // A dead peer reaches this client as a channel EOF;
+        // `FrameChannelCloseReason` carries no socket-level variants.
+        case "eof":
+            return "peer_death";
+        // `ShmFrameChannel` retires the generation on these when ring decoding
+        // or lease cleanup fails. The closed class vocabulary has no corruption
+        // member, so they report the generic setup class rather than leaving a
+        // terminal retirement unclassified.
+        case "protocol_violation":
+        case "role_violation":
+        case "quarantined":
+            return "setup_failure";
+        default:
+            return undefined;
+    }
 }
 
 /**
@@ -2140,36 +1752,6 @@ function parseCatalogResponse(parsed: Record<string, unknown>): CatalogSnapshot 
         };
     });
     return { generation, subcOps, modules };
-}
-
-function wrapNegotiationError(error: unknown): Error {
-    if (error instanceof NegotiationError) {
-        return new McHostCallError(
-            "terminal",
-            `transport negotiation failed: ${error.message}`,
-            "negotiation_failed",
-            error,
-        );
-    }
-    return error instanceof Error ? error : new Error(String(error));
-}
-
-/**
- * Wire `Error` failures use a bounded error before retirement info or callers receive them; other failures retain `wrapNegotiationError` semantics.
- */
-function boundedNegotiationFailure(error: unknown): Error {
-    if (
-        error instanceof McHostCallError &&
-        error.kind === "terminal" &&
-        error.errorTerminal !== undefined
-    ) {
-        return new McHostCallError(
-            "terminal",
-            "transport negotiation failed: host error terminal",
-            "negotiation_failed",
-        );
-    }
-    return wrapNegotiationError(error);
 }
 
 function toManagedCallError(error: unknown): McHostCallError {

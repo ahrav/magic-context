@@ -3,15 +3,15 @@ use std::sync::Arc;
 use mc_shm_transport::arena::{ArenaCounts, ArenaSpan, SpanPlan, MAX_FRAME_BYTES};
 use mc_shm_transport::backend::sample::{SamplePrefix, SAMPLE_PREFIX_BYTES};
 use mc_shm_transport::descriptor::{
-    BackendId, DescriptorCounts, DescriptorError, FrameDescriptor, HardwareProfileId, Incarnation,
-    MemoryLayout, OwnershipMode, PlatformKind, ReleaseIdentity, RuntimeKind, SchedulingMode,
-    TransportDescriptor, WorkloadClass, DESCRIPTOR_SCHEMA_VERSION, WIRE_V2_HEADER_BYTES,
+    DescriptorCounts, DescriptorError, FrameDescriptor, HardwareProfileId, Incarnation,
+    ReleaseIdentity, SchedulingMode, TransportDescriptor, DESCRIPTOR_SCHEMA_VERSION,
+    WIRE_V2_HEADER_BYTES,
 };
 use mc_shm_transport::evidence::OperationCounters;
 use mc_shm_transport::lifecycle::{CloseState, Lifecycle, LifecycleError};
 use mc_shm_transport::profile::{
-    ring_profile, AdmissionController, AdmissionError, CompletionMode, HostLimits,
-    ProducerTopology, ProfileConfig, ResourceCharges, TargetProfile, WorkerTopology,
+    ring_profile, AdmissionController, AdmissionError, HostLimits, ProfileConfig, ResourceCharges,
+    TargetProfile, WorkerTopology,
 };
 
 fn header(len: usize) -> [u8; WIRE_V2_HEADER_BYTES] {
@@ -57,6 +57,25 @@ fn valid_descriptor() -> FrameDescriptor {
             ArenaSpan::from_untrusted(0, 4),
         ],
     )
+}
+
+#[test]
+fn fixed_ring_identity_survives_profile_validation() {
+    let profile = ring_profile(
+        HardwareProfileId::new("fixed-ring-contract").unwrap(),
+        SchedulingMode::ColdParkWake,
+    )
+    .unwrap();
+
+    assert_eq!(
+        profile.descriptor().schema_version(),
+        DESCRIPTOR_SCHEMA_VERSION
+    );
+    assert_eq!(
+        profile.descriptor().scheduling(),
+        SchedulingMode::ColdParkWake
+    );
+    assert!(profile.descriptor().hardware_matches("fixed-ring-contract"));
 }
 
 #[test]
@@ -339,6 +358,9 @@ fn host_admission_retains_quarantined_commitments() {
         arena_bytes: charges.arena_bytes,
         leases: charges.leases,
         mappings: charges.mappings,
+        file_descriptors: charges.file_descriptors,
+        workers: charges.workers,
+        client_instances: charges.client_instances,
         pinned_workers: 0,
     }));
     let admission = controller.admit(&profile, None).unwrap();
@@ -357,19 +379,60 @@ fn host_admission_retains_quarantined_commitments() {
             | Err(AdmissionError::ArenaByteLimit)
             | Err(AdmissionError::LeaseLimit)
             | Err(AdmissionError::MappingLimit)
+            | Err(AdmissionError::FileDescriptorLimit)
+            | Err(AdmissionError::ClientInstanceLimit)
     ));
+}
+
+#[test]
+fn exact_aggregate_capacity_admits_n_and_rejects_n_plus_one_without_charging() {
+    let profile = ring_profile(
+        HardwareProfileId::new("contract-capacity").unwrap(),
+        SchedulingMode::ColdParkWake,
+    )
+    .unwrap();
+    let one = profile.charges();
+    let count = 3;
+    let controller = Arc::new(AdmissionController::new(HostLimits {
+        descriptors: one.descriptors * count,
+        arena_bytes: one.arena_bytes * count,
+        leases: one.leases * count,
+        mappings: one.mappings * count,
+        file_descriptors: one.file_descriptors * count,
+        workers: one.workers * count,
+        client_instances: one.client_instances * count,
+        pinned_workers: one.pinned_workers * count,
+    }));
+    let admissions: Vec<_> = (0..count)
+        .map(|_| {
+            controller
+                .admit(&profile, None)
+                .expect("capacity admission")
+        })
+        .collect();
+    let full = controller.snapshot().unwrap();
+    assert_eq!(full.active.client_instances, count);
+    assert!(matches!(
+        controller.admit(&profile, None),
+        Err(AdmissionError::DescriptorLimit)
+            | Err(AdmissionError::ArenaByteLimit)
+            | Err(AdmissionError::LeaseLimit)
+            | Err(AdmissionError::MappingLimit)
+            | Err(AdmissionError::FileDescriptorLimit)
+            | Err(AdmissionError::WorkerLimit)
+            | Err(AdmissionError::ClientInstanceLimit)
+    ));
+    assert_eq!(controller.snapshot().unwrap(), full);
+    drop(admissions);
+    let reclaimed = controller.snapshot().unwrap();
+    assert_eq!(reclaimed.active, ResourceCharges::ZERO);
+    assert_eq!(reclaimed.quarantined, ResourceCharges::ZERO);
 }
 
 fn span_profile(max_spans: usize) -> TargetProfile {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
-            BackendId::Ring,
-            MemoryLayout::TwoSpanWrap,
-            OwnershipMode::DirectLeased,
             SchedulingMode::ColdParkWake,
-            WorkloadClass::MixedDuplex,
-            PlatformKind::Linux,
-            RuntimeKind::Rust,
             HardwareProfileId::new("contract-spans").unwrap(),
         ),
         descriptor_depth: 8,
@@ -378,9 +441,7 @@ fn span_profile(max_spans: usize) -> TargetProfile {
         max_leases: 8,
         mappings: 2,
         pinned_workers: 0,
-        producer_topology: ProducerTopology::CallerConfined,
         worker_topology: WorkerTopology::CallerThread,
-        completion_mode: CompletionMode::SynchronousPull,
     })
     .unwrap()
 }
@@ -394,6 +455,9 @@ fn released_admissions_recompute_active_span_charge() {
         arena_bytes: 1 << 30,
         leases: 1024,
         mappings: 1024,
+        file_descriptors: 1024,
+        workers: 1024,
+        client_instances: 1024,
         pinned_workers: 0,
     }));
 
@@ -444,13 +508,7 @@ fn purity_gate_rejects_injected_copy_allocation_queue_and_wake() {
 fn debug_and_errors_redact_every_sentinel() {
     let sentinel = "SENTINEL_descriptor_token_object_incarnation_address";
     let transport = TransportDescriptor::new(
-        BackendId::Ring,
-        MemoryLayout::TwoSpanWrap,
-        OwnershipMode::DirectLeased,
         SchedulingMode::ColdParkWake,
-        WorkloadClass::MixedDuplex,
-        PlatformKind::Linux,
-        RuntimeKind::Rust,
         HardwareProfileId::new(sentinel).unwrap(),
     );
     let incarnation = Incarnation::from_bytes(*b"SENTINEL-SECRET!");

@@ -336,6 +336,8 @@ export function validateGreenPackageScripts(raw: unknown): void {
             "bun scripts/run-test-selection.ts --mode rust --timeout 600000 --max-concurrency 1",
         "test:incident-unit":
             "bun scripts/run-test-selection.ts --incident-unit --timeout 120000",
+        "test:metamorphic-unit":
+            "bun scripts/run-test-selection.ts --metamorphic-eval-unit --timeout 120000",
     };
     for (const [name, command] of Object.entries(required)) {
         if (raw.scripts[name] !== command) {

@@ -92,7 +92,7 @@ function verdictFromToolsMap(tools: unknown, toolName: string): boolean | null {
  * The resolver prefers the in-memory transform message array over the OpenCode DB.
  * The resolver caches verdicts derived from the first user message.
  */
-export function resolveToolAvailabilityFromMessages(
+function resolveToolAvailabilityFromMessages(
     sessionId: string,
     toolName: string,
     messages: ReadonlyArray<{ info?: { role?: string; tools?: unknown } }>,
@@ -120,11 +120,8 @@ export function resolveToolAvailabilityFromMessages(
  * The resolver reads the OpenCode DB and fails open when it is unavailable or unreadable.
  * read fails.
  */
-export function resolveToolAvailability(
-    sessionId: string,
-    toolName: string,
-): ToolAvailabilityVerdict {
-    // `ctx_reduce` is uncallable for every session when it is not globally registered.
+function resolveToolAvailability(sessionId: string, toolName: string): ToolAvailabilityVerdict {
+    // Process-global registration override (see resolveToolAvailabilityFromMessages).
     if (toolName === CTX_REDUCE_TOOL && !ctxReduceRegisteredGlobally) {
         return { callable: false, frozen: true };
     }
@@ -156,8 +153,8 @@ export function resolveToolAvailability(
     }
 }
 
-/* */
-export function clearToolAvailability(sessionId: string, toolName: string): void {
+/** Drop a cached verdict for one tool of one session (test/reset helper). */
+function clearToolAvailability(sessionId: string, toolName: string): void {
     availabilityBySession.delete(cacheKey(toolName, sessionId));
 }
 

@@ -16,9 +16,19 @@ import { probeCapabilities } from "../index.ts";
 const scratch = mkdtempSync(join(tmpdir(), "mc-shm-native-"));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
+const claimedTarget = process.env.MC_SHM_NATIVE_CLAIMED_TARGET === "1";
+
+function requiredAddonPath(): string | null {
+    const path = resolve(dirname(fileURLToPath(import.meta.url)), "../mc_shm_native.node");
+    if (existsSync(path)) return path;
+    if (claimedTarget) throw new Error(`claimed native target is missing addon: ${path}`);
+    return null;
+}
+
 describe("native mechanism gate", () => {
     test("proves every required runtime mechanism or omits capability", () => {
         const result = probeCapabilities();
+        if (claimedTarget) expect(result.available).toBe(true);
         expect(result.napiVersion === null || result.napiVersion >= 1).toBe(
             true,
         );
@@ -38,19 +48,14 @@ describe("native mechanism gate", () => {
     test("environment cleanup hook runs at runtime exit when addon loads", () => {
         const marker = join(scratch, "cleanup.marker");
         const script = join(scratch, "cleanup.mjs");
-        const addon = resolve(
-            dirname(fileURLToPath(import.meta.url)),
-            "../mc_shm_native.node",
-        );
-        // The first test tolerates an unbuilt addon via probeCapabilities();
-        // The cleanup-hook test requires the addon artifact, so skip when it is absent.
-        if (!existsSync(addon)) return;
+        const addon = requiredAddonPath();
+        if (!addon) return;
         writeFileSync(
             script,
             `import { createRequire } from "node:module";\n` +
                 `const addon = createRequire(import.meta.url)(${JSON.stringify(addon)});\n` +
                 `addon.registerCleanupProbe(${JSON.stringify(marker)});\n` +
-                `if (process.platform === "linux") addon.createTestPair();\n`,
+                `addon.createTestPair();\n`,
         );
         const child = spawnSync(process.execPath, [script], {
             encoding: "utf8",
@@ -69,19 +74,25 @@ interface RawAttachAddon {
 }
 
 function loadRawAddon(): RawAttachAddon | null {
-    const path = resolve(
-        dirname(fileURLToPath(import.meta.url)),
-        "../mc_shm_native.node",
-    );
-    if (!existsSync(path)) return null;
+    const path = requiredAddonPath();
+    if (!path) return null;
     return createRequire(import.meta.url)(path) as RawAttachAddon;
 }
 
-/** The grant constants define the `mc-host-test-ring-v1` `ring_profile` geometry. */
-const GRANT_DESCRIPTOR_DEPTH = 32n;
-/** `MIN_ARENA_BYTES` and `MAX_FRAME_BYTES` are both 64 MiB. */
+function supportsMechanismTests(addon: RawAttachAddon | null): addon is RawAttachAddon {
+    const supportedPlatform = ["linux", "darwin"].includes(process.platform);
+    if (addon && supportedPlatform) return true;
+    if (claimedTarget) {
+        throw new Error(`claimed native target is unsupported: ${process.platform}`);
+    }
+    return false;
+}
+
+/** Geometry of the `mc-host-test-ring-v1` profile (`mc_host_ring_profile`). */
+const GRANT_DESCRIPTOR_DEPTH = 8n;
+/** `MIN_ARENA_BYTES` == `MAX_FRAME_BYTES` == 64 MiB. */
 const GRANT_ARENA_BYTES = 67_108_864n;
-const GRANT_MAX_LEASES = 32n;
+const GRANT_MAX_LEASES = 8n;
 /**
  * The ring layout adds a control region before the page-aligned arena and a lifecycle page after it.
  * The control region contains producer, consumer, and reclaim cache lines.
@@ -92,7 +103,7 @@ const GRANT_MAX_LEASES = 32n;
  * Growing a control-region struct past a page boundary changes `GRANT_LAYOUT_OVERHEAD_BYTES`; a stale value causes `invalid shared-memory descriptor`.
  * An unresolvable descriptor must pass decoding before resolution fails.
  */
-const GRANT_LAYOUT_OVERHEAD_BYTES = 16_384n;
+const GRANT_LAYOUT_OVERHEAD_BYTES = 8_192n;
 
 /**
  * all little-endian.
@@ -120,7 +131,6 @@ function testGrantHex(lane: number, incarnation: number): string {
 function validRawDescriptor(): Record<string, unknown> {
     return {
         profile: "mc-host-test-ring-v1",
-        pid: 1234,
         hostToPeerFd: 10,
         hostToPeerGrant: testGrantHex(0, 0xab),
         peerToHostFd: 11,
@@ -147,7 +157,7 @@ describe("raw N-API descriptor boundary", () => {
 
     test("rejects non-object and structurally hostile arguments", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
+        if (!supportsMechanismTests(addon)) return;
         for (const hostile of [
             null,
             undefined,
@@ -160,37 +170,17 @@ describe("raw N-API descriptor boundary", () => {
             expectRejectedWithoutEffects(addon, hostile);
         }
         // A missing field and an explicit undefined are both absent.
-        const { pid: _pid, ...missingPid } = validRawDescriptor();
-        expectRejectedWithoutEffects(addon, missingPid);
+        const { hostToPeerFd: _fd, ...missingFd } = validRawDescriptor();
+        expectRejectedWithoutEffects(addon, missingFd);
         expectRejectedWithoutEffects(addon, {
             ...validRawDescriptor(),
-            pid: undefined,
+            hostToPeerFd: undefined,
         });
     });
 
     test("rejects every unsafe numeric representation before narrowing", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
-        const hostilePids = [
-            Number.NaN,
-            Number.POSITIVE_INFINITY,
-            Number.NEGATIVE_INFINITY,
-            2.5,
-            -1,
-            0,
-            -0,
-            2 ** 32,
-            2 ** 53,
-            "1234",
-            1234n,
-            { valueOf: () => 1234 },
-        ];
-        for (const pid of hostilePids) {
-            expectRejectedWithoutEffects(addon, {
-                ...validRawDescriptor(),
-                pid,
-            });
-        }
+        if (!supportsMechanismTests(addon)) return;
         const hostileFds = [-1, -0, 2 ** 31, 3.5, Number.NaN, "10"];
         for (const fd of hostileFds) {
             expectRejectedWithoutEffects(addon, {
@@ -206,7 +196,7 @@ describe("raw N-API descriptor boundary", () => {
 
     test("rejects malformed, non-ASCII, and aliased grant text", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
+        if (!supportsMechanismTests(addon)) return;
         const valid = validRawDescriptor();
         const hostileGrants = [
             "\u00e9".repeat(58), // UTF-8 length 116, non-ASCII
@@ -237,11 +227,11 @@ describe("raw N-API descriptor boundary", () => {
 
     test("accessor objects and proxies get one bounded redacted error", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
+        if (!supportsMechanismTests(addon)) return;
         let reads = 0;
         const accessor = {
             ...validRawDescriptor(),
-            get pid(): number {
+            get hostToPeerFd(): number {
                 reads += 1;
                 throw new Error("SENTINEL_ACCESSOR_THROW");
             },
@@ -261,7 +251,7 @@ describe("raw N-API descriptor boundary", () => {
 
         const flipping = new Proxy(validRawDescriptor(), {
             get(target, property, receiver) {
-                if (property === "pid") return Number.NaN;
+                if (property === "hostToPeerFd") return Number.NaN;
                 return Reflect.get(target, property, receiver);
             },
         });
@@ -270,7 +260,7 @@ describe("raw N-API descriptor boundary", () => {
 
     test("a wrong profile is refused before any attachment effect", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
+        if (!supportsMechanismTests(addon)) return;
         expectRejectedWithoutEffects(
             addon,
             { ...validRawDescriptor(), profile: "SENTINEL_PROFILE" },
@@ -280,12 +270,10 @@ describe("raw N-API descriptor boundary", () => {
 
     test("a well-formed but unresolvable descriptor fails without registry effects", () => {
         const addon = loadRawAddon();
-        if (!addon || process.platform !== "linux") return;
-        // PID 4294967295 exceeds Linux `pid_max`, but validation accepts it.
-        // The `/proc` open fails after validation accepts PID 4294967295, so no channel is registered.
+        if (!supportsMechanismTests(addon)) return;
         expectRejectedWithoutEffects(
             addon,
-            { ...validRawDescriptor(), pid: 4_294_967_295 },
+            validRawDescriptor(),
             /shared-memory attachment failed/,
         );
     });

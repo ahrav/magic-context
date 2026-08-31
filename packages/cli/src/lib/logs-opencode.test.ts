@@ -79,7 +79,8 @@ describe("sanitizeLogContent — secret token redaction (council finding #9)", (
         it("redacts hf_* tokens", () => {
             const log = "HF_TOKEN=hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
             const sanitized = sanitizeLogContent(log);
-            expect(sanitized).toBe("HF_TOKEN=<REDACTED:hf_token>");
+            // env-var redactor wins (more semantic context preserved)
+            expect(sanitized).toBe("HF_TOKEN=<REDACTED:token>");
         });
 
         it("redacts standalone hf_* tokens not in assignment form", () => {
@@ -94,7 +95,7 @@ describe("sanitizeLogContent — secret token redaction (council finding #9)", (
         it("redacts AKIA access key IDs", () => {
             const log = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
             const sanitized = sanitizeLogContent(log);
-            expect(sanitized).toBe("AWS_ACCESS_KEY_ID=<REDACTED:aws_access_key_id>");
+            expect(sanitized).toBe("AWS_ACCESS_KEY_ID=<REDACTED:aws_access_key>");
         });
 
         it("redacts standalone AKIA in log narration", () => {
@@ -125,7 +126,7 @@ describe("sanitizeLogContent — secret token redaction (council finding #9)", (
             const log = "SLACK_BOT_TOKEN=xoxb-1234567890-abcdefghij-ABCDEFG12345"; // gitleaks:allow redaction-test fixture
             const sanitized = sanitizeLogContent(log);
             // env-var wins
-            expect(sanitized).toBe("SLACK_BOT_TOKEN=<REDACTED:slack_bot_token>");
+            expect(sanitized).toBe("SLACK_BOT_TOKEN=<REDACTED:token>");
         });
 
         it("redacts standalone xoxp/xoxr/xoxs", () => {
@@ -150,22 +151,22 @@ describe("sanitizeLogContent — secret token redaction (council finding #9)", (
     describe("Generic env-var assignments", () => {
         it("redacts FOO_API_KEY=value", () => {
             const sanitized = sanitizeLogContent("MY_CUSTOM_API_KEY=abcdef12345");
-            expect(sanitized).toBe("MY_CUSTOM_API_KEY=<REDACTED:my_custom_api_key>");
+            expect(sanitized).toBe("MY_CUSTOM_API_KEY=<REDACTED:api_key>");
         });
 
         it("redacts BAR_TOKEN=value", () => {
             const sanitized = sanitizeLogContent("DATABASE_TOKEN=tokenvaluehere");
-            expect(sanitized).toBe("DATABASE_TOKEN=<REDACTED:database_token>");
+            expect(sanitized).toBe("DATABASE_TOKEN=<REDACTED:token>");
         });
 
         it("redacts BAZ_SECRET=value", () => {
             const sanitized = sanitizeLogContent("MY_SECRET=mysecretvalue");
-            expect(sanitized).toBe("MY_SECRET=<REDACTED:my_secret>");
+            expect(sanitized).toBe("MY_SECRET=<REDACTED:secret>");
         });
 
         it("redacts QUX_PASSWORD=value", () => {
             const sanitized = sanitizeLogContent("DB_PASSWORD=hunter2");
-            expect(sanitized).toBe("DB_PASSWORD=<REDACTED:db_password>");
+            expect(sanitized).toBe("DB_PASSWORD=<REDACTED:password>");
         });
 
         it("redacts COMPOUND_CREDENTIAL=value", () => {
@@ -175,7 +176,7 @@ describe("sanitizeLogContent — secret token redaction (council finding #9)", (
 
         it("redacts PRIVATE_KEY assignments", () => {
             const sanitized = sanitizeLogContent("MY_PRIVATE_KEY=mykey-data");
-            expect(sanitized).toBe("MY_PRIVATE_KEY=<REDACTED:my_private_key>");
+            expect(sanitized).toBe("MY_PRIVATE_KEY=<REDACTED:private_key>");
         });
 
         it("does NOT redact non-secret env vars", () => {
@@ -394,7 +395,7 @@ describe("bundleIssueReport secret redaction", () => {
 
             expect(body).toContain('"api_key": "<REDACTED:api_key>"');
             expect(body).toContain('"Authorization": "<REDACTED:authorization>"');
-            expect(body).toContain('"X-Api-Key": "<REDACTED:x-api-key>"');
+            expect(body).toContain('"X-Api-Key": "<REDACTED:x_api_key>"');
             expect(body).not.toContain("emb-secret-value");
             expect(body).not.toContain("historian-secret-value");
             expect(body).not.toContain("header-secret-value");

@@ -30,7 +30,14 @@ cortexkit-lease = { workspace = true }
 async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
-regex = "1"
+# Provider context-overflow error patterns (scheduler unit). Plain regex (no
+# lookarounds in those patterns); fancy-regex stays confined to mc-tokenizer.
+regex = { workspace = true }
+# Prepared matchers for caveman.rs phrase scanning; both are transitive deps
+# of `regex` already, so they add no new supply-chain root.
+aho-corasick = "1"
+memchr = "2"
+# `signal` enables the `ck-mc-host serve` SIGTERM handler.
 tokio = { workspace = true, features = ["signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = { workspace = true }
@@ -43,8 +50,21 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # `drive-fault` must remain outside the default feature set.
 drive-fault = []
 direct-host-fixture = []
+bench-internals = []
+
+[[bench]]
+name = "hot_path"
+path = "benches/hot_path.rs"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "kernels"
+harness = false
 
 [dev-dependencies]
+criterion = "=0.8.2"
+proptest = "1"
 chrono-tz = "0.10"
 tokio = { workspace = true, features = ["signal"] }
 # `mc-store` enables `test-support` only in dev-dependencies, so production builds exclude the feature.

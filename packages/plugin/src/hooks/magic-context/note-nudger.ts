@@ -37,7 +37,7 @@ function getPersistedNoteNudgeDeliveredAt(_db: unknown, sessionId: string): numb
     return lastDeliveredAt.get(sessionId) ?? 0;
 }
 
-export function recordNoteNudgeDeliveryTime(sessionId: string): void {
+function recordNoteNudgeDeliveryTime(sessionId: string): void {
     lastDeliveredAt.set(sessionId, Date.now());
 }
 
@@ -231,7 +231,7 @@ export function clearNoteNudgeState(
     lastDeliveredAt.delete(sessionId); // also reset in-memory cooldown
 }
 
-export function clearAllNoteNudgeState(db: Database, sessionId: string): void {
+function clearAllNoteNudgeState(db: Database, sessionId: string): void {
     db.transaction(() => {
         db.prepare(
             `UPDATE session_meta

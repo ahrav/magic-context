@@ -7,6 +7,7 @@ import {
     findBusts,
     isInternalAgentRequest,
     mainAgentRequests,
+    isHistorianRequest,
 } from "./cache-analysis";
 import { MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES } from "../../plugin/src/hooks/magic-context/internal-agent-signatures";
 import { HISTORIAN_SYSTEM_MARKER_FOR_DRIFT_TEST } from "./incident-pool/support/tool-loop";
@@ -285,5 +286,50 @@ describe("cache-bust oracle", () => {
                 expect(segs[segs.length - 1].breakpoint).toBe(true);
             });
         });
+    });
+});
+
+describe("isHistorianRequest", () => {
+    // Derived from the production classifier so the fixture cannot drift
+    // from the opener the historian actually sends.
+    const marker = MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES.find((signature) =>
+        signature.includes("hippocampus"),
+    );
+    if (!marker) throw new Error("historian signature missing from production classifier");
+
+    it("detects the marker in a string system prompt", () => {
+        expect(isHistorianRequest({ system: `${marker} rest of prompt` })).toBe(true);
+    });
+
+    it("detects the marker in a system block array", () => {
+        expect(isHistorianRequest({ system: [{ type: "text", text: marker }] })).toBe(true);
+    });
+
+    it("detects a historian chunk envelope carried only in messages", () => {
+        // Union semantics: some historian requests carry the marker only in
+        // the messages payload; a system-only predicate calls them main-agent.
+        expect(
+            isHistorianRequest({
+                system: "unrelated",
+                messages: [{ role: "user", content: "<new_messages>…</new_messages>" }],
+            }),
+        ).toBe(true);
+    });
+
+    it("detects the marker in a non-array system object", () => {
+        expect(isHistorianRequest({ system: { type: "text", text: marker } })).toBe(true);
+    });
+
+    it("treats an absent system prompt as not historian", () => {
+        expect(isHistorianRequest({ messages: [{ role: "user", content: "hi" }] })).toBe(false);
+    });
+
+    it("classifies an ordinary main-agent request as not historian", () => {
+        expect(
+            isHistorianRequest({
+                system: "You are a helpful coding assistant",
+                messages: [{ role: "user", content: "hello" }],
+            }),
+        ).toBe(false);
     });
 });

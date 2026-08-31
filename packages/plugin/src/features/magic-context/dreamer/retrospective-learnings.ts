@@ -30,8 +30,6 @@ export type ParsedRetrospectiveLearning =
     | { route: "observation"; content: string }
     | { route: "anti_memory"; payload: AntiMemoryPayload };
 
-export type RetrospectiveLearningRoute = ParsedRetrospectiveLearning["route"];
-
 export interface RetrospectiveApplyResult {
     memoryWritten: number;
     observationsInserted: number;

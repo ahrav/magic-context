@@ -9,6 +9,7 @@ import {
     redactSecretText,
     sanitizePathStringPortable,
 } from "../../src/shared/redaction";
+import { escapeRegex } from "../../src/shared/redaction";
 
 export const PRIVACY_POLICY_VERSION = "privacy-policy/v1";
 export const SANITIZER_VERSION = "sanitizer/v1";
@@ -195,9 +196,6 @@ function scanValue(
     }
 }
 
-function escapeRegex(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 /**
  * */

@@ -6,6 +6,11 @@ import {
     SCENARIO_SCHEMA,
     assertReleaseSuccession,
     assertTombstonesRetired,
+    authoredEvidenceText,
+    compactedEvidenceMessages,
+    containsCompleteValue,
+    countCompleteValues,
+    normalizedEvidenceMessages,
     parseReleaseLineage,
     MAX_EXPECTATION_ENTRIES,
     MAX_PROBE_CHOICES,
@@ -886,73 +891,53 @@ describe("lintScenario", () => {
         );
     });
 
-    test("rejects a probe gold answer the harness's own ballast emits", () => {
+    // Each row swaps in one gold answer for the FIRST probe (probe-capacity,
+    // which runs before any prompt suffix has rendered) and checks whether the
+    // harness-owned-text lint rejects it. Rejected rows prove the surface covers
+    // a given harness text source; accepted rows pin the deliberate holes.
+    test.each([
+        // "boundary" is in `ballastProse`'s word bank, so every filler, authored,
+        // padding, and spike turn states it. The post-epilogue padding sits in the
+        // protected tail, which is never compartment-covered and so never spliced
+        // out — the probe model can read the answer off raw history and PASS with
+        // the injected payload contributing nothing. Both runtime gates are scoped
+        // to the authored gold range and cannot see it.
+        ["rejects a probe gold answer the harness's own ballast emits", "boundary", true],
+        // Not only ballast: the runner's padding turns say "Housekeeping
+        // acknowledged." verbatim, and those turns are the protected tail.
+        ["rejects a probe gold answer the harness's own turn text states", "housekeeping", true],
+        // The runner numbers every padding turn — `Wrap-up housekeeping note 3.` —
+        // and those turns are the protected tail. A bare "3" is therefore stated in
+        // raw history the probe can read, and a surface that rendered index 1 alone
+        // would not see it.
+        ["rejects a probe gold answer that collides with a generated padding index", "3", true],
+        // The canonical recipe needs ten padding turns, so the last one says
+        // "Wrap-up housekeeping note 10." A surface built from a fixed sample of
+        // indices rather than from `paddingTurnCount()`'s own arithmetic would stop
+        // short and miss it. Run indices are rendered the same way ("step 1",
+        // "step 2"), but the canonical recipe's two runs fall inside the padding
+        // range, so no value separates the two sources here.
+        ["the generated-index surface spans every padding turn the runner sends", "10", true],
+        // `buildProbePrompt` writes "Question: <authored question>", so a gold answer of
+        // "question" is supplied by the very prompt being answered. The label was the one
+        // piece of the wrapper still written as a literal rather than a linted constant.
+        ["rejects a probe gold answer the prompt's question label states", "question", true],
+        // probe-capacity runs FIRST, so no `Choose exactly one of:` has been sent when it
+        // is asked and "choose" is in nothing its history carries. Refusing here would
+        // keep a valid scenario out of the corpus on text the session never held.
+        ["an exact probe is not rejected for a suffix no EARLIER prompt rendered", "choose", false],
+        // "memory" is in the shared boilerplate every probe's prompt carries, so the
+        // per-probe-type surface split must not narrow it out.
+        ["shared prompt wording is still checked for every probe type", "memory", true],
+        // The bank emits "session", never "sessio". Bare containment would refuse a
+        // legitimate answer here; the check matches complete values.
+        ["a gold answer merely contained in a harness word is not a collision", "sessio", false],
+    ] as Array<[string, string, boolean]>)("%s", (_title, goldAnswer, rejected) => {
         const raw = validScenarioRaw();
-        // `ballastProse` includes "boundary", so every filler, authored, padding, and spike turn states it.
-        // The protected tail is never compartment-covered, so it is never spliced into the authored gold range.
-        // The probe model can read the answer from raw history and pass without the injected payload.
-        // The runtime gates inspect only the authored gold range, not the protected tail.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "boundary";
+        (raw.probes as Record<string, unknown>[])[0].goldAnswer = goldAnswer;
         const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
-    test("rejects a probe gold answer the harness's own turn text states", () => {
-        const raw = validScenarioRaw();
-        // The runner's padding turns state `Housekeeping acknowledged.` verbatim, and those turns are the protected tail.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "housekeeping";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
-    test("rejects a probe gold answer that collides with a generated padding index", () => {
-        const raw = validScenarioRaw();
-        // The runner numbers every padding turn, placing each index in the protected tail.
-        // `Wrap-up housekeeping note 3.` places a bare `3` in the protected tail.
-        // The probe can read `3` from raw history, but a surface that renders only index 1 cannot see it.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "3";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
-    test("the generated-index surface spans every padding turn the runner sends", () => {
-        const raw = validScenarioRaw();
-        // The canonical recipe needs ten padding turns, so the last says `Wrap-up housekeeping note 10.`
-        // A fixed sample of indices can omit `Wrap-up housekeeping note 10.`
-        // The surface must derive indices from `paddingTurnCount()` to include every padding turn.
-        // The canonical recipe's two run indices fall within the padding-index range.
-        // No index value distinguishes padding turns from run indices in the canonical recipe.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "10";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
-    test("rejects a probe gold answer the prompt's question label states", () => {
-        const raw = validScenarioRaw();
-        // `Question:` is a literal outside the linted constants.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "question";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
-    test("an exact probe is not rejected for a suffix no EARLIER prompt rendered", () => {
-        const raw = validScenarioRaw();
-        // The capacity probe runs first, before any `Choose exactly one of:` text is sent.
-        // `choose` is absent from the capacity probe's history.
-        // Rejecting `choose` would exclude a valid scenario even though the session never receives that text.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "choose";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).not.toContain(
+        const expectation = expect(diagnostics);
+        (rejected ? expectation : expectation.not).toContain(
             "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
         );
     });
@@ -1007,17 +992,6 @@ describe("lintScenario", () => {
         );
     });
 
-    test("shared prompt wording is still checked for every probe type", () => {
-        const raw = validScenarioRaw();
-        // `memory` occurs in the shared boilerplate in every probe prompt.
-        // The probe-prompt surface must retain the `memory` check.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "memory";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
-    });
-
     test("an oversized probe question is a named diagnostic, not a regex blow-up", () => {
         const raw = validScenarioRaw();
         (raw.probes as Record<string, unknown>[])[0].question = "x".repeat(20_001);
@@ -1030,17 +1004,6 @@ describe("lintScenario", () => {
         // The parser rejects oversized answers before all-pairs scanning.
         (raw.probes as Record<string, unknown>[])[0].goldAnswer = "y".repeat(2_001);
         expect(() => parseScenario(raw)).toThrow(/goldAnswer: above-operational-maximum/);
-    });
-
-    test("a gold answer merely contained in a harness word is not a collision", () => {
-        const raw = validScenarioRaw();
-        // The bank emits `session`, not `sessio`; bare containment would reject `sessio`.
-        // Complete-value matching permits `sessio`, a legitimate answer.
-        (raw.probes as Record<string, unknown>[])[0].goldAnswer = "sessio";
-        const diagnostics = lintScenario(parseScenario(raw));
-        expect(diagnostics).not.toContain(
-            "hse-auth-rejected-redis.probes.probe-capacity.goldAnswer: occurs-in-harness-owned-text",
-        );
     });
 
     test("rejects a probe gold answer absent from its claim's source range", () => {
@@ -1168,6 +1131,104 @@ describe("predicate matching", () => {
             predicateMatches({ kind: "normalized-substring", value: "In-Process   LRU" }, "the in-process lru cache"),
         ).toBe(true);
         expect(predicateMatches({ kind: "normalized-substring", value: "redis" }, "no cache named")).toBe(false);
+    });
+});
+
+describe("complete-value counting", () => {
+    test("counts occurrences by starting position, including overlaps", () => {
+        // A consuming global match reports one here, which would let a caller
+        // comparing counts across a perturbation miss the loss of an occurrence.
+        expect(countCompleteValues("blue blue blue", "blue blue")).toBe(2);
+        expect(countCompleteValues("blue blue blue", "blue")).toBe(3);
+        expect(countCompleteValues("4096 entries", "4")).toBe(0);
+        expect(countCompleteValues("", "blue")).toBe(0);
+        expect(containsCompleteValue("blue blue blue", "blue blue")).toBe(true);
+    });
+
+    test("boundaries are code points, not code units", () => {
+        // A single `charAt` on an astral letter returns one surrogate half, which is
+        // not a letter under the boundary rule, so the match would have looked clean.
+        expect(containsCompleteValue("\u{10400}foo", "foo")).toBe(false);
+        expect(containsCompleteValue("foo\u{10400}", "foo")).toBe(false);
+        expect(countCompleteValues("\u{10400}foo foo", "foo")).toBe(1);
+        expect(containsCompleteValue("a foo b", "foo")).toBe(true);
+    });
+
+    test("stays linear against a repetitive haystack", () => {
+        // A regex advanced one character at a time re-derives every overlapping
+        // match, which turned a long answer against a megabyte of repetition into
+        // seconds. Both sizes are inside the contract's own limits.
+        const haystack = "a ".repeat(500_000);
+        const needle = "a ".repeat(1_000).trim();
+        const start = performance.now();
+        expect(countCompleteValues(haystack, needle)).toBeGreaterThan(0);
+        expect(containsCompleteValue(haystack, needle)).toBe(true);
+        expect(performance.now() - start).toBeLessThan(900);
+    });
+});
+
+describe("compacted evidence view", () => {
+    test("two spellings of one commit hash reach the historian identically", () => {
+        const turn = (hash: string) => ({
+            user: "Status check.",
+            assistant: `Committed ${hash} for the record.`,
+        });
+        const [upper] = compactedEvidenceMessages([turn("ABCDEF1")]).slice(-1);
+        const [lower] = compactedEvidenceMessages([turn("abcdef1")]).slice(-1);
+        expect(upper!.text).toBe(lower!.text);
+        // Ordinary identifier case is still significant.
+        expect(compactedEvidenceMessages([{ user: "MyFile.ts here.", assistant: "ok" }])[0]!.text)
+            .not.toBe(
+                compactedEvidenceMessages([{ user: "myfile.ts here.", assistant: "ok" }])[0]!.text,
+            );
+    });
+});
+
+describe("authored evidence views", () => {
+    test("the normalized messages join back to the evidence text a predicate is matched against", () => {
+        const scenario = validScenario();
+        const messages = normalizedEvidenceMessages(scenario.transcript.turns);
+        expect(messages.map((message) => message.text).join(" ")).toBe(
+            normalizeContent(authoredEvidenceText(scenario.transcript.turns)),
+        );
+    });
+
+    test("a match no single message contains is spanned by both of its messages", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0] = { user: "Should we keep the legacy", assistant: "bridge alive for now?" };
+        const scenario = parseScenario(raw);
+        const predicate = { kind: "normalized-substring", value: "legacy bridge" } as const;
+
+        expect(predicateMatches(predicate, authoredEvidenceText(scenario.transcript.turns))).toBe(true);
+        expect(predicateMatches(predicate, turns[0]!.user)).toBe(false);
+        expect(predicateMatches(predicate, turns[0]!.assistant)).toBe(false);
+
+        const messages = normalizedEvidenceMessages(scenario.transcript.turns);
+        const evidence = messages.map((message) => message.text).join(" ");
+        const at = evidence.indexOf(normalizeContent(predicate.value));
+        let offset = 0;
+        const spanned = messages.flatMap((message) => {
+            const start = offset;
+            offset += message.text.length + 1;
+            return start < at + predicate.value.length && at < start + message.text.length
+                ? [`${message.turnIndex}:${message.role}`]
+                : [];
+        });
+        expect(spanned).toEqual(["0:user", "0:assistant"]);
+    });
+
+    test("messages production discards carry no evidence", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[3]!.user = "<system-reminder>internal directive</system-reminder>";
+        const scenario = parseScenario(raw);
+
+        expect(
+            normalizedEvidenceMessages(scenario.transcript.turns).some(
+                (message) => message.turnIndex === 3 && message.role === "user",
+            ),
+        ).toBe(false);
     });
 });
 

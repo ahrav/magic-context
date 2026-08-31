@@ -19,18 +19,9 @@ pub const CLASSIFY_TEMPERATURE: f64 = 0.1;
 pub const CLASSIFY_MAX_OUTPUT_TOKENS: u32 = 32_000;
 pub const CLASSIFY_AWAIT_TIMEOUT: Duration = Duration::from_secs(600);
 pub const CLASSIFY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
-/// Callers must reserve `CLASSIFY_CLEANUP_RESERVE` beyond `timeout_ms` for post-deadline cleanup.
-///
-/// The payload deadline covers provider start, await, and re-drain; cleanup continues after it.
-/// Callers must reserve 40 seconds beyond `timeout_ms` for purge, subprocess reaping, ledger writes, and response dispatch.
-/// A transport timeout equal to `timeout_ms` can cancel the handler during post-deadline cleanup.
-/// Cancellation during cleanup can drop the handler before it purges the producer session.
-/// Cancellation before purge prevents recording the attempt and completing fallback.
-/// Cancellation before purge can leave a billable provider run alive with the memory-pool prompt.
-pub const CLASSIFY_CLEANUP_RESERVE: Duration = Duration::from_secs(40);
-
-/// The system role exposes no tools.
-/// The host retains the parser because accepting a caller-selected role would reopen the producer trust boundary.
+/// This is deliberately a zero-tool system role. The host supplies the pool and
+/// retains the parser because accepting a caller-selected role would reopen the
+/// producer trust boundary.
 pub const CLASSIFY_SYSTEM_PROMPT: &str = r#"You are a memory classifier for the magic-context system. You classify project memories by metadata only. You do NOT rewrite, merge, archive, verify, or create memories, and you do NOT read code — you judge each memory from its own text.
 
 ### How to score importance (1-100)

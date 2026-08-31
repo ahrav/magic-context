@@ -126,24 +126,9 @@ export function setRecompStarting(
     });
 }
 
-/**
- * */
-export function setRecompNote(
-    liveSessionState: LiveSessionState,
-    sessionId: string,
-    note: string,
-): void {
-    const cur = liveSessionState.recompProgressBySession.get(sessionId);
-    if (!cur || cur.phase === "done" || cur.phase === "failed") return;
-    liveSessionState.recompProgressBySession.set(sessionId, {
-        ...cur,
-        note,
-        updatedAt: Date.now(),
-    });
-}
-
-/**
- * */
+/** Record a terminal recomp/upgrade phase ("done"/"failed") so the TUI shows the
+ *  OUTCOME (not a missed toast). "done" auto-clears after a grace period; "failed"
+ *  persists until the next run so the reason stays visible. */
 export function setRecompTerminal(
     liveSessionState: LiveSessionState,
     sessionId: string,

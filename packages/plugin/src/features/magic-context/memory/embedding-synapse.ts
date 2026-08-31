@@ -5,7 +5,8 @@ import { log } from "../../../shared/logger";
 import {
     DAEMON_GENERATION_CHANGED_CODE,
     isMcHostCallError,
-    McHostClient,
+    processMcHostClient,
+    resetProcessMcHostClientsForTest,
 } from "../../../shared/mc-host-client";
 import {
     type ConnectionOrigin,
@@ -526,11 +527,10 @@ function extractBatchItems(value: unknown): Array<Record<string, unknown>> {
     });
 }
 
+const factoryClients = new WeakMap<() => Promise<SynapseClientLike>, Promise<SynapseClientLike>>();
 let sharedClient: SynapseClientLike | null = null;
 let sharedClientFile: string | null = null;
 let sharedClientPromise: Promise<SynapseClientLike> | null = null;
-
-const factoryClients = new WeakMap<() => Promise<SynapseClientLike>, Promise<SynapseClientLike>>();
 
 async function getSharedClient(
     options: SynapseEmbeddingProviderOptions,
@@ -551,29 +551,23 @@ async function getSharedClient(
         return promise;
     }
     const file = options.connectionFile ?? defaultConnectionFile();
-    if (sharedClient && sharedClientFile === file) return sharedClient;
-    if (sharedClientPromise && sharedClientFile === file) return sharedClientPromise;
-    const promise = McHostClient.connect({
+    const promise = processMcHostClient({
         connectionFile: file,
         handshakeTimeoutMs: SYNAPSE_HANDSHAKE_TIMEOUT_MS,
-    }).then((client) => {
-        if (sharedClientPromise === promise && sharedClientFile === file) {
-            sharedClient = client;
-        } else {
-            // A connect for a different connection file can supersede this attempt while it is in flight; the orphan must close rather than replace the newer cache entry.
-            client.close();
-        }
-        return client;
-    });
-    promise.catch(() => {
-        // The rejection handler removes the cached promise only if the cache still references that rejected promise.
-        if (sharedClientPromise === promise) {
-            sharedClientPromise = null;
-            sharedClientFile = null;
-        }
     });
     sharedClientFile = file;
     sharedClientPromise = promise;
+    void promise.then(
+        (client) => {
+            if (sharedClientPromise === promise) sharedClient = client;
+        },
+        () => {
+            if (sharedClientPromise !== promise) return;
+            sharedClient = null;
+            sharedClientFile = null;
+            sharedClientPromise = null;
+        },
+    );
     return promise;
 }
 
@@ -1898,7 +1892,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 }
 
 export function _resetSynapseClientForTests(): void {
-    sharedClient?.close();
+    resetProcessMcHostClientsForTest();
     sharedClient = null;
     sharedClientFile = null;
     sharedClientPromise = null;

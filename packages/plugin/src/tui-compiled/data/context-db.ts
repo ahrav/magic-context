@@ -2,8 +2,7 @@
  * The TUI accesses data through RPC and never accesses SQLite directly.
  * The TUI fetches all data from the server plugin through HTTP RPC.
  */
-import os from "node:os";
-import path from "node:path";
+import { getMagicContextStorageDir } from "../../shared/data-path";
 import { MagicContextRpcClient } from "../../shared/rpc-client";
 import type { EmbedDetail, SidebarSnapshot, StatusDetail } from "../../shared/rpc-types";
 
@@ -12,19 +11,12 @@ export type { EmbedDetail, SidebarSnapshot, StatusDetail };
 let rpcClient: MagicContextRpcClient | null = null;
 let rpcGeneration = 0;
 
-function getStorageDir(): string {
-    // OpenCode and Pi share state through `cortexkit/magic-context`.
-    // The TUI must use the server plugin's storage directory for lock-file discovery.
-    // discovery convention.
-    const dataDir = process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share");
-    return path.join(dataDir, "cortexkit", "magic-context");
-}
-
-/** The TUI must call initRpcClient once at startup. */
+/** Initialize the RPC client. Call once on TUI startup. */
 export function initRpcClient(directory: string): void {
-    const storageDir = getStorageDir();
-    // initRpcClient increments rpcGeneration before replacing rpcClient so the WebSocket socket ignores callbacks from the disposed client.
-    // The WebSocket socket abandons an in-flight connection when rpcGeneration changes.
+    const storageDir = getMagicContextStorageDir();
+    // Bump the generation before replacing the client so late notification
+    // responses from a disposed client are ignored (the WS socket observes the
+    // new generation and abandons its in-flight connect).
     rpcGeneration += 1;
     rpcClient = new MagicContextRpcClient(storageDir, directory);
 }

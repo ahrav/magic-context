@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
-# docs/perf/mc-host-baseline.md defines the baseline arms;
-# docs/perf/mc-host-ipc-budget.md defines the budget-* operations.
-# Usage: perf-mc-host.sh <outdir> <arm> [args...]
-#   arms: ceiling <conns> <rep> | open <conns> <rate> | large <payload>
-#         slowreader | greedy | starvation | strace | perfrec
+# docs/perf/mc-host-ipc-budget.md defines the budget and shared-memory operations.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/target/release/examples"
 
 BUDGET_BENCH=""
 BUDGET_CHILD=""
@@ -50,20 +45,13 @@ shm_build() {
 
 shm_run() {
   local out="${1:?outdir}" mode="${2:?mode}" args=()
-  local manifest="$ROOT/crates/mc-shm-transport/benches/manifests/v1.json"
-  if [[ "$mode" == "shm-smoke" ]]; then
-    args+=(--smoke)
-  else
-    [[ "${MC_SHM_DESIGNATED_HOST:-}" == "1" ]] || {
-      echo "shm-evidence requires MC_SHM_DESIGNATED_HOST=1" >&2
-      exit 1
-    }
-    if grep -q 'UNSET' "$manifest"; then
-      echo "shm-evidence refused: designated-host manifest fields remain UNSET" >&2
-      exit 1
-    fi
-    args+=(--designated-host)
-  fi
+  # The fixed-ring harness rejects --designated-host outright, so smoke is the
+  # only campaign it can produce.
+  [[ "$mode" == "shm-smoke" ]] || {
+    echo "unsupported shared-memory mode: $mode (expected shm-smoke)" >&2
+    exit 1
+  }
+  args+=(--smoke)
   mkdir -p "$out"
   local evidence="$out/hardware-envelope-${mode#shm-}.json"
   [[ ! -e "$evidence" ]] || {
@@ -72,8 +60,15 @@ shm_run() {
   }
   shm_build
   "$SHM_BENCH" "${args[@]}" >"$evidence"
-  grep -q '"verdict": "INCONCLUSIVE"' "$evidence" || {
-    echo "shared-memory harness did not retain structured INCONCLUSIVE output" >&2
+  # Assert on fields the fixed-ring report actually emits. The previous guard
+  # required a "verdict" key the harness no longer writes, so every run failed
+  # after producing valid evidence.
+  grep -q '"campaign": "smoke"' "$evidence" || {
+    echo "shared-memory harness did not retain smoke campaign output" >&2
+    exit 1
+  }
+  grep -q '"state": "complete"' "$evidence" || {
+    echo "shared-memory harness did not retain complete measurement state" >&2
     exit 1
   }
   cat "$evidence"
@@ -138,14 +133,14 @@ budget_collect() {
 budget_block() {
   local block="$1"
   shift
-  local arms=(atomic-floor tcp-serial tcp-open tcp-throughput)
+  local arms=(atomic-floor ring-serial ring-open ring-throughput)
   if (((block - 1) % 2 == 1)); then
-    arms=(tcp-throughput tcp-open tcp-serial atomic-floor)
+    arms=(ring-throughput ring-open ring-serial atomic-floor)
   fi
   for arm in "${arms[@]}"; do
-    if [[ "$arm" == tcp-open ]]; then
+    if [[ "$arm" == ring-open ]]; then
       for rate in $BUDGET_RATES; do
-        budget_collect tcp-open same-l3 "$block" "$@" "MC_IPC_BUDGET_RATE=$rate"
+        budget_collect ring-open same-l3 "$block" "$@" "MC_IPC_BUDGET_RATE=$rate"
       done
     else
       budget_collect "$arm" same-l3 "$block" "$@"
@@ -155,9 +150,9 @@ budget_block() {
   # finalizes a structured skip without failing the block. Their order
   # Their order reverses on even blocks exactly like the same-L3 arms.
   # too.
-  local cross=(atomic-floor tcp-serial)
+  local cross=(atomic-floor ring-serial)
   if (((block - 1) % 2 == 1)); then
-    cross=(tcp-serial atomic-floor)
+    cross=(ring-serial atomic-floor)
   fi
   for arm in "${cross[@]}"; do
     BUDGET_PAIR="${BUDGET_CROSS_PAIR:-}" budget_collect "$arm" cross-numa "$block" "$@"
@@ -205,7 +200,7 @@ budget-preflight)
   budget_trap
   budget_collect atomic-floor same-l3 1 \
     MC_IPC_BUDGET_WARMUP_BATCHES=2 MC_IPC_BUDGET_BATCHES=5 MC_IPC_BUDGET_EXCHANGES=1000
-  budget_collect tcp-serial same-l3 1 \
+  budget_collect ring-serial same-l3 1 \
     MC_IPC_BUDGET_WARMUP_OPS=200 MC_IPC_BUDGET_MEASURED_OPS=1000
   if [[ -n "${BUDGET_CROSS_PAIR:-}" ]]; then
     # An explicit cross pair must fail preflight, not the final run: an
@@ -220,7 +215,7 @@ budget-preflight)
 esac
 
 case "${2:-}" in
-shm-smoke | shm-evidence)
+shm-smoke)
   shm_run "${1:?outdir}" "$2"
   exit 0
   ;;
@@ -258,151 +253,5 @@ budget-summarize)
   ;;
 esac
 
-OUT="${1:?outdir}"
-ARM="${2:?arm}"
-shift 2
-mkdir -p "$OUT"
-
-HOST_PID=""
-DATA=""
-PUB=""
-
-start_host() {
-  DATA=$(mktemp -d)
-  local log="$OUT/host-$ARM$LABEL_SUFFIX.log"
-  local host_args=("$DATA")
-  [[ -n "${FRAME_DEADLINE:-}" ]] && host_args+=("$FRAME_DEADLINE")
-  if [[ "${HOST_WRAP:-}" == "strace" ]]; then
-    strace -f -c -o "$OUT/strace-$ARM$LABEL_SUFFIX.txt" \
-      "$BIN/perf_host" "${host_args[@]}" >"$log" 2>&1 &
-  else
-    "$BIN/perf_host" "${host_args[@]}" >"$log" 2>&1 &
-  fi
-  HOST_PID=$!
-  for _ in $(seq 200); do
-    grep -q READY "$log" 2>/dev/null && break
-    sleep 0.1
-  done
-  PUB=$(awk '/READY/{print $2; exit}' "$log")
-  [[ -n "$PUB" ]] || {
-    echo "host failed to publish"
-    cat "$log"
-    exit 1
-  }
-}
-
-stop_host() {
-  kill -INT "$HOST_PID" 2>/dev/null || true
-  wait "$HOST_PID" 2>/dev/null || true
-  rm -rf "$DATA"
-  # Clearing HOST_PID prevents the EXIT trap from signaling a PID the OS may reassign before the script exits.
-  HOST_PID=""
-  DATA=""
-}
-
-load() {
-  "$BIN/perf_load" "$PUB" --workload "${PERF_WORKLOAD:-raw}" "$@" | tee -a "$OUT/results.txt"
-}
-
-load_tolerant() {
-  # Record a nonzero pipeline exit status without aborting.
-  local rc=0
-  "$BIN/perf_load" "$PUB" --workload "${PERF_WORKLOAD:-raw}" "$@" | tee -a "$OUT/results.txt" || rc=$?
-  if [[ $rc -ne 0 ]]; then
-    echo "LOAD_EXIT status=$rc" | tee -a "$OUT/results.txt"
-  fi
-}
-
-cleanup_host() {
-  if [[ -n "${HOST_PID:-}" ]]; then
-    kill -INT "$HOST_PID" 2>/dev/null || true
-    wait "$HOST_PID" 2>/dev/null || true
-  fi
-  if [[ -n "${DATA:-}" && -d "${DATA:-}" ]]; then
-    rm -rf "$DATA"
-  fi
-}
-trap cleanup_host EXIT
-
-LABEL_SUFFIX=""
-case "$ARM" in
-ceiling)
-  CONNS="${1:?conns}"
-  REP="${2:?rep}"
-  LABEL_SUFFIX="-c$CONNS-r$REP"
-  start_host
-  load --label "A1-ceiling-c$CONNS-r$REP" --conns "$CONNS" --payload 256 --pipeline 32 --secs 15
-  stop_host
-  ;;
-open)
-  CONNS="${1:?conns}"
-  RATE="${2:?rate}"
-  LABEL_SUFFIX="-c$CONNS-rate$RATE"
-  start_host
-  load --label "A1-open-c$CONNS-rate$RATE" --conns "$CONNS" --payload 256 --rate "$RATE" --secs 20
-  stop_host
-  ;;
-large)
-  PAYLOAD="${1:?payload}"
-  LABEL_SUFFIX="-p$PAYLOAD"
-  start_host
-  load --label "A2-large-p$PAYLOAD" --conns 4 --payload "$PAYLOAD" --pipeline 4 --secs 15
-  stop_host
-  ;;
-slowreader)
-  start_host
-  load_tolerant --label A3-stall --stall-big 2 --payload 33554432 --secs 40 &
-  STALL_PID=$!
-  sleep 2
-  load_tolerant --label A3-victims --conns 8 --payload 256 --rate 2000 --secs 30
-  wait "$STALL_PID" || true
-  stop_host
-  ;;
-greedy)
-  start_host
-  load_tolerant --label A4-greedy --conns 1 --payload 256 --pipeline 512 --secs 25 &
-  GREEDY_PID=$!
-  sleep 2
-  load_tolerant --label A4-victims --conns 8 --payload 256 --rate 800 --secs 20
-  wait "$GREEDY_PID" || true
-  stop_host
-  ;;
-starvation)
-  start_host
-  load_tolerant --label A5-hogs --conns 3 --payload 8388608 --sleep-ms 2000 --pipeline 8 --secs 25 &
-  HOG_PID=$!
-  sleep 2
-  load_tolerant --label A5-victims --conns 2 --payload 256 --rate 400 --secs 20
-  wait "$HOG_PID" || true
-  load --label A5-recovery --conns 2 --payload 256 --rate 400 --secs 10
-  stop_host
-  ;;
-strace)
-  HOST_WRAP=strace
-  start_host
-  load --label ATTR-strace --conns 8 --payload 256 --pipeline 16 --secs 10
-  pkill -INT -x perf_host || true
-  wait "$HOST_PID" 2>/dev/null || true
-  rm -rf "$DATA"
-  HOST_PID=""
-  ;;
-perfrec)
-  start_host
-  load --label ATTR-perf-warm --conns 8 --payload 256 --pipeline 32 --secs 3 >/dev/null
-  perf record -e cycles:u -F 397 -g --call-graph fp -p "$HOST_PID" \
-    -o "$OUT/perf-small.data" -- sleep 12 &
-  PERF_PID=$!
-  load --label ATTR-perf-small --conns 8 --payload 256 --pipeline 32 --secs 12
-  wait "$PERF_PID" || true
-  perf record -e cycles:u -F 397 -g --call-graph fp -p "$HOST_PID" \
-    -o "$OUT/perf-large.data" -- sleep 12 &
-  PERF_PID=$!
-  load --label ATTR-perf-large --conns 4 --payload 1048576 --pipeline 4 --secs 12
-  wait "$PERF_PID" || true
-  stop_host
-  ;;
-*)
-  echo "unknown arm $ARM"
-  exit 1
-  ;;
-esac
+echo "unknown operation: ${2:-${1:-}}" >&2
+exit 1

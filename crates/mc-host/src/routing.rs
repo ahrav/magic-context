@@ -446,15 +446,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn generation(id: u64) -> Arc<GenerationCore> {
-        let (writer, _task) = crate::tcp_frame_channel::spawn_writer(
-            tokio::io::duplex(1024).0,
-            8,
-            CancellationToken::new(),
-            std::time::Duration::from_secs(5),
-        );
+        let token = CancellationToken::new();
+        let (writer, _queue) =
+            crate::frame_channel::frame_sender(8, token.clone(), std::time::Duration::from_secs(5));
         Arc::new(GenerationCore {
             id,
-            token: CancellationToken::new(),
+            token,
             read_cancel: CancellationToken::new(),
             read_tasks: tokio_util::task::TaskTracker::new(),
             shutdown_complete: CancellationToken::new(),
@@ -464,7 +461,6 @@ mod tests {
             pings: Mutex::new(HashMap::new()),
             busy_rejects: Arc::new(tokio::sync::Semaphore::new(4)),
             next_ping_corr: AtomicU64::new(1),
-            liveness: Mutex::new(None),
         })
     }
 

@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
@@ -11,36 +11,17 @@ import {
     peekDeferredExecutePending,
     setDeferredExecutePendingIfAbsent,
 } from "./storage-meta-persisted";
+import { createDirectTestDatabase } from "./test-database";
 
+/** First handle composes the full runtime schema on disk (WAL included);
+ *  the second must open plain because composeRegisteredSchema refuses a
+ *  non-empty database — giving two connections racing over one file, like
+ *  two production processes sharing one database. */
 function createRaceDb(path: string): Database {
+    if (!existsSync(path)) return createDirectTestDatabase({ path }).db;
     const db = new Database(path);
     db.exec("PRAGMA journal_mode=WAL");
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS session_meta (
-            session_id TEXT PRIMARY KEY,
-            harness TEXT NOT NULL DEFAULT 'opencode',
-            last_response_time INTEGER NOT NULL DEFAULT 0,
-            cache_ttl TEXT NOT NULL DEFAULT '5m',
-            counter INTEGER NOT NULL DEFAULT 0,
-            last_nudge_tokens INTEGER NOT NULL DEFAULT 0,
-            last_nudge_band TEXT NOT NULL DEFAULT '',
-            last_transform_error TEXT NOT NULL DEFAULT '',
-            is_subagent INTEGER NOT NULL DEFAULT 0,
-            last_context_percentage REAL NOT NULL DEFAULT 0,
-            last_input_tokens INTEGER NOT NULL DEFAULT 0,
-            observed_safe_input_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_alert_sent INTEGER NOT NULL DEFAULT 0,
-            times_execute_threshold_reached INTEGER NOT NULL DEFAULT 0,
-            compartment_in_progress INTEGER NOT NULL DEFAULT 0,
-            system_prompt_hash TEXT NOT NULL DEFAULT '',
-            system_prompt_tokens INTEGER NOT NULL DEFAULT 0,
-            conversation_tokens INTEGER NOT NULL DEFAULT 0,
-            tool_call_tokens INTEGER NOT NULL DEFAULT 0,
-            cleared_reasoning_through_tag INTEGER NOT NULL DEFAULT 0,
-            last_todo_state TEXT NOT NULL DEFAULT '',
-            deferred_execute_state TEXT
-        )
-    `);
+    db.exec("PRAGMA busy_timeout=5000");
     return db;
 }
 

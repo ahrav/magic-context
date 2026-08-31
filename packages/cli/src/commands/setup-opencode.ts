@@ -435,6 +435,14 @@ export async function runSetup(dryRun = false): Promise<number> {
         log.message(`[dry-run] would add the TUI sidebar plugin to ${paths.tuiConfig}`);
     }
 
+    // ─── Step 8: Oh-My-OpenCode compatibility ───────────
+    // Intentional: this branch handles the FIRST-TIME-INSTALL case only.
+    // Existing users hit the same OMO conflict-fix logic via the
+    // `if (hadExistingSetup) detectConflicts/fixConflicts` block above,
+    // which already covers omoPreemptiveCompaction,
+    // omoContextWindowMonitor, and omoAnthropicRecovery. Audit tools
+    // sometimes flag this `!hadExistingSetup` gate as "OMO check skipped
+    // for existing users" — that's a false positive.
     let disableOmoHooks = false;
     if (paths.omoConfig && !hadExistingSetup) {
         log.warn(`Found oh-my-opencode config: ${paths.omoConfig}`);

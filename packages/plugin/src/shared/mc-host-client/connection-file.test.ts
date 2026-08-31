@@ -36,9 +36,9 @@ const DAEMON_ID = Array.from({ length: 16 }, (_, i) => 0x60 + i);
 
 function validJson(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     return {
-        schema: 1,
+        schema: 2,
         wire_version: 2,
-        endpoints: [{ host: "127.0.0.1", port: 43_123 }],
+        setup_socket: "/tmp/mc-host.sock",
         key: KEY,
         daemon_id: DAEMON_ID,
         pid: 4_242,
@@ -85,13 +85,12 @@ describe("direct-file snapshot", () => {
         const filePath = freshPath("valid.json");
         await writePrivateFile(filePath, JSON.stringify(validJson()));
         const snapshot = await readConnectionFile(filePath, options());
-        expect(snapshot.endpoint).toEqual({ host: "127.0.0.1", port: 43_123 });
+        expect(snapshot.setupSocket).toBe("/tmp/mc-host.sock");
         expect(Array.from(snapshot.key)).toEqual(KEY);
         expect(Array.from(snapshot.daemonId)).toEqual(DAEMON_ID);
         expect(snapshot.pid).toBe(4_242);
         expect(snapshot.daemonVer).toBe("mc-host/0.1.0");
         expect(Object.isFrozen(snapshot)).toBe(true);
-        expect(Object.isFrozen(snapshot.endpoint)).toBe(true);
     });
 
     test("accepts a whitespace-padded file of exactly 65,536 bytes", async () => {
@@ -100,7 +99,7 @@ describe("direct-file snapshot", () => {
         expect(body.length).toBe(65_536);
         await writePrivateFile(filePath, body);
         const snapshot = await readConnectionFile(filePath, options());
-        expect(snapshot.endpoint.port).toBe(43_123);
+        expect(snapshot.setupSocket).toBe("/tmp/mc-host.sock");
     });
 
     test("rejects 65,537 bytes as oversize, not as a JSON failure", async () => {
@@ -161,13 +160,13 @@ describe("direct-file snapshot", () => {
             const replacement = freshPath("replacement.json");
             await writePrivateFile(
                 replacement,
-                JSON.stringify(validJson({ endpoints: [{ host: "127.0.0.1", port: 50_000 }] })),
+                JSON.stringify(validJson({ setup_socket: "/tmp/mc-host-replacement.sock" })),
             );
             await rename(replacement, filePath);
         };
         const snapshot = await readConnectionFile(filePath, options({ afterOpen }));
         expect(attempts).toBe(2);
-        expect(snapshot.endpoint.port).toBe(50_000);
+        expect(snapshot.setupSocket).toBe("/tmp/mc-host-replacement.sock");
     });
 
     test("fails closed on a second replacement", async () => {
@@ -251,8 +250,8 @@ describe("snapshot JSON validation", () => {
     });
 
     test("rejects a missing or wrong schema", async () => {
-        await writeInvalid(validJson({ schema: 2 }), "invalid_schema");
-        await writeInvalid(validJson({ schema: "1" }), "invalid_schema");
+        await writeInvalid(validJson({ schema: 1 }), "invalid_schema");
+        await writeInvalid(validJson({ schema: "2" }), "invalid_schema");
         const noSchema = validJson();
         delete noSchema.schema;
         await writeInvalid(noSchema, "invalid_schema");
@@ -268,18 +267,13 @@ describe("snapshot JSON validation", () => {
         await writeInvalid(validJson({ wire_version: 1 }), "invalid_wire_version");
     });
 
-    test("rejects hostnames, wildcard, IPv6, and invalid ports", async () => {
-        const endpoints = (host: unknown, port: unknown): Record<string, unknown> =>
-            validJson({ endpoints: [{ host, port }] });
-        await writeInvalid(endpoints("localhost", 43_123), "invalid_endpoint");
-        await writeInvalid(endpoints("0.0.0.0", 43_123), "invalid_endpoint");
-        await writeInvalid(endpoints("::1", 43_123), "invalid_endpoint");
-        await writeInvalid(endpoints("127.0.0.1", 0), "invalid_endpoint");
-        await writeInvalid(endpoints("127.0.0.1", 65_536), "invalid_endpoint");
-        await writeInvalid(endpoints("127.0.0.1", 1.5), "invalid_endpoint");
-        await writeInvalid(endpoints("127.0.0.1", "43123"), "invalid_endpoint");
-        await writeInvalid(validJson({ endpoints: [] }), "invalid_endpoint");
-        await writeInvalid(validJson({ endpoints: "127.0.0.1:1" }), "invalid_endpoint");
+    test("rejects missing, relative, and non-string setup socket paths", async () => {
+        const absent = validJson();
+        delete absent.setup_socket;
+        await writeInvalid(absent, "invalid_setup_socket");
+        await writeInvalid(validJson({ setup_socket: "relative.sock" }), "invalid_setup_socket");
+        await writeInvalid(validJson({ setup_socket: "" }), "invalid_setup_socket");
+        await writeInvalid(validJson({ setup_socket: 43123 }), "invalid_setup_socket");
     });
 
     test("rejects key and daemon_id byte-array violations", async () => {

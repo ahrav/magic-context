@@ -1,5 +1,11 @@
 //! complete-only aggregation.
 //!
+//! Rules: refuse a preexisting attempt directory, write sidecars before
+//! summary fields, checksum every sidecar, and atomically move `running`
+//! to exactly one terminal state. Histograms merge only within one arm
+//! whose complete manifests share schema, workload, build, host, and arm
+//! identifiers. Paired gaps join the atomic-floor and serial-ring arms only
+//! when build, host, ordered CPU pair, and run block all match.
 
 #![allow(dead_code)]
 
@@ -14,9 +20,9 @@ use super::perf_measurement::{sha256_hex, OutcomeCounts, WorkloadId};
 pub const SCHEMA_VERSION: u32 = 1;
 
 pub const ARM_ATOMIC: &str = "atomic-floor";
-pub const ARM_TCP_SERIAL: &str = "tcp-serial";
-pub const ARM_TCP_OPEN: &str = "tcp-open";
-pub const ARM_TCP_THROUGHPUT: &str = "tcp-throughput";
+pub const ARM_RING_SERIAL: &str = "ring-serial";
+pub const ARM_RING_OPEN: &str = "ring-open";
+pub const ARM_RING_THROUGHPUT: &str = "ring-throughput";
 
 /// `HIST_LOW_NS`, `HIST_HIGH_NS`, and `HIST_SIGFIGS` standardize histogram bounds across latency-recording arms.
 /// HdrHistogram rounds `lowest_discernible_value` down to a power of two, so `HIST_LOW_NS` must be 1 to retain sub-microsecond samples in distinct nanosecond buckets.
@@ -397,14 +403,17 @@ pub struct GapRow {
     pub class: Option<String>,
     pub pair: (u32, u32),
     pub atomic_rtt_ns: f64,
-    pub tcp_p50_ns: f64,
+    pub ring_p50_ns: f64,
     pub gap_ns: f64,
     pub ratio: f64,
 }
 
-/// The join matches complete atomic-floor and serial-TCP attempts by run block, topology class, and ordered pair within one compatible build/host set.
-/// Blocks missing either side produce no row.
-/// Cross-class joins would pair non-comparable observations or silently overwrite one observation.
+/// Joins complete atomic-floor and serial-ring attempts by (run block,
+/// topology class, ordered pair) within one compatible build/host set.
+/// Blocks missing either side produce no row. The class belongs in the
+/// key because one physical pair can be valid for both classes (nodes
+/// sharing an L3 under sub-NUMA clustering), and cross-class joins would
+/// pair non-comparable observations or silently overwrite one another.
 pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
     let complete: Vec<&LoadedAttempt> = attempts
         .iter()
@@ -415,9 +424,10 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
     };
     type GapKey = (u32, Option<String>, (u32, u32));
     let mut atomic: BTreeMap<GapKey, f64> = BTreeMap::new();
-    let mut tcp: BTreeMap<GapKey, f64> = BTreeMap::new();
-    // Each arm may use a different collection configuration.
-    // Each arm must use one collection configuration; do not combine rows produced with different batch sizes or operation counts.
+    let mut ring: BTreeMap<GapKey, f64> = BTreeMap::new();
+    // Each arm's collection configuration may differ from the other
+    // arm's, but must be uniform within the arm: rows produced under
+    // different batch sizes or operation counts are not one gap
     // distribution.
     let mut arm_collections: BTreeMap<String, Option<serde_json::Value>> = BTreeMap::new();
     for attempt in &complete {
@@ -431,7 +441,7 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
         }
         let m = &attempt.manifest;
         let Some(pair) = m.arm.pair else { continue };
-        if matches!(m.arm.name.as_str(), ARM_ATOMIC | ARM_TCP_SERIAL) {
+        if matches!(m.arm.name.as_str(), ARM_ATOMIC | ARM_RING_SERIAL) {
             let known = arm_collections
                 .entry(m.arm.name.clone())
                 .or_insert_with(|| m.collection.clone());
@@ -481,7 +491,7 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
                     ));
                 }
             }
-            ARM_TCP_SERIAL => {
+            ARM_RING_SERIAL => {
                 let p50 = results
                     .and_then(|r| r["p50_ns"].as_f64())
                     .ok_or_else(|| format!("{}: missing p50_ns", attempt.dir.display()))?;
@@ -495,7 +505,7 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
                         attempt.dir.display()
                     ));
                 }
-                if tcp.insert(key.clone(), p50).is_some() {
+                if ring.insert(key.clone(), p50).is_some() {
                     return Err(format!(
                         "{}: duplicate serial observation for its block/class/pair key",
                         attempt.dir.display()
@@ -507,8 +517,10 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
     }
     let mut rows = Vec::new();
     for (key, atomic_rtt) in &atomic {
-        if let Some(tcp_p50) = tcp.get(key) {
-            // `serde_json` encodes non-finite floating-point values as `null`.
+        if let Some(ring_p50) = ring.get(key) {
+            // A zero or negative atomic median cannot come from a real
+            // measurement; the ratio would be non-finite and serde_json
+            // would encode it as a silent null.
             if *atomic_rtt <= 0.0 {
                 return Err(format!(
                     "run block {} pair {:?}: atomic median {atomic_rtt} is not a positive \
@@ -521,9 +533,9 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
                 class: key.1.clone(),
                 pair: key.2,
                 atomic_rtt_ns: *atomic_rtt,
-                tcp_p50_ns: *tcp_p50,
-                gap_ns: tcp_p50 - atomic_rtt,
-                ratio: tcp_p50 / atomic_rtt,
+                ring_p50_ns: *ring_p50,
+                gap_ns: ring_p50 - atomic_rtt,
+                ratio: ring_p50 / atomic_rtt,
             });
         }
     }

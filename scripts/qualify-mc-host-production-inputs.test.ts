@@ -91,6 +91,7 @@ function freshRoot(): string {
         "Cargo.toml",
         "release/generated/mc-host-release-contract.rs",
         "packages/plugin/src/shared/mc-host-lifecycle/generated-contract.ts",
+        "packages/retina-local-fs/src/generated-layout.ts",
     ]) {
         mkdirSync(join(root, dirname(relative)), { recursive: true });
         cpSync(join(repoRoot, relative), join(root, relative));

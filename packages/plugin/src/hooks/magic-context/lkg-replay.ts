@@ -193,7 +193,7 @@ function assistantIsActive(message: LkgEntryProjection): boolean {
     return message.finish === "tool-calls" || message.hasIncompleteTool;
 }
 
-export function findLkgAnchor(messages: LkgEntryProjection[]): number | null {
+function findLkgAnchor(messages: LkgEntryProjection[]): number | null {
     const assistant = latestAssistant(messages);
     const assistantTime = assistant?.timeCreated ?? null;
     if (assistant && assistantTime === null) return null;
@@ -422,7 +422,7 @@ export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean
     return true;
 }
 
-export function validateLkgSeamBoundary(prefix: MessageLike[], tail: MessageLike[]): boolean {
+function validateLkgSeamBoundary(prefix: MessageLike[], tail: MessageLike[]): boolean {
     const last = prefix[prefix.length - 1];
     const first = tail[0];
     if (!last || !first) return true;

@@ -142,93 +142,104 @@ describe("traceTimingEvidence", () => {
         expect(() => traceTimingEvidence(validSpans, { indexBuildMs: -1 })).toThrow(TimingError);
     });
 
-    it("rejects negative durations", () => {
-        expect(() =>
-            traceTimingEvidence([
+    // Each row feeds one malformed span graph to `traceTimingEvidence` and
+    // asserts the named structural rejection.
+    it.each([
+        [
+            "rejects negative durations",
+            [
                 span({ id: 1, stage: "root", lane: "unified", startMs: 0, endMs: 100 }),
                 span({ id: 2, parentId: 1, startMs: 50, endMs: 40 }),
-            ]),
-        ).toThrow(/negative duration/);
-    });
-
-    it("rejects a graph without exactly one root", () => {
-        expect(() => traceTimingEvidence([span({ id: 2, startMs: 0, endMs: 10 })])).toThrow(
+            ],
+            /negative duration/,
+        ],
+        [
+            "rejects a graph with no root",
+            [span({ id: 2, startMs: 0, endMs: 10 })],
             /exactly one root/,
-        );
-        expect(() =>
-            traceTimingEvidence([
+        ],
+        [
+            "rejects a graph with two roots",
+            [
                 span({ id: 1, stage: "root", lane: "unified", startMs: 0, endMs: 10 }),
                 span({ id: 2, stage: "root", lane: "unified", startMs: 0, endMs: 10 }),
-            ]),
-        ).toThrow(/exactly one root/);
-    });
-
-    it("rejects a child extending outside its parent", () => {
-        expect(() =>
-            traceTimingEvidence([
+            ],
+            /exactly one root/,
+        ],
+        [
+            "rejects a child extending outside its parent",
+            [
                 span({ id: 1, stage: "root", lane: "unified", startMs: 0, endMs: 100 }),
                 span({ id: 2, parentId: 1, startMs: 10, endMs: 40 }),
                 span({ id: 3, parentId: 2, startMs: 30, endMs: 60 }),
-            ]),
-        ).toThrow(/outside its parent/);
-    });
-
-    it("rejects a span outside the root window", () => {
-        expect(() =>
-            traceTimingEvidence([
+            ],
+            /outside its parent/,
+        ],
+        [
+            "rejects a span outside the root window",
+            [
                 span({ id: 1, stage: "root", lane: "unified", startMs: 10, endMs: 100 }),
                 span({ id: 2, startMs: 0, endMs: 5 }),
-            ]),
-        ).toThrow(/outside the root window/);
-    });
-
-    it("rejects unknown parents, duplicate ids, and parent cycles", () => {
-        expect(() =>
-            traceTimingEvidence([
+            ],
+            /outside the root window/,
+        ],
+        [
+            "rejects an unknown parent id",
+            [
                 span({ id: 1, stage: "root", lane: "unified", startMs: 0, endMs: 100 }),
                 span({ id: 2, parentId: 99, startMs: 0, endMs: 10 }),
-            ]),
-        ).toThrow(/unknown parent/);
-        expect(() =>
-            traceTimingEvidence([
+            ],
+            /unknown parent/,
+        ],
+        [
+            "rejects duplicate span ids",
+            [
                 span({ id: 1, stage: "root", lane: "unified", startMs: 0, endMs: 100 }),
                 span({ id: 2, parentId: 1, startMs: 0, endMs: 10 }),
                 span({ id: 2, parentId: 1, startMs: 0, endMs: 10 }),
-            ]),
-        ).toThrow(/duplicate span id/);
-        expect(() =>
-            traceTimingEvidence([
+            ],
+            /duplicate span id/,
+        ],
+        [
+            "rejects parent cycles",
+            [
                 span({ id: 1, stage: "root", lane: "unified", startMs: 0, endMs: 100 }),
                 span({ id: 2, parentId: 3, startMs: 0, endMs: 10 }),
                 span({ id: 3, parentId: 2, startMs: 0, endMs: 10 }),
-            ]),
-        ).toThrow(/parent cycle/);
-    });
-
-    it("rejects dependency cycles and mixed clock domains", () => {
-        expect(() =>
-            traceTimingEvidence([
+            ],
+            /parent cycle/,
+        ],
+        [
+            "rejects dependency cycles",
+            [
                 span({ id: 1, stage: "root", lane: "unified", startMs: 0, endMs: 100 }),
                 span({ id: 2, parentId: 1, dependsOn: [3], startMs: 0, endMs: 10 }),
                 span({ id: 3, parentId: 1, dependsOn: [2], startMs: 0, endMs: 10 }),
-            ]),
-        ).toThrow(/cycle/);
-        expect(() =>
-            traceTimingEvidence([
+            ],
+            /cycle/,
+        ],
+        [
+            "rejects mixed clock domains",
+            [
                 span({ id: 1, stage: "root", lane: "unified", startMs: 0, endMs: 100 }),
                 span({ id: 2, parentId: 1, startMs: 0, endMs: 10, clockDomain: "other" }),
-            ]),
-        ).toThrow(/clock domains/);
-    });
-
-    it("rejects a root span that itself has a parent", () => {
-        expect(() =>
-            traceTimingEvidence([
+            ],
+            /clock domains/,
+        ],
+        [
+            "rejects a root span that itself has a parent",
+            [
                 span({ id: 1, stage: "root", lane: "unified", parentId: 2, startMs: 0, endMs: 9 }),
                 span({ id: 2, startMs: 0, endMs: 9 }),
-            ]),
-        ).toThrow(/must not have a parent/);
-    });
+            ],
+            /must not have a parent/,
+        ],
+    ] as Array<[string, Parameters<typeof traceTimingEvidence>[0], RegExp]>)(
+        "%s",
+        (_title, spans, message) => {
+            expect(() => traceTimingEvidence(spans)).toThrow(message);
+        },
+    );
 
     it("carries the versioned timing policy identifier", () => {
         expect(TIMING_POLICY_VERSION).toBe("retrieval-timing-policy/v1");

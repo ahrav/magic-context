@@ -229,6 +229,18 @@ pub async fn emit_frame(
     id: FrameId,
     body: Vec<u8>,
 ) -> Result<(), ()> {
+    emit_frame_with_written(budget, gen, ty, flags, id, body, None).await
+}
+
+async fn emit_frame_with_written(
+    budget: &crate::wire::ByteBudget,
+    gen: &GenerationCore,
+    ty: FrameType,
+    flags: Flags,
+    id: FrameId,
+    body: Vec<u8>,
+    written: Option<Box<dyn FnOnce(Instant) + Send>>,
+) -> Result<(), ()> {
     if body.len() > crate::wire::MAX_BODY_LEN as usize
         || gen.writer.is_retired()
         || gen.token.is_cancelled()
@@ -252,7 +264,7 @@ pub async fn emit_frame(
                 tail,
                 direct: None,
                 charge,
-                written: None,
+                written,
             },
             deadline,
         )
@@ -593,18 +605,30 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
         match shared.shutdown_latch.try_own() {
             crate::lifecycle::LatchDecision::Owner => break,
             crate::lifecycle::LatchDecision::Committed => {
-                // A request that observes `Committed` still emits a success response with `corr`.
-                if emit_frame(
+                // A prior attempt already linearized the stop; this request
+                // still settles with its own correlated success.
+                let (written, completed) = oneshot::channel();
+                let settled = if emit_frame_with_written(
                     &shared.egress_budget,
                     gen,
                     FrameType::Response,
                     response_flags(false, true),
                     FrameId::control(corr),
                     crate::control::host_shutdown_response_json(),
+                    Some(Box::new(move |_| {
+                        let _ = written.send(());
+                    })),
                 )
                 .await
                 .is_err()
                 {
+                    false
+                } else {
+                    tokio::time::timeout_at(gen.writer.admission_deadline(), completed)
+                        .await
+                        .is_ok()
+                };
+                if !settled {
                     gen.token.cancel();
                 }
                 return;
@@ -1255,7 +1279,10 @@ pub async fn force_close_all_routes<H: McHostHandler>(shared: &Arc<HostShared<H>
     while drains.join_next().await.is_some() {}
 }
 
-pub async fn send_connection_goodbye(gen: &GenerationCore) {
+/// Best-effort connection `Goodbye` (0/0/0), queued after drain terminals so
+/// clients do not retire the generation before those terminals arrive
+/// (protocol §12 step 4).
+pub async fn send_connection_goodbye(gen: Arc<GenerationCore>, deadline: tokio::time::Instant) {
     let bytes = encode_owned_frame(
         FrameType::Goodbye,
         pure_header_flags(),
@@ -1263,16 +1290,26 @@ pub async fn send_connection_goodbye(gen: &GenerationCore) {
         Vec::new(),
     )
     .expect("header-only Goodbye always encodes");
-    let _ = gen
+    let (written, completed) = tokio::sync::oneshot::channel();
+    if gen
         .writer
-        .send(OutboundFrame {
-            bytes,
-            tail: Vec::new(),
-            direct: None,
-            charge: crate::wire::ByteCharge::none(),
-            written: None,
-        })
-        .await;
+        .send_before(
+            OutboundFrame {
+                bytes,
+                tail: Vec::new(),
+                direct: None,
+                charge: crate::wire::ByteCharge::none(),
+                written: Some(Box::new(move |_| {
+                    let _ = written.send(());
+                })),
+            },
+            deadline,
+        )
+        .await
+        .is_ok()
+    {
+        let _ = tokio::time::timeout_at(deadline, completed).await;
+    }
 }
 
 pub fn handle_cancel(gen: &GenerationCore, key: PendingKey) {

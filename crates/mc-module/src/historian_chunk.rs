@@ -1,5 +1,10 @@
+//! Production historian chunk assembly from CK flat blocks.
+
+use crate::chunk_text::{
+    clean_user_text, compact_role, compact_text_for_summary, extract_key_arg, format_block_line,
+    is_system_directive, merge_commit_hashes, normalize_text,
+};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::OnceLock;
 
 use chrono::{Local, TimeZone};
 use mc_core::claim_operation::{canonical_snapshot_vector, SnapshotVector};
@@ -8,7 +13,6 @@ use mc_store::{
     StoredCompartment,
 };
 use mc_tokenizer::estimate_tokens;
-use regex::Regex;
 use serde_json::Value;
 
 use crate::boundary::BoundaryResolution;
@@ -22,10 +26,6 @@ use crate::historian_validate::{
     ChunkLine, HistorianChunk, MessageRange, StoredCompartmentRange, ValidateOptions,
 };
 use crate::memory_render::MirroredClaimMemory;
-
-const MAX_COMMITS_PER_BLOCK: usize = 5;
-const SYSTEM_DIRECTIVE_PREFIX: &str = "[SYSTEM DIRECTIVE: MAGIC-CONTEXT";
-const OMO_INTERNAL_INITIATOR_MARKER: &str = "<!-- OMO_INTERNAL_INITIATOR -->";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkSnapshotOwnedItem {
@@ -78,12 +78,6 @@ struct ChunkBlock {
     meta: Vec<MessageMeta>,
     commit_hashes: Vec<String>,
     is_tool_only: bool,
-}
-
-#[derive(Debug, Clone)]
-struct CompactedText {
-    text: String,
-    commit_hashes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -164,7 +158,7 @@ impl Builder {
         };
         let mut all_parts = text_parts.clone();
         all_parts.extend(tool_summaries);
-        let compacted = compact_text_for_summary(&all_parts.join(" / "), message.role);
+        let compacted = compact_text_for_summary(all_parts.join(" / "), message.role);
         if compacted.text.is_empty() {
             self.pending_noise_meta.push(meta);
             return true;
@@ -772,17 +766,20 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
         return input.to_string();
     }
 
-    let input_units: Vec<u16> = input.encode_utf16().collect();
+    // The reference implementation counts UTF-16 code units.
+    // A cut inside a surrogate pair rounds down to the character start:
+    // `utf16_prefix` never emits a partial scalar.
+    let unit_len = input.chars().map(char::len_utf16).sum::<usize>();
+
+    let mut candidate = String::with_capacity(input.len() + HISTORIAN_TRUNCATION_MARKER.len());
     let mut lo = 0usize;
-    let mut hi = input_units.len();
+    let mut hi = unit_len;
     let mut best = 0usize;
     while lo <= hi {
         let mid = (lo + hi) >> 1;
-        let candidate = format!(
-            "{}{}",
-            utf16_prefix(&input_units, mid),
-            HISTORIAN_TRUNCATION_MARKER
-        );
+        candidate.clear();
+        candidate.push_str(crate::transform::utf16_prefix(input, mid));
+        candidate.push_str(HISTORIAN_TRUNCATION_MARKER);
         if estimate_tokens(&candidate) <= token_budget {
             best = mid;
             lo = mid + 1;
@@ -795,17 +792,9 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
 
     format!(
         "{}{}",
-        utf16_prefix(&input_units, best),
+        crate::transform::utf16_prefix(input, best),
         HISTORIAN_TRUNCATION_MARKER
     )
-}
-
-fn utf16_prefix(units: &[u16], requested: usize) -> String {
-    let mut end = requested.min(units.len());
-    if end > 0 && (0xD800..=0xDBFF).contains(&units[end - 1]) {
-        end -= 1;
-    }
-    String::from_utf16_lossy(&units[..end])
 }
 
 fn end_placeholder(start: u64) -> u64 {
@@ -953,136 +942,14 @@ fn format_tool_summary(name: &str, input: &Value) -> String {
     }
 }
 
-fn extract_key_arg(input: &Value) -> Option<String> {
-    let object = input.as_object()?;
-    for key in ["filePath", "path", "pattern", "query"] {
-        if let Some(value) = object.get(key).and_then(Value::as_str) {
-            return Some(truncate_arg(value));
-        }
-    }
-    for key in ["symbol", "module", "action"] {
-        if let Some(value) = object.get(key).and_then(Value::as_str) {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-fn truncate_arg(value: &str) -> String {
-    if value.chars().count() <= 60 {
-        value.to_string()
-    } else {
-        format!("{}…", value.chars().take(60).collect::<String>())
-    }
-}
-
-fn clean_user_text(text: &str) -> String {
-    system_reminder_regex()
-        .replace_all(text, "")
-        .replace(OMO_INTERNAL_INITIATOR_MARKER, "")
-        .trim()
-        .to_string()
-}
-
-fn is_system_directive(text: &str) -> bool {
-    text.trim_start().starts_with(SYSTEM_DIRECTIVE_PREFIX)
-}
-
-fn normalize_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn compact_role(role: &str) -> String {
-    match role {
-        "assistant" => "A".to_string(),
-        "user" => "U".to_string(),
-        _ => role
-            .chars()
-            .next()
-            .map(|ch| ch.to_uppercase().collect::<String>())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "M".to_string()),
-    }
-}
-
 fn format_block(block: &ChunkBlock) -> String {
-    let range = if block.start_ordinal == block.end_ordinal {
-        format!("[{}]", block.start_ordinal)
-    } else {
-        format!("[{}-{}]", block.start_ordinal, block.end_ordinal)
-    };
-    let commit_suffix = if block.commit_hashes.is_empty() {
-        String::new()
-    } else {
-        format!(" commits: {}", block.commit_hashes.join(", "))
-    };
-    format!(
-        "{} {}:{} {}",
-        range,
-        block.role,
-        commit_suffix,
-        block.parts.join(" / ")
+    format_block_line(
+        &block.role,
+        block.start_ordinal,
+        block.end_ordinal,
+        &block.commit_hashes,
+        &block.parts,
     )
-}
-
-fn extract_commit_hashes(text: &str) -> Vec<String> {
-    let mut hashes = Vec::new();
-    for capture in commit_hash_extract_regex().captures_iter(text) {
-        let Some(hash) = capture.get(1).map(|value| value.as_str().to_lowercase()) else {
-            continue;
-        };
-        if hashes.contains(&hash) {
-            continue;
-        }
-        hashes.push(hash);
-        if hashes.len() >= MAX_COMMITS_PER_BLOCK {
-            break;
-        }
-    }
-    hashes
-}
-
-fn compact_text_for_summary(text: &str, role: &str) -> CompactedText {
-    let commit_hashes = if role == "assistant" {
-        extract_commit_hashes(text)
-    } else {
-        Vec::new()
-    };
-    if commit_hashes.is_empty() || !commit_verb_regex().is_match(text) {
-        return CompactedText {
-            text: text.to_string(),
-            commit_hashes,
-        };
-    }
-    let without_hashes = commit_hash_extract_regex().replace_all(text, "");
-    let without_hashes = empty_parens_regex().replace_all(&without_hashes, "");
-    let without_hashes = space_before_comma_regex().replace_all(&without_hashes, ",");
-    let without_hashes = repeated_comma_regex().replace_all(&without_hashes, ", ");
-    let without_hashes = repeated_space_regex().replace_all(&without_hashes, " ");
-    let without_hashes = space_before_punct_regex().replace_all(&without_hashes, "$1");
-    let trimmed = without_hashes.trim();
-    CompactedText {
-        text: if trimmed.is_empty() {
-            text.to_string()
-        } else {
-            trimmed.to_string()
-        },
-        commit_hashes,
-    }
-}
-
-fn merge_commit_hashes(existing: &[String], next: &[String]) -> Vec<String> {
-    let mut merged = existing.to_vec();
-    for hash in next {
-        if merged.contains(hash) {
-            continue;
-        }
-        merged.push(hash.clone());
-        if merged.len() >= MAX_COMMITS_PER_BLOCK {
-            break;
-        }
-    }
-    merged
 }
 
 fn merge_tool_only_ranges(ranges: &[MessageRange]) -> Vec<MessageRange> {
@@ -1097,46 +964,6 @@ fn merge_tool_only_ranges(ranges: &[MessageRange]) -> Vec<MessageRange> {
         merged.push(range.clone());
     }
     merged
-}
-
-fn system_reminder_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?is)<system-reminder>[\s\S]*?</system-reminder>").unwrap())
-}
-
-fn commit_hash_extract_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)`?\b([0-9a-f]{7,12})\b`?").unwrap())
-}
-
-fn commit_verb_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)\b(?:commit(?:ted|ting|s)?|cherry-?pick(?:ed|ing|s)?|merge[ds]?|merging|rebas(?:e|ed|es|ing))\b").unwrap())
-}
-
-fn empty_parens_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\(\s*\)").unwrap())
-}
-
-fn space_before_comma_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\s+,").unwrap())
-}
-
-fn repeated_comma_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r",\s*,+").unwrap())
-}
-
-fn repeated_space_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\s{2,}").unwrap())
-}
-
-fn space_before_punct_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\s+([,.;:])").unwrap())
 }
 
 #[cfg(test)]

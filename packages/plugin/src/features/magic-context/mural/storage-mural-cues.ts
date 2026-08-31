@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import type { Database } from "../../../shared/sqlite";
 
 /**
@@ -146,10 +144,4 @@ export function recordClaimMuralCueRejection(
             updated_at = excluded.updated_at`,
     ).run(claimId, args.revisionLocator, MURAL_CUE_RENDERER_EPOCH, count, Date.now());
     return count;
-}
-
-/**
- */
-export function computeCueContentHash(content: string): string {
-    return createHash("sha256").update(content).digest("hex");
 }

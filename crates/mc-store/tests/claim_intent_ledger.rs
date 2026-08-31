@@ -1,4 +1,4 @@
-use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+use cortexkit_store_types::StorageDescriptor;
 use mc_core::claim_operation::{
     canonical_json_encode, compute_claim_operation_request_digest, ClaimCommandIdentity,
     ClaimIntentAckKind, ClaimIntentBinding, ClaimIntentState,
@@ -14,14 +14,7 @@ const STORE_UUID: &str = "6f1d0c4a-6f2b-4b7a-9c3d-2e5f8a1b4c7d";
 const ROUTE_ROOT: &str = "/repo/claim-intent-test";
 
 fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
-    StorageDescriptor {
-        module_id: "magic-context-test".to_string(),
-        storage_namespace: "mc_cache".to_string(),
-        isolation: Isolation::Module,
-        backend: StorageBackend::Sqlite {
-            path: dir.join("store.db").to_string_lossy().into_owned(),
-        },
-    }
+    McStore::test_descriptor(dir, "magic-context-test")
 }
 
 fn binding(generation: u64) -> ClaimIntentBinding {

@@ -33,7 +33,9 @@ const CALIBRATION_TABLE: CalibrationEntry[] = [
     // The 1.0 fallback undercounts System+ToolDefs and shifts the residual into Conversation.
     { prefix: "anthropic/claude-opus-4-8", systemRatio: 1.51, toolsRatio: 1.57 },
     { prefix: "anthropic/claude-opus-4.8", systemRatio: 1.51, toolsRatio: 1.57 },
-    // Anthropic Opus 4.7 uses a tokenizer absent from ai-tokenizer's `claude` encoding.
+    // Anthropic Opus 4.7 — ai-tokenizer's claude encoding lacks its tokenizer,
+    // so its empirically-measured ratios are pinned here (the 4.8 rows above
+    // reuse them).
     { prefix: "anthropic/claude-opus-4-7", systemRatio: 1.51, toolsRatio: 1.57 },
     { prefix: "anthropic/claude-opus-4.7", systemRatio: 1.51, toolsRatio: 1.57 },
     { prefix: "anthropic/claude-opus-4-5", systemRatio: 1.02, toolsRatio: 1.16 },

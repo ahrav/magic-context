@@ -29,8 +29,8 @@ import type { MessageLike } from "./transform-operations";
 interface RunCompartmentPhaseArgs {
     canRunCompartments: boolean;
     fullFeatureMode: boolean;
-    /** Compaction-off mode skips historian startup and the 95% block.
-     * Compaction-off mode skips boundary resolution and only clears stale flags. */
+    /** Compaction-off mode: no historian start, no 95% block,
+     *  no boundary resolution — the phase degrades to a stale-flag cleanup. */
     compactionOff?: boolean;
     /** `historianRunnable` is false when `historian.disable=true`, which blocks historian-backed child agents. */
     historianRunnable?: boolean;
@@ -67,9 +67,9 @@ interface RunCompartmentPhaseArgs {
     experimentalTemporalAwareness?: boolean;
     /** `historianTwoPass` runs a second editor pass after historian processing to remove `U:` lines. */
     historianTwoPass?: boolean;
-    /** `memoryEnabled` gates cross-session memory through `memory.enabled`. */
+    /** Cross-session memory feature gate (`memory.enabled`). */
     memoryEnabled?: boolean;
-    /** `autoPromote` gates automatic promotion through `memory.auto_promote`. */
+    /** Auto-promotion gate (`memory.auto_promote`). */
     autoPromote?: boolean;
     /** `onCompartmentStatePublished` forwards state-publication notifications to the compartment runner. */
     onCompartmentStatePublished?: (sessionId: string) => void;
@@ -161,6 +161,10 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
     let rebuiltHistoryThisPass = false;
     const historianRunnable = args.historianRunnable !== false;
 
+    // Compaction-off mode: the historian/compartment phase is
+    // fully gated off — no fires, no boundary resolution, no await. A stale
+    // compartmentInProgress flag (a run interrupted before the flip) is
+    // cleared so the session state is honest and flip-back starts clean.
     if (args.compactionOff) {
         if (args.sessionMeta.compartmentInProgress) {
             sessionLog(
@@ -224,6 +228,30 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
         }
         return cachedBoundarySnapshot;
     }
+
+    const startCompartmentAgentWithPhaseArgs = (client: NonNullable<typeof args.client>): void => {
+        startCompartmentAgent({
+            client,
+            db: args.db,
+            sessionId: args.sessionId,
+            historianChunkTokens: args.historianChunkTokens,
+            boundarySnapshot: getBoundarySnapshotForCompartment() ?? undefined,
+            currentContextLimit: args.boundaryContextLimit,
+            historyBudgetTokens: args.historyBudgetTokens,
+            historianTimeoutMs: args.historianTimeoutMs,
+            fallbackModels: args.fallbackModels,
+            directory: args.compartmentDirectory,
+            fallbackModelId: args.fallbackModelId,
+            ensureProjectRegistered: args.ensureProjectRegistered,
+            getNotificationParams: args.getNotificationParams,
+            experimentalUserMemories: args.experimentalUserMemories,
+            historianTwoPass: args.historianTwoPass,
+            memoryEnabled: args.memoryEnabled,
+            autoPromote: args.autoPromote,
+            onCompartmentStatePublished: args.onCompartmentStatePublished,
+            preserveInjectionCacheUntilConsumed: true,
+        });
+    };
 
     function hasEligibleHistoryForCompartment(): boolean {
         const snapshot = getBoundarySnapshotForCompartment();
@@ -298,27 +326,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             compartmentInProgress = false;
         } else {
             sessionLog(args.sessionId, "transform: compartmentInProgress flag set, starting agent");
-            startCompartmentAgent({
-                client: args.client,
-                db: args.db,
-                sessionId: args.sessionId,
-                historianChunkTokens: args.historianChunkTokens,
-                boundarySnapshot: getBoundarySnapshotForCompartment() ?? undefined,
-                currentContextLimit: args.boundaryContextLimit,
-                historyBudgetTokens: args.historyBudgetTokens,
-                historianTimeoutMs: args.historianTimeoutMs,
-                fallbackModels: args.fallbackModels,
-                directory: args.compartmentDirectory,
-                fallbackModelId: args.fallbackModelId,
-                ensureProjectRegistered: args.ensureProjectRegistered,
-                getNotificationParams: args.getNotificationParams,
-                experimentalUserMemories: args.experimentalUserMemories,
-                historianTwoPass: args.historianTwoPass,
-                memoryEnabled: args.memoryEnabled,
-                autoPromote: args.autoPromote,
-                onCompartmentStatePublished: args.onCompartmentStatePublished,
-                preserveInjectionCacheUntilConsumed: true,
-            });
+            startCompartmentAgentWithPhaseArgs(args.client);
             compartmentInProgress = true;
         }
     }
@@ -338,27 +346,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                 args.sessionId,
                 `transform: 95% reached (${args.contextUsage.percentage.toFixed(1)}%), force-starting compartment agent and blocking`,
             );
-            startCompartmentAgent({
-                client: args.client,
-                db: args.db,
-                sessionId: args.sessionId,
-                historianChunkTokens: args.historianChunkTokens,
-                boundarySnapshot: getBoundarySnapshotForCompartment() ?? undefined,
-                currentContextLimit: args.boundaryContextLimit,
-                historyBudgetTokens: args.historyBudgetTokens,
-                historianTimeoutMs: args.historianTimeoutMs,
-                fallbackModels: args.fallbackModels,
-                directory: args.compartmentDirectory,
-                fallbackModelId: args.fallbackModelId,
-                ensureProjectRegistered: args.ensureProjectRegistered,
-                getNotificationParams: args.getNotificationParams,
-                experimentalUserMemories: args.experimentalUserMemories,
-                historianTwoPass: args.historianTwoPass,
-                memoryEnabled: args.memoryEnabled,
-                autoPromote: args.autoPromote,
-                onCompartmentStatePublished: args.onCompartmentStatePublished,
-                preserveInjectionCacheUntilConsumed: true,
-            });
+            startCompartmentAgentWithPhaseArgs(args.client);
             activeRun = getActiveCompartmentRun(args.sessionId);
         } else if (!activeRun && hasEligibleHistoryForCompartment()) {
             sessionLog(

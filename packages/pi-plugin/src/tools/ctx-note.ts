@@ -31,6 +31,11 @@ import {
 	updateNote,
 } from "@magic-context/core/features/magic-context/storage";
 import { CTX_NOTE_DESCRIPTION } from "@magic-context/core/tools/ctx-note/constants";
+import {
+	anchorSuffix,
+	DEFAULT_READ_LIMIT,
+	paginateNewestFirst,
+} from "@magic-context/core/tools/ctx-note/pagination";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
@@ -128,10 +133,6 @@ function captureAnchorOrdinal(
 	}
 }
 
-function anchorSuffix(note: Note): string {
-	return note.anchorOrdinal !== null ? ` ↳ @msg ${note.anchorOrdinal}` : "";
-}
-
 function formatNoteLine(note: Note): string {
 	if (note.type === "smart") {
 		const conditionLine =
@@ -147,26 +148,6 @@ function formatNoteLine(note: Note): string {
 
 const DISMISS_FOOTER =
 	'\n\nTo dismiss a stale note: ctx_note(action="dismiss", note_id=N)';
-
-/**
- * */
-const DEFAULT_READ_LIMIT = 25;
-
-function paginateNewestFirst(
-	notes: Note[],
-	limit: number,
-	offset: number,
-): { page: Note[]; total: number; footer: string | null } {
-	const total = notes.length;
-	const newestFirst = [...notes].reverse();
-	const page = newestFirst.slice(offset, offset + limit);
-	const remaining = total - offset - page.length;
-	const footer =
-		remaining > 0
-			? `Showing ${page.length} of ${total} (newest first) — ${remaining} older: ctx_note(action="read", offset=${offset + page.length})`
-			: null;
-	return { page, total, footer };
-}
 
 export interface CtxNoteToolDeps {
 	db: ContextDatabase;

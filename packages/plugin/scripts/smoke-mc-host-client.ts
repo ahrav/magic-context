@@ -5,7 +5,10 @@ import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { wakePlaneStatus } from "../src/features/magic-context/smart-notes/wake-plane";
-import { McHostClient, type McHostDiagnosticsEvent } from "../src/shared/mc-host-client";
+import {
+    type McHostDiagnosticsEvent,
+    processMcHostClient,
+} from "../src/shared/mc-host-client";
 
 const OVERALL_DEADLINE_MS = 60_000;
 const READY_DEADLINE_MS = 15_000;
@@ -28,7 +31,7 @@ function findRepoRoot(): string {
 }
 
 function buildPerfHost(repoRoot: string, binary: string): Promise<void> {
-    log("perf_host binary missing; running cargo build -p mc-host --example perf_host");
+    log("building current perf_host source");
     return new Promise((resolvePromise, rejectPromise) => {
         const build = spawn("cargo", ["build", "-p", "mc-host", "--example", "perf_host"], {
             cwd: repoRoot,
@@ -101,9 +104,7 @@ function waitForExit(child: ChildProcess, deadlineMs: number): Promise<number | 
 const repoRoot = findRepoRoot();
 const binary =
     process.env.PERF_HOST_BIN ?? join(repoRoot, "target", "debug", "examples", "perf_host");
-if (!existsSync(binary)) {
-    await buildPerfHost(repoRoot, binary);
-}
+await buildPerfHost(repoRoot, binary);
 
 const dataDir = mkdtempSync(join(tmpdir(), "mc-host-client-smoke-"));
 let child: ChildProcess | null = null;
@@ -137,36 +138,32 @@ try {
     const connectionFile = await waitForReady(child, READY_DEADLINE_MS);
     log(`perf_host READY, connection file ${connectionFile}`);
 
-    const previousXdgDataHome = process.env.XDG_DATA_HOME;
-    process.env.XDG_DATA_HOME = dataDir;
-    try {
-        const status = await wakePlaneStatus();
-        assert.equal(status, "absent", `direct host must probe as wake-plane absent (got ${status})`);
-    } finally {
-        if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
-        else process.env.XDG_DATA_HOME = previousXdgDataHome;
-    }
-    log("production wake-plane probe returned absent");
-
     const events: McHostDiagnosticsEvent[] = [];
-    const client = await McHostClient.connect({
+    const client = await processMcHostClient({
         connectionFile,
         diagnostics: (event) => events.push(event),
     });
     log(`connected (daemonVer=${client.daemonVer})`);
     try {
         const connectedEvent = events.find((event) => event.type === "connected");
-        assert.equal(
-            connectedEvent?.transport,
-            "tcp",
-            `negotiation must select tcp (got ${connectedEvent?.transport})`,
-        );
-        assert.equal(
-            connectedEvent?.fallbackReason,
-            undefined,
-            `a tcp-only offer must be a direct selection (got ${connectedEvent?.fallbackReason})`,
-        );
-        log("transport.negotiate selected tcp directly");
+        assert.equal(connectedEvent?.health, "healthy");
+        assert.equal(connectedEvent?.artifact?.profile, "mc-host-test-ring-v1");
+        log("shared-memory ring active");
+
+        const previousXdgDataHome = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dataDir;
+        try {
+            const status = await wakePlaneStatus();
+            assert.equal(
+                status,
+                "absent",
+                `direct host must probe as wake-plane absent (got ${status})`,
+            );
+        } finally {
+            if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = previousXdgDataHome;
+        }
+        log("production wake-plane probe returned absent");
 
         const modules = await client.catalogList();
         assert.ok(Array.isArray(modules), "catalog.list must return a module array");

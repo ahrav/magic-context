@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
+import { isHistorianRequest } from "../src/cache-analysis";
 
 /**
  *
@@ -14,26 +15,7 @@ import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
  *
  */
 
-const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
-
-function isHistorianRequest(body: Record<string, unknown>): boolean {
-    if (JSON.stringify(body.messages ?? "").includes("<new_messages>")) return true;
-    const system = body.system;
-    if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
-    if (Array.isArray(system)) {
-        for (const block of system) {
-            if (block && typeof block === "object") {
-                const text = (block as { text?: unknown }).text;
-                if (typeof text === "string" && text.includes(HISTORIAN_SYSTEM_MARKER)) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
-/* */
+/** Extract the message ordinals historian was asked to process from the body. */
 function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
     const messages = body.messages as Array<{ role: string; content: unknown }> | undefined;
     if (!messages) return null;
@@ -197,7 +179,7 @@ describe("historian success path", () => {
             console.log(`[TEST] compartment rows after historian: ${compartmentCount}`);
             expect(compartmentCount).toBeGreaterThanOrEqual(1);
 
-
+            // compartment_in_progress should be cleared after successful publication.
             const meta = h
                 .contextDb()
                 .prepare(

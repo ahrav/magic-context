@@ -110,8 +110,8 @@ export function modelKeyLookupOrder(modelKey: string | undefined): ModelKeyCandi
     });
 }
 
-/* */
-export function resolveModelConfigValue<T>(
+/** Resolve one per-model value using the shared cache_ttl lookup walk. */
+function resolveModelConfigValue<T>(
     values: Readonly<Record<string, T>> | undefined,
     modelKey: string | undefined,
 ): { value: T; source: ModelKeyLookupSource } | undefined {

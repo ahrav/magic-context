@@ -45,7 +45,7 @@ describe("subagent invocation storage", () => {
             cacheReadTokens: 5,
             cacheWriteTokens: 1,
         });
-        recordSubagentInvocation(db, {
+        const child = recordSubagentInvocation(db, {
             sessionId: "ses",
             harness: "opencode",
             subagent: "historian_editor",
@@ -59,12 +59,25 @@ describe("subagent invocation storage", () => {
             error: "bad",
             parentInvocationId: parent,
         });
+        const newerSameTimestamp = recordSubagentInvocation(db, {
+            sessionId: "ses",
+            harness: "opencode",
+            subagent: "historian",
+            startedAt: 3,
+            endedAt: 5,
+            status: "completed",
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+        });
         const rows = getSubagentInvocations(db, "ses");
-        expect(rows).toHaveLength(2);
-        expect(rows[0].parentInvocationId).toBe(parent);
+        expect(rows).toHaveLength(3);
+        expect(rows.map((row) => row.id)).toEqual([newerSameTimestamp, child, parent]);
+        expect(rows.find((row) => row.id === child)?.parentInvocationId).toBe(parent);
         const totals = getSubagentTotalsBySubagent(db, "ses");
         expect(totals.historian).toEqual({
-            invocations: 1,
+            invocations: 2,
             totalInput: 10,
             totalOutput: 2,
             totalCacheRead: 5,

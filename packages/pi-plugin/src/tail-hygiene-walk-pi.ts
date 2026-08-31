@@ -1,6 +1,13 @@
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
 import { estimateImageTokensFromDataUrl } from "@magic-context/core/hooks/magic-context/image-token-estimate";
-import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import {
+	contentSignature,
+	memoizedTokens,
+	partHash,
+	safeStableStringify,
+	sameMeasuredPrefix,
+	TAG_PREFIX,
+} from "@magic-context/core/hooks/magic-context/tail-hygiene-memo";
 import {
 	stripChannel1ReminderSpans,
 	type TailHygieneBaseline,
@@ -8,19 +15,10 @@ import {
 	type TailHygienePartKind,
 	type TailHygienePartMeasurement,
 } from "@magic-context/core/hooks/magic-context/tail-hygiene-walk";
+import { isRecord } from "@magic-context/core/shared/record-type-guard";
 import { PI_CTX_REDUCE_KEEP } from "./heuristic-cleanup-pi";
 
-const TAG_PREFIX = /^§(\d+)§\s*/;
 const SYNTHETIC_TODO_PREFIX = "mc_synthetic_todo_";
-const MAX_CONTENT_MEMO_ENTRIES = 100_000;
-const MAX_CONTENT_MEMO_BYTES = 64 * 1024 * 1024;
-const contentMemo = new Map<
-	string,
-	{ hash: string; tokens: number; keyBytes: number }
->();
-let contentMemoBytes = 0;
-const FNV1A_32_OFFSET = 0x811c9dc5;
-const FNV1A_32_PRIME = 0x01000193;
 
 export interface PiTailHygieneWalkInput {
 	messages: readonly unknown[];
@@ -48,74 +46,6 @@ interface DraftPart {
 	content: string;
 	tokens: number;
 	tag?: TagEntry;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object";
-}
-
-function fnv1a32(value: string): string {
-	let hash = FNV1A_32_OFFSET;
-	for (let index = 0; index < value.length; index += 1) {
-		hash ^= value.charCodeAt(index);
-		hash = Math.imul(hash, FNV1A_32_PRIME);
-	}
-	return (hash >>> 0).toString(16).padStart(8, "0");
-}
-
-function safeStableStringify(value: unknown): string {
-	const seen = new Set<object>();
-	try {
-		return (
-			JSON.stringify(value, (_key, current) => {
-				if (!isRecord(current) || Array.isArray(current)) return current;
-				if (seen.has(current)) return "[Circular]";
-				seen.add(current);
-				return Object.fromEntries(
-					Object.entries(current).sort(([left], [right]) =>
-						left.localeCompare(right),
-					),
-				);
-			}) ?? ""
-		);
-	} catch {
-		return "";
-	}
-}
-
-function memoizedContent(
-	kind: TailHygienePartKind,
-	content: string,
-): { hash: string; tokens: number } {
-	const key = `${kind}\0${content}`;
-	const cached = contentMemo.get(key);
-	if (cached) return cached;
-	const measured = {
-		hash: fnv1a32(key),
-		tokens: kind === "excluded" ? 0 : estimateTokens(content),
-		keyBytes: key.length * 2 + 32,
-	};
-	contentMemo.set(key, measured);
-	contentMemoBytes += measured.keyBytes;
-	while (
-		contentMemo.size > MAX_CONTENT_MEMO_ENTRIES ||
-		contentMemoBytes > MAX_CONTENT_MEMO_BYTES
-	) {
-		const oldest = contentMemo.keys().next().value;
-		if (typeof oldest !== "string") break;
-		const removed = contentMemo.get(oldest);
-		if (removed) contentMemoBytes -= removed.keyBytes;
-		contentMemo.delete(oldest);
-	}
-	return measured;
-}
-
-function memoizedTokens(kind: TailHygienePartKind, content: string): number {
-	return memoizedContent(kind, content).tokens;
-}
-
-function partHash(kind: TailHygienePartKind, content: string): string {
-	return memoizedContent(kind, content).hash;
 }
 
 function parseVisibleTag(
@@ -404,7 +334,7 @@ function excludedDraft(key: string, value: unknown): DraftPart {
 	return {
 		key,
 		kind: "excluded",
-		content: typeof value === "string" ? value : safeStableStringify(value),
+		content: safeStableStringify(value),
 		tokens: 0,
 	};
 }
@@ -456,9 +386,7 @@ function finalizeParts(
 	return {
 		u: Math.min(clampedT, Math.max(0, u)),
 		t: clampedT,
-		contentSignature: fnv1a32(
-			parts.map((part) => `${part.key}:${part.contentHash}`).join("\0"),
-		),
+		contentSignature: contentSignature(parts),
 		parts,
 	};
 }
@@ -599,10 +527,13 @@ export function measurePiTailHygiene(
 					drafts.push(excludedDraft(`${key}\0toolInput`, part));
 					continue;
 				}
-				const content = safeStableStringify(part.arguments);
-				if (!content) {
+				// Present-but-empty arguments still measure as a toolInput part
+				// (content ""), matching the core leg; only absent arguments are
+				// excluded from measurement.
+				if (part.arguments === undefined) {
 					drafts.push(excludedDraft(`${key}\0toolInput`, part));
 				} else {
+					const content = safeStableStringify(part.arguments);
 					drafts.push({
 						key: `${key}\0toolInput`,
 						kind: "toolInput",
@@ -617,39 +548,6 @@ export function measurePiTailHygiene(
 		}
 	}
 	return finalizeParts(drafts, input.protectedTags);
-}
-
-function sameMeasuredPrefix(
-	baseline: readonly TailHygienePartMeasurement[],
-	current: readonly TailHygienePartMeasurement[],
-): { valid: boolean; boundaryAdvanceU: number } {
-	if (current.length < baseline.length)
-		return { valid: false, boundaryAdvanceU: 0 };
-	let boundaryAdvanceU = 0;
-	for (let index = 0; index < baseline.length; index += 1) {
-		const before = baseline[index];
-		const after = current[index];
-		if (
-			before.key !== after.key ||
-			before.contentHash !== after.contentHash ||
-			before.kind !== after.kind ||
-			before.tokens !== after.tokens ||
-			before.tagNumber !== after.tagNumber ||
-			before.tagStatus !== after.tagStatus
-		) {
-			return { valid: false, boundaryAdvanceU: 0 };
-		}
-		if (!before.protected && after.protected)
-			return { valid: false, boundaryAdvanceU: 0 };
-		if (before.protected && !after.protected) {
-			if (after.tagStatus !== "active")
-				return { valid: false, boundaryAdvanceU: 0 };
-			boundaryAdvanceU += after.tokens;
-		} else if (before.uTokens !== after.uTokens) {
-			return { valid: false, boundaryAdvanceU: 0 };
-		}
-	}
-	return { valid: true, boundaryAdvanceU };
 }
 
 export function refreshPiTailHygieneBaseline(

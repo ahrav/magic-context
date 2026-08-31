@@ -1,5 +1,7 @@
 //! The wire shape matches JSON `HistorianProducer` sends and parses.
 
+// Broca conformance drives a Synapse primary, which ships only for `linux-x64-gnu`.
+#![cfg(target_os = "linux")]
 mod support;
 
 use std::sync::Arc;
@@ -489,6 +491,7 @@ async fn credential_snapshot_must_match_before_backend_spawn() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(backend.starts(), 1);
+    drop(client);
     host.shutdown().await.expect("host shutdown");
 }
 

@@ -1,5 +1,14 @@
 /**
  *
+ * Flow (presets-with-custom-escape, defaults-first):
+ *   1. Enable dreamer? (caller asks; this runs only when enabled)
+ *   2. Pick ONE dreamer model (applies to every task; per-task model overrides
+ *      stay an advanced config option — 8 model pickers is too much
+ *      friction for the wizard).
+ *   3. "Use recommended schedules?" → yes: return no `tasks` (schema defaults
+ *      apply, preserving v1 behavior). no: per-task loop, each task gets a
+ *      schedule PRESET picker (Nightly / Weekly / 6-hourly / Hourly / Disabled /
+ *      Custom cron…). Only the Custom branch drops to validated raw-cron entry.
  *
  */
 import { isValidCron } from "@magic-context/core/features/magic-context/dreamer/cron";

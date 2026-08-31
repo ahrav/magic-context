@@ -20,6 +20,10 @@ import {
     McHostClient,
     type BindIdentity,
 } from "@magic-context/core/shared/mc-host-client";
+import {
+    connectionFilePath,
+    managedSubtreePath,
+} from "@magic-context/core/shared/mc-host-lifecycle/paths";
 import { waitForChildExit } from "../process-exit";
 import { releaseRootPath, type VerifiedReleaseRoot } from "../prospective-holdout/release-root";
 
@@ -29,7 +33,6 @@ const FIXTURE_BINARY = join(
     "target/debug/examples/direct_host_fixture",
 );
 const CONTROL_FILE = "direct-host-control.sock";
-const CONNECTION_FILE = "subc-connection.json";
 const PID_FILE = "rust-e2e-pids.json";
 const MAX_LINE_BYTES = 64 * 1024;
 const MAX_LOG_BYTES = 256 * 1024;
@@ -172,7 +175,7 @@ function reapRecordedRustProcesses(): void {
                     entry.name.startsWith("opencode-e2e-"),
             )
             .map((entry) =>
-                join(tmpdir(), entry.name, "data", "cortexkit", PID_FILE),
+                join(managedSubtreePath(join(tmpdir(), entry.name, "data")), PID_FILE),
             );
     } catch {
         return;
@@ -716,16 +719,11 @@ export class HermeticMcHostStack {
         this.dataDir = options.dataDir;
         this.fixtureBin = options.fixtureBin;
         this.startTimeoutMs = options.startTimeoutMs;
-        this.connectionFile = join(
-            this.dataDir,
-            "cortexkit",
-            "run",
-            CONNECTION_FILE,
-        );
+        this.connectionFile = connectionFilePath(this.dataDir);
         this.controlPath = join(this.dataDir, CONTROL_FILE);
         this.fixtureConfigDir = join(this.dataDir, "fixture-config");
-        this.logPath = join(this.dataDir, "cortexkit", "direct-mc-host.log");
-        this.pidFilePath = join(this.dataDir, "cortexkit", PID_FILE);
+        this.logPath = join(managedSubtreePath(this.dataDir), "direct-mc-host.log");
+        this.pidFilePath = join(managedSubtreePath(this.dataDir), PID_FILE);
     }
 
     static async start(
@@ -915,7 +913,7 @@ export class HermeticMcHostStack {
 
     private async startHost(): Promise<void> {
         await this.closeClients();
-        mkdirSync(join(this.dataDir, "cortexkit"), { recursive: true });
+        mkdirSync(managedSubtreePath(this.dataDir), { recursive: true });
         chmodSync(this.dataDir, 0o700);
         const fixtureConfigRoot = join(this.fixtureConfigDir, "cortexkit");
         const fixtureConfigPath = join(fixtureConfigRoot, "magic-context.jsonc");
@@ -1109,7 +1107,7 @@ export class HermeticMcHostStack {
         if (!this.pidFileCreatedAtMs) return;
         const pid = this.child?.pid;
         try {
-            mkdirSync(join(this.dataDir, "cortexkit"), { recursive: true });
+            mkdirSync(managedSubtreePath(this.dataDir), { recursive: true });
             writeFileSync(
                 this.pidFilePath,
                 JSON.stringify({

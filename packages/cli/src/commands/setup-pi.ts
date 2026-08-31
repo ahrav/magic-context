@@ -11,7 +11,7 @@ import {
 import { runDreamerSetup } from "../lib/dreamer-setup";
 import { assertJsoncConfigsParseable, readJsoncConfigForUpdate } from "../lib/jsonc-config";
 import { pickModel } from "../lib/model-picker";
-import { getPiAgentConfigDir, getPiUserConfigPath, getPiUserExtensionsPath } from "../lib/paths";
+import { getPiAgentDir, getPiUserExtensionsPath, getSharedUserConfigPath } from "../lib/paths";
 import {
     detectPiBinary,
     getAvailableModels,
@@ -39,8 +39,8 @@ export interface SetupEnvironment {
     getPiVersion: typeof getPiVersion;
     getAvailableModels: typeof getAvailableModels;
     paths: {
-        getPiAgentConfigDir: typeof getPiAgentConfigDir;
-        getPiUserConfigPath: typeof getPiUserConfigPath;
+        getPiAgentConfigDir: typeof getPiAgentDir;
+        getPiUserConfigPath: typeof getSharedUserConfigPath;
         getPiUserExtensionsPath: typeof getPiUserExtensionsPath;
     };
 }
@@ -82,8 +82,8 @@ const DEFAULT_ENV: SetupEnvironment = {
     getPiVersion,
     getAvailableModels,
     paths: {
-        getPiAgentConfigDir,
-        getPiUserConfigPath,
+        getPiAgentConfigDir: getPiAgentDir,
+        getPiUserConfigPath: getSharedUserConfigPath,
         getPiUserExtensionsPath,
     },
 };

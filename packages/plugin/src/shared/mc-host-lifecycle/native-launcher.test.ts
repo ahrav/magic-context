@@ -36,6 +36,7 @@ function probeResultJson(ok: boolean): string {
         remediation: ok ? null : "run_daemon_start",
         effects: null,
         readiness: null,
+        shared_memory: null,
         checks: [],
         versions: {
             release: "0.38.0",

@@ -5,6 +5,7 @@ import {
     deriveMinForceEligibleTokens,
     deriveProtectedTailTokenTarget,
     MIN_FORCE_ELIGIBLE_TOKENS_CAP,
+    selectPerRunCap,
 } from "./protected-tail-boundary";
 import { buildTrueRawTokenIndexFromTokenCountsForTest } from "./read-session-true-raw-tokens";
 
@@ -16,6 +17,60 @@ describe("protected-tail size walk", () => {
         expect(index.findSuffixStartForTokens(301)).toBe(1);
         expect(index.findSuffixStartForTokens(300)).toBe(1);
         expect(index.findSuffixStartForTokens(0)).toBe(4);
+    });
+});
+
+describe("per-run cap tiers", () => {
+    // usable = round(contextLimit * executeThresholdPercentage / 100); the
+    // snapshot below fixes usable = 100_000 unless a case overrides it.
+    const base = { contextLimit: 125_000, executeThresholdPercentage: 80 };
+
+    it("selects the tier by usage percentage at the 80 and 95 boundaries", () => {
+        const N = 100;
+        // usable = 100_000: fraction term wins in every tier.
+        expect(selectPerRunCap({ ...base, N, usagePercentage: 79.9 })).toBe(25_000);
+        expect(selectPerRunCap({ ...base, N, usagePercentage: 80 })).toBe(35_000);
+        expect(selectPerRunCap({ ...base, N, usagePercentage: 94.9 })).toBe(35_000);
+        expect(selectPerRunCap({ ...base, N, usagePercentage: 95 })).toBe(50_000);
+    });
+
+    it("treats out-of-domain usage values as the non-emergency tier", () => {
+        const N = 100;
+        expect(selectPerRunCap({ ...base, N, usagePercentage: -1 })).toBe(25_000);
+        expect(selectPerRunCap({ ...base, N, usagePercentage: Number.NaN })).toBe(25_000);
+    });
+
+    it("never shrinks the cap when pressure rises across a tier boundary", () => {
+        for (const N of [100, 60_000, 200_000]) {
+            const nonEmergency = selectPerRunCap({ ...base, N, usagePercentage: 50 });
+            const force80 = selectPerRunCap({ ...base, N, usagePercentage: 80 });
+            const force95 = selectPerRunCap({ ...base, N, usagePercentage: 95 });
+            expect(force80).toBeGreaterThanOrEqual(nonEmergency);
+            expect(force95).toBeGreaterThanOrEqual(force80);
+        }
+    });
+
+    it("clamps the usable fraction at each tier's absolute term", () => {
+        // usable = 1_000_000: every tier's fraction exceeds its absolute clamp.
+        const big = { contextLimit: 1_250_000, executeThresholdPercentage: 80, N: 100 };
+        expect(selectPerRunCap({ ...big, usagePercentage: 50 })).toBe(100_000);
+        expect(selectPerRunCap({ ...big, usagePercentage: 80 })).toBe(150_000);
+        expect(selectPerRunCap({ ...big, usagePercentage: 95 })).toBe(250_000);
+    });
+
+    it("keeps the N-proportional floor when it exceeds the clamped fraction", () => {
+        // 2N / 3N / 4N all exceed each tier's absolute term at N = 60_000.
+        const N = 60_000;
+        expect(selectPerRunCap({ ...base, N, usagePercentage: 50 })).toBe(120_000);
+        expect(selectPerRunCap({ ...base, N, usagePercentage: 80 })).toBe(180_000);
+        expect(selectPerRunCap({ ...base, N, usagePercentage: 95 })).toBe(240_000);
+    });
+
+    it("caps each tier at its maximum even for a huge N", () => {
+        const N = 400_000;
+        expect(selectPerRunCap({ ...base, N, usagePercentage: 50 })).toBe(250_000);
+        expect(selectPerRunCap({ ...base, N, usagePercentage: 80 })).toBe(500_000);
+        expect(selectPerRunCap({ ...base, N, usagePercentage: 95 })).toBe(750_000);
     });
 });
 

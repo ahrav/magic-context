@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { connectionFilePath } from "../src/shared/mc-host-lifecycle/paths";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -368,7 +369,7 @@ options:
 
 const connectionFile = resolve(
     option("--connection-file") ??
-        join(homedir(), ".local", "share", "cortexkit", "run", "subc-connection.json"),
+        connectionFilePath(join(homedir(), ".local", "share")),
 );
 const moduleId = option("--module-id") ?? "magic-context";
 const projectRoot = resolve(option("--project-root") ?? process.cwd());
@@ -451,6 +452,11 @@ const moduleCounters = new Set([
     "tag_mint_tokenized_bytes",
     "tail_messages_emitted",
     "tail_units_matched",
+    "tokenize_bytes",
+    "tokenize_cache_bypassed",
+    "tokenize_cache_hits",
+    "tokenize_cache_misses",
+    "tokenize_calls",
     "trigger_tokenized_blocks",
 ]);
 const decisions = new Map<string, number>();

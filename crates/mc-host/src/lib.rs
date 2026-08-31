@@ -15,14 +15,8 @@ pub mod handler;
 pub mod harness_closure;
 pub mod lifecycle;
 #[doc(hidden)]
-pub mod provider_recovery;
-#[doc(hidden)]
-pub mod shm_provider;
+pub mod ring_transport;
 pub mod synapse;
-#[doc(hidden)]
-pub mod transport_negotiation;
-#[doc(hidden)]
-pub mod transport_provider;
 
 mod connection;
 mod control;
@@ -30,13 +24,14 @@ mod dispatch;
 mod file_mode;
 #[doc(hidden)]
 pub mod frame_channel;
-mod frame_read;
 mod instance;
 mod panic_boundary;
 mod routing;
 mod runtime;
-mod tcp_frame_channel;
-// `EnvelopeHeader` must be public because `shm_provider::send` and `recv` expose it in their signatures.
+#[doc(hidden)]
+pub mod setup_socket;
+// Ring setup and tests name raw envelope types, while the managed client API
+// exposes only responses, stream items, and call errors.
 #[doc(hidden)]
 pub mod wire;
 
@@ -58,8 +53,8 @@ pub use composite::{
 };
 pub use config::{ConfigError, HostConfig, HostInit, HostLimits, HostTiming, LivenessPolicy};
 pub use connection_file::{
-    read_for_client as read_connection_file, ConnectionFileError, ConnectionInfo, Endpoint,
-    DAEMON_ID_LEN, KEY_LEN, MAX_CONNECTION_FILE_LEN, MIN_KEY_LEN, SCHEMA_VERSION,
+    read_for_client as read_connection_file, ConnectionFileError, ConnectionInfo, DAEMON_ID_LEN,
+    KEY_LEN, MAX_CONNECTION_FILE_LEN, MIN_KEY_LEN, SCHEMA_VERSION,
 };
 pub use handler::{
     BindOutcome, HealthReport, HealthStatus, InitError, ManifestSnapshot, McHostHandler,
@@ -68,7 +63,7 @@ pub use handler::{
 };
 pub use instance::{
     data_dir_path, managed_dir_path, runtime_dir_path, InstanceError, CONNECTION_FILE_NAME,
-    MANAGED_DIR_NAME,
+    MANAGED_DIR_NAME, RUNTIME_DIR_NAME,
 };
 pub use lifecycle::{
     coordination_dir_path, is_canonical_payload_digest, lifecycle_dir_path, probe_lifecycle,
@@ -77,8 +72,9 @@ pub use lifecycle::{
     LIFECYCLE_RECORD_NAME, LIFETIME_LOCK_NAME, PAYLOAD_MANIFEST_DIGEST_LEN, TRANSACTION_LOCK_NAME,
     UNSUPPORTED_STATE_SCHEMA_REASON,
 };
-pub use runtime::{run, HostError};
-/// `MAX_FRAME_BODY_LEN` lets consumers reject oversized output before frame admission.
+pub use runtime::{run, run_with_publish_hook, HostError};
+/// The version-2 body cap. Published so a consumer preparing an output can
+/// gate on the same value frame admission enforces, rather than restating it.
 pub use wire::MAX_FRAME_BODY_LEN;
 /// `SUBC_LAUNCH_NONCE_ENV` and `SUBC_MODULE_ID_ENV` let module-side code use the names injected at spawn.
 pub use wire::{SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV};

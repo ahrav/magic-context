@@ -96,12 +96,7 @@ export function flushLogger(): void {
     flush();
 }
 
-/**
- */
-export function getLogFilePath(): string {
-    return getMagicContextLogPath();
-}
-
+// Flush remaining buffer on process exit
 if (!isTestEnv) {
     process.on("exit", flush);
 }

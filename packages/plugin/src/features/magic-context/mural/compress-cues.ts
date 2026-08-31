@@ -1,5 +1,8 @@
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import {
+    childSessionMessagesFetcher,
+    createChildSessionWithFence,
+} from "../../../hooks/magic-context/child-session-spawn";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {
@@ -15,7 +18,7 @@ import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from
 import { assertManifestCoversExactly } from "../dreamer/manifest-parser";
 import {
     DreamerProviderOutputFailureError,
-    providerOutputFailureFromInvalidManifest,
+    rethrowInvalidManifestAsProviderFailure,
 } from "../dreamer/provider-output-failure";
 import type { ProjectMemoryClaimSnapshot } from "../memory/storage-claim-current-state";
 import {
@@ -391,32 +394,23 @@ async function compressOneChunk(
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:compress-cues",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: agentSessionId as string },
-                        query: { directory: args.sessionDirectory, limit: 50 },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
+                fetchOutput: childSessionMessagesFetcher(
+                    args.client,
+                    agentSessionId as string,
+                    args.sessionDirectory,
+                    50,
+                ),
                 validateOutput: (messages) => {
                     if (hasLengthCappedOutput(messages)) {
                         throw new Error("compress-cues returned length-capped output");
                     }
                     const text = extractLatestAssistantText(messages);
                     if (!text) throw new Error("compress-cues returned no output");
-                    // A missing or truncated <cues> root rejects the whole chunk; do not partially apply the reply.
-                    try {
+                    // Fail-closed root parse: a missing/truncated <cues> root rejects
+                    // the whole chunk here (no partial apply from a truncated reply).
+                    rethrowInvalidManifestAsProviderFailure(messages, text, () => {
                         parseCuesManifest(text);
-                    } catch (error) {
-                        const providerFailure = providerOutputFailureFromInvalidManifest(
-                            messages,
-                            text,
-                        );
-                        if (providerFailure) throw providerFailure;
-                        throw error;
-                    }
+                    });
                     return text;
                 },
             },

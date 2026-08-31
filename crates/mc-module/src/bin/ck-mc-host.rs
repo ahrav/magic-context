@@ -121,7 +121,7 @@ struct ReadinessRecord {
 
 #[derive(serde::Serialize)]
 struct Readiness {
-    transport: ReadinessRecord,
+    shared_memory: ReadinessRecord,
 }
 
 #[derive(serde::Serialize)]
@@ -161,6 +161,7 @@ struct DaemonResult {
     remediation: Option<&'static str>,
     effects: Option<Effects>,
     readiness: Option<Readiness>,
+    shared_memory: Option<serde_json::Value>,
     checks: Vec<Check>,
     versions: Versions,
 }
@@ -176,6 +177,7 @@ impl DaemonResult {
             remediation: remediation_for(reason),
             effects: None,
             readiness: None,
+            shared_memory: None,
             checks: Vec::new(),
             versions: Versions::local(),
         }
@@ -1202,7 +1204,7 @@ fn cmd_start(
             result.versions.daemon = Some(daemon_ver);
             result.versions.proof = Some("current");
             result.readiness = Some(Readiness {
-                transport: ReadinessRecord {
+                shared_memory: ReadinessRecord {
                     state: "ready",
                     reason: "healthy",
                 },
@@ -1258,7 +1260,7 @@ fn start_outcome_result(
     if outcome.ok {
         result.versions.proof = Some("current");
         result.readiness = Some(Readiness {
-            transport: ReadinessRecord {
+            shared_memory: ReadinessRecord {
                 state: "ready",
                 reason: "healthy",
             },

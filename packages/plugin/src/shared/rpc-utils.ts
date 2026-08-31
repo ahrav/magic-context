@@ -30,7 +30,7 @@ export interface RpcPortFileRecord {
  * Stable hash for a project directory — scopes RPC port files per-project
  * so different project directories use separate RPC port-file directories unless their 64-bit hashes collide.
  */
-export function projectHash(directory: string): string {
+function projectHash(directory: string): string {
     const normalized = directory.replace(/\/+$/, "");
     return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
 }

@@ -1,4 +1,6 @@
-//! The module provides an in-process echo host for tests that require a live wire endpoint.
+//! Echo host support: one handler that echoes every request body, plus an
+//! in-process host runner for tests that need a live ring endpoint without
+//! a child process.
 
 #![allow(dead_code)]
 
@@ -6,10 +8,12 @@ use std::path::{Path, PathBuf};
 
 pub struct EchoHandler;
 
+pub const ECHO_MODULE_ID: &str = "perf-echo";
+
 impl mc_host::McHostHandler for EchoHandler {
     fn manifests(&self) -> Vec<mc_host::ManifestSnapshot> {
         vec![mc_host::ManifestSnapshot {
-            module_id: "perf-echo".to_owned(),
+            module_id: ECHO_MODULE_ID.to_owned(),
             module_version: "0.0.0".to_owned(),
             provides: vec![serde_json::json!({
                 "role": "tool_provider",

@@ -27,13 +27,18 @@ export interface PiDreamerOptions {
 	/** `loadPiConfig()` resolves `config` to a runnable `DreamerConfig`. */
 	config: DreamerConfig;
 	/**
-	 * Dreamer uses `embeddingConfig` for memory maintenance and re-embedding.
-	 * Dreamer uses deterministic file gates to maintain near-duplicate and stale memories.
-	 * Dreamer re-embeds memory content rewritten by `improve`.
+	 * Dreamer needs the real embedding config so it can
+	 * (a) maintain near-duplicate/stale memories using deterministic file gates and
+	 * (b) re-embed memory content when it gets rewritten by `improve`.
+	 * A hardcoded `{provider:"off"}` would skip both
+	 * paths even when the user has a real embedding model configured.
 	 */
 	embeddingConfig: EmbeddingConfig;
 	/**
-	 * Dreamer needs the configured `memory.enabled` gate.
+	 * Dreamer needs the real memory.enabled gate so the
+	 * memory-promotion pipeline (consolidation + improve + archive) can
+	 * actually write to the project memory store. A hardcoded `false`
+	 * would make dreamer's memory tasks a no-op.
 	 */
 	memoryEnabled: boolean;
 	retinaHandoff?: boolean;

@@ -1,4 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
+import { runImmediate } from "../../../shared/sqlite";
 import { deleteDreamState, getDreamState, setDreamState } from "./storage-dream-state";
 
 const LEASE_DURATION_MS = 2 * 60 * 1000; // 2 minutes — renewed periodically during task execution
@@ -88,28 +89,12 @@ export function leaseOwnershipMatches(
     );
 }
 
-// Each lease mutation uses `BEGIN IMMEDIATE` because the lease state spans four rows.
-// `BEGIN IMMEDIATE` acquires SQLite's write lock before the transaction reads lease state.
-// A deferred `BEGIN` acquires SQLite's write lock only at the first write.
-// The write lock makes each lease mutation atomic across processes sharing the SQLite file.
-// Without `BEGIN IMMEDIATE`, two readers can observe an inactive lease before either acquires the write lock.
-function runImmediate<T>(db: Database, body: () => T): T {
-    db.exec("BEGIN IMMEDIATE");
-    let committed = false;
-    try {
-        const result = body();
-        db.exec("COMMIT");
-        committed = true;
-        return result;
-    } finally {
-        if (!committed) {
-            try {
-                db.exec("ROLLBACK");
-            } catch {
-            }
-        }
-    }
-}
+// The lease spans four dream_state rows (holder/heartbeat/expiry/generation), so it can't
+// be a single-statement CAS like compartment-lease.ts. Instead each mutation
+// runs under `runImmediate` (shared/sqlite.ts): without IMMEDIATE, two
+// processes could both read isLeaseActive() = false under WAL snapshot
+// isolation and both write — double-acquiring the lease and spawning duplicate
+// dreamer workers.
 
 export interface LeaseAcquisition {
     acquiredAt: number;

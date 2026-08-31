@@ -1,5 +1,6 @@
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
+use super::json::{media_kind, opaque_arc, set_string, set_value, string_field, synth_tool_id};
 use crate::ck_wire::{
     CkIngressMessage, CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage, HarnessMeta,
     MediaBlock, MediaKind, MessageOrigin, OpaqueBlock, ProviderExtras, ResultBlock,
@@ -775,13 +776,6 @@ fn native_tool_id(id: &str, extras: &ProviderExtras, existing: Option<String>) -
     id.to_string()
 }
 
-fn synth_tool_id(ordinal: u64, part_index: usize, tool_name: &str, input: &Value) -> String {
-    format!(
-        "synth-tool-{ordinal}-{part_index}-{tool_name}-{}",
-        stable_hash_prefix(input, 12)
-    )
-}
-
 fn pi_extras_for_text(part: &Value) -> ProviderExtras {
     let mut extras = ProviderExtras::new();
     if let Some(signature) = string_field(part, "textSignature") {
@@ -1018,59 +1012,12 @@ fn render_media_part(media: &MediaBlock) -> Value {
     part
 }
 
-fn media_kind(media_type: &str) -> MediaKind {
-    if media_type.starts_with("image/") {
-        MediaKind::Image
-    } else if media_type.starts_with("audio/") {
-        MediaKind::Audio
-    } else if media_type.starts_with("video/") {
-        MediaKind::Video
-    } else if media_type == "application/pdf" {
-        MediaKind::Document
-    } else {
-        MediaKind::File
-    }
-}
-
 fn opaque_block(kind: &str, raw: Value, arc: Option<Value>) -> CkWireBlock {
-    CkWireBlock::bare(CkKind::Opaque(OpaqueBlock {
-        source: json!({ "type": "harness", "harness": HARNESS }),
-        kind: kind.to_string(),
-        raw,
-        arc,
-    }))
-}
-
-fn opaque_arc(part: &Value) -> Option<Value> {
-    let approval_id = string_field(part, "approvalId")?;
-    let part_type = string_field(part, "type").unwrap_or_default();
-    let role = if part_type.contains("response") {
-        "Response"
-    } else {
-        "Request"
-    };
-    Some(json!({ "kind": "Approval", "id": approval_id, "role": role }))
+    super::json::opaque_block(HARNESS, kind, raw, arc)
 }
 
 fn tool_name(part: &Value) -> String {
     string_field(part, "name").unwrap_or_else(|| "tool".to_string())
-}
-
-fn string_field(value: &Value, key: &str) -> Option<String> {
-    value.get(key).and_then(Value::as_str).map(str::to_string)
-}
-
-fn set_string(value: &mut Value, key: &str, text: &str) {
-    set_value(value, key, Value::String(text.to_string()));
-}
-
-fn set_value(value: &mut Value, key: &str, next: Value) {
-    if !value.is_object() {
-        *value = Value::Object(Map::new());
-    }
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert(key.to_string(), next);
-    }
 }
 
 #[cfg(test)]

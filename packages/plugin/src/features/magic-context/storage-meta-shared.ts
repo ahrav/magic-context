@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { getHarness } from "../../shared/harness";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import type { Database } from "../../shared/sqlite";
+import { ensureColumn, tableColumnSet } from "./storage-schema-helpers";
 import type { SessionMeta } from "./types";
 
 export interface SessionMetaRow {
@@ -182,15 +183,6 @@ export const META_COLUMNS: Record<string, string> = {
 };
 
 export const BOOLEAN_META_KEYS = new Set(["isSubagent", "compartmentInProgress", "cacheAlertSent"]);
-
-function ensureSessionFactsVersionColumn(db: Database): void {
-    const rows = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name?: string }>;
-    if (!rows.some((row) => row.name === "session_facts_version")) {
-        db.exec(
-            "ALTER TABLE session_meta ADD COLUMN session_facts_version INTEGER NOT NULL DEFAULT 0",
-        );
-    }
-}
 
 export const NULL_BIND_META_KEYS = new Set([
     "cachedM0Bytes",
@@ -395,7 +387,7 @@ export function ensureSessionMetaRow(db: Database, sessionId: string): void {
  * Using the caller's transaction prevents a race between the session_facts write and version bump.
  */
 export function bumpSessionFactsVersion(db: Database, sessionId: string): void {
-    ensureSessionFactsVersionColumn(db);
+    ensureColumn(db, "session_meta", "session_facts_version", "INTEGER NOT NULL DEFAULT 0");
     ensureSessionMetaRow(db, sessionId);
     db.prepare(
         "UPDATE session_meta SET session_facts_version = COALESCE(session_facts_version, 0) + 1 WHERE session_id = ?",
@@ -553,11 +545,7 @@ export function persistCachedM0(
 
 export function clearCachedM0M1(db: Database, sessionId: string): void {
     ensureSessionMetaRow(db, sessionId);
-    const existingColumns = new Set(
-        (db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name?: string }>).map(
-            (column) => column.name,
-        ),
-    );
+    const existingColumns = tableColumnSet(db, "session_meta");
     const clears: Array<[string, string | number | null]> = [
         ["cached_m0_bytes", null],
         ["cached_m0_mural_data_url", null],

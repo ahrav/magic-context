@@ -17,7 +17,7 @@ import {
 	updateNote,
 } from "@magic-context/core/features/magic-context/storage";
 
-import { createTestDb, fakeContext } from "../test-utils.test";
+import { createTestDb, fakeContext } from "../test-utils";
 import { createCtxNoteTool } from "./ctx-note";
 import { createCtxSearchTool } from "./ctx-search";
 

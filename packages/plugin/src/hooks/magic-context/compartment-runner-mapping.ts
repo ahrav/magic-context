@@ -1,3 +1,5 @@
+import type { PluginContext } from "../../plugin/types";
+import { normalizeSDKResponse } from "../../shared";
 import type { ParsedCompartment } from "./compartment-parser";
 import type { CandidateCompartment } from "./compartment-runner-types";
 
@@ -57,4 +59,25 @@ export function mapParsedCompartmentsToChunk(
     }
 
     return { ok: true, compartments: mapped };
+}
+
+/**
+ * The session's own directory when the SDK can supply it, else `fallback`.
+ * `session.get` failure is non-fatal by design — runners fall back to the
+ * deps-supplied directory.
+ */
+export async function resolveSessionDirectory(
+    client: PluginContext["client"],
+    sessionId: string,
+    fallback: string,
+): Promise<string> {
+    const parentSessionResponse = await client.session
+        .get({ path: { id: sessionId } })
+        .catch(() => null);
+    const parentSession = normalizeSDKResponse(
+        parentSessionResponse,
+        null as { directory?: string } | null,
+        { preferResponseOnMissingData: true },
+    );
+    return parentSession?.directory ?? fallback;
 }

@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
-import type { GitCommit } from "./git-commits/git-log-reader";
 import {
     countEmbeddedCommits,
     saveCommitEmbedding,
 } from "./git-commits/storage-git-commit-embeddings";
 import { upsertCommits } from "./git-commits/storage-git-commits";
+import { makeSeededGitCommit } from "./git-commits/test-support";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import {
     _resetProjectEmbeddingRegistryForTests,
@@ -80,17 +80,6 @@ function synapseConfig(fingerprint: string): EmbeddingConfig {
     } as unknown as EmbeddingConfig;
 }
 
-function makeGitCommit(shaSeed: string, committedAtMs: number): GitCommit {
-    const sha = shaSeed.padEnd(40, shaSeed);
-    return {
-        sha,
-        shortSha: sha.slice(0, 7),
-        message: `commit ${shaSeed}`,
-        author: "dev@example.com",
-        committedAtMs,
-    };
-}
-
 function primaryModelId(projectIdentity: string): string {
     return getProjectEmbeddingSnapshot(projectIdentity)?.modelId ?? "off";
 }
@@ -144,7 +133,9 @@ describe("shadow embedding historical backfill", () => {
         count: number,
     ): void {
         const modelId = primaryModelId(projectIdentity);
-        const commits = Array.from({ length: count }, (_, i) => makeGitCommit(`s${i}x`, 1000 + i));
+        const commits = Array.from({ length: count }, (_, i) =>
+            makeSeededGitCommit(`s${i}x`, 1000 + i),
+        );
         upsertCommits(db, projectIdentity, commits);
         for (const commit of commits) {
             saveCommitEmbedding(db, commit.sha, new Float32Array([1, 1]), modelId);
@@ -221,8 +212,8 @@ describe("shadow embedding historical backfill", () => {
             "/tmp/shadow-rotate-commits",
         );
         upsertCommits(db, projectIdentity, [
-            makeGitCommit("c-a", 1000),
-            makeGitCommit("c-b", 2000),
+            makeSeededGitCommit("c-a", 1000),
+            makeSeededGitCommit("c-b", 2000),
         ]);
         const modelId = primaryModelId(projectIdentity);
         saveCommitEmbedding(db, "c-a".padEnd(40, "c-a"), new Float32Array([1, 1]), modelId);
@@ -484,7 +475,7 @@ describe("shadow lane writes through versioned synapse receipts", () => {
         );
         const db = useTempDb();
         const projectIdentity = "git:shadow-detailed";
-        upsertCommits(db, projectIdentity, [makeGitCommit("d-a", 1000)]);
+        upsertCommits(db, projectIdentity, [makeSeededGitCommit("d-a", 1000)]);
         registerProjectEmbedding(
             db,
             projectIdentity,
@@ -540,7 +531,7 @@ describe("shadow lane writes through versioned synapse receipts", () => {
         );
         const db = useTempDb();
         const projectIdentity = "git:shadow-detailed-fail";
-        upsertCommits(db, projectIdentity, [makeGitCommit("f-a", 1000)]);
+        upsertCommits(db, projectIdentity, [makeSeededGitCommit("f-a", 1000)]);
         registerProjectEmbedding(
             db,
             projectIdentity,
