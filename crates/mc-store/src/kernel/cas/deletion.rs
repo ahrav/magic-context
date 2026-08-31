@@ -503,6 +503,11 @@ fn validate_request(request: &ArtifactDeletionRequest) -> Result<(), ArtifactErr
     if request.deleted_at < 0 {
         return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
     }
+    // The commit rejects a malformed request digest, which would otherwise happen
+    // after the purge intent is already durable.
+    if !is_artifact_digest(&request.intent.request_digest) {
+        return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
+    }
     if request.kind == ArtifactDeletionKind::Purge {
         for field in [
             request.operator_id.as_deref(),
@@ -535,10 +540,11 @@ fn load_artifact_state(
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
         ArtifactDeletionIdentity::EvidenceId(evidence_id) if !evidence_id.trim().is_empty() => {
+            let evidence_id = redact(evidence_id).text;
             let stored: String = connection
                 .query_row(
                     "SELECT artifact_digest FROM evidence_meta WHERE evidence_id=?1",
-                    [evidence_id],
+                    [&evidence_id],
                     |row| row.get(0),
                 )
                 .optional()

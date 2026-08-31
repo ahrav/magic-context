@@ -985,3 +985,63 @@ fn purge_audit_fields_are_redacted_in_every_durable_sink() {
         );
     }
 }
+
+#[test]
+fn a_rejected_commit_intent_leaves_no_durable_purge_record() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "bad-intent", b"bad-intent");
+    let mut request = delete_request("bad-intent", &handle.digest, ArtifactDeletionKind::Purge);
+    request.intent.request_digest = "not-a-digest".to_string();
+
+    assert_eq!(
+        store.delete_artifact(request).unwrap_err().kind(),
+        ArtifactErrorKind::InvalidInput
+    );
+
+    let log = root.path().join("purge-intent.jsonl");
+    let contents = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !contents.contains(&handle.digest),
+        "a rejected purge left a durable intent record"
+    );
+    assert_eq!(
+        inspect(root.path())
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_purge_tombstones WHERE artifact_digest=?1",
+                [&handle.digest],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert!(object_path(root.path(), &handle.digest).exists());
+}
+
+#[test]
+fn deletion_accepts_the_evidence_id_the_caller_supplied_at_ingestion() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let external_id = format!("evidence-{secret}");
+    let mut request = ingest_request("redacted-identity", b"redacted-identity");
+    request.evidence_id = external_id.clone();
+    let handle = store.ingest_artifact(request).unwrap();
+
+    let deletion = store
+        .delete_artifact(ArtifactDeletionRequest {
+            intent: intent("delete-redacted-identity"),
+            identity: ArtifactDeletionIdentity::EvidenceId(external_id),
+            kind: ArtifactDeletionKind::Delete,
+            operator_id: None,
+            target_locator: None,
+            reason: None,
+            deleted_at: 42,
+        })
+        .unwrap();
+
+    assert_eq!(deletion.digest, handle.digest);
+    assert!(!deletion.affected_object_ids.is_empty());
+}

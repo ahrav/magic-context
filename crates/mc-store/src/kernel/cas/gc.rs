@@ -30,8 +30,6 @@ pub enum ArtifactGcFault {
 struct Candidate {
     digest: String,
     modified_at: Option<i64>,
-    has_object: bool,
-    has_reclaim_state: bool,
 }
 
 impl KernelStore {
@@ -47,9 +45,6 @@ impl KernelStore {
         }
         let mut result = ArtifactGcResult::default();
         for candidate in candidates {
-            if !candidate.has_object && !candidate.has_reclaim_state {
-                continue;
-            }
             match self.reclaim_candidate(&candidate, now, fault_after_reclaiming) {
                 Ok(Some(bytes)) => {
                     result.reclaimed_objects += 1;
@@ -120,44 +115,40 @@ impl KernelStore {
         let reader = self.lock_reader()?;
         let mut statement = reader
             .prepare(
-                "SELECT artifact_digest,0 FROM evidence_meta
-                 UNION ALL SELECT artifact_digest,1 FROM artifact_ingestion_reservations
-                           WHERE state='Reclaiming'
-                 UNION ALL SELECT artifact_digest,1 FROM artifact_pending_unlinks",
+                "SELECT artifact_digest FROM artifact_ingestion_reservations
+                   WHERE state='Reclaiming'
+                 UNION SELECT artifact_digest FROM artifact_pending_unlinks",
             )
             .map_err(|_| KernelError::Io)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? == 1))
-            })
+        let reclaim_state = statement
+            .query_map([], |row| row.get::<_, String>(0))
             .map_err(|_| KernelError::Io)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| KernelError::Io)?;
         drop(statement);
         drop(reader);
 
+        // Reclaiming needs bytes to unlink or durable reclaim state to retire.
+        // `evidence_meta` outlives both, and `prepare_reclaim` rechecks liveness per
+        // candidate, so a pass costs the object scan plus outstanding reclaim rows
+        // rather than the whole reference history.
         let mut candidates: BTreeMap<String, Candidate> = BTreeMap::new();
-        for (digest, has_reclaim_state) in rows {
+        for digest in reclaim_state {
             if !is_artifact_digest(&digest) {
                 continue;
             }
-            candidates
-                .entry(digest.clone())
-                .and_modify(|candidate| candidate.has_reclaim_state |= has_reclaim_state)
-                .or_insert(Candidate {
+            candidates.insert(
+                digest.clone(),
+                Candidate {
                     digest,
                     modified_at: None,
-                    has_object: false,
-                    has_reclaim_state,
-                });
+                },
+            );
         }
         for object in scan_objects(&self.artifacts_path.join("objects"))? {
             candidates
                 .entry(object.digest.clone())
-                .and_modify(|candidate| {
-                    candidate.modified_at = object.modified_at;
-                    candidate.has_object = true;
-                })
+                .and_modify(|candidate| candidate.modified_at = object.modified_at)
                 .or_insert(object);
         }
         Ok(candidates.into_values().collect())
@@ -364,8 +355,6 @@ fn scan_objects(root: &std::path::Path) -> Result<Vec<Candidate>, KernelError> {
                 objects.push(Candidate {
                     digest,
                     modified_at,
-                    has_object: true,
-                    has_reclaim_state: false,
                 });
             }
         }
