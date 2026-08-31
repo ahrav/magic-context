@@ -66,6 +66,42 @@ class MemoryStore implements RolloutStore {
 }
 
 /** `findIndex` returns -1 for an absent arm and `splice(-1, 1)` then removes the last record, so the test would exercise a different arm and could pass for the wrong reason. commentlint: allow(JUDGE) */
+function storedRecord(armId: ArmId): RolloutRecord {
+    return {
+        schema: "paired-delta-rollout/v1",
+        poolManifestFingerprint: "a".repeat(64),
+        scenarioId: scenario.scenarioId,
+        armId,
+        replicateIndex: 0,
+        repoCommit: "commit-a",
+        pinnedProviderId: "mock-live",
+        pinnedSnapshotId: "snapshot-2026-08-01",
+        echoedProviderId: null,
+        echoedModelId: null,
+        baseScriptFingerprint: baseScriptFingerprint(scenario),
+        intervention: interventionFor(scenario, armId),
+        cell: {
+            armId,
+            checksPassed: 0,
+            checksTotal: 0,
+            criticalPassed: 0,
+            criticalTotal: 0,
+            invalidSuccess: false,
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+        },
+        checks: [],
+        usage: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+        costUsd: 0.25,
+        priorAttemptsCostUsd: 0,
+        maxAttemptCostUsd: 0.25,
+        costSource: "estimated",
+        wallClockMs: 1,
+        turns: 0,
+        harnessDisposed: true,
+    };
+}
+
 function dropRecord(store: MemoryStore, armId: ArmId): void {
     const index = store.records.findIndex((record) => record.armId === armId);
     if (index < 0) throw new Error(`missing ${armId} record`);
@@ -1114,6 +1150,107 @@ describe("paired-delta runner", () => {
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
+    });
+
+    it("merges into the file rather than overwriting another owner's records", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-merge-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.list();
+
+            const mine = storedRecord("mc-on");
+            store.put(mine);
+
+            // Another owner writes a coordinate this instance has never seen,
+            // which its cached snapshot therefore cannot contain.
+            const theirs = storedRecord("mc-off");
+            writeFileSync(path, JSON.stringify([mine, theirs]));
+
+            store.put(storedRecord("compaction"));
+
+            const written = new FileRolloutStore(path, { readOnly: true }).list();
+            expect(written.map(({ armId }) => armId).sort()).toEqual([
+                "compaction",
+                "mc-off",
+                "mc-on",
+            ]);
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("rejects a stored attempt total that cannot be summed", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-total-"));
+        try {
+            const path = join(root, "records.json");
+            // Both figures are finite; their sum is what the pre-scan adds.
+            writeFileSync(
+                path,
+                JSON.stringify([{
+                    ...storedRecord("mc-on"),
+                    costUsd: Number.MAX_VALUE,
+                    priorAttemptsCostUsd: Number.MAX_VALUE,
+                }]),
+            );
+
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                .toThrow(/attempt-cost-total-invalid/);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("reserves the failure estimate before starting an arm", async () => {
+        const store = new MemoryStore();
+        // A first arm priced far below the scenario's full-context fallback.
+        const cheap = {
+            ...options(store),
+            deskCostCeilingUsd: 0,
+            pricesPerMillionTokens: { input: 1, output: 0, cacheCreation: 0, cacheRead: 0 },
+        };
+        const worstCase = (scenario.modelContextLimit * 1) / 1_000_000;
+        const events: string[] = [];
+
+        const result = await runPairedDelta(
+            // Room for the first arm's own cost but not for a second arm's
+            // failure charge.
+            { ...cheap, maxCostUsd: worstCase, store },
+            dependencies(undefined, events),
+        );
+
+        expect(result.status).toBe("cost-cap-reached");
+        expect(events.filter((event) => event.startsWith("create:"))).toEqual(["create:mc-on"]);
+    });
+
+    it("records a rollout whose disposal throws synchronously", async () => {
+        const store = new MemoryStore();
+        const result = await runPairedDelta(
+            options(store),
+            {
+                now: () => 100,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            return observation(coordinate.armId);
+                        },
+                        // Throws before returning a promise at all.
+                        dispose: (() => {
+                            throw new Error("harness disposal exploded");
+                        }) as unknown as () => Promise<void>,
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("harness-unreclaimed");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+        });
+        // The paid rollout still reaches the store.
+        expect(store.records).toHaveLength(1);
     });
 
     it("classifies a malformed check vector as an exclusion and continues", async () => {

@@ -245,6 +245,10 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
         ] as const) {
             if (!Number.isFinite(value) || (value as number) < 0) fail(`${label}-invalid`);
         }
+        /** Each figure can be finite while their sum is not, and that sum is what the pre-scan adds to `spentUsd`: one `Infinity` there makes every later cap comparison false and serializes as `null`. commentlint: allow(JUDGE) */
+        if (!Number.isFinite((record.priorAttemptsCostUsd as number) + (record.costUsd as number))) {
+            fail("attempt-cost-total-invalid");
+        }
         if (record.costSource !== "observed" && record.costSource !== "estimated") {
             fail("cost-source-invalid");
         }
@@ -374,15 +378,15 @@ export class FileRolloutStore implements RolloutStore {
             throw new Error(`rollout store ${this.path} was opened read-only`);
         }
         this.acquire();
-        /** Ownership is re-proved at the write rather than assumed from acquisition. Reclaiming an expired lock cannot be made atomic against a concurrent reclaimer, so the lock is treated as advisory here: publishing a whole-file snapshot is the operation that would erase another runner's paid records, and it refuses rather than proceeding on a claim this process may no longer hold. commentlint: allow(JUDGE) */
+        /** Ownership is re-proved here, but a check cannot stay true through the write that follows it, so it is a fast failure rather than the safety property. What makes a lost lock harmless is the merge below. commentlint: allow(JUDGE) */
         if (!lockHeldByThisProcess(this.lockPath)) {
-            this.held = null;
-            ownedRecordPaths.delete(this.claim);
+            this.invalidate();
             throw new RolloutStoreBusyError(
                 `rollout store ${this.path} lock was taken over by another owner`,
             );
         }
-        const records = this.load();
+        /** The write merges into what the file holds now, not into the snapshot this instance cached: an intervening owner's records are read back and kept, so no interleaving of lock takeover and publication can erase a coordinate this process never knew about. The cached snapshot is replaced by the merged state, which also means a stale cache cannot survive a lost lock. commentlint: allow(JUDGE) */
+        const records = this.reload();
         const key = coordinateKey(record);
         const index = this.indexByCoordinate.get(key);
         if (index !== undefined && records[index]?.cell.runHealth === "completed") {
@@ -397,6 +401,18 @@ export class FileRolloutStore implements RolloutStore {
         // The records file feeds spend and resume decisions for later runs, so
         // it stays owner-only even though report artifacts are world-readable.
         publishJsonAtomically(records, this.path, { mode: 0o600 });
+    }
+
+    private invalidate(): void {
+        this.records = null;
+        this.indexByCoordinate = new Map();
+        this.held = null;
+        ownedRecordPaths.delete(this.claim);
+    }
+
+    private reload(): RolloutRecord[] {
+        this.records = null;
+        return this.load();
     }
 
     private load(): RolloutRecord[] {
@@ -650,7 +666,12 @@ export async function runPairedDelta(
                     status = "deadline-reached";
                     return null;
                 }
-                if (startedAny && spentUsd + reserveUsd > options.maxCostUsd) {
+                /** A failure at this arm is charged `max(reserve, worstCase)`, so admission has to hold that floor: a cheap first arm otherwise leaves the reserve below the fallback and admits a call whose own failure charge passes the cap. commentlint: allow(JUDGE) */
+                const admissionReserveUsd = Math.max(
+                    reserveUsd,
+                    worstCaseUsd(scenario, options.pricesPerMillionTokens),
+                );
+                if (startedAny && spentUsd + admissionReserveUsd > options.maxCostUsd) {
                     status = "cost-cap-reached";
                     return null;
                 }
@@ -1146,8 +1167,12 @@ async function settleDisposal(
         );
     });
     try {
+        /** `dispose()` is invoked inside the promise chain, so a handler that throws synchronously — before it ever returns a promise — becomes this outcome instead of escaping `runArm`'s `finally` and losing the paid rollout. commentlint: allow(JUDGE) */
         return await Promise.race([
-            handle.dispose().then(() => "reclaimed" as const, (error: unknown) => ({ error })),
+            (async () => handle.dispose())().then(
+                () => "reclaimed" as const,
+                (error: unknown) => ({ error }),
+            ),
             grace,
         ]);
     } finally {
@@ -1188,32 +1213,32 @@ async function withRolloutDeadline<T>(
     remainingMs: number,
 ): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    /** Armed before `work()` runs: a factory that spawns synchronously would otherwise consume the budget before the timer existed and then race against a full fresh allowance. commentlint: allow(JUDGE) */
+    const expiry = new Promise<never>((_, reject) => {
+        let left = remainingMs;
+        const arm = (): void => {
+            const chunk = Math.min(left, TIMER_MAX_MS);
+            left -= chunk;
+            timer = setTimeout(() => {
+                if (left > 0) {
+                    arm();
+                    return;
+                }
+                reject(new RolloutDeadlineError(
+                    `rollout still in flight after the ${remainingMs}ms deadline budget`,
+                ));
+            }, chunk);
+        };
+        arm();
+    });
     const pending = work();
     try {
-        return await Promise.race([
-            pending,
-            new Promise<never>((_, reject) => {
-                let left = remainingMs;
-                const arm = (): void => {
-                    const chunk = Math.min(left, TIMER_MAX_MS);
-                    left -= chunk;
-                    timer = setTimeout(() => {
-                        if (left > 0) {
-                            arm();
-                            return;
-                        }
-                        reject(new RolloutDeadlineError(
-                            `rollout still in flight after the ${remainingMs}ms deadline budget`,
-                        ));
-                    }, chunk);
-                };
-                arm();
-            }),
-        ]);
+        return await Promise.race([pending, expiry]);
     } finally {
         clearTimeout(timer);
         // On timeout the losing promise settles later with no consumer;
         // swallow its rejection so it cannot surface as unhandled.
         pending.catch(() => {});
+        expiry.catch(() => {});
     }
 }

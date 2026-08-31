@@ -236,8 +236,8 @@ const CREDENTIAL_VALUE_FORMATS: ReadonlyArray<{ label: string; pattern: RegExp }
     { label: "Google API key", pattern: /^AIza[0-9A-Za-z_-]{30,}/ },
     { label: "Slack token", pattern: /^xox[abprs]-[0-9A-Za-z-]{10,}/ },
     { label: "PEM private key", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
-    /** The username may be empty — `redis://:secret@host` is the common password-only shape. commentlint: allow(JUDGE) */
-    { label: "credential-bearing URI", pattern: /^[a-z][a-z0-9+.-]*:\/\/[^/@\s:]*:[^/@\s]+@/i },
+    /** Any userinfo at all: the password may be empty (`redis://:secret@host`) or absent (`https://ghp_token@host`), and a bare token in the username position is the shape a personal access token takes. commentlint: allow(JUDGE) */
+    { label: "credential-bearing URI", pattern: /^[a-z][a-z0-9+.-]*:\/\/[^/@\s]+@/i },
 ];
 
 /** Returns the format a value announces itself as, or null. The label never contains the value. */

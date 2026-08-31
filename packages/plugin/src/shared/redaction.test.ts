@@ -186,6 +186,10 @@ describe("credentialValueFormat", () => {
         expect(credentialValueFormat("redis://:supersecret@cache.internal:6379")).toBe(
             "credential-bearing URI",
         );
+        // A bare token in the username position, with no password at all.
+        expect(credentialValueFormat("https://ghp_abcdefghijklmnop@github.internal")).toBe(
+            "credential-bearing URI",
+        );
         expect(credentialValueFormat("-----BEGIN RSA PRIVATE KEY-----")).toBe("PEM private key");
 
         for (const value of [
