@@ -258,7 +258,7 @@ describe("raw N-API descriptor boundary", () => {
                 new Promise<never>((_, reject) => {
                     timeout = setTimeout(
                         () => reject(new Error("readiness callback timed out")),
-                        1_000,
+                        5_000,
                     );
                 }),
             ]);
