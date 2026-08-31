@@ -2445,3 +2445,124 @@ fn quarantining_a_supported_subject_records_a_quarantine_not_a_demotion() {
         1
     );
 }
+
+/// `LATEST_SUBJECT_DECISION_PREDICATE` and `load_prior_decision`'s ordered seek are
+/// two formulations of "latest decision for a subject". They must agree, including on
+/// the tie-break between rows sharing a `commit_seq`, or a stale prior could drive one
+/// path while the other reads the current row.
+#[test]
+fn both_latest_decision_formulations_choose_the_same_row() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    // Several decisions for one subject, including two in one commit so the
+    // admission_decision_id tie-break is exercised rather than just commit_seq.
+    stage(&store, "tied");
+    let mut promoted = request("tied");
+    promoted.source_class = Some(SourceClass::ModelInference);
+    promoted.taint_class = Some(TaintClass::AssistantInference);
+    promoted.event.kind = EventKind::Verify;
+    promoted.event.trigger_object_id = None;
+    promoted.event.approval_object_id = Some("approval".to_string());
+    assert_eq!(admit(&store, promoted, "tied", "tied"), "admit");
+    store
+        .commit(intent("tied-pair"), |envelope| {
+            for kind in [EventKind::MarkStale, EventKind::MarkDisputed] {
+                let mut event = subject_request("object-tied", kind);
+                event.source_class = Some(SourceClass::ModelInference);
+                event.taint_class = Some(TaintClass::AssistantInference);
+                event.event.approval_object_id = Some("approval".to_string());
+                envelope.record_admission(event)?;
+            }
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let by_predicate: String = connection
+        .query_row(
+            "SELECT a.admission_decision_id FROM admission_decisions a
+             WHERE a.subject_object_id='object-tied' AND a.commit_seq IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM admission_decisions newer
+                   WHERE newer.subject_object_id=a.subject_object_id
+                     AND newer.commit_seq IS NOT NULL
+                     AND (
+                         newer.commit_seq>a.commit_seq
+                         OR (
+                             newer.commit_seq=a.commit_seq
+                             AND newer.admission_decision_id>a.admission_decision_id
+                         )
+                     )
+               )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let by_seek: String = connection
+        .query_row(
+            "SELECT admission_decision_id FROM admission_decisions
+             WHERE subject_object_id='object-tied' AND commit_seq IS NOT NULL
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(by_predicate, by_seek);
+
+    // The predicate must also select exactly one row, not merely agree on one.
+    let matched: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM admission_decisions a
+             WHERE a.subject_object_id='object-tied' AND a.commit_seq IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM admission_decisions newer
+                   WHERE newer.subject_object_id=a.subject_object_id
+                     AND newer.commit_seq IS NOT NULL
+                     AND (
+                         newer.commit_seq>a.commit_seq
+                         OR (
+                             newer.commit_seq=a.commit_seq
+                             AND newer.admission_decision_id>a.admission_decision_id
+                         )
+                     )
+               )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(matched, 1);
+}
+
+#[test]
+fn a_materialized_candidate_cannot_receive_candidate_keyed_decisions() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "bound", "code_present", 1, "bound-trigger");
+    assert_eq!(admit(&store, request("bound"), "bound", "bound"), "admit");
+
+    // Decisions for a materialized candidate belong to its object; a candidate-keyed
+    // one would be invisible to that object's chain.
+    let error = store
+        .commit(intent("bound-orphan"), |envelope| {
+            let mut orphaned = request("bound");
+            orphaned.event.kind = EventKind::Corroborate;
+            orphaned.event.trigger_object_id = None;
+            envelope.record_admission(orphaned)?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(error, KernelError::AdmissionPolicy);
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM admission_decisions WHERE subject_object_id IS NULL"
+        ),
+        0
+    );
+}

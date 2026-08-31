@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "087ed5ad51d003cb302c3eac67501749fb811e527b6796b763610dbf3b323922";
+    "335e3c5a6dc20a8ce2e2a65da5fdb9d0d753d46097c29dbf45db551dfaedcd47";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -388,6 +388,7 @@ struct PreparedDecision {
     evaluation: Evaluation,
 }
 
+// policy-digest:authority-start
 /// Each approval may support at most 1,024 distinct subjects.
 const MAX_APPROVAL_DEPENDENTS: usize = 1_024;
 
@@ -419,7 +420,9 @@ const APPROVAL_OBJECT_PREDICATE: &str = "o.object_kind='decision'
    AND d.decision_kind='adr_accepted'
    AND d.invalidated_commit_seq IS NULL";
 
-/// Longest authority chain [`validate_approval`] walks. A chain is human-authored
+/// Longest authority chain [`validate_approval`] walks, counted in hops from the
+/// approval to its root. A chain of this many hops holds this many plus one members,
+/// which is what the walk's row count is compared against. A chain is human-authored
 /// accepted decisions, so real ones are short; the bound only stops a pathological
 /// graph from making validation unbounded.
 const MAX_AUTHORITY_CHAIN_DEPTH: usize = 64;
@@ -445,6 +448,7 @@ fn approval_qualifies_predicate(object_column: &str) -> String {
          )"
     )
 }
+// policy-digest:authority-end
 
 impl Envelope<'_> {
     #[cfg(feature = "test-support")]
@@ -539,10 +543,24 @@ impl Envelope<'_> {
         }
         let subject_object_id = request.subject_object_id.clone();
         let reason = request.event.reason.clone();
-        let granted_before = self.subject_grants_authority(subject_object_id.as_deref())?;
-        let decision = self.apply_admission(request)?;
+        self.with_authority_cascade(subject_object_id.as_deref(), &reason, |envelope| {
+            envelope.apply_admission(request)
+        })
+    }
+
+    /// Writes a decision and, when it costs the subject the authority it held,
+    /// demotes the dependents that were relying on it. Both callers must run the
+    /// same cascade, so neither owns a copy of it.
+    fn with_authority_cascade(
+        &mut self,
+        subject_object_id: Option<&str>,
+        reason: &str,
+        write: impl FnOnce(&mut Self) -> Result<AdmissionDecision, KernelError>,
+    ) -> Result<AdmissionDecision, KernelError> {
+        let granted_before = self.subject_grants_authority(subject_object_id)?;
+        let decision = write(self)?;
         if granted_before {
-            self.demote_dependents_if_authority_lost(subject_object_id.as_deref(), &reason)?;
+            self.demote_dependents_if_authority_lost(subject_object_id, reason)?;
         }
         Ok(decision)
     }
@@ -622,10 +640,7 @@ impl Envelope<'_> {
             return Err(KernelError::AdmissionPolicy);
         }
         let prepared = self.prepare_admission(request)?;
-        let Some(candidate_id) = prepared.facts.candidate_id() else {
-            return Err(KernelError::AdmissionPolicy);
-        };
-        if candidate_is_materialized(self, candidate_id)? {
+        if prepared.facts.candidate_id().is_none() {
             return Err(KernelError::AdmissionPolicy);
         }
         if prepared.evaluation.outcome == Outcome::Deny
@@ -715,12 +730,9 @@ impl Envelope<'_> {
                 .kind = "replace";
         }
         let reason = prepared.event.reason.clone();
-        let granted_before = self.subject_grants_authority(Some(&replaced_object_id))?;
-        let decision = self.write_admission(prepared, None)?;
-        if granted_before {
-            self.demote_dependents_if_authority_lost(Some(&replaced_object_id), &reason)?;
-        }
-        Ok(decision)
+        self.with_authority_cascade(Some(&replaced_object_id), &reason, |envelope| {
+            envelope.write_admission(prepared, None)
+        })
     }
 
     pub fn revoke_approval(
@@ -809,12 +821,15 @@ impl Envelope<'_> {
     /// descendant of a revoked root already grants nothing. This walk therefore only
     /// restores visibility, and may stop early without leaving live authority behind.
     ///
-    /// It never fails. Any error here would roll back the invalidation that prompted
-    /// it, leaving the root active and every identical retry failing on the same
-    /// graph — a permanently unrevokable approval. Dependents it cannot demote are
-    /// counted and reported instead: those past [`MAX_AUTHORITY_DEMOTIONS`], and
-    /// those whose latest decision was written under a superseded policy revision and
-    /// so cannot be re-evaluated under the current one.
+    /// No *policy* outcome fails it. Failing would roll back the invalidation that
+    /// prompted it, leaving the root active and every identical retry failing on the
+    /// same graph — a permanently unrevokable approval. So the two conditions that
+    /// would otherwise abort are deferred and counted instead: dependents past
+    /// [`MAX_AUTHORITY_DEMOTIONS`], and dependents whose latest decision was written
+    /// under a superseded policy revision and so cannot be re-evaluated.
+    ///
+    /// An I/O error or a stored source/taint class outside the current vocabulary
+    /// still propagates, because neither leaves a coherent transaction to commit.
     fn demote_authority_dependents(
         &mut self,
         authority_object_id: &str,
@@ -830,9 +845,7 @@ impl Envelope<'_> {
                 if !visited.insert(dependent.0.clone()) {
                     continue;
                 }
-                if decisions.len() >= MAX_AUTHORITY_DEMOTIONS
-                    || !dependent_is_current_revision(self, &dependent.0)?
-                {
+                if decisions.len() >= MAX_AUTHORITY_DEMOTIONS || dependent.3 != POLICY_REVISION {
                     deferred += 1;
                     continue;
                 }
@@ -848,11 +861,11 @@ impl Envelope<'_> {
 
     fn demote_one_dependent(
         &mut self,
-        dependent: (String, String, String),
+        dependent: (String, String, String, i64),
         reason: &str,
         decisions: &mut Vec<AdmissionDecision>,
     ) -> Result<(), KernelError> {
-        let (subject_object_id, source_class, taint_class) = dependent;
+        let (subject_object_id, source_class, taint_class, _) = dependent;
         let request = AdmissionRequest {
             candidate_id: None,
             subject_object_id: Some(subject_object_id),
@@ -882,6 +895,12 @@ impl Envelope<'_> {
             return Err(KernelError::AdmissionPolicy);
         }
         let facts = if let Some(candidate_id) = request.candidate_id.as_deref() {
+            // A materialized candidate's decisions belong to its canonical object; a
+            // candidate-keyed decision after materialization would be disconnected
+            // from that object's chain.
+            if candidate_is_materialized(self, candidate_id)? {
+                return Err(KernelError::AdmissionPolicy);
+            }
             load_candidate_facts(self, candidate_id)?
         } else {
             load_subject_facts(
@@ -1410,31 +1429,6 @@ fn subject_is_accepted_decision(
         .map_err(map_sqlite)
 }
 
-/// Whether `subject_object_id`'s latest decision was written under the current
-/// policy revision. A superseded row cannot be re-evaluated, and erroring on one
-/// would roll back the invalidation that prompted the walk.
-fn dependent_is_current_revision(
-    envelope: &Envelope<'_>,
-    subject_object_id: &str,
-) -> Result<bool, KernelError> {
-    envelope
-        .tx
-        .query_row(
-            &format!(
-                "SELECT EXISTS(
-                     SELECT 1 FROM admission_decisions a
-                     WHERE a.subject_object_id=?1
-                       AND a.commit_seq IS NOT NULL
-                       AND a.policy_revision={POLICY_REVISION}
-                       AND {LATEST_SUBJECT_DECISION_PREDICATE}
-                 )"
-            ),
-            [subject_object_id],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(map_sqlite)
-}
-
 /// Subjects whose latest decision still cites `approval_object_id`.
 ///
 /// `LIMIT` exceeds [`MAX_APPROVAL_DEPENDENTS`] by one so the caller can distinguish
@@ -1442,11 +1436,11 @@ fn dependent_is_current_revision(
 fn load_approval_dependents(
     envelope: &Envelope<'_>,
     approval_object_id: &str,
-) -> Result<Vec<(String, String, String)>, KernelError> {
+) -> Result<Vec<(String, String, String, i64)>, KernelError> {
     let mut statement = envelope
         .tx
         .prepare(&format!(
-            "SELECT a.subject_object_id,a.source_class,a.taint_class
+            "SELECT a.subject_object_id,a.source_class,a.taint_class,a.policy_revision
              FROM admission_decisions a
              WHERE a.approval_object_id=?1
                AND a.subject_object_id IS NOT NULL
@@ -1463,6 +1457,7 @@ fn load_approval_dependents(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })
         .map_err(map_sqlite)?
@@ -1499,6 +1494,7 @@ fn validate_provenance(
     }
 }
 
+// policy-digest:chain-start
 fn validate_approval(
     envelope: &Envelope<'_>,
     approval_object_id: Option<&str>,
@@ -1534,7 +1530,7 @@ fn validate_approval(
                        AND chain.depth<{MAX_AUTHORITY_CHAIN_DEPTH}
                        AND {qualifies}
                  )
-                 SELECT (SELECT COUNT(*) FROM chain)<={MAX_AUTHORITY_CHAIN_DEPTH}
+                 SELECT (SELECT COUNT(*) FROM chain)<={MAX_AUTHORITY_CHAIN_DEPTH}+1
                     AND NOT EXISTS(
                             SELECT 1 FROM chain member WHERE NOT {member_qualifies}
                         )"
@@ -1544,6 +1540,7 @@ fn validate_approval(
         )
         .map_err(map_sqlite)
 }
+// policy-digest:chain-end
 
 fn validate_trigger(
     envelope: &Envelope<'_>,
@@ -3036,6 +3033,18 @@ mod tests {
             source,
             "// policy-digest:tables-start",
             "// policy-digest:tables-end",
+        ));
+        // Authority validity is policy expressed in SQL, so it belongs under the
+        // same tripwire as the evaluator and its tables.
+        policy.push_str(section(
+            source,
+            "// policy-digest:authority-start",
+            "// policy-digest:authority-end",
+        ));
+        policy.push_str(section(
+            source,
+            "// policy-digest:chain-start",
+            "// policy-digest:chain-end",
         ));
         let digest = format!("{:x}", Sha256::digest(policy));
         assert_eq!(POLICY_REVISION, 1);
