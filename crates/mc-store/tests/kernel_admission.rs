@@ -5212,3 +5212,60 @@ fn an_invalidated_approval_still_serves_at_its_own_snapshot() {
         .iter()
         .all(|row| row.object.object_id != "approval"));
 }
+
+#[test]
+fn a_denied_event_does_not_hide_the_authority_it_carried_forward() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    seed_dependent_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    let before = store
+        .visible_as_of(Surface::AutoInject, 1)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|row| row.object.object_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        before,
+        vec!["approval".to_string(), "approval-b".to_string()]
+    );
+
+    // A citation that closes a cycle is denied, but the denial still records a row.
+    let denied = store
+        .commit(intent("cycle-attempt"), |envelope| {
+            let mut cyclic = subject_request("approval", EventKind::Approve);
+            cyclic.source_class = Some(SourceClass::ExplicitUser);
+            cyclic.taint_class = Some(TaintClass::UserExplicit);
+            cyclic.event.approval_object_id = Some("approval-b".to_string());
+            let decision = envelope.record_admission(cyclic)?;
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+
+    // That row carries `approved` forward with no approval of its own, because the
+    // approval that justified the level lives on the earlier row. Serving must not
+    // read the carried level as support the subject never earned.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT outcome||'/'||effective_maturity||'/'||COALESCE(approval_object_id,'NULL')
+             FROM admission_decisions WHERE subject_object_id='approval'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "deny/approved/NULL"
+    );
+    assert_eq!(
+        store
+            .visible_as_of(Surface::AutoInject, denied)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.object.object_id.clone())
+            .collect::<Vec<_>>(),
+        before,
+        "a denial must not remove what was visible before it"
+    );
+}

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "ca93c59df96ff30d4524370c3256fa1e85a2e685482a0bcc2254ce1a1e59d67c";
+    "b135222515365d5c83331f224411bb8c9781ec9c9055520db284eb588145be81";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -527,7 +527,8 @@ fn approval_row_fields(alias: &str) -> String {
    AND {alias}.disposition='active'
    AND {alias}.visibility='automatic'
    AND {alias}.sensitivity_class='normal'
-   AND {alias}.policy_revision={POLICY_REVISION}"
+   AND {alias}.policy_revision={POLICY_REVISION}
+"
     )
 }
 
@@ -1841,6 +1842,7 @@ struct DecidedColumns {
     policy_revision: &'static str,
     approval_object_id: &'static str,
     event_kind: &'static str,
+    outcome: &'static str,
 }
 
 const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
@@ -1854,6 +1856,7 @@ const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
     policy_revision: "d_policy_revision",
     approval_object_id: "d_approval_object_id",
     event_kind: "d_event_kind",
+    outcome: "d_outcome",
 };
 
 const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
@@ -1867,6 +1870,7 @@ const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
     policy_revision: "s_policy_revision",
     approval_object_id: "s_approval_object_id",
     event_kind: "s_event_kind",
+    outcome: "s_outcome",
 };
 
 /// The strongest surface a single stored decision can justify, its sensitivity
@@ -1880,6 +1884,13 @@ fn decided_row(
     let event = row
         .get::<_, Option<String>>(columns.event_kind)?
         .and_then(|value| EventKind::try_from(value.as_str()).ok());
+    // Only a row that granted an elevation claims to have earned it. A denial or a
+    // demotion carries forward the level its subject already held, and the approval
+    // that justified it lives on the earlier row.
+    let granted = row
+        .get::<_, Option<String>>(columns.outcome)?
+        .and_then(|value| Outcome::try_from(value.as_str()).ok())
+        .is_some_and(|outcome| matches!(outcome, Outcome::Admit | Outcome::Promote));
     let Some(revision) = row.get::<_, Option<i64>>(columns.policy_revision)? else {
         return Ok(None);
     };
@@ -1933,6 +1944,7 @@ fn decided_row(
                             )
                             .rank()
                             || approval.is_some()
+                            || !granted
                     }
                     _ => false,
                 } =>
@@ -1981,6 +1993,7 @@ impl KernelStore {
                             d.sensitivity_class AS d_sensitivity_class,
                             d.approval_object_id AS d_approval_object_id,
                             d.event_kind AS d_event_kind,
+                            d.outcome AS d_outcome,
                             s.maturity AS s_maturity,
                             s.effective_maturity AS s_effective_maturity,
                             s.disposition AS s_disposition,s.visibility AS s_visibility,
@@ -1989,6 +2002,7 @@ impl KernelStore {
                             s.sensitivity_class AS s_sensitivity_class,
                             s.approval_object_id AS s_approval_object_id,
                             s.event_kind AS s_event_kind,
+                            s.outcome AS s_outcome,
                             EXISTS(
                                 SELECT 1 FROM decisions ad
                                 WHERE ad.object_id=o.object_id
