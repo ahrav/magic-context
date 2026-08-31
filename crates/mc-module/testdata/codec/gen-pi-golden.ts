@@ -105,7 +105,7 @@ function selectEntries(files: string[]): {
         if (wanted.has(klass) && !byClass.has(klass)) byClass.set(klass, { path, entry });
       }
       if ([...wanted].every((klass) => byClass.has(klass) || klass === "redacted_thinking")) {
-        // redacted_thinking is optional.
+        // redacted_thinking is allowed to be absent when no scanned JSONL entry contains it.
         break;
       }
     }

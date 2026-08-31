@@ -1,3 +1,5 @@
+// Type declarations for @opencode-ai/plugin/tui
+// These types are not yet exported by the installed @opencode-ai/plugin package
 
 declare module "@opencode-ai/plugin/tui" {
     import type {

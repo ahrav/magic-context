@@ -1,6 +1,6 @@
 /**
- * The TUI accesses data through RPC and never accesses SQLite directly.
- * The TUI fetches all data from the server plugin through HTTP RPC.
+ * TUI data layer — pure RPC client, no direct SQLite access.
+ * All data is fetched from the server plugin via HTTP RPC.
  */
 import { getMagicContextStorageDir } from "../../shared/data-path";
 import { MagicContextRpcClient } from "../../shared/rpc-client";
@@ -25,15 +25,16 @@ export function getRpcGeneration(): number {
     return rpcGeneration;
 }
 
-/** The WS notification socket uses this client for endpoint discovery.
- * */
+/** The live RPC client (for the WS notification socket's endpoint discovery).
+ *  Null before init / after close. */
 export function getRpcClient(): MagicContextRpcClient | null {
     return rpcClient;
 }
 
-/* */
+/** Clean up the RPC client. */
 export function closeRpc(): void {
-    // closeRpc increments rpcGeneration before resetting rpcClient so callbacks from issued calls abandon their work.
+    // Closing invalidates any already-issued RPC calls; their callbacks must
+    // observe the new generation and abandon (the WS socket checks it too).
     rpcGeneration += 1;
     rpcClient?.reset();
     rpcClient = null;
@@ -77,14 +78,17 @@ const EMPTY_SNAPSHOT: SidebarSnapshot = {
 };
 
 /**
- * The cache returns the latest snapshot for a session after an RPC failure.
- * The client treats timeouts, aborts, and parse errors as RPC failures.
- * The client treats a missing port file or exhausted retries as an RPC failure.
- * The client treats an RPC error envelope as an RPC failure.
+ * Per-session client-side sticky cache. Mirrors the server-side cache in
+ * `sidebar-snapshot-cache.ts` but covers the cases the server can't:
+ *   - RPC call fails entirely (timeout, abort, parse error) → server is never reached
+ *   - RPC server is not yet up (port file missing, retries exhausted)
+ *   - Server returns an error envelope
  *
- * Without the cache, an RPC failure hides the breakdown bar until the next successful refresh.
- * The client returns the most recent good snapshot for the same session after an RPC failure.
- * The 5-minute staleness ceiling prevents the UI from showing old data after a long disconnect.
+ * In all three cases the breakdown bar would otherwise disappear until the
+ * next successful refresh. With this cache, the client returns the most
+ * recent good snapshot for the same session so the UI stays stable through
+ * transient RPC blips. 5-minute staleness ceiling keeps it from showing
+ * obviously old data after long disconnects.
  */
 interface CachedSnapshot {
     snapshot: SidebarSnapshot;
@@ -97,12 +101,14 @@ const stickySidebarCache = new Map<string, CachedSnapshot>();
 function rememberSidebarSnapshot(snapshot: SidebarSnapshot): void {
     if (!snapshot.sessionId) return;
     if (snapshot.inputTokens <= 0) {
-        // A successful snapshot with `inputTokens <= 0` clears the cache so later failures cannot resurrect old values.
+        // A successful zero is authoritative (new/deleted/reverted session) and
+        // must prevent a later transport failure from resurrecting old values.
         stickySidebarCache.delete(snapshot.sessionId);
         return;
     }
-    // The cache deletes its oldest entry when it reaches 100 entries.
-    // The cap prevents unbounded cache growth across session switches in a long TUI session.
+    // LRU-style bound: drop the oldest entry once we hit the cap. With a
+    // 5-min TTL most stale entries time out naturally; this just prevents
+    // unbounded growth across many session switches in a long TUI session.
     if (
         stickySidebarCache.size >= STICKY_MAX_ENTRIES &&
         !stickySidebarCache.has(snapshot.sessionId)
@@ -126,7 +132,7 @@ function recallSidebarSnapshot(sessionId: string, fallback: SidebarSnapshot): Si
     return cached.snapshot;
 }
 
-/* */
+/** Fetch sidebar snapshot from the server via RPC. */
 export async function loadSidebarSnapshot(
     sessionId: string,
     directory: string,
@@ -139,12 +145,22 @@ export async function loadSidebarSnapshot(
             directory,
         });
         if (isRpcError(result)) {
-            // The client treats snapshot-build error envelopes as transport failures.
-            // The client retains the last known-good snapshot after a snapshot-build error envelope.
+            // Snapshot-build errors are explicit failure envelopes, equivalent to
+            // a transport failure: retain the last known-good client snapshot.
             return recallSidebarSnapshot(sessionId, empty);
         }
-        // Successful RPC responses, including `inputTokens === 0`, replace the client snapshot.
+        // Trust successful server responses, including authoritative zeroes. The server has its own sticky
+        // sidebar cache (`sidebar-snapshot-cache.ts`) that handles transient
+        // zero-token windows by hybriding cached breakdown values into a
+        // fresh snapshot, AND clears that cache on `session.deleted`. If the
+        // server reaches us with `inputTokens === 0`, that's its considered
+        // answer — typically because the session was deleted, reverted, or
+        // is brand-new with no responses yet.
         //
+        // Falling back to the client cache here would resurrect old token
+        // data for a deleted session (the client never sees `session.deleted`
+        // events, so its cache TTL is the only expiry). Sticky behavior is
+        // owned exclusively by the server side.
         rememberSidebarSnapshot(result);
         return result;
     } catch {
@@ -152,7 +168,7 @@ export async function loadSidebarSnapshot(
     }
 }
 
-/* */
+/** Fetch full status detail from the server via RPC. */
 export async function loadStatusDetail(
     sessionId: string,
     directory: string,
@@ -220,7 +236,7 @@ const EMPTY_EMBED_DETAIL: EmbedDetail = {
     statusText: "Embedding is off (no provider configured).",
 };
 
-/* */
+/** Fetch embedding coverage status for `/ctx-embed` via RPC. */
 export async function loadEmbedDetail(sessionId: string, directory: string): Promise<EmbedDetail> {
     if (!rpcClient) return EMPTY_EMBED_DETAIL;
     try {
@@ -239,7 +255,7 @@ export async function loadEmbedDetail(sessionId: string, directory: string): Pro
 
 export type CompartmentCountResult = { ok: true; count: number } | { ok: false; error: string };
 
-/** The client preserves a transport failure instead of returning a real zero for the compartment count. */
+/** Get compartment count without making transport failure look like a real zero. */
 export async function getCompartmentCount(sessionId: string): Promise<CompartmentCountResult> {
     if (!rpcClient) return { ok: false, error: "RPC client is not initialized" };
     try {
@@ -257,7 +273,7 @@ export async function getCompartmentCount(sessionId: string): Promise<Compartmen
     }
 }
 
-/* */
+/** Send recomp request to server via RPC. */
 export async function requestRecomp(sessionId: string): Promise<boolean> {
     if (!rpcClient) return false;
     try {
@@ -268,8 +284,8 @@ export async function requestRecomp(sessionId: string): Promise<boolean> {
     }
 }
 
-/**
- * */
+/** Run `/ctx-session-upgrade` for the session (full recomp + once-per-project
+ *  memory migration). Fired from the upgrade dialog's "Run upgrade now" action. */
 export async function requestUpgrade(sessionId: string): Promise<boolean> {
     if (!rpcClient) return false;
     try {
@@ -280,8 +296,9 @@ export async function requestUpgrade(sessionId: string): Promise<boolean> {
     }
 }
 
-/**
- * */
+/** Mark the upgrade reminder dismissed (the user made an explicit Confirm/Cancel
+ *  choice), setting the durable stamp so the FRESH dialog won't re-show. Resume
+ *  prompts are staging-driven and unaffected. */
 export async function dismissUpgradeReminder(sessionId: string): Promise<boolean> {
     if (!rpcClient) return false;
     try {
@@ -294,7 +311,7 @@ export async function dismissUpgradeReminder(sessionId: string): Promise<boolean
     }
 }
 
-/* */
+/** Resolve global toast duration from server config via RPC. */
 export async function loadToastDurationMs(): Promise<number> {
     if (!rpcClient) return 5000;
     try {
@@ -306,6 +323,9 @@ export async function loadToastDurationMs(): Promise<number> {
 }
 
 /**
+ * Fetch the current startup announcement from the server, if any.
+ * Returns `{show: false}` when there's nothing to announce or when the
+ * configured ANNOUNCEMENT_VERSION has already been dismissed.
  */
 export interface AnnouncementResponse {
     show: boolean;
@@ -334,7 +354,7 @@ export async function getAnnouncement(): Promise<AnnouncementResponse> {
     }
 }
 
-/* */
+/** Mark the current ANNOUNCEMENT_VERSION as dismissed on the server. */
 export async function markAnnounced(): Promise<boolean> {
     if (!rpcClient) return false;
     try {

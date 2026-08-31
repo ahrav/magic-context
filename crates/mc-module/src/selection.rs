@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::transform::{utf16_len, utf16_prefix, ReductionDecision};
 
-/// `todowrite`: keep the newest 1 (the live plan is the newest task-list state).
+/// The newest `todowrite` record is the live plan, so retain one.
 const TODOWRITE_KEEP: usize = 1;
 /// Keep the newest 3 `ctx_reduce` arcs as housekeeping examples.
 const CTX_REDUCE_KEEP: usize = 3;
