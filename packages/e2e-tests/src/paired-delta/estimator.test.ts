@@ -295,6 +295,28 @@ describe("bound prospective estimator adapter", () => {
         expect(adapter(analysis).analyze(pairs, H3).direction).toBe("no-change");
     });
 
+    it("withholds direction when a resolved endpoint has no paired counterpart", () => {
+        // Both endpoints resolve positive over disjoint families, so no family is measured at both.
+        const disjoint = estimate({
+            minimumAnalyzableFamilyCount: 2,
+            observations: observations.map((row) => {
+                const positive = { ...row, delta: Math.abs(row.delta) + 0.2 };
+                return positive.endpoint === "mc-on-vs-compaction"
+                    ? {
+                        ...positive,
+                        familyId: `${positive.familyId}-alt`,
+                        coordinateId: `${positive.coordinateId}-alt`,
+                    }
+                    : positive;
+            }),
+            noiseFloors: undefined,
+        });
+        expect(disjoint.endpoints.every(({ resolution }) => resolution === "resolved")).toBe(true);
+        expect(disjoint.analyzableFamilyCount).toBe(0);
+        expect(disjoint.evidenceSufficient).toBe(false);
+        expect(adapter(disjoint).analyze(pairs, H3).direction).toBe("no-change");
+    });
+
     it("reports the analysis gate verbatim", () => {
         const analysis = estimate({ minimumAnalyzableFamilyCount: 1 });
         expect(adapter(analysis).analyze(pairs, H3).evidenceSufficient)

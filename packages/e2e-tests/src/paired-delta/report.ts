@@ -1,5 +1,6 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
+import { compareCodeUnits } from "../code-unit-order";
 import { parsePolicyOwnerDocument } from "../prospective-holdout/contract";
 import { ARM_IDS, REASON_CODES, type ArmId, type ReasonCode } from "./contract";
 import type { EndpointEstimate, FamilyDeltaAnalysis, RawRegretRecord } from "./estimator";
@@ -59,11 +60,6 @@ function requireHex64(value: string, label: string): void {
     }
 }
 
-// String `<` compares UTF-16 code units, avoiding locale-dependent `localeCompare` ordering.
-function compareCodeUnits(left: string, right: string): number {
-    return left < right ? -1 : left > right ? 1 : 0;
-}
-
 function sortedMetrics(metrics: ArmMetrics): ArmMetrics {
     for (const [armId, value] of Object.entries(metrics)) {
         if (!ARM_ID_SET.has(armId)) {
@@ -78,11 +74,16 @@ function sortedMetrics(metrics: ArmMetrics): ArmMetrics {
     );
 }
 
+// A `:`-joined key is ambiguous because both identifiers are free-form and may contain `:`; JSON array encoding keeps distinct pairs distinct.
+function ladderRowKey(coordinateId: string, familyId: string): string {
+    return JSON.stringify([coordinateId, familyId]);
+}
+
 // The ladder is a pivot of the analyzed records, so published regret values cannot contradict the analysis.
 function rawRegretLadder(records: readonly RawRegretRecord[]): RawRegretLadder[] {
     const rows = new Map<string, RawRegretLadder>();
     for (const record of records) {
-        const key = `${record.coordinateId}:${record.familyId}`;
+        const key = ladderRowKey(record.coordinateId, record.familyId);
         const row = rows.get(key) ?? {
             coordinateId: record.coordinateId,
             familyId: record.familyId,

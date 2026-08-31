@@ -1,4 +1,5 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { compareCodeUnits } from "../code-unit-order";
 import { HoldoutContractError, array, enumeration, exact, fail, hex64, integer, record, staticId } from "./contract";
 import type { PairedCaseFact } from "./comparison";
 import type { LifecycleState } from "./lifecycle";
@@ -71,11 +72,11 @@ export function completeFamilyCount(pairs: readonly PairedCaseFact[]): number {
     ).length;
 }
 
-// String `<` compares UTF-16 code units, avoiding locale-dependent `localeCompare` ordering.
 function comparePairKeys(left: PairedCaseFact, right: PairedCaseFact): number {
-    const leftKey = `${left.caseId}:${left.model}:${left.seed}:${left.platform}`;
-    const rightKey = `${right.caseId}:${right.model}:${right.seed}:${right.platform}`;
-    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    return compareCodeUnits(
+        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`,
+        `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
+    );
 }
 
 // Fingerprint inputs use this sort order to produce a stable canonical order.

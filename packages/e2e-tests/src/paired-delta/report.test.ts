@@ -184,6 +184,34 @@ describe("paired-delta report", () => {
         })).toThrow(/policy: identity-invalid/);
     });
 
+    it("keeps ladder rows distinct when an identifier contains the key separator", () => {
+        const policy = policyDocument(1);
+        // `a:b` + `c` and `a` + `b:c` share one `:`-joined key.
+        const analysis = estimateFamilyDeltas({
+            observations: [
+                { coordinateId: "a:b", familyId: "c", endpoint: "mc-on-vs-mc-off", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "a:b", familyId: "c", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "a:b", familyId: "c", endpoint: "retrieval", delta: 0.5, runHealth: "completed" },
+                { coordinateId: "a", familyId: "b:c", endpoint: "formation", delta: 0.7, runHealth: "completed" },
+            ],
+            minimumAnalyzableFamilyCount: 1,
+            bootstrapSeed: 17,
+            bootstrapResamples: 2000,
+            lane: {
+                poolManifestFingerprint: H1,
+                pinnedSnapshotId: "anthropic-model-20260830",
+                policyFingerprint: policy.policyFingerprint,
+                pairedFactsFingerprint: H2,
+            },
+        });
+        const built = report({ policyDocument: policy, analysis });
+        expect(built.body.regret.raw.map(({ coordinateId, familyId, retrieval, formation }) =>
+            [coordinateId, familyId, retrieval, formation])).toEqual([
+            ["a", "b:c", null, 0.7],
+            ["a:b", "c", 0.5, null],
+        ]);
+    });
+
     it("rejects a ready policy whose estimator settings the analysis does not honor", () => {
         const policy = policyDocument(2);
         expect(() => report({

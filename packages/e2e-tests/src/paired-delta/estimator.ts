@@ -1,5 +1,6 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
+import { compareCodeUnits } from "../code-unit-order";
 import {
     completeFamilyCount,
     pairedFactsFingerprint,
@@ -143,13 +144,6 @@ function stringSeed(value: string): number {
 
 function includesZero(interval: Interval): boolean {
     return interval.lower <= 0 && interval.upper >= 0;
-}
-
-// String `<` compares UTF-16 code units, avoiding locale-dependent `localeCompare` ordering.
-// Ordering feeds both the bootstrap RNG consumption order and the fingerprinted
-// output arrays, so it must not vary across machines.
-function compareCodeUnits(left: string, right: string): number {
-    return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function estimateEndpoint(
