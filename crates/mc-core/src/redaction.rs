@@ -36,6 +36,38 @@ const JS_SPACE: &str =
 /// The shared list keeps secret-name matching terms consistent across keyed rules.
 const SECRET_WORDS: &str = "key|token|secret|password|auth|bearer|credential";
 
+const LABEL_WORDS: &[&str] = &[
+    "key",
+    "token",
+    "secret",
+    "password",
+    "auth",
+    "authorization",
+    "bearer",
+    "credential",
+];
+const LABEL_QUALIFIERS: &[&str] = &[
+    "api",
+    "access",
+    "private",
+    "client",
+    "auth",
+    "authorization",
+    "secret",
+    "bearer",
+    "session",
+    "refresh",
+    "service",
+    "x",
+    "openai",
+    "anthropic",
+    "google",
+    "github",
+    "huggingface",
+    "aws",
+    "azure",
+];
+
 enum RuleKind {
     Fixed {
         secret_type: &'static str,
@@ -112,7 +144,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "<HUGGINGFACE_TOKEN_REDACTED>",
         ),
         fixed(
-            r"(?-u:\b)(?:AKIA|ASIA)[0-9A-Z]{16}(?-u:\b)",
+            r"(?-u:\b)(?P<value>(?:AKIA|ASIA)[0-9A-Z]{16})(?:[^A-Za-z0-9]|$)",
             "aws_access_key_id",
             "<AWS_ACCESS_KEY_ID_REDACTED>",
         ),
@@ -122,7 +154,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "<SLACK_TOKEN_REDACTED>",
         ),
         fixed(
-            r"(?-u:\b)AIza[A-Za-z0-9_-]{35}(?-u:\b)",
+            r"(?-u:\b)(?P<value>AIza[A-Za-z0-9_-]{35})(?:[^A-Za-z0-9]|$)",
             "google_api_key",
             "<GOOGLE_API_KEY_REDACTED>",
         ),
@@ -160,9 +192,6 @@ static SCALAR_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$")
         .expect("scalar diagnostic regex is valid")
 });
-
-static KEY_SEPARATOR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[^a-z0-9_.-]+").expect("key separator regex is valid"));
 
 /// A span of the working text: untouched input, or a replacement.
 ///
@@ -537,13 +566,37 @@ fn is_non_secret_scalar_value(value: &str) -> bool {
 }
 
 fn redaction_type_for_key(key: &str) -> String {
-    let lowered = key.trim_matches(is_js_space).to_lowercase();
-    let normalized = KEY_SEPARATOR.replace_all(&lowered, "_");
-    normalized
-        .split('.')
-        .rfind(|part| !part.is_empty())
-        .unwrap_or("secret")
-        .to_owned()
+    // `apiKey` needs camel-case splitting; lowercasing first produces `apikey`,
+    // which no vocabulary word matches.
+    let mut separated = String::with_capacity(key.len() + 8);
+    let mut previous: Option<char> = None;
+    for character in key.chars() {
+        if character.is_ascii_uppercase()
+            && previous
+                .is_some_and(|earlier| earlier.is_ascii_lowercase() || earlier.is_ascii_digit())
+        {
+            separated.push('_');
+        }
+        separated.push(character);
+        previous = Some(character);
+    }
+
+    let label = separated
+        .to_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|segment| is_label_segment(segment))
+        .collect::<Vec<_>>()
+        .join("_");
+    if label.is_empty() {
+        "secret".to_owned()
+    } else {
+        label
+    }
+}
+
+fn is_label_segment(segment: &str) -> bool {
+    let stem = segment.strip_suffix('s').unwrap_or(segment);
+    LABEL_WORDS.contains(&stem) || LABEL_QUALIFIERS.contains(&segment)
 }
 
 #[cfg(test)]
@@ -555,6 +608,8 @@ mod tests {
     #[derive(Deserialize)]
     struct Vocabulary {
         schema: String,
+        label_words: Vec<String>,
+        label_qualifiers: Vec<String>,
         cases: Vec<FixtureCase>,
         exemptions: Vec<String>,
         known_misses: Vec<String>,
@@ -580,6 +635,39 @@ mod tests {
             "../../../packages/plugin/src/shared/fixtures/redaction-vocabulary-v1.json"
         ))
         .expect("shared redaction fixture is valid")
+    }
+
+    #[test]
+    fn shared_label_vocabulary_matches_the_fixture() {
+        let vocabulary = vocabulary();
+        assert_eq!(vocabulary.label_words, LABEL_WORDS);
+        assert_eq!(vocabulary.label_qualifiers, LABEL_QUALIFIERS);
+    }
+
+    #[test]
+    fn labels_are_built_only_from_vocabulary_words() {
+        for key in [
+            "",
+            "key",
+            "x-api-key",
+            "config.api.key",
+            "AKIAJJJJJJJJJJJJJJJJ_key",
+            "AKIAJJJJJJJJJJJJJJJJkey",
+            "apiKey",
+            "openaiApiKey",
+            "<GOOGLE_API_KEY_REDACTED>",
+            "cl\u{e9}",
+            "\u{130}",
+        ] {
+            let label = redaction_type_for_key(key);
+            assert!(!label.is_empty(), "{key:?} produced an empty label");
+            for segment in label.split('_') {
+                assert!(
+                    segment == "secret" || is_label_segment(segment),
+                    "{key:?} leaked {segment:?} into label {label:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -740,13 +828,12 @@ mod tests {
     }
 
     #[test]
-    fn key_trimming_uses_javascript_whitespace() {
-        // U+0085 is not whitespace to JavaScript, so it normalizes into the type name.
+    fn junk_around_a_key_never_reaches_the_label() {
+        // U+0085 is not whitespace to JavaScript; U+FEFF is.
         assert_eq!(
             redact_secret_text("\"api_key\u{85}\":\"v\"").text,
-            "\"api_key\u{85}\":\"<REDACTED:api_key_>\""
+            "\"api_key\u{85}\":\"<REDACTED:api_key>\""
         );
-        // U+FEFF is whitespace to JavaScript, so trimming removes it first.
         assert_eq!(
             redact_secret_text("\"api_key\u{feff}\":\"v\"").text,
             "\"api_key\u{feff}\":\"<REDACTED:api_key>\""
