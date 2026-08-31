@@ -633,13 +633,80 @@ fn inputs_digest(
         hash.update(b"\0");
     }
     if let Some(terms) = &candidate.scope_terms {
-        hash.update(format!("{terms:?}").as_bytes());
+        hash.update([1u8]);
+        hash.update((terms.len() as u64).to_le_bytes());
+        for term in terms {
+            digest_field(&mut hash, Some(&term.dimension));
+            digest_field(&mut hash, Some(&term.operator));
+            digest_field(&mut hash, term.exact_value.as_deref());
+            match &term.set_values {
+                Some(values) => {
+                    hash.update([1u8]);
+                    hash.update((values.len() as u64).to_le_bytes());
+                    for value in values {
+                        digest_field(&mut hash, Some(value));
+                    }
+                }
+                None => hash.update([0u8]),
+            }
+            digest_field(&mut hash, term.range_start.as_deref());
+            digest_field(&mut hash, term.range_end.as_deref());
+            digest_field(&mut hash, term.version_range.as_deref());
+            digest_field(&mut hash, term.git_oid.as_deref());
+            digest_field(&mut hash, term.git_start_oid.as_deref());
+            digest_field(&mut hash, term.git_end_oid.as_deref());
+            digest_field(&mut hash, term.payload.as_deref());
+        }
+    } else {
+        hash.update([0u8]);
     }
-    hash.update(b"\0");
     if let Some(anchor) = &candidate.anchor {
-        hash.update(format!("{anchor:?}").as_bytes());
+        hash.update([1u8]);
+        digest_field(&mut hash, Some(&anchor.anchor_id));
+        digest_field(&mut hash, Some(&anchor.anchor_kind));
+        digest_field(&mut hash, anchor.exact_value.as_deref());
+        digest_field(&mut hash, anchor.reachable_from_oid.as_deref());
+        digest_field(&mut hash, anchor.reachable_between_start_oid.as_deref());
+        digest_field(&mut hash, anchor.reachable_between_end_oid.as_deref());
+        digest_field(&mut hash, anchor.deployment_revision.as_deref());
+        digest_field(&mut hash, anchor.config_revision.as_deref());
+        digest_field(&mut hash, anchor.platform_version_range.as_deref());
+        digest_i64(&mut hash, anchor.wall_clock_start);
+        digest_i64(&mut hash, anchor.wall_clock_end);
+        match &anchor.payload {
+            Some(payload) => {
+                hash.update([1u8]);
+                hash.update((payload.len() as u64).to_le_bytes());
+                hash.update(payload);
+            }
+            None => hash.update([0u8]),
+        }
+    } else {
+        hash.update([0u8]);
     }
-    hash.update(b"\0");
     hash.update(candidate.payload.as_deref().unwrap_or_default());
     format!("{:x}", hash.finalize())
+}
+
+/// Presence-tagged, length-prefixed encoding distinguishes `None`,
+/// `Some("<none>")`, and adjacent fields.
+fn digest_field(hash: &mut Sha256, field: Option<&str>) {
+    match field {
+        Some(value) => {
+            hash.update([1u8]);
+            hash.update((value.len() as u64).to_le_bytes());
+            hash.update(value.as_bytes());
+        }
+        None => hash.update([0u8]),
+    }
+}
+
+fn digest_i64(hash: &mut Sha256, field: Option<i64>) {
+    match field {
+        Some(value) => {
+            hash.update([1u8]);
+            hash.update(value.to_le_bytes());
+        }
+        None => hash.update([0u8]),
+    }
 }
