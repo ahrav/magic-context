@@ -239,8 +239,11 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         p.fail("scenario.expectedAnswer: collides-with-claim-id-prefix");
     }
     /** The R1 search turn adds this wrapper text to the transcript whatever the query resolves to, so an answer occurring in it is readable by the later probe without any retrieval — and unlike an id collision, no reseed can clear it. commentlint: allow(JUDGE) */
-    if ([SCRIPTED_SEARCH_PROMPT_PREFIX, SCRIPTED_SEARCH_FOLLOW_UP].some((text) =>
-        revealsAnswer(expectedAnswer, text))) {
+    /** Composed, not each part alone: the turn emits `${SCRIPTED_SEARCH_PROMPT_PREFIX}${query}` and every query starts with the claim-id prefix, so an answer straddling that join is revealed by a prompt neither string reveals by itself. commentlint: allow(JUDGE) */
+    if ([
+        `${SCRIPTED_SEARCH_PROMPT_PREFIX}${PUBLIC_CLAIM_ID_PREFIX}`,
+        SCRIPTED_SEARCH_FOLLOW_UP,
+    ].some((text) => revealsAnswer(expectedAnswer, text))) {
         p.fail("scenario.expectedAnswer: revealed-by-search-prompt");
     }
     const answerMatch = p.enumeration(root.answerMatch, ANSWER_MATCHES, "scenario.answerMatch");
@@ -319,6 +322,11 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         if (boundDynamicField(claim) !== claim) p.fail(`${label}: exceeds-render-bound`);
         /** `seedGoldMemories` writes through the production claim encoder, which rejects a lone surrogate, so an ill-formed claim freezes but can never be seeded. commentlint: allow(JUDGE) */
         if (!isWellFormedUnicode(claim)) p.fail(`${label}: unicode-ill-formed`);
+    }
+    /** The whole gold payload must fit what one rendered field carries. R2 admits claims against a configured `injection_budget_tokens` and skips any that does not fit, leaving R2 short while R1 and R3 receive the full set; the exact cost needs a seeded snapshot and the renderer's accounting, so this is a deliberately conservative proxy that stays well inside the 500-token floor the schema permits. The runner owns the exact check against its own budget. commentlint: allow(JUDGE) */
+    const payload = memories.map(({ claim }) => claim).join("\n");
+    if (boundDynamicField(payload) !== payload) {
+        p.fail("scenario.interventions.r2.memories: payload-exceeds-render-bound");
     }
     if (!memories.some(({ claim }) => suppliesAnswer(claim))) {
         p.fail("scenario.interventions.r2.memories: answer-absent");

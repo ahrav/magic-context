@@ -90,6 +90,32 @@ describe("paired-delta scenario contract", () => {
         ).not.toThrow();
     });
 
+    it("rejects an answer revealed only by the composed search prompt", () => {
+        /** Present in neither the fixed prefix nor a claim id alone, but in their join. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario({ expectedAnswer: "evidence: mcm" })),
+        ).toThrow(/expectedAnswer: revealed-by-search-prompt/);
+    });
+
+    it("rejects an aggregate claim payload past the render bound", () => {
+        const base = scenario();
+        const chunk = (n: number): string => `alpha-17 part ${n} ${"x".repeat(400)}`;
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r1: { ...base.interventions.r1, locatorIds: ["mem-a", "mem-b", "mem-c"] },
+                    r2: {
+                        memories: [0, 1, 2].map((n) => ({
+                            claim: chunk(n),
+                            evidence: "Remember ID alpha-17.",
+                        })),
+                    },
+                },
+            })),
+        ).toThrow(/r2\.memories: payload-exceeds-render-bound/);
+    });
+
     it("rejects an answer that collides with the claim-id prefix", () => {
         for (const expectedAnswer of ["mcm", "mcm_", "cm"]) {
             expect(() =>

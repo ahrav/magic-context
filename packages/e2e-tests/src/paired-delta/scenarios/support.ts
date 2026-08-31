@@ -40,9 +40,12 @@ export function r1WireDelivered(
 /** Casing is part of the gold only for scenarios that say so. Elsewhere a strict comparison would fail an agent that recalled the fact and transcribed it differently, scoring output formatting instead of the retrieval the lane measures. commentlint: allow(JUDGE) */
 function answerMatches(actual: string | null, spec: ScenarioSpec): boolean {
     if (actual === null) return false;
-    return spec.answerMatch === "exact"
-        ? actual === spec.answer
-        : actual.toLowerCase() === spec.answer.toLowerCase();
+    /** Canonical form on both operands, matching the contract's gold check: without it a declaration whose evidence and answer differ only in Unicode form freezes as valid while this comparison rejects the model's faithful copy. Form is never part of the declared gold, unlike casing. commentlint: allow(JUDGE) */
+    const fold = (value: string): string =>
+        spec.answerMatch === "exact"
+            ? value.normalize("NFC")
+            : value.normalize("NFC").toLowerCase();
+    return fold(actual) === fold(spec.answer);
 }
 
 export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
