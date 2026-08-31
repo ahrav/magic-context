@@ -133,52 +133,15 @@ impl Envelope<'_> {
                 ],
             )
             .map_err(map_write_error)?;
-        for (ordinal, term) in spec.terms.iter().enumerate() {
-            let ordinal = i64::try_from(ordinal).map_err(|_| KernelError::InvalidInput)?;
-            let set_values = term
-                .set_values
-                .as_ref()
-                .map(|values| {
-                    serde_json::to_vec(
-                        &values
-                            .iter()
-                            .map(|value| value.text.as_str())
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .transpose()
-                .map_err(|_| KernelError::InvalidInput)?;
-            self.tx
-                .execute(
-                    "INSERT INTO scope_term(
-                         scope_id,ordinal,dimension,operator,exact_value,set_values,range_start,
-                         range_end,version_range,git_oid,git_start_oid,git_end_oid,payload
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-                    params![
-                        spec.scope_id.text,
-                        ordinal,
-                        term.dimension.text,
-                        term.operator.text,
-                        text(&term.exact_value),
-                        set_values,
-                        text(&term.range_start),
-                        text(&term.range_end),
-                        text(&term.version_range),
-                        text(&term.git_oid),
-                        text(&term.git_start_oid),
-                        text(&term.git_end_oid),
-                        term.payload.as_ref().map(|value| value.text.as_bytes()),
-                    ],
-                )
-                .map_err(map_write_error)?;
-        }
-        for (name, field) in spec.text_fields() {
+        insert_scope_terms(self.tx, &spec.scope_id.text, &spec.terms)?;
+        let redactions = spec.text_fields();
+        for (name, field) in &redactions {
             record(
                 self.tx,
                 "scopes",
                 &spec.scope_id.text,
-                &name,
-                &field,
+                name,
+                field,
                 Some(self.commit_seq),
             )?;
         }
@@ -190,7 +153,7 @@ impl Envelope<'_> {
             object,
             kind: "scope_insert",
             replaced_object_id: None,
-            redactions: spec.text_fields(),
+            redactions,
             audit: None,
         });
         Ok(outcome)
@@ -312,6 +275,52 @@ impl RedactedTerm {
 
 fn text(field: &Option<RedactedField>) -> Option<&str> {
     field.as_ref().map(|value| value.text.as_str())
+}
+
+fn insert_scope_terms(
+    tx: &rusqlite::Transaction<'_>,
+    scope_id: &str,
+    terms: &[RedactedTerm],
+) -> Result<(), KernelError> {
+    for (ordinal, term) in terms.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal).map_err(|_| KernelError::InvalidInput)?;
+        let set_values = term
+            .set_values
+            .as_ref()
+            .map(|values| {
+                serde_json::to_vec(
+                    &values
+                        .iter()
+                        .map(|value| value.text.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .transpose()
+            .map_err(|_| KernelError::InvalidInput)?;
+        tx.execute(
+            "INSERT INTO scope_term(
+                 scope_id,ordinal,dimension,operator,exact_value,set_values,range_start,
+                 range_end,version_range,git_oid,git_start_oid,git_end_oid,payload
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                scope_id,
+                ordinal,
+                term.dimension.text,
+                term.operator.text,
+                text(&term.exact_value),
+                set_values,
+                text(&term.range_start),
+                text(&term.range_end),
+                text(&term.version_range),
+                text(&term.git_oid),
+                text(&term.git_start_oid),
+                text(&term.git_end_oid),
+                term.payload.as_ref().map(|value| value.text.as_bytes()),
+            ],
+        )
+        .map_err(map_write_error)?;
+    }
+    Ok(())
 }
 
 fn map_write_error(error: rusqlite::Error) -> KernelError {

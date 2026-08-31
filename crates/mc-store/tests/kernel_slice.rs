@@ -3,9 +3,9 @@
 use std::{cell::Cell, fs};
 
 use mc_store::kernel::{
-    CommitIntent, DecisionEventPayload, DecisionEventSpec, DecisionPayload, DecisionSpec,
-    DomainSpec, KernelErrorKind, KernelStore, ObservationDependencySpec, ObservationPayload,
-    ObservationSpec, Sensitivity,
+    ArtifactIngestRequest, CommitIntent, DecisionEventPayload, DecisionEventSpec, DecisionPayload,
+    DecisionSpec, DomainSpec, KernelErrorKind, KernelStore, ObservationDependencySpec,
+    ObservationPayload, ObservationSpec, ProviderEgress, RepositoryProvenance, Sensitivity,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -185,6 +185,15 @@ fn slice_payloads_redact_before_storage_and_missing_parents_are_typed() {
             Ok(envelope.insert_decision(secret)?.result_json())
         })
         .unwrap();
+    let mut secret_observation = observation(1, "decision-object-1");
+    secret_observation.dependencies[0].dependency_payload = Some(format!("context {SECRET}"));
+    store
+        .commit(intent("secret-dependency", 'a'), |envelope| {
+            Ok(envelope
+                .insert_observation(secret_observation)?
+                .result_json())
+        })
+        .unwrap();
 
     let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
     let payload: Vec<u8> = connection
@@ -208,6 +217,16 @@ fn slice_payloads_redact_before_storage_and_missing_parents_are_typed() {
         )
         .unwrap();
     assert_eq!(field, "decision_payload.summary");
+    let dependency_field: String = connection
+        .query_row(
+            "SELECT field_name FROM durable_text_redactions
+             WHERE owner_kind='observations' AND owner_id='observation-1'
+               AND field_name='dependencies.0.dependency_payload'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dependency_field, "dependencies.0.dependency_payload");
 
     let missing_domain = store
         .commit(intent("missing-domain", '3'), |envelope| {
@@ -344,6 +363,76 @@ fn events_allocate_per_decision_ordinals_replay_and_reject_dead_decisions() {
 }
 
 #[test]
+fn decision_event_records_redacted_evidence_identifier_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    seed_domain(&store);
+    let evidence_id = format!("evidence-{SECRET}");
+    let handle = store
+        .ingest_artifact(ArtifactIngestRequest {
+            intent: intent("evidence", '1'),
+            payload: b"fixture evidence".to_vec(),
+            evidence_id: evidence_id.clone(),
+            object_id: "evidence-object".to_string(),
+            object_kind: "evidence".to_string(),
+            domain_id: "domain".to_string(),
+            source_kind: "fixture".to_string(),
+            source_id: "evidence".to_string(),
+            source_revision: 1,
+            media_type: "text/plain".to_string(),
+            retention_class: "canonical".to_string(),
+            retain_until: None,
+            asserted_sensitivity: Sensitivity::Normal,
+            provider_egress: ProviderEgress::RemoteAllowed,
+            provenance: Some(RepositoryProvenance {
+                repository_id: "fixture".to_string(),
+                revision: "abc123".to_string(),
+            }),
+        })
+        .unwrap();
+    store
+        .commit(intent("decision-with-evidence-event", '2'), |envelope| {
+            envelope.insert_decision(decision(1))?;
+            envelope.append_decision_event(
+                "decision-1",
+                DecisionEventSpec {
+                    event_kind: "status".to_string(),
+                    payload: DecisionEventPayload {
+                        summary: "accepted".to_string(),
+                    },
+                    evidence_id: Some(evidence_id),
+                    recorded_at: 10,
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    let stored_evidence_id: String = connection
+        .query_row(
+            "SELECT evidence_id FROM decision_events
+             WHERE decision_id='decision-1' AND event_ordinal=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_evidence_id, handle.evidence_id);
+    assert_eq!(
+        inspect_i64(
+            directory.path(),
+            "SELECT COUNT(*) FROM durable_text_redactions
+             WHERE owner_kind='decision_events' AND owner_id='decision-1:1'
+               AND field_name='evidence_id'"
+        ),
+        1
+    );
+    assert!(!family_bytes(directory.path())
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+}
+
+#[test]
 fn corrections_preserve_old_rows_and_reauthor_observation_dependencies() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
@@ -405,6 +494,16 @@ fn corrections_preserve_old_rows_and_reauthor_observation_dependencies() {
         ),
         2
     );
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    let corrected_dependency: String = connection
+        .query_row(
+            "SELECT dependency_object_id FROM observation_dependencies
+             WHERE observation_id='observation-2'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(corrected_dependency, "decision-object-2");
     assert_eq!(
         inspect_i64(
             directory.path(),

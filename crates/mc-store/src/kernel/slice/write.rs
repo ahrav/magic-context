@@ -160,11 +160,12 @@ impl Envelope<'_> {
             )
             .map_err(map_write_error)?;
         let owner_id = format!("{}:{ordinal}", decision_id.text);
-        let event_fields = vec![
+        let mut event_fields = vec![
             ("decision_id".to_string(), decision_id.clone()),
             ("event_kind".to_string(), spec.kind.clone()),
             ("event_payload.summary".to_string(), spec.summary.clone()),
         ];
+        push_optional(&mut event_fields, "evidence_id", &spec.evidence_id);
         record_fields(
             self.tx,
             "decision_events",
