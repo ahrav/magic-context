@@ -3,7 +3,7 @@ use super::{KernelError, Sensitivity};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "7f6ff2b4084f57290e6db25a90575ae2baf550d6c2a29e5d98a46d75354790e0";
+    "2fc4df110aa4199e8f9abebe6d06bde0000a21648512d8022bafc8831bfe4f94";
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -175,7 +175,6 @@ pub struct Evaluation {
     pub visibility: VisibilityRow,
     pub sensitivity: Sensitivity,
     pub outcome: Outcome,
-    pub no_op: bool,
 }
 
 // policy-digest:evaluator-start
@@ -263,18 +262,8 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         )
         .max(input.predecessor_sensitivity.unwrap_or(Sensitivity::Normal));
 
-    let state_unchanged = input.prior.is_some_and(|prior| {
-        prior.historical_maturity == historical
-            && prior.effective_maturity == effective
-            && prior.disposition == disposition
-            && prior.sensitivity == sensitivity
-            && same_event_effect(prior.outcome, requested_outcome)
-    });
-
     let outcome = if denied {
         Outcome::Deny
-    } else if let Some(prior) = input.prior.filter(|_| state_unchanged) {
-        prior.outcome
     } else if historical.rank() > current.rank() || effective.rank() > current_effective.rank() {
         if input.prior.is_some() {
             Outcome::Promote
@@ -284,7 +273,6 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
     } else {
         requested_outcome
     };
-    let no_op = state_unchanged && !denied;
 
     let visibility = visibility_row(effective, disposition);
 
@@ -295,7 +283,6 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         visibility,
         sensitivity,
         outcome,
-        no_op,
     })
 }
 // policy-digest:evaluator-end
@@ -374,18 +361,6 @@ const fn event_effect(
         EventKind::Quarantine => (current, Some(Disposition::Quarantined), Outcome::Quarantine),
         EventKind::Other => (current, None, Outcome::Deny),
     }
-}
-
-const fn same_event_effect(prior: Outcome, requested: Outcome) -> bool {
-    matches!(
-        (prior, requested),
-        (Outcome::Admit | Outcome::Promote, Outcome::Promote)
-            | (Outcome::DemoteSupport, Outcome::DemoteSupport)
-            | (Outcome::Reject, Outcome::Reject)
-            | (Outcome::Correct, Outcome::Correct)
-            | (Outcome::Replace, Outcome::Replace)
-            | (Outcome::Quarantine, Outcome::Quarantine)
-    )
 }
 
 const fn disposition_restrictiveness(disposition: Disposition) -> u8 {
@@ -665,13 +640,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(denied.outcome, Outcome::Deny);
-        assert!(!denied.no_op);
         assert_eq!(denied.historical_maturity, Maturity::Verified);
         assert_eq!(denied.effective_maturity.get(), Maturity::Verified);
 
-        // A denial is an attempt, so it is never folded into an unchanged replay.
-        // `PriorDecision` carries no event identity, so a second denial reaching the
-        // same state is otherwise indistinguishable from the first.
         let repeated = evaluate_admission(EvaluationInputs {
             source_class: prior.source_class,
             taint_class: prior.taint_class,
@@ -688,7 +659,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(repeated.outcome, Outcome::Deny);
-        assert!(!repeated.no_op);
     }
 
     #[test]
@@ -731,7 +701,6 @@ mod tests {
             };
             let result = evaluate_admission(unauthorized).unwrap();
             assert_eq!(result.outcome, Outcome::Deny, "{event:?}");
-            assert!(!result.no_op, "{event:?}");
 
             let authorized = evaluate_admission(EvaluationInputs {
                 approval_valid: true,
@@ -739,7 +708,6 @@ mod tests {
             })
             .unwrap();
             assert_eq!(authorized.outcome, prior.outcome, "{event:?}");
-            assert!(authorized.no_op, "{event:?}");
         }
     }
 
@@ -1157,7 +1125,6 @@ mod tests {
             .unwrap();
             assert_eq!(result.effective_maturity.get(), remaining);
             assert_eq!(result.outcome, Outcome::DemoteSupport);
-            assert!(!result.no_op);
         }
     }
 
@@ -1188,12 +1155,11 @@ mod tests {
             })
             .unwrap();
             assert_eq!(result.outcome, expected);
-            assert!(!result.no_op);
         }
     }
 
     #[test]
-    fn identical_replay_is_a_no_op_with_a_stable_outcome() {
+    fn repeated_events_keep_their_requested_outcome() {
         let first = evaluate_admission(EvaluationInputs {
             source_class: SourceClass::TrustedLocalCode,
             taint_class: TaintClass::CurrentCode,
@@ -1207,7 +1173,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(first.outcome, Outcome::Admit);
-        assert!(!first.no_op);
 
         let replay = evaluate_admission(EvaluationInputs {
             source_class: SourceClass::TrustedLocalCode,
@@ -1229,8 +1194,7 @@ mod tests {
             remaining_support: None,
         })
         .unwrap();
-        assert!(replay.no_op);
-        assert_eq!(replay.outcome, first.outcome);
+        assert_eq!(replay.outcome, Outcome::Promote);
     }
 
     #[test]
@@ -1273,9 +1237,11 @@ mod tests {
             has_evidence: true,
             remaining_support: None,
         };
-        assert!(evaluate_admission(replay).unwrap().no_op);
+        assert_eq!(
+            evaluate_admission(replay).unwrap().outcome,
+            Outcome::Promote
+        );
 
-        // An already-enforced record whose artifact is gone must not replay as a no-op.
         assert_eq!(
             evaluate_admission(EvaluationInputs {
                 has_evidence: false,
