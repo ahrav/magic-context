@@ -24,7 +24,7 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 const MAX_METADATA_BYTES = 1024 * 1024;
 const LAUNCHER_REL_PATH = "payload/bin/ck-mc-host";
 
-export type PayloadTarget = "linux-x64-gnu" | "darwin-arm64" | "darwin-x64";
+export type PayloadTarget = "linux-x64-gnu";
 
 export type PayloadTrustIndexEntry = TrustIndexEntry;
 export type PayloadTrustIndex = TrustIndex;

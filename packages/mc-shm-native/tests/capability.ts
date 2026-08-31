@@ -3,10 +3,18 @@ import {
         activeNativeChannels,
         NativeChannel,
         probeCapabilities,
+        supportsNativePlatform,
 } from "../index.ts";
 
+assert.equal(supportsNativePlatform("linux", "x64"), true);
+assert.equal(supportsNativePlatform("darwin", "x64"), false);
+assert.equal(supportsNativePlatform("darwin", "arm64"), false);
 assert.equal(activeNativeChannels(), 0);
 const capability = probeCapabilities();
+if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
+        assert.equal(capability.available, false);
+        assert.equal(capability.reason, "node_detachment_unavailable");
+}
 assert.equal(
         activeNativeChannels(),
         0,

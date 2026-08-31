@@ -1836,7 +1836,7 @@ describe("provider-credential matrix", () => {
             /must cover exactly the U8 harness_unavailable_reason union/,
         );
         const badFloor = contractCopy();
-        badFloor.platforms.supported[2].kernel_min = "4.19";
+        badFloor.platforms.supported[0].kernel_min = "4.19";
         expect(() => assertPinsMatchContract(badFloor)).toThrow(
             /linux floor pins disagree/,
         );

@@ -75,7 +75,6 @@ function linuxReaders(overrides: Partial<PlatformReaders> = {}): PlatformReaders
         kernelRelease: () => "5.10.230-generic",
         glibcVersion: () => "2.34",
         procSelfFdUsable: () => true,
-        macosProductVersion: () => null,
         ...overrides,
     };
 }
@@ -104,23 +103,8 @@ describe("platform gate (U3 scenario 5)", () => {
         }
     });
 
-    test("macOS floors: 13.5 passes, 13.4 and unverifiable fail, others rejected", () => {
-        const mac = (version: string | null, arch = "arm64"): PlatformReaders => ({
-            platform: "darwin",
-            arch,
-            kernelRelease: () => "23.0.0",
-            glibcVersion: () => null,
-            procSelfFdUsable: () => false,
-            macosProductVersion: () => version,
-        });
-        expect(checkPlatform(mac("13.5"))).toEqual({ ok: true, target: "darwin-arm64" });
-        expect(checkPlatform(mac("14.2", "x64"))).toEqual({ ok: true, target: "darwin-x64" });
-        expect(checkPlatform(mac("13.4")).ok).toBe(false);
-        expect(checkPlatform(mac(null)).ok).toBe(false);
-        expect(checkPlatform(mac("13.5", "ia32")).ok).toBe(false);
-    });
-
     test("unknown operating systems are unsupported before any package byte", () => {
+        expect(checkPlatform(linuxReaders({ platform: "darwin" })).ok).toBe(false);
         expect(checkPlatform(linuxReaders({ platform: "win32" })).ok).toBe(false);
         expect(checkPlatform(linuxReaders({ platform: "freebsd" })).ok).toBe(false);
     });

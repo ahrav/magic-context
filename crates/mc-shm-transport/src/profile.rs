@@ -4,8 +4,9 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use crate::arena::MIN_ARENA_BYTES;
-use crate::descriptor::{HardwareProfileId, SchedulingMode, TransportDescriptor, MAX_SPANS};
+use crate::descriptor::{HardwareProfileId, TransportDescriptor, MAX_SPANS};
 
+/// Worker ownership topology.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerTopology {
     /// Caller publishes and receives directly.
@@ -19,13 +20,13 @@ pub enum WorkerTopology {
 /// Resource charges retained for one admitted duplex candidate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceCharges {
-    /// Each candidate charges descriptors across both directions.
+    /// Descriptors across both directions.
     pub descriptors: u64,
-    /// Each candidate charges payload bytes across both directions.
+    /// Payload bytes across both directions.
     pub arena_bytes: u64,
-    /// The charge records the maximum spans in one frame.
+    /// Maximum spans in one frame.
     pub spans_per_frame: u64,
-    /// Each candidate charges receive leases across both directions.
+    /// Receive leases across both directions.
     pub leases: u64,
     /// Shared mappings.
     pub mappings: u64,
@@ -40,6 +41,7 @@ pub struct ResourceCharges {
 }
 
 impl ResourceCharges {
+    /// Empty resource commitment.
     pub const ZERO: Self = Self {
         descriptors: 0,
         arena_bytes: 0,
@@ -70,7 +72,8 @@ impl ResourceCharges {
         Some(Self {
             descriptors: self.descriptors.checked_sub(other.descriptors)?,
             arena_bytes: self.arena_bytes.checked_sub(other.arena_bytes)?,
-            // Release paths recompute `spans_per_frame` from per-admission counts because it is a maximum, not a sum.
+            // A maximum, not a sum: release paths recompute it from the
+            // per-admission span counts in `Accounting`.
             spans_per_frame: self.spans_per_frame,
             leases: self.leases.checked_sub(other.leases)?,
             mappings: self.mappings.checked_sub(other.mappings)?,
@@ -82,27 +85,27 @@ impl ResourceCharges {
     }
 }
 
-/// ProfileConfig validates inputs into an immutable TargetProfile.
+/// Inputs validated into an immutable target profile.
 pub struct ProfileConfig {
-    /// Grant descriptor.
+    /// Immutable grant descriptor.
     pub descriptor: TransportDescriptor,
-    /// The profile stores descriptor depth per direction.
+    /// Descriptor depth per direction.
     pub descriptor_depth: usize,
-    /// The profile stores payload bytes per direction.
+    /// Payload bytes per direction.
     pub arena_bytes: usize,
-    /// The profile stores the maximum spans per complete frame.
+    /// Maximum spans per complete frame.
     pub max_spans: usize,
-    /// The profile stores the maximum outstanding receive leases per direction.
+    /// Maximum outstanding receive leases per direction.
     pub max_leases: usize,
-    /// Each candidate charges shared mappings.
+    /// Shared mappings charged by candidate.
     pub mappings: usize,
-    /// The hot profile charges dedicated workers.
+    /// Dedicated workers charged by hot profile.
     pub pinned_workers: usize,
     /// Worker ownership topology.
     pub worker_topology: WorkerTopology,
 }
 
-/// TargetProfile stores immutable admitted dimensions and bounds.
+/// Immutable admitted profile dimensions and bounds.
 pub struct TargetProfile {
     descriptor: TransportDescriptor,
     descriptor_depth: usize,
@@ -114,6 +117,7 @@ pub struct TargetProfile {
 }
 
 impl TargetProfile {
+    /// Validates a profile before any candidate object is created.
     pub fn new(config: ProfileConfig) -> Result<Self, ProfileError> {
         if config.descriptor.schema_version() != crate::descriptor::DESCRIPTOR_SCHEMA_VERSION {
             return Err(ProfileError::UnsupportedSchema);
@@ -133,14 +137,8 @@ impl TargetProfile {
         if config.mappings < 2 {
             return Err(ProfileError::InvalidMappingCharge);
         }
-        match config.descriptor.scheduling() {
-            SchedulingMode::HotPinnedPoll if config.pinned_workers == 0 => {
-                return Err(ProfileError::InvalidWorkerCharge)
-            }
-            SchedulingMode::ColdParkWake if config.pinned_workers != 0 => {
-                return Err(ProfileError::InvalidWorkerCharge)
-            }
-            _ => {}
+        if config.pinned_workers != 0 {
+            return Err(ProfileError::InvalidWorkerCharge);
         }
         let descriptors = u64::try_from(config.descriptor_depth)
             .ok()
@@ -160,7 +158,9 @@ impl TargetProfile {
             spans_per_frame: config.max_spans as u64,
             leases,
             mappings: config.mappings as u64,
-            file_descriptors: config.mappings as u64,
+            file_descriptors: (config.mappings as u64)
+                .checked_add(4)
+                .ok_or(ProfileError::ChargeOverflow)?,
             workers: match config.worker_topology {
                 WorkerTopology::CallerThread => 0,
                 WorkerTopology::SplitDirection => 2,
@@ -181,25 +181,27 @@ impl TargetProfile {
         })
     }
 
+    /// Immutable transport descriptor.
     pub const fn descriptor(&self) -> &TransportDescriptor {
         &self.descriptor
     }
 
-    /// The profile stores descriptor depth per direction.
+    /// Descriptor depth per direction.
     pub const fn descriptor_depth(&self) -> usize {
         self.descriptor_depth
     }
 
-    /// The profile stores arena bytes per direction.
+    /// Arena bytes per direction.
     pub const fn arena_bytes(&self) -> usize {
         self.arena_bytes
     }
 
+    /// Maximum spans per frame.
     pub const fn max_spans(&self) -> usize {
         self.max_spans
     }
 
-    /// The profile stores outstanding receive leases per direction.
+    /// Outstanding receive leases per direction.
     pub const fn max_leases(&self) -> usize {
         self.max_leases
     }
@@ -221,14 +223,14 @@ impl fmt::Debug for TargetProfile {
     }
 }
 
-/// Admission limits apply process-wide.
+/// Explicit process-wide admission limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostLimits {
-    /// The limit counts active and quarantined descriptors.
+    /// Active plus quarantined descriptors.
     pub descriptors: u64,
-    /// The limit counts active and quarantined arena bytes.
+    /// Active plus quarantined arena bytes.
     pub arena_bytes: u64,
-    /// The limit counts active and quarantined receive leases.
+    /// Active plus quarantined receive leases.
     pub leases: u64,
     /// Active plus quarantined mappings.
     pub mappings: u64,
@@ -247,6 +249,7 @@ pub struct HostLimits {
 pub struct VerifiedPhysicalCores(u64);
 
 impl VerifiedPhysicalCores {
+    /// Reads allowed logical CPUs and counts unique package/core pairs.
     #[cfg(target_os = "linux")]
     pub fn detect() -> Option<Self> {
         let allowed = allowed_linux_cpus()?;
@@ -268,12 +271,13 @@ impl VerifiedPhysicalCores {
         (!physical.is_empty()).then_some(Self(physical.len() as u64))
     }
 
-    /// Non-Linux builds do not guess affinity.
+    /// macOS execution is qualified on a designated host; generic builds do not guess affinity.
     #[cfg(not(target_os = "linux"))]
     pub const fn detect() -> Option<Self> {
         None
     }
 
+    /// Verified physical-core count.
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -351,6 +355,7 @@ pub struct AdmissionController {
 }
 
 impl AdmissionController {
+    /// Creates an empty controller with explicit ceilings.
     pub const fn new(limits: HostLimits) -> Self {
         Self {
             limits,
@@ -376,6 +381,7 @@ impl AdmissionController {
             .map(|_| ())
     }
 
+    /// Charges candidate before mappings or workers are created.
     pub fn admit(
         self: &Arc<Self>,
         profile: &TargetProfile,
@@ -403,12 +409,6 @@ impl AdmissionController {
         physical_cores: Option<VerifiedPhysicalCores>,
     ) -> Result<ResourceCharges, AdmissionError> {
         let requested = profile.charges();
-        if profile.descriptor().scheduling() == SchedulingMode::HotPinnedPoll {
-            let verified = physical_cores.ok_or(AdmissionError::PhysicalCoresUnverified)?;
-            if requested.pinned_workers > verified.get() {
-                return Err(AdmissionError::PhysicalCoreBudgetExceeded);
-            }
-        }
         let active = accounting
             .active
             .checked_add(requested)
@@ -499,6 +499,7 @@ enum AdmissionState {
     Quarantined,
 }
 
+/// RAII admission charge returned before candidate setup.
 #[must_use = "admission must remain alive while candidate resources exist"]
 pub struct Admission {
     controller: Arc<AdmissionController>,
@@ -547,9 +548,12 @@ impl fmt::Debug for QuarantineRecord {
     }
 }
 
+/// Invalid target profile.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProfileError {
+    /// Descriptor schema is unsupported.
     UnsupportedSchema,
+    /// Descriptor depth is zero.
     ZeroDescriptorDepth,
     /// Arena cannot hold one legal maximum frame.
     ArenaBelowMinimum,
@@ -588,8 +592,10 @@ impl fmt::Display for ProfileError {
 
 impl std::error::Error for ProfileError {}
 
+/// Host-wide admission rejection.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionError {
+    /// Physical-core topology could not be verified.
     PhysicalCoresUnverified,
     /// Active workers exceed verified or configured physical cores.
     PhysicalCoreBudgetExceeded,
@@ -609,7 +615,7 @@ pub enum AdmissionError {
     ClientInstanceLimit,
     /// Resource charge arithmetic overflowed.
     ChargeOverflow,
-    /// A prior panic poisoned the accounting lock.
+    /// Accounting lock was poisoned.
     AccountingUnavailable,
 }
 
@@ -649,7 +655,6 @@ pub const MC_HOST_RING_DEPTH: usize = 8;
 pub fn mc_host_ring_profile() -> Result<TargetProfile, ProfileError> {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
-            SchedulingMode::ColdParkWake,
             HardwareProfileId::new(MC_HOST_RING_PROFILE)
                 .expect("static hardware profile id is valid"),
         ),
@@ -664,23 +669,15 @@ pub fn mc_host_ring_profile() -> Result<TargetProfile, ProfileError> {
 }
 
 /// Builds a generic ring profile for tests and local tools.
-pub fn ring_profile(
-    hardware: HardwareProfileId,
-    scheduling: SchedulingMode,
-) -> Result<TargetProfile, ProfileError> {
-    let pinned_workers = usize::from(scheduling == SchedulingMode::HotPinnedPoll) * 2;
+pub fn ring_profile(hardware: HardwareProfileId) -> Result<TargetProfile, ProfileError> {
     TargetProfile::new(ProfileConfig {
-        descriptor: TransportDescriptor::new(scheduling, hardware),
+        descriptor: TransportDescriptor::new(hardware),
         descriptor_depth: 32,
         arena_bytes: MIN_ARENA_BYTES,
         max_spans: 2,
         max_leases: 32,
         mappings: 2,
-        pinned_workers,
-        worker_topology: if scheduling == SchedulingMode::HotPinnedPoll {
-            WorkerTopology::SplitDirection
-        } else {
-            WorkerTopology::CallerThread
-        },
+        pinned_workers: 0,
+        worker_topology: WorkerTopology::CallerThread,
     })
 }

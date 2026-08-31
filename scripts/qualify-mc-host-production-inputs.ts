@@ -137,8 +137,6 @@ export const RUNTIME_IDENTITY = {
  * Duplicated floors and layouts must equal the U8 contract; mismatches fail closed. */
 export const QUALIFICATION_PINS = {
     platform_floors: {
-        "darwin-arm64": { dev_fd_exec: true, os_min: "13.5" },
-        "darwin-x64": { dev_fd_exec: true, os_min: "13.5" },
         "linux-x64-gnu": {
             glibc_min: "2.28",
             kernel_min: "4.18",
@@ -156,10 +154,8 @@ export const QUALIFICATION_PINS = {
     cold_start_budgets_ms: {
         retained_transport: { p95: 2000, hard: 5000 },
         bootstrap_copy: { p95: 1000, hard: 3000 },
-        macos_generation_stage: { p95: 3000, hard: 10000 },
         linux_generation_stage: { p95: 20000, hard: 45000 },
         spawn_publication_auth: { p95: 1000, hard: 3000 },
-        fresh_macos_transport_aggregate: { p95: 5000, hard: 15000 },
         fresh_linux_transport_aggregate: { p95: 25000, hard: 60000 },
         storage_ready_post_publication: { p95: 2000, hard: 5000 },
         linux_synapse_certification_post_publication: {
@@ -168,14 +164,6 @@ export const QUALIFICATION_PINS = {
         },
     },
     package_size_limits_bytes: {
-        "@cortexkit/mc-host-darwin-arm64": {
-            compressed_max: 62914560,
-            unpacked_max: 157286400,
-        },
-        "@cortexkit/mc-host-darwin-x64": {
-            compressed_max: 62914560,
-            unpacked_max: 157286400,
-        },
         "@cortexkit/mc-host-linux-x64-gnu": {
             compressed_max: 471859200,
             unpacked_max: 734003200,
@@ -203,12 +191,6 @@ export function assertPinsMatchContract(contract: ReleaseContract): void {
             ) {
                 fail(`linux floor pins disagree with the U8 contract`);
             }
-        } else if (
-            !("os_min" in pinned) ||
-            pinned.os_min !== platform.os_min ||
-            pinned.dev_fd_exec !== platform.capabilities.dev_fd_exec
-        ) {
-            fail(`${platform.target} floor pins disagree with the U8 contract`);
         }
     }
     if (
@@ -2517,7 +2499,7 @@ export function validateSourceManifest(
                     `harnesses.${name}.closure_platforms`,
                 );
                 for (const platform of harness.closure_platforms) {
-                    if (!["linux-x64-gnu", "darwin-arm64", "darwin-x64"].includes(platform)) {
+                    if (platform !== "linux-x64-gnu") {
                         fail(`harnesses.${name}: unsupported closure platform ${platform}`);
                     }
                 }

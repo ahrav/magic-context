@@ -13,7 +13,7 @@
   },
   "scripts": {
     "build": "bun run build:native && bun run build:js",
-    "build:native": "cargo build --release -p mc-shm-native && cp -f ../../target/release/libmc_shm_native.$(test \"$(uname -s)\" = Darwin && echo dylib || echo so) ./mc_shm_native.node",
+    "build:native": "test \"$(uname -s)-$(uname -m)\" = Linux-x86_64 && cargo build --release -p mc-shm-native && cp -f ../../target/release/libmc_shm_native.so ./mc_shm_native.node",
     "build:js": "bun build index.ts --outfile index.js --target node --format esm",
     "build:source": "bun run build",
     "test": "bun test tests",

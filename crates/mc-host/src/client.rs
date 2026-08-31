@@ -1651,6 +1651,7 @@ impl Correlations {
 struct ByteCounter {
     cap: usize,
     used: Mutex<usize>,
+    wake: Mutex<Option<Weak<OwnedFd>>>,
 }
 
 impl ByteCounter {
@@ -1658,6 +1659,7 @@ impl ByteCounter {
         Self {
             cap,
             used: Mutex::new(0),
+            wake: Mutex::new(None),
         }
     }
 
@@ -1676,6 +1678,10 @@ impl ByteCounter {
 
     const fn capacity(&self) -> usize {
         self.cap
+    }
+
+    fn set_wake(&self, wake: &Arc<OwnedFd>) {
+        *lock_unpoisoned(&self.wake) = Some(Arc::downgrade(wake));
     }
 
     #[cfg(test)]
@@ -1705,8 +1711,16 @@ impl ByteCharge {
 impl Drop for ByteCharge {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.upgrade() {
-            let mut used = lock_unpoisoned(&owner.used);
-            *used = used.saturating_sub(self.bytes);
+            {
+                let mut used = lock_unpoisoned(&owner.used);
+                *used = used.saturating_sub(self.bytes);
+            }
+            if let Some(wake) = lock_unpoisoned(&owner.wake)
+                .as_ref()
+                .and_then(Weak::upgrade)
+            {
+                signal_eventfd(&wake);
+            }
         }
     }
 }
@@ -1741,7 +1755,25 @@ struct RingWrite {
     deadline: StdInstant,
 }
 
-type RingWriteSender = std::sync::mpsc::SyncSender<RingWrite>;
+struct RingWriteSender {
+    tx: std::sync::mpsc::SyncSender<RingWrite>,
+    wake: Arc<OwnedFd>,
+}
+
+impl RingWriteSender {
+    fn try_send(&self, write: RingWrite) -> Result<(), std::sync::mpsc::TrySendError<RingWrite>> {
+        self.tx.try_send(write)?;
+        signal_eventfd(&self.wake);
+        Ok(())
+    }
+}
+
+impl Drop for RingWriteSender {
+    fn drop(&mut self) {
+        signal_eventfd(&self.wake);
+    }
+}
+
 type RingFrameReceiver = mpsc::Receiver<(EnvelopeHeader, Vec<u8>, ByteCharge)>;
 
 /// The mapped ring cannot express host death: a host that exits without a
@@ -1761,14 +1793,32 @@ fn setup_peer_closed(stream: &StdUnixStream) -> bool {
     }
 }
 
+fn signal_eventfd(fd: &OwnedFd) {
+    let _ = rustix::io::write(fd, &1u64.to_ne_bytes());
+}
+
+fn drain_eventfd(fd: &OwnedFd) {
+    let mut value = [0u8; size_of::<u64>()];
+    let _ = rustix::io::read(fd, &mut value);
+}
+
 fn start_ring_bridge(
     descriptor: serde_json::Value,
-    descriptors: [OwnedFd; 2],
+    descriptors: [OwnedFd; crate::setup_socket::RING_DESCRIPTOR_COUNT],
     mut setup: StdUnixStream,
     cancel: CancellationToken,
     read_budget: Arc<ByteCounter>,
 ) -> Result<(RingWriteSender, RingFrameReceiver), ClientError> {
     let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<RingWrite>(CLIENT_DATA_QUEUE_FRAMES);
+    let wake_fd = Arc::new(
+        rustix::event::eventfd(
+            0,
+            rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+        )
+        .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?,
+    );
+    let worker_wake = Arc::clone(&wake_fd);
+    read_budget.set_wake(&wake_fd);
     let (read_tx, read_rx) = mpsc::channel(CLIENT_DATA_QUEUE_FRAMES);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -1782,6 +1832,10 @@ fn start_ring_bridge(
                 let _ = ready_tx.send(Err(()));
                 return;
             };
+            let Ok(data_ready) = endpoint.from_host.duplicate_data_ready() else {
+                let _ = ready_tx.send(Err(()));
+                return;
+            };
             if ready_tx.send(Ok(())).is_err() {
                 return;
             }
@@ -1789,6 +1843,7 @@ fn start_ring_bridge(
                 if setup_peer_closed(&setup) {
                     break;
                 }
+                let mut wrote = false;
                 match write_rx.try_recv() {
                     Ok(write) => {
                         let deadline = write.deadline;
@@ -1800,6 +1855,7 @@ fn start_ring_bridge(
                         if failed {
                             break;
                         }
+                        wrote = true;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -1820,16 +1876,79 @@ fn start_ring_bridge(
                     if cancel.is_cancelled() {
                         return None;
                     }
-                    std::thread::sleep(Duration::from_micros(50));
+                    let mut fds = [
+                        rustix::event::PollFd::new(&*worker_wake, rustix::event::PollFlags::IN),
+                        rustix::event::PollFd::new(
+                            &setup,
+                            rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR,
+                        ),
+                    ];
+                    loop {
+                        match rustix::event::poll(&mut fds, None) {
+                            Ok(_) => break,
+                            Err(rustix::io::Errno::INTR) if !cancel.is_cancelled() => continue,
+                            Err(_) => return None,
+                        }
+                    }
+                    if fds[1]
+                        .revents()
+                        .intersects(rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR)
+                    {
+                        return None;
+                    }
+                    if fds[0].revents().contains(rustix::event::PollFlags::IN) {
+                        drain_eventfd(&worker_wake);
+                    }
                 };
                 match endpoint.try_recv_with(charge) {
                     Ok(Some(frame)) => {
                         if read_tx.blocking_send(frame).is_err() {
                             break;
                         }
+                        continue;
                     }
-                    Ok(None) => std::thread::sleep(Duration::from_micros(50)),
+                    Ok(None) => {}
                     Err(_) => break,
+                }
+                if wrote {
+                    continue;
+                }
+                match endpoint.from_host.arm_data_wait() {
+                    Ok(false) => continue,
+                    Ok(true) => {}
+                    Err(_) => break,
+                }
+                let mut fds = [
+                    rustix::event::PollFd::new(&*worker_wake, rustix::event::PollFlags::IN),
+                    rustix::event::PollFd::new(&data_ready, rustix::event::PollFlags::IN),
+                    rustix::event::PollFd::new(
+                        &setup,
+                        rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR,
+                    ),
+                ];
+                let poll_ready = loop {
+                    match rustix::event::poll(&mut fds, None) {
+                        Ok(_) => break true,
+                        Err(rustix::io::Errno::INTR) if !cancel.is_cancelled() => continue,
+                        Err(_) => break false,
+                    }
+                };
+                if !poll_ready {
+                    break;
+                }
+                if fds[0].revents().contains(rustix::event::PollFlags::IN) {
+                    drain_eventfd(&worker_wake);
+                }
+                if fds[1].revents().contains(rustix::event::PollFlags::IN)
+                    && endpoint.from_host.complete_data_wait().is_err()
+                {
+                    break;
+                }
+                if fds[2]
+                    .revents()
+                    .intersects(rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR)
+                {
+                    break;
                 }
             }
             if let Ok(goodbye) = crate::setup_socket::encoded_goodbye() {
@@ -1842,7 +1961,13 @@ fn start_ring_bridge(
         .recv()
         .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?
         .map_err(|_| ClientError::new("setup_failed", "shared-memory setup failed"))?;
-    Ok((write_tx, read_rx))
+    Ok((
+        RingWriteSender {
+            tx: write_tx,
+            wake: wake_fd,
+        },
+        read_rx,
+    ))
 }
 
 fn decode_outbound(bytes: &[u8]) -> Result<(EnvelopeHeader, &[u8]), ()> {
@@ -1860,7 +1985,7 @@ fn decode_outbound(bytes: &[u8]) -> Result<(EnvelopeHeader, &[u8]), ()> {
 
 async fn writer_loop(
     inner: Arc<Inner>,
-    write: std::sync::mpsc::SyncSender<RingWrite>,
+    write: RingWriteSender,
     mut data_rx: mpsc::Receiver<QueuedFrame>,
     mut control_rx: mpsc::Receiver<QueuedFrame>,
 ) {
@@ -2417,6 +2542,14 @@ mod tests {
         assert!(control_rx.try_recv().is_err(), "not-sent needs no Cancel");
 
         let (write, writes) = std::sync::mpsc::sync_channel(1);
+        let wake = Arc::new(
+            rustix::event::eventfd(
+                0,
+                rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+            )
+            .unwrap(),
+        );
+        let write = RingWriteSender { tx: write, wake };
         let writer_inner = Arc::clone(&inner);
         let writer = tokio::spawn(async move {
             writer_loop(writer_inner, write, data_rx, control_rx).await;
@@ -3864,6 +3997,82 @@ mod tests {
         assert_eq!(SendOutcome::NotSent.as_str(), "not_sent");
         assert_eq!(SendOutcome::OutcomeUnknown.as_str(), "outcome_unknown");
         assert_eq!(SendOutcome::Terminal.as_str(), "terminal");
+    }
+
+    #[tokio::test]
+    async fn ring_bridge_drains_inbound_and_queued_writes() {
+        let rings = mc_shm_transport::backend::ring::DuplexRing::create(
+            &crate::ring_transport::ring_profile(),
+        )
+        .expect("duplex ring");
+        let (descriptor, descriptors) =
+            crate::ring_transport::worker_descriptor(&rings).expect("descriptor");
+        let (client_end, _host_end) = StdUnixStream::pair().expect("socket pair");
+        let (write, mut read_rx) = start_ring_bridge(
+            descriptor,
+            descriptors,
+            client_end,
+            CancellationToken::new(),
+            Arc::new(ByteCounter::new(CLIENT_INBOUND_FRAME_BYTES)),
+        )
+        .expect("bridge");
+
+        let outbound = EnvelopeHeader {
+            len: 0,
+            ver: PROTOCOL_VERSION,
+            ty: FrameType::Request,
+            flags: pure_header_flags(),
+            channel: 1,
+            epoch: 1,
+            corr: 1,
+        }
+        .encode()
+        .to_vec();
+        let mut completions = Vec::new();
+        for _ in 0..8 {
+            let (completed, rx) = oneshot::channel();
+            write
+                .tx
+                .try_send(RingWrite {
+                    bytes: outbound.clone(),
+                    completed,
+                    deadline: StdInstant::now() + Duration::from_secs(1),
+                })
+                .expect("queue write without waking worker");
+            completions.push(rx);
+        }
+        rings
+            .first
+            .try_reserve(
+                0,
+                EnvelopeHeader {
+                    len: 0,
+                    ver: PROTOCOL_VERSION,
+                    ty: FrameType::Response,
+                    flags: response_flags(false, true),
+                    channel: 1,
+                    epoch: 1,
+                    corr: 1,
+                }
+                .encode(),
+            )
+            .expect("reserve inbound")
+            .commit(0)
+            .expect("publish inbound");
+        signal_eventfd(&write.wake);
+
+        let frame = tokio::time::timeout(Duration::from_millis(250), read_rx.recv())
+            .await
+            .expect("inbound frame starved behind queued writes")
+            .expect("bridge closed");
+        assert_eq!(frame.0.ty, FrameType::Response);
+        for completion in completions {
+            tokio::time::timeout(Duration::from_millis(250), completion)
+                .await
+                .expect("queued write stranded after eventfd drain")
+                .expect("bridge dropped write completion")
+                .expect("queued write failed");
+        }
     }
 
     #[test]

@@ -121,27 +121,12 @@ export function renderDaemonHuman(result: DaemonResultV1): string {
         );
     }
     if (result.readiness !== null) {
-        for (const component of ["shared_memory", "storage", "synapse"] as const) {
+        for (const component of ["transport", "storage", "synapse"] as const) {
             const readiness = result.readiness[component];
             if (readiness !== undefined) {
                 lines.push(`Readiness ${component}: ${readiness.state} (${readiness.reason})`);
             }
         }
-    }
-    if (result.shared_memory !== null) {
-        const diagnostic = result.shared_memory;
-        lines.push(
-            `Shared memory: ${diagnostic.state}${diagnostic.error_class === null ? "" : ` (${diagnostic.error_class})`}`,
-        );
-        lines.push(
-            `Ring artifact: profile=${diagnostic.artifact.profile} wire=${diagnostic.artifact.wire_version} descriptor=${diagnostic.artifact.descriptor_schema}`,
-        );
-        lines.push(
-            `Ring accounting: active_bytes=${diagnostic.accounting?.active.arena_bytes ?? "unknown"} quarantined_bytes=${diagnostic.accounting?.quarantined.arena_bytes ?? "unknown"} bound_bytes=${diagnostic.bounds?.arena_bytes ?? "unknown"}`,
-        );
-        lines.push(
-            `Ring lifecycle: activations=${diagnostic.activation.completed} peer_deaths=${diagnostic.peer_death.observed} reclamations=${diagnostic.reclamation.completed} exhaustions=${diagnostic.exhaustion.observed}`,
-        );
     }
     for (const check of result.checks) {
         const remediation = check.remediation === null ? "" : ` remediation=${check.remediation}`;

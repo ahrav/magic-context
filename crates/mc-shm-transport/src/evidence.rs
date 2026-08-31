@@ -1,26 +1,25 @@
-use crate::descriptor::SchedulingMode;
+//! Operation counters and disqualification reason codes.
 
+/// Operation counters used to produce disqualification reason codes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OperationCounters {
     /// Transport-body copies.
     pub body_copies: u64,
+    /// Native transport heap allocations.
     pub native_allocations: u64,
     /// Timed-path syscalls.
     pub syscalls: u64,
     /// Park/wake transitions.
     pub park_wakes: u64,
+    /// Generic queue hops.
     pub generic_queue_hops: u64,
     /// Scheduler handoffs.
     pub scheduler_handoffs: u64,
 }
 
 impl OperationCounters {
-    /// disqualifications returns one reason code for each nonzero forbidden operation.
-    pub fn disqualifications(
-        self,
-        scheduling: SchedulingMode,
-        cold_native_wake_qualified: bool,
-    ) -> Vec<&'static str> {
+    /// Returns one reason code for each nonzero forbidden operation.
+    pub fn disqualifications(self, eventfd_wake_qualified: bool) -> Vec<&'static str> {
         let mut reasons = Vec::new();
         if self.body_copies != 0 {
             reasons.push("transport_body_copy");
@@ -31,7 +30,7 @@ impl OperationCounters {
         if self.generic_queue_hops != 0 {
             reasons.push("generic_queue_hop");
         }
-        let wake_allowed = scheduling == SchedulingMode::ColdParkWake && cold_native_wake_qualified;
+        let wake_allowed = eventfd_wake_qualified;
         if self.syscalls != 0 && !wake_allowed {
             reasons.push("timed_path_syscall");
         }

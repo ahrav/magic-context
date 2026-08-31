@@ -33,7 +33,6 @@ import {
     PAYLOAD_TARGETS,
     type PayloadManifest,
     NATIVE_ADDON_PATH,
-    packProductionPayload,
     type ReleaseContext,
     payloadManifestDigest,
     runCheck,
@@ -54,11 +53,7 @@ const CONTEXT_FILES = [
     "release/mc-host-provider-credentials.json",
     "release/mc-host-registry-gate.json",
 ];
-const PACKAGE_DIRS = [
-    "packages/mc-host-darwin-arm64",
-    "packages/mc-host-darwin-x64",
-    "packages/mc-host-linux-x64-gnu",
-];
+const PACKAGE_DIRS = ["packages/mc-host-linux-x64-gnu"];
 const PARENT_MANIFESTS = [
     "packages/plugin/package.json",
     "packages/pi-plugin/package.json",
@@ -223,7 +218,7 @@ function nativeAddon(root: string): string {
 function devManifest(): PayloadManifest {
     const ctx = context();
     const contract = buildContract();
-    const target = targetFor("darwin-arm64");
+    const target = targetFor("linux-x64-gnu");
     return {
         schema: "magic-context.mc-host-payload-manifest/v1",
         release: { id: contract.release.id, version: contract.release.version },
@@ -235,8 +230,12 @@ function devManifest(): PayloadManifest {
             version: contract.release.version,
             target: target.target,
         },
-        platform_floor: { os_min: "13.5", dev_fd_exec: true },
-        synapse: "unsupported",
+        platform_floor: {
+            glibc_min: "2.28",
+            kernel_min: "4.18",
+            procfs_self_fd_exec: true,
+        },
+        synapse: "certified_cpu",
         launcher: LAUNCHER_PATH,
         files: [
             {
@@ -314,21 +313,6 @@ describe("payload package metadata", () => {
         }
     });
 
-    test("libc on a darwin package fails", () => {
-        const root = freshRoot();
-        const relative = "packages/mc-host-darwin-arm64/package.json";
-        const pkg = readMutable(root, relative);
-        pkg.libc = ["glibc"];
-        writeJson(root, relative, pkg);
-        expect(() =>
-            validatePayloadPackageDir(
-                root,
-                targetFor("darwin-arm64"),
-                buildContract(),
-            ),
-        ).toThrow(/libc is Linux-only/);
-    });
-
     test("any lifecycle script fails the no-lifecycle scan", () => {
         for (const script of [
             "preinstall",
@@ -337,14 +321,14 @@ describe("payload package metadata", () => {
             "build",
         ]) {
             const root = freshRoot();
-            const relative = "packages/mc-host-darwin-x64/package.json";
+            const relative = "packages/mc-host-linux-x64-gnu/package.json";
             const pkg = readMutable(root, relative);
             pkg.scripts = { [script]: "node evil.js" };
             writeJson(root, relative, pkg);
             expect(() =>
                 validatePayloadPackageDir(
                     root,
-                    targetFor("darwin-x64"),
+                    targetFor("linux-x64-gnu"),
                     buildContract(),
                 ),
             ).toThrow(/no scripts/);
@@ -354,11 +338,11 @@ describe("payload package metadata", () => {
     test("missing license/notice/readme fails", () => {
         for (const doc of ["LICENSE", "NOTICE", "README.md"]) {
             const root = freshRoot();
-            rmSync(join(root, "packages/mc-host-darwin-arm64", doc));
+            rmSync(join(root, "packages/mc-host-linux-x64-gnu", doc));
             expect(() =>
                 validatePayloadPackageDir(
                     root,
-                    targetFor("darwin-arm64"),
+                    targetFor("linux-x64-gnu"),
                     buildContract(),
                 ),
             ).toThrow(new RegExp(`missing or empty ${doc}`));
@@ -381,7 +365,7 @@ describe("payload package metadata", () => {
 });
 
 describe("parent optional dependencies", () => {
-    test("committed parents declare all three exact versions", () => {
+    test("committed parents declare the exact payload version", () => {
         expect(() =>
             validateParentManifests(repoRoot, buildContract()),
         ).not.toThrow();
@@ -394,10 +378,10 @@ describe("parent optional dependencies", () => {
             const pkg = readMutable(root, relative);
             if (spec === undefined) {
                 delete pkg.optionalDependencies[
-                    "@cortexkit/mc-host-darwin-x64"
+                    "@cortexkit/mc-host-linux-x64-gnu"
                 ];
             } else {
-                pkg.optionalDependencies["@cortexkit/mc-host-darwin-x64"] =
+                pkg.optionalDependencies["@cortexkit/mc-host-linux-x64-gnu"] =
                     spec;
             }
             writeJson(root, relative, pkg);
@@ -495,30 +479,6 @@ describe("payload manifest schema", () => {
         );
     });
 
-    test("macOS manifests cannot claim Synapse or carry model bytes", () => {
-        const ctx = context();
-        const claims = structuredClone(devManifest());
-        claims.synapse = "certified_cpu";
-        expect(() => validatePayloadManifest(claims, ctx)).toThrow(
-            /Synapse claim mismatch/,
-        );
-
-        const withModel = structuredClone(devManifest());
-        withModel.files = [
-            withModel.files[0],
-            {
-                path: "payload/model/gte-modernbert-base-f16/model.onnx",
-                type: "file",
-                size: 4,
-                mode: "644",
-                sha256: sha256Hex("onnx"),
-            },
-        ].sort((a, b) => (a.path < b.path ? -1 : 1));
-        expect(() => validatePayloadManifest(withModel, ctx)).toThrow(
-            /must be exactly/,
-        );
-    });
-
     test("size budget overflow fails with the budget in the message", () => {
         const ctx = context();
         const manifest = structuredClone(devManifest());
@@ -610,7 +570,7 @@ describe("stop-provenance record", () => {
         return {
             tag: "predecessor",
             release_version: "0.39.0",
-            target: "darwin-arm64",
+            target: "linux-x64-gnu",
             predecessor_release_version: "0.38.0",
             predecessor_daemon_version: "mc-host/0.1.0",
             legacy_proof_version: 1,
@@ -722,7 +682,7 @@ describe("stop-provenance record", () => {
 });
 
 describe("trust index", () => {
-    test("qualified trust generation requires a complete three-target payload root", () => {
+    test("qualified trust generation requires the complete payload root", () => {
         const ctx = qualifiedContext();
         expect(() => buildTrustArtifacts(ctx)).toThrow(
             /requires the complete payload root/,
@@ -791,21 +751,25 @@ describe("trust index", () => {
             [
                 "floor drift",
                 (copy) => {
-                    copy.entries[2].platform_floor.glibc_min = "2.27";
+                    copy.entries[0].platform_floor.glibc_min = "2.27";
                 },
                 /platform floor drift/,
             ],
             [
                 "budget drift",
                 (copy) => {
-                    copy.entries[2].size_budget_bytes.unpacked_max += 1;
+                    const entry = copy.entries.find(
+                        (candidate: any) => candidate.size_budget_bytes,
+                    );
+                    if (!entry) throw new Error("missing budgeted payload entry");
+                    entry.size_budget_bytes.unpacked_max += 1;
                 },
                 /size budget drift/,
             ],
             [
                 "synapse drift",
                 (copy) => {
-                    copy.entries[0].synapse = "certified_cpu";
+                    copy.entries[0].synapse = "unsupported";
                 },
                 /Synapse claim drift/,
             ],
@@ -925,38 +889,6 @@ describe("production payload assembly", () => {
         ).toThrow(/differs from the U9 lock/);
     });
 
-    test("macOS host-only payload carries no Linux model bytes", () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-host-production-"));
-        tempRoots.push(root);
-        const binary = join(root, "ck-mc-host");
-        writeFileSync(binary, "Mach-O production launcher\n");
-
-        const result = assembleProductionPayload(
-            qualifiedContext(),
-            targetFor("darwin-arm64"),
-            {
-                outDir: join(root, "out"),
-                sources: {
-                    binaryPath: binary,
-                    nativeAddonPath: nativeAddon(root),
-                },
-            },
-        );
-
-        expect(result.manifest.files.map((entry) => entry.path)).toEqual([
-            LAUNCHER_PATH,
-            NATIVE_ADDON_PATH,
-        ]);
-        expect(result.manifest.synapse).toBe("unsupported");
-        writeFileSync(
-            join(result.outDir, NATIVE_ADDON_PATH),
-            "release native addon byteS\n",
-        );
-        expect(() => verifyPayloadDir(result.outDir, result.manifest)).toThrow(
-            /digest drift/,
-        );
-    });
-
     test("source pathname replacement after open cannot change copied bytes", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-source-swap-"));
         tempRoots.push(root);
@@ -1013,44 +945,6 @@ describe("production payload assembly", () => {
         expect(readFileSync(modelPath, "utf8")).toBe("attacker replacement");
     });
 
-    test("npm 11 packs the manifest and payload from the staged package root", () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-host-production-"));
-        tempRoots.push(root);
-        const binary = join(root, "ck-mc-host");
-        writeFileSync(binary, "Mach-O production launcher\n");
-        const result = assembleProductionPayload(
-            qualifiedContext(),
-            targetFor("darwin-x64"),
-            {
-                outDir: join(root, "out"),
-                packageMetadataDir: join(
-                    repoRoot,
-                    "packages",
-                    "mc-host-darwin-x64",
-                ),
-                sources: {
-                    binaryPath: binary,
-                    nativeAddonPath: nativeAddon(root),
-                },
-            },
-        );
-
-        const packed = packProductionPayload(result, join(root, "tarballs"));
-        const listing = Bun.spawnSync(["tar", "-tf", packed.tarballPath]);
-
-        expect(listing.exitCode).toBe(0);
-        const names = listing.stdout.toString("utf8");
-        expect(names).toContain("package/payload-manifest.json");
-        expect(names).toContain("package/payload/bin/ck-mc-host");
-        expect(names).toContain("package/payload/native/mc_shm_native.node");
-        expect(() =>
-            packProductionPayload(
-                { ...result, releaseQualified: false },
-                join(root, "blocked-tarballs"),
-            ),
-        ).toThrow(/gate-bypassed payloads cannot be packed/);
-    });
-
     test("unqualified context and missing Linux inputs fail before a manifest exists", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-host-production-"));
         tempRoots.push(root);
@@ -1060,7 +954,7 @@ describe("production payload assembly", () => {
         expect(() =>
             assembleProductionPayload(
                 unqualifiedContext(),
-                targetFor("darwin-x64"),
+                targetFor("linux-x64-gnu"),
                 {
                 outDir: join(root, "unqualified"),
                 sources: {
@@ -1115,7 +1009,7 @@ describe("production payload assembly", () => {
 
         expect(() => validateTrustIndex(artifacts.index, ctx)).not.toThrow();
         const entries = (artifacts.index.entries as Record<string, unknown>[]);
-        expect(entries).toHaveLength(3);
+        expect(entries).toHaveLength(1);
         expect(entries.every((entry) => entry.qualified === true)).toBe(true);
         expect(entries.every((entry) => entry.published === false)).toBe(true);
         expect(
@@ -1171,7 +1065,7 @@ describe("dev payload build", () => {
         const result = buildDevPayload(releaseRoot, {
             outDir: join(root, "out"),
             binaryPath: fakeBinary,
-            target: targetFor("darwin-x64"),
+            target: targetFor("linux-x64-gnu"),
         });
         const ctx = loadReleaseContext(releaseRoot);
         const reloaded = JSON.parse(readFileSync(result.manifestPath, "utf8"));
@@ -1192,7 +1086,7 @@ describe("dev payload build", () => {
         const result = buildDevPayload(releaseRoot, {
             outDir: join(root, "out"),
             binaryPath: fakeBinary,
-            target: targetFor("darwin-arm64"),
+            target: targetFor("linux-x64-gnu"),
         });
         writeFileSync(join(result.outDir, LAUNCHER_PATH), "dev binarY");
         expect(() => verifyPayloadDir(result.outDir, result.manifest)).toThrow(

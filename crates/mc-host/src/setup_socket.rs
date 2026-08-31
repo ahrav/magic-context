@@ -11,7 +11,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
-use rustix::io::{fcntl_setfd, FdFlags};
+#[cfg(test)]
+use rustix::io::FdFlags;
 use rustix::net::{
     recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
     SendAncillaryBuffer, SendAncillaryMessage, SendFlags,
@@ -22,7 +23,7 @@ use tokio::net::UnixStream;
 use tokio::time::{timeout_at, Instant};
 
 pub const MAX_SETUP_MESSAGE_LEN: usize = 16 * 1024;
-pub const RING_DESCRIPTOR_COUNT: usize = 2;
+pub const RING_DESCRIPTOR_COUNT: usize = mc_shm_transport::descriptor::SETUP_DESCRIPTOR_COUNT;
 
 pub(crate) fn bind_owner_only(path: &Path) -> io::Result<tokio::net::UnixListener> {
     match std::fs::symlink_metadata(path) {
@@ -128,7 +129,7 @@ impl std::error::Error for SetupError {
     }
 }
 
-/// Sends the grant and exactly two ring descriptors in one `SCM_RIGHTS` message.
+/// Sends one fixed six-descriptor grant in one `SCM_RIGHTS` message.
 pub async fn send_grant(
     stream: &mut UnixStream,
     grant: &GrantMessage,
@@ -174,7 +175,7 @@ pub async fn send_grant(
     Ok(())
 }
 
-/// Receives one grant and exactly two close-on-exec descriptors.
+/// Receives one grant and exactly six close-on-exec descriptors.
 pub async fn receive_grant(
     stream: &mut UnixStream,
     deadline: Instant,
@@ -193,7 +194,7 @@ pub async fn receive_grant(
                 stream.as_fd(),
                 &mut iov,
                 &mut ancillary,
-                RecvFlags::DONTWAIT,
+                RecvFlags::DONTWAIT | RecvFlags::CMSG_CLOEXEC,
             )
             .map_err(io::Error::from)
         }) {
@@ -222,9 +223,6 @@ pub async fn receive_grant(
     }
     if descriptors.len() > RING_DESCRIPTOR_COUNT {
         return Err(SetupError::DuplicateDescriptors);
-    }
-    for descriptor in &descriptors {
-        fcntl_setfd(descriptor, FdFlags::CLOEXEC).map_err(io::Error::from)?;
     }
     let descriptors: [OwnedFd; RING_DESCRIPTOR_COUNT] = descriptors
         .try_into()
@@ -441,7 +439,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grant_transfers_exactly_two_descriptors() {
+    async fn grant_transfers_exactly_six_descriptors_close_on_exec() {
+        assert_eq!(RING_DESCRIPTOR_COUNT, 6);
         let (mut server, mut client) = UnixStream::pair().expect("socket pair");
         let descriptors = descriptors();
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -510,12 +509,14 @@ mod tests {
     #[tokio::test]
     async fn grant_with_extra_descriptor_is_rejected() {
         let (server, mut client) = UnixStream::pair().expect("socket pair");
-        let descriptors: [OwnedFd; 3] =
+        let descriptors: [OwnedFd; RING_DESCRIPTOR_COUNT + 1] =
             std::array::from_fn(|_| tempfile::tempfile().expect("temporary descriptor").into());
-        let borrowed: [BorrowedFd<'_>; 3] = std::array::from_fn(|index| descriptors[index].as_fd());
+        let borrowed: [BorrowedFd<'_>; RING_DESCRIPTOR_COUNT + 1] =
+            std::array::from_fn(|index| descriptors[index].as_fd());
         let bytes = encode_message(&serde_json::json!({"type": "grant"})).unwrap();
         server.writable().await.unwrap();
-        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(3))];
+        let mut space =
+            [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(RING_DESCRIPTOR_COUNT + 1))];
         let mut ancillary = SendAncillaryBuffer::new(&mut space);
         assert!(ancillary.push(SendAncillaryMessage::ScmRights(&borrowed)));
         sendmsg(

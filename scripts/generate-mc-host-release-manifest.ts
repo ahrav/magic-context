@@ -1,19 +1,27 @@
 /**
- * The generator creates the pre-build release and compatibility contract.
+ * U8 pre-build release and compatibility contract generator (KTD7, KTD12, KTD20).
  *
- * The generator emits three deterministic, byte-exact outputs from the in-source contract literal.
+ * Generates, deterministically (stable key order, no timestamps, no environment
+ * input), three byte-exact outputs from one in-source contract literal:
  *
+ *   - release/mc-host-release.json                                  (canonical JSON)
+ *   - release/generated/mc-host-release-contract.rs                 (Rust, include!-able)
+ *   - packages/plugin/src/shared/mc-host-lifecycle/generated-contract.ts (TypeScript)
  *
- * The Rust and TypeScript outputs embed byte-identical canonical JSON and its SHA-256 digest.
- * The pre-build contract contains no binary, model, runtime, or payload hashes; post-build artifacts bind its digest instead.
+ * The Rust and TypeScript outputs embed the byte-identical canonical JSON plus
+ * one SHA-256 digest of those canonical bytes. The pre-build contract carries NO
+ * binary, model, runtime, or payload hashes (KTD7); post-build artifacts (U9/U6/U7)
+ * bind this contract's digest instead.
  *
- * The generator requires a valid local `release/mc-host-registry-gate.json` gate and makes no registry calls.
- * The gate records npm ownership, publisher, credential-revocation, and unpublished-version evidence.
- * An absent or failing gate file blocks generation.
+ * Generation is gated on `release/mc-host-registry-gate.json`, the local evidence
+ * file release engineering populates after the real npm R50 checks (five-name
+ * ownership/reservation, trusted publishers, revoked bootstrap credential, and one
+ * synchronized unpublished version). No registry call happens here; an absent or
+ * failing gate file blocks generation.
  *
  * Usage:
- * `bun scripts/generate-mc-host-release-manifest.ts` writes the generated outputs.
- * `bun scripts/generate-mc-host-release-manifest.ts --check` fails when any generated output drifts.
+ *   bun scripts/generate-mc-host-release-manifest.ts          # write outputs
+ *   bun scripts/generate-mc-host-release-manifest.ts --check  # fail on any drift
  */
 
 import { createHash } from "node:crypto";
@@ -22,10 +30,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
-// The contract literal is the sole pre-build source of truth.
+// Contract literal: the single pre-build source of truth.
 // ---------------------------------------------------------------------------
 
-/** The registry gate must verify that `0.38.0` is unpublished for all six packages. */
+/** Synchronized release version (R50). */
 const RELEASE_VERSION = "0.38.0";
 
 const PARENT_PACKAGES = [
@@ -34,11 +42,7 @@ const PARENT_PACKAGES = [
     "@cortexkit/pi-magic-context",
 ] as const;
 
-const PAYLOAD_PACKAGES = [
-    "@cortexkit/mc-host-darwin-arm64",
-    "@cortexkit/mc-host-darwin-x64",
-    "@cortexkit/mc-host-linux-x64-gnu",
-] as const;
+const PAYLOAD_PACKAGES = ["@cortexkit/mc-host-linux-x64-gnu"] as const;
 
 /**
  * The shared-memory addon is a non-optional dependency of every parent, so an
@@ -62,6 +66,7 @@ const CONTRACT = {
     },
     versions: {
         daemon: "mc-host/0.1.0",
+        // Half-open [min_inclusive, max_exclusive).
         supported_daemon_range: {
             min_inclusive: "0.1.0",
             max_exclusive: "0.2.0",
@@ -83,8 +88,8 @@ const CONTRACT = {
         wire_protocol: 2,
     },
     proof: {
-        // `current_offers` orders proof versions by client preference.
-        // Servers on the current proof version accept only offer lists containing `current_version`.
+        // Ordered current-proof offer list (client preference order). N servers
+        // accept only offer lists containing the current version (KTD20).
         current_version: 2,
         current_offers: [2],
         // Both current proof MACs bind exactly these transcript fields, in order.
@@ -96,7 +101,8 @@ const CONTRACT = {
             "server_nonce",
             "daemon_id",
         ],
-        // The trusted N-1 `legacy_stop_only` profile is never negotiated on the general endpoint and does not infer a missing offer.
+        // Dedicated trusted N-1 stop-only profile. Never negotiated on the general
+        // endpoint; no missing-offer inference exists.
         legacy_stop_only: {
             version: 1,
             scope: "stop_only",
@@ -104,13 +110,13 @@ const CONTRACT = {
             missing_offer_inference: false,
         },
     },
-    // The schema reserves a stop-provenance tag for a post-build record.
+    // Tagged stop-provenance SCHEMA only (the record itself is a U6 artifact).
     stop_provenance_schema: {
         tag_field: "tag",
         tags: ["genesis", "predecessor"],
         genesis: {
-            // The post-build binding covers only the current release identity.
-            // The post-build binding grants no predecessor, proof, or payload-manifest authority.
+            // Binds the current U8 release identity and nothing else. Carries no
+            // predecessor, proof, or payload-manifest authority (R48).
             required_fields: ["release_version", "tag"],
             forbidden_fields: [
                 "legacy_proof_version",
@@ -135,6 +141,8 @@ const CONTRACT = {
             legacy_stop_authority: true,
         },
     },
+    // Exact five-part epochs (KTD8). state_sync is the numeric epoch added by U8
+    // alongside the pre-existing boolean `state_sync_deltas` feature signal.
     epochs: {
         compartment_render: 2,
         memory_render: 2,
@@ -144,40 +152,6 @@ const CONTRACT = {
     },
     platforms: {
         supported: [
-            {
-                target: "darwin-arm64",
-                os_min: "13.5",
-                synapse: "unsupported",
-                synapse_reason: "synapse_unsupported",
-                capabilities: {
-                    dev_fd_exec: true,
-                    filesystem: [
-                        "atomic_same_filesystem_replacement",
-                        "cross_process_locks",
-                        "file_and_directory_fsync",
-                        "local_filesystem",
-                        "no_follow_link_semantics",
-                        "retained_object_execution",
-                    ],
-                },
-            },
-            {
-                target: "darwin-x64",
-                os_min: "13.5",
-                synapse: "unsupported",
-                synapse_reason: "synapse_unsupported",
-                capabilities: {
-                    dev_fd_exec: true,
-                    filesystem: [
-                        "atomic_same_filesystem_replacement",
-                        "cross_process_locks",
-                        "file_and_directory_fsync",
-                        "local_filesystem",
-                        "no_follow_link_semantics",
-                        "retained_object_execution",
-                    ],
-                },
-            },
             {
                 target: "linux-x64-gnu",
                 kernel_min: "4.18",
@@ -196,19 +170,18 @@ const CONTRACT = {
                 },
             },
         ],
-        // The fallback applies to musl, below-floor hosts, and Linux without qualified procfs self-fd execution.
+        // Everything else, musl, below-floor hosts, and Linux without qualified
+        // procfs self-fd execution.
         unsupported_reason: "unsupported_platform",
     },
     model_lane: {
         id: "gte-modernbert-base-f16",
         execution_provider: "cpu",
         platforms: ["linux-x64-gnu"],
-        unsupported: {
-            "darwin-arm64": "synapse_unsupported",
-            "darwin-x64": "synapse_unsupported",
-        },
+        unsupported: {},
     },
-    // Supported code never renames or unlinks the version-neutral coordination names.
+    // Stable version-neutral coordination names (KTD2). Supported code never
+    // renames or unlinks these.
     coordination: {
         directory: ".mc-host-coordination",
         transaction_lock: "transaction.lock",
@@ -237,7 +210,7 @@ const CONTRACT = {
         ],
         check_statuses: ["pass", "fail", "warn", "skip"],
         readiness_states: {
-            shared_memory: ["ready", "starting", "unavailable"],
+            transport: ["ready", "starting", "unavailable"],
             storage: ["ready", "starting", "unavailable"],
             synapse: ["ready", "starting", "degraded", "unsupported"],
         },
@@ -246,7 +219,7 @@ const CONTRACT = {
             fields: ["stop_committed", "start_committed"],
         },
         exit_codes: { ok: 0, operational_failure: 1, usage: 2 },
-        // The v1 check-ID union is closed and lexicographically sorted.
+        // Closed v1 check-ID union, lexicographically sorted.
         check_ids: [
             "artifact.bootstrap",
             "artifact.current_generation",
@@ -267,11 +240,11 @@ const CONTRACT = {
             "lifecycle.fences",
             "lifecycle.publication",
             "platform.support",
-            "readiness.shared_memory",
             "readiness.storage",
             "readiness.synapse",
+            "readiness.transport",
         ],
-        // The remediation union is closed.
+        // Closed remediation union.
         remediations: [
             "align_versions",
             "free_storage",
@@ -291,7 +264,8 @@ const CONTRACT = {
         ],
         reasons: {
             // Fixed precedence order: the first failed row wins for status/doctor.
-            // `harness_unavailable` chooses remediation by subreason precedence.
+            // `harness_unavailable` remediation is null here because it is decided
+            // per subreason (harness_unavailable.reasons_by_precedence).
             failing_by_precedence: [
                 { id: "internal_error", remediation: "report_bug" },
                 { id: "no_data_dir", remediation: "set_data_directory" },
@@ -381,8 +355,8 @@ const CONTRACT = {
             ],
         },
     },
-    // Broca unavailability reasons are closed and evaluated in precedence order.
-    // Credential value size is checked before aggregate row size.
+    // Closed Broca unavailability union, in precedence order. Individual credential
+    // size is checked before aggregate row size.
     harness_unavailable: {
         reasons_by_precedence: [
             {
@@ -423,13 +397,14 @@ const CONTRACT = {
         value_cap_bytes: 16384,
         row_cap_bytes: 65536,
     },
-    // Credential-row fingerprints use the configured domain separator.
+    // Domain-separated keyed credential-row fingerprint identity (KTD21). The key
+    // derives from the authenticated connection bearer; no fingerprint or value is
     // ever emitted.
     credential_fingerprint: {
         domain: "subc-broca-credential-v1",
         canonicalization: "harness-provider-name-length-value/1",
     },
-    // Only the listed physical install layouts are supported.
+    // Supported certified physical install layouts (KTD10).
     install_layouts: [
         "bun_physical_link",
         "compiled_bun_external",
@@ -445,9 +420,10 @@ export function buildContract(): ReleaseContract {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical serialization and digest.
 // ---------------------------------------------------------------------------
 
-/* */
+/** JSON-shaped values the contract is built from. */
 type JsonValue =
     | string
     | number
@@ -456,7 +432,7 @@ type JsonValue =
     | JsonValue[]
     | { [key: string]: JsonValue };
 
-/* */
+/** Recursively key-sorted, 2-space-indented JSON. Arrays keep their order. */
 export function canonicalJson(value: unknown): string {
     return JSON.stringify(sortKeys(value as JsonValue), null, 2);
 }
@@ -465,7 +441,7 @@ function sortKeys(value: JsonValue): JsonValue {
     if (Array.isArray(value)) return value.map(sortKeys);
     if (value !== null && typeof value === "object") {
         const out: { [key: string]: JsonValue } = {};
-        // Default string sorting is locale-independent.
+        // Code-point sort: deterministic across runtimes/locales.
         for (const key of Object.keys(value).sort()) {
             out[key] = sortKeys(value[key]);
         }
@@ -479,17 +455,24 @@ export function sha256Hex(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Strict schema validation.
 // ---------------------------------------------------------------------------
 
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 /**
- * An exact SemVer prerelease reserves an inert name.
- * Ranges without a prerelease on the same version triple exclude prerelease versions.
- * `^` and `~` ranges without a prerelease on the same version triple cannot select the reservation.
- * Bare `reserved` labels and GA versions do not satisfy the reservation gate.
+ * An inert R50 name reservation: exact semver carrying a prerelease identifier.
+ * The prerelease is what makes it inert — semver range resolution excludes
+ * prerelease versions unless the range itself carries a prerelease on the same
+ * version triple, so a dependent's `^`/`~` range can never select it. A bare
+ * label ("reserved") or an ordinary GA version is not evidence of a reservation
+ * and must not satisfy the gate.
  */
-// The reservation must be an npm-publishable SemVer prerelease.
-// Numeric prerelease identifiers cannot contain leading zeroes.
+// A reservation must be a valid npm-publishable SemVer prerelease, so this
+// follows SemVer's own grammar rather than a loose approximation: numeric
+// identifiers carry no leading zeroes (SemVer §9), which is why `0.0.1-01` and
+// `0.0.1-reserved.01` are rejected here — npm's parser rejects them too, so such
+// a value could never be the published inert reservation the gate claims to
+// verify. Build metadata stays excluded: `+meta` is not part of the published
 // version identity.
 const RESERVATION_VERSION_RE =
     /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*$/;
@@ -500,7 +483,15 @@ function fail(message: string): never {
 }
 
 /**
+ * Build an exact-key asserter: the returned function requires an object to carry
+ * every key in `keys`, permits any key in `optional`, and rejects anything else,
+ * naming the first offending key.
  *
+ * `subject` is the calling module's error prefix. The same assertion guards
+ * in-source contract literals here and operator-authored manifests in the U9
+ * qualifier, and an operator editing a source manifest must not be told the
+ * release contract is at fault, so each module binds its own reporter rather
+ * than sharing one prefix.
  */
 export function exactKeysAsserter(
     subject: string,
@@ -517,7 +508,8 @@ export function exactKeysAsserter(
         if (obj === null || typeof obj !== "object" || Array.isArray(obj)) {
             reject(`${where} must be an object`);
         }
-        // SAFETY: The guard excludes `null` and arrays before casting `obj` to `Record<string, unknown>`.
+        // SAFETY: `obj` is a non-null, non-array object after the guard, and only
+        // its own enumerable keys are read.
         const record = obj as Record<string, unknown>;
         for (const key of Object.keys(record)) {
             if (!keys.includes(key) && !optional.includes(key)) {
@@ -542,6 +534,8 @@ function compareSemver(a: string, b: string): number {
 }
 
 /**
+ * Reject any binary/model/runtime/payload hash in the pre-build contract: hash-like
+ * key names and hex-digest-like string values are both forbidden anywhere (KTD7).
  */
 function rejectHashes(value: unknown, path: string): void {
     if (typeof value === "string") {
@@ -600,6 +594,7 @@ function assertHalfOpenRange(
     }
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: strict runtime validation of a parsed document
 export function validateContractSchema(contract: any): void {
     if (contract === null || typeof contract !== "object")
         fail("contract must be an object");
@@ -633,7 +628,6 @@ export function validateContractSchema(contract: any): void {
     if (!SEMVER_RE.test(contract.release.version))
         fail("release.version must be exact semver");
 
-    // Packages require three parents, three payloads, and one synchronized version.
     assertExactKeys(
         contract.packages,
         ["addons", "parents", "payloads", "version"],
@@ -644,12 +638,10 @@ export function validateContractSchema(contract: any): void {
     }
     if (
         contract.packages.parents.length !== 3 ||
-        contract.packages.payloads.length !== 3 ||
+        contract.packages.payloads.length !== 1 ||
         contract.packages.addons.length !== 1
     ) {
-        fail(
-            "exactly three parent, three payload, and one addon package are required",
-        );
+        fail("exactly three parent, one payload, and one addon package are required");
     }
     assertUnique(
         [
@@ -660,6 +652,7 @@ export function validateContractSchema(contract: any): void {
         "package names",
     );
 
+    // Versions and half-open ranges.
     assertExactKeys(
         contract.versions,
         ["daemon", "modules", "supported_daemon_range", "wire_protocol"],
@@ -699,6 +692,8 @@ export function validateContractSchema(contract: any): void {
             range: { min_inclusive: string; max_exclusive: string };
         },
     ][]) {
+        // SAFETY: assertExactKeys only reads own keys; the typed destructuring above
+        // is validated field-by-field on the following lines.
         assertExactKeys(
             module as unknown as Record<string, unknown>,
             ["range", "version"],
@@ -715,6 +710,7 @@ export function validateContractSchema(contract: any): void {
         }
     }
 
+    // Proof profiles (KTD20).
     assertExactKeys(
         contract.proof,
         [
@@ -734,6 +730,7 @@ export function validateContractSchema(contract: any): void {
     if (
         !Array.isArray(contract.proof.current_offers) ||
         contract.proof.current_offers.length === 0 ||
+        // biome-ignore lint/suspicious/noExplicitAny: runtime validation
         !contract.proof.current_offers.every((v: any) => Number.isInteger(v)) ||
         !contract.proof.current_offers.includes(contract.proof.current_version)
     ) {
@@ -784,6 +781,7 @@ export function validateContractSchema(contract: any): void {
         );
     }
 
+    // Stop-provenance schema (R48): genesis carries no legacy authority.
     const stop = contract.stop_provenance_schema;
     assertExactKeys(
         stop,
@@ -813,6 +811,7 @@ export function validateContractSchema(contract: any): void {
         }
     }
 
+    // Exact five-part epochs.
     assertExactKeys(
         contract.epochs,
         [
@@ -831,6 +830,7 @@ export function validateContractSchema(contract: any): void {
     if (contract.epochs.state_sync < 1)
         fail("state_sync epoch must be a positive integer");
 
+    // Platform capability table.
     assertExactKeys(
         contract.platforms,
         ["supported", "unsupported_reason"],
@@ -844,11 +844,9 @@ export function validateContractSchema(contract: any): void {
     );
     if (
         JSON.stringify([...targets].sort()) !==
-        JSON.stringify(["darwin-arm64", "darwin-x64", "linux-x64-gnu"])
+        JSON.stringify(["linux-x64-gnu"])
     ) {
-        fail(
-            "supported platform targets are fixed to linux-x64-gnu, darwin-arm64, darwin-x64",
-        );
+        fail("supported platform target is fixed to linux-x64-gnu");
     }
     for (const platform of contract.platforms.supported) {
         if (platform.target === "linux-x64-gnu") {
@@ -863,22 +861,6 @@ export function validateContractSchema(contract: any): void {
             }
             if (platform.synapse !== "certified_cpu")
                 fail("linux synapse lane must be certified_cpu");
-        } else {
-            if (!DOTTED_FLOOR_RE.test(platform.os_min))
-                fail(`${platform.target} os floor must be exact`);
-            if (
-                platform.synapse !== "unsupported" ||
-                platform.synapse_reason !== "synapse_unsupported"
-            ) {
-                fail(
-                    `${platform.target} synapse must be exactly unsupported / synapse_unsupported`,
-                );
-            }
-            if (platform.capabilities.dev_fd_exec !== true) {
-                fail(
-                    `${platform.target} requires /dev/fd execution capability`,
-                );
-            }
         }
         assertUniqueSorted(
             platform.capabilities.filesystem,
@@ -886,6 +868,7 @@ export function validateContractSchema(contract: any): void {
         );
     }
 
+    // Model lane identity.
     assertExactKeys(
         contract.model_lane,
         ["execution_provider", "id", "platforms", "unsupported"],
@@ -904,6 +887,7 @@ export function validateContractSchema(contract: any): void {
         fail("model lane platforms are fixed to linux-x64-gnu");
     }
 
+    // Coordination names (KTD2).
     assertExactKeys(
         contract.coordination,
         ["directory", "lifetime_lock", "transaction_lock"],
@@ -1018,10 +1002,10 @@ export function validateContractSchema(contract: any): void {
         fail("synapse_unsupported is a non-failing component reason");
     }
     if (
-        JSON.stringify(cli.readiness_states.shared_memory) !==
+        JSON.stringify(cli.readiness_states.transport) !==
         JSON.stringify(["ready", "starting", "unavailable"])
     ) {
-        fail("shared-memory readiness states are fixed");
+        fail("transport readiness states are fixed");
     }
     if (
         JSON.stringify(cli.readiness_states.storage) !==
@@ -1051,7 +1035,7 @@ export function validateContractSchema(contract: any): void {
         fail("cli exit codes are fixed");
     }
 
-    // `harness_unavailable_reason` accepts only declared values in precedence order.
+    // Closed harness_unavailable_reason union, precedence-ordered.
     const harness = contract.harness_unavailable;
     assertExactKeys(
         harness,
@@ -1093,6 +1077,7 @@ export function validateContractSchema(contract: any): void {
         fail("credential value/row caps are fixed at 16 KiB / 64 KiB");
     }
 
+    // Credential fingerprint identity.
     assertExactKeys(
         contract.credential_fingerprint,
         ["canonicalization", "domain"],
@@ -1108,6 +1093,7 @@ export function validateContractSchema(contract: any): void {
         );
     }
 
+    // Supported install layouts (KTD10).
     if (
         JSON.stringify(contract.install_layouts) !==
         JSON.stringify([
@@ -1120,11 +1106,12 @@ export function validateContractSchema(contract: any): void {
         fail("install layout identifiers are fixed");
     }
 
-    // The validator rejects hash-like key names and 64-character hexadecimal or prefixed SHA/BLAKE values at every traversed path.
+    // No binary/model/runtime/payload hashes anywhere in the pre-build contract.
     rejectHashes(contract, "$");
 }
 
 // ---------------------------------------------------------------------------
+// Registry gate (R50 evidence file; populated by release engineering).
 // ---------------------------------------------------------------------------
 
 export interface RegistryGatePackage {
@@ -1149,8 +1136,18 @@ function gateFail(message: string): never {
 }
 
 /**
- * The validator checks the gate's structure but does not assert that audited conditions are met.
+ * Validates the gate's structure against the contract without asserting that
+ * the audited conditions are met.
  *
+ * The gate records a live npm audit, and outside a release window its honest
+ * value is fail-closed — `release/mc-host-registry-gate.json` carries exactly
+ * such an audit today. Folding the audited booleans into every drift check
+ * therefore makes drift permanently red, which trains reviewers to ignore the
+ * one signal that catches a hand-edited gate. Structure is what drift can
+ * meaningfully police, so it lives here: schema, release identity, the exact
+ * package set, per-package kind, and the type of every audited field. A typo'd
+ * `"true"` string fails on the change that introduces it rather than at publish
+ * time, while a truthful `false` passes.
  */
 export function validateRegistryGateShape(
     gate: unknown,
@@ -1196,10 +1193,13 @@ export function validateRegistryGateShape(
                 );
             }
             // An unreserved name is recorded as `null`, which readiness rejects.
-            // A non-null `reservation_version` must be an inert prerelease.
-            // `reservation_version` presence does not establish inertness.
-            // A GA version is selectable by an ordinary dependent range.
-            // `release.version` is GA semver, so a prerelease cannot equal it.
+            // Any value that is present, though, must be a well-formed inert
+            // prerelease: presence alone is not evidence of inertness. A GA
+            // version is selectable by an ordinary dependent range, and a bare
+            // label is not a version at all; either would report R50 satisfied
+            // while leaving the name takeover-exposed. `release.version` is
+            // exact GA semver, so a prerelease can never collide with it and no
+            // separate inequality check is reachable.
             const reservation = pkg.reservation_version;
             if (reservation !== null && reservation !== undefined) {
                 if (
@@ -1221,9 +1221,13 @@ export function validateRegistryGateShape(
 }
 
 /**
+ * Asserts the audited conditions npm publication depends on.
  *
- * Drift checks must not evaluate audited values because fail-closed gates are expected outside release windows.
- * `validateRegistryGateShape` must run before the readiness check.
+ * Reachable only from the publication path. A fail-closed gate arriving here is
+ * the intended steady state between releases, so this must never gate a drift
+ * check; see `validateRegistryGateShape` for the half that always runs.
+ * Assumes the gate already passed shape validation, so each field's type is
+ * settled and only its value is in question.
  */
 export function assertRegistryGateReleaseReady(gate: RegistryGate): void {
     for (const pkg of gate.packages) {
@@ -1251,7 +1255,7 @@ export function assertRegistryGateReleaseReady(gate: RegistryGate): void {
     }
 }
 
-/** Publication requires both shape validation and release readiness. */
+/** Shape plus release readiness — the full publication-time gate. */
 export function validateRegistryGate(
     gate: unknown,
     contract: ReleaseContract,
@@ -1260,6 +1264,7 @@ export function validateRegistryGate(
 }
 
 // ---------------------------------------------------------------------------
+// Contract-consumer helpers (shared by tests and later lifecycle policy).
 // ---------------------------------------------------------------------------
 
 export interface PlatformProbe {
@@ -1268,18 +1273,22 @@ export interface PlatformProbe {
     libc?: "gnu" | "musl";
     kernel?: string;
     glibc?: string;
-    osVersion?: string;
     procfsSelfFdExec?: boolean;
-    devFdExec?: boolean;
 }
 
 /**
- * Host version strings can contain suffixes.
- * `uname -r` can report versions such as `4.18.0-513.el8.x86_64`, whose suffix must not affect floor comparison.
- * On RHEL 8, glibc reports `2.28-236.el8`.
- * Each `probe` component contributes its leading integer; one without leading digits counts as 0.
- * A nonnumeric floor component yields `NaN`, which the caller rejects.
+ * Compares a host-reported dotted version against a contract floor over the
+ * floor's precision. Host strings are messy in exactly the deployments the
+ * floors encode — `uname -r` reports `4.18.0-513.el8.x86_64` and glibc
+ * reports `2.28-236.el8` on the RHEL-8 floor — so each probe component
+ * contributes its leading integer and a component with no leading digits
+ * counts as 0 (conservative: it can only fail the floor, never satisfy it).
+ * Floors themselves are validated as clean dotted versions; a malformed
+ * floor yields NaN so `>= 0` checks fail closed.
  *
+ * Exported so the input qualifier gates its oracle host against these same
+ * floors with this same comparator; two implementations could disagree about
+ * whether a host clears a floor.
  */
 export function compareDotted(probe: string, floor: string): number {
     const floorParts = floor.split(".").map(Number);
@@ -1297,23 +1306,46 @@ export function compareDotted(probe: string, floor: string): number {
 }
 
 /**
+ * True when `probe` is at or above the dotted `floor`.
  *
- * The caller must validate `probe`: `compareDotted` treats missing or nonnumeric `probe` components as 0.
+ * `compareDotted` alone is not that predicate. It reads each component's leading
+ * digit run and scores a missing or non-numeric component as 0, which admits two
+ * kinds of value that do not actually clear a floor:
  *
- * `compareDotted` ranks `999garbage` above `4.18`.
- * `compareDotted` treats `4.18-rc1` as equal to `4.18`.
+ *   - Values shorter than the floor, compared as if their absent components were
+ *     zeros, so one high component decides the result alone: `999garbage` clears
+ *     `4.18` without ever naming a minor version.
+ *   - Prerelease builds, whose marker is discarded: `4.18-rc1` scores exactly
+ *     equal to `4.18` even though a release candidate precedes it.
  *
- * Once a component exceeds the floor, later prerelease suffixes do not affect acceptance: `4.18.0-rc2` is rejected, but `4.18.1-rc2` is accepted.
+ * So one digit-led component per floor component is required, and at equality a
+ * prerelease marker disqualifies. A numeric release suffix means the opposite of a
+ * prerelease — `2.28-236.el8` is 2.28 plus patches — so the two are separated by
+ * the marker, not by shape, and the marker only counts while the version is still
+ * exactly at the floor: components are scanned until one beyond the floor's
+ * precision carries a non-zero number, the point the version has genuinely moved
+ * past it. `4.18.0-rc2` is therefore rejected and `4.18.1-rc2` is not.
  *
+ * Both the U8 platform gate and the U9 oracle-host check call this. That is the
+ * point: sharing only `compareDotted` let the qualifier add these guards while
+ * `evaluatePlatform` kept a bare `>= 0`, so the two disagreed about the same host
+ * — exactly what sharing the comparator was meant to prevent.
  */
 export function meetsDottedFloor(probe: unknown, floor: string): boolean {
     if (typeof probe !== "string" || probe.length === 0) return false;
     const parts = probe.split(".");
     const floorParts = floor.split(".");
     if (parts.length < floorParts.length) return false;
-    // `compareDotted` discards suffix text, so `999garbage` scores as 999.
+    // Shape, not just a leading digit. `compareDotted` reads the digit run and
+    // discards the rest, so `999garbage` scores 999 and a component that is digits
+    // welded to letters passes as a version. Require digits, then either nothing or
+    // a separator before whatever follows — which is every real distro spelling
+    // (`0-513`, `28-236`) and none of the malformed ones. Only the components the
+    // floor actually compares are constrained; beyond its precision live `el8` and
+    // `x86_64`, which are not version numbers at all.
     for (let i = 0; i < floorParts.length; i++) {
-        // `.+` rejects dangling separators such as `4.18-` and `2.28+`.
+        // `.+`, not `.*`: a separator with nothing after it (`4.18-`, `2.28+`) is not
+        // a suffix, and `compareDotted` would read the digits and ignore the dangling
         // separator entirely.
         if (!/^\d+(?:[-+._~].+)?$/.test(parts[i] ?? "")) return false;
     }
@@ -1325,8 +1357,9 @@ export function meetsDottedFloor(probe: unknown, floor: string): boolean {
             const leading = /^\d*/.exec(part)?.[0] ?? "";
             if (Number(leading || "0") > 0) break;
         }
-        // The prerelease check recognizes every separator that the shape check admits.
-        // The prerelease check treats `~` and `_` as prerelease markers.
+        // Every separator the shape check above admits, not just `-` and `.`:
+        // `4.18~rc1` and `13.5_rc1` are prereleases too, and accepting a separator
+        // in one regex while the other ignores it is how they slipped through.
         if (/^\d*[-+._~]?(?:rc|pre|alpha|beta|dev|snapshot)/i.test(part)) {
             return false;
         }
@@ -1334,7 +1367,7 @@ export function meetsDottedFloor(probe: unknown, floor: string): boolean {
     return true;
 }
 
-/* */
+/** Evaluate a host probe against the contract's platform capability table. */
 export function evaluatePlatform(
     contract: ReleaseContract,
     probe: PlatformProbe,
@@ -1368,40 +1401,13 @@ export function evaluatePlatform(
             synapse: linux.synapse,
         };
     }
-    if (probe.os === "darwin") {
-        const target =
-            probe.arch === "arm64"
-                ? "darwin-arm64"
-                : probe.arch === "x64"
-                  ? "darwin-x64"
-                  : undefined;
-        if (target === undefined) return unsupported;
-        const mac = contract.platforms.supported.find(
-            (p) => p.target === target,
-        );
-        if (mac === undefined || !("os_min" in mac)) return unsupported;
-        if (!meetsDottedFloor(probe.osVersion, mac.os_min)) {
-            return unsupported;
-        }
-        if (
-            "capabilities" in mac &&
-            "dev_fd_exec" in mac.capabilities &&
-            mac.capabilities.dev_fd_exec === true &&
-            probe.devFdExec !== true
-        ) {
-            return unsupported;
-        }
-        return {
-            supported: true,
-            target,
-            synapse: mac.synapse,
-            synapseReason: mac.synapse_reason,
-        };
-    }
     return unsupported;
 }
 
 /**
+ * N-server offer admission (KTD20): only an offer list containing the current
+ * proof version is accepted; absent and legacy-only offers are rejected, and no
+ * missing-offer inference exists.
  */
 export function evaluateProofOffers(
     contract: ReleaseContract,
@@ -1422,6 +1428,8 @@ export function evaluateProofOffers(
 }
 
 /**
+ * Schema-level validation of a tagged stop-provenance record. `genesis` binds the
+ * current release identity only and never grants legacy stop authority (R48).
  */
 export function validateStopProvenance(
     contract: ReleaseContract,
@@ -1480,10 +1488,19 @@ export function validateStopProvenance(
             "predecessor record must carry exactly its required fields",
         );
     }
+    // `release_version` binds the record to the release that is claiming stop
+    // authority, exactly as it does for genesis; the predecessor's own identity
+    // travels in `predecessor_release_version`. Without this check a record
+    // minted under a different release grants legacy stop authority under this
     // contract.
     if (rec.release_version !== contract.release.version) {
         return invalid("predecessor must bind the current release identity");
     }
+    // Presence is not validity. This is the consumer-facing gate for the only
+    // tag that grants legacy stop authority, so every bound field is checked
+    // for type, and each field whose value the contract fixes is bound to it.
+    // The loop above only proves a key is present and not `""`, which admits
+    // `false`, `0`, and structurally wrong values.
     const nonEmptyString = (field: string): string | null => {
         const value = rec[field];
         return typeof value === "string" && value.length > 0 ? value : null;
@@ -1509,6 +1526,12 @@ export function validateStopProvenance(
     if (predecessorRelease === null || !SEMVER_RE.test(predecessorRelease)) {
         return invalid("predecessor_release_version must be exact semver");
     }
+    // `proof.legacy_stop_only.adjacent_release_only` limits legacy stop
+    // authority to the release immediately preceding this one, but the contract
+    // states no predecessor version, so exact adjacency is not derivable here.
+    // Enforce the half that is: a predecessor must be strictly older than the
+    // release claiming authority, which rejects a record naming this release or
+    // a newer one as its own predecessor.
     if (compareSemver(predecessorRelease, contract.release.version) >= 0) {
         return invalid(
             "predecessor_release_version must be older than the current release",
@@ -1555,23 +1578,36 @@ export function renderRustOutput(canonical: string, digest: string): string {
         .join("\n");
     return `${banner}
 //
+// Pre-build release and compatibility contract (U8, KTD7). This file is included
+// via include! and must not add any crate dependency edge; in particular it can
+// never create an mc-host -> mc-module edge.
 
+/// Canonical pre-build release contract JSON, byte-identical to
+/// \`release/mc-host-release.json\` (without its trailing newline).
 pub const RELEASE_CONTRACT_JSON: &str = "${escapeRustString(canonical)}";
 
+/// SHA-256 hex digest of \`RELEASE_CONTRACT_JSON\`.
 pub const RELEASE_CONTRACT_SHA256: &str = "${digest}";
 
+/// Synchronized release version at freeze.
 pub const RELEASE_VERSION: &str = "${contract.release.version}";
 
+/// Bounded daemon version string authenticated by ServerProof.
 pub const DAEMON_VERSION: &str = "${contract.versions.daemon}";
 
+/// Version-2 frame protocol.
 pub const WIRE_PROTOCOL_VERSION: u8 = ${contract.versions.wire_protocol};
 
+/// Exact five-part epochs (KTD8).
 pub const MEMORY_RENDER_EPOCH: u32 = ${contract.epochs.memory_render};
 pub const COMPARTMENT_RENDER_EPOCH: u32 = ${contract.epochs.compartment_render};
 pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = ${contract.epochs.profile_claude_code_anthropic};
 pub const TAGGER_EPOCH: u32 = ${contract.epochs.tagger};
+/// Numeric state-sync epoch, advertised alongside the boolean \`state_sync_deltas\`
+/// feature signal in Magic Context status.
 pub const STATE_SYNC_EPOCH: u32 = ${contract.epochs.state_sync};
 
+/// Stable version-neutral coordination names (KTD2).
 pub const COORDINATION_DIRECTORY: &str = "${contract.coordination.directory}";
 pub const TRANSACTION_LOCK_NAME: &str = "${contract.coordination.transaction_lock}";
 pub const LIFETIME_LOCK_NAME: &str = "${contract.coordination.lifetime_lock}";
@@ -1619,18 +1655,22 @@ ${banner}
  */
 
 /**
+ * Canonical pre-build release contract JSON, byte-identical to
+ * \`release/mc-host-release.json\` (without its trailing newline) and to the
+ * generated Rust \`RELEASE_CONTRACT_JSON\`.
  */
 export const RELEASE_CONTRACT_JSON: string = ${JSON.stringify(canonical)};
 
-/* */
+/** SHA-256 hex digest of \`RELEASE_CONTRACT_JSON\`. */
 export const RELEASE_CONTRACT_SHA256 = "${digest}";
 
-/* */
+/** The decoded canonical contract. */
 export const releaseContract = ${canonical} as const;
 `;
 }
 
 // ---------------------------------------------------------------------------
+// Generation and drift check.
 // ---------------------------------------------------------------------------
 
 export const OUTPUT_PATHS = {
@@ -1672,6 +1712,8 @@ export function generate(
                 (error instanceof Error ? error.message : String(error)),
         );
     }
+    // Drift-only: this runs on every change, so it polices the gate's structure
+    // and leaves the audited release-readiness booleans to the publication path.
     validateRegistryGateShape(gate, contract);
 
     const canonical = canonicalJson(contract);

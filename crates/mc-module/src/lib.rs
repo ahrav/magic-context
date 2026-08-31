@@ -29736,15 +29736,7 @@ mod release_contract_tests {
         assert_eq!(linux["glibc_min"], json!("2.28"));
         assert_eq!(linux["capabilities"]["procfs_self_fd_exec"], json!(true));
         assert_eq!(linux["synapse"], json!("certified_cpu"));
-        for target in ["darwin-arm64", "darwin-x64"] {
-            let mac = supported
-                .iter()
-                .find(|platform| platform["target"] == json!(target))
-                .expect("macOS platform row");
-            assert_eq!(mac["os_min"], json!("13.5"));
-            assert_eq!(mac["synapse"], json!("unsupported"));
-            assert_eq!(mac["synapse_reason"], json!("synapse_unsupported"));
-        }
+        assert_eq!(supported.len(), 1);
         assert_eq!(
             contract["platforms"]["unsupported_reason"],
             json!("unsupported_platform")

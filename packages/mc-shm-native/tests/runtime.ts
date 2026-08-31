@@ -87,7 +87,7 @@ function fill(
 function receive(channel: NativeChannel): NativeReceiveLease {
     let lease: NativeReceiveLease | undefined;
     assert.equal(
-        channel.poll((value) => {
+        channel.drainOne((value) => {
             lease = value;
         }),
         true,
@@ -155,7 +155,7 @@ function runNativeLifecycle(): void {
     );
     assert.equal(thrownAlias?.byteLength, 0);
     assert.equal(
-        direct.second.poll(() => {}),
+        direct.second.drainOne(() => {}),
         false,
     );
     direct.first.close();
@@ -198,7 +198,7 @@ function runNativeLifecycle(): void {
     const refsBeforeFailure = activeExternalRefs();
     setExternalViewCreationFailpoint(2);
     assert.throws(
-        () => partial.second.poll(() => {}),
+        () => partial.second.drainOne(() => {}),
         /external view creation failpoint/,
     );
     setExternalViewCreationFailpoint(0);
@@ -212,7 +212,7 @@ function runNativeLifecycle(): void {
     for (let index = 0; index < leaked.descriptorDepth; index++) {
         fill(leaked.first, 1, index);
         assert.equal(
-            leaked.second.poll(() => {}),
+            leaked.second.drainOne(() => {}),
             true,
         );
     }

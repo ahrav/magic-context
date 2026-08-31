@@ -17,8 +17,8 @@ pub const DAEMON_ID_LEN: usize = 16;
 pub const MAX_AUTH_MESSAGE_LEN: usize = 4096;
 /// Upper bound on one setup message body.
 pub const MAX_SETUP_MESSAGE_LEN: usize = 16 * 1024;
-/// Descriptors a grant transfers: one ring per direction.
-pub const RING_DESCRIPTOR_COUNT: usize = 2;
+/// Descriptors a grant transfers: mapping and two doorbells per direction.
+pub use crate::descriptor::SETUP_DESCRIPTOR_COUNT as RING_DESCRIPTOR_COUNT;
 
 /// Separates the host's key-possession proof from other MAC inputs.
 pub const SERVER_PROOF_DOMAIN: &str = "subc-server-v1";
@@ -88,6 +88,11 @@ pub mod vectors {
 mod tests {
     use super::vectors;
     use super::*;
+
+    #[test]
+    fn descriptor_count_matches_setup_contract() {
+        assert_eq!(RING_DESCRIPTOR_COUNT, 6);
+    }
 
     #[test]
     fn committed_vectors_pin_the_shared_construction() {

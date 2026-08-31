@@ -11,7 +11,7 @@ This repository is a monorepo containing TypeScript packages (under `packages/`)
 │   ├── mc-store/           # Durable cache-state store (SQLite backed)
 │   ├── mc-tokenizer/       # Claude BPE token estimator
 │   ├── mc-host/            # Direct-linked mandatory-ring host runtime
-│   ├── mc-shm-transport/   # Fixed shared-memory ring and accounting
+│   ├── mc-shm-transport/   # Linux eventfd sparse ring, reclaim, and accounting
 │   └── mc-module/          # Magic Context adapter and ck-mc-host lifecycle executable
 ├── packages/               # TypeScript packages
 │   ├── plugin/             # OpenCode plugin package (published as @cortexkit/opencode-magic-context)
@@ -115,7 +115,8 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
   - `crates/mc-store/`: Durable SQLite session database schema, metadata, and CAS transitions.
   - `crates/mc-tokenizer/`: tiktoken BPE-based token count estimator.
   - `crates/mc-host/`: Direct-linked host library. Owns secure publication, owner-only Unix setup, HMAC authentication, mandatory ring attachment, wire-v2 framing, fixed-profile control and routing, process-global routes and epochs, bounded request settlement split into general and reserved pending/task permit classes, Ping/Pong, and ordered shutdown. `src/composite.rs` dispatches across the three static components, `src/synapse/` serves the certified offline embedding lane, and `src/broca/` serves the LLM run lane. Setup or ring failure retires the connection; no application TCP or transport-selection path exists.
-  - `crates/mc-shm-transport/`: Sole shared-memory implementation: fixed descriptor ring, payload arenas, checked grants, lexical receive leases, lifecycle state, and process-wide admission/accounting.
+  - `crates/mc-shm-transport/`: Linux fixed eventfd ring with sparse 64 MiB arenas, FIFO page reclaim, six-descriptor grants, leases, and admission accounting.
+  - `packages/mc-shm-native/`: Linux x64 addon selection, async setup, one environment readiness watcher, and TSFN delivery.
   - `crates/mc-module/`: Magic Context adapter, autonomous historian coordinator, and `ck-mc-host` production leaf. The binary depends on both `mc-module` and `mc-host`; the host crate never depends on the module.
 
 **Pi Sibling Package (`packages/pi-plugin/`):**

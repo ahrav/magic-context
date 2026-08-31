@@ -1,11 +1,11 @@
 use std::fmt;
 
-/// wire-v2 limits bodies to 64 MiB.
+/// Maximum legal wire-v2 body size.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-/// Each logical direction requires at least MAX_FRAME_BYTES of payload capacity.
+/// Minimum payload capacity for each logical direction.
 pub const MIN_ARENA_BYTES: usize = MAX_FRAME_BYTES;
 
-/// ArenaError reports FIFO arena reservation failures.
+/// Failure while planning a FIFO arena reservation.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ArenaError {
     /// Arena cannot hold one legal maximum frame.
@@ -14,7 +14,7 @@ pub enum ArenaError {
     FrameTooLarge,
     /// Absolute cursors are malformed or wrapped.
     InvalidCursor,
-    /// Current FIFO hold leaves insufficient capacity.
+    /// Current FIFO hold leaves insufficient contiguous logical capacity.
     Exhausted,
     /// Offset or length arithmetic overflowed.
     ArithmeticOverflow,
@@ -40,6 +40,7 @@ impl fmt::Display for ArenaError {
 
 impl std::error::Error for ArenaError {}
 
+/// One offset-and-length region within an arena.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct ArenaSpan {
     pub(crate) offset: u64,
@@ -47,20 +48,22 @@ pub struct ArenaSpan {
 }
 
 impl ArenaSpan {
-    /// from_untrusted defers span validation.
+    /// Constructs an untrusted span for later validation.
     pub const fn from_untrusted(offset: u64, len: u64) -> Self {
         Self { offset, len }
     }
 
-    /// offset is relative to the arena base.
+    /// Offset from arena base.
     pub const fn offset(self) -> u64 {
         self.offset
     }
 
+    /// Span byte length.
     pub const fn len(self) -> u64 {
         self.len
     }
 
+    /// Whether span is empty.
     pub const fn is_empty(self) -> bool {
         self.len == 0
     }
@@ -72,7 +75,7 @@ impl fmt::Debug for ArenaSpan {
     }
 }
 
-/// SpanPlan represents a checked reservation split into at most two spans.
+/// Checked at-most-two-span reservation plan.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SpanPlan {
     allocation_start: u64,
@@ -82,7 +85,7 @@ pub struct SpanPlan {
 }
 
 impl SpanPlan {
-    /// reserve plans a FIFO reservation from monotonic write and reclaim cursors.
+    /// Plans a FIFO reservation from monotonic write and reclaim cursors.
     pub fn reserve(
         capacity: usize,
         write: u64,
@@ -124,7 +127,7 @@ impl SpanPlan {
         })
     }
 
-    /// prefix shortens an allocation to its exact committed body length.
+    /// Returns same allocation shortened to exact committed body length.
     pub fn prefix(self, exact_len: usize) -> Result<Self, ArenaError> {
         let exact_len = u64::try_from(exact_len).map_err(|_| ArenaError::ArithmeticOverflow)?;
         if exact_len > self.allocation_len {
@@ -143,24 +146,27 @@ impl SpanPlan {
         })
     }
 
-    /// allocation_start is the absolute monotonic allocation start.
+    /// Absolute monotonic allocation start.
     pub const fn allocation_start(self) -> u64 {
         self.allocation_start
     }
 
-    /// allocation_len includes reserved but uncommitted tail bytes.
+    /// Reserved bytes, including any uncommitted tail.
     pub const fn allocation_len(self) -> u64 {
         self.allocation_len
     }
 
+    /// Number of body spans.
     pub const fn span_count(self) -> u8 {
         self.span_count
     }
 
+    /// Returns one body span.
     pub fn span(self, index: usize) -> Option<ArenaSpan> {
         (index < usize::from(self.span_count)).then_some(self.spans[index])
     }
 
+    /// Returns fixed storage used by shared descriptors.
     pub(crate) const fn spans(self) -> [ArenaSpan; 2] {
         self.spans
     }
@@ -172,28 +178,29 @@ impl fmt::Debug for SpanPlan {
     }
 }
 
+/// Arena byte-state snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ArenaCounts {
     /// Uncharged bytes.
     pub free: u64,
-    /// An unfinished producer holds the bytes.
+    /// Bytes held by an unfinished producer.
     pub producer_reserved: u64,
-    /// The receiver has not acquired the published bytes.
+    /// Published bytes not acquired by receiver.
     pub published: u64,
-    /// Receiver validation holds the bytes.
+    /// Bytes undergoing receiver validation.
     pub receiver_held: u64,
-    /// Receive leases expose the bytes.
+    /// Bytes visible through receive leases.
     pub receiver_leased: u64,
-    /// Released bytes await FIFO reclamation.
+    /// Released bytes awaiting FIFO reclamation.
     pub release_pending: u64,
     /// Contiguous-wrap padding.
     pub pad: u64,
-    /// Uncertain cleanup permanently withholds the bytes.
+    /// Bytes permanently withheld after uncertain cleanup.
     pub quarantined: u64,
 }
 
 impl ArenaCounts {
-    /// The check requires accounted bytes to equal arena capacity.
+    /// Checks exact byte conservation against arena capacity.
     pub fn conserves(self, capacity: u64) -> bool {
         [
             self.free,
@@ -209,20 +216,4 @@ impl ArenaCounts {
         .try_fold(0u64, u64::checked_add)
             == Some(capacity)
     }
-}
-
-///
-/// # Safety
-/// `base..base.add(len)` must be writable for this call.
-pub(crate) unsafe fn prefault(base: *mut u8, len: usize) {
-    if len == 0 {
-        return;
-    }
-    let page = 4096usize;
-    for offset in (0..len).step_by(page) {
-        // SAFETY: caller provides a writable mapping and offset is below len.
-        unsafe { base.add(offset).write_volatile(0) };
-    }
-    // SAFETY: len is nonzero and caller provides the full writable range.
-    unsafe { base.add(len - 1).write_volatile(0) };
 }

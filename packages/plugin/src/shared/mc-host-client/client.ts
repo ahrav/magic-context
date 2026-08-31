@@ -39,7 +39,6 @@ import {
     SocketTimeoutError,
 } from "./errors";
 import { bytesFrameBody, type DirectFrameBody, ReceiveLease, utf8FrameBody } from "./frame-channel";
-import { PROTOCOL_VERSION } from "./protocol";
 import {
     belongsToConnection,
     createRouteHandle,
@@ -47,7 +46,6 @@ import {
     type RouteHandle,
     StaleRouteHandleError,
 } from "./route-handle";
-import { classifySharedMemoryFailure } from "./shared-memory-failure";
 import type {
     AuthenticatedPeer,
     BindIdentity,
@@ -61,14 +59,8 @@ import type {
     PublicationDiagnostics,
     RequestOptions,
     RouteTarget,
-    SharedMemoryDiagnostics,
-    SharedMemoryResourceCounts,
-    SharedMemoryTerminalClass,
 } from "./types";
 import { sameDaemonId } from "./types";
-
-const QUALIFIED_TEST_PROFILE = "mc-host-test-ring-v1" as const;
-const DESCRIPTOR_SCHEMA_VERSION = 2 as const;
 
 /** Preserves the repo's current 2-second TypeScript handshake budget. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 2_000;
@@ -109,13 +101,7 @@ export interface McHostDiagnosticsEvent {
     readonly daemonVer?: string;
     readonly pid?: number;
     readonly reason?: string;
-    readonly health?: "healthy" | "terminal";
-    readonly errorClass?: SharedMemoryTerminalClass;
-    readonly artifact?: Readonly<{
-        profile: typeof QUALIFIED_TEST_PROFILE;
-        wireVersion: typeof PROTOCOL_VERSION;
-        descriptorSchema: typeof DESCRIPTOR_SCHEMA_VERSION;
-    }>;
+    readonly transport?: "shm";
 }
 
 export type McHostDiagnosticsObserver = (event: McHostDiagnosticsEvent) => void;
@@ -346,7 +332,6 @@ export class McHostClient {
     /** Owner close bounds draining in-flight `route.open` attempts. */
     private readonly pendingRouteOpens = new Set<Promise<void>>();
     private closeStarted = false;
-    private retirementEmitted = false;
     private closePromise: Promise<void> | null = null;
 
     private diagWindowStartMs = 0;
@@ -375,19 +360,8 @@ export class McHostClient {
      */
     static async connect(options: McHostClientOptions): Promise<McHostClient> {
         const client = new McHostClient(options);
-        try {
-            await client.ensureConnection(Deadline.start(client.handshakeTimeoutMs, client.clock));
-            return client;
-        } catch (error) {
-            if (!client.retirementEmitted) {
-                client.emitDiagnostics({
-                    type: "retired",
-                    health: "terminal",
-                    errorClass: classifySharedMemoryFailure(error),
-                });
-            }
-            throw error;
-        }
+        await client.ensureConnection(Deadline.start(client.handshakeTimeoutMs, client.clock));
+        return client;
     }
 
     /* */
@@ -792,18 +766,7 @@ export class McHostClient {
                 cached.handle = null;
             }
         }
-        const terminalClass =
-            info.reason === "setup_failed" || info.reason === "setup_deadline"
-                ? classifySharedMemoryFailure(info.error)
-                : terminalRetirementClass(info.reason);
-        this.retirementEmitted = true;
-        this.emitDiagnostics({
-            type: "retired",
-            reason: info.reason,
-            ...(terminalClass === undefined
-                ? {}
-                : { health: "terminal" as const, errorClass: terminalClass }),
-        });
+        this.emitDiagnostics({ type: "retired", reason: info.reason });
     }
 
     private onRouteGoodbye(conn: ActiveConnection, channel: number, epoch: number): void {
@@ -880,12 +843,7 @@ export class McHostClient {
             type: "connected",
             daemonVer: conn.snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
             pid: conn.snapshot.pid,
-            health: "healthy",
-            artifact: {
-                profile: QUALIFIED_TEST_PROFILE,
-                wireVersion: PROTOCOL_VERSION,
-                descriptorSchema: DESCRIPTOR_SCHEMA_VERSION,
-            },
+            transport: "shm",
         });
     }
 
@@ -1526,178 +1484,10 @@ function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSna
     return {
         health,
         metrics: parsed.metrics as Record<string, unknown>,
-        sharedMemory: parseSharedMemoryDiagnostics(sharedMemory),
+        ...(sharedMemory === undefined
+            ? {}
+            : { sharedMemory: sharedMemory as Record<string, unknown> }),
     };
-}
-
-const RESOURCE_FIELDS = [
-    "arena_bytes",
-    "client_instances",
-    "descriptors",
-    "file_descriptors",
-    "leases",
-    "mappings",
-    "pinned_workers",
-    "workers",
-] as const;
-
-function requireRecord(value: unknown, what: string): Record<string, unknown> {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) {
-        throw malformedStatus(`${what} is not an object`);
-    }
-    return value as Record<string, unknown>;
-}
-
-function exactKeys(
-    record: Record<string, unknown>,
-    expected: readonly string[],
-    what: string,
-): void {
-    const keys = Object.keys(record).sort();
-    const sorted = [...expected].sort();
-    if (keys.length !== sorted.length || keys.some((key, index) => key !== sorted[index])) {
-        throw malformedStatus(`${what} has an unexpected shape`);
-    }
-}
-
-function boundedCount(value: unknown, what: string): number {
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-        throw malformedStatus(`${what} is not a nonnegative safe integer`);
-    }
-    return value;
-}
-
-function parseResourceCounts(value: unknown, what: string): SharedMemoryResourceCounts {
-    const record = requireRecord(value, what);
-    exactKeys(record, RESOURCE_FIELDS, what);
-    return Object.fromEntries(
-        RESOURCE_FIELDS.map((field) => [field, boundedCount(record[field], `${what}.${field}`)]),
-    ) as unknown as SharedMemoryResourceCounts;
-}
-
-function parseCounter(value: unknown, field: "completed" | "observed", what: string) {
-    const record = requireRecord(value, what);
-    exactKeys(record, [field], what);
-    return { [field]: boundedCount(record[field], `${what}.${field}`) } as
-        | { completed: number }
-        | { observed: number };
-}
-
-function malformedStatus(detail: string): McHostCallError {
-    return new McHostCallError(
-        "terminal",
-        `host.status response rejected: ${detail}`,
-        "malformed_control_response",
-    );
-}
-
-export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagnostics {
-    const record = requireRecord(value, "shared_memory");
-    exactKeys(
-        record,
-        [
-            "state",
-            "error_class",
-            "artifact",
-            "bounds",
-            "accounting",
-            "activation",
-            "peer_death",
-            "reclamation",
-            "exhaustion",
-        ],
-        "shared_memory",
-    );
-    const terminalClasses = new Set<SharedMemoryTerminalClass>([
-        "missing_addon",
-        "identity_mismatch",
-        "setup_failure",
-        "peer_death",
-        "resource_exhaustion",
-    ]);
-    const state = record.state;
-    const errorClass = record.error_class;
-    if (
-        (state !== "healthy" && state !== "terminal") ||
-        (state === "healthy" && errorClass !== null) ||
-        (state === "terminal" &&
-            (typeof errorClass !== "string" ||
-                !terminalClasses.has(errorClass as SharedMemoryTerminalClass)))
-    ) {
-        throw malformedStatus("shared_memory state contradicts its error class");
-    }
-    // Healthy is reported only after a successful accounting snapshot, and bounds
-    // are always concrete, so a healthy record withholding either describes
-    // resources it never observed.
-    if (state === "healthy" && (record.bounds === null || record.accounting === null)) {
-        throw malformedStatus("healthy shared_memory withholds observed resource data");
-    }
-    const artifact = requireRecord(record.artifact, "shared_memory.artifact");
-    exactKeys(artifact, ["profile", "wire_version", "descriptor_schema"], "shared_memory.artifact");
-    if (
-        artifact.profile !== QUALIFIED_TEST_PROFILE ||
-        artifact.wire_version !== PROTOCOL_VERSION ||
-        artifact.descriptor_schema !== DESCRIPTOR_SCHEMA_VERSION
-    ) {
-        throw malformedStatus("shared_memory artifact identity mismatch");
-    }
-    let accounting: SharedMemoryDiagnostics["accounting"] = null;
-    if (record.accounting !== null) {
-        const raw = requireRecord(record.accounting, "shared_memory.accounting");
-        exactKeys(raw, ["active", "quarantined"], "shared_memory.accounting");
-        accounting = {
-            active: parseResourceCounts(raw.active, "shared_memory.accounting.active"),
-            quarantined: parseResourceCounts(
-                raw.quarantined,
-                "shared_memory.accounting.quarantined",
-            ),
-        };
-    }
-    return {
-        state,
-        error_class: errorClass as SharedMemoryTerminalClass | null,
-        artifact: {
-            profile: QUALIFIED_TEST_PROFILE,
-            wire_version: PROTOCOL_VERSION,
-            descriptor_schema: DESCRIPTOR_SCHEMA_VERSION,
-        },
-        bounds:
-            record.bounds === null
-                ? null
-                : parseResourceCounts(record.bounds, "shared_memory.bounds"),
-        accounting,
-        activation: parseCounter(record.activation, "completed", "shared_memory.activation") as {
-            completed: number;
-        },
-        peer_death: parseCounter(record.peer_death, "observed", "shared_memory.peer_death") as {
-            observed: number;
-        },
-        reclamation: parseCounter(record.reclamation, "completed", "shared_memory.reclamation") as {
-            completed: number;
-        },
-        exhaustion: parseCounter(record.exhaustion, "observed", "shared_memory.exhaustion") as {
-            observed: number;
-        },
-    };
-}
-
-function terminalRetirementClass(reason: RetirementReason): SharedMemoryTerminalClass | undefined {
-    switch (reason) {
-        // A dead peer reaches this client as a channel EOF;
-        // `FrameChannelCloseReason` carries no socket-level variants.
-        case "eof":
-            return "peer_death";
-        // `ShmFrameChannel` retires the generation on these when ring decoding
-        // or lease cleanup fails. The closed class vocabulary has no corruption
-        // member, so they report the generic setup class rather than leaving a
-        // terminal retirement unclassified.
-        case "protocol_violation":
-        case "role_violation":
-        case "quarantined":
-            return "setup_failure";
-        default:
-            return undefined;
-    }
 }
 
 /**

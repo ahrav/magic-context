@@ -2,25 +2,21 @@
 
 ## Status
 
-The fixed ring is the only application transport. Linux and macOS clients use the owner-only Unix setup socket to authenticate, receive two mapping descriptors, validate the current release identity, attach, and commit activation. Application frames never use the setup socket.
-
-The host publishes the setup socket's absolute path as `setup_socket` in the connection file. The client dials it, proves identity over the shared HMAC construction, and receives the two ring descriptors over `SCM_RIGHTS`. Because those descriptors cross the boundary as file descriptors, the setup socket cannot be proxied by a byte forwarder: any container or remote topology has to make the socket itself reachable.
+The fixed sparse ring is the only application transport. Production support is Linux x64 with glibc only. Clients use the owner-only Unix setup socket to authenticate, receive two memfds and four eventfds, validate the current release identity, attach, and commit activation. Application frames never use the setup socket or eventfds.
 
 There is no runtime transport selector, alternate shared-memory backend, compatibility reader, or degraded data path. A transport failure is terminal for the affected connection.
 
 The accepted identity is fixed by the release:
 
-- profile: `mc-host-test-ring-v1`, exposed as `MC_HOST_RING_PROFILE`
+- profile: `mc-host-test-ring-v1`
 - wire version: `2`
-- descriptor schema: `2`
+- descriptor schema: `3`
 
 An install that cannot load the native addon or establish this identity fails before application traffic.
 
-Host receive still calls `lease.to_vec()` and records one transport-body copy before semantic dispatch, so this path must not support a zero-copy claim.
-
 ## Ring and ownership
 
-Each connection owns two bounded single-producer/single-consumer rings, one per direction. Each ring has a fixed descriptor depth and payload arena. A producer reserves capacity, writes into the shared arena, and publishes the exact body length with the wire header. A receiver validates the descriptor and header before exposing a scoped lease.
+Each connection owns two bounded single-producer/single-consumer rings, one per direction. Each ring has a fixed descriptor depth and sparse 64 MiB payload arena. Setup touches control pages only. A producer reserves capacity, writes into the shared arena, and publishes the exact body length with the wire header. A receiver validates the descriptor and header before exposing a scoped lease. FIFO reclamation removes only fully released, page-aligned interiors with `MADV_REMOVE`; partial neighboring pages remain mapped and capacity is published only after successful removal.
 
 The process-wide admission controller charges descriptors, arena bytes, receive leases, mappings, mapping file descriptors, endpoint workers, client instances, and pinned workers before creating ring resources. Active and quarantined charges are reported separately. Every configured limit is finite and validated at startup.
 
@@ -43,7 +39,7 @@ Setup proceeds through these phases:
 
 1. Authenticate the peer over the owner-only Unix socket.
 2. Admit the fixed ring charge.
-3. Transfer exactly two mapping descriptors.
+3. Transfer exactly two memfds and four eventfds.
 4. Validate the profile, wire version, descriptor schema, grants, and activation token.
 5. Attach both directions and commit activation.
 6. Keep the setup socket open as the peer-lifetime sentinel.
@@ -67,7 +63,7 @@ A healthy report includes only bounded, aggregate data:
 - fixed artifact identity;
 - process bounds;
 - active and quarantined accounting;
-- completed activation count;
+- completed activation counts;
 - observed peer-death count;
 - completed reclamation count;
 - observed exhaustion count.
@@ -78,16 +74,12 @@ Reports never include setup-socket paths, native handles, mapping descriptors, g
 
 ## Resource bounds
 
-The fixed profile charges both directions. One connection uses 16 descriptors, 128 MiB of arena storage, 16 receive leases, two mappings, two mapping file descriptors, one endpoint worker, one client instance, and no pinned workers. Process bounds multiply this profile by the configured maximum connection count with checked arithmetic.
+The fixed profile charges both directions. One connection charges 16 ring descriptors, 128 MiB of sparse virtual arena capacity, 16 receive leases, two mappings, six transferred file descriptors, one fused endpoint worker, one client instance, and zero pinned workers. Native JS integration adds one environment watcher, not one watcher per connection. Process bounds multiply this profile by the configured maximum connection count with checked arithmetic. Resident memory grows on first touch and returns through FIFO page removal; the virtual arena charge stays fixed.
 
 Exact-capacity admission succeeds. Capacity plus one fails without creating another mapping or worker. Repeated peer crashes must not increase active charges after reclamation, and quarantined charges remain within the configured process bound.
 
-## Trusted-peer boundary
-
-Owner-only attachment establishes same-user authentication. The ring still trusts the peer and any in-process consumer to honor lane ownership, no-transfer, no resizing, and post-publication immutability. Scoped leases guarantee lifetime and ownership discipline; they do not protect against a malicious authenticated peer mutating mapped payload after publication, and tests and documents must not claim such immutability.
-
 ## Platform contract
 
-Release packages include the native addon for supported targets. The package manifest and addon checksum are verified before loading. Build profile and target identity are checked before setup. Managed Rust clients use the same setup protocol, ring profile, wire version, and descriptor schema.
+Shared-memory production support is `linux-x64-gnu` only. The package manifest and addon checksum are verified before loading. Build profile and target identity are checked before setup. Managed Rust clients use the same setup protocol, ring profile, wire version, and descriptor schema.
 
-Linux seals ring objects against size changes. macOS does not provide the same seal contract, so a same-user process that holds a shared-memory descriptor remains trusted not to resize it after validation.
+Clean-install gates must complete one cross-process application round trip on Linux x64. A missing package, addon, manifest, checksum, or platform capability fails the gate; unsupported or omitted results are not success states.

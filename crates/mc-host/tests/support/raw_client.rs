@@ -615,7 +615,7 @@ impl RawClient {
 
 fn start_ring_stream_bridge(
     descriptor: serde_json::Value,
-    descriptors: [rustix::fd::OwnedFd; 2],
+    descriptors: [rustix::fd::OwnedFd; mc_host::setup_socket::RING_DESCRIPTOR_COUNT],
     mut setup: StdUnixStream,
 ) -> Result<(UnixStream, RawWriteSender), String> {
     let (client_stream, mut bridge_stream) =
