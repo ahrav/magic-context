@@ -110,6 +110,7 @@ pub enum ArtifactErrorKind {
     ReferenceUnavailable,
     ReferenceCommit,
     ReclaimInProgress,
+    UnredactableSecret,
     InvalidInput,
     PurgeIntent,
     PurgeUnlinkPending,
@@ -219,6 +220,8 @@ impl fmt::Display for ArtifactError {
             ArtifactErrorKind::ReclaimInProgress => {
                 formatter.write_str("artifact reclamation is in progress; retry ingestion")
             }
+            ArtifactErrorKind::UnredactableSecret => formatter
+                .write_str("artifact payload holds a recognized secret that cannot be redacted"),
             ArtifactErrorKind::InvalidInput => formatter.write_str("artifact input is invalid"),
             ArtifactErrorKind::PurgeIntent => {
                 formatter.write_str("artifact purge intent could not be made durable")

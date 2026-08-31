@@ -697,3 +697,77 @@ fn malformed_intent_digest_is_rejected_before_staging() {
     assert_eq!(published_objects(root.path()), Vec::<String>::new());
     assert_eq!(reservation_count(root.path()), 0);
 }
+
+#[test]
+fn uninspectable_payload_never_persists_a_recognized_secret() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let mut payload = vec![0xff, 0xfe];
+    payload.extend_from_slice(format!("prefix {SECRET} suffix").as_bytes());
+
+    let error = store
+        .ingest_artifact(request("binary-secret", payload))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::UnredactableSecret);
+    assert!(!format!("{error}").contains(SECRET));
+    assert!(!tree_bytes(root.path())
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+}
+
+#[test]
+fn uninspectable_payload_without_a_secret_still_ingests() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = vec![0xff, 0x00, 0xfe, 0x01, 0x80];
+
+    let handle = store
+        .ingest_artifact(request("binary-clean", payload.clone()))
+        .unwrap();
+
+    assert_eq!(store.read_artifact(&handle).unwrap(), payload);
+    assert_eq!(
+        store
+            .artifact_eligibility(&handle, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::SensitiveRemote)
+    );
+}
+
+#[test]
+fn symlinked_object_is_not_admitted_as_a_verified_reference() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"symlink bait".to_vec();
+    let digest = format!("{:x}", Sha256::digest(&payload));
+
+    let outside = root.path().join("outside-the-cas");
+    fs::write(&outside, &payload).unwrap();
+    let shard = root.path().join("artifacts/objects").join(&digest[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    fs::set_permissions(&shard, fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&outside, shard.join(&digest[2..])).unwrap();
+
+    let error = store
+        .ingest_artifact(request("symlink", payload))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::MissingObject);
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    let references: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM evidence_meta WHERE artifact_digest=?1",
+            [&digest],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(references, 0);
+    assert_eq!(reservation_count(root.path()), 0);
+    assert_eq!(staged_entries(root.path()), 0);
+}

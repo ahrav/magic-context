@@ -206,6 +206,26 @@ pub(super) fn append_and_sync(file: &mut File, bytes: &[u8]) -> Result<(), Stora
     sync_file(file)
 }
 
+pub(super) fn open_regular_nofollow(directory: &File, name: &str) -> Result<File, StorageError> {
+    validate_name(name)?;
+    let descriptor = rfs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(classify_errno)?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata().map_err(classify_io)?;
+    if !metadata.file_type().is_file() {
+        return Err(classify_io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "artifact object must be a regular file",
+        )));
+    }
+    Ok(file)
+}
+
 pub(super) fn write_and_sync(file: &mut File, bytes: &[u8]) -> Result<(), StorageError> {
     file.write_all(bytes).map_err(classify_io)?;
     sync_file(file)

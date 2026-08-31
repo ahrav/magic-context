@@ -1,4 +1,5 @@
 use std::fs::{self, File};
+use std::io::Read;
 
 use mc_core::redaction::Detection;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -13,7 +14,8 @@ use super::{
 };
 use crate::kernel::durable_fs::{
     classify_io, create_new_file, durable_unlink, open_or_create_secure_directory,
-    publish_noreplace_between_locked, temp_name, write_and_sync, PublishOutcome, StorageError,
+    open_regular_nofollow, publish_noreplace_between_locked, temp_name, write_and_sync,
+    PublishOutcome, StorageError,
 };
 use crate::kernel::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
 use crate::kernel::open::current_time_ms;
@@ -80,14 +82,22 @@ impl PreparedArtifact {
                 let bytes = redaction.text.as_bytes().to_vec();
                 (redaction, bytes, true)
             }
-            Err(_) => (
-                RedactedField {
-                    text: String::new(),
-                    detections: Vec::new(),
-                },
-                std::mem::take(&mut request.payload),
-                false,
-            ),
+            Err(_) => {
+                if !redact(&String::from_utf8_lossy(&request.payload))
+                    .detections
+                    .is_empty()
+                {
+                    return Err(ArtifactError::new(ArtifactErrorKind::UnredactableSecret));
+                }
+                (
+                    RedactedField {
+                        text: String::new(),
+                        detections: Vec::new(),
+                    },
+                    std::mem::take(&mut request.payload),
+                    false,
+                )
+            }
         };
         let affirmative_provenance = request.provenance.as_ref().is_some_and(|provenance| {
             !provenance.repository_id.trim().is_empty() && !provenance.revision.trim().is_empty()
@@ -275,15 +285,12 @@ impl KernelStore {
             Err(error) => {
                 let mapped =
                     self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed);
-                self.release_reservation(&mut writer, &reservation_id);
+                self.cleanup_failed_reference(&mut writer, &reservation_id, &prepared.digest, true);
                 return Err(mapped);
             }
         };
 
-        if let Err(error) = verify_object(
-            &self.artifact_object_path(&prepared.digest),
-            &prepared.digest,
-        ) {
+        if let Err(error) = verify_object(&shard, &prepared.digest[2..], &prepared.digest) {
             self.cleanup_failed_reference(
                 &mut writer,
                 &reservation_id,
@@ -679,8 +686,12 @@ fn artifact_is_reclaiming(
         .map_err(|_| KernelError::Io)
 }
 
-fn verify_object(path: &std::path::Path, digest: &str) -> Result<(), ArtifactError> {
-    let bytes = fs::read(path)
+fn verify_object(shard: &File, name: &str, digest: &str) -> Result<(), ArtifactError> {
+    let mut object = open_regular_nofollow(shard, name)
+        .map_err(|_| ArtifactError::for_digest(ArtifactErrorKind::MissingObject, digest))?;
+    let mut bytes = Vec::new();
+    object
+        .read_to_end(&mut bytes)
         .map_err(|_| ArtifactError::for_digest(ArtifactErrorKind::MissingObject, digest))?;
     if format!("{:x}", Sha256::digest(bytes)) != digest {
         return Err(ArtifactError::for_digest(
