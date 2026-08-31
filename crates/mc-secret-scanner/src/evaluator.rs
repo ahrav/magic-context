@@ -573,6 +573,33 @@ fn is_blank_with_escapes(text: &str) -> bool {
     true
 }
 
+// Hex-encoded credentials are also `0x`-prefixed, so a longer digit run stays a
+// candidate: an Ethereum private key carries 64 hex digits. Modes, masks, and
+// flags fit inside this bound.
+// commentlint: allow(JUDGE)
+const MAX_RADIX_SCALAR_DIGITS: usize = 8;
+
+fn is_radix_scalar(bytes: &[u8]) -> bool {
+    let bytes = match bytes.first() {
+        Some(b'+' | b'-') => &bytes[1..],
+        _ => bytes,
+    };
+    if bytes.first() != Some(&b'0') {
+        return false;
+    }
+    let Some(radix) = bytes.get(1) else {
+        return false;
+    };
+    let digits = &bytes[2..];
+    let accepts: fn(&u8) -> bool = match radix.to_ascii_lowercase() {
+        b'x' => u8::is_ascii_hexdigit,
+        b'o' => |byte: &u8| (b'0'..=b'7').contains(byte),
+        b'b' => |byte: &u8| matches!(byte, b'0' | b'1'),
+        _ => return false,
+    };
+    !digits.is_empty() && digits.len() <= MAX_RADIX_SCALAR_DIGITS && digits.iter().all(accepts)
+}
+
 fn is_scalar(value: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(value) else {
         return false;
@@ -588,6 +615,9 @@ fn is_scalar(value: &[u8]) -> bool {
         return true;
     }
     let bytes = text.as_bytes();
+    if is_radix_scalar(bytes) {
+        return true;
+    }
     let mut index = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
     // Digits are counted across the point rather than required on its left, because `.5` and `5.` are decimal literals a configuration file can hold.
     let mut digits = 0usize;
@@ -975,6 +1005,12 @@ mod tests {
             "\\t",
             "\\r\\n",
             " \\n ",
+            "0x10",
+            "0X1F",
+            "0o755",
+            "0b1010",
+            "-0x10",
+            "0xdeadbeef",
         ] {
             assert!(is_scalar(scalar.as_bytes()), "{scalar:?}");
         }
@@ -988,6 +1024,12 @@ mod tests {
             "-.",
             ".x",
             "5.5.5",
+            "0x",
+            "0xz",
+            "0o8",
+            "0b2",
+            "0x123456789",
+            "0xdeadbeefcafe1234",
             "\\\\",
             "\\nhunter2",
             "\\x",

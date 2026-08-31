@@ -54,6 +54,12 @@ fn short_quoted_values_are_kept_and_scalars_are_rejected() {
         "password=nil",
         "password=NaN",
         "password=~",
+        "password=0x10",
+        "password=0X1F",
+        "password=0o755",
+        "password=0b1010",
+        "password=-0x10",
+        "password=0xdeadbeef",
         "password=.inf",
         "password=-.inf",
         "password=.NaN",
@@ -98,6 +104,13 @@ fn empty_keyed_values_and_secret_substrings_are_not_findings() {
     for input in [
         "auth_token=hunter-two",
         "api-key=hunter-two",
+        // A hex-encoded credential is `0x`-prefixed too, so the radix branch must
+        // not reach past a mode or mask into an Ethereum private key.
+        "private_key=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        "private_key=0xdeadbeefcafe1234",
+        "password=0x",
+        "password=0xz",
+        "password=0o8",
         r#"{"clientSecret":"hunter-two"}"#,
         r#"{"password":"\nhunter-two"}"#,
         r#"{"password":"\\"}"#,
