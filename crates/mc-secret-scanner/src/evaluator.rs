@@ -465,7 +465,19 @@ const KEY_QUALIFIERS: &[&[u8]] = &[
     b"values",
 ];
 
+// A key naming the public half of a keypair is not a credential, and the marker
+// has to apply across delimited tokens too: `public_key` splits into `public` and
+// `key`, so excluding `public` from the qualifiers only covers `publickey`.
+const NON_SECRET_KEY_MARKERS: &[&[u8]] = &[b"public", b"pubkey", b"publishable"];
+
 fn has_secret_key_token(key: &[u8]) -> bool {
+    if key_tokens(key).any(|token| {
+        NON_SECRET_KEY_MARKERS
+            .iter()
+            .any(|marker| token.eq_ignore_ascii_case(marker))
+    }) {
+        return false;
+    }
     key_tokens(key).any(|token| token_matches_any_key_name(token, SECRET_KEY_WORDS))
 }
 
@@ -655,6 +667,28 @@ fn is_blank_with_escapes(text: &str) -> bool {
 // commentlint: allow(JUDGE)
 const MAX_RADIX_SCALAR_DIGITS: usize = 8;
 
+// A separator only counts between digits, so `1_000` is a literal while `_1`,
+// `1_`, and `1__0` are not.
+fn consume_digit_run(
+    bytes: &[u8],
+    index: &mut usize,
+    digits: &mut usize,
+    accepts: fn(&u8) -> bool,
+) {
+    while let Some(byte) = bytes.get(*index) {
+        if accepts(byte) {
+            *index += 1;
+            *digits += 1;
+            continue;
+        }
+        let separated = *byte == b'_' && *digits > 0 && bytes.get(*index + 1).is_some_and(accepts);
+        if !separated {
+            return;
+        }
+        *index += 1;
+    }
+}
+
 fn is_radix_scalar(bytes: &[u8]) -> bool {
     let bytes = match bytes.first() {
         Some(b'+' | b'-') => &bytes[1..],
@@ -673,7 +707,10 @@ fn is_radix_scalar(bytes: &[u8]) -> bool {
         b'b' => |byte: &u8| matches!(byte, b'0' | b'1'),
         _ => return false,
     };
-    !digits.is_empty() && digits.len() <= MAX_RADIX_SCALAR_DIGITS && digits.iter().all(accepts)
+    let mut index = 0usize;
+    let mut count = 0usize;
+    consume_digit_run(digits, &mut index, &mut count, accepts);
+    index == digits.len() && count > 0 && count <= MAX_RADIX_SCALAR_DIGITS
 }
 
 fn is_scalar(value: &[u8]) -> bool {
@@ -697,16 +734,10 @@ fn is_scalar(value: &[u8]) -> bool {
     let mut index = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
     // Digits are counted across the point rather than required on its left, because `.5` and `5.` are decimal literals a configuration file can hold.
     let mut digits = 0usize;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        index += 1;
-        digits += 1;
-    }
+    consume_digit_run(bytes, &mut index, &mut digits, u8::is_ascii_digit);
     if bytes.get(index) == Some(&b'.') {
         index += 1;
-        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-            index += 1;
-            digits += 1;
-        }
+        consume_digit_run(bytes, &mut index, &mut digits, u8::is_ascii_digit);
     }
     if digits == 0 {
         return false;
