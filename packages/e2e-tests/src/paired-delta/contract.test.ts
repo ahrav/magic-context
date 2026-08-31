@@ -111,6 +111,32 @@ describe("paired-delta scenario contract", () => {
         ).toThrow(/r1\.locatorIds: empty/);
     });
 
+    it("bounds R1 locator sets to the scripted-search limit", () => {
+        const base = scenario();
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r1: {
+                        ...base.interventions.r1,
+                        locatorIds: ["a", "b", "c", "d", "e", "f"].map((s) => `mem-${s}`),
+                    },
+                },
+            })),
+        ).toThrow(/r1\.locatorIds: exceeds-search-limit/);
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r1: {
+                        ...base.interventions.r1,
+                        locatorIds: ["a", "b", "c", "d", "e"].map((s) => `mem-${s}`),
+                    },
+                },
+            })),
+        ).not.toThrow();
+    });
+
     it("requires every critical check to cover every compared arm", () => {
         expect(() =>
             parseScenarioDeclaration(scenario({
@@ -233,6 +259,55 @@ describe("paired-delta armed cell contract", () => {
                 criticalTotal: 1,
             }),
         ).toThrow(/critical: passed-exceeds-checks/);
+    });
+
+    it("rejects reason codes incompatible with the reported health", () => {
+        expect(() =>
+            parseArmedCellResult({
+                ...completed,
+                runHealth: "timeout",
+                reasonCode: "runner-crash",
+            }),
+        ).toThrow(/reasonCode: health-incompatible/);
+        expect(() =>
+            parseArmedCellResult({
+                ...completed,
+                runHealth: "crash",
+                reasonCode: "deadline-exceeded",
+            }),
+        ).toThrow(/reasonCode: health-incompatible/);
+        for (const health of ["timeout", "crash", "malformed", "unavailable"] as const) {
+            expect(() =>
+                parseArmedCellResult({
+                    ...completed,
+                    runHealth: health,
+                    reasonCode: "harness-failure",
+                }),
+            ).not.toThrow();
+        }
+    });
+
+    it("rejects a completed cell with an empty score denominator", () => {
+        expect(() =>
+            parseArmedCellResult({
+                ...completed,
+                checksPassed: 0,
+                checksTotal: 0,
+                criticalPassed: 0,
+                criticalTotal: 0,
+            }),
+        ).toThrow(/checks: completed-requires-checks/);
+        expect(() =>
+            parseArmedCellResult({
+                ...completed,
+                checksPassed: 0,
+                checksTotal: 0,
+                criticalPassed: 0,
+                criticalTotal: 0,
+                runHealth: "timeout",
+                reasonCode: "deadline-exceeded",
+            }),
+        ).not.toThrow();
     });
 });
 

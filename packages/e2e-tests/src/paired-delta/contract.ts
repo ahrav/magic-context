@@ -1,5 +1,6 @@
 import { CHARS_PER_TOKEN } from "../ballast";
 import { makeContractPrimitives } from "../contract-primitives";
+import { ID_SHAPED_QUERY_MAX_TOKENS } from "../../../plugin/src/features/magic-context/search";
 
 export const ARM_IDS = ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"] as const;
 export type ArmId = (typeof ARM_IDS)[number];
@@ -25,6 +26,21 @@ export const REASON_CODES = [
     "absence-precondition-unmet",
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
+const NON_COMPLETED_HEALTHS: readonly RunHealth[] = RUN_HEALTHS.filter(
+    (health) => health !== "completed",
+);
+/** Most reason codes name their own terminal path, so pairing one with a different health describes a run that cannot have happened and misattributes the missingness. `harness-failure` and `absence-precondition-unmet` are general-purpose and stay admissible on any non-completed health. commentlint: allow(JUDGE) */
+const REASON_CODE_HEALTHS: Readonly<Record<ReasonCode, readonly RunHealth[]>> = {
+    "deadline-exceeded": ["timeout"],
+    "runner-crash": ["crash"],
+    "product-crash": ["crash"],
+    "invalid-result": ["malformed"],
+    "arm-identity-mismatch": ["malformed"],
+    "prerequisite-unavailable": ["unavailable"],
+    "provider-unavailable": ["unavailable"],
+    "harness-failure": NON_COMPLETED_HEALTHS,
+    "absence-precondition-unmet": NON_COMPLETED_HEALTHS,
+};
 
 export const RUN_MODES = ["calibration", "weekly", "release"] as const;
 export type RunMode = (typeof RUN_MODES)[number];
@@ -241,6 +257,15 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     if (!turnIds.has(insertAfterTurnId)) {
         p.fail("scenario.interventions.r1.insertAfterTurnId: unknown-turn");
     }
+    const locatorIds = parseStringArray(
+        r1.locatorIds,
+        MEMORY_ID_RE,
+        "scenario.interventions.r1.locatorIds",
+    );
+    /** A runner must pass the resolved ids as one locator-shaped query, and `scriptedCtxSearchTurn` rejects a larger set rather than chunking it — chunking would no longer be one tool turn. Enforcing the helper's bound here fails the declaration at freeze time instead of at R1 run time. commentlint: allow(JUDGE) */
+    if (locatorIds.length > ID_SHAPED_QUERY_MAX_TOKENS) {
+        p.fail("scenario.interventions.r1.locatorIds: exceeds-search-limit");
+    }
     const r2 = p.record(interventions.r2, "scenario.interventions.r2");
     p.exact(r2, ["memories"], "scenario.interventions.r2");
     const memories = p.array(r2.memories, "scenario.interventions.r2.memories").map(
@@ -313,11 +338,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
             r1: {
                 insertAfterTurnId,
                 query: r1Query,
-                locatorIds: parseStringArray(
-                    r1.locatorIds,
-                    MEMORY_ID_RE,
-                    "scenario.interventions.r1.locatorIds",
-                ),
+                locatorIds,
             },
             r2: { memories },
             r3: { evidence: p.string(r3.evidence, "scenario.interventions.r3.evidence") },
@@ -373,6 +394,19 @@ export function parseArmedCellResult(raw: unknown): ArmedCellResult {
     }
     if ((result.runHealth === "completed") !== (result.reasonCode === null)) {
         p.fail("cell.reasonCode: health-mismatch");
+    }
+    if (
+        result.reasonCode !== null &&
+        !REASON_CODE_HEALTHS[result.reasonCode].includes(result.runHealth)
+    ) {
+        p.fail("cell.reasonCode: health-incompatible");
+    }
+    /** Every compared arm declares at least one check and at least one critical check, so a completed run cannot report an empty denominator; accepting one would make the paired deltas divide by nothing while looking like a valid measurement. commentlint: allow(JUDGE) */
+    if (
+        result.runHealth === "completed" &&
+        (result.checksTotal === 0 || result.criticalTotal === 0)
+    ) {
+        p.fail("cell.checks: completed-requires-checks");
     }
     return result;
 }
