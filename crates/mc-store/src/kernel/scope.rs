@@ -342,14 +342,11 @@ fn map_write_error(error: rusqlite::Error) -> KernelError {
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Marker fragment every redaction replacement token carries (for example
-/// `<ANTHROPIC_API_KEY_REDACTED>`). A stored scope value containing it is a
-/// redaction placeholder: distinct secrets collapse onto one token, so the
-/// value can never be compared as an ordinary term value.
-const REDACTION_MARKER: &str = "_REDACTED>";
-
-fn contains_redaction_placeholder(value: &str) -> bool {
-    value.contains(REDACTION_MARKER)
+// Distinct secrets collapse to the same replacement token, so a value
+// containing one must stay out of equality, matching, and dedup decisions.
+pub(super) fn contains_redaction_placeholder(value: &str) -> bool {
+    mc_core::redaction::contains_redaction_token(value)
+        || value.contains(super::envelope::OPERATOR_REDACTION_PLACEHOLDER)
 }
 
 /// The ten bounded scope dimensions. Stored strings are exactly the
@@ -417,12 +414,45 @@ pub enum TermValue {
         start: Option<String>,
         end: Option<String>,
     },
-    /// Raw semver requirement string, validated at decode time.
-    VersionRange(String),
+    VersionRange(VersionSpec),
     /// Lower-hex commit OID whose descendant cone is the value set.
     GitReachable(String),
     RedactedPlaceholder,
 }
+
+#[derive(Debug, Clone)]
+pub struct VersionSpec {
+    raw: String,
+    req: semver::VersionReq,
+    /// `None` when the requirement has no interval reading.
+    interval: Option<VersionInterval>,
+}
+
+impl VersionSpec {
+    /// `None` when `raw` is not a valid semver requirement.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let req = semver::VersionReq::parse(raw).ok()?;
+        let interval = req_interval(&req);
+        Some(Self {
+            raw: raw.to_string(),
+            req,
+            interval,
+        })
+    }
+
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+}
+
+/// Equality compares raw requirement strings, not parsed requirements.
+impl PartialEq for VersionSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl Eq for VersionSpec {}
 
 /// Why a scope failed to decode into canonical form. Malformed scopes
 /// evaluate uncertain and never match.
@@ -532,11 +562,10 @@ impl CanonicalScope {
     }
 }
 
-fn is_lower_hex_oid(value: &str) -> bool {
-    (value.len() == 40 || value.len() == 64)
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+/// 40 and 64 hex digits identify SHA-1 and SHA-256 commit OIDs, respectively.
+pub(super) fn is_commit_oid(value: &str) -> bool {
+    mc_core::claim_operation::is_lower_hex(value, 40)
+        || mc_core::claim_operation::is_lower_hex(value, 64)
 }
 
 fn decode_term_value(
@@ -624,10 +653,9 @@ fn decode_term_value(
                 .as_deref()
                 .filter(|value| !value.is_empty())
                 .ok_or(ScopeFormError::MissingValue(dimension))?;
-            if semver::VersionReq::parse(raw).is_err() {
-                return Err(ScopeFormError::InvalidVersionRange(dimension));
-            }
-            Ok(TermValue::VersionRange(raw.to_string()))
+            let spec =
+                VersionSpec::parse(raw).ok_or(ScopeFormError::InvalidVersionRange(dimension))?;
+            Ok(TermValue::VersionRange(spec))
         }
         "git_reachable" => {
             if extra_columns([false, false, false, false, true, false]) {
@@ -637,7 +665,7 @@ fn decode_term_value(
                 .git_oid
                 .as_deref()
                 .ok_or(ScopeFormError::MissingValue(dimension))?;
-            if !is_lower_hex_oid(oid) {
+            if !is_commit_oid(oid) {
                 return Err(ScopeFormError::InvalidOid(dimension));
             }
             Ok(TermValue::GitReachable(oid.to_string()))
@@ -720,16 +748,17 @@ impl ScopeMatchContext {
 }
 
 /// Coerces a platform-version style string into a semver `Version`: missing
-/// minor/patch components pad with zero, a `+build` suffix is dropped, and a
-/// non-numeric vendor suffix becomes a pre-release identifier. Returns `None`
-/// when no leading numeric component exists.
+/// minor/patch components pad with zero, numeric components after the third
+/// are discarded, and vendor suffixes use build metadata because
+/// pre-releases do not satisfy plain semver ranges. Returns `None` when no
+/// usable numeric core can be parsed.
 pub fn coerce_version(raw: &str) -> Option<semver::Version> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
     if let Ok(version) = semver::Version::parse(raw) {
-        return Some(version);
+        return demote_pre_to_build(version);
     }
     let (core, _build) = match raw.split_once('+') {
         Some((core, build)) => (core, Some(build)),
@@ -744,7 +773,7 @@ pub fn coerce_version(raw: &str) -> Option<semver::Version> {
     let mut trailing_suffix: Option<String> = None;
     for part in numeric.split('.') {
         if count == 3 {
-            return None;
+            break;
         }
         match part.parse::<u64>() {
             Ok(value) => {
@@ -753,7 +782,7 @@ pub fn coerce_version(raw: &str) -> Option<semver::Version> {
             }
             Err(_) => {
                 // A vendor suffix glued to the last numeric component, such
-                // as "3ubuntu1", splits into the digits and a pre-release.
+                // as "3ubuntu1", splits into the digits and a build qualifier.
                 let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
                 let rest = &part[digits.len()..];
                 if digits.is_empty() || rest.is_empty() {
@@ -769,8 +798,8 @@ pub fn coerce_version(raw: &str) -> Option<semver::Version> {
     if count == 0 {
         return None;
     }
-    let pre_source = trailing_suffix.or_else(|| suffix.map(str::to_string));
-    let pre = match pre_source {
+    let build_source = trailing_suffix.or_else(|| suffix.map(str::to_string));
+    let build = match build_source {
         Some(suffix) if !suffix.is_empty() => {
             let sanitized: String = suffix
                 .chars()
@@ -782,12 +811,28 @@ pub fn coerce_version(raw: &str) -> Option<semver::Version> {
                     }
                 })
                 .collect();
-            semver::Prerelease::new(&sanitized).ok()?
+            semver::BuildMetadata::new(&sanitized).ok()?
         }
-        _ => semver::Prerelease::EMPTY,
+        _ => semver::BuildMetadata::EMPTY,
     };
     let mut version = semver::Version::new(components[0], components[1], components[2]);
-    version.pre = pre;
+    version.build = build;
+    Some(version)
+}
+
+/// `VersionReq::matches` excludes prereleases from plain requirements; build
+/// metadata preserves the qualifier without affecting comparison.
+fn demote_pre_to_build(mut version: semver::Version) -> Option<semver::Version> {
+    if version.pre.is_empty() {
+        return Some(version);
+    }
+    let merged = if version.build.is_empty() {
+        version.pre.as_str().to_string()
+    } else {
+        format!("{}.{}", version.pre, version.build)
+    };
+    version.build = semver::BuildMetadata::new(&merged).ok()?;
+    version.pre = semver::Prerelease::EMPTY;
     Some(version)
 }
 
@@ -971,11 +1016,8 @@ fn comparator_interval(comparator: &semver::Comparator) -> Option<VersionInterva
     Some(interval)
 }
 
-/// Normalizes a validated requirement string into one interval. `None` when
-/// any comparator resists the interval reading (pre-release comparators or
-/// unknown operators).
-fn version_req_interval(raw: &str) -> Option<VersionInterval> {
-    let req = semver::VersionReq::parse(raw).ok()?;
+/// Returns `None` when any comparator has no representable interval.
+fn req_interval(req: &semver::VersionReq) -> Option<VersionInterval> {
     let mut interval = VersionInterval::full();
     for comparator in &req.comparators {
         interval = interval.intersect(comparator_interval(comparator)?);
@@ -983,8 +1025,7 @@ fn version_req_interval(raw: &str) -> Option<VersionInterval> {
     Some(interval)
 }
 
-fn version_req_matches(raw: &str, value: &str) -> Option<bool> {
-    let req = semver::VersionReq::parse(raw).ok()?;
+pub(super) fn version_req_matches(req: &semver::VersionReq, value: &str) -> Option<bool> {
     let version = coerce_version(value)?;
     Some(req.matches(&version))
 }
@@ -1009,11 +1050,11 @@ fn term_subsumes(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Opti
             Some(range_bound_le(ps, rs) && range_bound_ge(pe, re))
         }
         (Range { .. }, _) => Some(false),
-        (VersionRange(q), Exact(v)) => version_req_matches(q, v),
+        (VersionRange(q), Exact(v)) => version_req_matches(&q.req, v),
         (VersionRange(q), Set(s)) => {
             let mut all = true;
             for value in s {
-                match version_req_matches(q, value) {
+                match version_req_matches(&q.req, value) {
                     Some(true) => {}
                     Some(false) => {
                         all = false;
@@ -1028,9 +1069,9 @@ fn term_subsumes(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Opti
             if q == vr {
                 return Some(true);
             }
-            let outer = version_req_interval(q)?;
-            let inner = version_req_interval(vr)?;
-            Some(outer.contains(&inner))
+            let outer = q.interval.as_ref()?;
+            let inner = vr.interval.as_ref()?;
+            Some(outer.contains(inner))
         }
         (VersionRange(_), _) => Some(false),
         (GitReachable(h), GitReachable(g)) => {
@@ -1055,7 +1096,7 @@ fn term_overlaps(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Opti
         (Exact(u), Range { start, end }) | (Range { start, end }, Exact(u)) => {
             Some(range_contains(start, end, u))
         }
-        (Exact(u), VersionRange(q)) | (VersionRange(q), Exact(u)) => version_req_matches(q, u),
+        (Exact(u), VersionRange(q)) | (VersionRange(q), Exact(u)) => version_req_matches(&q.req, u),
         (Set(t), Set(s)) => Some(!t.is_disjoint(s)),
         (Set(s), Range { start, end }) | (Range { start, end }, Set(s)) => {
             Some(s.iter().any(|value| range_contains(start, end, value)))
@@ -1063,7 +1104,7 @@ fn term_overlaps(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Opti
         (Set(s), VersionRange(q)) | (VersionRange(q), Set(s)) => {
             let mut any = false;
             for value in s {
-                match version_req_matches(q, value) {
+                match version_req_matches(&q.req, value) {
                     Some(true) => {
                         any = true;
                         break;
@@ -1079,12 +1120,12 @@ fn term_overlaps(a: &TermValue, b: &TermValue, oracle: &dyn GraphOracle) -> Opti
         }
         (VersionRange(q), VersionRange(vr)) => {
             if q == vr {
-                let interval = version_req_interval(q)?;
+                let interval = q.interval.as_ref()?;
                 return Some(!interval.is_empty());
             }
-            let left = version_req_interval(q)?;
-            let right = version_req_interval(vr)?;
-            Some(left.overlaps(&right))
+            let left = q.interval.as_ref()?;
+            let right = vr.interval.as_ref()?;
+            Some(left.overlaps(right))
         }
         (GitReachable(h), GitReachable(g)) => {
             if h == g {
@@ -1172,7 +1213,7 @@ fn term_matches(
         TermValue::Exact(expected) => bool_outcome(expected == value),
         TermValue::Set(values) => bool_outcome(values.contains(value)),
         TermValue::Range { start, end } => bool_outcome(range_contains(start, end, value)),
-        TermValue::VersionRange(req) => match version_req_matches(req, value) {
+        TermValue::VersionRange(spec) => match version_req_matches(&spec.req, value) {
             Some(holds) => bool_outcome(holds),
             None => MatchOutcome::Uncertain,
         },

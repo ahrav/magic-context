@@ -225,6 +225,13 @@ pub fn redact_secret_text(input: &str) -> Redaction {
     Redaction { text, detections }
 }
 
+/// A value containing a replacement token must not participate in equality,
+/// matching, or deduplication.
+#[must_use]
+pub fn contains_redaction_token(text: &str) -> bool {
+    text.contains("_REDACTED>") || text.contains("<REDACTED:")
+}
+
 fn is_non_secret_scalar_value(value: &str) -> bool {
     let value = value.trim();
     matches!(value, "true" | "false" | "null" | "undefined") || SCALAR_VALUE.is_match(value)
@@ -351,6 +358,23 @@ mod tests {
                 .detections
                 .iter()
                 .all(|detection| detection.detector_id == DETECTOR_ID));
+        }
+    }
+
+    #[test]
+    fn every_fixture_replacement_is_detected_as_a_redaction_token() {
+        let vocabulary = vocabulary();
+        for fixture in vocabulary.cases {
+            let result = redact_secret_text(&fixture.input);
+            if result.detections.is_empty() {
+                continue;
+            }
+            assert!(
+                contains_redaction_token(&result.text),
+                "{}: redacted output {:?} not recognized as a placeholder",
+                fixture.name,
+                result.text
+            );
         }
     }
 

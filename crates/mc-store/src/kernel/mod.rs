@@ -48,7 +48,7 @@ pub use retention::{StagingMaintenanceResult, StagingTerminalState};
 pub use scope::{
     coerce_version, scope_equivalent, scope_matches, scope_overlaps, scope_subsumes,
     CanonicalScope, Dimension, GraphOracle, MatchOutcome, ScopeFormError, ScopeMatchContext,
-    ScopeSpec, ScopeTermSpec, ScopeWriteOutcome, TermValue, UnknownGraph,
+    ScopeSpec, ScopeTermSpec, ScopeWriteOutcome, TermValue, UnknownGraph, VersionSpec,
 };
 pub use slice::{
     AlignmentRebuild, AlignmentRow, AlignmentSnapshot, DecisionEventOutcome, DecisionEventPayload,

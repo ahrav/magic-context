@@ -51,6 +51,40 @@ fn exact_anchor_compares_against_the_context_token() {
 }
 
 #[test]
+fn redaction_placeholders_evaluate_uncertain_never_current() {
+    // Distinct secrets collapse onto one redaction token, so equality on a
+    // placeholder would report two unrelated values as the same anchor.
+    for token in ["<REDACTED:token>", "<GITHUB_PAT_REDACTED>"] {
+        let stored_placeholder = decode(&AnchorRowSpec {
+            exact_value: Some(format!("deploy={token}")),
+            ..row("exact")
+        });
+        let matching_ctx = QueryContext {
+            exact_token: Some(format!("deploy={token}")),
+            ..QueryContext::default()
+        };
+        assert_eq!(
+            evaluate_non_git(&stored_placeholder, &matching_ctx),
+            AnchorEvaluation::Uncertain,
+            "{token} stored value must never hold"
+        );
+        let plain = decode(&AnchorRowSpec {
+            deployment_revision: Some("rev-42".to_string()),
+            ..row("deployment_revision")
+        });
+        let placeholder_ctx = QueryContext {
+            deployment_revision: Some(format!("rev-{token}")),
+            ..QueryContext::default()
+        };
+        assert_eq!(
+            evaluate_non_git(&plain, &placeholder_ctx),
+            AnchorEvaluation::Uncertain,
+            "{token} context value must never decide"
+        );
+    }
+}
+
+#[test]
 fn deployment_and_config_revisions_hold_fail_and_stay_uncertain() {
     for (kind, context_field) in [
         ("deployment_revision", "deployment"),
@@ -122,14 +156,21 @@ fn platform_version_coerces_non_semver_context_values() {
         evaluate_non_git(&condition, &with_version("14.4")),
         AnchorEvaluation::Holds
     );
-    // Vendor-suffixed build strings demote the suffix to a pre-release
-    // rather than failing the parse; pre-releases do not match a plain
-    // range, so the verdict is a definite non-match, not a panic.
-    let vendored = evaluate_non_git(&condition, &with_version("14.4.1ubuntu3"));
-    assert!(matches!(
-        vendored,
-        AnchorEvaluation::Holds | AnchorEvaluation::DoesNotHold { .. }
-    ));
+    // Vendor suffixes become SemVer build metadata, which comparison
+    // ignores.
+    assert_eq!(
+        evaluate_non_git(&condition, &with_version("14.4.1ubuntu3")),
+        AnchorEvaluation::Holds
+    );
+    assert_eq!(
+        evaluate_non_git(&condition, &with_version("14.4.0-91-generic")),
+        AnchorEvaluation::Holds
+    );
+    // Four-component platform versions truncate to the semver core.
+    assert_eq!(
+        evaluate_non_git(&condition, &with_version("14.4.1041.7")),
+        AnchorEvaluation::Holds
+    );
     // Unparseable strings are uncertain, never a match and never a panic.
     assert_eq!(
         evaluate_non_git(&condition, &with_version("not-a-version")),
