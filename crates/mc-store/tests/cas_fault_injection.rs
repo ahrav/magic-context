@@ -25,6 +25,7 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 const CHILD_MODE: &str = "MC_CAS_FAULT_CHILD_MODE";
 const CHILD_ROOT: &str = "MC_CAS_FAULT_CHILD_ROOT";
 const CHILD_BARRIER: &str = "MC_CAS_CRASH_BARRIER";
+const RESERVATION_CRASH_POINT: &str = "ingest.035.reservation.commit.after";
 const INGEST_CRASH_POINT: &str = "ingest.070.object.rename.after";
 const PURGE_CRASH_POINT: &str = "purge.020.reference.commit.after";
 
@@ -60,6 +61,12 @@ const PROTOCOL: &[ProtocolPoint] = &[
         operation: "ingest",
         persistent_edge: "commit live hash reservation",
         driver: Driver::ReturnValue,
+    },
+    ProtocolPoint {
+        id: "ingest.035.reservation.commit.after",
+        operation: "ingest",
+        persistent_edge: "live reservation committed before the object is published",
+        driver: Driver::ProcessKill,
     },
     ProtocolPoint {
         id: "ingest.040.object.rename.before",
@@ -538,21 +545,24 @@ fn purge_and_gc_fault_table_preserves_pending_work_and_converges() {
 #[test]
 fn deletion_return_faults_separate_intent_envelope_and_unlink_outcomes() {
     let mut driven = Vec::new();
-    for (point, fault, expected, committed) in [
+    for (point, kind, fault, expected, committed) in [
         (
             "purge.010.intent.append-fsync.before",
+            ArtifactDeletionKind::Purge,
             ArtifactDeletionFault::IntentAppend,
             ArtifactErrorKind::PurgeIntent,
             false,
         ),
         (
             "delete.010.reference.commit.before",
+            ArtifactDeletionKind::Delete,
             ArtifactDeletionFault::BeforeCommit,
             ArtifactErrorKind::ReferenceCommit,
             false,
         ),
         (
             "purge.030.object.unlink.before",
+            ArtifactDeletionKind::Purge,
             ArtifactDeletionFault::Unlink,
             ArtifactErrorKind::PurgeUnlinkPending,
             true,
@@ -564,11 +574,18 @@ fn deletion_return_faults_separate_intent_envelope_and_unlink_outcomes() {
         let handle = store
             .ingest_artifact(ingest_request("deletion-fault", b"deletion fault"))
             .unwrap();
+        let request = match kind {
+            ArtifactDeletionKind::Purge => purge_request("purge-fault", &handle.digest),
+            ArtifactDeletionKind::Delete => ArtifactDeletionRequest {
+                kind: ArtifactDeletionKind::Delete,
+                operator_id: None,
+                target_locator: None,
+                reason: None,
+                ..purge_request("delete-fault", &handle.digest)
+            },
+        };
         let error = store
-            .delete_artifact_with_fault_for_test(
-                purge_request("purge-fault", &handle.digest),
-                fault,
-            )
+            .delete_artifact_with_fault_for_test(request, fault)
             .unwrap_err();
         assert_eq!(error.kind(), expected, "{fault:?}");
         let state = SemanticState::read(root.path());
@@ -842,11 +859,43 @@ fn crash_windows_recover_idempotently_and_match_no_crash_execution() {
     drop(store);
     assert_eq!(crashed_state, recover_twice(expected.path()));
 
+    let crashed = tempfile::tempdir().unwrap();
+    run_crash_child(crashed.path(), "post-reservation");
+    // The reservation is durable and no object was published, so recovery must
+    // reclaim it rather than wait out the lease.
+    let pre_recovery = SemanticState::read(crashed.path());
+    assert_eq!(
+        pre_recovery.reservations,
+        vec![(reservation_digest(), "Live".into())],
+        "crash left no live reservation to recover"
+    );
+    assert!(
+        pre_recovery.objects.is_empty(),
+        "crash published an object before the rename: {:?}",
+        pre_recovery.objects
+    );
+    assert!(pre_recovery.canonical_refs.is_empty());
+    let crashed_state = recover_twice(crashed.path());
+    assert!(
+        crashed_state.reservations.is_empty(),
+        "recovery left the reservation behind: {:?}",
+        crashed_state.reservations
+    );
+    assert!(crashed_state.objects.is_empty());
+
     assert_drives(
-        &[INGEST_CRASH_POINT, PURGE_CRASH_POINT],
+        &[
+            RESERVATION_CRASH_POINT,
+            INGEST_CRASH_POINT,
+            PURGE_CRASH_POINT,
+        ],
         Driver::ProcessKill,
         &["ingest", "purge"],
     );
+}
+
+fn reservation_digest() -> String {
+    format!("{:x}", Sha256::digest(b"crash reservation"))
 }
 
 /// Re-executed by `run_crash_child` with `--exact`; a direct run returns early.
@@ -866,6 +915,17 @@ fn crash_child_entrypoint_reexecuted_by_the_parent() {
                 |hook| {
                     if hook == ArtifactIngestHook::AfterPublish {
                         crash_barrier(INGEST_CRASH_POINT)
+                    }
+                },
+            );
+        }
+        "post-reservation" => {
+            let _ = store.ingest_artifact_with_protocol_hook_for_test(
+                ingest_request("crash-reservation", b"crash reservation"),
+                None,
+                |hook| {
+                    if hook == ArtifactIngestHook::AfterReservation {
+                        crash_barrier(RESERVATION_CRASH_POINT)
                     }
                 },
             );
