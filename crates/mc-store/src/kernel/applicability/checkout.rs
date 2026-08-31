@@ -2,12 +2,21 @@
 //! content-addressed dirty fingerprint, taken once per request.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
+
+/// Cap that keeps one huge worktree file from dominating a snapshot's memory
+/// or outlasting its deadline. A same-length edit above the cap keeps the
+/// same key.
+const MAX_HASHED_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Read granularity; large-file hashing checks the deadline after each chunk.
+const HASH_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Deadline plus cooperative interrupt flag threaded through every walk the
 /// engine performs. The flag is the shape gix status accepts, so an async
@@ -144,9 +153,9 @@ impl CheckoutSnapshot {
         &self.repo
     }
 
-    /// Absolute path of a repo-relative worktree file.
+    /// Returns only paths contained by the worktree.
     pub fn worktree_path(&self, rela_path: &str) -> Option<PathBuf> {
-        self.repo.workdir().map(|workdir| workdir.join(rela_path))
+        contained_path(self.repo.workdir()?, rela_path)
     }
 }
 
@@ -178,7 +187,9 @@ pub fn snapshot_checkout(
     budget: &EvalBudget,
 ) -> Result<CheckoutSnapshot, SnapshotError> {
     budget.check()?;
-    let repo = open_isolated(path)?;
+    let mut repo = open_isolated(path)?;
+    // Resolution re-reads the same commits and trees across anchors.
+    repo.object_cache_size_if_unset(4 * 1024 * 1024);
     let identity = checkout_identity(&repo)?;
     let head = repo
         .head_id()
@@ -214,6 +225,9 @@ fn scan_dirty_entries(
         .status(gix::progress::Discard)
         .map_err(|error| SnapshotError::Scan(error.to_string()))?
         .should_interrupt_owned(budget.interrupt_flag())
+        // Collapsed untracked directories share one content-less fingerprint
+        // entry; `Files` also overrides `status.showUntrackedFiles`.
+        .untracked_files(gix::status::UntrackedFiles::Files)
         // Rename tracking would fold a delete+add pair into one entry;
         // the fingerprint wants the raw path set.
         .index_worktree_rewrites(None)
@@ -282,8 +296,8 @@ fn index_worktree_entry(
                 return Ok(None);
             }
             if entry.disk_kind.is_some_and(|kind| kind.is_dir()) {
-                // An untracked directory stands for its contents; the walk
-                // already collapsed them, so record the directory itself.
+                // `UntrackedFiles::Files` emits contained files individually,
+                // so directory entries have no content to hash.
                 return Ok(Some(DirtyEntry {
                     path: entry.rela_path.to_string(),
                     status: "untracked",
@@ -328,6 +342,9 @@ fn tree_index_entry(change: &gix::diff::index::Change) -> DirtyEntry {
 
 /// Content hash of a worktree file, so the fingerprint changes exactly when
 /// content changes (stat-only churn keeps the same key).
+///
+/// Symlinks hash their target path rather than the pointee.
+/// Non-regular files use a fixed token because opening them can block forever.
 fn worktree_content_hash(
     repo: &gix::Repository,
     rela_path: &str,
@@ -337,29 +354,83 @@ fn worktree_content_hash(
     let Some(workdir) = repo.workdir() else {
         return Ok("no-worktree".to_string());
     };
-    let path = workdir.join(rela_path);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            let mut hash = Sha256::new();
-            hash.update(&bytes);
-            Ok(format!("{:x}", hash.finalize()))
-        }
-        // The file can race away between the walk and the hash; the entry
-        // stays dirty under a distinct token.
-        Err(_) => Ok("unreadable".to_string()),
+    let Some(path) = contained_path(workdir, rela_path) else {
+        return Ok("out-of-worktree".to_string());
+    };
+    // Inspection failures use `unreadable`, distinct from content hashes.
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return Ok("unreadable".to_string());
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        let Ok(target) = std::fs::read_link(&path) else {
+            return Ok("unreadable".to_string());
+        };
+        let mut hash = Sha256::new();
+        hash.update(b"symlink\0");
+        hash.update(target.as_os_str().as_encoded_bytes());
+        return Ok(format!("symlink:{:x}", hash.finalize()));
     }
+    if !file_type.is_file() {
+        return Ok("not-a-regular-file".to_string());
+    }
+    if metadata.len() > MAX_HASHED_FILE_BYTES {
+        return Ok(format!("oversize:{}", metadata.len()));
+    }
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Ok("unreadable".to_string());
+    };
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
+    let mut hashed: u64 = 0;
+    loop {
+        budget.check()?;
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                hashed += read as u64;
+                // The file can grow past the cap mid-read.
+                if hashed > MAX_HASHED_FILE_BYTES {
+                    return Ok(format!("oversize:{hashed}"));
+                }
+                hash.update(&buffer[..read]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Ok("unreadable".to_string()),
+        }
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+/// Rejects paths that escape `workdir`. An absolute path would replace
+/// `workdir` outright, and `..` would climb out of it.
+fn contained_path(workdir: &Path, rela_path: &str) -> Option<PathBuf> {
+    if rela_path.is_empty() {
+        return None;
+    }
+    let candidate = Path::new(rela_path);
+    let escapes = candidate
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir));
+    if escapes {
+        return None;
+    }
+    Some(workdir.join(candidate))
 }
 
 fn fingerprint_entries(entries: &[DirtyEntry]) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"mc-dirty-fingerprint-v1\0");
+    hash.update(b"mc-dirty-fingerprint-v2\0");
     for entry in entries {
-        hash.update(entry.path.as_bytes());
-        hash.update(b"\0");
-        hash.update(entry.status.as_bytes());
-        hash.update(b"\0");
-        hash.update(entry.content_hash.as_bytes());
-        hash.update(b"\n");
+        // Length prefixes make adjacent fields unambiguous.
+        for field in [
+            entry.path.as_bytes(),
+            entry.status.as_bytes(),
+            entry.content_hash.as_bytes(),
+        ] {
+            hash.update((field.len() as u64).to_le_bytes());
+            hash.update(field);
+        }
     }
     format!("{:x}", hash.finalize())
 }

@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use gix::ObjectId;
 use sha2::{Digest, Sha256};
@@ -15,16 +16,12 @@ use super::checkout::{CheckoutSnapshot, EvalBudget};
 /// Version tag for this crate's patch identity. Values are internal
 /// fallback keys: whitespace-stripped per-file content hashes combined
 /// order-independently, never interchangeable with `git patch-id` output.
-pub const PATCH_ID_ALGORITHM: &str = "mc-patch-id-v1";
+pub const PATCH_ID_ALGORITHM: &str = "mc-patch-id-v2";
 
 /// Fallback candidates come from the first-parent walk from HEAD, capped, so
 /// resolution cost stays bounded on deep histories. A true match outside the
 /// window is unresolved at that rung.
 pub const CANDIDATE_WINDOW: usize = 512;
-
-/// Ancestry walks stop after this many commits even under a generous
-/// deadline, keeping a single test bounded on pathological histories.
-const ANCESTRY_WALK_CAP: usize = 1 << 20;
 
 /// Verdict for one git anchor condition against one checkout snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +54,9 @@ pub struct ResolutionLadder<'s> {
     snapshot: &'s CheckoutSnapshot,
     budget: &'s EvalBudget,
     ancestry_cache: RefCell<HashMap<(ObjectId, ObjectId), Option<bool>>>,
-    window: RefCell<Option<Vec<ObjectId>>>,
+    window: RefCell<Option<Rc<[ObjectId]>>>,
+    /// A candidate's patch identity depends only on its commit.
+    patch_id_cache: RefCell<HashMap<ObjectId, Option<String>>>,
 }
 
 impl<'s> ResolutionLadder<'s> {
@@ -67,6 +66,7 @@ impl<'s> ResolutionLadder<'s> {
             budget,
             ancestry_cache: RefCell::new(HashMap::new()),
             window: RefCell::new(None),
+            patch_id_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -131,6 +131,7 @@ impl<'s> ResolutionLadder<'s> {
             WindowMatch::Exactly => CommitResolution::Reachable,
             WindowMatch::Ambiguous => CommitResolution::Uncertain,
             WindowMatch::Budget => CommitResolution::Uncertain,
+            WindowMatch::Unreadable => CommitResolution::Uncertain,
             WindowMatch::None if anchor_present => CommitResolution::NotReachable,
             WindowMatch::None => CommitResolution::Uncertain,
         }
@@ -143,19 +144,23 @@ impl<'s> ResolutionLadder<'s> {
         let Some(capture) = capture else {
             return WindowMatch::None;
         };
-        let stored_patch_id = capture
+        // Patch IDs from a different algorithm cannot establish anchor movement.
+        if capture
             .patch_id
             .as_ref()
-            .filter(|patch| patch.algorithm == PATCH_ID_ALGORITHM);
+            .is_some_and(|patch| patch.algorithm != PATCH_ID_ALGORITHM)
+        {
+            return WindowMatch::Unreadable;
+        }
+        let stored_patch_id = capture.patch_id.as_ref();
         if let Some(stored) = stored_patch_id {
             match self.match_candidates(|candidate| {
                 if !self.commit_touches_paths(candidate, &capture.changed_paths) {
                     return Ok(false);
                 }
-                Ok(
-                    compute_patch_id(self.snapshot.repo(), candidate, self.budget)?
-                        .is_some_and(|patch_id| patch_id == stored.value),
-                )
+                Ok(self
+                    .cached_patch_id(candidate)?
+                    .is_some_and(|patch_id| patch_id == stored.value))
             }) {
                 WindowMatch::None => {}
                 decided => return decided,
@@ -185,7 +190,7 @@ impl<'s> ResolutionLadder<'s> {
             return WindowMatch::Budget;
         };
         let mut found = None;
-        for candidate in window {
+        for candidate in window.iter().copied() {
             if self.budget.is_exhausted() {
                 return WindowMatch::Budget;
             }
@@ -207,9 +212,9 @@ impl<'s> ResolutionLadder<'s> {
 
     /// First-parent commits from HEAD, capped at [`CANDIDATE_WINDOW`],
     /// computed once per request.
-    fn candidate_window(&self) -> Option<Vec<ObjectId>> {
+    fn candidate_window(&self) -> Option<Rc<[ObjectId]>> {
         if let Some(window) = self.window.borrow().as_ref() {
-            return Some(window.clone());
+            return Some(Rc::clone(window));
         }
         let repo = self.snapshot.repo();
         let head = ObjectId::from_hex(self.snapshot.head().as_bytes()).ok()?;
@@ -221,8 +226,20 @@ impl<'s> ResolutionLadder<'s> {
             }
             window.push(info.ok()?.id);
         }
-        *self.window.borrow_mut() = Some(window.clone());
+        let window: Rc<[ObjectId]> = window.into();
+        *self.window.borrow_mut() = Some(Rc::clone(&window));
         Some(window)
+    }
+
+    fn cached_patch_id(&self, candidate: ObjectId) -> Result<Option<String>, Budget> {
+        if let Some(cached) = self.patch_id_cache.borrow().get(&candidate) {
+            return Ok(cached.clone());
+        }
+        let patch_id = compute_patch_id(self.snapshot.repo(), candidate, self.budget)?;
+        self.patch_id_cache
+            .borrow_mut()
+            .insert(candidate, patch_id.clone());
+        Ok(patch_id)
     }
 
     /// Whether `commit` changes any of `paths` relative to its first
@@ -243,18 +260,19 @@ impl<'s> ResolutionLadder<'s> {
             .next()
             .and_then(|parent| repo.find_commit(parent.detach()).ok())
             .and_then(|parent| parent.tree().ok());
-        paths.iter().any(|path| {
-            let new_entry = tree
-                .lookup_entry_by_path(path.as_str())
+        // Mode is part of the comparison, since a diff reports a mode-only
+        // change while the entry ids stay equal.
+        let entry_at = |tree: &gix::Tree<'_>, path: &str| {
+            tree.lookup_entry_by_path(path)
                 .ok()
                 .flatten()
-                .map(|entry| entry.object_id());
-            let old_entry = parent_tree.as_ref().and_then(|tree| {
-                tree.lookup_entry_by_path(path.as_str())
-                    .ok()
-                    .flatten()
-                    .map(|entry| entry.object_id())
-            });
+                .map(|entry| (entry.object_id(), entry.mode().kind()))
+        };
+        paths.iter().any(|path| {
+            let new_entry = entry_at(&tree, path.as_str());
+            let old_entry = parent_tree
+                .as_ref()
+                .and_then(|tree| entry_at(tree, path.as_str()));
             new_entry != old_entry
         })
     }
@@ -266,33 +284,23 @@ impl<'s> ResolutionLadder<'s> {
         if let Some(answer) = self.ancestry_cache.borrow().get(&(ancestor, descendant)) {
             return *answer;
         }
-        let answer = self.walk_ancestry(ancestor, descendant);
+        let answer = self.test_ancestry(ancestor, descendant);
         self.ancestry_cache
             .borrow_mut()
             .insert((ancestor, descendant), answer);
         answer
     }
 
-    /// Ancestor walk from `descendant` looking for `ancestor`. gix uses the
-    /// commit-graph file when present and falls back to the object store
-    /// per commit, so a stale graph never renders a reachable commit
-    /// unreachable. Budget exhaustion or missing objects answer unknown.
-    fn walk_ancestry(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
+    /// `ancestor` is an ancestor of `descendant` exactly when it appears among
+    /// their merge bases. Disjoint histories yield no base; lookup failures
+    /// return `None`.
+    fn test_ancestry(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
         let repo = self.snapshot.repo();
         if repo.find_commit(descendant).is_err() || repo.find_commit(ancestor).is_err() {
             return None;
         }
-        let walk = repo.rev_walk([descendant]).all().ok()?;
-        for (steps, info) in walk.enumerate() {
-            if steps >= ANCESTRY_WALK_CAP || self.budget.is_exhausted() {
-                return None;
-            }
-            let info = info.ok()?;
-            if info.id == ancestor {
-                return Some(true);
-            }
-        }
-        Some(false)
+        let bases = repo.merge_bases_many(ancestor, &[descendant]).ok()?;
+        Some(bases.iter().any(|base| base.detach() == ancestor))
     }
 }
 
@@ -303,6 +311,8 @@ enum WindowMatch {
     Ambiguous,
     None,
     Budget,
+    /// Stored fallback data this build cannot interpret.
+    Unreadable,
 }
 
 struct Budget;
@@ -315,46 +325,20 @@ impl GraphOracle for ResolutionLadder<'_> {
     }
 }
 
-/// Computes this crate's version-tagged patch identity for `commit`:
-/// per-file hashes over (change kind, paths, whitespace-stripped content),
-/// XOR-combined so file order cannot perturb the identity. Merge commits
-/// have no patch identity, mirroring `git patch-id` semantics.
+/// File order does not affect the identity; merge commits have no patch
+/// identity.
 pub fn compute_patch_id(
     repo: &gix::Repository,
     commit: ObjectId,
     budget: &EvalBudget,
 ) -> Result<Option<String>, BudgetExhaustedInResolve> {
-    let commit = match repo.find_commit(commit) {
-        Ok(commit) => commit,
-        Err(_) => return Ok(None),
-    };
-    let parents: Vec<_> = commit.parent_ids().collect();
-    if parents.len() > 1 {
+    let Some(changes) = first_parent_blob_changes(repo, commit) else {
         return Ok(None);
-    }
-    let new_tree = match commit.tree() {
-        Ok(tree) => tree,
-        Err(_) => return Ok(None),
-    };
-    let old_tree = match parents.first() {
-        Some(parent) => match repo
-            .find_commit(parent.detach())
-            .ok()
-            .and_then(|parent| parent.tree().ok())
-        {
-            Some(tree) => Some(tree),
-            None => return Ok(None),
-        },
-        None => None,
-    };
-    let changes = match repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None) {
-        Ok(changes) => changes,
-        Err(_) => return Ok(None),
     };
     if changes.is_empty() {
         return Ok(None);
     }
-    let mut combined = [0u8; 32];
+    let mut file_hashes = Vec::with_capacity(changes.len());
     for change in &changes {
         if budget.is_exhausted() {
             return Err(BudgetExhaustedInResolve);
@@ -362,11 +346,49 @@ pub fn compute_patch_id(
         let Some(file_hash) = file_change_hash(repo, change) else {
             return Ok(None);
         };
-        for (byte, file_byte) in combined.iter_mut().zip(file_hash.iter()) {
-            *byte ^= file_byte;
-        }
+        file_hashes.push(file_hash);
     }
-    Ok(Some(hex(&combined)))
+    // Hashing all file hashes together prevents linear cancellation.
+    file_hashes.sort_unstable();
+    let mut combined = Sha256::new();
+    combined.update(PATCH_ID_ALGORITHM.as_bytes());
+    combined.update(b"\0");
+    combined.update((file_hashes.len() as u64).to_le_bytes());
+    for file_hash in &file_hashes {
+        combined.update(file_hash);
+    }
+    Ok(Some(format!("{:x}", combined.finalize())))
+}
+
+/// Tree changes do not identify blobs; excluding them prevents blob lookup
+/// failures.
+///
+/// Default diff options keep repository `diff.renames` out of the identity.
+fn first_parent_blob_changes(
+    repo: &gix::Repository,
+    commit: ObjectId,
+) -> Option<Vec<gix::object::tree::diff::ChangeDetached>> {
+    let commit = repo.find_commit(commit).ok()?;
+    let parents: Vec<_> = commit.parent_ids().collect();
+    if parents.len() > 1 {
+        return None;
+    }
+    let new_tree = commit.tree().ok()?;
+    let old_tree = match parents.first() {
+        Some(parent) => Some(repo.find_commit(parent.detach()).ok()?.tree().ok()?),
+        None => None,
+    };
+    let changes = repo
+        .diff_tree_to_tree(
+            old_tree.as_ref(),
+            Some(&new_tree),
+            Some(gix::diff::Options::default()),
+        )
+        .ok()?
+        .into_iter()
+        .filter(|change| !change.entry_mode().is_tree())
+        .collect();
+    Some(changes)
 }
 
 /// Typed budget signal raised from inside patch-ID computation.
@@ -402,7 +424,9 @@ fn file_change_hash(
             } => ("rewrite", location, Some(*source_id), Some(*id)),
         };
     let mut hash = Sha256::new();
-    hash.update(b"mc-patch-id-v1-file\0");
+    // Derived from the version tag, so a hash change forces a tag change.
+    hash.update(PATCH_ID_ALGORITHM.as_bytes());
+    hash.update(b"-file\0");
     hash.update(kind.as_bytes());
     hash.update(b"\0");
     hash.update(location.as_slice());
@@ -411,7 +435,7 @@ fn file_change_hash(
         match id {
             Some(id) if !id.is_null() => {
                 let blob = repo.find_blob(id).ok()?;
-                hash.update(normalized_content(&blob.data));
+                hash_normalized_content(&mut hash, &blob.data);
             }
             _ => hash.update(b"<absent>"),
         }
@@ -420,22 +444,15 @@ fn file_change_hash(
     Some(hash.finalize().into())
 }
 
-/// Strips all ASCII whitespace so formatting-only variants of the same
-/// change share a patch identity.
-fn normalized_content(bytes: &[u8]) -> Vec<u8> {
-    bytes
-        .iter()
-        .copied()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes.iter().fold(String::new(), |mut out, byte| {
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+/// Feeds `bytes` to `hash` without ASCII whitespace, so formatting-only
+/// variants of the same change share a patch identity. Runs go straight to the
+/// hasher instead of building a stripped copy.
+fn hash_normalized_content(hash: &mut Sha256, bytes: &[u8]) {
+    for run in bytes.split(|byte| byte.is_ascii_whitespace()) {
+        if !run.is_empty() {
+            hash.update(run);
+        }
+    }
 }
 
 /// Builds the capture-time representation of `commit` that anchor authoring
@@ -449,21 +466,11 @@ pub fn capture_anchor_representation(
 ) -> Option<AnchorCapture> {
     let commit = repo.find_commit(commit_oid).ok()?;
     let tree_oid = commit.tree_id().ok()?.detach();
-    let parents: Vec<_> = commit.parent_ids().collect();
-    let changed_paths = if parents.len() > 1 {
-        Vec::new()
-    } else {
-        let new_tree = commit.tree().ok()?;
-        let old_tree = match parents.first() {
-            Some(parent) => Some(repo.find_commit(parent.detach()).ok()?.tree().ok()?),
-            None => None,
-        };
-        repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)
-            .ok()?
-            .iter()
-            .map(|change| change.location().to_string())
-            .collect()
-    };
+    let changed_paths = first_parent_blob_changes(repo, commit_oid)
+        .unwrap_or_default()
+        .iter()
+        .map(|change| change.location().to_string())
+        .collect();
     let patch_id = compute_patch_id(repo, commit_oid, budget)
         .ok()?
         .map(|value| super::super::anchor::PatchIdCapture {

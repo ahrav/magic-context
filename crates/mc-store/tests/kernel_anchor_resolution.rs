@@ -6,10 +6,13 @@ mod git_fixtures;
 
 use std::collections::BTreeMap;
 
-use git_fixtures::{commit_snapshot, init_repo, materialize, set_head_detached, FixtureRepo};
+use git_fixtures::{
+    commit_snapshot, commit_snapshot_with_modes, init_repo, materialize, set_head_detached,
+    FixtureRepo,
+};
 use mc_store::kernel::applicability::{
     capture_anchor_representation, compute_patch_id, snapshot_checkout, CheckoutSnapshot,
-    EvalBudget, GitConditionOutcome, ResolutionLadder,
+    EvalBudget, GitConditionOutcome, ResolutionLadder, PATCH_ID_ALGORITHM,
 };
 use mc_store::kernel::{AnchorCapture, GitCondition};
 
@@ -400,10 +403,197 @@ fn patch_id_is_stable_across_parents_and_whitespace_and_absent_for_merges() {
 }
 
 #[test]
+fn nested_path_commits_have_a_patch_identity_and_resolve_after_rebase() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(
+        repo,
+        "main",
+        &[],
+        &[("src/lib.rs", "pub fn a() {}\n")],
+        "base",
+        1,
+    );
+    // A tree diff reports the enclosing `src` directory alongside the file.
+    let anchored = commit_snapshot(
+        repo,
+        "topic",
+        &[base],
+        &[("src/lib.rs", "pub fn a() {}\npub fn b() {}\n")],
+        "anchored",
+        2,
+    );
+    let budget = EvalBudget::unbounded();
+    assert!(
+        compute_patch_id(repo, anchored, &budget).unwrap().is_some(),
+        "a commit below the repository root has a patch identity"
+    );
+    let captures = captures_for(repo, &[anchored]);
+    assert_eq!(
+        captures[&anchored.to_string()].changed_paths,
+        vec!["src/lib.rs".to_string()],
+        "changed paths hold files, not enclosing directories"
+    );
+
+    let advanced = commit_snapshot(
+        repo,
+        "main",
+        &[base],
+        &[("src/lib.rs", "pub fn a() {}\n"), ("README.md", "readme\n")],
+        "advance",
+        3,
+    );
+    let rebased = commit_snapshot(
+        repo,
+        "main",
+        &[advanced],
+        &[
+            ("src/lib.rs", "pub fn a() {}\npub fn b() {}\n"),
+            ("README.md", "readme\n"),
+        ],
+        "anchored",
+        4,
+    );
+    let snapshot = checkout(&fixture, rebased);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    assert_eq!(
+        ladder.evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::Holds
+    );
+}
+
+#[test]
+fn mode_only_change_resolves_through_the_patch_id_rung() {
+    use gix::objs::tree::EntryKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot_with_modes(
+        repo,
+        "main",
+        &[],
+        &[("run.sh", "echo hi\n", EntryKind::Blob)],
+        "base",
+        1,
+    );
+    // Content is unchanged; only the executable bit moves.
+    let anchored = commit_snapshot_with_modes(
+        repo,
+        "topic",
+        &[base],
+        &[("run.sh", "echo hi\n", EntryKind::BlobExecutable)],
+        "chmod",
+        2,
+    );
+    let captures = captures_for(repo, &[anchored]);
+    let advanced = commit_snapshot_with_modes(
+        repo,
+        "main",
+        &[base],
+        &[
+            ("run.sh", "echo hi\n", EntryKind::Blob),
+            ("other.txt", "other\n", EntryKind::Blob),
+        ],
+        "advance",
+        3,
+    );
+    let rebased = commit_snapshot_with_modes(
+        repo,
+        "main",
+        &[advanced],
+        &[
+            ("run.sh", "echo hi\n", EntryKind::BlobExecutable),
+            ("other.txt", "other\n", EntryKind::Blob),
+        ],
+        "chmod",
+        4,
+    );
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, rebased);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    assert_eq!(
+        ladder.evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::Holds
+    );
+}
+
+#[test]
+fn capture_from_another_algorithm_version_is_uncertain() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "base", 1);
+    let anchored = commit_snapshot(
+        repo,
+        "topic",
+        &[base],
+        &[("f.txt", "one\n"), ("g.txt", "change\n")],
+        "anchored",
+        2,
+    );
+    let mut captures = captures_for(repo, &[anchored]);
+    let capture = captures.get_mut(&anchored.to_string()).unwrap();
+    let patch_id = capture.patch_id.as_mut().expect("capture has a patch id");
+    patch_id.algorithm = "mc-patch-id-v0".to_string();
+    assert_ne!(patch_id.algorithm, PATCH_ID_ALGORITHM);
+
+    let advanced = commit_snapshot(repo, "main", &[base], &[("f.txt", "two\n")], "advance", 3);
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, advanced);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    assert_eq!(
+        ladder.evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::Uncertain,
+        "an unreadable fallback is not evidence the anchor moved"
+    );
+}
+
+#[test]
+fn patch_id_ignores_repository_diff_configuration() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let base = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("a.txt", "shared content\n")],
+        "base",
+        1,
+    );
+    let renamed = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[base],
+        &[("b.txt", "shared content\n")],
+        "rename",
+        2,
+    );
+    let budget = EvalBudget::unbounded();
+    let before = compute_patch_id(&fixture.repo, renamed, &budget)
+        .unwrap()
+        .expect("rename has a patch id");
+
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.repo.git_dir().join("config"))
+        .expect("config opens");
+    writeln!(config, "[diff]\n\trenames = false").expect("config writes");
+    drop(config);
+
+    let reopened = mc_store::kernel::applicability::open_isolated(&fixture.root)
+        .expect("checkout reopens with the new config");
+    let after = compute_patch_id(&reopened, renamed, &budget)
+        .unwrap()
+        .expect("rename still has a patch id");
+    assert_eq!(before, after, "diff.renames does not shift the identity");
+}
+
+#[test]
 fn kernel_store_sources_contain_no_subprocess_usage() {
-    // KTD1 gate, first-party half: no std::process or Command anywhere in
-    // this crate's sources. The gix half is covered by the isolated open
-    // options (no credential helpers or filter drivers become reachable).
     let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut pending = vec![src_root];
     while let Some(dir) = pending.pop() {

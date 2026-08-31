@@ -117,6 +117,110 @@ fn interrupt_and_deadline_yield_typed_cancellation() {
 }
 
 #[test]
+fn untracked_directory_contents_change_the_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let budget = EvalBudget::unbounded();
+    write_worktree_file(&fixture.repo, "scratch/one.txt", "one\n");
+    let first = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert!(
+        first.dirty_paths().contains("scratch/one.txt"),
+        "{:?}",
+        first.dirty_entries()
+    );
+
+    write_worktree_file(&fixture.repo, "scratch/one.txt", "edited\n");
+    let edited = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(
+        first.dirty_fingerprint(),
+        edited.dirty_fingerprint(),
+        "editing a file inside an untracked directory changes the key"
+    );
+
+    write_worktree_file(&fixture.repo, "scratch/two.txt", "two\n");
+    let added = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(edited.dirty_fingerprint(), added.dirty_fingerprint());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_hash_their_target_without_reading_the_pointee() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    // A secret outside the worktree, of the kind a link could point at.
+    let outside = dir.path().parent().unwrap().join("outside-secret");
+    std::fs::write(&outside, "secret\n").unwrap();
+    let workdir = fixture.repo.workdir().unwrap().to_path_buf();
+    std::os::unix::fs::symlink(&outside, workdir.join("link")).unwrap();
+
+    let budget = EvalBudget::unbounded();
+    let snapshot = snapshot_checkout(dir.path(), &budget).unwrap();
+    let entry = snapshot
+        .dirty_entries()
+        .iter()
+        .find(|entry| entry.path == "link")
+        .expect("the symlink is dirty");
+    assert!(entry.content_hash.starts_with("symlink:"), "{entry:?}");
+
+    // Rewriting the pointee leaves the entry alone; the target path decides.
+    std::fs::write(&outside, "secret changed\n").unwrap();
+    let unchanged = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_eq!(
+        snapshot.dirty_fingerprint(),
+        unchanged.dirty_fingerprint(),
+        "the pointee's content is never hashed"
+    );
+}
+
+#[test]
+fn oversize_files_are_recorded_by_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let big = vec![b'x'; 33 * 1024 * 1024];
+    let workdir = fixture.repo.workdir().unwrap().to_path_buf();
+    std::fs::write(workdir.join("big.bin"), &big).unwrap();
+
+    let snapshot = snapshot_checkout(dir.path(), &EvalBudget::unbounded()).unwrap();
+    let entry = snapshot
+        .dirty_entries()
+        .iter()
+        .find(|entry| entry.path == "big.bin")
+        .expect("the large file is dirty");
+    assert_eq!(entry.content_hash, format!("oversize:{}", big.len()));
+}
+
+#[test]
+fn worktree_path_rejects_paths_outside_the_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let snapshot = snapshot_checkout(dir.path(), &EvalBudget::unbounded()).unwrap();
+    assert!(snapshot.worktree_path("a.txt").is_some());
+    assert!(snapshot.worktree_path("nested/a.txt").is_some());
+    for escaping in ["/etc/passwd", "../outside", "nested/../../outside", ""] {
+        assert!(
+            snapshot.worktree_path(escaping).is_none(),
+            "{escaping} escapes the worktree"
+        );
+    }
+}
+
+#[test]
 fn fixture_kit_builds_branched_rebase_and_cherry_pick_histories() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = init_repo(dir.path());
