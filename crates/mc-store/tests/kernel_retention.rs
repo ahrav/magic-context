@@ -787,48 +787,43 @@ fn remediation_rejects_an_unknown_object_and_a_non_domain_kind() {
 fn staging_a_candidate_cannot_revive_a_run_whose_lease_expired() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
-    store
-        .stage_candidate(candidate("run", "first", 100))
-        .unwrap();
+    // Liveness is judged against the store clock, so one run gets a lease that has already
+    // lapsed by the time it is reused and the other keeps a lease the clock cannot outrun.
+    let origin = now_ms();
+    let mut expired_run = candidate("expired", "expired-a", origin);
+    expired_run.lease_expires_at = origin + 1;
+    store.stage_candidate(expired_run).unwrap();
 
-    // The stored lease ends at 100 + HOUR_MS. A producer arriving at that instant is as
-    // stale as one calling renew_staging_run, so both paths refuse it.
+    let mut live_run = candidate("live", "live-a", origin);
+    live_run.lease_expires_at = origin + 60_000;
+    store.stage_candidate(live_run).unwrap();
+
+    // The lapsed lease belongs to the sweep now, so its producer cannot add to it.
     assert_eq!(
         store
-            .stage_candidate(candidate("run", "second", 100 + HOUR_MS))
+            .stage_candidate(candidate("expired", "expired-b", origin))
             .unwrap_err(),
         KernelError::Conflict
     );
+
+    // The live lease keeps working.
+    let mut live_second = candidate("live", "live-b", origin);
+    live_second.lease_expires_at = origin + 60_000;
+    store.stage_candidate(live_second).unwrap();
+
     let connection = inspect(directory.path());
-    assert_eq!(
+    let candidates_for = |run: &str| -> i64 {
         connection
-            .query_row("SELECT COUNT(*) FROM candidates", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        connection
-            .query_row("SELECT lease_expires_at FROM extraction_runs", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-        100 + HOUR_MS
-    );
-
-    // A producer still inside the lease keeps working.
-    store
-        .stage_candidate(candidate("run", "third", 100 + HOUR_MS - 1))
-        .unwrap();
-    assert_eq!(
-        connection
-            .query_row("SELECT COUNT(*) FROM candidates", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        2
-    );
+            .query_row(
+                "SELECT COUNT(*) FROM candidates WHERE extraction_run_id=?1",
+                [run],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(candidates_for("expired"), 1);
+    assert_eq!(candidates_for("live"), 2);
 }
-
 #[test]
 fn finishing_requires_the_lease_to_still_cover_the_terminal_instant() {
     let directory = tempfile::tempdir().unwrap();

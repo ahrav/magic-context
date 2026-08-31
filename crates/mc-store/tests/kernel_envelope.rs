@@ -957,3 +957,42 @@ fn an_empty_rebuild_still_orders_later_replacements() {
         0
     );
 }
+
+#[test]
+fn a_blank_alignment_kind_cannot_replace_a_valid_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    let spec = |kind: &str| AlignmentProjectionSpec {
+        decision_id: "decision".to_string(),
+        observation_id: "observation".to_string(),
+        alignment_kind: kind.to_string(),
+        alignment_payload: None,
+        built_through_commit_seq: 1,
+    };
+    store
+        .replace_alignment_projection(&[spec("intended")])
+        .unwrap();
+
+    for blank in ["", "   ", "\t"] {
+        assert_eq!(
+            store
+                .replace_alignment_projection(&[spec(blank)])
+                .unwrap_err(),
+            KernelError::InvalidInput,
+            "{blank:?}"
+        );
+    }
+    let surviving: String = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT alignment_kind FROM alignment_projection",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap();
+    assert_eq!(surviving, "intended", "the valid projection must survive");
+}
