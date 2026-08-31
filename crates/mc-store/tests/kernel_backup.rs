@@ -1153,3 +1153,78 @@ fn backup_reports_deadline_rather_than_blocking_on_a_held_writer() {
     );
     assert!(destination_entries(destination.path()).is_empty());
 }
+
+#[test]
+fn a_secret_row_classifies_the_backup_secret_not_merely_sensitive() {
+    let root = private_dir();
+    let destination = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Sensitive);
+    let sensitive = store.backup(request(destination.path())).unwrap();
+    assert_eq!(sensitive.max_sensitivity, Sensitivity::Sensitive);
+
+    insert_domain(&store, 2, Sensitivity::Secret);
+    let secret = store.backup(request(destination.path())).unwrap();
+    assert_eq!(
+        secret.max_sensitivity,
+        Sensitivity::Secret,
+        "a secret row must not be reported as merely sensitive"
+    );
+}
+
+#[test]
+fn an_orphaned_recovery_directory_is_reclaimed_on_the_next_open() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // A crash after the marker is removed but before cleanup leaves the prior
+    // family, which may hold sensitive rows, with nothing to reclaim it.
+    let recovery_dir = store.abandon_restore_marker_for_test().unwrap();
+    fs::write(recovery_dir.join("core.sqlite"), b"prior family bytes").unwrap();
+    fs::remove_file(root.path().join("core.sqlite.mc-restore")).unwrap();
+    drop(store);
+    assert!(recovery_dir.is_dir());
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert!(
+        !recovery_dir.exists(),
+        "recovery directory was not reclaimed"
+    );
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(insert_domain(&reopened, 2, Sensitivity::Normal), 2);
+}
+
+#[test]
+fn an_oversized_or_special_restore_marker_is_refused_before_it_is_read() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    drop(store);
+    let marker = root.path().join("core.sqlite.mc-restore");
+
+    fs::write(&marker, vec![b'{'; 64 * 1024 + 1]).unwrap();
+    assert_eq!(
+        KernelStore::open(root.path()).unwrap_err(),
+        KernelError::Inconclusive
+    );
+    fs::remove_file(&marker).unwrap();
+
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &marker,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        KernelStore::open(root.path()).unwrap_err(),
+        KernelError::Inconclusive
+    );
+    fs::remove_file(&marker).unwrap();
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 1);
+}

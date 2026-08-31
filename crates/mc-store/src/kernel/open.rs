@@ -159,6 +159,8 @@ impl KernelStore {
 
         if entry_exists(&restore_marker_path(&db_path))? {
             super::backup::resume_restore(&db_path)?;
+        } else {
+            super::backup::reap_orphan_restore_recovery(&db_path)?;
         }
 
         if entry_exists(&reset_marker_path(&db_path))? {

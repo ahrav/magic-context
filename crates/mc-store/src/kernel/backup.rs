@@ -33,6 +33,8 @@ const DEFAULT_CAPTURE_PIN_LIFETIME_MS: i64 = 24 * 60 * 60 * 1_000;
 const BACKUP_PREFIX: &str = "core-backup-";
 const RESTORE_INFIX: &str = ".mc-restore-";
 const RESTORE_MARKER_PROTOCOL: &str = "mc-kernel-restore-marker-v1";
+/// Bound the marker read so invalid content cannot control allocation size.
+const RESTORE_MARKER_MAX_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LOCAL_FILESYSTEMS: &[u64] = &[
     0x0000_ef53, // ext2, ext3, ext4
@@ -187,9 +189,7 @@ impl KernelStore {
             // SQLite uses a pathname, while cleanup uses the verified directory
             // descriptor; comparing identities rejects destination swaps.
             assert_same_file(&destination, &temp_name, &sqlite_temp_path)?;
-            File::open(&sqlite_temp_path)
-                .and_then(|file| file.sync_all())
-                .map_err(|_| KernelError::Io)?;
+            sync_child(&destination, &temp_name)?;
             if Instant::now() >= request.deadline {
                 return Err(KernelError::Deadline);
             }
@@ -343,6 +343,9 @@ impl KernelStore {
         };
         let mut source = open_private_regular_nofollow(backup_path)?;
         let source_seq = verify_database(backup_path, None, KernelError::InvalidRestore, None)?;
+        // Verification resolves a pathname while the copy reads the descriptor, so a
+        // source replaced in between would install bytes that were never verified.
+        assert_same_open_file(&source, backup_path, KernelError::InvalidRestore)?;
 
         let mut writer = self.lock_writer()?;
         let mut readers = self
@@ -562,6 +565,32 @@ fn create_private_file_at(directory: &File, name: &str) -> Result<(), KernelErro
     Ok(())
 }
 
+// Reaching the file through the verified directory descriptor means a destination
+// swapped after `assert_same_file` cannot redirect this fsync.
+fn sync_child(directory: &File, name: &str) -> Result<(), KernelError> {
+    let file = rfs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| KernelError::Io)?;
+    File::from(file).sync_all().map_err(|_| KernelError::Io)
+}
+
+fn assert_same_open_file(
+    file: &File,
+    pathname: &Path,
+    error: KernelError,
+) -> Result<(), KernelError> {
+    let opened = file.metadata().map_err(|_| error)?;
+    let resolved = fs::symlink_metadata(pathname).map_err(|_| error)?;
+    if opened.dev() != resolved.dev() || opened.ino() != resolved.ino() {
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn assert_same_file(directory: &File, name: &str, pathname: &Path) -> Result<(), KernelError> {
     let anchored = rfs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| KernelError::InvalidBackup)?;
@@ -626,7 +655,7 @@ fn capture_state(
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(|_| KernelError::Io)?;
-    let sensitive = any_sensitive_row(&tx)?;
+    let max_sensitivity = max_stored_sensitivity(&tx)?;
     let created_at = current_time_ms();
     let expires_at =
         expires_at.unwrap_or_else(|| created_at.saturating_add(DEFAULT_CAPTURE_PIN_LIFETIME_MS));
@@ -669,11 +698,7 @@ fn capture_state(
     Ok(CaptureState {
         commit_seq,
         evidence_refs,
-        max_sensitivity: if sensitive {
-            Sensitivity::Sensitive
-        } else {
-            Sensitivity::Normal
-        },
+        max_sensitivity,
         pin_id,
     })
 }
@@ -743,20 +768,35 @@ fn sensitivity_bearing_tables(tx: &rusqlite::Transaction<'_>) -> Result<Vec<Stri
     Ok(names)
 }
 
-fn any_sensitive_row(tx: &rusqlite::Transaction<'_>) -> Result<bool, KernelError> {
+fn max_stored_sensitivity(tx: &rusqlite::Transaction<'_>) -> Result<Sensitivity, KernelError> {
     let names = sensitivity_bearing_tables(tx)?;
     if names.is_empty() {
-        return Ok(false);
+        return Ok(Sensitivity::Normal);
     }
-    let clauses = names
+    let selects = names
         .iter()
-        .map(|name| format!("EXISTS(SELECT 1 FROM {name} WHERE sensitivity_class<>'normal')"))
+        .map(|name| format!("SELECT 1 FROM {name} WHERE sensitivity_class='secret'"))
         .collect::<Vec<_>>()
-        .join(" OR ");
-    tx.query_row(&format!("SELECT {clauses}"), [], |row| {
-        row.get::<_, bool>(0)
+        .join(" UNION ALL ");
+    let has_secret: bool = tx
+        .query_row(&format!("SELECT EXISTS({selects})"), [], |row| row.get(0))
+        .map_err(|_| KernelError::Io)?;
+    if has_secret {
+        return Ok(Sensitivity::Secret);
+    }
+    let selects = names
+        .iter()
+        .map(|name| format!("SELECT 1 FROM {name} WHERE sensitivity_class<>'normal'"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let has_sensitive: bool = tx
+        .query_row(&format!("SELECT EXISTS({selects})"), [], |row| row.get(0))
+        .map_err(|_| KernelError::Io)?;
+    Ok(if has_sensitive {
+        Sensitivity::Sensitive
+    } else {
+        Sensitivity::Normal
     })
-    .map_err(|_| KernelError::Io)
 }
 
 #[cfg(feature = "test-support")]
@@ -898,7 +938,12 @@ fn valid_recovery_path(path: &Path, recovery_dir: &Path) -> bool {
 // `restore` that never returned to its caller, so the displaced family is the
 // authoritative copy and a half-installed replacement is discarded.
 pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
-    let bytes = fs::read(restore_marker_path(path)).map_err(|_| KernelError::Inconclusive)?;
+    let marker_path = restore_marker_path(path);
+    let metadata = fs::symlink_metadata(&marker_path).map_err(|_| KernelError::Inconclusive)?;
+    if !metadata.is_file() || metadata.len() > RESTORE_MARKER_MAX_BYTES {
+        return Err(KernelError::Inconclusive);
+    }
+    let bytes = fs::read(&marker_path).map_err(|_| KernelError::Inconclusive)?;
     let marker: RestoreMarker =
         serde_json::from_slice(&bytes).map_err(|_| KernelError::Inconclusive)?;
     let recovery_directory = path_from_bytes(&marker.recovery_directory);
@@ -922,6 +967,36 @@ pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
     remove_restore_marker(path)?;
     cleanup_recovery_dir(path, &recovery_directory);
     Ok(())
+}
+
+// A crash between removing the marker and cleaning up leaves the prior family,
+// which may hold sensitive rows, under `.mc-restore-*` with nothing to reclaim it.
+pub(super) fn reap_orphan_restore_recovery(path: &Path) -> Result<(), KernelError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let Some(stem) = path.file_name() else {
+        return Ok(());
+    };
+    let prefix = format!("{}{RESTORE_INFIX}", stem.to_string_lossy());
+    let entries = fs::read_dir(parent).map_err(|_| KernelError::Inconclusive)?;
+    let mut reaped = false;
+    for entry in entries {
+        let entry = entry.map_err(|_| KernelError::Inconclusive)?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let candidate = entry.path();
+        if !candidate.is_dir() {
+            continue;
+        }
+        fs::remove_dir_all(&candidate).map_err(|_| KernelError::Inconclusive)?;
+        reaped = true;
+    }
+    if reaped {
+        sync_parent(path)?;
+    }
+    remove_restore_scratch(path)
 }
 
 fn remove_restore_scratch(path: &Path) -> Result<(), KernelError> {
@@ -1025,6 +1100,7 @@ fn open_live_family(
     }
     activate_wal(&writer)?;
     stamp_writer_fence(&mut writer, lease_epoch)?;
+    super::envelope::strip_legacy_candidate_verifiers(&mut writer)?;
     harden_family(path)?;
     let readers = (0..reader_count)
         .map(|_| open_reader(path))
