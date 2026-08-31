@@ -48,6 +48,14 @@ const PAYLOAD_PACKAGES = [
     "@cortexkit/mc-host-linux-x64-gnu",
 ] as const;
 
+/**
+ * The shared-memory addon is a non-optional dependency of every parent, so an
+ * unpublished or unowned name breaks `npm install` outright rather than
+ * degrading one capability. It is not a payload: it carries the loader, not a
+ * daemon binary.
+ */
+const ADDON_PACKAGES = ["@cortexkit/mc-shm-native"] as const;
+
 const CONTRACT = {
     schema: "magic-context.mc-host-release/v1",
     release: {
@@ -57,6 +65,7 @@ const CONTRACT = {
     packages: {
         parents: [...PARENT_PACKAGES],
         payloads: [...PAYLOAD_PACKAGES],
+        addons: [...ADDON_PACKAGES],
         version: RELEASE_VERSION,
     },
     versions: {
@@ -242,7 +251,7 @@ const CONTRACT = {
         ],
         check_statuses: ["pass", "fail", "warn", "skip"],
         readiness_states: {
-            transport: ["ready", "starting", "unavailable"],
+            shared_memory: ["ready", "starting", "unavailable"],
             storage: ["ready", "starting", "unavailable"],
             synapse: ["ready", "starting", "degraded", "unsupported"],
         },
@@ -272,9 +281,9 @@ const CONTRACT = {
             "lifecycle.fences",
             "lifecycle.publication",
             "platform.support",
+            "readiness.shared_memory",
             "readiness.storage",
             "readiness.synapse",
-            "readiness.transport",
         ],
         // Closed remediation union.
         remediations: [
@@ -663,7 +672,7 @@ export function validateContractSchema(contract: any): void {
     // Packages: three parents, three payloads, one synchronized version.
     assertExactKeys(
         contract.packages,
-        ["parents", "payloads", "version"],
+        ["addons", "parents", "payloads", "version"],
         "packages",
     );
     if (contract.packages.version !== contract.release.version) {
@@ -671,12 +680,19 @@ export function validateContractSchema(contract: any): void {
     }
     if (
         contract.packages.parents.length !== 3 ||
-        contract.packages.payloads.length !== 3
+        contract.packages.payloads.length !== 3 ||
+        contract.packages.addons.length !== 1
     ) {
-        fail("exactly three parent and three payload packages are required");
+        fail(
+            "exactly three parent, three payload, and one addon package are required",
+        );
     }
     assertUnique(
-        [...contract.packages.parents, ...contract.packages.payloads],
+        [
+            ...contract.packages.parents,
+            ...contract.packages.payloads,
+            ...contract.packages.addons,
+        ],
         "package names",
     );
 
@@ -1048,10 +1064,10 @@ export function validateContractSchema(contract: any): void {
         fail("synapse_unsupported is a non-failing component reason");
     }
     if (
-        JSON.stringify(cli.readiness_states.transport) !==
+        JSON.stringify(cli.readiness_states.shared_memory) !==
         JSON.stringify(["ready", "starting", "unavailable"])
     ) {
-        fail("transport readiness states are fixed");
+        fail("shared-memory readiness states are fixed");
     }
     if (
         JSON.stringify(cli.readiness_states.storage) !==
@@ -1210,10 +1226,11 @@ export function validateRegistryGateShape(
         );
     }
     if (!Array.isArray(g.packages)) gateFail("gate packages must be an array");
-    const expected = new Map<string, "parent" | "payload">();
+    const expected = new Map<string, "parent" | "payload" | "addon">();
     for (const name of contract.packages.parents) expected.set(name, "parent");
     for (const name of contract.packages.payloads)
         expected.set(name, "payload");
+    for (const name of contract.packages.addons) expected.set(name, "addon");
     const seen = new Set<string>();
     for (const pkg of g.packages) {
         const kind = expected.get(pkg.name);

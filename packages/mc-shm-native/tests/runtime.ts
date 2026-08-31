@@ -13,6 +13,14 @@ import {
 
 const result = probeCapabilities();
 assert.ok(result.napiVersion === null || result.napiVersion >= 1);
+// A claimed source-build target must load its addon. Node can load the addon and report `detachment_unavailable`, so this assertion cannot require `available`; `addon_unavailable` is the only reason returned before the addon loads. commentlint: allow(JUDGE)
+if (process.env.MC_SHM_NATIVE_CLAIMED_TARGET === "1" && !result.available) {
+    assert.notEqual(
+        result.reason,
+        "addon_unavailable",
+        `claimed native target failed to load its addon: ${result.reason}`,
+    );
+}
 if (result.available) {
     assert.ok((result.napiVersion ?? 0) >= 8);
     assert.equal(result.externalArrayBuffer, true);
@@ -30,8 +38,8 @@ console.log(JSON.stringify({ runtime: process.release.name, ...result }));
 function runAttachBoundary(): void {
     // Invalid descriptors create no native channels or external views.
     const hostile: unknown[] = [
-        { profile: "mc-host-test-ring-v1", pid: Number.NaN },
-        { profile: "mc-host-test-ring-v1", pid: 2.5 },
+        { profile: "mc-host-test-ring-v1", hostToPeerFd: Number.NaN },
+        { profile: "mc-host-test-ring-v1", hostToPeerFd: 2.5 },
     ];
     for (const descriptor of hostile) {
         const refs = activeExternalRefs();

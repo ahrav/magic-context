@@ -4,8 +4,7 @@ use std::cell::Cell;
 
 use mc_store::kernel::schema::{apply_kernel_connection_profile, apply_kernel_schema};
 use mc_store::kernel::{
-    AlignmentProjectionSpec, CommitFault, CommitIntent, DomainSpec, KernelError, KernelErrorKind,
-    KernelStore, Sensitivity,
+    AlignmentProjectionSpec, CommitIntent, DomainSpec, KernelError, KernelStore, Sensitivity,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -45,9 +44,11 @@ fn seed_projection_inputs(root: &std::path::Path) {
     let transaction = connection.transaction().unwrap();
     transaction
         .execute(
-            "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
-             VALUES ('seed',1,1,'test','projection fixture')",
-            [],
+            "INSERT INTO commit_log(
+                 transaction_id,writer_epoch,producer,operation_key,request_digest,
+                 recorded_at,actor,cause
+             ) VALUES ('seed',1,'fixture','seed',?1,1,'test','projection fixture')",
+            ["0".repeat(64)],
         )
         .unwrap();
     let commit_seq = transaction.last_insert_rowid();
@@ -132,7 +133,7 @@ fn fault_after_events_rolls_back_canonical_rows_events_outbox_and_receipt() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
     let error = store
-        .commit_with_fault_for_test(intent("fault", 'b'), CommitFault::AfterEvents, |envelope| {
+        .commit_with_fault_after_events_for_test(intent("fault", 'b'), |envelope| {
             envelope.insert_domain(domain(1))?;
             Ok("must-not-persist".to_string())
         })
@@ -185,7 +186,7 @@ fn receipt_replay_is_effect_free_and_digest_conflict_is_typed() {
     let conflict = store
         .commit(intent("replay", 'd'), |_| Ok(String::new()))
         .unwrap_err();
-    assert_eq!(conflict.kind(), KernelErrorKind::Conflict);
+    assert_eq!(conflict, KernelError::Conflict);
 }
 
 #[test]
@@ -236,8 +237,8 @@ fn known_as_of_matches_reference_history_and_masks_future_metadata() {
     }
     assert!(store.known_as_of(25).unwrap().objects.is_empty());
     assert_eq!(
-        store.known_as_of(26).unwrap_err().kind(),
-        KernelErrorKind::FutureSnapshot
+        store.known_as_of(26).unwrap_err(),
+        KernelError::FutureSnapshot
     );
 }
 
@@ -403,21 +404,597 @@ fn randomized_history_matches_reference_model() {
 
 #[test]
 fn stale_writer_is_rejected_before_user_operation() {
-    for delta in [-1_i64, 1] {
-        let directory = tempfile::tempdir().unwrap();
-        let store = KernelStore::open(directory.path()).unwrap();
-        let expected = i64::try_from(store.lease_epoch()).unwrap();
-        store.set_writer_fence_for_test(expected + delta).unwrap();
-        let called = Cell::new(false);
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store.invalidate_writer_fence_for_test().unwrap();
+    let called = Cell::new(false);
+    let error = store
+        .commit(intent("stale", 'f'), |_| {
+            called.set(true);
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(error, KernelError::FenceLost);
+    assert!(!called.get());
+}
+
+#[test]
+fn projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    let baseline_commits = inspect(directory.path(), "SELECT COUNT(*) FROM commit_log");
+
+    let first = AlignmentProjectionSpec {
+        decision_id: "decision".to_string(),
+        observation_id: "observation".to_string(),
+        alignment_kind: "intended".to_string(),
+        alignment_payload: Some("first".to_string()),
+        built_through_commit_seq: 1,
+    };
+    assert_eq!(store.replace_alignment_projection(&[first]).unwrap(), 1);
+    let second = AlignmentProjectionSpec {
+        decision_id: "decision".to_string(),
+        observation_id: "observation".to_string(),
+        alignment_kind: "implemented".to_string(),
+        alignment_payload: Some("second".to_string()),
+        built_through_commit_seq: 1,
+    };
+    assert_eq!(store.replace_alignment_projection(&[second]).unwrap(), 1);
+
+    assert_eq!(
+        inspect(directory.path(), "SELECT COUNT(*) FROM commit_log"),
+        baseline_commits
+    );
+    assert_eq!(
+        inspect(directory.path(), "SELECT COUNT(*) FROM change_event"),
+        0
+    );
+    assert_eq!(inspect(directory.path(), "SELECT COUNT(*) FROM outbox"), 0);
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let row: (String, Vec<u8>) = connection
+        .query_row(
+            "SELECT alignment_kind,alignment_payload FROM alignment_projection",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (row.0, String::from_utf8(row.1).unwrap()),
+        ("implemented".to_string(), "second".to_string())
+    );
+}
+
+const SECRET: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
+
+#[test]
+fn projection_replace_repeats_when_a_field_carries_a_detected_secret() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    let spec = |payload: &str| AlignmentProjectionSpec {
+        decision_id: "decision".to_string(),
+        observation_id: "observation".to_string(),
+        alignment_kind: "intended".to_string(),
+        alignment_payload: Some(payload.to_string()),
+        built_through_commit_seq: 1,
+    };
+
+    assert_eq!(
+        store
+            .replace_alignment_projection(&[spec(&format!("first {SECRET}"))])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .replace_alignment_projection(&[spec(&format!("second {SECRET}"))])
+            .unwrap(),
+        1
+    );
+
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM durable_text_redactions
+             WHERE owner_kind='alignment_projection'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn projection_replace_rejects_an_empty_batch_instead_of_truncating() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .replace_alignment_projection(&[AlignmentProjectionSpec {
+            decision_id: "decision".to_string(),
+            observation_id: "observation".to_string(),
+            alignment_kind: "intended".to_string(),
+            alignment_payload: None,
+            built_through_commit_seq: 1,
+        }])
+        .unwrap();
+
+    assert_eq!(
+        store.replace_alignment_projection(&[]).unwrap_err(),
+        KernelError::InvalidInput
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM alignment_projection"
+        ),
+        1
+    );
+}
+
+#[test]
+fn retire_and_correct_refuse_a_non_domain_object() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    for (key, digest) in [("retire-foreign", 'a'), ("correct-foreign", 'b')] {
         let error = store
-            .commit(intent(&format!("stale-{delta}"), 'f'), |_| {
-                called.set(true);
+            .commit(intent(key, digest), |envelope| {
+                if key == "retire-foreign" {
+                    envelope.retire_domain("decision-object")?;
+                } else {
+                    envelope.correct_domain("observation-object", domain(9))?;
+                }
                 Ok(String::new())
             })
             .unwrap_err();
-        assert_eq!(error, KernelError::FenceLost);
-        assert!(!called.get());
+        assert_eq!(error, KernelError::InvalidInput, "{key}");
     }
+
+    for object_id in ["decision-object", "observation-object"] {
+        assert_eq!(
+            inspect(
+                directory.path(),
+                &format!(
+                    "SELECT COUNT(*) FROM object_registry
+                     WHERE object_id='{object_id}' AND invalidated_commit_seq IS NULL
+                       AND superseded_by IS NULL"
+                )
+            ),
+            1,
+            "{object_id}"
+        );
+    }
+    assert_eq!(
+        inspect(directory.path(), "SELECT COUNT(*) FROM change_event"),
+        0
+    );
+}
+
+#[test]
+fn a_lookup_key_carrying_a_detected_secret_is_rejected_not_redacted() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut planted = domain(1);
+    planted.object_id = format!("object-{}", "a".repeat(40));
+    let planted_id = planted.object_id.clone();
+    store
+        .commit(intent("plant", 'a'), |envelope| {
+            envelope.insert_domain(planted)?;
+            Ok("planted".to_string())
+        })
+        .unwrap();
+
+    // Two distinct secrets redact to one constant, so a redacted key would alias.
+    let error = store
+        .commit(intent("alias", 'b'), |envelope| {
+            envelope.retire_domain(SECRET)?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(error, KernelError::InvalidInput);
+
+    let mut secret_spec = domain(2);
+    secret_spec.object_id = SECRET.to_string();
+    assert_eq!(
+        store
+            .commit(intent("secret-id", 'c'), |envelope| {
+                envelope.insert_domain(secret_spec)?;
+                Ok(String::new())
+            })
+            .unwrap_err(),
+        KernelError::InvalidInput
+    );
+
+    let live = store.known_as_of(1).unwrap();
+    assert_eq!(live.objects.len(), 1);
+    assert_eq!(live.objects[0].object_id, planted_id);
+    assert_eq!(live.objects[0].invalidated_commit_seq, None);
+}
+
+#[test]
+fn two_live_domains_cannot_share_a_name_and_a_retired_name_is_reusable() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let named = |index: usize| {
+        let mut spec = domain(index);
+        spec.name = "shared-name".to_string();
+        spec
+    };
+
+    store
+        .commit(intent("first-name", 'a'), |envelope| {
+            envelope.insert_domain(named(1))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        store
+            .commit(intent("second-name", 'b'), |envelope| {
+                envelope.insert_domain(named(2))?;
+                Ok(String::new())
+            })
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+
+    store
+        .commit(intent("retire-name", 'c'), |envelope| {
+            envelope.retire_domain("object-1")?;
+            Ok(String::new())
+        })
+        .unwrap();
+    store
+        .commit(intent("reuse-name", 'd'), |envelope| {
+            envelope.insert_domain(named(3))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM domains WHERE name='shared-name'"
+        ),
+        2
+    );
+}
+
+#[test]
+fn a_constraint_violation_is_a_conflict_rather_than_an_io_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("initial", 'a'), |envelope| {
+            envelope.insert_domain(domain(1))?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let error = store
+        .commit(intent("duplicate", 'b'), |envelope| {
+            envelope.insert_domain(domain(1))?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(error, KernelError::Conflict);
+    assert!(!error.is_retryable());
+    assert!(KernelError::Busy.is_retryable());
+}
+
+#[test]
+fn a_swallowed_mutation_error_cannot_commit_a_partial_correction() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("seed-a", 'a'), |envelope| {
+            envelope.insert_domain(domain(1))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let mut taken = domain(2);
+    taken.name = "occupied".to_string();
+    store
+        .commit(intent("seed-b", 'b'), |envelope| {
+            envelope.insert_domain(taken)?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // The replacement collides with the live name held by object-2, so
+    // correct_domain fails after it has already invalidated object-1.
+    let mut colliding = domain(3);
+    colliding.name = "occupied".to_string();
+    let error = store
+        .commit(intent("swallow", 'c'), |envelope| {
+            let _ = envelope.correct_domain("object-1", colliding);
+            Ok("swallowed".to_string())
+        })
+        .unwrap_err();
+    assert_eq!(error, KernelError::Conflict);
+
+    let live = store
+        .known_as_of(store.known_as_of(0).unwrap().tip)
+        .unwrap();
+    let mut ids = live
+        .objects
+        .iter()
+        .map(|row| row.object_id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["object-1", "object-2"],
+        "invalidation must not survive"
+    );
+    assert_eq!(
+        inspect(directory.path(), "SELECT COUNT(*) FROM commit_log"),
+        2
+    );
+}
+
+#[test]
+fn two_distinct_secret_bearing_names_are_rejected_not_collapsed() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for (index, key, digest) in [(1_usize, "n1", 'a'), (2, "n2", 'b')] {
+        let mut spec = domain(index);
+        spec.name = format!("name {SECRET}");
+        assert_eq!(
+            store
+                .commit(intent(key, digest), |envelope| {
+                    envelope.insert_domain(spec)?;
+                    Ok(String::new())
+                })
+                .unwrap_err(),
+            KernelError::InvalidInput,
+            "name {index}"
+        );
+    }
+    // A rejected name must not consume the live-name index either.
+    let mut clean = domain(3);
+    clean.name = "plain".to_string();
+    store
+        .commit(intent("n3", 'c'), |envelope| {
+            envelope.insert_domain(clean)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(inspect(directory.path(), "SELECT COUNT(*) FROM domains"), 1);
+}
+
+#[test]
+fn a_caught_callback_panic_leaves_the_store_usable() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.commit(intent("panic", 'a'), |_| {
+            panic!("callback panics while holding the writer");
+        });
+    }));
+    assert!(panicked.is_err(), "the panic must reach this caller");
+
+    // A poisoned writer mutex would make every later write fail with Io.
+    store
+        .commit(intent("after-panic", 'b'), |envelope| {
+            envelope.insert_domain(domain(1))?;
+            Ok("recovered".to_string())
+        })
+        .unwrap();
+    assert_eq!(store.known_as_of(1).unwrap().objects.len(), 1);
+}
+
+#[test]
+fn an_empty_rebuild_is_publishable_through_the_clear_path() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .replace_alignment_projection(&[AlignmentProjectionSpec {
+            decision_id: "decision".to_string(),
+            observation_id: "observation".to_string(),
+            alignment_kind: "intended".to_string(),
+            alignment_payload: Some(format!("payload {SECRET}")),
+            built_through_commit_seq: 1,
+        }])
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM alignment_projection"
+        ),
+        1
+    );
+
+    // An accidental empty vector is still refused.
+    assert_eq!(
+        store.replace_alignment_projection(&[]).unwrap_err(),
+        KernelError::InvalidInput
+    );
+
+    assert_eq!(store.clear_alignment_projection(1).unwrap(), 1);
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM alignment_projection"
+        ),
+        0
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM durable_text_redactions
+             WHERE owner_kind='alignment_projection'"
+        ),
+        0,
+        "clearing must retire the projection's redaction rows too"
+    );
+    assert_eq!(store.clear_alignment_projection(1).unwrap(), 0);
+}
+
+#[test]
+fn a_stale_projection_rebuild_cannot_regress_a_newer_one() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    // built_through_commit_seq references commit_log, so generations 2 and 3
+    // must exist before a rebuild can name them.
+    let seeder = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    for transaction_id in ["gen-2", "gen-3"] {
+        seeder
+            .execute(
+                "INSERT INTO commit_log(
+                     transaction_id,writer_epoch,producer,operation_key,request_digest,
+                     recorded_at,actor,cause
+                 ) VALUES (?1,1,'fixture',?1,'',1,'test','generation')",
+                [transaction_id],
+            )
+            .unwrap();
+    }
+    drop(seeder);
+    let store = KernelStore::open(directory.path()).unwrap();
+    let at = |generation: i64, kind: &str| AlignmentProjectionSpec {
+        decision_id: "decision".to_string(),
+        observation_id: "observation".to_string(),
+        alignment_kind: kind.to_string(),
+        alignment_payload: None,
+        built_through_commit_seq: generation,
+    };
+
+    store
+        .replace_alignment_projection(&[at(2, "newer")])
+        .unwrap();
+    assert_eq!(
+        store
+            .replace_alignment_projection(&[at(1, "older")])
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT built_through_commit_seq FROM alignment_projection"
+        ),
+        2,
+        "the newer rows must survive a stale rebuild"
+    );
+    // Re-publishing the same generation stays allowed.
+    store
+        .replace_alignment_projection(&[at(2, "same")])
+        .unwrap();
+
+    let mixed = [at(2, "a"), at(3, "b")];
+    assert_eq!(
+        store.replace_alignment_projection(&mixed).unwrap_err(),
+        KernelError::InvalidInput,
+        "one batch must carry one generation"
+    );
+}
+
+#[test]
+fn change_event_identity_distinguishes_two_producers_sharing_an_operation_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for (index, producer) in [(1_usize, "producer-a"), (2, "producer-b")] {
+        let mut spec = intent("shared-key", 'a');
+        spec.producer = producer.to_string();
+        store
+            .commit(spec, |envelope| {
+                envelope.insert_domain(domain(index))?;
+                Ok(String::new())
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(DISTINCT idempotency_key) FROM change_event"
+        ),
+        2,
+        "two producers sharing an operation key must not share a change-event identity"
+    );
+}
+
+#[test]
+fn an_empty_rebuild_still_orders_later_replacements() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    let seeder = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    seeder
+        .execute(
+            "INSERT INTO commit_log(
+                 transaction_id,writer_epoch,producer,operation_key,request_digest,
+                 recorded_at,actor,cause
+             ) VALUES ('gen-2',1,'fixture','gen-2','',1,'test','generation')",
+            [],
+        )
+        .unwrap();
+    drop(seeder);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    // A newer rebuild legitimately produces nothing.
+    store.clear_alignment_projection(2).unwrap();
+    // A slower rebuild from an older snapshot must not repopulate stale rows.
+    assert_eq!(
+        store
+            .replace_alignment_projection(&[AlignmentProjectionSpec {
+                decision_id: "decision".to_string(),
+                observation_id: "observation".to_string(),
+                alignment_kind: "stale".to_string(),
+                alignment_payload: None,
+                built_through_commit_seq: 1,
+            }])
+            .unwrap_err(),
+        KernelError::Conflict
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM alignment_projection"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_blank_alignment_kind_cannot_replace_a_valid_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_projection_inputs(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    let spec = |kind: &str| AlignmentProjectionSpec {
+        decision_id: "decision".to_string(),
+        observation_id: "observation".to_string(),
+        alignment_kind: kind.to_string(),
+        alignment_payload: None,
+        built_through_commit_seq: 1,
+    };
+    store
+        .replace_alignment_projection(&[spec("intended")])
+        .unwrap();
+
+    for blank in ["", "   ", "\t"] {
+        assert_eq!(
+            store
+                .replace_alignment_projection(&[spec(blank)])
+                .unwrap_err(),
+            KernelError::InvalidInput,
+            "{blank:?}"
+        );
+    }
+    let surviving: String = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT alignment_kind FROM alignment_projection",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap();
+    assert_eq!(surviving, "intended", "the valid projection must survive");
 }
 
 #[test]
@@ -461,95 +1038,4 @@ fn envelope_persists_declared_sensitivity_across_canonical_and_outbox_rows() {
             "{table}"
         );
     }
-}
-
-#[test]
-fn projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events() {
-    let directory = tempfile::tempdir().unwrap();
-    seed_projection_inputs(directory.path());
-    let store = KernelStore::open(directory.path()).unwrap();
-    let baseline_commits = inspect(directory.path(), "SELECT COUNT(*) FROM commit_log");
-
-    let first = AlignmentProjectionSpec {
-        decision_id: "decision".to_string(),
-        observation_id: "observation".to_string(),
-        alignment_kind: "intended".to_string(),
-        alignment_payload: Some("api_key=first-private-value".to_string()),
-        built_through_commit_seq: 1,
-    };
-    assert_eq!(
-        store.replace_alignment_projection(&[first]).unwrap().rows,
-        1
-    );
-    assert_eq!(
-        inspect(
-            directory.path(),
-            "SELECT COUNT(*) FROM durable_text_redactions WHERE owner_kind='alignment_projection'"
-        ),
-        1
-    );
-    let second = AlignmentProjectionSpec {
-        decision_id: "decision".to_string(),
-        observation_id: "observation".to_string(),
-        alignment_kind: "implemented".to_string(),
-        alignment_payload: Some("password=second-private-value".to_string()),
-        built_through_commit_seq: 1,
-    };
-    assert_eq!(
-        store.replace_alignment_projection(&[second]).unwrap().rows,
-        1
-    );
-
-    assert_eq!(
-        inspect(directory.path(), "SELECT COUNT(*) FROM commit_log"),
-        baseline_commits
-    );
-    assert_eq!(
-        inspect(directory.path(), "SELECT COUNT(*) FROM change_event"),
-        0
-    );
-    assert_eq!(inspect(directory.path(), "SELECT COUNT(*) FROM outbox"), 0);
-    let connection = Connection::open_with_flags(
-        directory.path().join("core.sqlite"),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    let row: (String, String) = connection
-        .query_row(
-            "SELECT alignment_kind,alignment_payload FROM alignment_projection",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        row,
-        (
-            "implemented".to_string(),
-            "password=<REDACTED:password>".to_string()
-        )
-    );
-    let redactions = connection
-        .prepare(
-            "SELECT owner_id,field_name,secret_type FROM durable_text_redactions
-             WHERE owner_kind='alignment_projection' ORDER BY detection_ordinal",
-        )
-        .unwrap()
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-    assert_eq!(
-        redactions,
-        [(
-            "decision:observation".to_string(),
-            "alignment_payload".to_string(),
-            "password".to_string()
-        )]
-    );
 }

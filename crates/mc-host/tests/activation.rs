@@ -226,6 +226,7 @@ async fn transport_publishes_before_blocked_activation_settles() {
     assert!(!broca_like.activated.load(Ordering::SeqCst));
 
     broca_like.release.add_permits(1);
+    drop(client);
     shutdown.cancel();
     let result = host.await.expect("run task joins");
     assert!(result.is_ok(), "graceful shutdown, got {result:?}");
@@ -304,6 +305,7 @@ async fn expected_artifact_faults_degrade_only_their_lane() {
         .await
         .expect("primary still binds");
 
+    drop(client);
     shutdown.cancel();
     let result = host.await.expect("run task joins");
     assert!(result.is_ok(), "graceful shutdown, got {result:?}");

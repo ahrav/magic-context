@@ -1,7 +1,7 @@
 //! Cross-platform test-only process resource observer (plan U5, KTD9,
 //! R13).
 //!
-//! Counts open file descriptors, mapped memory regions, and threads for
+//! Counts open file descriptors, mapped memory regions, threads, and RSS for
 //! one pid through one interface. Linux reads `/proc/<pid>/fd`,
 //! `/proc/<pid>/maps`, and `/proc/<pid>/task`; macOS uses the public
 //! `libproc` selectors `PROC_PIDLISTFDS`, `PROC_PIDREGIONINFO`, and
@@ -23,15 +23,17 @@ pub struct ResourceCounts {
     pub fds: u64,
     pub mapped_regions: u64,
     pub threads: u64,
+    pub rss_bytes: u64,
 }
 
 impl ResourceCounts {
     /// Counter kind/value pairs for uniform envelope comparisons.
-    pub fn counters(&self) -> [(&'static str, u64); 3] {
+    pub fn counters(&self) -> [(&'static str, u64); 4] {
         [
             ("fds", self.fds),
             ("mapped_regions", self.mapped_regions),
             ("threads", self.threads),
+            ("rss_bytes", self.rss_bytes),
         ]
     }
 }
@@ -64,14 +66,79 @@ fn fail(counter: &'static str) -> ObserveError {
     ObserveError { counter }
 }
 
-/// Observes all three counters for `pid`, failing the whole observation if
+/// Observes all counters for `pid`, failing the whole observation if
 /// any single counter cannot be read exactly.
 pub fn observe(pid: u32) -> Result<ResourceCounts, ObserveError> {
     Ok(ResourceCounts {
         fds: count_fds(pid)?,
         mapped_regions: count_mapped_regions(pid)?,
         threads: count_threads(pid)?,
+        rss_bytes: resident_bytes(pid)?,
     })
+}
+
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Returns a baseline for `pid` once three consecutive samples are identical.
+/// Requiring three matching samples rejects counters still changing between
+/// polls.
+///
+/// Uses Tokio sleep to avoid blocking a runtime worker thread while polling.
+pub async fn stabilize(pid: u32, within: std::time::Duration) -> ResourceCounts {
+    let deadline = std::time::Instant::now() + within;
+    let mut previous = None;
+    let mut repeats = 0;
+    loop {
+        let counts = observe(pid).expect("observe process resources");
+        if previous == Some(counts) {
+            repeats += 1;
+            if repeats == 2 {
+                return counts;
+            }
+        } else {
+            previous = Some(counts);
+            repeats = 0;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resource counters did not stabilize"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Descriptors, regions, and threads must equal `baseline`; RSS may exceed
+/// `baseline.rss_bytes` by at most `rss_tolerance` bytes.
+/// commentlint: allow(JUDGE)
+///
+/// `context` names the caller's iteration so a ratcheting leak reports which
+/// cycle exceeded the envelope rather than only that one did.
+///
+/// Uses Tokio sleep to avoid blocking a runtime worker thread while polling.
+pub async fn await_envelope(
+    pid: u32,
+    baseline: ResourceCounts,
+    rss_tolerance: u64,
+    within: std::time::Duration,
+    context: &str,
+) {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let counts = observe(pid).expect("observe process resources");
+        if counts.fds == baseline.fds
+            && counts.mapped_regions == baseline.mapped_regions
+            && counts.threads == baseline.threads
+            && counts.rss_bytes <= baseline.rss_bytes.saturating_add(rss_tolerance)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{context}: resources did not return to envelope: \
+             baseline={baseline:?} actual={counts:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Linux scheduler/accounting counters for one task. Values are raw kernel
@@ -228,6 +295,19 @@ fn count_threads(pid: u32) -> Result<u64, ObserveError> {
     count_dir_entries(&format!("/proc/{pid}/task"), "threads")
 }
 
+#[cfg(target_os = "linux")]
+fn resident_bytes(pid: u32) -> Result<u64, ObserveError> {
+    let status =
+        std::fs::read_to_string(format!("/proc/{pid}/status")).map_err(|_| fail("rss_bytes"))?;
+    let kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| fail("rss_bytes"))?;
+    kib.checked_mul(1024).ok_or_else(|| fail("rss_bytes"))
+}
+
 // ---------------------------------------------------------------------------
 // macOS backend: public libproc (R13). Compiled and self-testable on macOS
 // CI; this crate's provisional soak tuple itself is Linux-only until the
@@ -243,6 +323,7 @@ mod libproc {
     pub const PROC_PIDLISTFDS: c_int = 1;
     pub const PROC_PIDLISTTHREADS: c_int = 6;
     pub const PROC_PIDREGIONINFO: c_int = 7;
+    pub const PROC_PIDTASKINFO: c_int = 4;
 
     /// `struct proc_fdinfo` from `proc_info.h`.
     #[repr(C)]
@@ -277,6 +358,28 @@ mod libproc {
         pub pri_depth: u32,
         pub pri_address: u64,
         pub pri_size: u64,
+    }
+
+    #[repr(C)]
+    pub struct ProcTaskInfo {
+        pub virtual_size: u64,
+        pub resident_size: u64,
+        pub total_user: u64,
+        pub total_system: u64,
+        pub threads_user: u64,
+        pub threads_system: u64,
+        pub policy: i32,
+        pub faults: i32,
+        pub pageins: i32,
+        pub cow_faults: i32,
+        pub messages_sent: i32,
+        pub messages_received: i32,
+        pub syscalls_mach: i32,
+        pub syscalls_unix: i32,
+        pub context_switches: i32,
+        pub thread_count: i32,
+        pub running_threads: i32,
+        pub priority: i32,
     }
 
     extern "C" {
@@ -414,6 +517,28 @@ fn count_mapped_regions(pid: u32) -> Result<u64, ObserveError> {
     Err(fail(counter))
 }
 
+#[cfg(target_os = "macos")]
+fn resident_bytes(pid: u32) -> Result<u64, ObserveError> {
+    use libproc::{proc_pidinfo, ProcTaskInfo, PROC_PIDTASKINFO};
+    let counter = "rss_bytes";
+    let pid = i32::try_from(pid).map_err(|_| fail(counter))?;
+    let size = std::mem::size_of::<ProcTaskInfo>();
+    let mut info = std::mem::MaybeUninit::<ProcTaskInfo>::uninit();
+    let returned = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(size).map_err(|_| fail(counter))?,
+        )
+    };
+    if returned as usize != size {
+        return Err(fail(counter));
+    }
+    Ok(unsafe { info.assume_init() }.resident_size)
+}
+
 // ---------------------------------------------------------------------------
 // Other platforms: unsupported observations fail, never silently zero.
 // ---------------------------------------------------------------------------
@@ -431,4 +556,9 @@ fn count_mapped_regions(_pid: u32) -> Result<u64, ObserveError> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn count_threads(_pid: u32) -> Result<u64, ObserveError> {
     Err(fail("threads"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn resident_bytes(_pid: u32) -> Result<u64, ObserveError> {
+    Err(fail("rss_bytes"))
 }

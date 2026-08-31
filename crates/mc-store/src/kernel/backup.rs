@@ -15,10 +15,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::envelope::check_fence;
+use crate::current_time_ms;
+
 use super::open::{
-    activate_wal, apply_preclassification_profile, current_time_ms, family_sidecars, harden_family,
-    open_reader, open_writer, restore_marker_path, stamp_writer_fence, suffix_path, sync_directory,
-    sync_parent, verify_exact_identity,
+    activate_wal, apply_preclassification_profile, family_sidecars, harden_family, open_reader,
+    open_writer, restore_marker_path, stamp_writer_fence, suffix_path, sync_directory, sync_parent,
+    verify_exact_identity,
 };
 use super::{KernelError, KernelStore, Sensitivity};
 
@@ -245,6 +247,12 @@ impl KernelStore {
             return Err(KernelError::NotFound);
         }
         tx.execute(
+            "UPDATE capture_pin_refs SET released_at=?1
+             WHERE capture_pin_id=?2 AND released_at IS NULL",
+            params![released_at, capture_pin_id],
+        )
+        .map_err(|_| KernelError::Io)?;
+        tx.execute(
             "DELETE FROM capture_pin_refs WHERE capture_pin_id=?1",
             [capture_pin_id],
         )
@@ -261,6 +269,14 @@ impl KernelStore {
         tx.execute(
             "UPDATE capture_pins SET released_at=?1
              WHERE released_at IS NULL AND expires_at IS NOT NULL AND expires_at<=?1",
+            [now_ms],
+        )
+        .map_err(|_| KernelError::Io)?;
+        tx.execute(
+            "UPDATE capture_pin_refs SET released_at=?1 WHERE released_at IS NULL
+             AND capture_pin_id IN (
+                 SELECT capture_pin_id FROM capture_pins WHERE released_at IS NOT NULL
+             )",
             [now_ms],
         )
         .map_err(|_| KernelError::Io)?;
@@ -676,11 +692,24 @@ fn rollback_capture_pin(writer: &mut Connection, lease_epoch: u64, pin_id: &str)
     if check_fence(&tx, lease_epoch).is_err() {
         return;
     }
+    let released_at = current_time_ms();
     if tx
         .execute(
-            "DELETE FROM capture_pin_refs WHERE capture_pin_id=?1",
-            [pin_id],
+            "UPDATE capture_pin_refs SET released_at=?1 WHERE capture_pin_id=?2",
+            params![released_at, pin_id],
         )
+        .and_then(|_| {
+            tx.execute(
+                "UPDATE capture_pins SET released_at=?1 WHERE capture_pin_id=?2",
+                params![released_at, pin_id],
+            )
+        })
+        .and_then(|_| {
+            tx.execute(
+                "DELETE FROM capture_pin_refs WHERE capture_pin_id=?1",
+                [pin_id],
+            )
+        })
         .and_then(|_| tx.execute("DELETE FROM capture_pins WHERE capture_pin_id=?1", [pin_id]))
         .is_ok()
     {

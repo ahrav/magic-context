@@ -15,9 +15,6 @@
 //! - `MC_IPC_BUDGET_MODE=finalize-interrupted`: move leftover running
 //!   manifests to the `interrupted` terminal state.
 
-#[path = "../tests/support/raw_client.rs"]
-mod raw_client;
-
 #[path = "../tests/support/perf_measurement.rs"]
 mod perf_measurement;
 
@@ -30,8 +27,8 @@ mod atomic;
 #[path = "support/evidence.rs"]
 mod evidence;
 
-#[path = "support/tcp.rs"]
-mod tcp;
+#[path = "support/ring.rs"]
+mod ring;
 
 #[path = "../tests/support/echo_host.rs"]
 mod echo_host;
@@ -47,7 +44,7 @@ use criterion::Criterion;
 use atomic::{run_ping_pong, timed_exchanges, PingPongConfig};
 use evidence::{
     counterbalanced_schedule, ArmId, Attempt, BuildId, HistogramConfig, HostId, Manifest, State,
-    ARM_ATOMIC, ARM_TCP_OPEN, ARM_TCP_SERIAL, ARM_TCP_THROUGHPUT,
+    ARM_ATOMIC, ARM_RING_OPEN, ARM_RING_SERIAL, ARM_RING_THROUGHPUT,
 };
 use linux_topology::{auto_select, effective_affinity, read_topology, AutoSelection, Class};
 use perf_measurement::fixture_workload;
@@ -283,7 +280,14 @@ struct CollectConfig {
 fn read_collect_config() -> Result<CollectConfig, String> {
     let out = PathBuf::from(env_var("MC_IPC_BUDGET_OUT").ok_or("MC_IPC_BUDGET_OUT unset")?);
     let arm = env_var("MC_IPC_BUDGET_ARM").ok_or("MC_IPC_BUDGET_ARM unset")?;
-    if ![ARM_ATOMIC, ARM_TCP_SERIAL, ARM_TCP_OPEN, ARM_TCP_THROUGHPUT].contains(&arm.as_str()) {
+    if ![
+        ARM_ATOMIC,
+        ARM_RING_SERIAL,
+        ARM_RING_OPEN,
+        ARM_RING_THROUGHPUT,
+    ]
+    .contains(&arm.as_str())
+    {
         return Err(format!("unknown arm {arm:?}"));
     }
     let class = Class::parse(&env_var("MC_IPC_BUDGET_CLASS").unwrap_or("same-l3".to_owned()))?;
@@ -430,7 +434,7 @@ fn base_manifest(cfg: &CollectConfig, pair: Option<(u32, u32)>) -> Manifest {
         // planned for; the collector overwrites this with the full
         // configuration on success. Without it, a skip copied onto a
         // different planned rate path would pass identity binding.
-        collection: if cfg.arm == ARM_TCP_OPEN {
+        collection: if cfg.arm == ARM_RING_OPEN {
             let rate =
                 env_parse("MC_IPC_BUDGET_RATE", 0u64).expect("rate validated at config load");
             Some(serde_json::json!({ "rate_per_sec": rate }))
@@ -443,7 +447,7 @@ fn base_manifest(cfg: &CollectConfig, pair: Option<(u32, u32)>) -> Manifest {
 
 fn attempt_name(cfg: &CollectConfig) -> String {
     let mut name = format!("{}-{}-b{:02}", cfg.arm, cfg.class.label(), cfg.block);
-    if cfg.arm == ARM_TCP_OPEN {
+    if cfg.arm == ARM_RING_OPEN {
         let rate = env_parse("MC_IPC_BUDGET_RATE", 0u64).expect("rate validated at config load");
         name.push_str(&format!("-r{rate}"));
     }
@@ -474,9 +478,9 @@ fn run_collect() -> i32 {
     };
     match cfg.arm.as_str() {
         ARM_ATOMIC => run_attempt(&cfg, pair, collect_atomic),
-        ARM_TCP_SERIAL => run_attempt(&cfg, pair, collect_tcp_serial),
-        ARM_TCP_OPEN => run_attempt(&cfg, pair, collect_tcp_open),
-        ARM_TCP_THROUGHPUT => run_attempt(&cfg, pair, collect_tcp_throughput),
+        ARM_RING_SERIAL => run_attempt(&cfg, pair, collect_ring_serial),
+        ARM_RING_OPEN => run_attempt(&cfg, pair, collect_ring_open),
+        ARM_RING_THROUGHPUT => run_attempt(&cfg, pair, collect_ring_throughput),
         _ => unreachable!("arm validated at parse"),
     }
 }
@@ -591,7 +595,7 @@ fn collect_atomic(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String>
     // A batch mean beyond the histogram range would be retained in
     // batches.json yet omitted from every merged percentile; the
     // attempt fails rather than publishing the faster subset, matching
-    // the TCP arms' overflow gate.
+    // the ring arms' overflow gate.
     if rejected > 0 {
         return Err(format!(
             "{rejected} batch mean(s) exceeded the histogram range; the attempt is invalid"
@@ -630,7 +634,7 @@ fn collect_atomic(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String>
 
 /// Pins the collector (load side) and spawns the pinned child host,
 /// recording requested and effective affinity in the manifest.
-fn tcp_arm_setup(attempt: &mut Attempt, pair: (u32, u32)) -> Result<ChildHost, String> {
+fn ring_arm_setup(attempt: &mut Attempt, pair: (u32, u32)) -> Result<ChildHost, String> {
     linux_topology::pin_current_thread(pair.0).map_err(|err| format!("load pin: {err}"))?;
     let host = ChildHost::spawn(Some(pair.1))?;
     let load_affinity: Vec<u32> = effective_affinity()?.into_iter().collect();
@@ -688,15 +692,15 @@ fn check_host_and_conservation(
     check_correctness(outcomes)
 }
 
-fn collect_tcp_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
-    let cfg = tcp::SerialConfig {
+fn collect_ring_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
+    let cfg = ring::SerialConfig {
         warmup_ops: env_parse("MC_IPC_BUDGET_WARMUP_OPS", 20_000)?,
         measured_ops: env_parse("MC_IPC_BUDGET_MEASURED_OPS", 120_000)?,
         histogram: HistogramConfig::default(),
     };
-    let mut host = tcp_arm_setup(attempt, pair)?;
+    let mut host = ring_arm_setup(attempt, pair)?;
     let result =
-        tcp::run_serial(host.publication(), &cfg).map_err(|err| format!("serial arm: {err}"))?;
+        ring::run_serial(host.publication(), &cfg).map_err(|err| format!("serial arm: {err}"))?;
     if result.scheduled != cfg.measured_ops
         || result.outcomes.peer_closed
             + result.outcomes.write_failure
@@ -748,17 +752,17 @@ fn collect_tcp_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Str
     Ok(())
 }
 
-fn collect_tcp_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
+fn collect_ring_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
     let rate = env_parse("MC_IPC_BUDGET_RATE", 0u64)?;
-    let cfg = tcp::OpenLoopConfig {
+    let cfg = ring::OpenLoopConfig {
         rate_per_sec: rate,
         warmup: Duration::from_secs(env_parse("MC_IPC_BUDGET_WARMUP_SECS", 2)?),
         measure: Duration::from_secs(env_parse("MC_IPC_BUDGET_MEASURE_SECS", 10)?),
         inflight_cap: env_parse("MC_IPC_BUDGET_INFLIGHT_CAP", 1024)?,
         histogram: HistogramConfig::default(),
     };
-    let mut host = tcp_arm_setup(attempt, pair)?;
-    let result = tcp::run_open_loop(host.publication(), &cfg)
+    let mut host = ring_arm_setup(attempt, pair)?;
+    let result = ring::run_open_loop(host.publication(), &cfg)
         .map_err(|err| format!("open-loop arm: {err}"))?;
     if result.truncated {
         return Err(format!(
@@ -836,14 +840,14 @@ fn collect_tcp_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Strin
     Ok(())
 }
 
-fn collect_tcp_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
-    let cfg = tcp::ThroughputConfig {
+fn collect_ring_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
+    let cfg = ring::ThroughputConfig {
         depth: env_parse("MC_IPC_BUDGET_DEPTH", 32)?,
         warmup: Duration::from_secs(env_parse("MC_IPC_BUDGET_WARMUP_SECS", 2)?),
         measure: Duration::from_secs(env_parse("MC_IPC_BUDGET_MEASURE_SECS", 10)?),
     };
-    let mut host = tcp_arm_setup(attempt, pair)?;
-    let result = tcp::run_throughput(host.publication(), &cfg)
+    let mut host = ring_arm_setup(attempt, pair)?;
+    let result = ring::run_throughput(host.publication(), &cfg)
         .map_err(|err| format!("throughput arm: {err}"))?;
     if result.truncated {
         return Err(format!(
@@ -914,24 +918,29 @@ pub const DEFAULT_RATES: &str = "20000 50000 80000";
 /// Cross-NUMA paired tail in forward orientation. The script's
 /// `budget_block` runs these after the same-L3 arms, reversing their
 /// order on even blocks like the same-L3 arms.
-const CROSS_ARMS: [&str; 2] = [ARM_ATOMIC, ARM_TCP_SERIAL];
+const CROSS_ARMS: [&str; 2] = [ARM_ATOMIC, ARM_RING_SERIAL];
 
 fn plan_arms() -> Vec<String> {
-    [ARM_ATOMIC, ARM_TCP_SERIAL, ARM_TCP_OPEN, ARM_TCP_THROUGHPUT]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect()
+    [
+        ARM_ATOMIC,
+        ARM_RING_SERIAL,
+        ARM_RING_OPEN,
+        ARM_RING_THROUGHPUT,
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect()
 }
 
 /// Expands one block into the collection sequence the script's
 /// `budget_block` executes: the counterbalanced same-L3 arms with
-/// `tcp-open` fanned out per offered rate (rate order as given, never
+/// `ring-open` fanned out per offered rate (rate order as given, never
 /// reversed), then the cross-NUMA paired tail in its own counterbalanced
 /// order.
 pub fn plan_block_entries(same_l3: &[String], cross: &[String], rates: &[u64]) -> Vec<String> {
     let mut entries = Vec::new();
     for arm in same_l3 {
-        if arm == ARM_TCP_OPEN {
+        if arm == ARM_RING_OPEN {
             entries.extend(rates.iter().map(|rate| format!("{arm}@same-l3:r{rate}")));
         } else {
             entries.push(format!("{arm}@same-l3"));
@@ -948,11 +957,11 @@ pub fn plan_block_entries(same_l3: &[String], cross: &[String], rates: &[u64]) -
 fn expected_attempt_names(blocks: u32, rates: &[u64]) -> Vec<String> {
     let mut names = Vec::new();
     for block in 1..=blocks {
-        for arm in [ARM_ATOMIC, ARM_TCP_SERIAL, ARM_TCP_THROUGHPUT] {
+        for arm in [ARM_ATOMIC, ARM_RING_SERIAL, ARM_RING_THROUGHPUT] {
             names.push(format!("{arm}-same-l3-b{block:02}"));
         }
         for rate in rates {
-            names.push(format!("{ARM_TCP_OPEN}-same-l3-b{block:02}-r{rate}"));
+            names.push(format!("{ARM_RING_OPEN}-same-l3-b{block:02}-r{rate}"));
         }
         for arm in CROSS_ARMS {
             names.push(format!("{arm}-cross-numa-b{block:02}"));
@@ -1173,7 +1182,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
             m.arm.class.clone().unwrap_or_default(),
             m.run_block
         );
-        let name_ok = if m.arm.name == ARM_TCP_OPEN {
+        let name_ok = if m.arm.name == ARM_RING_OPEN {
             // Every open-loop manifest records its planned rate from
             // creation, so skipped and failed attempts bind to their
             // exact operating point too.
@@ -1247,7 +1256,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
         entry.insert("collection".to_owned(), serde_json::json!(collection));
         let hist_file = match arm.name.as_str() {
             ARM_ATOMIC => Some("batch_mean_rtt.hist"),
-            ARM_TCP_SERIAL => Some("issue_to_terminal.hist"),
+            ARM_RING_SERIAL => Some("issue_to_terminal.hist"),
             _ => None,
         };
         if let Some(file) = hist_file {
@@ -1281,7 +1290,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
                 }),
             );
         }
-        if arm.name == ARM_TCP_OPEN {
+        if arm.name == ARM_RING_OPEN {
             // Open-loop block scalars must agree with their checksummed
             // sidecars, exactly like the paired-gap scalars: the
             // manifest's results object is otherwise unprotected on its
@@ -1318,9 +1327,9 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
         // histogram covers only its percentiles; the throughput arm has
         // no histogram at all.
         let record_file = match arm.name.as_str() {
-            ARM_TCP_SERIAL => Some("serial.json"),
-            ARM_TCP_OPEN => Some("open.json"),
-            ARM_TCP_THROUGHPUT => Some("throughput.json"),
+            ARM_RING_SERIAL => Some("serial.json"),
+            ARM_RING_OPEN => Some("open.json"),
+            ARM_RING_THROUGHPUT => Some("throughput.json"),
             _ => None,
         };
         if let Some(file) = record_file {
@@ -1489,7 +1498,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
             "class": g.class,
             "pair": g.pair,
             "atomic_rtt_ns": g.atomic_rtt_ns,
-            "tcp_p50_ns": g.tcp_p50_ns,
+            "ring_p50_ns": g.ring_p50_ns,
             "gap_ns": g.gap_ns,
             "ratio": g.ratio,
         })).collect::<Vec<_>>(),
@@ -1560,8 +1569,8 @@ fn run_criterion() {
 
     match ChildHost::spawn(None) {
         Ok(host) => {
-            let mut probe = tcp::SerialProbe::connect(host.publication()).expect("serial probe");
-            let mut group = criterion.benchmark_group("serial_tcp_rtt");
+            let mut probe = ring::SerialProbe::connect(host.publication()).expect("serial probe");
+            let mut group = criterion.benchmark_group("serial_ring_rtt");
             group.bench_function("loopback_fixture_echo", |bencher| {
                 bencher.iter_custom(|iters| probe.roundtrips(iters).expect("roundtrips"));
             });
@@ -1569,7 +1578,7 @@ fn run_criterion() {
             drop(probe);
             drop(host);
         }
-        Err(err) => eprintln!("serial_tcp_rtt: skipped ({err})"),
+        Err(err) => eprintln!("serial_ring_rtt: skipped ({err})"),
     }
 
     criterion.final_summary();

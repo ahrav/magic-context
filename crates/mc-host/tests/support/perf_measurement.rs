@@ -1,7 +1,7 @@
 //! Shared measurement rules for the mc-host performance harness.
 //!
 //! Pure timing, percentile, workload, and outcome-accounting logic used by
-//! `examples/perf_load.rs`, the `ipc_budget` benchmark, and their tests.
+//! the `ipc_budget` benchmark and its tests.
 //! Contract: issue-to-validated-terminal is the RTT boundary, scheduled
 //! time exists only for open-loop accounting, and every scheduled slot must
 //! resolve to exactly one terminal outcome.

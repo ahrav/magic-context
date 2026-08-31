@@ -20,6 +20,8 @@ pub mod lease;
 pub mod lifecycle;
 /// Target profiles and host-wide resource admission. commentlint: allow(JUDGE)
 pub mod profile;
+/// Setup-handshake proof transcript shared by both peers. commentlint: allow(JUDGE)
+pub mod setup_auth;
 
 pub use arena::{MAX_FRAME_BYTES, MIN_ARENA_BYTES};
 pub use descriptor::{Incarnation, ReleaseIdentity, WIRE_V2_HEADER_BYTES};

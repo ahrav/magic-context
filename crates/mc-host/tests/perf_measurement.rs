@@ -5,9 +5,6 @@
 #[path = "support/perf_measurement.rs"]
 mod perf_measurement;
 
-#[path = "support/raw_client.rs"]
-mod raw_client;
-
 use perf_measurement::{
     fixture_workload, nearest_rank, open_loop_offset_ns, tail_publishable, validate_open_loop_rate,
     LatencySummary, Outcome, OutcomeCounts, WindowClass, FIXTURE_BODY, TAIL_SAMPLE_FLOOR,
@@ -371,22 +368,6 @@ fn ledger_rejects_duplicate_and_orphan_records() {
         .errors
         .iter()
         .any(|error| error.contains("records 3 attempts")));
-}
-
-#[test]
-fn raw_error_surfaces_retry_after_ms() {
-    let frame = raw_client::RawFrame {
-        len: 45,
-        ver: raw_client::WIRE_VERSION,
-        ty: raw_client::TY_ERROR,
-        flags: raw_client::FLAGS_RESPONSE_TEXT_LAST,
-        channel: 1,
-        epoch: 1,
-        corr: 1,
-        body: br#"{"code":"queue_full","retry_after_ms":73}"#.to_vec(),
-    };
-    assert_eq!(frame.error_code(), "queue_full");
-    assert_eq!(frame.error_retry_after_ms(), Some(73));
 }
 
 #[test]

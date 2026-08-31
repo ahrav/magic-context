@@ -95,7 +95,7 @@ function goldSatisfyingFacts(scenario: HistorianEvalScenario): MockHistorianFact
  * before any mutation ran. The count is clamped to the message count because a
  * segment must cover at least one message.
  */
-function baselineCompartments(scenario: HistorianEvalScenario): MockHistorianCompartment[] {
+export function baselineCompartments(scenario: HistorianEvalScenario): MockHistorianCompartment[] {
     const messageCount = scenario.transcript.turns.length * 2;
     const count = Math.max(1, Math.min(scenario.gold.compartments.minCount, messageCount));
     const span = Math.floor(messageCount / count);
@@ -128,7 +128,7 @@ function baselineCompartments(scenario: HistorianEvalScenario): MockHistorianCom
  * minimum above one unpromotable. The authored span stays explicit so
  * `compartment-count` still measures only compartments over authored content.
  */
-function batteryScoringOptions(scenario: HistorianEvalScenario): {
+export function batteryScoringOptions(scenario: HistorianEvalScenario): {
     chunkStartOrdinal: number;
     chunkEndOrdinal: number;
     authoredStartOrdinal: number;
