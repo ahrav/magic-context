@@ -28,7 +28,6 @@ function scenario(overrides: Partial<ScenarioDeclaration> = {}): ScenarioDeclara
         interventions: {
             r1: {
                 insertAfterTurnId: "turn-burial",
-                query: "mem-alpha",
                 locatorIds: ["mem-alpha"],
             },
             r2: {
@@ -278,15 +277,15 @@ describe("paired-delta scenario contract", () => {
         ).toThrow(/restartArms: unsupported-arm/);
     });
 
-    it("rejects an R1 query that leaks the expected answer", () => {
+    it("rejects an R1 locator handle that leaks the expected answer", () => {
         expect(() =>
             parseScenarioDeclaration(scenario({
                 interventions: {
                     ...scenario().interventions,
-                    r1: { ...scenario().interventions.r1, query: "find alpha-17 now" },
+                    r1: { ...scenario().interventions.r1, locatorIds: ["mem-alpha-17"] },
                 },
             })),
-        ).toThrow(/r1\.query: contains-answer/);
+        ).toThrow(/r1\.locatorIds: contains-answer/);
     });
 
     it("rejects ballast below the token-denominated context window", () => {

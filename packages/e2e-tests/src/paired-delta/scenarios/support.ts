@@ -78,8 +78,6 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
         interventions: {
             r1: {
                 insertAfterTurnId: "turn-burial",
-                /** The locator id, not the answer: R1 is "search result only; no injection", and the scripted-search prompt carries the query verbatim, so an answer-bearing query would leak the gold value into the transcript. commentlint: allow(JUDGE) */
-                query: spec.locatorId,
                 locatorIds: [spec.locatorId],
             },
             r2: {

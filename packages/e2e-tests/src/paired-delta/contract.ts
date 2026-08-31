@@ -76,7 +76,6 @@ export interface TurnDeclaration {
 export interface ScenarioInterventions {
     r1: {
         insertAfterTurnId: string;
-        query: string;
         /** Symbolic `mem-*` handles, never wire ids: a `mcm_<32hex>` public claim id is assigned by `seedGoldMemories` per run, so freezing one would freeze a value that never resolves. A runner must map each handle to the seeded `publicClaimId` before calling `scriptedCtxSearchTurn` and must assert the wire result against that resolved id — passing a handle through unmapped demotes the turn to a text search that cannot serve project-memory claims, silently collapsing R1 onto R0. commentlint: allow(JUDGE) */
         locatorIds: string[];
     };
@@ -209,7 +208,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     const interventions = p.record(root.interventions, "scenario.interventions");
     p.exact(interventions, ["r1", "r2", "r3"], "scenario.interventions");
     const r1 = p.record(interventions.r1, "scenario.interventions.r1");
-    p.exact(r1, ["insertAfterTurnId", "query", "locatorIds"], "scenario.interventions.r1");
+    p.exact(r1, ["insertAfterTurnId", "locatorIds"], "scenario.interventions.r1");
     const expectedAnswer = p.string(root.expectedAnswer, "scenario.expectedAnswer");
     /** Verifiers compare against the model's trimmed file contents, and `p.string` preserves the authored bytes so a fingerprint stays over what was written. A padded answer is therefore unmatchable in every arm; reject it here rather than trimming and changing the covered bytes. commentlint: allow(JUDGE) */
     if (expectedAnswer !== expectedAnswer.trim()) {
@@ -219,25 +218,14 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     /** Deliberately the opposite bound from `suppliesAnswer` below, because the two guards fail safe in opposite directions. A leak asks "could the model read the gold here", so any occurrence counts and a wider match is the conservative one: `alpha-170` exposes `alpha-17`. commentlint: allow(JUDGE) */
     const revealsAnswer = (text: string): boolean =>
         text.toLowerCase().includes(expectedAnswer.toLowerCase());
-    /** Gold presence asks "can the arm derive the exact answer here", so only a complete value counts and a narrower match is the conservative one: `147` does not supply `47`. It also honors the declared casing policy, unlike the leak guard: under `exact` the verifier rejects a differently-cased answer, so folding here would certify gold the arm can never produce. Boundaries use Unicode letter and number properties, so a non-ASCII neighbour is not mistaken for a separator; `.`, `;`, and `,` are not value characters, so a trailing sentence period still matches. commentlint: allow(JUDGE) */
+    /** Gold presence asks "can the arm derive the exact answer here", so only a complete value counts and a narrower match is the conservative one: `147` does not supply `47`. It also honors the declared casing policy, unlike the leak guard: under `exact` the verifier rejects a differently-cased answer, so folding here would certify gold the arm can never produce. Boundaries are code-point aware through `u`-flag lookaround rather than index arithmetic, which would read one UTF-16 unit and see an astral letter's low surrogate as a separator. Letters, numbers, combining marks, `_`, and `-` are value characters; `.`, `;`, and `,` are not, so a trailing sentence period still matches. commentlint: allow(JUDGE) */
     const suppliesAnswer = (text: string): boolean => {
         const fold = (value: string): string =>
             answerMatch === "exact" ? value : value.toLowerCase();
-        const haystack = fold(text);
-        const needle = fold(expectedAnswer);
-        const valueChar = /[\p{L}\p{N}_-]/u;
-        for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
-            const before = at === 0 ? "" : haystack[at - 1]!;
-            const after = haystack[at + needle.length] ?? "";
-            if (!valueChar.test(before) && !valueChar.test(after)) return true;
-        }
-        return false;
+        const escaped = fold(expectedAnswer).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const valueChar = "[\\p{L}\\p{N}\\p{M}_-]";
+        return new RegExp(`(?<!${valueChar})${escaped}(?!${valueChar})`, "u").test(fold(text));
     };
-    const r1Query = p.string(r1.query, "scenario.interventions.r1.query");
-    /** `scriptedCtxSearchTurn` interpolates the query into the model-visible prompt, so a query containing the expected answer lets R1 pass its critical check with no retrieval. Case-folded because a model reads `sqlite` and `SQLite` as the same token. commentlint: allow(JUDGE) */
-    if (revealsAnswer(r1Query)) {
-        p.fail("scenario.interventions.r1.query: contains-answer");
-    }
     const insertAfterTurnId = p.staticId(
         r1.insertAfterTurnId,
         "scenario.interventions.r1.insertAfterTurnId",
@@ -267,6 +255,10 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     /** A runner must pass the resolved ids as one locator-shaped query, and `scriptedCtxSearchTurn` rejects a larger set rather than chunking it — chunking would no longer be one tool turn. Enforcing the helper's bound here fails the declaration at freeze time instead of at R1 run time. commentlint: allow(JUDGE) */
     if (locatorIds.length > ID_SHAPED_QUERY_MAX_TOKENS) {
         p.fail("scenario.interventions.r1.locatorIds: exceeds-search-limit");
+    }
+    /** The resolved handles become the search query, which `scriptedCtxSearchTurn` interpolates into the model-visible prompt, so a handle named after the answer would let R1 pass its critical check with no retrieval. commentlint: allow(JUDGE) */
+    if (locatorIds.some(revealsAnswer)) {
+        p.fail("scenario.interventions.r1.locatorIds: contains-answer");
     }
     const r2 = p.record(interventions.r2, "scenario.interventions.r2");
     p.exact(r2, ["memories"], "scenario.interventions.r2");
@@ -368,7 +360,6 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         interventions: {
             r1: {
                 insertAfterTurnId,
-                query: r1Query,
                 locatorIds,
             },
             r2: { memories },
