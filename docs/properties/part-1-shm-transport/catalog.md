@@ -977,49 +977,69 @@ Open questions: None.
 
 Type: safety
 Reachability: default-production — the ring transport is built unconditionally
-(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
-duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+(`crates/mc-host/src/runtime.rs:741`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:117`), so this code is on the
 shipped path. This replaces the test-only, non-default framing in the
 product-context section above, which predates the ring-transport refactor.
 Status: active
-Exercised: yes — `crates/mc-host/tests/shm_failure_modes.rs:150`
-`killed_victim_holding_active_charges_is_never_reclaimed` constructs the fault
-(SIGKILL, signal-9 wait status, post-reap observation window) and pins the
-current behaviour.
+Exercised: partial — `crates/mc-host/tests/shm_failure_modes.rs:213`
+`setup_active_and_idle_sigkill_each_return_exact_capacity` constructs the
+fault (SIGKILL with a required signal-9 wait status, `:154-158`) for setup,
+active, and idle victims and witnesses the reclaim arm by readmission at a
+one-connection cap. No per-identity charge ledger and no declared-exception
+arm is asserted. The former pinning test
+`killed_victim_holding_active_charges_is_never_reclaimed` no longer exists at
+HEAD.
 Guarantee: A peer that dies without a `Goodbye` either has its candidate's
 charges reclaimed, or the retention is a declared, bounded exception rather than
 an unqualified accounting claim.
 Check: `always` — after killing and reaping a committed peer, either the
-charges return, or the accounting snapshot exposes them as a distinct
-"unreclaimable" class that the admission contract accounts for.
-Fault/timing angle: with the default `HostConfig.liveness = None` the endpoint
-loop polls `try_receive → Ok(false)` forever and never becomes a suspect. With a
-liveness policy configured the ring eventually fills, `publish_one` fails, and
-the close is unclean, which quarantines instead — a different outcome for the
-same fault.
+killed connection's exact charges return to free capacity once the
+sentinel-triggered teardown completes, or the accounting snapshot exposes them
+as a distinct "unreclaimable" class that the admission contract accounts for.
+`always` because the obligation applies at every peer death, not at one code
+point.
+Fault/timing angle: under the eventfd mechanism a dead peer is pure silence.
+It never signals `data_ready`, so the endpoint arms the data wait
+(`crates/mc-host/src/ring_transport.rs:429`) and parks in the readiness select
+(`:441-474`); the ring path alone never produces an error, a wake, or a
+suspect, and a parked endpoint is indistinguishable from an idle one.
+Detection is out of band: the setup socket is held open as the peer-lifetime
+sentinel, and a non-`Goodbye` closure records a peer death and cancels the
+generation (`crates/mc-host/src/connection.rs:180-190`), after which the
+endpoint thread joins and `admission.release()` runs unconditionally
+(`ring_transport.rs:276`). With outbound frames queued, the other path is
+`reserve_until` parking on the `capacity_ready` doorbell and returning
+`Deadline` at `frame_deadline`
+(`crates/mc-shm-transport/src/backend/ring.rs:1035`, `:1043-1044`), which
+fails the publish and cancels (`ring_transport.rs:479-483`). Both paths
+converge on the same unconditional release; the pre-refactor
+release-versus-suspect fork is gone.
 Required faults and enabling state: an actual kill without `Goodbye`, plus a
 committed candidate.
 Confidence: high — [evidence](evidence/dead-peer-charges-are-reclaimed-or-declared.md).
-The gap is documented at `docs/mc-host-shm-transport.md:106-108` and tracked as
-`magic-context-ymc.12`; the release-gate plan makes it a blocker. It followed
-from the former `shm_provider.rs:363-370`, where only a returned `run_endpoint`
-triggered release or suspect reporting. The refactor removed the branch entirely:
-`crates/mc-host/src/ring_transport.rs:279-291` catches an endpoint panic and then
-calls `admission.release()` unconditionally, so there is no longer a
-release-versus-suspect decision and a dead peer's charges are returned as clean
-capacity rather than declared. The gap the record names is therefore wider than
-when it was written, not narrower.
-Existing check: the test above pins the gap, which is the right shape for a
-known limitation. Status unaudited as an oracle for the *desired* behaviour.
-Impact: with single-candidate limits, one dead peer permanently ends
-shared-memory eligibility for the process. The catalog entry exists because
-`docs/mc-host-shm-transport.md:57` states the accounting claim without this
-exception.
+The documented gap this record was opened against is gone from HEAD:
+`docs/mc-host-shm-transport.md` is now 85 lines, states the sentinel contract
+at `:49` ("Unexpected closure records peer death, cancels ring work, and tears
+down the exact connection"), and no longer carries the retention paragraph
+formerly at `:106-108` or the unqualified accounting claim formerly at `:57`.
+The unconditional `admission.release()` introduced by `ed487e11` survives at
+`ring_transport.rs:276`, reached after `run_endpoint` returns or panics
+(`:264-274`).
+Existing check: the SIGKILL test above. Status unaudited as an oracle for the
+per-identity tuple: readmission at a one-connection cap witnesses that enough
+capacity returned, not that the killed candidate's exact tuple did.
+Impact: if release fails after a peer death, then with single-candidate limits
+one dead peer permanently ends shared-memory eligibility for the process while
+readiness still reports healthy — and under blocking eventfd waits nothing on
+the ring path would ever surface it, because the endpoint parks silently
+instead of visibly polling an empty ring.
 Open questions:
 
-- Which behaviour is normative when a liveness policy is configured — retention,
-  or quarantine via a failed publish? Both are currently reachable for the same
-  fault.
+- None open on the former release-versus-suspect fork: both close paths end in
+  the unconditional `admission.release()` at `ring_transport.rs:276` at HEAD,
+  which resolves that question by code change. What remains untested is the
+  per-identity ledger oracle described in the evidence file.
 
 ### cancelled-frame-disposition-is-declared
 
@@ -2888,8 +2908,8 @@ an explicit interval.
 
 Type: liveness
 Reachability: default-production — the ring transport is built unconditionally
-(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
-duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+(`crates/mc-host/src/runtime.rs:741`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:117`), so this code is on the
 shipped path. This replaces the test-only, non-default framing in the
 product-context section above, which predates the ring-transport refactor.
 Status: active
@@ -2902,13 +2922,22 @@ lease, then require the next single `try_reserve` to succeed, and require
 `reserve_until` with a deadline set beyond the release to return `Ok` strictly
 inside it. The bounded fault-free window is one `try_reserve` after the release
 becomes visible, because `reclaim_completed` drains the whole contiguous completed
-prefix per call and is invoked at the head of `try_reserve` (`ring.rs:675`).
+prefix per call and is invoked at the head of `try_reserve` (`ring.rs:916`).
 Fault/timing angle: three independent conditions all surface as
-`ProducerError::Exhausted` — depth full (`:685-686`), a lost reservation
-compare-exchange (`:702`), and arena exhaustion (`:710-714`) — and only that
-variant is retried (`:747-756`). Under the cold park-wake mode the host selects,
-retries are 50 microseconds apart, so one quantum is the floor on any asserted
-bound.
+`ProducerError::Exhausted` — depth full (`:926-928`), a lost reservation
+compare-exchange (`:938-943`), and arena exhaustion (`:949-955`) — and only
+that variant is retried (`reserve_until`, `:980-1048`). Retries no longer
+poll: between attempts the producer parks a generation-bound epoch
+(`:995-1000`), re-runs `try_reserve` after parking (`:1001`) and after
+draining the doorbell (`:1020`), rechecks the generation (`:1012`, `:1031`),
+and blocks in `capacity_ready.wait_until(deadline)` (`:1035`). `release`
+signals `capacity_ready` (`:1236-1241`) through `signal_wake` (`:1418`), which
+bumps the generation and writes the eventfd only when a waiter was parked, so
+the hazard is a lost wake rather than a slow poll, and doorbell wake latency
+replaces the former 50-microsecond poll quantum as the floor on any asserted
+bound. `POLL_INTERVAL` survives only in
+`crates/mc-host/tests/support/process_resources.rs`, a test-support constant
+unrelated to this path.
 Required faults and enabling state: genuine exhaustion of either capacity, then
 removal of the pressure. Two arms, because only the arena arm is covered today.
 Enabling situation `shm_arena_wrap_with_live_lease`; the descriptor arm needs no
@@ -2916,15 +2945,17 @@ marker.
 Confidence: high — [evidence](evidence/backpressure-converges-in-a-bounded-reclaim-window.md).
 `reclaim_completed`'s sole call site in the repository is `try_reserve`, so
 reclamation is producer-driven and a retry is the act that recovers capacity; the
-reclaim loop exits only at the first gap, an error, or an exhausted prefix; and
-the compare-exchange at `:702` cannot lose fault-free, because `slot_ptr` maps
-sequence to `(sequence - 1) % descriptor_depth` and the depth gate already puts
-that slot's previous user at or below `completed`, hence freed.
+reclaim loop exits only at the first gap, an error, or an exhausted prefix
+(`:1478-1505`); and the compare-exchange at `:938-943` cannot lose fault-free,
+because `slot_ptr` maps sequence to `(sequence - 1) % descriptor_depth`
+(`:1438`) and the depth gate already puts that slot's previous user at or
+below `completed`, hence freed (`:1554`).
 Existing check: partial —
 `two_process_zero_copy_exchange_uses_authenticated_grant`
-(`tests/ring.rs:581-618`). A `reserve_until` with a five-second deadline converges
-after the child releases, and an elapsed-time assertion keeps it from passing
-vacuously. Status unaudited. The give-up path is pinned separately at `:192-196`.
+(`tests/ring.rs:551-592`). A `reserve_until` with a five-second deadline
+(`:575-582`) converges after the child releases, and an elapsed-time assertion
+(`:583`) keeps it from passing vacuously. Status unaudited. The give-up path is
+pinned separately at `:181-185`.
 Impact: this is the only statement in the catalog that the transport makes forward
 progress in normal operation. A recovery-chain defect presents as
 `ProducerError::Deadline`, which the host converts into a failed publish, a
@@ -2940,8 +2971,8 @@ Open questions:
 
 Type: liveness
 Reachability: default-production — the ring transport is built unconditionally
-(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
-duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+(`crates/mc-host/src/runtime.rs:741`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:117`), so this code is on the
 shipped path. This replaces the test-only, non-default framing in the
 product-context section above, which predates the ring-transport refactor.
 Status: active
@@ -2954,15 +2985,24 @@ Check: `always-or-unreached` — at the declining return, require `conservation(
 to report `receiver_leased == max_leases` and `published >= 1`; then release one
 lease and require the immediately following `try_receive` to return the frame
 whose sequence equals the pre-saturation `consumed + 1`. The window is exactly one
-call, because both gates are pure reads of state the release already updated.
-`always-or-unreached` because the saturation state is unreachable in the shipped
-host: `receive_one` holds at most one of eight leases and releases it on every
-path.
+call, because both gates are pure reads of state the release already updated. A
+consumer parked in `wait_for_data` (`ring.rs:1138`) instead of calling again
+does not weaken the window: the same release signals the `data_ready` doorbell
+(`:1236-1241`), and `data_available` (`:1160-1172`) returns true only when
+`published != consumed` and `active < max_leases`, so the saturation state is
+exactly the one that parks a waiter and the release's signal is what un-parks
+it. `always-or-unreached` because the saturation state is unreachable in the
+shipped host: `receive_one` holds at most one of eight leases and releases it
+on every path.
 Fault/timing angle: no race — the counter is incremented and decremented by the
 same thread-confined receiver. The hazard is representational: the declining
-return is used both for saturation (`ring.rs:774-778`) and for an empty ring
-(`:784-785`), and the saturation gate is taken before `consumed` or `published` is
-read at all, so the value carries no reason.
+return is used both for saturation (`ring.rs:1063-1068`) and for an empty ring
+(`:1073-1075`), and the saturation gate is taken before `consumed` or `published`
+is read at all, so the value carries no reason. A second hazard is new with the
+eventfd mechanism: a release whose `data_ready` signal is lost leaves a parked
+`wait_for_data` consumer asleep until its deadline even though the state gates
+would pass, so the recovery assertion must use a direct `try_receive` to test
+the state and a parked waiter to test the wake, not one call for both.
 Required faults and enabling state: a profile whose `max_leases` is reachable and
 strictly greater than one, plus at least one frame published beyond the leased
 set, which requires `descriptor_depth > max_leases`. Without the second, the
@@ -2972,13 +3012,14 @@ Confidence: high — [evidence](evidence/receive-resumes-when-lease-capacity-cle
 Both gates and the single decrement site were read directly, and every
 `receive_one` return path in the host was traced to confirm one lease per call.
 Existing check: `lease_limit_reports_backpressure_then_recovers_after_release`
-(`tests/ring.rs:278-293`) against a profile with depth 2 and one lease. The
+(`tests/ring.rs:272-286`) against a profile with depth 2 and one lease. The
 recovery half is real; the saturation half asserts only absence. Status unaudited,
 and the oracle cannot distinguish saturation from an empty ring, which is the gap
 this record closes.
 Impact: a release-path defect leaves the lease counter pinned at the cap and every
-later receive returns what an idle channel returns. The endpoint keeps polling and
-no error, quarantine, or counter fires: the silent capacity-loss signature of
+later receive returns what an idle channel returns. The endpoint arms its data
+wait and parks on the doorbell (`ring_transport.rs:429`, `:459`) and no error,
+quarantine, or counter fires: the silent capacity-loss signature of
 `attach-reconciles-or-refuses-stale-shared-cursors`, reached with no crash.
 Open questions:
 
@@ -2992,8 +3033,8 @@ Open questions:
 
 Type: liveness
 Reachability: default-production — the ring transport is built unconditionally
-(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
-duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+(`crates/mc-host/src/runtime.rs:741`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:117`), so this code is on the
 shipped path. This replaces the test-only, non-default framing in the
 product-context section above, which predates the ring-transport refactor.
 Status: active
@@ -3003,28 +3044,40 @@ Guarantee: Under simultaneous load in both directions, each direction keeps maki
 progress, and once the offered load stops both directions drain.
 Check: `always`, in two arms. Ratio: while both directions are offered
 continuously, neither may complete fewer than one frame per K completions of the
-other, with K derived from `frame_deadline / POLL_INTERVAL` and recorded in the
-test. Bounded drain: stop offering both ways, poll until stable within an explicit
-bound, then require both queues empty, all descriptors free on both rings, and no
-close reported, strictly inside the bound. The stalls below are bounded rather
-than deadlocks, so an unbounded formulation would be both weaker and unrefutable.
+other, with K pinned by the test from its own configuration and recorded in the
+test. The only per-lane stall bound the code enforces is `frame_deadline`: the
+outbound `reserve_until` deadline (`ring_transport.rs:583`, `ring.rs:980`) and
+the inbound sender's admission timeout (`frame_channel.rs:640-652`). The
+former `frame_deadline / POLL_INTERVAL` derivation is void: waits park on
+eventfd doorbells with no retry quantum, and `POLL_INTERVAL` survives only in
+`crates/mc-host/tests/support/process_resources.rs`. Bounded drain: stop
+offering both ways, poll until stable within an explicit bound, then require
+both queues empty, all descriptors free on both rings, and no close reported,
+strictly inside the bound. The stalls below are bounded rather than deadlocks,
+so an unbounded formulation would be both weaker and unrefutable.
 Fault/timing angle: two asymmetric mechanisms, both on one task on one dedicated
-thread with its own current-thread runtime. Outbound blocks inbound: `publish_one`
-is synchronous and spins inside `Ring::reserve_until` with no await point, for up
-to `frame_deadline`, during which no receive runs. Inbound blocks outbound: the
-inbound send is awaited with no timeout and no enclosing select, so it parks until
-the application drains. Neither is infinite: the first ends in an unclean close,
-the second in the sender's own admission timeout.
+thread with its own current-thread runtime. Outbound blocks inbound:
+`publish_one` (`ring_transport.rs:560`, called at `:479` and `:535`) is
+synchronous and parks inside `Ring::reserve_until` on the `capacity_ready`
+doorbell (`ring.rs:1035`) with no await point, for up to `frame_deadline`,
+during which no receive runs. Inbound blocks outbound: the inbound send is
+awaited with no timeout and no enclosing select
+(`ring_transport.rs:551-556`), so it parks until the application drains.
+Neither is infinite: the first ends in an unclean close, the second in the
+sender's own admission timeout.
 Required faults and enabling state: genuine overlap, plus capacity pressure on one
-lane. The peer harness cannot produce overlap today, because its send and receive
-are both synchronous and thread-confined. Coverage marker
+lane. The peer harness cannot produce overlap today: `RingClientEndpoint::send`
+blocks in `reserve_until` (`ring_transport.rs:692`) and `recv` blocks in
+`wait_for_data` (`:710`); `try_recv` (`:718`) is non-blocking, but nothing
+drives send and receive concurrently. Coverage marker
 `shm_both_directions_in_flight`, recorded as `duplex-overlap-is-reached`.
 Confidence: high — [evidence](evidence/neither-direction-starves-the-other.md).
-The comment at `ring_transport.rs:410-414` claims the directions alternate so a peer
-refilling the inbound ring cannot starve responses and close frames. That claim is
-accurate for the case it describes, since every received frame is followed by one
-non-blocking outbound poll and the ingress-budget wait also services outbound, and
-it does not cover either blocking path above.
+The comment at `ring_transport.rs:416-420` claims the directions alternate so a
+peer refilling the inbound ring cannot starve responses and close frames. That
+claim is accurate for the case it describes, since every received frame is
+followed by one non-blocking outbound take (`:421`) and the ingress-budget wait
+also services outbound in its select (`:533-538`), and it does not cover either
+blocking path above.
 Existing check: none. Every shared-memory host test is lockstep: each peer send is
 immediately followed by a peer receive, five times in the main negotiation test.
 The transport's own two-process test is one ring in one direction.
@@ -3091,11 +3144,11 @@ drains the whole prefix, is resolved by direct read of the loop's exits.
 Type: reachability
 Reachability: default-production — the lease-capacity gate is on the shipped
 path, since the ring is built unconditionally
-(`crates/mc-host/src/runtime.rs:876`) and prepared per connection
-(`crates/mc-host/src/connection.rs:148`). The saturated *state* is not
-shipped-reachable: `max_leases` is 8
-(`crates/mc-host/src/ring_transport.rs:32`, `:50`) while a receive holds one
-lease at a time, which is this record's finding.
+(`crates/mc-host/src/runtime.rs:741`) and prepared per connection
+(`crates/mc-host/src/connection.rs:117`). The saturated *state* is not
+shipped-reachable: `max_leases` is `MC_HOST_RING_DEPTH`, 8
+(`crates/mc-shm-transport/src/profile.rs:652`, `:655-670`) while a receive
+holds one lease at a time, which is this record's finding.
 Status: active
 Exercised: not yet — reached once, in one synthetic profile, at a cap of one,
 which cannot distinguish being at the cap from holding one lease.
@@ -3115,7 +3168,11 @@ name as superseded rather than emitting both.
 Fault/timing angle: no race, since one thread-confined receiver both mutates and
 reads the counter. What matters is ordering between the halves: the snapshot must
 be taken at the declining return, not before the last acquire and not after the
-first release.
+first release. The drain half no longer relies on the caller polling again:
+the release that clears the cap signals both the `capacity_ready` and
+`data_ready` doorbells (`ring.rs:1236-1241`), so a consumer parked in
+`wait_for_data` (`:1138`) is woken into the drained state rather than
+discovering it on a later poll.
 Required faults and enabling state: none. A profile whose `max_leases` is
 reachable and strictly greater than one, with `descriptor_depth > max_leases` so
 the extra publication has a slot. The existing lease-limited profile satisfies the
@@ -3124,7 +3181,8 @@ Confidence: high — [evidence](evidence/lease-saturation-is-reached-then-drains
 Both halves are observable in one existing `conservation()` snapshot, so the
 marker needs no new instrumentation, and the shipped host cannot reach the state
 at all: `max_leases` is 8 while `receive_one` holds at most one lease per call,
-releasing it on every path.
+releasing it on every path (`crates/mc-host/src/ring_transport.rs:507-509`,
+`:546-548`, and `Drop` on error returns).
 Existing check: none as a coverage marker. The lease-limit test constructs and
 drains the state at a cap of one, so the situation is reached but not witnessed.
 Impact: without this marker,
@@ -3143,8 +3201,8 @@ Open questions:
 
 Type: reachability
 Reachability: default-production — the ring transport is built unconditionally
-(`crates/mc-host/src/runtime.rs:876`) and every accepted connection prepares a
-duplex ring (`crates/mc-host/src/connection.rs:148`), so this code is on the
+(`crates/mc-host/src/runtime.rs:741`) and every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:117`), so this code is on the
 shipped path. This replaces the test-only, non-default framing in the
 product-context section above, which predates the ring-transport refactor.
 Status: active
@@ -3169,14 +3227,19 @@ completes between the reads, which is why the monotone construction is part of t
 check rather than an implementation note.
 Required faults and enabling state: none; every state observed is one a healthy
 duplex channel occupies constantly. What is required is a peer that can hold
-frames outstanding both ways, which today means independent send and receive
-threads or non-blocking variants.
+frames outstanding both ways. `RingClientEndpoint::try_recv`
+(`crates/mc-host/src/ring_transport.rs:718`) is already non-blocking, but
+`send` still blocks in `reserve_until` up to its deadline (`:692`) and `recv`
+blocks in `wait_for_data` (`:710`), so overlap still needs independent send
+and receive threads or a non-blocking send.
 Confidence: high — [evidence](evidence/duplex-overlap-is-reached.md).
 Every shared-memory host test, the transport's two-process test, and the soak
 harness were read: all are lockstep, single-direction, or resource-counter based.
-That also established that two endpoint-loop paths, the post-receive outbound poll
-and the outbound service inside the ingress-budget wait, are unreachable under the
-existing traffic shape.
+That also established that two endpoint-loop paths, the post-receive outbound
+take (`ring_transport.rs:416-421`) and the outbound service inside the
+ingress-budget wait (`:533-538`), are unreachable under the existing traffic
+shape; under the eventfd mechanism the idle path instead arms the data doorbell
+(`:429`) and parks in the readiness select (`:459`).
 Existing check: none. In the main negotiation test each peer send is immediately
 followed by a peer receive, so two frames are never outstanding in opposite
 directions.
