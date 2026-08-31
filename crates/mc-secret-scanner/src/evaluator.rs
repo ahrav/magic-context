@@ -406,7 +406,7 @@ const SECRET_KEY_WORDS: &[&[u8]] = &[
     b"credentials",
 ];
 
-// KEY_QUALIFIERS limits undelimited `<qualifier><secret word>` matches: `monkey` and `whiskey` do not match because `mon` and `whis` are not qualifiers. `public` is excluded because public keys are not credentials.
+// KEY_QUALIFIERS limits undelimited matches around a secret word: `monkey` and `whiskey` do not match because `mon` and `whis` are not qualifiers, and `keyboard` and `keywords` do not because `board` and `words` are not. `public` is excluded because public keys are not credentials.
 const KEY_QUALIFIERS: &[&[u8]] = &[
     b"access",
     b"admin",
@@ -443,6 +443,26 @@ const KEY_QUALIFIERS: &[&[u8]] = &[
     b"user",
     b"vault",
     b"webhook",
+    b"b64",
+    b"base64",
+    b"data",
+    b"env",
+    b"file",
+    b"hash",
+    b"hashes",
+    b"hex",
+    b"id",
+    b"ids",
+    b"name",
+    b"names",
+    b"path",
+    b"plain",
+    b"prefix",
+    b"ref",
+    b"string",
+    b"text",
+    b"value",
+    b"values",
 ];
 
 fn has_secret_key_token(key: &[u8]) -> bool {
@@ -459,30 +479,32 @@ fn token_matches_key_name(token: &[u8], name: &[u8]) -> bool {
     if token.eq_ignore_ascii_case(name) {
         return true;
     }
-    let Some(prefix_len) = token.len().checked_sub(name.len()) else {
+    let Some(last) = token.len().checked_sub(name.len()) else {
         return false;
     };
-    prefix_len > 0
-        && token[prefix_len..].eq_ignore_ascii_case(name)
-        && prefix_is_qualifiers(&token[..prefix_len])
+    (0..=last).any(|start| {
+        token[start..start + name.len()].eq_ignore_ascii_case(name)
+            && is_qualifier_sequence(&token[..start])
+            && is_qualifier_sequence(&token[start + name.len()..])
+    })
 }
 
-// One undelimited identifier can stack qualifiers, as `AWSSECRETACCESSKEY` stacks three, so the prefix is decomposed rather than compared whole.
-fn prefix_is_qualifiers(prefix: &[u8]) -> bool {
-    let mut reachable = vec![false; prefix.len() + 1];
+// One undelimited identifier can stack qualifiers on either side of the secret word, as `AWSSECRETACCESSKEY` and `PASSWORDHASH` do, and the whole remainder has to decompose so `monkey` and `keyboard` still fail on `mon` and `board`.
+fn is_qualifier_sequence(part: &[u8]) -> bool {
+    let mut reachable = vec![false; part.len() + 1];
     reachable[0] = true;
-    for start in 0..prefix.len() {
+    for start in 0..part.len() {
         if !reachable[start] {
             continue;
         }
         for qualifier in KEY_QUALIFIERS {
             let end = start + qualifier.len();
-            if end <= prefix.len() && prefix[start..end].eq_ignore_ascii_case(qualifier) {
+            if end <= part.len() && part[start..end].eq_ignore_ascii_case(qualifier) {
                 reachable[end] = true;
             }
         }
     }
-    reachable[prefix.len()]
+    reachable[part.len()]
 }
 
 fn key_tokens(key: &[u8]) -> impl Iterator<Item = &[u8]> {
