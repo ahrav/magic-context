@@ -1,0 +1,741 @@
+use regex::bytes::Captures;
+
+use crate::api::REVISION;
+use crate::rules::{
+    EntropySpec, LocalContextSpec, OfflineValidationKind, OfflineValidationSpec, Rule, RuleSet,
+};
+use crate::{Finding, RuleSource, ScanError, ScanLimits, ScanProfile, ScanReport, TextSpan};
+
+pub(crate) fn evaluate(
+    rules: &RuleSet,
+    profile: ScanProfile,
+    limits: ScanLimits,
+    semantic_digest: [u8; 32],
+    input: &str,
+) -> Result<ScanReport, ScanError> {
+    if input.len() > limits.max_input_bytes {
+        return Err(ScanError::InputLimitExceeded);
+    }
+    let bytes = input.as_bytes();
+    let mut findings = Vec::new();
+    let mut candidates = 0usize;
+    let mut work = 0usize;
+
+    for rule in rules.active(profile) {
+        add_work(&mut work, bytes.len(), limits.max_work_bytes)?;
+        for captures in rule.regex.captures_iter(bytes) {
+            candidates = candidates
+                .checked_add(1)
+                .ok_or(ScanError::CandidateLimitExceeded)?;
+            if candidates > limits.max_candidates {
+                return Err(ScanError::CandidateLimitExceeded);
+            }
+            if let Some(finding) =
+                evaluate_candidate(rules, rule, &captures, input, &mut work, limits)?
+            {
+                findings.push(finding);
+            }
+        }
+    }
+    findings.sort_by(|left, right| {
+        (
+            left.full_span.start(),
+            left.value_span.start(),
+            left.rule_source,
+            left.rule_id.as_str(),
+            left.full_span.end(),
+            left.value_span.end(),
+        )
+            .cmp(&(
+                right.full_span.start(),
+                right.value_span.start(),
+                right.rule_source,
+                right.rule_id.as_str(),
+                right.full_span.end(),
+                right.value_span.end(),
+            ))
+    });
+
+    Ok(ScanReport {
+        findings,
+        revision: REVISION,
+        semantic_digest,
+        candidates_evaluated: candidates,
+        work_bytes: work,
+    })
+}
+
+fn evaluate_candidate(
+    rules: &RuleSet,
+    rule: &Rule,
+    captures: &Captures<'_>,
+    input: &str,
+    work: &mut usize,
+    limits: ScanLimits,
+) -> Result<Option<Finding>, ScanError> {
+    let full_match = captures.get(0).ok_or(ScanError::InvalidSpan)?;
+    let value_match = if let Some(name) = rule.declaration.value_group.as_deref() {
+        captures.name(name).ok_or(ScanError::InvalidSpan)?
+    } else if let Some(group) = rule.declaration.secret_group {
+        captures
+            .get(usize::from(group))
+            .filter(|value| !value.is_empty())
+            .or_else(|| first_nonempty_capture(captures))
+            .unwrap_or(full_match)
+    } else {
+        first_nonempty_capture(captures).unwrap_or(full_match)
+    };
+    let key_match = rule
+        .declaration
+        .key_group
+        .as_deref()
+        .and_then(|name| captures.name(name));
+
+    let full_span = TextSpan::new(input, full_match.start(), full_match.end())?;
+    let value_span = TextSpan::new(input, value_match.start(), value_match.end())?;
+    let key_span = key_match
+        .map(|value| TextSpan::new(input, value.start(), value.end()))
+        .transpose()?;
+    if !full_span.contains(value_span) || key_span.is_some_and(|span| !full_span.contains(span)) {
+        return Err(ScanError::InvalidSpan);
+    }
+    let value = input
+        .as_bytes()
+        .get(value_span.start()..value_span.end())
+        .ok_or(ScanError::InvalidSpan)?;
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if let Some(key) = key_match {
+        let key = input
+            .as_bytes()
+            .get(key.start()..key.end())
+            .ok_or(ScanError::InvalidSpan)?;
+        if !has_secret_key_token(key) {
+            return Ok(None);
+        }
+    }
+    if rule.declaration.reject_scalars && is_scalar(value) {
+        return Ok(None);
+    }
+
+    let radius = rule.declaration.radius;
+    let window_start = full_span.start().saturating_sub(radius);
+    let window_end = full_span.end().saturating_add(radius).min(input.len());
+    let window = input
+        .as_bytes()
+        .get(window_start..window_end)
+        .ok_or(ScanError::InvalidSpan)?;
+    add_work(work, window.len(), limits.max_work_bytes)?;
+
+    if let Some(needle) = &rule.declaration.must_contain {
+        if !contains_charged(window, needle.as_bytes(), work, limits)? {
+            return Ok(None);
+        }
+    }
+    if let Some(keywords) = &rule.declaration.keywords_any {
+        let mut matched = false;
+        for key in keywords {
+            matched |= contains_charged(window, key.as_bytes(), work, limits)?;
+        }
+        if !matched {
+            return Ok(None);
+        }
+    }
+    if let Some(values) = &rule.declaration.value_suppressors_any {
+        for item in values {
+            if contains_charged(value, item.as_bytes(), work, limits)? {
+                return Ok(None);
+            }
+        }
+    }
+
+    if let Some(two_phase) = &rule.declaration.two_phase {
+        let seed_start = full_span.start().saturating_sub(two_phase.seed_radius);
+        let seed_end = full_span
+            .end()
+            .saturating_add(two_phase.seed_radius)
+            .min(input.len());
+        let seed = input
+            .as_bytes()
+            .get(seed_start..seed_end)
+            .ok_or(ScanError::InvalidSpan)?;
+        add_work(work, seed.len(), limits.max_work_bytes)?;
+        let mut confirmed = false;
+        for item in &two_phase.confirm_any {
+            confirmed |= contains_charged(seed, item.as_bytes(), work, limits)?;
+        }
+        if !confirmed {
+            return Ok(None);
+        }
+    }
+
+    let char_class = rule.declaration.char_class.as_ref().or_else(|| {
+        rule.declaration
+            .entropy
+            .as_ref()
+            .and_then(|entropy| (entropy.min_bits_per_byte >= 3.0).then_some(&DEFAULT_CHAR_CLASS))
+    });
+    if char_class.is_some_and(|spec| {
+        window.len() >= usize::from(spec.min_window_len)
+            && lowercase_percent(window) > usize::from(spec.max_lower_pct)
+    }) {
+        return Ok(None);
+    }
+
+    let entropy_measured = if let Some(spec) = &rule.declaration.entropy {
+        match entropy_allows(spec, value) {
+            EntropyOutcome::Failed => return Ok(None),
+            EntropyOutcome::Bypassed => false,
+            EntropyOutcome::Passed => true,
+        }
+    } else {
+        false
+    };
+    if rule.source == RuleSource::Upstream
+        && (rules.context_is_safelisted(window)
+            || rules.value_is_safelisted(value)
+            || (!rule.declaration.uuid_format_secret && is_uuid(value)))
+    {
+        return Ok(None);
+    }
+    if rule
+        .declaration
+        .local_context
+        .as_ref()
+        .map(|spec| local_context_allows(spec, input.as_bytes(), value_span, work, limits))
+        .transpose()?
+        .is_some_and(|allowed| !allowed)
+    {
+        return Ok(None);
+    }
+
+    let offline = rule
+        .declaration
+        .offline_validation
+        .as_ref()
+        .map(|spec| offline_verdict(spec, value));
+    if matches!(offline, Some(OfflineVerdict::Invalid)) {
+        return Ok(None);
+    }
+    let mut confidence = 0i8;
+    if entropy_measured {
+        confidence += 1;
+    }
+    if rule.declaration.keywords_any.is_some() {
+        confidence += 2;
+    }
+    if rule.declaration.name == "generic-api-key" {
+        confidence += 2;
+    }
+    if matches!(offline, Some(OfflineVerdict::Valid)) {
+        confidence += 5;
+    }
+    let minimum = rule.declaration.min_confidence.unwrap_or_else(|| {
+        if rule.declaration.name == "generic-api-key" {
+            2
+        } else if rule.declaration.keywords_any.is_some() && rule.declaration.entropy.is_some() {
+            3
+        } else {
+            0
+        }
+    });
+    if confidence < minimum {
+        return Ok(None);
+    }
+
+    Ok(Some(Finding {
+        rule_id: rule.declaration.name.clone(),
+        rule_source: rule.source,
+        full_span,
+        value_span,
+        key_span,
+    }))
+}
+
+fn first_nonempty_capture<'a>(captures: &'a Captures<'a>) -> Option<regex::bytes::Match<'a>> {
+    (1..captures.len()).find_map(|index| captures.get(index).filter(|value| !value.is_empty()))
+}
+
+fn add_work(total: &mut usize, amount: usize, limit: usize) -> Result<(), ScanError> {
+    *total = total
+        .checked_add(amount)
+        .ok_or(ScanError::WorkLimitExceeded)?;
+    if *total > limit {
+        return Err(ScanError::WorkLimitExceeded);
+    }
+    Ok(())
+}
+
+fn contains_charged(
+    haystack: &[u8],
+    needle: &[u8],
+    work: &mut usize,
+    limits: ScanLimits,
+) -> Result<bool, ScanError> {
+    add_work(work, haystack.len(), limits.max_work_bytes)?;
+    Ok(!needle.is_empty() && memchr::memmem::find(haystack, needle).is_some())
+}
+
+fn has_secret_key_token(key: &[u8]) -> bool {
+    const TOKENS: &[&[u8]] = &[
+        b"key",
+        b"keys",
+        b"token",
+        b"tokens",
+        b"secret",
+        b"secrets",
+        b"password",
+        b"passwords",
+        b"auth",
+        b"authorization",
+        b"bearer",
+        b"credential",
+        b"credentials",
+    ];
+    key_tokens(key).any(|token| TOKENS.iter().any(|word| token.eq_ignore_ascii_case(word)))
+}
+
+fn key_tokens(key: &[u8]) -> impl Iterator<Item = &[u8]> {
+    key.split(|byte| !byte.is_ascii_alphanumeric())
+        .flat_map(|part| CamelTokens { remaining: part })
+        .filter(|part| !part.is_empty())
+}
+
+struct CamelTokens<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> Iterator for CamelTokens<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining.is_empty() {
+            return None;
+        }
+        let split = (1..self.remaining.len()).find(|&index| {
+            self.remaining[index].is_ascii_uppercase()
+                && (self.remaining[index - 1].is_ascii_lowercase()
+                    || self
+                        .remaining
+                        .get(index + 1)
+                        .is_some_and(u8::is_ascii_lowercase))
+        });
+        let (token, remaining) = split.map_or((self.remaining, &[][..]), |index| {
+            self.remaining.split_at(index)
+        });
+        self.remaining = remaining;
+        Some(token)
+    }
+}
+
+static DEFAULT_CHAR_CLASS: crate::rules::CharClassSpec = crate::rules::CharClassSpec {
+    max_lower_pct: 95,
+    min_window_len: 32,
+};
+
+fn lowercase_percent(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    bytes
+        .iter()
+        .filter(|byte| byte.is_ascii_lowercase())
+        .count()
+        .saturating_mul(100)
+        / bytes.len()
+}
+
+enum EntropyOutcome {
+    Failed,
+    Bypassed,
+    Passed,
+}
+
+fn entropy_allows(spec: &EntropySpec, value: &[u8]) -> EntropyOutcome {
+    if value.len() < spec.min_len {
+        return EntropyOutcome::Bypassed;
+    }
+    let value = &value[..value.len().min(spec.max_len)];
+    let mut counts = [0usize; 256];
+    for byte in value {
+        counts[usize::from(*byte)] += 1;
+    }
+    let len = value.len() as f32;
+    let mut shannon = 0.0f32;
+    let mut max_count = 0usize;
+    for count in counts.into_iter().filter(|count| *count > 0) {
+        let probability = count as f32 / len;
+        shannon -= probability * probability.log2();
+        max_count = max_count.max(count);
+    }
+    if spec.digit_penalty && value.iter().all(u8::is_ascii_digit) && len > 1.0 {
+        shannon -= 1.2 / len.log2();
+    }
+    if shannon < spec.min_bits_per_byte {
+        return EntropyOutcome::Failed;
+    }
+    if spec
+        .min_entropy_bits_per_byte
+        .is_some_and(|minimum| len.log2() - (max_count as f32).log2() < minimum)
+    {
+        return EntropyOutcome::Failed;
+    }
+    EntropyOutcome::Passed
+}
+
+fn is_scalar(value: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(value) else {
+        return false;
+    };
+    let text = text.trim();
+    if matches!(text, "true" | "false" | "null" | "undefined") {
+        return true;
+    }
+    if text.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let mut index = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let integer_start = index;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+    }
+    if index == integer_start {
+        return false;
+    }
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let fraction_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == fraction_start {
+            return false;
+        }
+    }
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        let exponent_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == exponent_start {
+            return false;
+        }
+    }
+    index == bytes.len()
+}
+
+fn local_context_allows(
+    spec: &LocalContextSpec,
+    input: &[u8],
+    value: TextSpan,
+    work: &mut usize,
+    limits: ScanLimits,
+) -> Result<bool, ScanError> {
+    let start = value.start().saturating_sub(spec.lookbehind);
+    let end = value.end().saturating_add(spec.lookahead).min(input.len());
+    let Some(window) = input.get(start..end) else {
+        return Ok(false);
+    };
+    let value_start = value.start() - start;
+    let value_end = value.end() - start;
+    if spec.require_quoted {
+        let quoted = value_start
+            .checked_sub(1)
+            .and_then(|before| window.get(before).copied())
+            .zip(window.get(value_end).copied())
+            .is_some_and(|(left, right)| left == right && matches!(left, b'\'' | b'"' | b'`'));
+        if !quoted {
+            return Ok(false);
+        }
+    }
+    let line_start = window[..value_start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let before = &window[line_start..value_start];
+    if spec.require_same_line_assignment
+        && !before.iter().any(|byte| matches!(byte, b'=' | b':' | b'>'))
+    {
+        return Ok(false);
+    }
+    if let Some(keys) = &spec.key_names_any {
+        for key in keys {
+            if contains_charged(before, key.as_bytes(), work, limits)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn is_uuid(value: &[u8]) -> bool {
+    value.len() == 36
+        && value.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23) && *byte == b'-'
+                || !matches!(index, 8 | 13 | 18 | 23) && byte.is_ascii_hexdigit()
+        })
+}
+
+#[derive(Clone, Copy)]
+enum OfflineVerdict {
+    Valid,
+    Invalid,
+    Indeterminate,
+}
+
+fn offline_verdict(spec: &OfflineValidationSpec, value: &[u8]) -> OfflineVerdict {
+    match spec.kind {
+        OfflineValidationKind::Crc32Base62 => {
+            let (Some(skip), Some(payload_len), Some(checksum_len)) =
+                (spec.prefix_skip, spec.payload_len, spec.checksum_len)
+            else {
+                return OfflineVerdict::Indeterminate;
+            };
+            validate_crc32_base62(
+                value,
+                usize::from(skip),
+                usize::from(payload_len),
+                usize::from(checksum_len),
+            )
+        }
+        OfflineValidationKind::GithubFineGrainedPat => {
+            if value.len() < 93 || !value.starts_with(b"github_pat_") {
+                OfflineVerdict::Indeterminate
+            } else {
+                crc_verdict(&value[..87], &value[87..93])
+            }
+        }
+        OfflineValidationKind::GrafanaServiceAccount => {
+            if value.len() < 46 || !value.starts_with(b"glsa_") || value.get(37) != Some(&b'_') {
+                OfflineVerdict::Indeterminate
+            } else {
+                match parse_hex_u32(&value[38..46]) {
+                    Some(expected) if crc32(&value[..37]) == expected => OfflineVerdict::Valid,
+                    Some(_) => OfflineVerdict::Invalid,
+                    None => OfflineVerdict::Indeterminate,
+                }
+            }
+        }
+        OfflineValidationKind::AwsAccessKey => validate_aws(value),
+        OfflineValidationKind::SentryOrgToken => validate_sentry(value),
+        OfflineValidationKind::PypiToken => validate_pypi(value),
+        OfflineValidationKind::SlackToken => validate_slack(value),
+    }
+}
+
+fn validate_crc32_base62(
+    value: &[u8],
+    skip: usize,
+    payload: usize,
+    checksum: usize,
+) -> OfflineVerdict {
+    let Some(required) = skip
+        .checked_add(payload)
+        .and_then(|size| size.checked_add(checksum))
+    else {
+        return OfflineVerdict::Indeterminate;
+    };
+    let Some(body) = value.get(skip..skip + payload) else {
+        return OfflineVerdict::Indeterminate;
+    };
+    let Some(encoded) = value.get(skip + payload..required) else {
+        return OfflineVerdict::Indeterminate;
+    };
+    match base62_u32(encoded) {
+        Some(expected) if crc32(body) == expected => OfflineVerdict::Valid,
+        Some(_) => OfflineVerdict::Invalid,
+        None => OfflineVerdict::Indeterminate,
+    }
+}
+
+fn crc_verdict(body: &[u8], encoded: &[u8]) -> OfflineVerdict {
+    match base62_u32(encoded) {
+        Some(expected) if crc32(body) == expected => OfflineVerdict::Valid,
+        Some(_) => OfflineVerdict::Invalid,
+        None => OfflineVerdict::Indeterminate,
+    }
+}
+
+fn base62_u32(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0u64;
+    for byte in bytes {
+        let digit = match byte {
+            b'0'..=b'9' => u64::from(byte - b'0'),
+            b'A'..=b'Z' => u64::from(byte - b'A' + 10),
+            b'a'..=b'z' => u64::from(byte - b'a' + 36),
+            _ => return None,
+        };
+        value = value.checked_mul(62)?.checked_add(digit)?;
+    }
+    u32::try_from(value).ok()
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+fn parse_hex_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() != 8 {
+        return None;
+    }
+    let mut value = 0u32;
+    for byte in bytes {
+        let digit = match byte {
+            b'0'..=b'9' => u32::from(byte - b'0'),
+            b'a'..=b'f' => u32::from(byte - b'a' + 10),
+            b'A'..=b'F' => u32::from(byte - b'A' + 10),
+            _ => return None,
+        };
+        value = value.checked_mul(16)?.checked_add(digit)?;
+    }
+    Some(value)
+}
+
+fn validate_aws(value: &[u8]) -> OfflineVerdict {
+    if value.len() < 20 {
+        return OfflineVerdict::Indeterminate;
+    }
+    let key = &value[..20];
+    if !(key.starts_with(b"AKIA")
+        || key.starts_with(b"ASIA")
+        || key.starts_with(b"ABIA")
+        || key.starts_with(b"ACCA")
+        || key.starts_with(b"A3T"))
+    {
+        return OfflineVerdict::Indeterminate;
+    }
+    if key[4..]
+        .iter()
+        .all(|byte| byte.is_ascii_uppercase() || (b'2'..=b'7').contains(byte))
+    {
+        OfflineVerdict::Valid
+    } else {
+        OfflineVerdict::Invalid
+    }
+}
+
+fn validate_sentry(value: &[u8]) -> OfflineVerdict {
+    if !value.starts_with(b"sntrys_") {
+        return OfflineVerdict::Indeterminate;
+    }
+    let body = &value[7..];
+    let Some(separator) = body.iter().rposition(|byte| *byte == b'_') else {
+        return OfflineVerdict::Indeterminate;
+    };
+    if body.len().saturating_sub(separator + 1) < 43 {
+        return OfflineVerdict::Indeterminate;
+    }
+    if base64_prefix(&body[..separator], b"{\"iat\":") {
+        OfflineVerdict::Valid
+    } else {
+        OfflineVerdict::Invalid
+    }
+}
+
+fn validate_pypi(value: &[u8]) -> OfflineVerdict {
+    const HEADER: &[u8] = b"\x02\x01\x08pypi.org\x02";
+    if !value.starts_with(b"pypi-") || value.len() < 21 {
+        return OfflineVerdict::Indeterminate;
+    }
+    if base64url_prefix(&value[5..], HEADER) {
+        OfflineVerdict::Valid
+    } else {
+        OfflineVerdict::Invalid
+    }
+}
+
+fn validate_slack(value: &[u8]) -> OfflineVerdict {
+    if value.len() < 10 {
+        return OfflineVerdict::Indeterminate;
+    }
+    let prefix = &value[..4];
+    if value.get(4) != Some(&b'-') && !value.starts_with(b"xoxe.xox") {
+        return OfflineVerdict::Indeterminate;
+    }
+    if matches!(
+        prefix,
+        b"xoxb" | b"xoxp" | b"xoxo" | b"xoxs" | b"xoxa" | b"xoxr"
+    ) || prefix.eq_ignore_ascii_case(b"xapp")
+        || prefix.eq_ignore_ascii_case(b"xoxe")
+    {
+        OfflineVerdict::Valid
+    } else {
+        OfflineVerdict::Indeterminate
+    }
+}
+
+fn base64_prefix(input: &[u8], prefix: &[u8]) -> bool {
+    decode_prefix(input, prefix, false)
+}
+
+fn base64url_prefix(input: &[u8], prefix: &[u8]) -> bool {
+    decode_prefix(input, prefix, true)
+}
+
+fn decode_prefix(input: &[u8], prefix: &[u8], url: bool) -> bool {
+    let mut bits = 0u32;
+    let mut bit_count = 0u8;
+    let mut output = 0usize;
+    for byte in input {
+        let value = match byte {
+            b'A'..=b'Z' => u32::from(byte - b'A'),
+            b'a'..=b'z' => u32::from(byte - b'a' + 26),
+            b'0'..=b'9' => u32::from(byte - b'0' + 52),
+            b'+' if !url => 62,
+            b'/' if !url => 63,
+            b'-' if url => 62,
+            b'_' if url => 63,
+            b'=' if !url => continue,
+            _ => return false,
+        };
+        bits = (bits << 6) | value;
+        bit_count += 6;
+        while bit_count >= 8 {
+            bit_count -= 8;
+            let decoded = (bits >> bit_count) as u8;
+            if prefix.get(output) != Some(&decoded) {
+                return false;
+            }
+            output += 1;
+            if output == prefix.len() {
+                return true;
+            }
+            bits &= (1u32 << bit_count) - 1;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalar_classifier_is_closed() {
+        for scalar in ["0", "-1.5", "+2e10", "true", "false", "null", "undefined"] {
+            assert!(is_scalar(scalar.as_bytes()));
+        }
+        for secret in ["", "12x", "hunter2", "true-blue"] {
+            assert!(!is_scalar(secret.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn crc32_matches_standard_vector() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
+}

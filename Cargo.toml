@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mc-core", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer", "crates/mc-shm-transport", "packages/mc-shm-native"]
+members = ["crates/mc-core", "crates/mc-secret-scanner", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer", "crates/mc-shm-transport", "packages/mc-shm-native"]
 # The evidence probe depends on the PUBLISHED subc crates from crates.io rather than the
 # sibling sources, so it must never join this workspace's dependency graph.
 # The cargo-fuzz workspace under crates/mc-shm-transport/fuzz declares its own
@@ -19,6 +19,7 @@ cortexkit-lease = { path = "../commons/crates/cortexkit-lease" }
 
 # Internal crates.
 mc-core = { path = "crates/mc-core" }
+mc-secret-scanner = { path = "crates/mc-secret-scanner" }
 mc-store = { path = "crates/mc-store" }
 
 # Third-party. rusqlite pinned to the same version+features cortexkit-store uses so
@@ -34,3 +35,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 rusqlite = { version = "0.39", features = ["bundled"] }
 regex = "1"
 sha2 = "0.10"
+serde_norway = "0.9.42"
