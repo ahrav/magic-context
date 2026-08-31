@@ -761,7 +761,6 @@ impl Envelope<'_> {
         prepared: PreparedDecision,
         materialized: Option<ObjectRow>,
     ) -> Result<AdmissionDecision, KernelError> {
-        let latest_key = prepared.facts.key();
         let latest = StoredAdmission {
             decision: PriorDecision {
                 historical_maturity: prepared.evaluation.historical_maturity,
@@ -804,6 +803,16 @@ impl Envelope<'_> {
             .as_ref()
             .map(|object| object.object_id.clone())
             .or(prepared.facts.subject_object_id.clone());
+        // Materialization moves the decision from the source key to the new
+        // object, so the cache key has to follow the row that is written.
+        let latest_key = subject_object_id.clone().map_or_else(
+            || AdmissionKey::Source {
+                kind: prepared.facts.source_kind.clone(),
+                id: prepared.facts.source_id.clone(),
+                revision: prepared.facts.source_revision,
+            },
+            AdmissionKey::Object,
+        );
         self.tx
             .execute(
                 "INSERT INTO admission_decisions(
@@ -884,19 +893,6 @@ impl Envelope<'_> {
             sensitivity: prepared.evaluation.sensitivity,
             outcome: prepared.evaluation.outcome,
         })
-    }
-}
-
-impl SubjectFacts {
-    fn key(&self) -> AdmissionKey {
-        self.subject_object_id.as_ref().map_or_else(
-            || AdmissionKey::Source {
-                kind: self.source_kind.clone(),
-                id: self.source_id.clone(),
-                revision: self.source_revision,
-            },
-            |object_id| AdmissionKey::Object(object_id.clone()),
-        )
     }
 }
 
