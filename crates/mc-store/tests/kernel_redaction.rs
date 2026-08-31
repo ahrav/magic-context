@@ -772,3 +772,76 @@ fn a_secret_bearing_candidate_is_not_replayed_from_a_lossy_payload() {
     let first = store.stage_candidate(clean.clone()).unwrap();
     assert_eq!(store.stage_candidate(clean).unwrap(), first);
 }
+
+#[test]
+fn opening_a_store_strips_a_legacy_pre_redaction_digest() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut clean = shared_run_candidate("candidate-legacy", 1);
+    clean.payload = "no secret here".to_string();
+    let staged = store.stage_candidate(clean.clone()).unwrap();
+    drop(store);
+
+    // Recreate the parent build's `{request_digest, detections}` shape.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            r#"UPDATE candidates
+               SET redaction_metadata=CAST('{"request_digest":"deadbeefdeadbeef","detections":[]}' AS BLOB)"#,
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = KernelStore::open(directory.path()).unwrap();
+    let metadata: Vec<u8> = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row("SELECT redaction_metadata FROM candidates", [], |row| {
+        row.get(0)
+    })
+    .unwrap();
+    let blob = String::from_utf8_lossy(&metadata);
+    assert!(
+        !blob.contains("request_digest") && !blob.contains("deadbeef"),
+        "opening must rewrite the legacy verifier, got {blob}"
+    );
+    assert_eq!(blob.trim(), "[]", "the detection array survives");
+
+    // The legacy blob must not cost a detection-free candidate its replay.
+    assert_eq!(
+        store.stage_candidate(clean).unwrap(),
+        staged,
+        "a detection-free candidate stays replayable after the rewrite"
+    );
+}
+
+#[test]
+fn a_changed_candidate_kind_is_not_an_idempotent_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut original = shared_run_candidate("candidate-kind", 1);
+    original.candidate_kind = "observation".to_string();
+    store.stage_candidate(original).unwrap();
+
+    let mut retyped = shared_run_candidate("candidate-kind", 2);
+    retyped.candidate_kind = "proposition".to_string();
+    assert_eq!(
+        store.stage_candidate(retyped).unwrap_err(),
+        KernelError::Conflict,
+        "a different candidate_kind is not the same request"
+    );
+    assert_eq!(
+        Connection::open_with_flags(
+            directory.path().join("core.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row("SELECT candidate_kind FROM candidates", [], |row| row
+            .get::<_, String>(0))
+        .unwrap(),
+        "observation"
+    );
+}
