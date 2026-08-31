@@ -300,9 +300,22 @@ impl KernelStore {
                 staged.consume();
                 true
             }
-            // The destination holds the object but the temp link survived, so the
-            // guard stays armed to retry its removal on scope exit.
-            Ok(PublishOutcome::PublishedTempRetained) => true,
+            // A retained temp link makes the object's link count two, which
+            // `verify_object` rejects.
+            Ok(PublishOutcome::PublishedTempRetained) => {
+                if let Err(error) = durable_unlink(&tmp, &temp_name) {
+                    let mapped = self.map_storage_error(error);
+                    self.cleanup_failed_reference(
+                        &mut writer,
+                        &reservation_id,
+                        &prepared.digest,
+                        true,
+                    );
+                    return Err(mapped);
+                }
+                staged.consume();
+                true
+            }
             Ok(PublishOutcome::AlreadyExists) => {
                 if let Err(error) = durable_unlink(&tmp, &temp_name) {
                     let mapped = self.map_storage_error(error);
