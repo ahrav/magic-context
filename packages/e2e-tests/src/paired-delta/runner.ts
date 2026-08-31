@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
 import { HoldoutContractError } from "../prospective-holdout/contract";
-import { acquireRecoverableLock } from "../prospective-holdout/lock";
+import { acquireRecoverableLock, lockHeldByThisProcess } from "../prospective-holdout/lock";
 import {
     ARM_IDS,
     PRIMARY_ARM_IDS,
@@ -374,6 +374,14 @@ export class FileRolloutStore implements RolloutStore {
             throw new Error(`rollout store ${this.path} was opened read-only`);
         }
         this.acquire();
+        /** Ownership is re-proved at the write rather than assumed from acquisition. Reclaiming an expired lock cannot be made atomic against a concurrent reclaimer, so the lock is treated as advisory here: publishing a whole-file snapshot is the operation that would erase another runner's paid records, and it refuses rather than proceeding on a claim this process may no longer hold. commentlint: allow(JUDGE) */
+        if (!lockHeldByThisProcess(this.lockPath)) {
+            this.held = null;
+            ownedRecordPaths.delete(this.claim);
+            throw new RolloutStoreBusyError(
+                `rollout store ${this.path} lock was taken over by another owner`,
+            );
+        }
         const records = this.load();
         const key = coordinateKey(record);
         const index = this.indexByCoordinate.get(key);
@@ -926,6 +934,10 @@ function completedRecord(
             runHealth = "malformed";
         }
     }
+    /** Usage the provider never reported cannot be priced, so an unusable counter falls back to the same worst-case reserve a crashed rollout is charged. commentlint: allow(JUDGE) */
+    const costUsd = usage === null || observedCostUsd === null
+        ? Math.max(reserveUsd, worstCaseUsd(scenario, options.pricesPerMillionTokens))
+        : observedCostUsd;
     const applicableCritical = new Set(scenario.criticalCheckIds);
     const checksPassed = checks.filter(({ passed }) => passed).length;
     const criticalPassed = checks.filter(
@@ -961,12 +973,10 @@ function completedRecord(
         },
         checks,
         usage: usage ?? ZERO_USAGE,
-        /** Usage the provider never reported cannot be priced, so an unusable counter falls back to the same worst-case reserve a crashed rollout is charged. commentlint: allow(JUDGE) */
-        costUsd: usage === null || observedCostUsd === null
-            ? Math.max(reserveUsd, worstCaseUsd(scenario, options.pricesPerMillionTokens))
-            : observedCostUsd,
+        costUsd,
         priorAttemptsCostUsd,
-        maxAttemptCostUsd: Math.max(priorMaxAttemptCostUsd, observedCostUsd ?? 0),
+        /** The record's own cost, not the rejected `observedCostUsd`: a price that overflowed is the reason `usage` is null, and storing `Infinity` here would serialize as `null` and fail the next resume's parse. commentlint: allow(JUDGE) */
+        maxAttemptCostUsd: Math.max(priorMaxAttemptCostUsd, costUsd),
         costSource: usage === null ? "estimated" : "observed",
         wallClockMs,
         turns: Number.isSafeInteger(observation.turns) && observation.turns >= 0
@@ -1171,6 +1181,9 @@ async function disposeLateHandle(creation: Promise<RolloutHandle>): Promise<bool
     }
 }
 
+/** `setTimeout` truncates a delay past the 32-bit millisecond limit and fires almost immediately, so a legitimate deadline more than about 24.8 days out would record the first rollout as `deadline-exceeded`. The wait is therefore chunked: each timer is clamped, and only the round that exhausts the budget rejects. commentlint: allow(JUDGE) */
+const TIMER_MAX_MS = 2_147_483_647;
+
 async function withRolloutDeadline<T>(
     work: () => Promise<T>,
     remainingMs: number,
@@ -1181,12 +1194,21 @@ async function withRolloutDeadline<T>(
         return await Promise.race([
             pending,
             new Promise<never>((_, reject) => {
-                timer = setTimeout(
-                    () => reject(new RolloutDeadlineError(
-                        `rollout still in flight after the ${remainingMs}ms deadline budget`,
-                    )),
-                    remainingMs,
-                );
+                let left = remainingMs;
+                const arm = (): void => {
+                    const chunk = Math.min(left, TIMER_MAX_MS);
+                    left -= chunk;
+                    timer = setTimeout(() => {
+                        if (left > 0) {
+                            arm();
+                            return;
+                        }
+                        reject(new RolloutDeadlineError(
+                            `rollout still in flight after the ${remainingMs}ms deadline budget`,
+                        ));
+                    }, chunk);
+                };
+                arm();
             }),
         ]);
     } finally {

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HoldoutContractError } from "./contract";
 
@@ -122,7 +122,30 @@ export function takeOverLock(lock: string, judged: LockAbandonment): void {
         // A `renameSync` error makes `takeOverLock` return without deleting `lock`.
         return;
     }
+    // `rename` moves whatever occupies the path, and a live owner can replace the judged
+    // lock between the check above and that move. Re-reading the moved directory is what
+    // distinguishes the two: a foreign owner's lock is put back rather than deleted, and
+    // `link` refuses an occupied destination so a third claimant is not overwritten either.
+    if (!sameLockOwner(readLockOwner(sideline), judged.owner)) {
+        try {
+            linkSync(join(sideline, LOCK_OWNER_FILE), join(lock, LOCK_OWNER_FILE));
+        } catch {
+            try {
+                renameSync(sideline, lock);
+                return;
+            } catch {
+                // The path is occupied again, so the mover keeps nothing and deletes nothing.
+            }
+        }
+        rmSync(sideline, { recursive: true, force: true });
+        return;
+    }
     rmSync(sideline, { recursive: true, force: true });
+}
+
+/** True when `lock` still carries this process's claim. A holder that intends to act on a lock reads it again rather than trusting acquisition, because reclamation of an expired lock cannot be made atomic against a concurrent reclaimer. */
+export function lockHeldByThisProcess(lock: string): boolean {
+    return readLockOwner(lock)?.nonce === LOCK_NONCE;
 }
 
 /**

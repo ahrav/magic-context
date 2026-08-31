@@ -110,7 +110,8 @@ function smokeRepoCommit(recordsPath: string): string {
     /** Untracked contents are hashed as raw bytes: decoding to UTF-8 first maps distinct binary payloads onto the same replacement character, and `git status` cannot tell them apart either while `git diff HEAD` omits untracked files entirely. commentlint: allow(JUDGE) */
     const parts: Uint8Array[] = [
         Buffer.from(status, "utf8"),
-        Buffer.from(git(["diff", "HEAD", "--", ...scope]), "utf8"),
+        /** `--binary` because a plain diff reduces a modified binary file to a stable `Binary files … differ` line, so its bytes could change while the digest did not. commentlint: allow(JUDGE) */
+        Buffer.from(git(["diff", "--binary", "HEAD", "--", ...scope]), "utf8"),
     ];
     for (const path of untracked) {
         parts.push(Buffer.from(`${path}\n`, "utf8"));

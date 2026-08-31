@@ -204,6 +204,21 @@ describe("opencode child lifecycle", () => {
                 })
             ).toThrow(/projectMagicContextConfig\.hook\.token/);
 
+            // A value with a `toJSON()` hook exposes no enumerable fields to the
+            // walk and then serializes into the credential it was hiding.
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                    openCodeConfigExtra: {
+                        provider: {
+                            anthropic: {
+                                baseURL: new URL("https://user:hunter2@host.internal"),
+                            },
+                        },
+                    },
+                })
+            ).toThrow(/credential-bearing URI value at/);
+
             // An ordinary header value still passes.
             expect(() =>
                 __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {

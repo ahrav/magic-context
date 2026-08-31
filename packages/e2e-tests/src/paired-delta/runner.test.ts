@@ -1024,6 +1024,91 @@ describe("paired-delta runner", () => {
         );
     });
 
+    it("keeps an overflowing price out of the persisted attempt maximum", async () => {
+        const store = new MemoryStore();
+        // Prices whose worst-case estimate is finite, so the run is admitted, but
+        // whose product with a safe counter is not.
+        const result = await runPairedDelta(
+            {
+                ...options(store),
+                // Large enough that the earlier arms' own costs do not trip the cap
+                // before mc-off runs.
+                maxCostUsd: 1e308,
+                pricesPerMillionTokens: {
+                    input: 1e300,
+                    output: 0,
+                    cacheCreation: 0,
+                    cacheRead: 0,
+                },
+            },
+            dependencies((armId) => {
+                const value = observation(armId);
+                if (armId === "mc-off") {
+                    value.usage = { ...value.usage, input: Number.MAX_SAFE_INTEGER };
+                }
+                return value;
+            }),
+        );
+        const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+        expect(malformed?.cell.reasonCode).toBe("invalid-result");
+        // `Infinity` here serializes as `null` and fails the next resume's parse.
+        expect(Number.isFinite(malformed?.maxAttemptCostUsd)).toBe(true);
+        expect(malformed?.maxAttemptCostUsd).toBe(malformed?.costUsd);
+        // The next resume has to be able to parse what this run wrote.
+        expect(JSON.stringify(store.records)).not.toContain("null,\"costSource\"");
+    });
+
+    it("honours a deadline beyond the timer limit", async () => {
+        const result = await runPairedDelta(
+            // Past the 32-bit millisecond limit, which `setTimeout` truncates to
+            // fire almost immediately.
+            { ...options(), deadlineEpochMs: Date.now() + 2_147_483_647 + 60_000 },
+            {
+                now: Date.now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            // Long enough that a truncated timer would win the race.
+                            await new Promise((resolve) => setTimeout(resolve, 50));
+                            return observation(coordinate.armId);
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("completed");
+        expect(result.records.map(({ armId }) => armId)).toEqual([
+            "mc-on",
+            "mc-off",
+            "compaction",
+        ]);
+    }, 20_000);
+
+    it("refuses to publish once its lock has been taken over", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-fence-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            store.list();
+            // Another owner's record in place of ours, which is what a lost
+            // takeover race leaves behind.
+            writeFileSync(
+                join(`${path}.lock`, LOCK_OWNER_FILE),
+                `${JSON.stringify({ pid: process.pid, nonce: "foreign", acquiredAt: Date.now() })}\n`,
+            );
+
+            // Publishing a whole-file snapshot is what would erase the other
+            // runner's records, so it refuses rather than proceeding.
+            expect(() => store.put({} as unknown as RolloutRecord))
+                .toThrow(RolloutStoreBusyError);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("classifies a malformed check vector as an exclusion and continues", async () => {
         const result = await runPairedDelta(
             options(),

@@ -160,6 +160,8 @@ const TOKEN_COUNTING_QUALIFIERS = [
     "num",
     "idle",
     "ideal",
+    /** Named from this repository's own settings: `execute_threshold_tokens`, `injection_budget_tokens`, `max_input_tokens`. A tuning field rejected as a credential blocks the spawn outright. commentlint: allow(JUDGE) */
+    "threshold",
 ];
 
 /** `key` names a position in a data structure as often as a credential, and these qualifiers only ever mean the former. Kept closed and structural: anything not named here is treated as a credential, because a refused spawn is visible and a written credential is not. */

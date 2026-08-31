@@ -265,6 +265,10 @@ function writeConfigs(
  * than by recognition.
  */
 function assertConfigHasNoCredentials(value: unknown, label: string): void {
+    /** The guard walks what will be written, not what was passed: a value with a `toJSON()` hook — `new URL("https://user:pw@host")` — exposes no enumerable fields to `Object.entries` and then serializes into the credential the value scan exists to catch. A cyclic config throws here, which is the same refusal the write would have produced. commentlint: allow(JUDGE) */
+    const serialized: unknown = value === undefined
+        ? undefined
+        : JSON.parse(JSON.stringify(value)) as unknown;
     const seen = new WeakSet<object>();
     const visit = (current: unknown, path: string): void => {
         if (current === null || typeof current !== "object" || seen.has(current)) return;
@@ -289,7 +293,7 @@ function assertConfigHasNoCredentials(value: unknown, label: string): void {
             visit(child, childPath);
         }
     };
-    visit(value, label);
+    visit(serialized, label);
 }
 
 /**
