@@ -1419,3 +1419,77 @@ fn purging_after_a_completed_delete_barrier_mints_a_new_barrier() {
         "the purge committed its intent but left the artifact bytes in place"
     );
 }
+
+#[test]
+fn a_purge_identity_is_validated_before_its_intent_is_durable() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "identity-gate", b"identity-gate");
+    let log = root.path().join("purge-intent.jsonl");
+    let before = fs::read_to_string(&log).unwrap_or_default();
+
+    for mutate in [
+        (|request: &mut ArtifactDeletionRequest| request.intent.producer = String::new())
+            as fn(&mut ArtifactDeletionRequest),
+        |request: &mut ArtifactDeletionRequest| request.intent.operation_key = String::new(),
+        |request: &mut ArtifactDeletionRequest| {
+            request.intent.producer = "producer AKIAIOSFODNN7EXAMPLE".to_string();
+        },
+        |request: &mut ArtifactDeletionRequest| {
+            request.intent.operation_key = "key AKIAIOSFODNN7EXAMPLE".to_string();
+        },
+    ] {
+        let mut request =
+            delete_request("identity-gate", &handle.digest, ArtifactDeletionKind::Purge);
+        mutate(&mut request);
+        assert_eq!(
+            store.delete_artifact(request).unwrap_err().kind(),
+            ArtifactErrorKind::InvalidInput
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap_or_default(),
+            before,
+            "a rejected purge left a durable intent behind"
+        );
+    }
+
+    assert!(object_path(root.path(), &handle.digest).exists());
+}
+
+#[test]
+fn a_purge_retires_an_expired_live_reservation() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "stranded", b"stranded");
+
+    // A crash between the replayed-classification commit and the best-effort
+    // release leaves a `Live` reservation whose lease has since expired.
+    inspect(root.path())
+        .execute(
+            "INSERT INTO artifact_ingestion_reservations(
+                 reservation_id,artifact_digest,artifact_reference,state,writer_epoch,
+                 created_at,heartbeat_at,lease_expires_at
+             ) VALUES ('stranded-reservation',?1,?2,'Live',1,1,1,2)",
+            rusqlite::params![
+                handle.digest,
+                format!("objects/{}/{}", &handle.digest[..2], &handle.digest[2..])
+            ],
+        )
+        .unwrap();
+
+    let purge = store
+        .delete_artifact(delete_request(
+            "stranded",
+            &handle.digest,
+            ArtifactDeletionKind::Purge,
+        ))
+        .unwrap();
+
+    assert_eq!(purge.digest, handle.digest);
+    assert!(
+        !object_path(root.path(), &handle.digest).exists(),
+        "the stranded reservation blocked the purge tombstone"
+    );
+}

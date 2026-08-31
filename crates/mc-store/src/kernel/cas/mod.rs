@@ -289,6 +289,10 @@ impl KernelStore {
     /// A same-UID process can replace `artifacts` or `objects` with a symlink
     /// after the store is open, so neither is trusted as a path component.
     pub(super) fn open_objects_directory(&self) -> Result<File, StorageError> {
+        self.open_artifacts_subdirectory("objects")
+    }
+
+    pub(super) fn open_artifacts_subdirectory(&self, name: &str) -> Result<File, StorageError> {
         let Some(store_root) = self.artifacts_path.parent() else {
             return Err(classify_io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -297,7 +301,7 @@ impl KernelStore {
         };
         let root = File::open(store_root).map_err(classify_io)?;
         let artifacts = open_secure_directory(&root, "artifacts")?;
-        open_secure_directory(&artifacts, "objects")
+        open_secure_directory(&artifacts, name)
     }
 
     pub(super) fn cas_is_failed(&self) -> bool {

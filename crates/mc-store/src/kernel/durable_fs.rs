@@ -64,7 +64,7 @@ pub(super) fn classify_io(source: io::Error) -> StorageError {
     }
 }
 
-fn classify_errno(source: rustix::io::Errno) -> StorageError {
+pub(super) fn classify_errno(source: rustix::io::Errno) -> StorageError {
     classify_io(io::Error::from(source))
 }
 

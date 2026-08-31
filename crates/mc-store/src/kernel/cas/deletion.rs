@@ -1,17 +1,17 @@
-use std::fs::{self, File};
-
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rustix::fs::{self as rfs, AtFlags};
 use serde::Serialize;
 
 use super::MAX_TEXT_FIELD_BYTES;
 use super::{is_artifact_digest, ArtifactError, ArtifactErrorKind};
 use crate::kernel::durable_fs::{
-    append_and_sync, classify_io, durable_unlink, open_secure_directory, StorageError,
+    append_and_sync, classify_errno, classify_io, durable_unlink, open_secure_directory,
+    StorageError,
 };
 use crate::kernel::envelope::{
     check_fence, commit_with_writer, CommitIntent, ObjectRow, PendingChange, Sensitivity,
 };
-use crate::kernel::redaction::{redact, RedactedField};
+use crate::kernel::redaction::{identity, redact, RedactedField};
 use crate::kernel::{KernelError, KernelStore};
 
 const PROPAGATION_TARGETS: [&str; 4] = [
@@ -287,6 +287,17 @@ impl KernelStore {
                     deleted_at,
                 )?;
                 if kind == ArtifactDeletionKind::Purge {
+                    // A reservation whose lease has expired can outlive the ingest that
+                    // created it, and an unexpired one still blocks the tombstone.
+                    envelope
+                        .tx
+                        .execute(
+                            "DELETE FROM artifact_ingestion_reservations
+                             WHERE state='Live' AND lease_expires_at<=?1
+                               AND (artifact_digest=?2 OR artifact_reference=?3)",
+                            params![deleted_at, digest, artifact_reference],
+                        )
+                        .map_err(|_| KernelError::Io)?;
                     envelope
                         .tx
                         .execute(
@@ -440,23 +451,23 @@ impl KernelStore {
     }
 
     pub(super) fn sweep_digest_temps(&self, digest: &str) -> Result<(), StorageError> {
-        let tmp_path = self.artifacts_path.join("tmp");
-        let tmp = File::open(&tmp_path).map_err(classify_io)?;
+        let tmp = self.open_artifacts_subdirectory("tmp")?;
         let prefix = format!(".artifact-{digest}-");
-        for entry in fs::read_dir(&tmp_path).map_err(classify_io)? {
-            let entry = entry.map_err(classify_io)?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        for entry in rfs::Dir::read_from(&tmp).map_err(classify_errno)? {
+            let entry = entry.map_err(classify_errno)?;
+            let Some(name) = entry.file_name().to_str().ok().map(str::to_owned) else {
                 continue;
             };
             if !name.starts_with(&prefix) {
                 continue;
             }
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(classify_io(error)),
+            let stat = match rfs::statat(&tmp, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(error) => return Err(classify_errno(error)),
             };
-            if file_type.is_file() || file_type.is_symlink() {
+            let kind = rfs::FileType::from_raw_mode(stat.st_mode);
+            if kind.is_file() || kind.is_symlink() {
                 durable_unlink(&tmp, &name)?;
             }
         }
@@ -543,9 +554,14 @@ fn validate_request(request: &ArtifactDeletionRequest) -> Result<(), ArtifactErr
     if request.deleted_at < 0 {
         return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
     }
-    // The commit rejects a malformed request digest, which would otherwise happen
-    // after the purge intent is already durable.
     if !is_artifact_digest(&request.intent.request_digest) {
+        return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
+    }
+    if request.intent.producer.trim().is_empty()
+        || request.intent.operation_key.trim().is_empty()
+        || identity(&request.intent.producer).is_err()
+        || identity(&request.intent.operation_key).is_err()
+    {
         return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
     }
     if request.kind == ArtifactDeletionKind::Purge {

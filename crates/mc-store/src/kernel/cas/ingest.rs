@@ -15,7 +15,7 @@ use super::{
 };
 use crate::current_time_ms;
 use crate::kernel::durable_fs::{
-    classify_io, create_new_file, durable_unlink, open_or_create_secure_directory,
+    classify_errno, create_new_file, durable_unlink, open_or_create_secure_directory,
     open_regular_nofollow, publish_noreplace_between_locked, sync_directory,
     sync_publish_directories_with, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
@@ -843,10 +843,6 @@ fn verify_object(shard: &File, name: &str, digest: &str) -> Result<(), ArtifactE
     Ok(())
 }
 
-fn storage_errno(source: rustix::io::Errno) -> StorageError {
-    classify_io(std::io::Error::from(source))
-}
-
 fn stat_bytes(stat: &rfs::Stat) -> u64 {
     u64::try_from(stat.st_size).unwrap_or(0)
 }
@@ -863,13 +859,13 @@ fn open_shard_nofollow(objects: &File, name: impl rustix::path::Arg) -> Result<F
         rfs::Mode::empty(),
     )
     .map(File::from)
-    .map_err(storage_errno)
+    .map_err(classify_errno)
 }
 
 pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
     let mut bytes = 0_u64;
-    for entry in rfs::Dir::read_from(objects).map_err(storage_errno)? {
-        let entry = entry.map_err(storage_errno)?;
+    for entry in rfs::Dir::read_from(objects).map_err(classify_errno)? {
+        let entry = entry.map_err(classify_errno)?;
         let name = entry.file_name();
         if is_dot_entry(name) {
             continue;
@@ -878,7 +874,7 @@ pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
         let stat = match rfs::statat(objects, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => stat,
             Err(rustix::io::Errno::NOENT) => continue,
-            Err(error) => return Err(storage_errno(error)),
+            Err(error) => return Err(classify_errno(error)),
         };
         let kind = rfs::FileType::from_raw_mode(stat.st_mode);
         if kind.is_file() {
@@ -895,8 +891,8 @@ pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
             }
             Err(error) => return Err(error),
         };
-        for shard_entry in rfs::Dir::read_from(&shard).map_err(storage_errno)? {
-            let shard_entry = shard_entry.map_err(storage_errno)?;
+        for shard_entry in rfs::Dir::read_from(&shard).map_err(classify_errno)? {
+            let shard_entry = shard_entry.map_err(classify_errno)?;
             let shard_name = shard_entry.file_name();
             if is_dot_entry(shard_name) {
                 continue;
@@ -904,7 +900,7 @@ pub(super) fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
             let shard_stat = match rfs::statat(&shard, shard_name, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(shard_stat) => shard_stat,
                 Err(rustix::io::Errno::NOENT) => continue,
-                Err(error) => return Err(storage_errno(error)),
+                Err(error) => return Err(classify_errno(error)),
             };
             if rfs::FileType::from_raw_mode(shard_stat.st_mode).is_file() {
                 bytes = bytes.saturating_add(stat_bytes(&shard_stat));
