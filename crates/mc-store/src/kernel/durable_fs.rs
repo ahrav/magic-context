@@ -106,6 +106,29 @@ pub(super) fn create_secure_directory(parent: &File, name: &str) -> Result<File,
     Ok(directory)
 }
 
+pub(super) fn open_secure_directory(parent: &File, name: &str) -> Result<File, StorageError> {
+    validate_name(name)?;
+    let descriptor = rfs::openat(
+        parent,
+        name,
+        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(classify_errno)?;
+    let directory = File::from(descriptor);
+    let metadata = directory.metadata().map_err(classify_io)?;
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(classify_io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "directory is not owner-only",
+        )));
+    }
+    Ok(directory)
+}
+
 pub(super) fn open_or_create_secure_directory(
     parent: &File,
     name: &str,
@@ -113,26 +136,7 @@ pub(super) fn open_or_create_secure_directory(
     match create_secure_directory(parent, name) {
         Ok(directory) => Ok(directory),
         Err(StorageError::Other(source)) if source.kind() == io::ErrorKind::AlreadyExists => {
-            validate_name(name)?;
-            let descriptor = rfs::openat(
-                parent,
-                name,
-                OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(classify_errno)?;
-            let directory = File::from(descriptor);
-            let metadata = directory.metadata().map_err(classify_io)?;
-            if !metadata.is_dir()
-                || metadata.uid() != rustix::process::geteuid().as_raw()
-                || metadata.permissions().mode() & 0o777 != 0o700
-            {
-                return Err(classify_io(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "directory is not owner-only",
-                )));
-            }
-            Ok(directory)
+            open_secure_directory(parent, name)
         }
         Err(error) => Err(error),
     }
