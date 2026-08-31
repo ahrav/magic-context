@@ -144,7 +144,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "72259c375f731a098aedb2bfce0cf91967df93a029b34838c41203a589a1ec20";
+    "374757e1a6f85b86ac47a0a0d4a49ed34fb721af215036aaf62c15773ec68c8c";
 
 #[test]
 fn cas_control_tables_and_lookup_indexes_are_frozen() {
@@ -307,6 +307,13 @@ fn cas_control_rows_preserve_reclaim_purge_and_backfill_state() {
         [],
     )
     .unwrap();
+    assert!(conn
+        .execute(
+            "UPDATE artifact_ingestion_reservations
+             SET state='Live',reclaim_started_at=NULL WHERE reservation_id='reservation-1'",
+            [],
+        )
+        .is_err());
 
     conn.execute(
         "INSERT INTO artifact_purge_tombstones(
@@ -384,6 +391,13 @@ fn cas_control_rows_preserve_reclaim_purge_and_backfill_state() {
     .unwrap();
     assert!(conn
         .execute(
+            "UPDATE capture_pins SET purge_degraded_at=NULL,purge_barrier_id=NULL
+             WHERE capture_pin_id='pin-1'",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
             "DELETE FROM artifact_purge_tombstones WHERE artifact_digest='digest'",
             [],
         )
@@ -415,6 +429,14 @@ fn cas_control_rows_preserve_reclaim_purge_and_backfill_state() {
                  artifact_digest,artifact_reference,created_at
              ) VALUES ('digest-3','wrong-ref',5)",
             [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO deletion_backfill_barriers(
+                 barrier_id,artifact_digest,artifact_reference,delete_commit_seq,created_at
+             ) VALUES ('mismatched','digest-3','not-ref-3',?1,6)",
+            [commit_seq],
         )
         .is_err());
     assert!(conn
