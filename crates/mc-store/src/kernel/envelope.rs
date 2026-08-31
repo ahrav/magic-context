@@ -395,10 +395,12 @@ pub(super) fn commit_with_writer(
         if digest != intent.request_digest {
             return Err(KernelError::Conflict);
         }
-        if commit_affects_alignment(&tx, commit_seq)? {
-            super::slice::rebuild_alignment_tx(&tx)?;
-        }
+        let repair_alignment = commit_affects_alignment(&tx, commit_seq)?;
         tx.commit().map_err(|_| KernelError::Io)?;
+        if repair_alignment {
+            // The commit is already durable, so a repair failure cannot change its outcome.
+            let _ = super::slice::rebuild_alignment_with_writer(writer, lease_epoch);
+        }
         return Ok(CommitReceipt {
             commit_seq,
             result,
@@ -554,38 +556,31 @@ pub(super) fn commit_with_writer(
     })
 }
 
+/// Single source for the pending-change and replay checks below, so a kind added
+/// here cannot reach only one of them.
+const ALIGNMENT_CHANGE_KINDS: &[&str] = &[
+    "decision_insert",
+    "observation_insert",
+    "decision_correct",
+    "observation_correct",
+    "decision_retire",
+    "observation_retire",
+    "artifact_deletion",
+];
+
 fn change_affects_alignment(change: &PendingChange) -> bool {
-    matches!(
-        change.kind,
-        "scope_insert"
-            | "decision_insert"
-            | "observation_insert"
-            | "decision_event_append"
-            | "decision_correct"
-            | "observation_correct"
-            | "decision_retire"
-            | "observation_retire"
-            | "artifact_deletion"
-    )
+    ALIGNMENT_CHANGE_KINDS.contains(&change.kind)
 }
 
 fn commit_affects_alignment(tx: &Transaction<'_>, commit_seq: i64) -> Result<bool, KernelError> {
+    let kinds = serde_json::to_string(ALIGNMENT_CHANGE_KINDS).map_err(|_| KernelError::Io)?;
     tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM change_event
-             WHERE commit_seq=?1 AND change_kind IN (
-                 'scope_insert',
-                 'decision_insert',
-                 'observation_insert',
-                 'decision_event_append',
-                 'decision_correct',
-                 'observation_correct',
-                 'decision_retire',
-                 'observation_retire',
-                 'artifact_deletion'
-             )
+             WHERE commit_seq=?1
+               AND change_kind IN (SELECT value FROM json_each(?2))
          )",
-        [commit_seq],
+        params![commit_seq, kinds],
         |row| row.get(0),
     )
     .map_err(|_| KernelError::Io)
@@ -853,21 +848,28 @@ pub(super) fn replace_alignment_projection_tx(
     .map_err(|_| KernelError::Io)?;
     tx.execute("DELETE FROM alignment_projection", [])
         .map_err(|_| KernelError::Io)?;
+    {
+        let mut statement = tx
+            .prepare(
+                "INSERT INTO alignment_projection(
+                     decision_id,observation_id,alignment_kind,alignment_payload,
+                     built_through_commit_seq
+                 ) VALUES (?1,?2,?3,?4,?5)",
+            )
+            .map_err(|_| KernelError::Io)?;
+        for row in &rows {
+            statement
+                .execute(params![
+                    row.decision_id.text,
+                    row.observation_id.text,
+                    row.alignment_kind.text,
+                    row.alignment_payload.as_ref().map(|field| &field.text),
+                    row.built_through_commit_seq,
+                ])
+                .map_err(|_| KernelError::Io)?;
+        }
+    }
     for row in &rows {
-        tx.execute(
-            "INSERT INTO alignment_projection(
-                 decision_id,observation_id,alignment_kind,alignment_payload,
-                 built_through_commit_seq
-             ) VALUES (?1,?2,?3,?4,?5)",
-            params![
-                row.decision_id.text,
-                row.observation_id.text,
-                row.alignment_kind.text,
-                row.alignment_payload.as_ref().map(|field| &field.text),
-                row.built_through_commit_seq,
-            ],
-        )
-        .map_err(|_| KernelError::Io)?;
         row.record(tx)?;
     }
     Ok(ProjectionReplaceResult { rows: rows.len() })

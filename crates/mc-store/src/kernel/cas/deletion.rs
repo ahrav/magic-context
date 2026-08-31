@@ -197,7 +197,7 @@ impl KernelStore {
 
         if request.kind == ArtifactDeletionKind::Purge && state.tombstoned {
             crate::kernel::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
-                .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+                .map_err(|_| ArtifactError::new(ArtifactErrorKind::AlignmentRebuild))?;
             if state.pending_unlink {
                 self.complete_pending_purge_locked(&mut writer, &state.digest)?;
             }
@@ -211,7 +211,7 @@ impl KernelStore {
                 ));
             }
             crate::kernel::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
-                .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+                .map_err(|_| ArtifactError::new(ArtifactErrorKind::AlignmentRebuild))?;
             return Ok(result_from_state(&state, request.kind, true));
         }
 

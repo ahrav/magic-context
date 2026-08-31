@@ -145,6 +145,7 @@ pub enum ArtifactErrorKind {
     CorruptObject,
     ReferenceUnavailable,
     ReferenceCommit,
+    AlignmentRebuild,
     ReclaimInProgress,
     UnredactableSecret,
     InvalidInput,
@@ -252,6 +253,9 @@ impl fmt::Display for ArtifactError {
             }
             ArtifactErrorKind::ReferenceCommit => {
                 formatter.write_str("artifact canonical reference commit failed")
+            }
+            ArtifactErrorKind::AlignmentRebuild => {
+                formatter.write_str("artifact deletion could not rebuild the alignment projection")
             }
             ArtifactErrorKind::ReclaimInProgress => {
                 formatter.write_str("artifact reclamation is in progress; retry ingestion")
