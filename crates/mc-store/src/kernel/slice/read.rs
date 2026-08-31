@@ -122,7 +122,7 @@ pub(super) fn load_decisions(
         })
         .map_err(|_| KernelError::Io)?
         .collect::<rusqlite::Result<_>>()
-        .map_err(|_| KernelError::Io)?;
+        .map_err(classify_row_error)?;
     Ok(rows)
 }
 
@@ -167,6 +167,19 @@ pub(super) fn load_observations(
         })
         .map_err(|_| KernelError::Io)?
         .collect::<rusqlite::Result<_>>()
-        .map_err(|_| KernelError::Io)?;
+        .map_err(classify_row_error)?;
     Ok(rows)
+}
+
+// A `serde_json::Error` indicates non-transient stored-payload corruption; every
+// other failure this query can raise is retriable.
+fn classify_row_error(error: rusqlite::Error) -> KernelError {
+    match &error {
+        rusqlite::Error::FromSqlConversionFailure(_, _, source)
+            if source.downcast_ref::<serde_json::Error>().is_some() =>
+        {
+            KernelError::CorruptCanonicalRow
+        }
+        _ => KernelError::Io,
+    }
 }

@@ -198,9 +198,14 @@ impl KernelStore {
         receipt_conflict_free(&writer, &request.intent)?;
 
         if request.kind == ArtifactDeletionKind::Purge && state.tombstoned {
-            crate::kernel::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
-                .map_err(|_| ArtifactError::new(ArtifactErrorKind::AlignmentRebuild))?;
+            let repair = crate::kernel::slice::rebuild_alignment_with_writer(
+                &mut writer,
+                self.lease_epoch(),
+            );
             if state.pending_unlink {
+                // A pending unlink leaves the purge incomplete, so a repair failure is
+                // reportable here.
+                repair.map_err(|_| ArtifactError::new(ArtifactErrorKind::AlignmentRebuild))?;
                 self.complete_pending_purge_locked(&mut writer, &state.digest)?;
             }
             return Ok(result_from_state(&state, request.kind, true));
@@ -212,8 +217,11 @@ impl KernelStore {
                     &state.digest,
                 ));
             }
-            crate::kernel::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
-                .map_err(|_| ArtifactError::new(ArtifactErrorKind::AlignmentRebuild))?;
+            // Do not report a durable deletion as failed when alignment rebuild fails.
+            let _ = crate::kernel::slice::rebuild_alignment_with_writer(
+                &mut writer,
+                self.lease_epoch(),
+            );
             return Ok(result_from_state(&state, request.kind, true));
         }
 
