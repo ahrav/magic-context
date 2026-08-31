@@ -97,6 +97,29 @@ describe("paired-delta scenario contract", () => {
         ).toThrow(/checks: ladder-intersection-empty/);
     });
 
+    it("requires every critical check to cover every compared arm", () => {
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                checks: [
+                    {
+                        id: "check-shared",
+                        appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
+                    },
+                    { id: "check-mc-only", appliesToArms: ["mc-on"] },
+                ],
+                criticalCheckIds: ["check-mc-only"],
+            })),
+        ).toThrow(/criticalCheckIds: arm-coverage-incomplete/);
+    });
+
+    it("rejects an R2 declaration with no gold memory", () => {
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: { ...scenario().interventions, r2: { memories: [] } },
+            })),
+        ).toThrow(/r2\.memories: empty/);
+    });
+
     it("requires an absence precondition and rejects non-MC restart declarations", () => {
         expect(() =>
             parseScenarioDeclaration({ ...scenario(), absencePrecondition: undefined }),
@@ -140,6 +163,20 @@ describe("paired-delta scenario contract", () => {
             ]),
         ).toThrow(/duplicate/);
     });
+
+    it("rejects a verifier vector that is not an array of check results", () => {
+        const declaration = parseScenarioDeclaration(scenario());
+        for (const vector of [null, undefined, "check-shared", { id: "check-shared" }]) {
+            expect(() =>
+                validateCheckVector(declaration, "mc-on", vector as never),
+            ).toThrow(PairedDeltaContractError);
+        }
+        expect(() =>
+            validateCheckVector(declaration, "mc-on", [
+                { id: "check-shared", passed: "yes" as never },
+            ]),
+        ).toThrow(/checkVector\[0\]\.passed: boolean-required/);
+    });
 });
 
 describe("paired-delta armed cell contract", () => {
@@ -168,6 +205,20 @@ describe("paired-delta armed cell contract", () => {
         expect(() => parseArmedCellResult({ ...completed, criticalPassed: 2 })).toThrow(
             /critical: passed-exceeds-total/,
         );
+    });
+
+    it("rejects critical counts that exceed the overall counts they subset", () => {
+        expect(() =>
+            parseArmedCellResult({ ...completed, criticalTotal: 4, criticalPassed: 1 }),
+        ).toThrow(/critical: total-exceeds-checks/);
+        expect(() =>
+            parseArmedCellResult({
+                ...completed,
+                checksPassed: 0,
+                criticalPassed: 1,
+                criticalTotal: 1,
+            }),
+        ).toThrow(/critical: passed-exceeds-checks/);
     });
 });
 
@@ -212,5 +263,11 @@ describe("paired-delta manifest contract", () => {
                 scenarios: [{ ...entry, runModes: ["nightly"] }],
             }),
         ).toThrow(/enum-invalid/);
+        expect(() =>
+            parsePairedDeltaManifest({
+                schema: PAIRED_DELTA_MANIFEST_SCHEMA,
+                scenarios: [{ ...entry, runModes: [] }],
+            }),
+        ).toThrow(/runModes: empty/);
     });
 });

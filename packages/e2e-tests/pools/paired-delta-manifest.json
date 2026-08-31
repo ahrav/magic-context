@@ -4,7 +4,7 @@
     {
       "scenarioId": "var-compaction-deploy-region",
       "semanticFingerprint": "021e879cd9bb5be7e652bd23f780856552610047c9411b0704844053f2bc4e59",
-      "verifierBundleDigest": "15b29bae7e6d763d62385517e8fd0a8c5d491f03851d765a21c4fe582e75a299",
+      "verifierBundleDigest": "2ecef96f68e755e5b38aa5121605d19dc16cf6b06e15f67130b26d91205b9af3",
       "runModes": [
         "calibration",
         "weekly",
@@ -14,7 +14,7 @@
     {
       "scenarioId": "var-compaction-feature-state",
       "semanticFingerprint": "2fa1d14e50812b5a1f267b79e076b2a91942633665c049c9c91a7b0c7691d480",
-      "verifierBundleDigest": "81c907356cb57f3245694c5a0c010d1e806244fe3d1b413d21e489010d6c0f08",
+      "verifierBundleDigest": "6e3f36e7097a9c17b32e773e97c1221d819a4dd7dc3e9cb3c24a77a62625dd71",
       "runModes": [
         "release"
       ]
@@ -22,7 +22,7 @@
     {
       "scenarioId": "var-compaction-schema-version",
       "semanticFingerprint": "4006effce64a30fc15f438d81b080b2320c0d80c1650002275bfef34c6bf8400",
-      "verifierBundleDigest": "170fec320e9ef76033aba0dba9a07ef9bf09eb0152b395d58c27a30d1e720805",
+      "verifierBundleDigest": "56673047b9066a5e287c946d37f2b44bc35ecc41dfa691350c5df1a9df648369",
       "runModes": [
         "calibration",
         "weekly",
@@ -32,7 +32,7 @@
     {
       "scenarioId": "var-exact-path",
       "semanticFingerprint": "b0cace52a7b5a0c0532d2bff3b13a46b8897aaba355d04ca104d9c9c66422cde",
-      "verifierBundleDigest": "e8faf289581697c4233f543e7b0a4e7fa49978887c61aca3f5d225b1b5a7be5a",
+      "verifierBundleDigest": "e8eb417df6e191a60d98d28a1f6e6505ce91ca4878ecbe022dd96be06e4074f6",
       "runModes": [
         "release"
       ]
@@ -40,7 +40,7 @@
     {
       "scenarioId": "var-exact-symbol",
       "semanticFingerprint": "4b2fbb12046a904b0ea5dcbc3d8ca53e4dccfe92d9bafd80a37943c28feb698a",
-      "verifierBundleDigest": "4ea3400aefc28081716ceece4065bbe3648ef93fe4d3b0d680d30c276094b5d3",
+      "verifierBundleDigest": "afa516199624be658e86d91d1512d31c126247306a291667862ee29fd6c2c7ad",
       "runModes": [
         "calibration",
         "weekly",
@@ -50,15 +50,15 @@
     {
       "scenarioId": "var-exact-ticket",
       "semanticFingerprint": "77e3d68b5ee37b1d1355ad9fecfb52f4dca6d9f2c313dcab6922c621b32f9f1b",
-      "verifierBundleDigest": "01e70d60f8eabc5da96f9363a2b15d1986e0210e76e0c304d070827d60e57449",
+      "verifierBundleDigest": "acb80b16f60a0caf42b039949db7f9ff9564e06a47f7f71d8284a7653fd0b51f",
       "runModes": [
         "release"
       ]
     },
     {
       "scenarioId": "var-rejected-database",
-      "semanticFingerprint": "a502151d9997ae862edcc10bf5a7cc8eb4dc9f5a7efe9b2bda3506adaa1f1518",
-      "verifierBundleDigest": "42bd7469003bedf3cb39fada16f7089b55fcb62ce483746a380d3e55109d7ee3",
+      "semanticFingerprint": "1800184d54e28df6d102d812ac3c1bfd0e85d01afd23274ef3b849136a7d28b9",
+      "verifierBundleDigest": "0b0fcbaff8e7dea918c88b32d0744aeee0933303e0dc54d618596d12847cdf26",
       "runModes": [
         "calibration",
         "weekly",
@@ -67,8 +67,8 @@
     },
     {
       "scenarioId": "var-rejected-queue",
-      "semanticFingerprint": "8949bd1697cf21aefe9992b297f937c2fc6fcd2c2f9323449a468f6759a4f8d7",
-      "verifierBundleDigest": "69af919ba7bd3d9cdee3bac8c9fc1e414d995329339b237f17f23c966708fe52",
+      "semanticFingerprint": "4a9a084fcd311dbab1d6486bf4a81ede2f63025926566650ac592efddb580344",
+      "verifierBundleDigest": "4247091aadb77bd09e947c2c8d6beecb9acad8c5b4888ebbb0d3b14b1c3e7d6a",
       "runModes": [
         "release"
       ]
@@ -76,15 +76,15 @@
     {
       "scenarioId": "var-superseded-owner",
       "semanticFingerprint": "2074ec1051b6617b3545fa5b88f1644056d7fcd389833b653a5431a176896aeb",
-      "verifierBundleDigest": "9395e38da0db098fe53641618cc5ec2cdc481fa6eac95dc56ea195bfe7d97e11",
+      "verifierBundleDigest": "35cd66c0f14c38146cbeeb64aa05a7b2570ab19b44d277e497dd8f224c1762b9",
       "runModes": [
         "release"
       ]
     },
     {
       "scenarioId": "var-superseded-timeout",
-      "semanticFingerprint": "1741e6f735654466cb24462e07af01a549b6d0bcfbd28f021a08b856cb69626f",
-      "verifierBundleDigest": "1879cf95246377594888455392c56b02e0b8aa3668616bd03a0d1d1a4ca3e8f4",
+      "semanticFingerprint": "ef3ba15d6f459d20811acdd5dc70ff22a4ba2d34c7a0ab5abdd80b0b3b522533",
+      "verifierBundleDigest": "5db42bbb657e3f5b53859653ada83b598636674db9799b3476a0f4896f63628c",
       "runModes": [
         "calibration",
         "weekly",

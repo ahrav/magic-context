@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ScenarioDeclaration, VerifierContext } from "../contract";
 
@@ -14,10 +14,17 @@ interface ScenarioSpec {
 export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
     const verifier = (context: VerifierContext) => {
         const answerPath = join(context.workspacePath, "result", "answer.txt");
-        const exists = existsSync(answerPath);
-        const actual = exists ? readFileSync(answerPath, "utf8").trim() : "";
+        /** A model can leave a directory or an unreadable file at the answer path; reading it unguarded throws EISDIR or EACCES, which a runner records as a harness failure and excludes from scoring instead of the ordinary scenario failure it is. commentlint: allow(JUDGE) */
+        let actual: string | null = null;
+        try {
+            if (statSync(answerPath).isFile()) {
+                actual = readFileSync(answerPath, "utf8").trim();
+            }
+        } catch {
+            actual = null;
+        }
         return [
-            { id: "check-file", passed: exists },
+            { id: "check-file", passed: actual !== null },
             { id: "check-answer", passed: actual === spec.answer },
             ...(context.armId === "r1"
                 ? [{

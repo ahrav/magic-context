@@ -6,6 +6,10 @@ export type ArmId = (typeof ARM_IDS)[number];
 export const PRIMARY_ARM_IDS = ["mc-on", "mc-off", "compaction"] as const;
 export type PrimaryArmId = (typeof PRIMARY_ARM_IDS)[number];
 export const REGRET_ARM_IDS = ["mc-on", "r1", "r2", "r3"] as const;
+/** Every arm that appears on either side of a paired subtraction. */
+const COMPARED_ARM_IDS: readonly ArmId[] = [
+    ...new Set<ArmId>([...PRIMARY_ARM_IDS, ...REGRET_ARM_IDS]),
+];
 
 export const RUN_HEALTHS = ["completed", "timeout", "crash", "malformed", "unavailable"] as const;
 export type RunHealth = (typeof RUN_HEALTHS)[number];
@@ -189,9 +193,16 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         CHECK_ID_RE,
         "scenario.criticalCheckIds",
     );
-    const checkIds = new Set(checks.map(({ id }) => id));
-    if (criticalCheckIds.some((id) => !checkIds.has(id))) {
+    const checksById = new Map(checks.map((check) => [check.id, check]));
+    if (criticalCheckIds.some((id) => !checksById.has(id))) {
         p.fail("scenario.criticalCheckIds: unknown-check");
+    }
+    /** `validateCheckVector` omits a check from the arms it does not apply to, so a critical check declared for only some compared arms gives those arms different critical denominators and the paired critical delta subtracts unlike outcomes. Requiring full coverage keeps every critical comparison like-for-like. commentlint: allow(JUDGE) */
+    if (
+        criticalCheckIds.some((id) =>
+            !COMPARED_ARM_IDS.every((arm) => checksById.get(id)!.appliesToArms.includes(arm)))
+    ) {
+        p.fail("scenario.criticalCheckIds: arm-coverage-incomplete");
     }
 
     const turnScript = p.array(root.turnScript, "scenario.turnScript").map((rawTurn, index) => {
@@ -238,6 +249,10 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
             };
         },
     );
+    /** R2 is the formation rung: with no gold memory to inject the arm reproduces R1 rather than measuring formation, so `R2 - R1` and `R3 - R2` both silently describe a rung that was never exercised. commentlint: allow(JUDGE) */
+    if (memories.length === 0) {
+        p.fail("scenario.interventions.r2.memories: empty");
+    }
     const r3 = p.record(interventions.r3, "scenario.interventions.r3");
     p.exact(r3, ["evidence"], "scenario.interventions.r3");
 
@@ -344,6 +359,13 @@ export function parseArmedCellResult(raw: unknown): ArmedCellResult {
     if (result.criticalPassed > result.criticalTotal) {
         p.fail("cell.critical: passed-exceeds-total");
     }
+    /** `criticalCheckIds` is a declared subset of the scenario's checks, so a cell reporting more critical checks — or more critical successes — than overall ones is unreachable and would let an estimator credit critical success against a smaller or zero overall denominator. commentlint: allow(JUDGE) */
+    if (result.criticalTotal > result.checksTotal) {
+        p.fail("cell.critical: total-exceeds-checks");
+    }
+    if (result.criticalPassed > result.checksPassed) {
+        p.fail("cell.critical: passed-exceeds-checks");
+    }
     if ((result.runHealth === "completed") !== (result.reasonCode === null)) {
         p.fail("cell.reasonCode: health-mismatch");
     }
@@ -367,6 +389,8 @@ export function parsePairedDeltaManifest(raw: unknown): PairedDeltaManifest {
         const runModes = p.array(entry.runModes, `${label}.runModes`).map((mode, modeIndex) =>
             p.enumeration(mode, RUN_MODES, `${label}.runModes[${modeIndex}]`));
         p.unique(runModes, `${label}.runModes`);
+        /** The manifest is the sole source of run-mode membership, so an entry claiming no mode is frozen into the pool yet selected by no calibration, weekly, or release run — silently removing a scenario from execution while every freeze check still passes. commentlint: allow(JUDGE) */
+        if (runModes.length === 0) p.fail(`${label}.runModes: empty`);
         return {
             scenarioId: p.staticId(entry.scenarioId, `${label}.scenarioId`, SCENARIO_ID_RE),
             semanticFingerprint: p.hex64(entry.semanticFingerprint, `${label}.semanticFingerprint`),
@@ -387,15 +411,21 @@ export function validateCheckVector(
         .filter(({ appliesToArms }) => appliesToArms.includes(armId))
         .map(({ id }) => id)
         .sort();
-    const actual = results.map(({ id }) => id);
+    /** Verifier output is untrusted input, not a parsed artifact: without this revalidation a verifier returning null or a malformed entry raises a bare TypeError that a runner records as a harness failure rather than a scenario failure. commentlint: allow(JUDGE) */
+    const actual = p.array(results, "checkVector").map((entry, index) => {
+        const label = `checkVector[${index}]`;
+        const check = p.record(entry, label);
+        p.exact(check, ["id", "passed"], label);
+        if (typeof check.passed !== "boolean") {
+            p.fail(`${label}.passed: boolean-required`);
+        }
+        return p.staticId(check.id, `${label}.id`, CHECK_ID_RE);
+    });
     p.unique(actual, "checkVector");
     if (
         actual.length !== expected.length ||
         [...actual].sort().some((id, index) => id !== expected[index])
     ) {
         p.fail("checkVector: declaration-mismatch");
-    }
-    if (results.some(({ passed }) => typeof passed !== "boolean")) {
-        p.fail("checkVector: passed-boolean-required");
     }
 }
