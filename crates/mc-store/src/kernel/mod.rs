@@ -13,7 +13,7 @@ pub use admission::{
     evaluate_admission, surface_visibility, AdmissionDecision, AdmissionDomainSpec, AdmissionEvent,
     AdmissionRequest, Disposition, EffectiveMaturity, Evaluation, EvaluationInputs, EventKind,
     Maturity, Outcome, PriorDecision, SourceClass, Surface, SurfaceVisibility, TaintClass,
-    VisibilityRow, POLICY_REVISION,
+    VisibilityRow, VisibleAsOf, VisibleRow, POLICY_REVISION,
 };
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 pub use backup::filesystem_is_unsafe_for_test;

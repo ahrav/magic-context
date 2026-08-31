@@ -3,7 +3,7 @@
 use mc_store::kernel::{
     AdmissionDomainSpec, AdmissionEvent, AdmissionRequest, CommitIntent, DomainSpec, EventKind,
     KernelError, KernelStore, RepositoryProvenance, Sensitivity, SourceClass, StagingCandidateSpec,
-    TaintClass,
+    StagingTerminalState, Surface, TaintClass, STAGING_RETENTION_MS,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -18,6 +18,10 @@ fn intent(key: &str) -> CommitIntent {
 }
 
 fn stage(store: &KernelStore, candidate_id: &str) {
+    stage_from(store, candidate_id, &format!("source-{candidate_id}"));
+}
+
+fn stage_from(store: &KernelStore, candidate_id: &str, source_id: &str) {
     let now: i64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -30,7 +34,7 @@ fn stage(store: &KernelStore, candidate_id: &str) {
             candidate_id: candidate_id.to_string(),
             extractor: "fixture".to_string(),
             source_kind: "repo".to_string(),
-            source_id: format!("source-{candidate_id}"),
+            source_id: source_id.to_string(),
             source_revision: 1,
             candidate_kind: "domain".to_string(),
             payload: format!("name-{candidate_id}"),
@@ -74,6 +78,51 @@ fn subject_request(object_id: &str, kind: EventKind) -> AdmissionRequest {
             reason: format!("{kind:?}"),
         },
     }
+}
+
+fn insert_subject(
+    store: &KernelStore,
+    key: &str,
+    sensitivity: Sensitivity,
+    event: Option<EventKind>,
+) -> i64 {
+    store
+        .commit(intent(key), |envelope| {
+            let domain_id = format!("domain-{key}");
+            let object_id = format!("object-{key}");
+            envelope.insert_domain(DomainSpec {
+                domain_id: domain_id.clone(),
+                object_id: object_id.clone(),
+                name: key.to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: format!("source-{key}"),
+                source_revision: 1,
+                sensitivity,
+            })?;
+            if let Some(event) = event {
+                let mut request = subject_request(&object_id, event);
+                if matches!(event, EventKind::CodeObserved | EventKind::ConfigObserved) {
+                    let observation_id = format!("observation-{key}");
+                    envelope.insert_admission_observation_for_test(
+                        &observation_id,
+                        if event == EventKind::CodeObserved {
+                            "code_present"
+                        } else {
+                            "config_present"
+                        },
+                        &domain_id,
+                        "fixture",
+                        &format!("source-{key}"),
+                        1,
+                    )?;
+                    request.event.trigger_object_id = Some(observation_id);
+                }
+                envelope.record_admission(request)?;
+            }
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq
 }
 
 fn inspect(root: &std::path::Path, sql: &str) -> i64 {
@@ -855,4 +904,417 @@ fn same_envelope_prior_and_double_digit_ordinal_choose_the_last_decision() {
             Ok(String::new())
         })
         .unwrap();
+}
+
+#[test]
+fn visible_reads_exclude_decisionless_objects_and_apply_maturity_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    insert_subject(&store, "undecided", Sensitivity::Normal, None);
+    insert_subject(
+        &store,
+        "candidate",
+        Sensitivity::Normal,
+        Some(EventKind::Other),
+    );
+    insert_subject(
+        &store,
+        "verified",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+
+    let auto = store.visible_as_of(Surface::AutoInject, 3).unwrap();
+    assert_eq!(auto.rows.len(), 1);
+    assert_eq!(auto.rows[0].object.object_id, "object-verified");
+    assert!(!auto.rows[0].labeled);
+    let explicit = store.visible_as_of(Surface::ExplicitSearch, 3).unwrap();
+    assert_eq!(
+        explicit
+            .rows
+            .iter()
+            .map(|row| (row.object.object_id.as_str(), row.labeled))
+            .collect::<Vec<_>>(),
+        vec![("object-candidate", true), ("object-verified", false)]
+    );
+    assert_eq!(
+        store
+            .known_as_of(3)
+            .unwrap()
+            .objects
+            .iter()
+            .filter(|object| object.object_kind == "domain")
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn dispositions_and_sensitivity_only_reduce_visibility() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    insert_subject(
+        &store,
+        "stale",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    store
+        .commit(intent("mark-stale"), |envelope| {
+            envelope.record_admission(subject_request("object-stale", EventKind::MarkStale))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    insert_subject(
+        &store,
+        "sensitive",
+        Sensitivity::Sensitive,
+        Some(EventKind::CodeObserved),
+    );
+    insert_subject(
+        &store,
+        "secret",
+        Sensitivity::Secret,
+        Some(EventKind::CodeObserved),
+    );
+
+    assert!(store
+        .visible_as_of(Surface::AutoSearch, 4)
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        store
+            .visible_as_of(Surface::ExplicitSearch, 4)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| (row.object.object_id.as_str(), row.labeled))
+            .collect::<Vec<_>>(),
+        vec![("object-sensitive", false), ("object-stale", true)]
+    );
+}
+
+#[test]
+fn taint_sensitivity_floor_applies_to_existing_canonical_objects() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("personal"), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "personal-domain".to_string(),
+                object_id: "personal-object".to_string(),
+                name: "personal".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "personal".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            envelope.record_admission(AdmissionRequest {
+                candidate_id: None,
+                subject_object_id: Some("personal-object".to_string()),
+                source_class: Some(SourceClass::ModelInference),
+                taint_class: Some(TaintClass::Personal),
+                event: AdmissionEvent {
+                    kind: EventKind::Other,
+                    trigger_object_id: None,
+                    approval_object_id: None,
+                    evidence_id: None,
+                    reason: "personal".to_string(),
+                },
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert!(store
+        .visible_as_of(Surface::AutoSearch, 1)
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        store
+            .visible_as_of(Surface::ExplicitSearch, 1)
+            .unwrap()
+            .rows[0]
+            .object
+            .object_id,
+        "personal-object"
+    );
+}
+
+#[test]
+fn visibility_is_time_travel_safe_across_support_loss() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "timed");
+    let mut approved = request("timed");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("approval".to_string());
+    store
+        .commit(intent("timed"), |envelope| {
+            envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "domain-timed".to_string(),
+                    object_id: "object-timed".to_string(),
+                    name: "name-timed".to_string(),
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
+    store
+        .commit(intent("timed-revoke"), |envelope| {
+            envelope.revoke_approval("approval", "revoked")?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    assert!(store
+        .visible_as_of(Surface::AutoInject, 2)
+        .unwrap()
+        .rows
+        .iter()
+        .any(|row| row.object.object_id == "object-timed"));
+    assert!(store
+        .visible_as_of(Surface::AutoInject, 3)
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        store
+            .visible_as_of(Surface::ExplicitSearch, 3)
+            .unwrap()
+            .rows[0]
+            .object
+            .object_id,
+        "object-timed"
+    );
+}
+
+#[test]
+fn every_non_active_disposition_has_the_contracted_surface_row() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for (key, event) in [
+        ("disputed", EventKind::MarkDisputed),
+        ("superseded", EventKind::Other),
+        ("rejected", EventKind::ExplicitReject),
+        ("contradicted", EventKind::Contradict),
+        ("quarantined", EventKind::Quarantine),
+    ] {
+        insert_subject(&store, key, Sensitivity::Normal, Some(event));
+    }
+    drop(store);
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE admission_decisions
+             SET disposition='superseded',visibility='explicit_labeled'
+             WHERE subject_object_id='object-superseded'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert!(store
+        .visible_as_of(Surface::AutoSearch, 5)
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        store
+            .visible_as_of(Surface::ExplicitSearch, 5)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.object.object_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["object-disputed", "object-superseded"]
+    );
+}
+
+#[test]
+fn malformed_stored_policy_and_sensitivity_fail_closed_without_read_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    insert_subject(
+        &store,
+        "bad-policy",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    insert_subject(
+        &store,
+        "null-sequence",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    drop(store);
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE admission_decisions
+             SET maturity='future',disposition='future',visibility='future',policy_revision=0
+             WHERE subject_object_id='object-bad-policy'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE admission_decisions SET commit_seq=NULL
+             WHERE subject_object_id='object-null-sequence'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO object_registry(
+                 object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                 created_commit_seq,sensitivity_class
+             ) VALUES (
+                 'object-bad-sensitivity','fixture','domain-null-sequence','fixture',
+                 'bad-sensitivity',1,2,'future'
+             );
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,maturity,disposition,visibility,policy_revision,
+                 reason,commit_seq,decided_at
+             ) VALUES (
+                 'bad-sensitivity-decision','object-bad-sensitivity','fixture',
+                 'bad-sensitivity',1,'trusted_local_code','current_code','verified','active',
+                 'automatic',1,'fixture',2,2
+             );
+             INSERT INTO object_registry(
+                 object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                 created_commit_seq,sensitivity_class
+             ) VALUES (
+                 'object-inconsistent','fixture','domain-null-sequence','fixture',
+                 'inconsistent',1,2,'normal'
+             );
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,maturity,disposition,visibility,policy_revision,
+                 reason,commit_seq,decided_at
+             ) VALUES (
+                 'inconsistent-decision','object-inconsistent','fixture','inconsistent',1,
+                 'trusted_local_code','current_code','verified','rejected','automatic',1,
+                 'fixture',2,2
+             );",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert!(store
+        .visible_as_of(Surface::ExplicitSearch, 2)
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+#[test]
+fn valid_old_policy_revision_uses_current_surface_mapping() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    insert_subject(
+        &store,
+        "old-policy",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    drop(store);
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE admission_decisions SET policy_revision=0
+             WHERE subject_object_id='object-old-policy'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert_eq!(
+        store.visible_as_of(Surface::AutoInject, 1).unwrap().rows[0]
+            .object
+            .object_id,
+        "object-old-policy"
+    );
+}
+
+#[test]
+fn rejection_survives_candidate_retention_and_applies_to_re_staged_source() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_from(&store, "old-candidate", "stable-source");
+    let rejected = |candidate_id: &str| AdmissionRequest {
+        candidate_id: Some(candidate_id.to_string()),
+        subject_object_id: None,
+        source_class: Some(SourceClass::UntrustedRepoText),
+        taint_class: Some(TaintClass::RepoUntrustedText),
+        event: AdmissionEvent {
+            kind: EventKind::ExplicitReject,
+            trigger_object_id: None,
+            approval_object_id: None,
+            evidence_id: None,
+            reason: "remember rejection".to_string(),
+        },
+    };
+    store
+        .commit(intent("remember-rejection"), |envelope| {
+            envelope.record_admission(rejected("old-candidate"))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let terminal_at: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    store
+        .finish_staging_run(
+            "run-old-candidate",
+            StagingTerminalState::Completed,
+            terminal_at,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .delete_aged_staging_runs(terminal_at + STAGING_RETENTION_MS)
+            .unwrap(),
+        1
+    );
+    stage_from(&store, "new-candidate", "stable-source");
+    store
+        .commit(intent("remembered-rejection"), |envelope| {
+            assert!(envelope
+                .record_admission(rejected("new-candidate"))?
+                .is_none());
+            Ok(String::new())
+        })
+        .unwrap();
+
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM admission_decisions
+             WHERE source_id='stable-source'"
+        ),
+        1
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM admission_decisions
+             WHERE source_id='stable-source' AND candidate_id IS NULL"
+        ),
+        1
+    );
 }

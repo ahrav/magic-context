@@ -1,6 +1,6 @@
 use super::envelope::{object_row_from, DomainSpec, Envelope, ObjectRow, PendingChange};
 use super::redaction::{identity, record, redact};
-use super::{map_sqlite, KernelError, Sensitivity};
+use super::{map_sqlite, KernelError, KernelStore, Sensitivity};
 use crate::current_time_ms;
 use rusqlite::{params, OptionalExtension};
 
@@ -193,6 +193,20 @@ pub struct AdmissionDecision {
     pub visibility: VisibilityRow,
     pub sensitivity: Sensitivity,
     pub outcome: Outcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleRow {
+    pub object: ObjectRow,
+    pub visibility: SurfaceVisibility,
+    pub labeled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleAsOf {
+    pub known_as_of: i64,
+    pub tip: i64,
+    pub rows: Vec<VisibleRow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1182,6 +1196,94 @@ fn validate_trigger(
         // establish that contract, so enforcement remains closed until that seam exists.
         EventKind::Enforce => Ok(false),
         _ => Ok(true),
+    }
+}
+
+impl KernelStore {
+    /// Serving reads must use this filtered view; `known_as_of` remains an audit/replay view.
+    pub fn visible_as_of(
+        &self,
+        surface: Surface,
+        requested: i64,
+    ) -> Result<VisibleAsOf, KernelError> {
+        let (tip, rows) = self.read_snapshot(requested, |tx| {
+            let mut statement = tx
+                .prepare(
+                    "SELECT o.object_id,o.object_kind,o.domain_id,o.source_kind,o.source_id,
+                            o.source_revision,o.created_commit_seq,NULL,NULL,o.sensitivity_class,
+                            a.maturity,a.disposition,a.visibility,a.taint_class
+                     FROM object_registry o
+                     JOIN admission_decisions a ON a.subject_object_id=o.object_id
+                     WHERE o.created_commit_seq<=?1
+                       AND (o.invalidated_commit_seq IS NULL OR ?1<o.invalidated_commit_seq)
+                       AND a.commit_seq IS NOT NULL
+                       AND a.commit_seq<=?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM admission_decisions newer
+                           WHERE newer.subject_object_id=a.subject_object_id
+                             AND newer.commit_seq IS NOT NULL
+                             AND newer.commit_seq<=?1
+                             AND (
+                                 newer.commit_seq>a.commit_seq
+                                 OR (
+                                     newer.commit_seq=a.commit_seq
+                                     AND newer.admission_decision_id>a.admission_decision_id
+                                 )
+                             )
+                       )
+                     ORDER BY o.object_id",
+                )
+                .map_err(map_sqlite)?;
+            let rows = statement
+                .query_map([requested], |row| {
+                    let mut object = object_row_from(row)?;
+                    object.sensitivity =
+                        match TaintClass::try_from(row.get::<_, String>(13)?.as_str()) {
+                            Ok(taint) => object.sensitivity.max(sensitivity_floor(taint)),
+                            Err(_) => Sensitivity::Secret,
+                        };
+                    let maturity = Maturity::try_from(row.get::<_, String>(10)?.as_str())
+                        .unwrap_or(Maturity::Candidate);
+                    let disposition = Disposition::try_from(row.get::<_, String>(11)?.as_str())
+                        .unwrap_or(Disposition::Quarantined);
+                    let stored_visibility =
+                        VisibilityRow::try_from(row.get::<_, String>(12)?.as_str()).ok();
+                    let expected_visibility = visibility_row(maturity, disposition);
+                    let visibility_row = match (stored_visibility, expected_visibility) {
+                        (None | Some(VisibilityRow::AuditOnly), _)
+                        | (_, VisibilityRow::AuditOnly) => VisibilityRow::AuditOnly,
+                        (Some(VisibilityRow::ReviewOnly), _) | (_, VisibilityRow::ReviewOnly) => {
+                            VisibilityRow::ReviewOnly
+                        }
+                        (Some(VisibilityRow::ExplicitLabeled), _)
+                        | (_, VisibilityRow::ExplicitLabeled) => VisibilityRow::ExplicitLabeled,
+                        (Some(VisibilityRow::Automatic), VisibilityRow::Automatic) => {
+                            VisibilityRow::Automatic
+                        }
+                    };
+                    let visibility =
+                        surface_visibility(visibility_row, surface, object.sensitivity);
+                    Ok((object, visibility))
+                })
+                .map_err(map_sqlite)?
+                .filter_map(|row| match row {
+                    Ok((_object, SurfaceVisibility::Hidden)) => None,
+                    Ok((object, visibility)) => Some(Ok(VisibleRow {
+                        object,
+                        visibility,
+                        labeled: visibility == SurfaceVisibility::Labeled,
+                    })),
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_sqlite)?;
+            Ok(rows)
+        })?;
+        Ok(VisibleAsOf {
+            known_as_of: requested,
+            tip,
+            rows,
+        })
     }
 }
 
