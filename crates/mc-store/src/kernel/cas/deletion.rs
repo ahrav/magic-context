@@ -86,9 +86,15 @@ pub struct DeletionBarrierStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactDeletionHook {
+    AfterCommit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactDeletionFault {
     IntentAppend,
     IntentStorageExhausted,
+    BeforeCommit,
     AfterCommit,
     Unlink,
     UnlinkStorageExhausted,
@@ -159,7 +165,7 @@ impl KernelStore {
         &self,
         request: ArtifactDeletionRequest,
     ) -> Result<ArtifactDeletionResult, ArtifactError> {
-        self.delete_artifact_inner(request, None)
+        self.delete_artifact_inner(request, None, None)
     }
 
     #[cfg(feature = "test-support")]
@@ -168,13 +174,23 @@ impl KernelStore {
         request: ArtifactDeletionRequest,
         fault: ArtifactDeletionFault,
     ) -> Result<ArtifactDeletionResult, ArtifactError> {
-        self.delete_artifact_inner(request, Some(fault))
+        self.delete_artifact_inner(request, Some(fault), None)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn delete_artifact_with_hook_for_test(
+        &self,
+        request: ArtifactDeletionRequest,
+        mut hook: impl FnMut(ArtifactDeletionHook),
+    ) -> Result<ArtifactDeletionResult, ArtifactError> {
+        self.delete_artifact_inner(request, None, Some(&mut hook))
     }
 
     fn delete_artifact_inner(
         &self,
         request: ArtifactDeletionRequest,
         fault: Option<ArtifactDeletionFault>,
+        hook: Option<&mut dyn FnMut(ArtifactDeletionHook)>,
     ) -> Result<ArtifactDeletionResult, ArtifactError> {
         validate_request(&request)?;
         let redacted = PurgeAuditFields::new(&request);
@@ -355,7 +371,12 @@ impl KernelStore {
                 })
                 .map_err(|_| KernelError::Io)
             },
-            || Ok(()),
+            || {
+                if fault == Some(ArtifactDeletionFault::BeforeCommit) {
+                    return Err(KernelError::Fault);
+                }
+                Ok(())
+            },
         )
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
 
@@ -371,6 +392,9 @@ impl KernelStore {
             barrier_id: committed.barrier_id,
             already_applied: receipt.replayed,
         };
+        if let Some(hook) = hook {
+            hook(ArtifactDeletionHook::AfterCommit);
+        }
         if kind == ArtifactDeletionKind::Purge {
             if fault == Some(ArtifactDeletionFault::AfterCommit) {
                 return Err(ArtifactError::for_digest(

@@ -20,7 +20,10 @@ pub use backup::{
 };
 pub use backup::{BackupManifest, BackupRequest};
 #[cfg(feature = "test-support")]
-pub use cas::{ArtifactDeletionFault, ArtifactGcFault, ArtifactIngestFault};
+pub use cas::{
+    ArtifactDeletionFault, ArtifactDeletionHook, ArtifactGcFault, ArtifactIngestFault,
+    ArtifactIngestHook,
+};
 pub use cas::{
     ArtifactDeletionIdentity, ArtifactDeletionKind, ArtifactDeletionRequest,
     ArtifactDeletionResult, ArtifactDestination, ArtifactEligibility, ArtifactError,

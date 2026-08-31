@@ -23,8 +23,44 @@ pub(super) const MAX_TEXT_FIELD_BYTES: usize = 1024;
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactIngestFault {
+    Write,
+    FileSync,
+    ReservationCommit,
+    Rename,
     AfterDirectorySync,
     AfterEvents,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactIngestHook {
+    AfterReservation,
+    AfterPublish,
+}
+
+/// Injection flags carried through ingest so the private path keeps one signature
+/// in every feature configuration. Production passes `Default`, which folds away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct IngestFaults {
+    pub write: bool,
+    pub file_sync: bool,
+    pub reservation_commit: bool,
+    pub rename: bool,
+    pub after_directory_sync: bool,
+    pub after_events: bool,
+}
+
+#[cfg(feature = "test-support")]
+impl From<ArtifactIngestFault> for IngestFaults {
+    fn from(fault: ArtifactIngestFault) -> Self {
+        Self {
+            write: fault == ArtifactIngestFault::Write,
+            file_sync: fault == ArtifactIngestFault::FileSync,
+            reservation_commit: fault == ArtifactIngestFault::ReservationCommit,
+            rename: fault == ArtifactIngestFault::Rename,
+            after_directory_sync: fault == ArtifactIngestFault::AfterDirectorySync,
+            after_events: fault == ArtifactIngestFault::AfterEvents,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,7 +285,7 @@ impl fmt::Display for ArtifactError {
 }
 
 #[cfg(feature = "test-support")]
-pub use deletion::ArtifactDeletionFault;
+pub use deletion::{ArtifactDeletionFault, ArtifactDeletionHook};
 pub use deletion::{
     ArtifactDeletionIdentity, ArtifactDeletionKind, ArtifactDeletionRequest,
     ArtifactDeletionResult, BarrierConsumerStatus, DeletionBarrierStatus,
@@ -349,4 +385,50 @@ pub(super) fn is_artifact_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod lattice_tests {
+    use super::ProviderEgress;
+    use crate::kernel::envelope::Sensitivity;
+
+    #[test]
+    fn sensitivity_merge_keeps_the_more_restrictive_class() {
+        use Sensitivity::{Normal, Secret, Sensitive};
+        for (left, right, expected) in [
+            (Normal, Normal, Normal),
+            (Normal, Sensitive, Sensitive),
+            (Normal, Secret, Secret),
+            (Sensitive, Normal, Sensitive),
+            (Sensitive, Sensitive, Sensitive),
+            (Sensitive, Secret, Secret),
+            (Secret, Normal, Secret),
+            (Secret, Sensitive, Secret),
+            (Secret, Secret, Secret),
+        ] {
+            assert_eq!(left.restrictive(right), expected, "{left:?} + {right:?}");
+        }
+    }
+
+    #[test]
+    fn egress_merge_keeps_the_more_restrictive_class() {
+        use ProviderEgress::{LocalOnly, RemoteAllowed};
+        for (left, right, expected) in [
+            (RemoteAllowed, RemoteAllowed, RemoteAllowed),
+            (RemoteAllowed, LocalOnly, LocalOnly),
+            (LocalOnly, RemoteAllowed, LocalOnly),
+            (LocalOnly, LocalOnly, LocalOnly),
+        ] {
+            assert_eq!(left.restrictive(right), expected, "{left:?} + {right:?}");
+        }
+    }
+
+    #[test]
+    fn unrecognized_stored_classes_read_back_restrictive() {
+        assert_eq!(Sensitivity::from_stored("internal"), Sensitivity::Secret);
+        assert_eq!(
+            ProviderEgress::from_stored("internal"),
+            ProviderEgress::LocalOnly
+        );
+    }
 }
