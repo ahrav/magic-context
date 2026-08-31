@@ -239,7 +239,7 @@ fn evaluate_candidate(
     } else {
         false
     };
-    if rule.source == RuleSource::Upstream
+    if (rule.source == RuleSource::Upstream || rule.declaration.upstream_parity)
         && (rules.context_is_safelisted(window)
             || rules.value_is_safelisted(value)
             || (!rule.declaration.uuid_format_secret && is_uuid(value)))
@@ -373,57 +373,79 @@ fn find_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     false
 }
 
+const SECRET_KEY_WORDS: &[&[u8]] = &[
+    b"key",
+    b"keys",
+    b"token",
+    b"tokens",
+    b"secret",
+    b"secrets",
+    b"password",
+    b"passwords",
+    b"auth",
+    b"authorization",
+    b"bearer",
+    b"credential",
+    b"credentials",
+];
+
+// KEY_QUALIFIERS limits undelimited `<qualifier><secret word>` matches: `monkey` and `whiskey` do not match because `mon` and `whis` are not qualifiers. `public` is excluded because public keys are not credentials.
+const KEY_QUALIFIERS: &[&[u8]] = &[
+    b"access",
+    b"admin",
+    b"api",
+    b"app",
+    b"application",
+    b"auth",
+    b"aws",
+    b"azure",
+    b"bearer",
+    b"client",
+    b"consumer",
+    b"database",
+    b"db",
+    b"encryption",
+    b"gcp",
+    b"github",
+    b"gitlab",
+    b"hmac",
+    b"jwt",
+    b"master",
+    b"oauth",
+    b"private",
+    b"refresh",
+    b"root",
+    b"secret",
+    b"service",
+    b"session",
+    b"shared",
+    b"signing",
+    b"slack",
+    b"stripe",
+    b"twilio",
+    b"user",
+    b"vault",
+    b"webhook",
+];
+
 fn has_secret_key_token(key: &[u8]) -> bool {
-    const TOKENS: &[&[u8]] = &[
-        b"key",
-        b"keys",
-        b"token",
-        b"tokens",
-        b"secret",
-        b"secrets",
-        b"password",
-        b"passwords",
-        b"auth",
-        b"authorization",
-        b"bearer",
-        b"credential",
-        b"credentials",
-        // Use exact token matches to avoid matching unrelated identifiers such as `monkey`, `turkey`, `keyboard`, `author`, `secretary`, and `tokenizer`.
-        b"apikey",
-        b"apikeys",
-        b"apisecret",
-        b"apitoken",
-        b"apitokens",
-        b"authkey",
-        b"authsecret",
-        b"authtoken",
-        b"accesskey",
-        b"accesskeys",
-        b"accesssecret",
-        b"accesstoken",
-        b"accesstokens",
-        b"appkey",
-        b"appsecret",
-        b"apptoken",
-        b"bearertoken",
-        b"clientkey",
-        b"clientsecret",
-        b"clienttoken",
-        b"encryptionkey",
-        b"privatekey",
-        b"privatekeys",
-        b"refreshtoken",
-        b"refreshtokens",
-        b"secretkey",
-        b"secretkeys",
-        b"secrettoken",
-        b"sessionkey",
-        b"sessionsecret",
-        b"sessiontoken",
-        b"signingkey",
-        b"signingsecret",
-    ];
-    key_tokens(key).any(|token| TOKENS.iter().any(|word| token.eq_ignore_ascii_case(word)))
+    key_tokens(key).any(is_secret_key_token)
+}
+
+fn is_secret_key_token(token: &[u8]) -> bool {
+    SECRET_KEY_WORDS.iter().any(|word| {
+        if token.eq_ignore_ascii_case(word) {
+            return true;
+        }
+        let Some(prefix_len) = token.len().checked_sub(word.len()) else {
+            return false;
+        };
+        prefix_len > 0
+            && token[prefix_len..].eq_ignore_ascii_case(word)
+            && KEY_QUALIFIERS
+                .iter()
+                .any(|qualifier| token[..prefix_len].eq_ignore_ascii_case(qualifier))
+    })
 }
 
 fn key_tokens(key: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -514,7 +536,7 @@ fn entropy_allows(spec: &EntropySpec, value: &[u8]) -> EntropyOutcome {
     EntropyOutcome::Passed
 }
 
-// `is_scalar` ignores ASCII case because languages capitalize null-like and boolean values differently; otherwise `password=None` is reported as a secret.
+// `is_scalar` ignores ASCII case because languages capitalize null-like and boolean values differently; otherwise `password=None` is reported as a secret. The non-finite spellings carry their own sign because the decimal parser below never reaches them.
 const SCALAR_KEYWORDS: &[&str] = &[
     "true",
     "false",
@@ -523,6 +545,16 @@ const SCALAR_KEYWORDS: &[&str] = &[
     "none",
     "nil",
     "nan",
+    ".nan",
+    "inf",
+    "+inf",
+    "-inf",
+    ".inf",
+    "+.inf",
+    "-.inf",
+    "infinity",
+    "+infinity",
+    "-infinity",
     "~",
 ];
 

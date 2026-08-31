@@ -54,6 +54,12 @@ fn short_quoted_values_are_kept_and_scalars_are_rejected() {
         "password=nil",
         "password=NaN",
         "password=~",
+        "password=.inf",
+        "password=-.inf",
+        "password=.NaN",
+        "password=Infinity",
+        "password=-Infinity",
+        "password=inf",
     ] {
         assert!(scanner.scan(input).unwrap().findings.is_empty(), "{input}");
     }
@@ -74,7 +80,13 @@ fn empty_keyed_values_and_secret_substrings_are_not_findings() {
         "secretary=hunter-two",
         "monkey=hunter-two",
         "turkey=hunter-two",
+        "donkey=hunter-two",
+        "hockey=hunter-two",
+        "whiskey=hunter-two",
+        "jockey=hunter-two",
         "keyboard=hunter-two",
+        "publickey=hunter-two",
+        "PUBLICKEY=hunter-two",
         r#"{"password":"\n"}"#,
         r#"{"password":"\t"}"#,
         r#"{"password":"\r\n"}"#,
@@ -110,6 +122,13 @@ fn undelimited_secret_key_names_are_gated_like_their_delimited_spelling() {
         "privatekey",
         "accesstoken",
         "refreshtoken",
+        "DATABASEPASSWORD",
+        "WEBHOOKSECRET",
+        "dbpassword",
+        "servicekey",
+        "usertoken",
+        "mastertoken",
+        "sharedsecret",
     ] {
         let report = scanner.scan(&format!("{key}={value}")).unwrap();
         assert!(
@@ -488,6 +507,37 @@ fn a_truncated_report_is_not_a_prefix_of_a_complete_one() {
         truncated.findings[0].full_span.start(),
         complete.findings[0].full_span.start(),
         "the counter-example stopped reproducing; re-derive it before relaxing the contract"
+    );
+}
+
+/// A credential matched by both rule sets must produce the same verdict.
+#[test]
+fn overlay_vendor_rules_honour_the_upstream_safelists() {
+    for profile in [ScanProfile::Conservative, ScanProfile::Comprehensive] {
+        let scanner = Scanner::new(profile).unwrap();
+        for input in [
+            "AKIAIOSFODNN7EXAMPLE",
+            "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
+        ] {
+            assert!(
+                scanner.scan(input).unwrap().findings.is_empty(),
+                "{profile:?} reported {input}"
+            );
+        }
+    }
+}
+
+/// The keyed rules stay outside those safelists and carry their own suppressors.
+#[test]
+fn overlay_keyed_rules_stay_outside_the_upstream_safelists() {
+    let scanner = Scanner::new(ScanProfile::Conservative).unwrap();
+    assert!(
+        !scanner
+            .scan("password=hunter2")
+            .unwrap()
+            .findings
+            .is_empty(),
+        "the value safelist reached a keyed overlay rule"
     );
 }
 
