@@ -187,3 +187,61 @@ fn fixture_kit_builds_branched_rebase_and_cherry_pick_histories() {
         assert_eq!(resolved, tip, "branch {branch}");
     }
 }
+
+#[test]
+fn dirty_fingerprint_is_content_addressed_at_stable_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("src/lib.rs", "base\n")],
+        "seed",
+        1,
+    );
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+    let budget = EvalBudget::unbounded();
+
+    // Same path, same status, different content: the fingerprint must move.
+    write_worktree_file(&fixture.repo, "src/lib.rs", "edit v1\n");
+    let v1 = snapshot_checkout(dir.path(), &budget).unwrap();
+    write_worktree_file(&fixture.repo, "src/lib.rs", "edit v2\n");
+    let v2 = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_eq!(v1.dirty_paths(), v2.dirty_paths());
+    assert_ne!(v1.dirty_fingerprint(), v2.dirty_fingerprint());
+
+    // Rewriting identical bytes is stat-only churn: the key must not move.
+    write_worktree_file(&fixture.repo, "src/lib.rs", "edit v2\n");
+    let v2_again = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_eq!(v2.dirty_fingerprint(), v2_again.dirty_fingerprint());
+}
+
+#[test]
+fn edits_inside_untracked_directories_move_the_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("tracked.txt", "t\n")],
+        "seed",
+        1,
+    );
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+    let budget = EvalBudget::unbounded();
+
+    write_worktree_file(&fixture.repo, "newdir/inner.txt", "one\n");
+    let one = snapshot_checkout(dir.path(), &budget).unwrap();
+    // Edit a file inside the collapsed untracked directory.
+    write_worktree_file(&fixture.repo, "newdir/inner.txt", "two\n");
+    let two = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(one.dirty_fingerprint(), two.dirty_fingerprint());
+    // Add a second file beneath it.
+    write_worktree_file(&fixture.repo, "newdir/deeper/extra.txt", "x\n");
+    let three = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(two.dirty_fingerprint(), three.dirty_fingerprint());
+}

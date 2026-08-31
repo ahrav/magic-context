@@ -474,3 +474,182 @@ fn scope_context_dimension_values_gate_matching() {
     );
     assert_eq!(batch.objects[0].state, ApplicabilityState::OutOfScope);
 }
+
+#[test]
+fn cache_hits_survive_an_unreadable_object_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+    let candidates = [ApplicabilityCandidate {
+        anchor: Some(reachable_anchor(&fixture, "anchor-odb", base)),
+        ..candidate("object-odb")
+    }];
+    let first = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &candidates,
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(first.objects[0].state, ApplicabilityState::Current);
+
+    // Park the object database: a hit path that touched it could no longer
+    // answer current. This is the oracle the graph-operation counter only
+    // approximates.
+    let objects_dir = fixture.repo.git_dir().join("objects");
+    let parked = fixture.repo.git_dir().join("objects.parked");
+    std::fs::rename(&objects_dir, &parked).unwrap();
+    let second = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &candidates,
+        &EvalBudget::unbounded(),
+    );
+    std::fs::rename(&parked, &objects_dir).unwrap();
+    assert_eq!(second.stats.object_cache_hits, 1);
+    assert_eq!(second.objects[0].state, ApplicabilityState::Current);
+}
+
+#[test]
+fn shared_anchor_ids_with_different_rows_never_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, base, tip) = seeded_repo(dir.path());
+    let foreign = commit_snapshot(&fixture.repo, "foreign", &[], &[("q.txt", "q\n")], "q", 9);
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+    // Same anchor_id, different anchored commits: the second candidate must
+    // not inherit the first's verdict through the batch memo.
+    let candidates = [
+        ApplicabilityCandidate {
+            anchor: Some(reachable_anchor(&fixture, "anchor-dup", base)),
+            ..candidate("object-a")
+        },
+        ApplicabilityCandidate {
+            anchor: Some(reachable_anchor(&fixture, "anchor-dup", foreign)),
+            ..candidate("object-b")
+        },
+    ];
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &candidates,
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(batch.objects[0].state, ApplicabilityState::Current);
+    assert_eq!(batch.objects[1].state, ApplicabilityState::Historical);
+}
+
+#[test]
+fn undecodable_object_payloads_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+    let corrupt = ApplicabilityCandidate {
+        payload: Some(b"not json".to_vec()),
+        ..candidate("object-corrupt")
+    };
+    let unknown_schema = ApplicabilityCandidate {
+        payload: Some(
+            br#"{"schema":"mc.applicability.object.v99","affected_paths":["src/lib.rs"]}"#.to_vec(),
+        ),
+        ..candidate("object-unknown-schema")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[corrupt, unknown_schema],
+        &EvalBudget::unbounded(),
+    );
+    for object in &batch.objects {
+        assert_eq!(
+            object.state,
+            ApplicabilityState::Uncertain,
+            "{}",
+            object.object_id
+        );
+        assert!(object.evidence.contains("undecodable"));
+    }
+}
+
+#[test]
+fn dirty_overlap_respects_directory_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    set_head_detached(&fixture.repo, tip);
+    materialize(&fixture.repo, tip);
+    write_worktree_file(&fixture.repo, "src/lib.rs", "dirty\n");
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    let engine = ApplicabilityEngine::new();
+    // Affected path declared at directory granularity overlaps a dirty file
+    // beneath it; a textual-prefix sibling does not.
+    let dir_scoped = ApplicabilityCandidate {
+        payload: Some(ObjectApplicabilitySpec::new(vec!["src".to_string()], vec![]).encode()),
+        ..candidate("object-dir")
+    };
+    let sibling = ApplicabilityCandidate {
+        payload: Some(
+            ObjectApplicabilitySpec::new(vec!["src/lib.rs.bak".to_string()], vec![]).encode(),
+        ),
+        ..candidate("object-sibling")
+    };
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &[dir_scoped, sibling],
+        &EvalBudget::unbounded(),
+    );
+    assert_eq!(
+        batch.objects[0].state,
+        ApplicabilityState::DirtyTreeUncertain
+    );
+    assert_eq!(batch.objects[1].state, ApplicabilityState::Current);
+}
+
+#[test]
+fn traversal_and_absolute_check_paths_are_invalid_not_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fixture, _base, tip) = seeded_repo(dir.path());
+    let snapshot = checkout(&fixture, tip);
+    let engine = ApplicabilityEngine::new();
+    let candidates: Vec<ApplicabilityCandidate> = ["../outside.txt", "/etc/hostname"]
+        .iter()
+        .enumerate()
+        .map(|(index, path)| ApplicabilityCandidate {
+            payload: Some(
+                ObjectApplicabilitySpec::new(
+                    vec![],
+                    vec![CheckSpec::FileExists {
+                        path: path.to_string(),
+                    }],
+                )
+                .encode(),
+            ),
+            ..candidate(&format!("object-escape-{index}"))
+        })
+        .collect();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &QueryContext::default(),
+        &ScopeMatchContext::new(),
+        &candidates,
+        &EvalBudget::unbounded(),
+    );
+    for object in &batch.objects {
+        // Escaping paths are unusable specifications: uncertain, never a
+        // stale classification that would trigger read repair, and never a
+        // probe outside the checkout reported as pass/fail.
+        assert_eq!(
+            object.state,
+            ApplicabilityState::Uncertain,
+            "{}",
+            object.object_id
+        );
+        assert!(object.failed_check.is_none());
+    }
+}

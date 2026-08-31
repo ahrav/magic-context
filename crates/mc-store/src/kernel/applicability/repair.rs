@@ -56,6 +56,15 @@ pub struct RepairIntent {
     head: String,
 }
 
+/// The commit sequence of the latest clearing (`applicability.current`)
+/// observation for the (object, checkout) pair, folded into the dedup
+/// identity. It advances only when a clear lands, so repeated evaluations
+/// of a persistently stale object replay one receipt, while a re-failure
+/// after a clear derives a fresh key instead of replaying the pre-clear
+/// receipt (which would leave the durable block silently lifted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriorBlockState(pub Option<i64>);
+
 impl RepairIntent {
     /// Builds the durable-append intent for a classified object. Returns
     /// `None` for states that do not append: only stale classifications and
@@ -68,16 +77,20 @@ impl RepairIntent {
         domain_id: &str,
         actor: &str,
         observed_at: i64,
+        prior_block: PriorBlockState,
     ) -> Option<Self> {
         let kind = match object.state {
             ApplicabilityState::Stale => OBSERVATION_KIND_STALE,
             ApplicabilityState::Current => OBSERVATION_KIND_CURRENT,
             _ => return None,
         };
+        // The declared serde encoding, not Debug output: this string enters
+        // a durable identity, and Debug formatting is not a stability
+        // contract.
         let check_digest = object
             .failed_check
             .as_ref()
-            .map(|failed| format!("{:?}", failed.check))
+            .and_then(|failed| serde_json::to_string(&failed.check).ok())
             .unwrap_or_default();
         let payload = ApplicabilityObservationPayload {
             schema: OBSERVATION_APPLICABILITY_SCHEMA.to_string(),
@@ -90,9 +103,13 @@ impl RepairIntent {
         };
         let detail = serde_json::to_string(&payload).expect("observation payload is serializable");
         // Deep-verification dedup identity (KTD9): object revision, checkout
-        // identity, failed check, and algorithm version, plus HEAD and dirty
-        // fingerprint so a re-failure after a clearing observation appends a
-        // fresh record instead of replaying the pre-clear receipt.
+        // identity, failed check, and algorithm version, plus HEAD, dirty
+        // fingerprint, and the latest clearing observation's commit
+        // sequence as the epoch discriminator.
+        let prior_block_marker = prior_block
+            .0
+            .map(|seq| seq.to_string())
+            .unwrap_or_else(|| "none".to_string());
         let mut key = Sha256::new();
         key.update(b"mc-applicability-repair-v1\0");
         for part in [
@@ -104,6 +121,7 @@ impl RepairIntent {
             kind,
             &check_digest,
             PATCH_ID_ALGORITHM,
+            &prior_block_marker,
         ] {
             key.update(part.as_bytes());
             key.update(b"\0");
@@ -126,10 +144,10 @@ impl RepairIntent {
         })
     }
 
-    fn observation_spec(&self, commit_marker: &str) -> ObservationSpec {
+    fn observation_spec(&self, sensitivity: Sensitivity) -> ObservationSpec {
         ObservationSpec {
-            observation_id: format!("applicability-{}", commit_marker),
-            object_id: format!("applicability-object-{}", commit_marker),
+            observation_id: format!("applicability-{}", self.operation_key),
+            object_id: format!("applicability-object-{}", self.operation_key),
             domain_id: self.domain_id.clone(),
             proposition_id: None,
             scope_id: None,
@@ -150,7 +168,7 @@ impl RepairIntent {
             source_kind: REPAIR_PRODUCER.to_string(),
             source_id: self.operation_key.clone(),
             source_revision: 1,
-            sensitivity: Sensitivity::Normal,
+            sensitivity,
         }
     }
 }
@@ -181,10 +199,12 @@ pub fn commit_read_repair(
         actor: intent.actor.clone(),
         cause: format!("applicability read repair: {}", intent.kind),
     };
-    let spec = intent.observation_spec(&intent.operation_key[..16]);
     let result = store.commit(commit_intent, |envelope| {
         // Revalidate after acquiring the writer: the deadline may have
-        // expired while waiting, and the checkout may have moved.
+        // expired while waiting, and the checkout may have moved. A receipt
+        // replay skips this closure, which is sound because the operation
+        // key already binds object revision, HEAD, and dirty fingerprint —
+        // a replayed key is a commit for this exact state.
         if budget.is_exhausted() {
             return Err(KernelError::Deadline);
         }
@@ -197,20 +217,27 @@ pub fn commit_read_repair(
         if live_head != intent.head {
             return Err(KernelError::Conflict);
         }
-        let revision: Option<i64> = envelope
+        let target: Option<(i64, String)> = envelope
             .tx
             .query_row(
-                "SELECT source_revision FROM object_registry
+                "SELECT source_revision, sensitivity_class FROM object_registry
                  WHERE object_id=?1 AND invalidated_commit_seq IS NULL",
                 [intent.object_id.as_str()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|_| KernelError::Io)?;
-        if revision != Some(intent.object_revision) {
+        let Some((revision, sensitivity)) = target else {
+            return Err(KernelError::Conflict);
+        };
+        if revision != intent.object_revision {
             return Err(KernelError::Conflict);
         }
-        Ok(envelope.insert_observation(spec.clone())?.result_json())
+        // The observation inherits the target's sensitivity: repair must
+        // not launder sensitive object metadata into normal-class rows.
+        let sensitivity = Sensitivity::from_stored(&sensitivity).restrictive(Sensitivity::Normal);
+        let spec = intent.observation_spec(sensitivity);
+        Ok(envelope.insert_observation(spec)?.result_json())
     });
     match result {
         Ok(receipt) => {
@@ -234,6 +261,9 @@ pub struct InjectionBlock {
     pub commit_seq: i64,
     /// Blocked unless the latest observation records `applicability.current`.
     pub blocked: bool,
+    /// Commit sequence of the latest clearing observation for the pair,
+    /// which may be older than `commit_seq` when the latest record blocks.
+    pub latest_clear_commit_seq: Option<i64>,
 }
 
 impl KernelStore {
@@ -293,6 +323,8 @@ impl KernelStore {
             .map_err(|_| KernelError::Io)?;
         drop(statement);
         tx.commit().map_err(|_| KernelError::Io)?;
+        let mut latest: Option<(String, i64)> = None;
+        let mut latest_clear_commit_seq = None;
         for (kind, payload, commit_seq) in rows {
             let Ok(payload) = serde_json::from_slice::<ObservationPayload>(&payload) else {
                 continue;
@@ -308,12 +340,19 @@ impl KernelStore {
             {
                 continue;
             }
-            return Ok(Some(InjectionBlock {
-                blocked: kind != OBSERVATION_KIND_CURRENT,
-                observation_kind: kind,
-                commit_seq,
-            }));
+            if latest.is_none() {
+                latest = Some((kind.clone(), commit_seq));
+            }
+            if kind == OBSERVATION_KIND_CURRENT {
+                latest_clear_commit_seq = Some(commit_seq);
+                break;
+            }
         }
-        Ok(None)
+        Ok(latest.map(|(kind, commit_seq)| InjectionBlock {
+            blocked: kind != OBSERVATION_KIND_CURRENT,
+            observation_kind: kind,
+            commit_seq,
+            latest_clear_commit_seq,
+        }))
     }
 }

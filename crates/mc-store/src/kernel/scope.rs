@@ -742,7 +742,8 @@ pub fn coerce_version(raw: &str) -> Option<semver::Version> {
     let mut components = [0u64; 3];
     let mut count = 0usize;
     let mut trailing_suffix: Option<String> = None;
-    for part in numeric.split('.') {
+    let mut parts = numeric.split('.');
+    for part in parts.by_ref() {
         if count == 3 {
             return None;
         }
@@ -765,6 +766,12 @@ pub fn coerce_version(raw: &str) -> Option<semver::Version> {
                 break;
             }
         }
+    }
+    // A suffix only attaches to the final component: "1foo.9.9" is not a
+    // version, and silently truncating it would manufacture a definite
+    // match verdict from garbage.
+    if trailing_suffix.is_some() && parts.next().is_some() {
+        return None;
     }
     if count == 0 {
         return None;

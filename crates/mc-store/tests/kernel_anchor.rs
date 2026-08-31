@@ -125,11 +125,10 @@ fn platform_version_coerces_non_semver_context_values() {
     // Vendor-suffixed build strings demote the suffix to a pre-release
     // rather than failing the parse; pre-releases do not match a plain
     // range, so the verdict is a definite non-match, not a panic.
-    let vendored = evaluate_non_git(&condition, &with_version("14.4.1ubuntu3"));
-    assert!(matches!(
-        vendored,
-        AnchorEvaluation::Holds | AnchorEvaluation::DoesNotHold { .. }
-    ));
+    assert_eq!(
+        evaluate_non_git(&condition, &with_version("14.4.1ubuntu3")),
+        AnchorEvaluation::DoesNotHold { historical: false }
+    );
     // Unparseable strings are uncertain, never a match and never a panic.
     assert_eq!(
         evaluate_non_git(&condition, &with_version("not-a-version")),

@@ -26,12 +26,15 @@ pub use engine::{
     ApplicabilityCandidate, ApplicabilityEngine, ApplicabilityState, BatchEvaluation,
     ClassificationToken, EvaluationStats, FailedCheck, ObjectApplicability,
 };
+pub use payloads::PayloadDecodeError;
 pub use payloads::{
     ApplicabilityObservationPayload, CheckSpec, ObjectApplicabilitySpec, DEPENDENCY_KIND_TARGET,
     OBJECT_APPLICABILITY_SCHEMA, OBSERVATION_APPLICABILITY_SCHEMA, OBSERVATION_KIND_CURRENT,
     OBSERVATION_KIND_HISTORICAL, OBSERVATION_KIND_STALE, OBSERVATION_KIND_UNCERTAIN,
 };
-pub use repair::{commit_read_repair, AppendOutcome, InjectionBlock, RepairIntent};
+pub use repair::{
+    commit_read_repair, AppendOutcome, InjectionBlock, PriorBlockState, RepairIntent,
+};
 pub use resolve::{
     capture_anchor_representation, compute_patch_id, GitConditionOutcome, ResolutionLadder,
     CANDIDATE_WINDOW, PATCH_ID_ALGORITHM,
@@ -117,19 +120,32 @@ impl ApplicabilityEngine {
             budget,
         );
         let mut appends = Vec::new();
+        // One committed tip for the whole batch: every block-state read in
+        // this request sees the same snapshot of the observation log.
+        let tip = store_tip(store)?;
         for object in &batch.objects {
-            if !object.append_pending && object.state != ApplicabilityState::Current {
+            // Only stale classifications and current re-evaluations earn
+            // durable appends; the other states are recomputable in-request
+            // vetoes.
+            if !matches!(
+                object.state,
+                ApplicabilityState::Stale | ApplicabilityState::Current
+            ) {
                 continue;
             }
-            let needs_clearing = object.state == ApplicabilityState::Current
-                && store
-                    .applicability_block_state(
-                        &object.object_id,
-                        snapshot.identity(),
-                        store_tip(store)?,
-                    )?
-                    .is_some_and(|block| block.blocked);
-            if object.state == ApplicabilityState::Current && !needs_clearing {
+            let prior_block =
+                store.applicability_block_state(&object.object_id, snapshot.identity(), tip)?;
+            let durably_blocked = prior_block.as_ref().is_some_and(|block| block.blocked);
+            let appends_durably = match object.state {
+                // A stale verdict appends when its own append is pending or
+                // when the durable record disagrees (a clear landed since
+                // the cached classification confirmed its append).
+                ApplicabilityState::Stale => object.append_pending || !durably_blocked,
+                // A current verdict appends only to clear a recorded block.
+                ApplicabilityState::Current => durably_blocked,
+                _ => false,
+            };
+            if !appends_durably {
                 continue;
             }
             let Some(intent) = RepairIntent::for_classification(
@@ -138,6 +154,7 @@ impl ApplicabilityEngine {
                 request.domain_id,
                 request.actor,
                 request.observed_at,
+                PriorBlockState(prior_block.and_then(|block| block.latest_clear_commit_seq)),
             ) else {
                 continue;
             };

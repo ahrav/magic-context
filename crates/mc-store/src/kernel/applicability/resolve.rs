@@ -72,6 +72,14 @@ impl<'s> ResolutionLadder<'s> {
         }
     }
 
+    pub(super) fn snapshot(&self) -> &CheckoutSnapshot {
+        self.snapshot
+    }
+
+    pub(super) fn budget(&self) -> &EvalBudget {
+        self.budget
+    }
+
     /// Object-database operations performed so far: ancestry walks,
     /// candidate-window builds, and patch-ID computations. The zero-IO
     /// cache-hit proof asserts this stays flat on hits.

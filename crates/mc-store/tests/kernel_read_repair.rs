@@ -13,7 +13,8 @@ use git_fixtures::{commit_snapshot, init_repo, materialize, set_head_detached, F
 use mc_store::kernel::applicability::{
     commit_read_repair, snapshot_checkout, AppendOutcome, ApplicabilityCandidate,
     ApplicabilityEngine, ApplicabilityRequest, ApplicabilityState, CheckSpec, EvalBudget,
-    ObjectApplicabilitySpec, RepairIntent, OBSERVATION_KIND_CURRENT, OBSERVATION_KIND_STALE,
+    ObjectApplicabilitySpec, PriorBlockState, RepairIntent, OBSERVATION_KIND_CURRENT,
+    OBSERVATION_KIND_STALE,
 };
 use mc_store::kernel::{
     CommitFault, CommitIntent, DecisionPayload, DecisionSpec, DomainSpec, KernelErrorKind,
@@ -345,9 +346,15 @@ fn deadline_missed_append_retries_on_the_next_evaluation() {
         &EvalBudget::unbounded(),
     );
     assert_eq!(batch.objects[0].state, ApplicabilityState::Stale);
-    let intent_record =
-        RepairIntent::for_classification(&snapshot, &batch.objects[0], DOMAIN, "test", 42)
-            .expect("stale classifications build repair intents");
+    let intent_record = RepairIntent::for_classification(
+        &snapshot,
+        &batch.objects[0],
+        DOMAIN,
+        "test",
+        42,
+        PriorBlockState(None),
+    )
+    .expect("stale classifications build repair intents");
     let expired = EvalBudget::new(
         Some(Instant::now() - Duration::from_millis(1)),
         Default::default(),
@@ -408,8 +415,15 @@ fn moved_head_between_snapshot_and_commit_discards_the_repair() {
         &candidates,
         &EvalBudget::unbounded(),
     );
-    let intent_record =
-        RepairIntent::for_classification(&snapshot, &batch.objects[0], DOMAIN, "test", 42).unwrap();
+    let intent_record = RepairIntent::for_classification(
+        &snapshot,
+        &batch.objects[0],
+        DOMAIN,
+        "test",
+        42,
+        PriorBlockState(None),
+    )
+    .unwrap();
 
     // The checkout moves between snapshot and commit.
     let moved = commit_snapshot(
@@ -518,4 +532,177 @@ fn future_known_as_of_is_a_typed_error() {
         .applicability_block_state(TARGET_OBJECT, "checkout", i64::MAX)
         .unwrap_err();
     assert_eq!(error.kind(), KernelErrorKind::FutureSnapshot);
+}
+
+#[test]
+fn refailure_after_a_clear_restores_the_durable_block() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (fixture, _tip) = seeded_checkout(repo_dir.path());
+    let engine = ApplicabilityEngine::new();
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let failing = [ApplicabilityCandidate {
+        object_id: TARGET_OBJECT.to_string(),
+        object_revision: 1,
+        payload: Some(
+            ObjectApplicabilitySpec::new(
+                vec![],
+                vec![CheckSpec::FileExists {
+                    path: "src/feature.rs".to_string(),
+                }],
+            )
+            .encode(),
+        ),
+        ..ApplicabilityCandidate::default()
+    }];
+
+    // Fail → clear → fail again, returning to the exact same worktree
+    // state as the first failure.
+    engine
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &failing),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    git_fixtures::write_worktree_file(&fixture.repo, "src/feature.rs", "pub fn f() {}\n");
+    engine
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &failing),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    std::fs::remove_file(fixture.repo.workdir().unwrap().join("src/feature.rs")).unwrap();
+    let refail = engine
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &failing),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    assert_eq!(refail.objects[0].state, ApplicabilityState::Stale);
+    assert!(
+        matches!(
+            refail.appends[0].1,
+            AppendOutcome::Landed {
+                replayed: false,
+                ..
+            }
+        ),
+        "a re-failure after a clear appends fresh instead of replaying the pre-clear receipt: {:?}",
+        refail.appends[0].1
+    );
+    let tip = store.known_as_of(0).unwrap().tip;
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let block = store
+        .applicability_block_state(TARGET_OBJECT, snapshot.identity(), tip)
+        .unwrap()
+        .expect("block re-recorded");
+    assert!(
+        block.blocked,
+        "the durable block is restored after the clear"
+    );
+}
+
+#[test]
+fn blocks_are_scoped_to_the_recording_checkout() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let engine = ApplicabilityEngine::new();
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+    engine
+        .evaluate(
+            &store,
+            &request(repo_dir.path(), &query, &scope, &candidates),
+            &EvalBudget::unbounded(),
+        )
+        .unwrap();
+    let tip = store.known_as_of(0).unwrap().tip;
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    assert!(
+        store
+            .applicability_block_state(TARGET_OBJECT, snapshot.identity(), tip)
+            .unwrap()
+            .unwrap()
+            .blocked
+    );
+    // A different worktree of the same project sees no recorded block.
+    assert!(store
+        .applicability_block_state(TARGET_OBJECT, "/some/other/worktree/.git", tip)
+        .unwrap()
+        .is_none());
+    // An object without observations has no recorded block.
+    assert!(store
+        .applicability_block_state("never-evaluated", snapshot.identity(), tip)
+        .unwrap()
+        .is_none());
+    // Negative snapshots are typed errors.
+    assert_eq!(
+        store
+            .applicability_block_state(TARGET_OBJECT, snapshot.identity(), -1)
+            .unwrap_err()
+            .kind(),
+        KernelErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn superseded_object_revision_discards_the_repair() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let store = seed_store(store_dir.path());
+    let (_fixture, _tip) = seeded_checkout(repo_dir.path());
+    let engine = ApplicabilityEngine::new();
+    let query = QueryContext::default();
+    let scope = ScopeMatchContext::new();
+    let candidates = [failing_candidate()];
+    let snapshot = snapshot_checkout(repo_dir.path(), &EvalBudget::unbounded()).unwrap();
+    let batch = engine.evaluate_batch(
+        &snapshot,
+        &query,
+        &scope,
+        &candidates,
+        &EvalBudget::unbounded(),
+    );
+    let intent_record = RepairIntent::for_classification(
+        &snapshot,
+        &batch.objects[0],
+        DOMAIN,
+        "test",
+        42,
+        PriorBlockState(None),
+    )
+    .unwrap();
+    // The target object is retired between classification and commit; the
+    // revision CAS must discard the repair.
+    store
+        .commit(intent("retire-target", '4'), |envelope| {
+            envelope.retire_decision(TARGET_OBJECT)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let outcome = commit_read_repair(
+        &store,
+        &engine,
+        &snapshot,
+        &batch.objects[0],
+        &intent_record,
+        &EvalBudget::unbounded(),
+    )
+    .unwrap();
+    assert_eq!(outcome, AppendOutcome::Discarded);
+    assert_eq!(
+        count(
+            store_dir.path(),
+            "SELECT COUNT(*) FROM observations WHERE observation_kind LIKE 'applicability.%'"
+        ),
+        0
+    );
 }

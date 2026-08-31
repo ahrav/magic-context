@@ -395,11 +395,17 @@ impl TermValueSpec {
     }
 }
 
+/// Laws draw dimensions from a three-element pool so two generated scopes
+/// share dimensions roughly half the time; over the full ten-dimension
+/// vocabulary, non-trivial subsumption pairs almost never arise and the
+/// implication laws pass vacuously.
+const LAW_DIMENSIONS: [Dimension; 3] = [Dimension::Branch, Dimension::Region, Dimension::Platform];
+
 fn scope_strategy() -> impl Strategy<Value = CanonicalScope> {
     prop::collection::btree_map(
-        prop::sample::select(Dimension::ALL.to_vec()),
+        prop::sample::select(LAW_DIMENSIONS.to_vec()),
         term_strategy(),
-        0..3,
+        1..3,
     )
     .prop_map(|terms: BTreeMap<Dimension, TermValueSpec>| {
         let specs: Vec<ScopeTermSpec> = terms
@@ -410,10 +416,41 @@ fn scope_strategy() -> impl Strategy<Value = CanonicalScope> {
     })
 }
 
+/// Widens one decoded term into a strictly-larger value set, giving the
+/// laws a construction-side subsumption witness that does not depend on
+/// `scope_subsumes` itself.
+fn widen_term(dimension: Dimension, value: &TermValue) -> Option<ScopeTermSpec> {
+    let name = dimension.as_str();
+    match value {
+        TermValue::Exact(value) => Some(set(name, &[value, "zz-widened"])),
+        TermValue::Set(values) => {
+            let mut widened: Vec<&str> = values.iter().map(String::as_str).collect();
+            widened.push("zz-widened");
+            Some(set(name, &widened))
+        }
+        TermValue::Range { start, .. } => Some(range(name, start.as_deref().min(Some("a")), None)),
+        TermValue::VersionRange(_) => Some(version_range(name, ">=0.0.0")),
+        TermValue::GitReachable(_) => Some(git_reachable(name, &oid(0))),
+        TermValue::RedactedPlaceholder => None,
+    }
+}
+
+/// A scope paired with a widening of itself: every term's value set grows,
+/// so the widened scope subsumes the original by construction.
+fn widened_pair_strategy() -> impl Strategy<Value = (CanonicalScope, CanonicalScope)> {
+    scope_strategy().prop_filter_map("terms must be widenable", |narrow| {
+        let widened: Option<Vec<ScopeTermSpec>> = narrow
+            .terms()
+            .map(|(dimension, term)| widen_term(dimension, term))
+            .collect();
+        widened.map(|specs| (scope(&specs), narrow))
+    })
+}
+
 fn context_strategy() -> impl Strategy<Value = ScopeMatchContext> {
     (
         prop::collection::btree_map(
-            prop::sample::select(Dimension::ALL.to_vec()),
+            prop::sample::select(LAW_DIMENSIONS.to_vec()),
             prop_oneof![
                 value_strategy(),
                 (0u64..6).prop_map(|major| format!("{major}.1.0")),
@@ -526,6 +563,21 @@ proptest! {
     }
 
     #[test]
+    fn constructed_widening_subsumes_and_preserves_matches(
+        (wide, narrow) in widened_pair_strategy(),
+        ctx in context_strategy(),
+    ) {
+        let oracle = law_oracle();
+        // The widening is a subsumption witness built independently of the
+        // predicate under test.
+        prop_assert!(scope_subsumes(&wide, &narrow, &oracle));
+        if scope_matches(&narrow, &ctx, &oracle) == MatchOutcome::Matches {
+            prop_assert_eq!(scope_matches(&wide, &ctx, &oracle), MatchOutcome::Matches);
+        }
+        prop_assert!(scope_overlaps(&wide, &narrow, &oracle));
+    }
+
+    #[test]
     fn absent_dimension_scope_subsumes_added_term(
         a in scope_strategy(),
         term in term_strategy(),
@@ -566,4 +618,66 @@ fn term_value_to_spec(dimension: Dimension, value: &TermValue) -> Option<ScopeTe
         TermValue::GitReachable(oid) => Some(git_reachable(name, oid)),
         TermValue::RedactedPlaceholder => None,
     }
+}
+
+#[test]
+fn law_generators_reach_nontrivial_subsumption_pairs() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let strategy = (scope_strategy(), scope_strategy());
+    let oracle = law_oracle();
+    let mut nontrivial = 0usize;
+    for _ in 0..2_000 {
+        let (a, b) = strategy
+            .new_tree(&mut runner)
+            .expect("strategy generates")
+            .current();
+        let a_size = a.terms().count();
+        if a_size > 0 && b.terms().count() > 0 && a != b && scope_subsumes(&a, &b, &oracle) {
+            nontrivial += 1;
+        }
+    }
+    assert!(
+        nontrivial >= 50,
+        "law generators must reach non-trivial subsumption pairs, got {nontrivial}"
+    );
+}
+
+#[test]
+fn placeholder_terms_decode_on_every_operator_carrier() {
+    for spec in [
+        set("branch", &["main", PLACEHOLDER_BRANCH]),
+        range("branch", Some(PLACEHOLDER_BRANCH), None),
+        range("branch", None, Some(PLACEHOLDER_BRANCH)),
+    ] {
+        assert_eq!(
+            scope(std::slice::from_ref(&spec)).term(Dimension::Branch),
+            Some(&TermValue::RedactedPlaceholder),
+            "{spec:?}"
+        );
+    }
+    // Two different secrets collapse onto one token; they must never be
+    // judged equivalent or mutually subsuming.
+    let a = scope(&[set("branch", &["x", PLACEHOLDER_BRANCH])]);
+    let b = scope(&[set("branch", &["y", PLACEHOLDER_BRANCH])]);
+    assert!(!scope_subsumes(&a, &b, &UnknownGraph));
+    assert!(!scope_equivalent(&a, &b, &UnknownGraph));
+    assert!(scope_overlaps(&a, &b, &UnknownGraph));
+}
+
+#[test]
+fn contradictory_version_ranges_are_empty_sets() {
+    let empty = scope(&[version_range("platform", ">=3.0.0, <2.0.0")]);
+    let point = scope(&[version_range("platform", "=1.0.0")]);
+    // Everything subsumes the empty set; nothing overlaps it.
+    assert!(scope_subsumes(&point, &empty, &UnknownGraph));
+    assert!(!scope_overlaps(&point, &empty, &UnknownGraph));
+}
+
+#[test]
+fn coerce_version_rejects_components_after_a_vendor_suffix() {
+    assert_eq!(coerce_version("1foo.9.9"), None);
+    assert_eq!(coerce_version("1.2foo.9"), None);
+    assert!(coerce_version("1.2.3foo").is_some());
 }

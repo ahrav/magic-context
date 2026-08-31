@@ -52,3 +52,37 @@ impl<K: Eq + Hash + Clone, V: Clone> TwoGenerationCache<K, V> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_preserves_one_generation_and_hits_promote() {
+        let mut cache = TwoGenerationCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        // Third distinct insert rotates: {a, b} becomes the previous
+        // generation.
+        cache.insert("c", 3);
+        // A previous-generation hit promotes the entry back into current.
+        assert_eq!(cache.get(&"a"), Some(1));
+        // Updates reach values still parked in the previous generation.
+        cache.update(&"b", |value| *value = 20);
+        assert_eq!(cache.get(&"b"), Some(20));
+        // Two more distinct inserts push the oldest generation out entirely.
+        cache.insert("d", 4);
+        cache.insert("e", 5);
+        assert_eq!(cache.get(&"c"), None);
+    }
+
+    #[test]
+    fn reinserting_an_existing_key_does_not_rotate() {
+        let mut cache = TwoGenerationCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        cache.insert("a", 10);
+        assert_eq!(cache.get(&"a"), Some(10));
+        assert_eq!(cache.get(&"b"), Some(2));
+    }
+}

@@ -185,8 +185,10 @@ impl ApplicabilityEngine {
         let mut stats = EvaluationStats::default();
         let ladder = ResolutionLadder::new(snapshot, budget);
         let scope_context = scope_context.clone().with_head_commit(snapshot.head());
-        // Distinct anchors resolve once per batch even on cache misses.
-        let mut batch_anchor_memo: HashMap<String, GitConditionOutcome> = HashMap::new();
+        // Distinct anchors resolve once per batch even on cache misses. The
+        // memo key matches the anchor cache key, so two candidates sharing
+        // an anchor id but carrying different rows can never alias.
+        let mut batch_anchor_memo: HashMap<AnchorCacheKey, GitConditionOutcome> = HashMap::new();
         let mut objects = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             let token = ClassificationToken(self.object_cache_key(
@@ -234,18 +236,14 @@ impl ApplicabilityEngine {
                 continue;
             }
             stats.object_cache_misses += 1;
-            let graph_ops_before = ladder.graph_operations();
             let classification = self.classify(
-                snapshot,
                 query,
                 &scope_context,
                 &ladder,
                 &mut batch_anchor_memo,
                 &mut stats,
                 candidate,
-                budget,
             );
-            stats.graph_operations += ladder.graph_operations() - graph_ops_before;
             if classification.cacheable {
                 self.object_cache.lock().expect("cache lock").insert(
                     token.0.clone(),
@@ -260,6 +258,9 @@ impl ApplicabilityEngine {
             let append_pending = classification.state.blocks_auto_injection();
             objects.push(finished(candidate, token, classification, append_pending));
         }
+        // Read the counter once for the whole batch so hit paths cannot hide
+        // graph work behind branch placement.
+        stats.graph_operations = ladder.graph_operations();
         BatchEvaluation { objects, stats }
     }
 
@@ -272,18 +273,17 @@ impl ApplicabilityEngine {
             .update(&token.0, |cached| cached.append_confirmed = true);
     }
 
-    #[expect(clippy::too_many_arguments, reason = "internal classify pipeline")]
     fn classify(
         &self,
-        snapshot: &CheckoutSnapshot,
         query: &QueryContext,
         scope_context: &ScopeMatchContext,
         ladder: &ResolutionLadder<'_>,
-        batch_anchor_memo: &mut HashMap<String, GitConditionOutcome>,
+        batch_anchor_memo: &mut HashMap<AnchorCacheKey, GitConditionOutcome>,
         stats: &mut EvaluationStats,
         candidate: &ApplicabilityCandidate,
-        budget: &EvalBudget,
     ) -> Classification {
+        let snapshot = ladder.snapshot();
+        let budget = ladder.budget();
         // Scope gate.
         if let Some(terms) = &candidate.scope_terms {
             let scope = match CanonicalScope::from_term_specs(terms) {
@@ -328,8 +328,19 @@ impl ApplicabilityEngine {
                 }
             }
         }
-        // Dirty-tree gate and cheap checks read the object payload.
-        let spec = ObjectApplicabilitySpec::decode(candidate.payload.as_deref());
+        // Dirty-tree gate and cheap checks read the object payload. A
+        // present-but-undecodable payload fails closed: the declared paths
+        // and checks are unknowable, so the object is uncertain, never
+        // silently current.
+        let spec = match ObjectApplicabilitySpec::decode(candidate.payload.as_deref()) {
+            Ok(spec) => spec,
+            Err(_) => {
+                return Classification::terminal(
+                    ApplicabilityState::Uncertain,
+                    "object applicability payload is undecodable",
+                );
+            }
+        };
         if let Some(spec) = &spec {
             if let Some(path) = dirty_overlap(snapshot, &spec.affected_paths) {
                 return Classification::terminal(
@@ -351,7 +362,7 @@ impl ApplicabilityEngine {
                             cacheable: true,
                         };
                     }
-                    CheckOutcome::Unsupported { evidence } => {
+                    CheckOutcome::Unsupported { evidence } | CheckOutcome::Invalid { evidence } => {
                         return Classification::terminal(ApplicabilityState::Uncertain, evidence);
                     }
                     CheckOutcome::BudgetExhausted => {
@@ -374,7 +385,7 @@ impl ApplicabilityEngine {
         snapshot: &CheckoutSnapshot,
         query: &QueryContext,
         ladder: &ResolutionLadder<'_>,
-        batch_anchor_memo: &mut HashMap<String, GitConditionOutcome>,
+        batch_anchor_memo: &mut HashMap<AnchorCacheKey, GitConditionOutcome>,
         stats: &mut EvaluationStats,
         anchor: &AnchorRowSpec,
     ) -> AnchorVerdict {
@@ -397,16 +408,16 @@ impl ApplicabilityEngine {
         let AnchorCondition::Git(git_condition) = &condition else {
             unreachable!("NeedsGitResolution is only reported for git conditions");
         };
-        let outcome = if let Some(outcome) = batch_anchor_memo.get(&anchor.anchor_id) {
+        let key = AnchorCacheKey {
+            checkout_identity: snapshot.identity().to_string(),
+            anchor_id: anchor.anchor_id.clone(),
+            payload_digest: digest_optional(anchor.payload.as_deref()),
+            head: snapshot.head().to_string(),
+            patch_id_algorithm: PATCH_ID_ALGORITHM,
+        };
+        let outcome = if let Some(outcome) = batch_anchor_memo.get(&key) {
             *outcome
         } else {
-            let key = AnchorCacheKey {
-                checkout_identity: snapshot.identity().to_string(),
-                anchor_id: anchor.anchor_id.clone(),
-                payload_digest: digest_optional(anchor.payload.as_deref()),
-                head: snapshot.head().to_string(),
-                patch_id_algorithm: PATCH_ID_ALGORITHM,
-            };
             let cached = self.anchor_cache.lock().expect("cache lock").get(&key);
             let outcome = match cached {
                 Some(outcome) => {
@@ -422,12 +433,12 @@ impl ApplicabilityEngine {
                         self.anchor_cache
                             .lock()
                             .expect("cache lock")
-                            .insert(key, outcome);
+                            .insert(key.clone(), outcome);
                     }
                     outcome
                 }
             };
-            batch_anchor_memo.insert(anchor.anchor_id.clone(), outcome);
+            batch_anchor_memo.insert(key, outcome);
             outcome
         };
         match outcome {

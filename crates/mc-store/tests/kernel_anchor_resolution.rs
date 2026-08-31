@@ -235,6 +235,92 @@ fn rebase_fixture_resolves_through_patch_id_and_duplicates_stay_uncertain() {
         ladder.evaluate(&reachable_from(anchored, captures)),
         GitConditionOutcome::Uncertain
     );
+
+    // A reachable anchor is decided by ancestry before any fallback rung:
+    // the ambiguous window above must never be consulted for it.
+    let reachable_captures = captures_for(repo, &[rebased]);
+    assert_eq!(
+        ladder.evaluate(&reachable_from(rebased, reachable_captures)),
+        GitConditionOutcome::Holds,
+        "ancestry decides before the fallback ladder"
+    );
+}
+
+#[test]
+fn foreign_algorithm_patch_ids_skip_the_rung() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(
+        repo,
+        "main",
+        &[],
+        &[(
+            "f.txt", "one
+",
+        )],
+        "base",
+        1,
+    );
+    let anchored = commit_snapshot(
+        repo,
+        "topic",
+        &[base],
+        &[
+            (
+                "f.txt", "one
+",
+            ),
+            (
+                "g.txt", "change
+",
+            ),
+        ],
+        "anchored",
+        2,
+    );
+    let advanced = commit_snapshot(
+        repo,
+        "main",
+        &[base],
+        &[(
+            "f.txt", "two
+",
+        )],
+        "advance",
+        3,
+    );
+    let rebased = commit_snapshot(
+        repo,
+        "main",
+        &[advanced],
+        &[
+            (
+                "f.txt", "two
+",
+            ),
+            (
+                "g.txt", "change
+",
+            ),
+        ],
+        "anchored",
+        4,
+    );
+    let mut captures = captures_for(repo, &[anchored]);
+    let capture = captures.get_mut(&anchored.to_string()).unwrap();
+    // Same value, foreign algorithm tag; the rung must not treat it as one
+    // of ours. Drop the tree hash to isolate the patch-ID rung.
+    capture.patch_id.as_mut().unwrap().algorithm = "git-patch-id-stable-v1".to_string();
+    capture.tree_oid = None;
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, rebased);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    assert_eq!(
+        ladder.evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::DoesNotHold { historical: false },
+        "present-but-unreachable anchor keeps the ancestry verdict"
+    );
 }
 
 #[test]
@@ -386,6 +472,37 @@ fn patch_id_is_stable_across_parents_and_whitespace_and_absent_for_merges() {
         id_a,
         compute_patch_id(repo, different, &budget).unwrap().unwrap()
     );
+
+    // A two-file change on two different parents: the order-independent
+    // combination yields the same identity, distinct from the one-file one.
+    let two_on_a = commit_snapshot(
+        repo,
+        "two-a",
+        &[base_a],
+        &[
+            ("f.txt", "base a\n"),
+            ("g.txt", "same change\n"),
+            ("h.txt", "second file\n"),
+        ],
+        "two",
+        8,
+    );
+    let two_on_b = commit_snapshot(
+        repo,
+        "two-b",
+        &[base_b],
+        &[
+            ("f.txt", "base b\n"),
+            ("g.txt", "same change\n"),
+            ("h.txt", "second file\n"),
+        ],
+        "two",
+        9,
+    );
+    let id_two_a = compute_patch_id(repo, two_on_a, &budget).unwrap().unwrap();
+    let id_two_b = compute_patch_id(repo, two_on_b, &budget).unwrap().unwrap();
+    assert_eq!(id_two_a, id_two_b, "two-file diff stable across parents");
+    assert_ne!(id_two_a, id_a, "two-file diff differs from one-file diff");
 
     // Merge commits have no patch identity.
     let merge = commit_snapshot(

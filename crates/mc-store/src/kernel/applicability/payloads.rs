@@ -50,14 +50,35 @@ impl ObjectApplicabilitySpec {
         serde_json::to_vec(self).expect("object applicability payload is serializable")
     }
 
-    /// Fail-closed decode: `None` when the payload is missing, unreadable,
-    /// or carries an unknown schema. Callers treat `None` as "no declared
-    /// inputs".
-    pub fn decode(payload: Option<&[u8]>) -> Option<Self> {
-        let decoded = serde_json::from_slice::<Self>(payload?).ok()?;
-        (decoded.schema == OBJECT_APPLICABILITY_SCHEMA).then_some(decoded)
+    /// Fail-closed decode. An absent payload is `Ok(None)` — the object
+    /// declares no inputs. A present payload that is unreadable or carries
+    /// an unknown schema is an error: its declared paths and checks are
+    /// unknowable, so callers render the object uncertain rather than
+    /// skipping the gates it may have declared.
+    pub fn decode(payload: Option<&[u8]>) -> Result<Option<Self>, PayloadDecodeError> {
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let decoded = serde_json::from_slice::<Self>(payload).map_err(|_| PayloadDecodeError)?;
+        if decoded.schema != OBJECT_APPLICABILITY_SCHEMA {
+            return Err(PayloadDecodeError);
+        }
+        Ok(Some(decoded))
     }
 }
+
+/// A present object payload that could not be decoded; the owning object
+/// evaluates uncertain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadDecodeError;
+
+impl std::fmt::Display for PayloadDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("object applicability payload is undecodable")
+    }
+}
+
+impl std::error::Error for PayloadDecodeError {}
 
 /// One bounded cheap check. `Symbol` ships as vocabulary only: it decodes,
 /// evaluates as unsupported, and renders the object uncertain until a real
