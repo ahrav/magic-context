@@ -1,12 +1,11 @@
 use std::fs;
-use std::io::Read;
 
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use super::{
-    is_artifact_digest, ArtifactDestination, ArtifactEligibility, ArtifactError, ArtifactErrorKind,
-    ArtifactHandle, EligibilityDeniedReason, ProviderEgress, MAX_PAYLOAD_BYTES,
+    is_artifact_digest, read_capped, ArtifactDestination, ArtifactEligibility, ArtifactError,
+    ArtifactErrorKind, ArtifactHandle, EligibilityDeniedReason, ProviderEgress,
 };
 use crate::kernel::{KernelStore, Sensitivity};
 
@@ -61,23 +60,15 @@ impl KernelStore {
         let object = fs::File::open(&path).map_err(|_| {
             ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
         })?;
-        let mut bytes = Vec::new();
-        object
-            .take(
-                u64::try_from(MAX_PAYLOAD_BYTES)
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1),
-            )
-            .read_to_end(&mut bytes)
-            .map_err(|_| {
-                ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
-            })?;
-        if bytes.len() > MAX_PAYLOAD_BYTES {
+        let Some(bytes) = read_capped(object).map_err(|_| {
+            ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
+        })?
+        else {
             return Err(ArtifactError::for_digest(
                 ArtifactErrorKind::CorruptObject,
                 &handle.digest,
             ));
-        }
+        };
         if format!("{:x}", Sha256::digest(&bytes)) != handle.digest {
             return Err(ArtifactError::for_digest(
                 ArtifactErrorKind::CorruptObject,
