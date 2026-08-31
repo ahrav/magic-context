@@ -166,7 +166,6 @@ describe("seedFixture on the reviewed v1 release", () => {
     it("binds the deterministic vector-recipe id into the fixture identity", () => {
         const result = seedV1();
         expect(result.manifest.embeddingModelId).toBe(BENCHMARK_EMBEDDING_MODEL_ID);
-        // Changing embeddingModelId changes manifestFingerprint.
         const staleRecipe = canonicalFingerprint({
             ...result.manifest,
             embeddingModelId: "benchmark:deterministic/v1",
@@ -198,8 +197,7 @@ describe("seedFixture on the reviewed v1 release", () => {
             "where is normalizeSearchResultLimit defined",
             { sources: ["message"], maxMessageOrdinal: 1 },
         );
-        // msg-fixture-0001 has ordinal 1 and matches the query, so an empty
-        // result would make the containment loop below vacuously pass.
+        // `msg-fixture-0001` matches the query at ordinal 1, so `narrow` must be nonempty before the containment loop.
         expect(narrow.length).toBeGreaterThan(0);
         const narrowOrdinals = new Set(
             messageEntries
@@ -219,9 +217,7 @@ describe("seedFixture on the reviewed v1 release", () => {
             const messages = db
                 .prepare("SELECT COUNT(*) AS count FROM message_history_fts")
                 .get() as { count: number };
-            // Each reviewed compartment reserves an ordinal backed by one
-            // message carrying its content, so the indexed count covers
-            // message documents plus one backing message per compartment.
+            // The indexed count includes each message document and one content-carrying backing message for each reviewed compartment.
             expect(messages.count).toBe(
                 result.manifest.documents.filter(
                     (entry) => entry.kind === "message" || entry.kind === "compartment",
@@ -290,9 +286,7 @@ describe("seed-time positive-target validation (AE2)", () => {
     });
 
     it("applies the same inclusive cutoff to compartment end ordinals", () => {
-        // Reviewed compartments anchor just past the reviewed-message
-        // watermark (four message ordinals), so scale filler cannot shift
-        // them and they never overlap a judged message ordinal:
+        // Reviewed compartments start at ordinal 5, after the four reviewed-message ordinals, so filler cannot shift or overlap judged message ordinals.
         // d-architecture-rationale-dev is the first compartment: ordinal 5.
         const atCutoff = releaseWithCutoff("q-architecture-rationale-dev", 5);
         expect(() =>

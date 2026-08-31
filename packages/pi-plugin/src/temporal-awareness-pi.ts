@@ -1,26 +1,17 @@
 /**
- * Pi-side temporal-marker injection — mirrors OpenCode's
  * `injectTemporalMarkers` (packages/plugin/src/hooks/magic-context/temporal-awareness.ts).
  *
- * Behaves identically to OpenCode at the agent-visible layer: when the
- * gap between the previous message's effective end time and the current
- * user message's creation time exceeds TEMPORAL_AWARENESS_THRESHOLD_SECONDS
- * (5 minutes), prepends an HTML-comment marker to the user message's
- * first text content (`<!-- +12m -->\n`, `<!-- +2h 15m -->\n`, etc.).
+ * The gap runs from the previous timestamped message to the current user message timestamp.
+ * injectPiTemporalMarkers injects only when the gap exceeds 300 seconds.
+ * The marker is prepended to the first text content.
+ * Markers use the `<!-- +<gap> -->\n` format.
  *
  * Pi differences:
- *   - Pi messages carry a single `timestamp` (number, ms epoch). Pi has
- *     no separate created/completed fields the way OpenCode does — the
- *     timestamp is when the message was emitted. We use that for both
- *     "previous end time" and "current creation time", which is the
- *     same effective behavior OpenCode falls back to for non-completed
- *     messages (see effectiveEndMs in temporal-awareness.ts).
- *   - Pi user messages have `content: string | (TextContent | ImageContent)[]`.
- *     We mutate the first text content (or convert string → array+text).
+ * Pi messages use a millisecond-epoch `timestamp`.
+ * Pi uses `timestamp` as both the previous end time and current creation time.
+ * The marker precedes the first text part.
  *
- * Idempotent: re-injecting on a later transform pass detects existing
- * markers via the same regex OpenCode uses and skips. Safe to run on
- * every pass (intentional — same as OpenCode, see transform.ts:648).
+ * Existing markers are skipped.
  */
 
 import {
@@ -45,7 +36,7 @@ type PiOtherMessage = {
 };
 type PiAgentMessage = PiUserMessage | PiOtherMessage;
 
-/** Remove one derived gap marker while preserving any leading MC tag notation. */
+/** `withoutPiLeadingTemporalMarker` removes one derived gap marker while preserving leading MC tag notation. */
 export function withoutPiLeadingTemporalMarker(text: string): string {
 	const { tagPrefix, body } = peelLeadingMcTagNotation(text);
 	return tagPrefix + body.replace(TEMPORAL_MARKER_PATTERN, "");
@@ -77,12 +68,8 @@ export function stripPiLeadingTemporalMarker(message: unknown): boolean {
 }
 
 /**
- * Inject HTML-comment gap markers into Pi user messages. Mirrors
- * OpenCode's `injectTemporalMarkers` 1:1 in agent-visible behavior;
- * differences are limited to the message-shape walking and write
- * back into Pi's content union.
  *
- * Returns the number of user messages that received a new marker.
+ * `injectPiTemporalMarkers` returns the number of user messages that received a new marker.
  */
 export function injectPiTemporalMarkers(messages: unknown[]): number {
 	let injected = 0;
@@ -95,9 +82,7 @@ export function injectPiTemporalMarkers(messages: unknown[]): number {
 		const role = msg.role;
 
 		const currTimestamp = msg.timestamp;
-		// Compute gap from previous-any-role message → current user message.
-		// Matches OpenCode: any role triggers the "previous time" baseline,
-		// only user role receives the marker.
+		// `injectPiTemporalMarkers` computes the gap from the previous timestamped message of any role to the current user message.
 		if (
 			prevTimestampMs !== undefined &&
 			role === "user" &&
@@ -145,9 +130,8 @@ export function injectPiTemporalMarkers(messages: unknown[]): number {
 			}
 		}
 
-		// Use the current message's timestamp as the baseline for the
-		// next iteration. Falls back to keeping the previous value when
-		// the current message has no timestamp (e.g. malformed input).
+		// A timestamped message resets the baseline for subsequent messages, regardless of role.
+		// Messages without timestamps preserve the previous timestamp baseline.
 		if (typeof currTimestamp === "number") {
 			prevTimestampMs = currTimestamp;
 		}

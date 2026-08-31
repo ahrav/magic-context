@@ -1,9 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { classifyGitLogFailure, parseGitLogOutput, readGitCommits } from "./git-log-reader";
 
-// Field separator is US (0x1f, ASCII Unit Separator). We deliberately moved
-// off NUL (0x00) because Node's child_process.execFile rejects argv elements
-// containing embedded NUL bytes — see git-log-reader.ts header comment.
+// FS uses US (0x1f) because Node's child_process.execFile rejects argv elements containing NUL bytes.
 const FS = "\x1f";
 const RS = "\x1e";
 
@@ -58,7 +56,6 @@ describe("parseGitLogOutput", () => {
         expect(commits).toHaveLength(3);
         expect(commits[0].sha).toBe(s1);
         expect(commits[1].message).toBe("second\n\nbody");
-        // Empty author becomes null.
         expect(commits[2].author).toBeNull();
     });
 

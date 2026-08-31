@@ -1828,8 +1828,7 @@ describe("Rust mode authority adapter", () => {
                 const page = body as Record<string, unknown>;
                 transformCalls.push(page);
                 if (page.transform_page_index === 1) {
-                    // Possible-send failures throw; they never surface as a
-                    // typed generation-change result.
+                    // Possible-send failures throw instead of returning a typed generation-change result.
                     throw new McHostCallError(
                         "outcome_unknown",
                         "connection dropped after a possible send",
@@ -2085,11 +2084,8 @@ describe("Rust mode authority adapter", () => {
         expect(Buffer.byteLength(JSON.stringify(requestBodies[1]))).toBeLessThan(
             MODULE_PAGE_MAX_BYTES,
         );
-        // Loose wall-clock ceiling: the contract under test is the O(1)
-        // steady-state shape asserted above (empty page + tail delta), not a
-        // latency SLO. 100ms held locally but flaked on loaded CI runners; a
-        // linear re-send of 1,000 messages costs far more than 500ms there,
-        // so the bound still catches the regression this test guards.
+        // The 500ms ceiling catches linear re-sends without enforcing a latency SLO.
+        // A 500ms ceiling catches linear re-sends without enforcing a latency SLO.
         expect(steadyElapsed).toBeLessThan(500);
     });
 
@@ -2851,8 +2847,7 @@ describe("Rust mode authority adapter", () => {
             needsEmergencyRecovery: true,
             emergencyRecoveryOrigin: "provider_overflow",
         });
-        // The second observation models a provider overflow event arriving while recovery
-        // from the first rejection is still durably armed.
+        // The second observation models an overflow event during recovery from the first rejection.
         recordOverflowDetected(db, sessionId, undefined);
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) => {
@@ -3213,9 +3208,9 @@ describe("prepareRustMemoryAuthority mixed restore", () => {
             onProjectPrepared: (prepared) => preparedProjects.push(prepared),
         });
         expect(state.memoryAuthorityReady).toBe(true);
-        // Hosts hang per-project services (the smart-note evaluator bridge) off this
-        // callback, so it must fire with the RESOLVED project — a session that resolves
-        // a project other than the plugin's launch directory still gets its bridge.
+        // The callback must receive the resolved project so hosts can attach its smart-note evaluator bridge.
+        // The callback must receive the resolved project, not the plugin launch directory.
+        // A session resolved to another project receives that project's smart-note evaluator bridge.
         expect(preparedProjects).toEqual([projectPath]);
         expect(authorityRoots.length).toBeGreaterThan(0);
         expect(authorityRoots.every((root) => root === projectRoot)).toBe(true);
@@ -3400,7 +3395,7 @@ describe("delta prefix-mutation guard", () => {
 
         const first = buildMessages(3);
         await transform.run(sessionId, first, { messages: [...first] }, makeMeta(db, sessionId));
-        // Steady-state control: an appended tail rides a delta.
+        // An appended tail rides a delta.
         const appended = buildMessages(4);
         await transform.run(
             sessionId,
@@ -3414,9 +3409,8 @@ describe("delta prefix-mutation guard", () => {
             replace_from: expect.any(Number),
             native_replace_from: expect.any(Number),
         });
-        // Mutate an OLD message in place (the ephemeral reminder-wrapper class): the
-        // pass must abandon the delta and full-send, because the prefix the module
-        // would reuse no longer matches what OpenCode holds.
+        // Mutating an old ephemeral reminder-wrapper message requires a full send because it invalidates OpenCode's reusable prefix.
+        // Mutating an old ephemeral reminder-wrapper message requires a full send because it invalidates OpenCode's reusable prefix.
         const mutated = buildMessages(4, true);
         expect(__rustModeTransformTest.messageContentSnapshot(mutated[0]).signature).not.toBe(
             __rustModeTransformTest.messageContentSnapshot(appended[0]).signature,

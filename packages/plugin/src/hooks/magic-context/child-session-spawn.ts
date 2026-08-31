@@ -25,7 +25,7 @@ interface ChildSessionSpawnArgs {
     title: string;
     directory?: string;
     notificationParams?: NotificationParams;
-    /** Test seam for the one-shot, N-consecutive failure surface. */
+    /* */
     onFenceLatched?: (failure: ChildSpawnFenceFailure) => void | Promise<void>;
 }
 
@@ -59,8 +59,6 @@ async function surfaceSchemaFenceFailure(
             },
             args.parentSessionId,
         );
-        // The toast's companion action makes the persisted sidebar error visible
-        // immediately instead of waiting for the next session event or poll.
         pushNotification("action", { action: "refresh-sidebar" }, args.parentSessionId);
         // This is the same out-of-band boot-warning surface used for compaction-off mode
         // transitions. It never joins the transform message array or nudge path.
@@ -80,8 +78,6 @@ async function surfaceSchemaFenceFailure(
 }
 
 /**
- * Shared OpenCode child-session choke point. Every historian/recomp, dreamer,
- * and sidekick child must pass this probe before asking OpenCode to create it.
  */
 export async function createChildSessionWithFence(
     args: ChildSessionSpawnArgs,

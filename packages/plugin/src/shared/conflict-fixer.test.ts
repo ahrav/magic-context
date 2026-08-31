@@ -47,7 +47,7 @@ describe("fixConflicts", () => {
         try {
             rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     });
 
@@ -56,14 +56,14 @@ describe("fixConflicts", () => {
         writeFileSync(
             configPath,
             `{
-  // keep this file-level comment
+  // The JSONC rewrite preserves this file-level comment.
   "plugin": [
     ["@plannotator/opencode@latest", { "workflow": "plan-agent" }],
     ["@tarquinen/opencode-dcp@latest", { "enabled": true }],
     "@cortexkit/opencode-magic-context@latest"
   ],
   "compaction": {
-    // keep this compaction comment
+    // The JSONC rewrite preserves this compaction comment.
     "auto": true,
     "prune": true
   }
@@ -81,8 +81,8 @@ describe("fixConflicts", () => {
         const updatedText = readFileSync(configPath, "utf-8");
         const updated = parseJsonc(updatedText) as Record<string, unknown>;
         expect(actions).toEqual(["Disabled auto-compaction", "Removed opencode-dcp plugin"]);
-        expect(updatedText).toContain("keep this file-level comment");
-        expect(updatedText).toContain("keep this compaction comment");
+        expect(updatedText).toContain("The JSONC rewrite preserves this file-level comment");
+        expect(updatedText).toContain("The JSONC rewrite preserves this compaction comment");
         expect(updated.compaction).toEqual({ auto: false, prune: false });
         expect(updated.plugin).toEqual([
             ["@plannotator/opencode@latest", { workflow: "plan-agent" }],
@@ -132,7 +132,7 @@ describe("fixConflicts", () => {
         ]);
     });
 
-    // --- Unified OMO config (oh-my-openagent >= 4.19.0) ---
+    // oh-my-openagent 4.19.0+ uses the unified OMO config format.
 
     describe("unified OMO config paths", () => {
         const omoConflicts = {
@@ -179,8 +179,7 @@ describe("fixConflicts", () => {
             ]);
             expect(opencodeBlock.other_setting).toBe("value");
 
-            // Round-trip: detector should now report no OMO conflicts
-            // Need a project-level opencode.json with OMO plugin for detection
+            // detectConflicts requires a project-level opencode.json containing the OMO plugin.
             writeFileSync(
                 join(projectDir, "opencode.json"),
                 JSON.stringify({ plugin: ["oh-my-opencode"] }),
@@ -198,7 +197,7 @@ describe("fixConflicts", () => {
             writeFileSync(
                 configPath,
                 `{
-  // just a top-level setting, no [opencode] block
+  // top-level setting
   "some-omo-setting": true
 }
 `,
@@ -271,7 +270,7 @@ describe("fixConflicts", () => {
         });
 
         it("updates both legacy and unified config when both exist", () => {
-            // Legacy: project-level oh-my-opencode.json
+            // The fixer supports project-level oh-my-opencode.json as a legacy configuration format.
             const legacyPath = join(projectDir, "oh-my-opencode.json");
             writeFileSync(legacyPath, JSON.stringify({ disabled_hooks: [] }));
 
@@ -290,7 +289,7 @@ describe("fixConflicts", () => {
 
             expect(actions).toEqual(["Disabled conflicting oh-my-opencode hooks"]);
 
-            // Legacy: top-level disabled_hooks
+            // The legacy configuration stores disabled_hooks at the top level.
             const legacy = JSON.parse(readFileSync(legacyPath, "utf-8"));
             expect(legacy.disabled_hooks).toEqual([
                 "context-window-monitor",
@@ -298,7 +297,7 @@ describe("fixConflicts", () => {
                 "anthropic-context-window-limit-recovery",
             ]);
 
-            // Unified: inside [opencode] block
+            // The unified configuration stores disabled_hooks in the [opencode] block.
             const unified = JSON.parse(readFileSync(unifiedPath, "utf-8"));
             expect(unified["[opencode]"].disabled_hooks).toEqual([
                 "context-window-monitor",
@@ -308,16 +307,12 @@ describe("fixConflicts", () => {
         });
 
         it("skips non-existent unified paths (no create)", () => {
-            // No .omo directory at all — fixer should find no targets
+            // Without a .omo directory, the fixer finds no targets.
             const actions = fixConflicts(projectDir, omoConflicts);
             expect(actions).toEqual([]);
         });
     });
 
-    // --- Compaction-off mode parity (issue #266 S2) ---
-    // In compaction-off mode the fixer MUST NOT flip compaction.auto/prune to
-    // false — native compaction fields are left byte-for-byte as found.
-    // DCP and OMO hook fixes keep their existing policy in BOTH modes.
     describe("compaction-off mode parity (issue #266)", () => {
         it("does NOT flip compaction.auto to false when compaction-off", () => {
             const configPath = join(projectDir, "opencode.jsonc");
@@ -342,9 +337,7 @@ describe("fixConflicts", () => {
                 { compactionEnabled: false },
             );
 
-            // No compaction repair action in compaction-off mode.
             expect(actions).toEqual([]);
-            // File is byte-for-byte unchanged (native fields preserved).
             expect(readFileSync(configPath, "utf-8")).toBe(original);
         });
 
@@ -364,7 +357,6 @@ describe("fixConflicts", () => {
                 { compactionEnabled: false },
             );
 
-            // DCP removed, compaction NOT flipped.
             expect(actions).toEqual(["Removed opencode-dcp plugin"]);
             const updated = parseJsonc(readFileSync(configPath, "utf-8")) as Record<
                 string,
@@ -398,8 +390,6 @@ describe("fixConflicts", () => {
             expect(actions).toEqual(["Disabled conflicting oh-my-opencode hooks"]);
         });
 
-        // Mutation direction: with mode ON, the same compaction conflict IS
-        // repaired. Proves the off-gate isn't just always-skip.
         it("mutation direction: same conflict IS repaired when mode forced on", () => {
             const configPath = join(projectDir, "opencode.jsonc");
             writeFileSync(configPath, JSON.stringify({ compaction: { auto: true, prune: true } }));
@@ -573,20 +563,20 @@ describe("fixConflicts", () => {
             mkdirSync(omoDir, { recursive: true });
             const configPath = join(omoDir, "omo.jsonc");
             const original = `{
-    // preserve this leading comment
+    // The fixer preserves this leading comment.
     "[opencode]": {
         "disabled_hooks": [
-            // custom hook comment
+            // The fixer preserves this custom-hook comment.
             "custom-hook",
         ], // preserve this array comment
     },
 }
 `;
             const expected = `{
-    // preserve this leading comment
+    // The fixer preserves this leading comment.
     "[opencode]": {
         "disabled_hooks": [
-            // custom hook comment
+            // The fixer preserves this custom-hook comment.
             "custom-hook",
             "context-window-monitor",
         ], // preserve this array comment

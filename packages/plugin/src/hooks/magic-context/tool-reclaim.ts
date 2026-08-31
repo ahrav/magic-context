@@ -19,8 +19,6 @@ export function buildSyntheticToolReclaimOps(input: {
     if (watermark <= 0) return [];
 
     const realPendingTagIds = new Set((input.pendingOps ?? []).map((op) => op.tagId));
-    // Storage-level candidate selection removes the newest ctx_reduce exemplars
-    // before this lane applies its watermark and value-floor checks.
     const tags = getActiveToolTagsForAgeReclaim(input.db, input.sessionId);
     const newestTodowriteTag = tags.reduce<number | null>(
         (newest, tag) =>

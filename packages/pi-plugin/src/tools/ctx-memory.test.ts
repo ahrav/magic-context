@@ -85,8 +85,6 @@ function createArgs(content: string) {
 }
 
 /**
- * A model that saw a clamped tool call in reduced history imitates that wrapper.
- * Mutations must survive the imitation, tokens included.
  */
 function reduced(inner: Record<string, unknown>) {
 	return { reduced: true, summary: JSON.stringify(inner) };

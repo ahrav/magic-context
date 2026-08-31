@@ -75,7 +75,7 @@ afterEach(() => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                /* Ignore EBUSY on Windows */
+                /* */
             }
         } catch {
             // Best-effort cleanup
@@ -124,9 +124,8 @@ describe("auto-update-checker/index", () => {
         const { createAutoUpdateCheckerHook } = await freshIndexImport();
         const { ctx, showToast } = createCtx();
 
-        // initDelayMs: 0 fires the check immediately so the test doesn't wait 5s.
-        // storageDir is provided so the dedup file isn't written into the test
-        // process's home dir.
+        // `initDelayMs: 0` avoids the default 5-second delay.
+        // storageDir keeps the dedup file out of the test process's home directory.
         createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
             initDelayMs: 0,
             storageDir: makeTempStorageDir(),
@@ -157,7 +156,7 @@ describe("auto-update-checker/index", () => {
                 storageDir: makeTempStorageDir(),
             },
         );
-        // Wait for init-timer check to fire
+        // The initialization timer triggers the development toast.
         await waitForCalls(showToast);
         const callsAfterInit = showToast.mock.calls.length;
 
@@ -166,7 +165,6 @@ describe("auto-update-checker/index", () => {
         await hook({ event: { type: "session.created", properties: { info: {} } } });
         await hook({ event: { type: "message.updated", properties: {} } });
 
-        // Give any rogue async work a tick to flush
         await new Promise((r) => setTimeout(r, 10));
 
         expect(showToast.mock.calls.length).toBe(callsAfterInit);
@@ -196,7 +194,7 @@ describe("auto-update-checker/index", () => {
         const ctxA = createCtx();
         const ctxB = createCtx();
 
-        // First instance claims the slot
+        // The first instance writes the dedup timestamp.
         createAutoUpdateCheckerHook(ctxA.ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
             initDelayMs: 0,
             storageDir: sharedDir,
@@ -204,7 +202,7 @@ describe("auto-update-checker/index", () => {
         await waitForCalls(ctxA.showToast);
 
         // Second instance starts after the first wrote the timestamp;
-        // a 1-hour interval (default) means it must skip.
+        // The second instance skips the check during the default 1-hour interval.
         createAutoUpdateCheckerHook(ctxB.ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
             initDelayMs: 0,
             storageDir: sharedDir,
@@ -237,7 +235,7 @@ describe("auto-update-checker/index", () => {
 
         expect(showToast).toHaveBeenCalledTimes(1);
 
-        // The new instance should have refreshed the timestamp
+        // The new instance refreshes the timestamp.
         const updated = JSON.parse(readFileSync(join(dir, "last-update-check.json"), "utf-8")) as {
             lastCheckedMs: number;
         };
@@ -251,7 +249,7 @@ describe("auto-update-checker/index", () => {
 
         createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
             initDelayMs: 0,
-            // No storageDir — fail-open path
+            // Without storageDir, the checker fails open.
         });
         await waitForCalls(showToast);
 
@@ -263,7 +261,6 @@ describe("auto-update-checker/index", () => {
         const { createAutoUpdateCheckerHook } = await freshIndexImport();
         const dir = makeTempStorageDir();
 
-        // Write garbage that JSON.parse can't handle
         writeFileSync(join(dir, "last-update-check.json"), "{not-json", "utf-8");
 
         const { ctx, showToast } = createCtx();
@@ -274,7 +271,6 @@ describe("auto-update-checker/index", () => {
         await waitForCalls(showToast);
 
         expect(showToast).toHaveBeenCalledTimes(1);
-        // File should now be valid JSON
         const written = JSON.parse(readFileSync(join(dir, "last-update-check.json"), "utf-8")) as {
             lastCheckedMs: number;
         };
@@ -287,7 +283,7 @@ describe("auto-update-checker/index", () => {
         const { ctx, showToast } = createCtx();
 
         const abort = new AbortController();
-        // Use a long initDelayMs so we have time to abort before the check fires
+        // The long `initDelayMs` leaves time to abort before the check fires.
         createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
             initDelayMs: 1000,
             storageDir: makeTempStorageDir(),

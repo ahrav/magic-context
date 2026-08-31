@@ -2,6 +2,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
 use super::envelope::{Envelope, ObjectRow, PendingChange};
+use super::object_write::{insert_registry, map_write_error, record_registry_fields};
 use super::redaction::{record, redact, RedactedField};
 use super::{KernelError, Sensitivity};
 
@@ -87,38 +88,16 @@ impl Envelope<'_> {
             return Err(KernelError::NotFound);
         }
         let object = spec.object_row(self.commit_seq);
-        self.tx
-            .execute(
-                "INSERT INTO object_registry(
-                     object_id,object_kind,domain_id,source_kind,source_id,source_revision,
-                     created_commit_seq,sensitivity_class
-                 ) VALUES (?1,'scope',?2,?3,?4,?5,?6,?7)",
-                params![
-                    object.object_id,
-                    object.domain_id,
-                    object.source_kind,
-                    object.source_id,
-                    object.source_revision,
-                    self.commit_seq,
-                    object.sensitivity.as_str(),
-                ],
-            )
-            .map_err(map_write_error)?;
-        for (name, field) in [
-            ("object_id", &spec.object_id),
-            ("domain_id", &spec.domain_id),
-            ("source_kind", &spec.source_kind),
-            ("source_id", &spec.source_id),
-        ] {
-            record(
-                self.tx,
-                "object_registry",
-                &spec.object_id.text,
-                name,
-                field,
-                Some(self.commit_seq),
-            )?;
-        }
+        insert_registry(self.tx, self.commit_seq, &object)?;
+        record_registry_fields(
+            self.tx,
+            &spec.object_id.text,
+            &spec.domain_id,
+            &spec.object_id,
+            &spec.source_kind,
+            &spec.source_id,
+            self.commit_seq,
+        )?;
         self.tx
             .execute(
                 "INSERT INTO scopes(
@@ -321,19 +300,6 @@ fn insert_scope_terms(
         .map_err(map_write_error)?;
     }
     Ok(())
-}
-
-fn map_write_error(error: rusqlite::Error) -> KernelError {
-    match error {
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::ConstraintViolation,
-                ..
-            },
-            _,
-        ) => KernelError::Conflict,
-        _ => KernelError::Io,
-    }
 }
 
 // ---------------------------------------------------------------------------

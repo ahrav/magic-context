@@ -17,7 +17,6 @@ from __future__ import annotations
 import os
 import sys
 
-# (inventory row, declaration probe that must appear in dist/*.d.ts).
 ITEMS: tuple[tuple[str, str], ...] = (
     ("SubcClient", "export declare class SubcClient"),
     ("SubcClient.connect", "static connect(opts: ConnectOptions)"),

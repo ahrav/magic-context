@@ -1,11 +1,4 @@
-// Import smoke test for the bare-Bun TUI loader fallback.
 //
-// The published `./tui` export points at src/tui/entry.mjs. When the host does
-// not provide OpenTUI's virtual runtime-module registry, the loader falls back
-// to src/tui/index.tsx, which still needs @opentui/solid + solid-js to resolve
-// from the plugin package itself. `bun test` does not import that entry, so this
-// catches missing or version-mismatched OpenTUI/Solid runtime deps before a TUI
-// that cannot load is shipped. Run: bun packages/plugin/scripts/smoke-tui-import.ts
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -23,8 +16,6 @@ function check(name: string, cond: boolean, detail?: string): void {
 }
 
 try {
-    // With no virtual runtime-module registry installed, the loader must catch the
-    // virtual import failure and load the raw TSX fallback end to end.
     const mod = (await import(entry)) as { default?: { id?: string; tui?: unknown } };
     check("TUI loader imports through the raw-TSX fallback", true);
     check(

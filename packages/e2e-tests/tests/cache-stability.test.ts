@@ -4,27 +4,18 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
 
 /**
- * Cache stability across defer passes.
  *
- * The whole point of magic-context is to keep the Anthropic prompt cache alive
- * across turns. That depends on the plugin producing a BYTE-IDENTICAL prefix
- * (system prompt + prior messages) on every defer-pass transform.
+ * magic-context keeps the Anthropic prompt cache alive across turns.
+ * The plugin must produce a byte-identical prefix on every defer-pass transform to preserve the cache across turns.
+ * Each defer-pass transform must preserve a byte-identical prefix containing the system prompt and prior messages.
  *
- * "Prefix" excludes the tail: OpenCode deliberately moves the
- * `cache_control: { type: "ephemeral" }` mark to the latest message each turn
- * to extend the cache boundary forward. That's expected. We strip it before
+ * OpenCode moves cache_control to the latest message each turn.
  * comparing.
  *
- * This test drives several low-pressure turns (all below execute_threshold so
- * every pass is a defer) and verifies that:
  *
  *   1. The system field text stays byte-identical across turns 2..N.
- *   2. Each message in the prefix (everything except the latest user turn)
- *      stays byte-identical across turns 2..N, after stripping cache_control.
+ * The prefix excludes the latest user turn and must remain byte-identical across turns 2..N after stripping `cache_control`.
  *
- * If any mutation slips in on a defer pass — a stale date line, a newly
- * stripped placeholder, a drifted hash token — the prefix will differ and
- * this test catches it.
  */
 
 let h: TestHarness;
@@ -41,7 +32,7 @@ afterAll(async () => {
     await h.dispose();
 });
 
-/** Remove cache_control fields so only durable content is compared. */
+/** stripCacheControl removes `cache_control` because OpenCode moves it to the latest message each turn. */
 function stripCacheControl(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(stripCacheControl);
     if (value && typeof value === "object") {
@@ -87,9 +78,8 @@ describe("cache stability", () => {
         });
         expect(mainRequests.length).toBeGreaterThanOrEqual(turnCount);
 
-        // Compare system fields across turns 2..N (turn 1 establishes the
-        // cache). cache_control is moved turn-by-turn by OpenCode, so we strip
-        // it before comparison.
+        // The test excludes turn 1 because it establishes the cache.
+        // The comparison strips `cache_control` because OpenCode moves it to the latest message each turn.
         const systems = new Set<string>();
         for (let i = 1; i < mainRequests.length; i++) {
             systems.add(serialize(mainRequests[i]!.body.system));
@@ -127,16 +117,11 @@ describe("cache stability", () => {
         });
         expect(mainRequests.length).toBeGreaterThanOrEqual(turnCount);
 
-        // For each PAIR of adjacent turns, the messages of the earlier turn's
-        // request must be a byte-identical prefix of the later turn's messages
-        // (after stripping cache_control). If the plugin mutates any earlier
-        // message on a defer pass, this prefix-match breaks.
+        // After stripping `cache_control`, each earlier request's messages must be a byte-identical prefix of the next request's messages.
         for (let i = 1; i < mainRequests.length - 1; i++) {
             const earlier = mainRequests[i]!.body.messages as unknown[];
             const later = mainRequests[i + 1]!.body.messages as unknown[];
             expect(earlier.length).toBeLessThanOrEqual(later.length);
-            // The earlier array, in full, must appear byte-for-byte at the
-            // start of the later array.
             for (let j = 0; j < earlier.length; j++) {
                 const earlierMsg = serialize(earlier[j]);
                 const laterMsg = serialize(later[j]);

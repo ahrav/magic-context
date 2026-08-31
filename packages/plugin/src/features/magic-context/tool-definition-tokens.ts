@@ -1,41 +1,9 @@
 /**
- * Tool-definition token measurement store.
  *
- * OpenCode's `tool.definition` hook fires once per tool per
- * `ToolRegistry.tools()` call, with `{ toolID }` as input and
- * `{ description, parameters }` as output. Crucially the hook input does NOT
- * carry `sessionID` — the tool set is computed per
- * `{providerID, modelID, agent}` combination, independent of session.
  *
- * We measure each tool's description + JSON-schema parameters, tokenize with
- * the same Claude tokenizer used everywhere else in the plugin, and store
- * per-tool totals keyed by `${providerID}/${modelID}/${agentName}`. Inner map
- * keys on `toolID` so every hook fire idempotently overwrites its own slot
- * (same tool set on each turn → same key → same measured total).
  *
- * Consumers (RPC sidebar/status handlers) look up the active session's
- * measurement via `getMeasuredToolDefinitionTokens(providerID, modelID,
- * agentName)`. Returns `undefined` when the key has never been measured — the
- * caller is expected to fall back to residual math or show zero.
  *
- * Persistence (v9+): measurements are also written to SQLite so that a
- * plugin restart can repopulate the in-memory map without waiting for the
- * next chat.message → tool.definition hook chain. The in-memory Map remains
- * the hot read path; SQLite is a write-through mirror that backs cold starts.
- * If `setDatabase()` hasn't been called yet (cold path before openDatabase
- * completes), `recordToolDefinition` still updates the in-memory map and
- * silently skips persistence — first measurement after init lands both.
  *
- * Hot-path optimization: `tool.definition` fires once per tool per LLM
- * flight (~58 tools × 5–18ms SQLite write = ~1.4s of redundant work per
- * flight on large MC databases). Tool descriptions and parameters almost
- * never change between flights, so we keep a per-key content-fingerprint
- * Map and bail out at the top of `recordToolDefinition` when the new fire
- * carries the same fingerprint as the previous one. This collapses
- * steady-state hook overhead from ~1.4s to <1ms while still re-measuring
- * any tool whose description/schema actually changed (e.g. MCP server
- * restart, OpenCode upgrade). Cached prepared statement avoids repeated
- * `db.prepare()` compile cost on first-flight rebuilds.
  */
 
 import { createHash } from "node:crypto";
@@ -43,25 +11,18 @@ import { estimateTokens } from "../../hooks/magic-context/read-session-formattin
 import type { Database, Statement } from "../../shared/sqlite";
 import { stableStringify } from "../../shared/stable-json";
 
-// Inner map: toolID → measured tokens for that tool (description + params).
-// Outer map: composite key → per-tool breakdown.
+// Each measurement covers a tool's description and parameters.
 const measurements = new Map<string, Map<string, number>>();
 
-// Parallel structure: composite key → toolID → cheap content fingerprint
-// derived from the inputs of the previous fire. Used solely to short-circuit
-// repeated identical fires; the actual measurement still lives in the
-// `measurements` map above. Cleared together with `measurements` on reset.
+// A matching fingerprint skips recomputation; `measurements` retains the token count.
 const fingerprints = new Map<string, Map<string, string>>();
 
-// Database reference for persistence. Set by setDatabase() once
-// openDatabase() has finished migrations. Until then, recordToolDefinition
-// only updates the in-memory map (lossy, but the next call after init will
-// land in SQLite).
+// Before initialization, `recordToolDefinition()` does not persist measurements.
 let persistenceDb: Database | null = null;
 
-// Cached INSERT OR REPLACE statement — recompiling on every fire was a
-// significant share of the hot-path cost. Initialized lazily on first use
-// after `setDatabase()` and dropped on reset / DB rebind.
+// The cached statement avoids recompilation on each write.
+// `cachedInsertStmt` initializes on first use after `setDatabase()`.
+// `cachedInsertStmt` is cleared on reset and database rebind.
 let cachedInsertStmt: Statement | null = null;
 
 function keyFor(providerID: string, modelID: string, agentName: string | undefined): string {
@@ -71,8 +32,7 @@ function keyFor(providerID: string, modelID: string, agentName: string | undefin
 
 /**
  * Build a stable fingerprint of all inputs that determine the measured value.
- * Correctness beats the prior shallow optimization: nested schema changes must
- * invalidate cached token counts too.
+ * Nested schema changes invalidate cached token counts.
  */
 function fingerprintFor(description: string, parameters: unknown): string {
     return createHash("sha256")
@@ -83,27 +43,20 @@ function fingerprintFor(description: string, parameters: unknown): string {
 }
 
 /**
- * Register the database used to persist measurements. Called by
- * openDatabase() after runMigrations() has ensured the
- * `tool_definition_measurements` table exists. Subsequent
- * recordToolDefinition() calls will write through to SQLite.
+ * `recordToolDefinition()` requires `tool_definition_measurements` to exist before it can persist measurements.
+ * `recordToolDefinition()` attempts to persist subsequent measurements to SQLite.
  */
 export function setDatabase(db: Database): void {
     persistenceDb = db;
-    // New DB binding invalidates any cached statement compiled against the
+    // A DB rebind clears cached statements compiled for the previous handle.
     // previous handle.
     cachedInsertStmt = null;
 }
 
 /**
- * Populate the in-memory measurements map from the
- * `tool_definition_measurements` table. Called once at startup after
- * setDatabase(), before the first sidebar snapshot or status query, so the
- * sidebar's "Tool Defs" segment shows the correct value immediately on
- * restart instead of 0.
+ * Call `loadToolDefinitionMeasurements()` after `setDatabase()` and before the first sidebar snapshot or status query.
  *
- * Idempotent: re-running over the same DB reapplies the same values; the
- * inner-map key (toolID) ensures duplicates overwrite rather than accumulate.
+ * Re-running over the same DB overwrites existing values instead of accumulating them.
  */
 export function loadToolDefinitionMeasurements(db: Database): void {
     let rows: Array<{
@@ -120,7 +73,6 @@ export function loadToolDefinitionMeasurements(db: Database): void {
             )
             .all() as typeof rows;
     } catch {
-        // Table doesn't exist yet — migrations haven't run. Nothing to load.
         return;
     }
 
@@ -133,19 +85,12 @@ export function loadToolDefinitionMeasurements(db: Database): void {
         }
         inner.set(row.tool_id, row.token_count);
     }
-    // Note: we deliberately do NOT seed `fingerprints` from DB here. The
-    // first fire after restart will compute a real fingerprint, find no
-    // entry, do the work once, and store both. This means the very first
-    // flight after restart pays full measurement cost (~1.4s on a large
-    // tool set) but every subsequent flight skips it — same steady-state
-    // behavior as before-restart.
+    // Do not seed fingerprints from persisted measurements.
+    // The first record after restart computes and stores a fingerprint because persisted measurements do not include fingerprints.
 }
 
 /**
- * Tokenize a single tool's schema and store it under the given key. Called
- * from the `tool.definition` plugin hook once per tool per flight. Same
- * toolID on a later flight overwrites its slot — the total for the key stays
- * consistent even if descriptions or parameters drift between turns.
+ * `toolID` overwrites its measurement so the key total remains correct when a tool definition changes.
  */
 export function recordToolDefinition(
     providerID: string,
@@ -158,16 +103,11 @@ export function recordToolDefinition(
     if (!providerID || !modelID || !toolID) return;
     const key = keyFor(providerID, modelID, agentName);
 
-    // Fast-path skip: if this exact tool's last fire under this key carried
-    // an identical fingerprint, every downstream operation (stringify,
-    // tokenize, map write, SQLite write) would produce the same result.
-    // Bail out before doing any of them.
     const fp = fingerprintFor(description ?? "", parameters);
     let innerFp = fingerprints.get(key);
     if (innerFp && innerFp.get(toolID) === fp) return;
 
-    // Serialize parameters to match what the provider actually sees on the
-    // wire. `JSON.stringify(undefined)` returns undefined, so guard that.
+    // `parameters === undefined` is stored as an empty string because `JSON.stringify(undefined)` returns `undefined`.
     let paramsText = "";
     try {
         paramsText = parameters === undefined ? "" : JSON.stringify(parameters);
@@ -175,11 +115,7 @@ export function recordToolDefinition(
         paramsText = "";
     }
 
-    // Count: description + serialized params. This is the token cost of a
-    // single tool's definition inside the `tools` array the provider
-    // receives. Overhead around the array (field names, commas, braces) is
-    // attributed to the separate "Overhead" bucket the RPC handler computes
-    // as a residual against inputTokens.
+    // `tokens` excludes provider-level `tools` array syntax.
     const tokens = estimateTokens(description ?? "") + estimateTokens(paramsText);
 
     let inner = measurements.get(key);
@@ -189,9 +125,7 @@ export function recordToolDefinition(
     }
     inner.set(toolID, tokens);
 
-    // Update fingerprint AFTER the in-memory map so a thrown error above
-    // doesn't poison the skip-check on the next fire. (Currently nothing
-    // above can throw post-guard, but the ordering is intentionally
+    // Store the fingerprint after the measurement so an earlier failure cannot suppress a later retry.
     // defensive.)
     if (!innerFp) {
         innerFp = new Map<string, string>();
@@ -199,15 +133,10 @@ export function recordToolDefinition(
     }
     innerFp.set(toolID, fp);
 
-    // Write-through to SQLite so the value survives a plugin restart.
-    // Skipped silently when the DB isn't wired yet (cold path before
-    // openDatabase has finished init): the in-memory map still has the
-    // value, and the next recordToolDefinition() after init lands both.
+    // Measurements recorded while `persistenceDb` is unset remain only in memory.
     if (persistenceDb) {
         try {
             const agent = agentName && agentName.length > 0 ? agentName : "default";
-            // Compile statement once per DB binding. `.run()` is reusable
-            // across calls with different bound values.
             if (!cachedInsertStmt) {
                 cachedInsertStmt = persistenceDb.prepare(
                     `INSERT OR REPLACE INTO tool_definition_measurements
@@ -217,20 +146,14 @@ export function recordToolDefinition(
             }
             cachedInsertStmt.run(providerID, modelID, agent, toolID, tokens, Date.now());
         } catch {
-            // Persistence is best-effort. A SQLITE_BUSY or transient write
-            // failure must not break the live measurement: the in-memory
-            // map already has the new value and the sidebar will display
-            // it correctly until the next plugin restart.
-            // Drop the cached statement on error — if the DB connection
-            // went bad, recompiling on the next attempt is the safe move.
+            // A SQLite write failure must not prevent updating the in-memory measurement.
+            // Discard the cached statement so the next attempt recompiles it.
             cachedInsertStmt = null;
         }
     }
 }
 
 /**
- * Returns the summed measured tokens for a `{provider, model, agent}` key,
- * or `undefined` when never measured (e.g. fresh session before first turn).
  */
 export function getMeasuredToolDefinitionTokens(
     providerID: string,
@@ -245,7 +168,7 @@ export function getMeasuredToolDefinitionTokens(
     return total;
 }
 
-/** Test helper: reset the store so suites don't leak measurements. */
+/* */
 export function __resetToolDefinitionMeasurements(): void {
     measurements.clear();
     fingerprints.clear();
@@ -253,7 +176,7 @@ export function __resetToolDefinitionMeasurements(): void {
     cachedInsertStmt = null;
 }
 
-/** Inspection helper: snapshot the current store (for debug logging/tests). */
+/* */
 export function getToolDefinitionSnapshot(): Array<{
     key: string;
     totalTokens: number;

@@ -1,32 +1,17 @@
 /// <reference types="bun-types" />
 
 /**
- * v3.3.1 Layer C — end-to-end collision-repro test.
  *
- * Drives a real OpenCode + magic-context plugin pair through a
- * scenario the bug class this fix is for would have corrupted:
- * two assistant turns that share an OpenCode-generated tool callID
- * (e.g. both invoke `read:32`). Pre-fix the second turn's tag bound
- * to the first turn's row by `messageId == callId`; dropping the
- * first would silently corrupt the second.
+ * The test covers two assistant turns that share a tool call ID.
+ * Dropping either turn must not alter the other turn's tag.
  *
  * Post-fix:
- *   1. Schema migration v10 is applied (column exists).
- *   2. Each tool tag carries a `tool_owner_message_id` so the two
- *      turns are stored as DISTINCT rows (composite identity).
- *   3. The composite-key drop queue and heuristic dedup don't
- *      cross-merge between owners.
+ * Each tool tag carries `tool_owner_message_id`; rows with the same call ID require distinct owner message IDs.
+ * The drop queue and heuristic dedup must not merge tags with different owners.
  *
- * The harness can't drive real tool execution (OpenCode requires
- * registered tools and the mock env doesn't have them), so we seed
- * the DB directly with the shape the new tagger would produce and
- * verify the storage-side and runtime-side invariants hold.
+ * The harness cannot execute tools because OpenCode requires registered tools.
  *
- * Plugin-side unit tests (`tag-messages-collision.test.ts`,
  * `compartment-runner-drop-queue.test.ts`, `migrations-v10.test.ts`)
- * cover the algorithmic correctness with full fidelity. This test's
- * job is to prove the wiring holds when the plugin runs against a
- * real OpenCode subprocess.
  */
 
 import { Database } from "bun:sqlite";
@@ -62,15 +47,13 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
 
         await h.waitFor(() => h.hasContextDb(), { label: "context.db created" });
 
-        // Plugin's openDatabase() runs migrations on startup. Confirm
-        // v10 (or higher) is recorded in the migration log.
+        // `openDatabase()` applies migrations at startup.
         const db = h.contextDb();
         const row = db
             .prepare("SELECT MAX(version) AS v FROM schema_migrations")
             .get() as { v: number };
         expect(row.v).toBeGreaterThanOrEqual(10);
 
-        // Confirm the v10 column exists with the expected default.
         const cols = db.prepare("PRAGMA table_info(tags)").all() as Array<{
             name: string;
             dflt_value: string | null;
@@ -80,7 +63,6 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
         expect(owner).toBeDefined();
         expect(owner?.type).toBe("TEXT");
 
-        // Confirm both v10 indexes exist.
         const idxComposite = db
             .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name=?")
             .get("idx_tags_tool_composite") as { sql: string } | undefined;
@@ -94,23 +76,16 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
     }, 60_000);
 
     it("two tool rows with same callId + different owners coexist via composite UNIQUE", async () => {
-        // Seed the DB shape the post-Layer-C tagger would produce when
-        // two assistant turns reuse the same callId. We use a
-        // writable handle because the harness's default DB handle is
+        // The writable handle is required because the harness's default handle is read-only.
         // read-only.
         const sessionId = "ses-collision-repro";
         const dbPath = h.contextDb().filename;
         const writable = openTestDb(dbPath);
-        // Mirror production (storage-db.ts initializeDatabase): wait out a
-        // concurrent writer instead of throwing SQLITE_BUSY immediately. The
-        // live plugin process holds the write lock during its startup
-        // migration (which can take several seconds on slow CI disks), so a
-        // pragma-less handle hits "database is locked" before it can insert.
+        // SQLite waits for a concurrent startup migration writer instead of returning `SQLITE_BUSY` immediately.
+        // The plugin can hold the write lock while applying startup migrations.
+        // A handle without a busy timeout fails with `database is locked` before inserting.
         try {
-            // Two tool tags: same callID `read:32`, different owners.
-            // With composite identity these are DISTINCT rows. Pre-fix
-            // they would have been the SAME row (last-write-wins via
-            // `messageId == callId`), so seeding both would have
+            // The composite key treats rows with different `tool_owner_message_id` values as distinct.
             // unique-violated.
             const insert = writable.prepare(
                 "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, harness) VALUES (?, ?, 'tool', ?, ?, 'read', ?, 'opencode')",
@@ -133,15 +108,14 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
                 "m-asst-2",
             ]);
 
-            // The partial UNIQUE composite index forbids a third
-            // (same-callId, same-owner) insert. This is the DB-level
-            // guard that defends the runtime invariant.
+            // The partial UNIQUE index rejects a third row with the same non-NULL `(message_id, tool_owner_message_id)` pair.
+            // The partial unique index rejects duplicate non-NULL `(message_id, tool_owner_message_id)` pairs.
             expect(() =>
                 insert.run(sessionId, "read:32", 999, 200, "m-asst-1"),
             ).toThrow(/UNIQUE/i);
 
-            // ...but a third row with a NEW owner is fine. Cross-turn
-            // collisions remain freely resolvable.
+            // The index permits a third row with a new `tool_owner_message_id`.
+            // Rows with the same callId and different owners remain insertable.
             insert.run(sessionId, "read:32", 300, 200, "m-asst-3");
             const after = writable
                 .prepare("SELECT COUNT(*) AS n FROM tags WHERE session_id = ?")
@@ -153,20 +127,11 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
     }, 30_000);
 
     it("legacy NULL-owner rows for the same callId still coexist (no UNIQUE collision)", async () => {
-        // Pre-Layer-B-backfill data: tool tags written before v10 had
-        // `tool_owner_message_id = NULL`. The partial UNIQUE
-        // (`WHERE tool_owner_message_id IS NOT NULL`) intentionally
-        // does NOT include those rows, so the collision artifact (two
-        // NULL-owner rows with same callId) survives and lazy
-        // adoption can clean them up over time.
+        // Tool tags with `tool_owner_message_id = NULL` are excluded from the partial unique index.
         const sessionId = "ses-legacy-null";
         const dbPath = h.contextDb().filename;
         const writable = openTestDb(dbPath);
-        // Mirror production (storage-db.ts initializeDatabase): wait out a
-        // concurrent writer instead of throwing SQLITE_BUSY immediately. The
-        // live plugin process holds the write lock during its startup
-        // migration (which can take several seconds on slow CI disks), so a
-        // pragma-less handle hits "database is locked" before it can insert.
+        // The busy timeout lets SQLite wait while the plugin's startup migration holds the write lock.
         try {
             const insert = writable.prepare(
                 "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, harness) VALUES (?, ?, 'tool', ?, ?, 'read', NULL, 'opencode')",
@@ -186,18 +151,11 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
     }, 30_000);
 
     it("dropping tag-1 (m-asst-1) leaves tag-2 (m-asst-2) active — no cross-owner cascade", async () => {
-        // The bug this whole fix prevents: dropping the first turn's
-        // tag must not propagate to the second turn's content. With
-        // composite identity, drop ops target a single tag_number;
-        // the second turn's tag is a separate row and stays active.
+        // Dropping tag 1 must leave tag 2 active.
         const sessionId = "ses-drop-isolation";
         const dbPath = h.contextDb().filename;
         const writable = openTestDb(dbPath);
-        // Mirror production (storage-db.ts initializeDatabase): wait out a
-        // concurrent writer instead of throwing SQLITE_BUSY immediately. The
-        // live plugin process holds the write lock during its startup
-        // migration (which can take several seconds on slow CI disks), so a
-        // pragma-less handle hits "database is locked" before it can insert.
+        // The busy timeout lets the concurrent writer wait for the write lock before SQLite returns SQLITE_BUSY.
         try {
             const insert = writable.prepare(
                 "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, status, harness) VALUES (?, ?, 'tool', ?, ?, 'read', ?, 'active', 'opencode')",
@@ -205,7 +163,6 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
             insert.run(sessionId, "read:32", 1, 200, "m-asst-1");
             insert.run(sessionId, "read:32", 2, 200, "m-asst-2");
 
-            // Simulate a drop op fired against tag 1.
             writable
                 .prepare(
                     "UPDATE tags SET status = 'dropped' WHERE session_id = ? AND tag_number = ?",

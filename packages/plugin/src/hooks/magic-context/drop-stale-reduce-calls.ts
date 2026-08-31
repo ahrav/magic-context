@@ -6,17 +6,14 @@ const STALE_TOOL_NAMES = new Set(["ctx_reduce"]);
 
 export function isReduceToolPart(part: unknown): boolean {
     if (!isRecord(part)) return false;
-    // OpenCode format: { type: "tool", tool: "ctx_reduce" }
     if (part.type === "tool" && typeof part.tool === "string" && STALE_TOOL_NAMES.has(part.tool))
         return true;
-    // tool-invocation format: { type: "tool-invocation", toolName: "ctx_reduce" }
     if (
         part.type === "tool-invocation" &&
         typeof part.toolName === "string" &&
         STALE_TOOL_NAMES.has(part.toolName)
     )
         return true;
-    // tool_use format: { type: "tool_use", name: "ctx_reduce" }
     if (
         part.type === "tool_use" &&
         typeof part.name === "string" &&
@@ -63,8 +60,6 @@ function sentinelizeReduceParts(message: MessageLike): boolean {
         }
     }
     if (touched && !hasAnyMeaningfulPart(message.parts)) {
-        // Whole message becomes a single-sentinel-part shell. Preserves
-        // messages.length so proxy cache hashes stay stable.
         message.parts.length = 0;
         message.parts.push(makeSentinel(undefined));
     }
@@ -81,14 +76,10 @@ export interface StaleReduceStripResult {
 /**
  * Sentinel-strip aged `ctx_reduce` tool parts using a FROZEN replay watermark.
  *
- * The cache-stability contract: a defer pass must replay byte-identical to the
- * prior pass. An earlier version recomputed eligibility from the live
- * `messages.length - protectedCount` boundary on every pass — but that boundary
- * MOVES as the conversation grows, so a defer pass with tail growth would newly
- * strip an older ctx_reduce call mid-prefix (for Anthropic the empty sentinel is
- * filtered before the wire and the dropped tool_result lets the SDK merge
- * adjacent assistants → the message vanishes + the array shifts → the cached
- * prefix busts). That is exactly the bug this design removes.
+ * A defer pass must replay byte-identically.
+ * Defer passes must not recompute eligibility from `messages.length - protectedCount`.
+ * A live `messages.length - protectedCount` boundary moves as the conversation grows.
+ * Tail growth can move a live boundary into the cached prefix.
  *
  * Instead, eligibility is an id-keyed frozen set:
  * - REPLAY (every pass): strip ctx_reduce parts in any message whose `info.id`
@@ -119,10 +110,7 @@ export function dropStaleReduceCalls(
         const message = messages[i];
         const id = typeof message.info.id === "string" ? message.info.id : undefined;
 
-        // Replay: any message frozen on a prior cache-busting pass.
         const inFrozen = id !== undefined && frozenIds.has(id);
-        // Detect (cache-busting passes only): a not-yet-frozen ctx_reduce call
-        // that has aged past the protected window and carries a stable id.
         const isNewDetection =
             !inFrozen &&
             detect &&

@@ -1,12 +1,10 @@
-//! Historian output validation: parse the historian's compartment XML and
-//! validate it against the raw chunk and already-persisted compartment ranges
-//! before any side effect can publish it.
+//! The module validates historian compartment XML before publication.
+//! Validation compares the XML against the raw chunk and persisted compartment ranges.
+//! Validation completes before any side effect publishes output.
 //!
-//! The functions in this module are deliberately pure. They receive the raw
-//! historian text plus caller-provided chunk/store metadata, and return either a
-//! fully mapped publish plan or a validation error. That keeps persistence code
-//! fail-closed: malformed ranges, stale chunks, bad message-id endpoints, and
-//! boundary-healing decisions are resolved before any database write is possible.
+//! The functions in this module are pure.
+//! Validation rejects malformed ranges, stale chunks, and invalid message-id endpoints before database writes.
+//! Validation resolves boundary-healing decisions before database writes.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -18,23 +16,23 @@ use crate::boundary::completed_tool_arc_crosses_boundary;
 
 const BOUNDARY_HEALING_SLACK: u64 = 2;
 
-/// A raw ordinal range, inclusive on both ends.
+/// MessageRange includes both endpoints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageRange {
     pub start: u64,
     pub end: u64,
 }
 
-/// One formatted chunk line that can be mapped back to a provider message id.
+/// ChunkLine maps a formatted chunk line to a provider message ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkLine {
     pub ordinal: u64,
-    /// The real flat block id (`<mid>#<index>`) of the line's last block. This is empty
-    /// only when the raw message has no flat blocks and therefore cannot anchor a
+    /// message_id is the last flat block's `<mid>#<index>` ID.
+    /// message_id is empty only when the raw message has no flat blocks.
     /// compartment boundary.
     pub message_id: String,
-    /// Whether `message_id` names a real flat block. A compartment must end on an
-    /// anchorable block so publication cannot mint an impossible coverage boundary.
+    /// anchorable is true only when message_id names a real flat block.
+    /// A compartment must end on an anchorable block to avoid impossible coverage boundaries.
     #[serde(default = "chunk_line_anchorable_by_default")]
     pub anchorable: bool,
 }
@@ -43,52 +41,48 @@ fn chunk_line_anchorable_by_default() -> bool {
     true
 }
 
-/// The raw-history slice that the historian was asked to summarize.
+/// HistorianChunk identifies the raw-history slice submitted to the historian.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianChunk {
     pub start_index: u64,
     pub end_index: u64,
     pub lines: Vec<ChunkLine>,
-    /// All non-synthetic input ordinals visible when this chunk was built, in
-    /// provider order. Claude Code proxy submissions can permanently retire
-    /// ordinals when message identities are re-minted, so validation filters
-    /// this sparse set to the claimed range instead of assuming 0..n density.
+    /// present_ordinals contains all non-synthetic input ordinals visible when the chunk was built.
+    /// present_ordinals may be sparse when message identities are re-minted.
+    /// Validation filters present_ordinals to the claimed range.
+    /// Validation must not assume that present_ordinals has dense `0..n` coverage.
     #[serde(default)]
     pub present_ordinals: Vec<u64>,
-    /// Gaps fully inside one of these ranges are safe to heal at any size because
-    /// the omitted raw lines were tool-only transcript noise rather than narrative.
+    /// Gaps wholly within tool_only_ranges may be healed at any size.
+    /// tool_only_ranges may contain only tool-only transcript noise.
     #[serde(default)]
     pub tool_only_ranges: Vec<MessageRange>,
-    /// Completed invocation/result ranges whose terminal publication boundary must stay atomic.
+    /// completed_tool_arcs identifies invocation/result ranges whose terminal publication boundary must remain atomic.
     #[serde(default)]
     pub completed_tool_arcs: Vec<MessageRange>,
 }
 
-/// An already-persisted compartment range with the raw start and end ordinals
-/// needed to validate store ordering before appending new compartments.
+/// StoredCompartmentRange records an already-persisted compartment's raw ordinal range.
+/// Validation uses these ordinals to verify store ordering before appending compartments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredCompartmentRange {
     pub start_message: u64,
     pub end_message: u64,
 }
 
-/// Options that are known by the runner but are not present in the historian XML.
+/// ValidateOptions contains runner-supplied options absent from historian XML.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidateOptions {
-    /// Sequence number to assign to the first emitted compartment in this publish.
+    /// sequence_offset assigns the sequence number of the first emitted compartment.
     #[serde(default)]
     pub sequence_offset: u64,
-    /// When true, emergency recovery favors fast raw-history reduction over the
-    /// highest-quality final boundary for the newest compartment.
+    /// When in_emergency is true, recovery favors rapid raw-history reduction over the newest compartment's final boundary quality.
     #[serde(default)]
     pub in_emergency: bool,
-    /// Memory promotion is disabled when the durable memory feature is off.
     #[serde(default = "default_true")]
     pub memory_enabled: bool,
-    /// Facts are also gated by the explicit auto-promote switch.
     #[serde(default = "default_true")]
     pub auto_promote: bool,
-    /// Privacy gate for historian user-behavior observations.
     #[serde(default)]
     pub user_memory_collection_enabled: bool,
     /// Explicit wrapup runs retain their final compartment instead of deleting it during cleanup.
@@ -113,14 +107,13 @@ impl Default for ValidateOptions {
     }
 }
 
-/// A parsed compartment before endpoint ids are resolved.
+/// The struct stores a parsed compartment before validation resolves endpoint IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedCompartment {
     pub start_message: u64,
     pub end_message: u64,
     pub title: String,
-    /// In v2 compartments the main body is duplicated into `p1`; v1/legacy
-    /// compartments store their body text only in this flat `content` field.
+    /// In v2 compartments, the main body is duplicated into `p1`; v1/legacy compartments store body text only in `content`.
     pub content: String,
     #[serde(default)]
     pub p1: Option<String>,
@@ -136,21 +129,18 @@ pub struct ParsedCompartment {
     pub episode_type: Option<String>,
 }
 
-/// A fact extracted from the `<facts>` block.
+/// The struct stores a fact extracted from the `<facts>` block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FactCandidate {
     pub category: String,
     pub content: String,
-    /// Optional forward-compatible anchor. Current TypeScript facts are
-    /// unanchored; when absent and the last compartment is discarded during
-    /// boundary healing, the fact is skipped because its source compartment
-    /// cannot be proven.
+    /// TypeScript facts are unanchored.
+    /// When boundary healing discards the last compartment, validation skips a fact without `origin_compartment_index` because it cannot prove the fact's source compartment.
     #[serde(default)]
     pub origin_compartment_index: Option<u64>,
 }
 
-/// A historian-extracted event. The event kind is the XML element name; fields
-/// are child element text keyed by element name.
+/// A historian event uses its XML element name as `kind` and child element text keyed by element name as `fields`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedEvent {
     pub kind: String,
@@ -160,28 +150,26 @@ pub struct ParsedEvent {
     pub fields: BTreeMap<String, String>,
 }
 
-/// A durable standing-question candidate for later primer generation.
+/// PrimerCandidate represents a durable standing question for later primer generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrimerCandidate {
     pub question: String,
-    /// 1-based index into this historian output's emitted compartments.
+    /// `origin_compartment_index` is a 1-based index into this historian output's emitted compartments.
     #[serde(default)]
     pub origin_compartment_index: Option<u64>,
 }
 
-/// Optional user-memory observation extracted from the chunk.
+/// UserObservationCandidate represents an optional user-memory observation extracted from the chunk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserObservationCandidate {
     pub content: String,
-    /// Optional forward-compatible anchor. Current TypeScript observations are
-    /// unanchored; when the last compartment is discarded during boundary
-    /// healing, an unanchored observation is skipped because its source
-    /// compartment cannot be proven.
+    /// TypeScript observations are unanchored.
+    /// When boundary healing discards the last compartment, validation skips an observation without `origin_compartment_index` because it cannot prove the observation's source compartment.
     #[serde(default)]
     pub origin_compartment_index: Option<u64>,
 }
 
-/// Parsed XML-ish historian output, before validation mutates/heals ranges.
+/// ParsedCompartmentOutput stores XML-ish historian output before validation mutates or heals ranges.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedCompartmentOutput {
     #[serde(default)]
@@ -198,7 +186,7 @@ pub struct ParsedCompartmentOutput {
     pub primer_candidates: Vec<PrimerCandidate>,
 }
 
-/// A compartment whose raw endpoints have been resolved to provider message ids.
+/// ValidatedCompartment stores raw endpoints resolved to provider message IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatedCompartment {
     pub sequence: u64,
@@ -222,7 +210,7 @@ pub struct ValidatedCompartment {
     pub episode_type: Option<String>,
 }
 
-/// The side-effect-free publish plan produced by validation.
+/// ValidatedChunk is the side-effect-free publish plan that validation produces.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatedChunk {
     pub compartments: Vec<ValidatedCompartment>,
@@ -230,15 +218,13 @@ pub struct ValidatedChunk {
     pub events: Vec<ParsedEvent>,
     pub primer_candidates: Vec<PrimerCandidate>,
     pub user_observations: Vec<UserObservationCandidate>,
-    /// The next raw ordinal to read after the compartments that are safe to persist.
+    /// `unprocessed_from` is the next raw ordinal to read after the safe-to-persist compartments.
     pub unprocessed_from: u64,
-    /// True when the provisional last compartment was intentionally withheld so it
-    /// can be re-derived with real lookahead in the next run.
+    /// Validation withholds the provisional last compartment when this flag is true so the next run can re-derive it with real lookahead.
     pub discarded_last: bool,
 }
 
-/// Validation failures are plain, serializable messages because callers surface
-/// them in repair prompts and telemetry.
+/// Validation failures are plain, serializable messages because callers include them in repair prompts and telemetry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianValidationError {
     pub message: String,
@@ -258,8 +244,7 @@ fn validation_error(message: impl Into<String>) -> HistorianValidationError {
     }
 }
 
-/// Require one complete historian output envelope, then use the TypeScript host
-/// parser's permissive extraction semantics for structures inside that root.
+/// The parser requires one complete historian-output envelope and uses the TypeScript host parser's permissive extraction semantics within that root.
 /// Malformed inner XML yields fewer usable structures for validation to assess.
 pub fn parse_compartment_output(
     text: &str,
@@ -445,8 +430,7 @@ pub fn parse_compartment_output(
     })
 }
 
-/// Parse, heal safe gaps, map endpoint ordinals to message ids, enforce coverage,
-/// apply discard-last boundary healing, and return only data safe to persist.
+/// Validation applies discard-last boundary healing and returns only data safe to persist.
 pub fn validate_historian_output(
     text: &str,
     chunk: &HistorianChunk,
@@ -541,9 +525,7 @@ pub fn validate_historian_output(
             .last()
             .map(|c| c.end_message)
             .unwrap_or(chunk.end_index);
-        // TypeScript uses numeric ordinal distance here. Retired message numbers are
-        // intentionally part of that distance, so a sparse coordinate gap still counts
-        // as lookahead for boundary healing.
+        // TypeScript counts numeric ordinal distance, including retired message numbers, so sparse coordinate gaps still count.
         let lookahead_distance = chunk.end_index.saturating_sub(last_end);
         let previous_end = compartments
             .get(compartments.len().saturating_sub(2))
@@ -582,10 +564,7 @@ pub fn validate_historian_output(
                 )
         })
         .collect();
-    // A discarded lookahead compartment invalidates the whole producer output's anchors.
-    // Keeping any side channel here would make a later re-read double-store it. A forced final
-    // wrapup chunk has the same weak lookahead for promotions, while retaining earlier anchored
-    // events that do not point at the final compartment.
+    // Discarding the last compartment requires validation to skip unanchored producer output because its source compartment cannot be proven.
     let events = parsed
         .events
         .into_iter()
@@ -631,19 +610,15 @@ pub fn validate_historian_output(
         events,
         primer_candidates,
         user_observations,
-        // This value is a publication floor, not a promise that the next integer
-        // ordinal exists. Consumer legs may retire ordinals permanently, so
-        // downstream scans treat it as a lower bound and advance to the next
-        // present input message.
+        // `unprocessed_from` is a publication floor: retired ordinals may be absent, so downstream scans advance to the next present input message.
         unprocessed_from: last_new_end.saturating_add(1),
         discarded_last,
     })
 }
 
-/// Validate already-persisted ranges before appending new output.
+/// The validator checks already-persisted ranges before appending new output.
 ///
-/// This store-pure check anchors at the first stored compartment: only the live-aware
-/// fold can decide whether that first start matches the session's true first message.
+/// The store-pure check anchors at the first stored compartment because only the live-aware fold can compare that start with the session's true first message.
 pub fn validate_stored_compartments(compartments: &[StoredCompartmentRange]) -> Option<String> {
     let first = compartments.first()?;
     if first.end_message < first.start_message {
@@ -704,9 +679,7 @@ fn next_present_after(ordinals: &[u64], after: u64) -> Option<u64> {
     ordinals.iter().copied().find(|ordinal| *ordinal > after)
 }
 
-/// Ensure the chunk's ordinal lines cover exactly the present input ordinals in
-/// the advertised raw range. Consumer legs can retire ordinal numbers permanently,
-/// so a missing integer is valid when it is absent from the real input set.
+/// The chunk's ordinal lines must cover exactly the present input ordinals in the advertised raw range; missing retired ordinals are valid when absent from the real input set.
 pub fn validate_chunk_coverage(chunk: &HistorianChunk) -> Option<String> {
     if chunk.present_ordinals.is_empty() {
         return validate_dense_chunk_coverage(chunk);
@@ -813,11 +786,8 @@ fn parse_events(text: &str) -> Vec<ParsedEvent> {
     let block = block_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
     let mut events = Vec::new();
 
-    // Rust's regex engine intentionally has no backreferences, while the TS parser
-    // uses one to require `</kind>` to match the opening event element. Match only
-    // event *open* tags here, then search for the corresponding literal close tag.
-    // Event child fields do not carry `at_compartment`, so they cannot be mistaken
-    // for event opens.
+    // Rust regexes lack backreferences, so the parser matches event opening tags and searches for the corresponding literal close tag.
+    // Event child fields lack `at_compartment`, so the parser cannot mistake them for event opens.
     for event_caps in event_open_regex().captures_iter(block) {
         let Some(full_match) = event_caps.get(0) else {
             continue;
@@ -920,9 +890,7 @@ fn heal_compartment_gaps(
                 .iter()
                 .any(|range| range.start <= *ordinal && range.end >= *ordinal)
         });
-        // Production replay showed contiguous narrative coverage. Tool-only noise is
-        // therefore the sole safe gap to absorb; any narrative gap rejects before the
-        // publish path can advance its durable boundary.
+        // Only tool-only gaps may be absorbed; narrative gaps reject before the publish path advances the durable boundary.
         if fully_inside_tool_only {
             compartments[i - 1].end_message = *omitted_present
                 .last()
@@ -995,8 +963,7 @@ fn validate_parsed_compartments(
     let mut expected_start = chunk_ordinals.first().copied();
 
     for (index, compartment) in compartments.iter().enumerate() {
-        // P1 is the required v2 boundary. Missing P2-P4 deliberately keep the
-        // parser's denser-tier fallbacks; only the flat v1 shape must retry.
+        // P1 is required at the v2 boundary; absent P2-P4 use the parser's denser-tier fallbacks, but the flat v1 shape retries.
         match compartment.p1.as_deref() {
             Some(p1) if !p1.trim().is_empty() => {}
             _ => {
@@ -1112,21 +1079,18 @@ fn capture_u64(regex: &Regex, haystack: &str) -> Option<u64> {
 fn extract_tier(inner: &str, index: usize) -> Option<String> {
     let open_match = tier_open_regexes()[index].captures(inner)?;
     let full = open_match.get(0)?;
-    // Self-close form (<p4/> or <p4 />) → empty tier.
+    // A self-closing `<p4/>` or `<p4 />` represents an empty tier.
     if open_match.get(1).map(|m| m.as_str()) == Some("/") {
         return Some(String::new());
     }
     let rest = &inner[full.end()..];
-    // Bound the body at the next closing tier tag (any digit). When there is no
-    // close at all, run to the end of the compartment and let the guard below
-    // trim at the next opener if one is present.
+    // The parser bounds a tier body at the next closing tier tag; without a close tag, it stops at the compartment end or an intervening opener.
     let end = tier_close_any_regex()
         .find(rest)
         .map(|m| m.start())
         .unwrap_or(rest.len());
     let mut body = &rest[..end];
-    // Over-capture guard: never swallow a subsequent tier's opening tag into
-    // this tier's content. If an opener appears before the close, cut there.
+    // The over-capture guard cuts tier content at any subsequent tier opener before the closing tag.
     if let Some(open_inside) = tier_open_any_regex().find(body) {
         body = &body[..open_inside.start()];
     }
@@ -1195,10 +1159,9 @@ fn attr_importance_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"\bimportance="(\d+)""#).unwrap())
 }
 
-/// Per-tier opener: matches `<p1>` / `<p1 >` (group 1 empty) or the self-close
-/// `<p1/>` / `<p1 />` (group 1 = "/"). The body that follows an opener is
-/// bounded procedurally in `extract_tier` rather than by an exact `</pN>` close,
-/// because some models mismatch the closing digit (e.g. `<p1>…</p2>`).
+/// Self-closing tier tags represent empty tiers.
+/// Mismatched closing digits terminate an opened tier.
+/// Mismatched closing digits terminate an opened tier.
 fn tier_open_regexes() -> &'static [Regex; 4] {
     static RE: OnceLock<[Regex; 4]> = OnceLock::new();
     RE.get_or_init(|| {
@@ -1211,15 +1174,14 @@ fn tier_open_regexes() -> &'static [Regex; 4] {
     })
 }
 
-/// Any tier's closing tag (`</p1>`…`</p9>`) — bounds an opened tier's body
-/// regardless of whether the close digit matches the opener.
+/// Any closing tag matching `</p\d` bounds an opened tier's body.
+/// Any closing tier tag terminates an opened tier even when its digit differs from the opener's.
 fn tier_close_any_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"</p\d").unwrap())
 }
 
-/// Any tier's OPENING tag (`<p1>`…`<p9>`) — the over-capture guard: a tier body
-/// must never swallow a following tier's opener.
+/// Any later tier opener terminates the current tier body.
 fn tier_open_any_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"<p\d").unwrap())
@@ -1499,7 +1461,6 @@ full narrative
         assert_eq!(compartment.p3.as_deref(), Some("outcome"));
         assert_eq!(compartment.p4.as_deref(), Some(""));
 
-        // Genuinely tier-free flat output still rejects into retry/fallback.
         let flat = r#"<output><compartment start="1" end="2" title="flat">flat summary</compartment><meta><unprocessed_from>3</unprocessed_from></meta></output>"#;
         let error = validate_historian_output(flat, &chunk(1, 2), &[], ValidateOptions::default())
             .expect_err("tier-free flat output must still reject");
@@ -1510,7 +1471,6 @@ full narrative
 
     #[test]
     fn lenient_tier_extraction_bounds_bodies_and_guards_overcapture() {
-        // Missing close entirely: an opened tier is bounded by the next opener.
         let missing_close = r#"<output><compartments><compartment start="1" end="2" title="x" importance="50"><p1>first body<p2>second body</p2><p3>third</p3><p4/></compartment></compartments></output>"#;
         let parsed = parse_compartment_output(missing_close).expect("parse missing-close");
         let compartment = &parsed.compartments[0];
@@ -1518,8 +1478,7 @@ full narrative
         assert_eq!(compartment.p2.as_deref(), Some("second body"));
         assert_eq!(compartment.p3.as_deref(), Some("third"));
 
-        // Over-capture guard: a stray close past the next opener must not extend
-        // the earlier tier's body across that opener.
+        // A later tier opener terminates the current tier body.
         let overcapture = r#"<output><compartments><compartment start="1" end="2" title="x" importance="50"><p1>alpha<p2>beta</p1><p3>gamma</p3><p4/></compartment></compartments></output>"#;
         let parsed = parse_compartment_output(overcapture).expect("parse over-capture");
         let compartment = &parsed.compartments[0];
@@ -1681,8 +1640,6 @@ full narrative
 
     #[test]
     fn terminal_unprocessed_boundary_closes_a_completed_arc_forward() {
-        // This fixture models a chunk spanning ordinals 98-128 with a completed tool arc at
-        // 123-124. Its adapted bytes carry no provider verdict.
         let mut row_chunk = chunk(98, 128);
         row_chunk.completed_tool_arcs = vec![MessageRange {
             start: 123,

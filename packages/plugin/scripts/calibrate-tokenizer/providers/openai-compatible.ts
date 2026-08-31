@@ -1,14 +1,6 @@
 /**
- * OpenAI-compatible backend: covers any provider that exposes the standard
- * /v1/chat/completions endpoint and returns `usage.prompt_tokens` (or the
- * Responses API equivalent `usage.input_tokens`).
  *
- * Strategy: send a minimal inference request with `max_tokens=1` (or the
- * smallest the provider allows), let the provider tokenize the prompt, read
- * the actual prompt_tokens from the response. Cost is tiny (one output token).
  *
- * Per-provider URL/auth header variations handled inline. We do NOT route
- * through OpenCode — direct fetch only.
  */
 
 interface ModelTest {
@@ -155,7 +147,7 @@ async function chatCompletion(
     return tokens;
 }
 
-/** Convert Anthropic tool shape to OpenAI tool shape. */
+/* */
 function toOpenAITools(anthropicTools: unknown[]): unknown[] {
     return (anthropicTools as Array<Record<string, unknown>>).map((t) => ({
         type: "function",

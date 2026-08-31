@@ -1,5 +1,3 @@
-/// <reference types="bun-types" />
-
 import { describe, expect, it } from "bun:test";
 import { findFirstKeptEntryId } from "./pi-historian-runner";
 import {
@@ -121,28 +119,16 @@ describe("isMidTurnPi", () => {
 });
 
 describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () => {
-	// Regression coverage for the cortexkit/magic-context X1+X2 production
-	// bugs. Pi sessions with many `toolResult → assistant` transitions emit
-	// synthetic user RawMessages. The original implementation set those
-	// synthetic users' `id` to `""`, which broke two downstream consumers:
+	// Tool-result-to-assistant transitions emit synthetic user RawMessages.
+	// Synthetic user RawMessages require an entry ID for chunk boundaries and compaction markers.
 	//
-	//   - read-session-chunk.ts:345 puts `messageId: msg.id` into
-	//     `chunk.lines`. When the chunk's final ordinal lands on a synthetic
-	//     user, `mapParsedCompartmentsToChunk` populates `endMessageId = ""`
-	//     on the published compartment, breaking the magic-context
-	//     boundary-trim path. (Bug X2)
-	//   - pi-historian-runner.ts:findFirstKeptEntryId walks raw
-	//     SessionEntries with its own counter that skips synthetics
-	//     entirely, never reaching the historian's `lastCompactedOrdinal`.
-	//     It returns null, `appendCompaction` is silently skipped, the
-	//     JSONL grows unbounded, and Pi/Codex eventually rejects the wire
-	//     payload with context_length_exceeded. (Bug X1)
+	// A synthetic user's entry ID must remain nonempty when it is the final chunk message.
+	// A synthetic user's entry ID must remain nonempty so `mapParsedCompartmentsToChunk` can set `endMessageId`.
+	// `findFirstKeptEntryId` must use the same raw-message ordinal mapping as `convertEntriesToRawMessages`.
+	// A null first-kept ID prevents `appendCompaction` from writing a compaction marker.
 	//
-	// Fix: synthetic users now carry the FIRST folded toolResult's entry id
-	// as `RawMessage.id`. That id is always a real, lookup-able SessionEntry
-	// id, so chunk.lines and compaction-marker placement both work
-	// correctly. findFirstKeptEntryId now delegates to
-	// convertEntriesToRawMessages so the two ordinal counters can't diverge.
+	// Synthetic `RawMessage.id` values derive from the first folded `toolResult` entry ID.
+	// The first folded `toolResult` entry ID identifies a real, lookup-able `SessionEntry`.
 
 	function messageEntry(
 		id: string,
@@ -194,7 +180,6 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 				toolName: "read",
 				content: [{ type: "text", text: "output-1" }],
 			}),
-			// toolResult → assistant: synthetic user gets emitted here
 			messageEntry("asst-2", {
 				role: "assistant",
 				content: [{ type: "text", text: "follow-up" }],
@@ -203,11 +188,6 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 
 		const raws = convertEntriesToRawMessages(entries);
 
-		// Expected ordinal layout:
-		//   1: user-1 (real)
-		//   2: asst-1 (real)
-		//   3: synthetic user folding tr-1 — MUST carry tr-1's id
-		//   4: asst-2 (real)
 		expect(
 			raws.map((r) => ({ ordinal: r.ordinal, id: r.id, role: r.role })),
 		).toEqual([
@@ -240,7 +220,7 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 				toolName: "read",
 				content: [{ type: "text", text: "out-2" }],
 			}),
-			// stacked tr-1, tr-2 fold into synthetic user at this transition
+			// The transition folds `tr-1` and `tr-2` into one synthetic user.
 			messageEntry("asst-2", { role: "assistant", content: [] }),
 		];
 
@@ -248,7 +228,6 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 		const synthetic = raws[2];
 		expect(synthetic?.ordinal).toBe(3);
 		expect(synthetic?.role).toBe("user");
-		// First folded toolResult wins — never empty.
 		expect(synthetic?.id).toBe("synth-user-tr-1");
 	});
 
@@ -265,7 +244,7 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 				toolName: "read",
 				content: [{ type: "text", text: "tail" }],
 			}),
-			// No following user/assistant — trailing tail synthetic emits
+			// A trailing `toolResult` sequence emits a synthetic user.
 		];
 
 		const raws = convertEntriesToRawMessages(entries);
@@ -276,9 +255,8 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 	});
 
 	it("clears pending state after a real user folds toolResults", () => {
-		// Real user message folds toolResults — no synthetic should emit.
-		// The pending state must reset so a LATER synthetic point doesn't
-		// reuse a stale toolResult id.
+		// A real user message folds pending `toolResult` entries without emitting a synthetic user `RawMessage`.
+		// Emission clears pending tool results so later synthetic users cannot reuse their IDs.
 		const entries = [
 			messageEntry("asst-1", {
 				role: "assistant",
@@ -307,9 +285,7 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 		const raws = convertEntriesToRawMessages(entries);
 		// Expected:
 		//   1: asst-1
-		//   2: real-user (folds tr-1)        — id="real-user", NOT "tr-1"
 		//   3: asst-2
-		//   4: synthetic user folding tr-2   — id="tr-2"
 		//   5: asst-3
 		expect(
 			raws.map((r) => ({ ordinal: r.ordinal, id: r.id, role: r.role })),
@@ -323,16 +299,8 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 	});
 
 	it("reproduces the user-session ordinal divergence: every RawMessage has a non-empty id", () => {
-		// Build a branch that mirrors the user's stuck session pattern:
-		// alternating assistant → toolResult → assistant transitions
-		// produce a flood of synthetic users. Each synthetic must carry
-		// the folded toolResult's id; no RawMessage may have id="".
+		// Every `RawMessage` has a nonempty `id`, including synthetic users.
 		//
-		// Pattern: kickoff user, then 50 cycles of
-		//   assistant(toolCall) → toolResult → assistant(toolCall) → toolResult → ...
-		// terminated by a final assistant. This is structurally identical
-		// to a tool-heavy autonomous run where the agent fires tools, sees
-		// results, and immediately fires more without user input.
 		const entries: Array<Record<string, unknown>> = [
 			messageEntry("u-0", { role: "user", content: "go" }),
 		];
@@ -359,9 +327,6 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 
 		const raws = convertEntriesToRawMessages(entries);
 
-		// Every RawMessage must carry a non-empty id, including synthetics.
-		// Pre-fix this assertion failed because synthetic-user emissions
-		// at every toolResult→assistant transition had id="".
 		const empties = raws.filter((r) => !r.id || r.id.length === 0);
 		expect(empties).toEqual([]);
 
@@ -374,8 +339,6 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 			expect(cur).toBe(prev + 1);
 		}
 
-		// 50 synthetic users (toolResult→assistant transitions) emitted,
-		// each carrying its first folded toolResult's id.
 		const syntheticUsers = raws.filter(
 			(r, idx) =>
 				r.role === "user" &&
@@ -396,8 +359,6 @@ describe("findFirstKeptEntryId — replay-safe boundary resolution", () => {
 		return { type: "message", id, message };
 	}
 
-	// Branch: user(u-0) → assistant(toolCall) → toolResult → assistant(text).
-	// RawMessage ordinals: 1=u-0, 2=asst-1, 3=synthetic-user(folds tr-1, id
 	// `${PREFIX}tr-1`), 4=asst-2.
 	const entries = [
 		messageEntry("u-0", { role: "user", content: "go" }),
@@ -418,22 +379,20 @@ describe("findFirstKeptEntryId — replay-safe boundary resolution", () => {
 	];
 
 	it("returns a real entry id when the boundary lands on a normal message", () => {
-		// boundary after ordinal 1 (u-0) → kept start is ordinal 2 (asst-1).
+		// A boundary after ordinal 1 makes ordinal 2 (`asst-1`) the kept-tail start.
 		expect(findFirstKeptEntryId(entries, 1)).toBe("asst-1");
 	});
 
 	it("DEFERS (null) when the kept-start ordinal is a folded-toolResult synthetic user", () => {
-		// boundary after ordinal 2 (asst-1) → ordinal 3 (the FIRST kept-tail
-		// message) is the synthetic user folding tr-1. That folded toolResult run
-		// is un-summarized kept-tail content: advancing past it to asst-2 would
-		// DROP it (neither summarized nor kept), and cutting at the toolResult
-		// would orphan it. The only safe action is to defer the marker until a
-		// later pass when a real entry heads the kept tail.
+		// A boundary after ordinal 2 makes ordinal 3 the kept-tail start.
+		// Ordinal 3 is the synthetic user that folds `tr-1`.
+		// The folded `toolResult` run remains unsummarized kept-tail content.
+		// Advancing the boundary to `asst-2` would drop the folded `toolResult` run instead of summarizing or retaining it.
+		// `appendCompaction` must wait until a real entry heads the kept tail before writing a compaction marker.
 		expect(findFirstKeptEntryId(entries, 2)).toBeNull();
 	});
 
 	it("defers (null) when only folded tool-result tails remain after the boundary", () => {
-		// Tail ends in a folded toolResult with no following real entry.
 		const tailEntries = [
 			messageEntry("u-0", { role: "user", content: "go" }),
 			messageEntry("asst-1", {
@@ -447,8 +406,8 @@ describe("findFirstKeptEntryId — replay-safe boundary resolution", () => {
 				content: [{ type: "text", text: "out" }],
 			}),
 		];
-		// boundary after ordinal 2 → only the synthetic-user (folded tr-1) tail
-		// remains → no replay-safe real entry → defer.
+		// A boundary after ordinal 2 leaves only the synthetic user that folds tr-1.
+		// No replay-safe real entry remains, so findFirstKeptEntryId returns null.
 		expect(findFirstKeptEntryId(tailEntries, 2)).toBeNull();
 	});
 });

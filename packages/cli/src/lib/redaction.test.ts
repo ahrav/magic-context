@@ -9,7 +9,6 @@ import {
 } from "./redaction";
 
 describe("isSecretKey — true positives", () => {
-    // Real secret-bearing key names from common providers and config shapes.
     const SHOULD_REDACT = [
         "api_key",
         "apiKey",
@@ -41,7 +40,7 @@ describe("isSecretKey — true positives", () => {
         "Password",
         "PASSWORD",
         "credential",
-        // Bare segment alone.
+        // Bare secret-word segments must be redacted.
         "token",
         "key",
         "secret",
@@ -57,19 +56,14 @@ describe("isSecretKey — true positives", () => {
 });
 
 describe("isSecretKey — false positives we deliberately reject", () => {
-    // Real config field names from packages/plugin/src/config/schema/magic-context.ts
-    // that DO contain a secret word as a substring but are NOT secrets.
-    // The substring-based pattern shipped through v0.21.2 wrongly redacted
-    // ALL of these in `doctor --issue` and dashboard config dumps,
-    // confusing reporters and hiding values that should be visible.
+    // Magic Context field names contain secret-word substrings but do not identify secrets.
     const SHOULD_NOT_REDACT = [
-        // Magic Context config fields that triggered the regression on issue #85.
         "pin_key_files",
         "token_budget",
         "execute_threshold_tokens",
         "injection_budget_tokens",
         "key_files", // a sub-field of pin_key_files
-        // Generic plain English compounds that aren't secrets.
+        // These names are generic English compounds, not secret identifiers.
         "key_value", // map-style label
         "tokens_per_second",
         "auth_method", // enum value name, not credential — `method` isn't a descriptor
@@ -114,7 +108,6 @@ describe("sanitizeConfigValue — preserves benign config keys", () => {
         };
         const sanitized = sanitizeConfigValue(config) as Record<string, Record<string, unknown>>;
         expect(sanitized.embedding?.api_key).toBe("<REDACTED:api_key>");
-        // Sibling fields under same parent must remain visible.
         expect(sanitized.embedding?.provider).toBe("openai-compatible");
         expect(sanitized.embedding?.model).toBe("text-embedding-3-small");
     });
@@ -171,10 +164,9 @@ describe("hasShareabilitySensitiveText", () => {
     });
 
     it("allows non-sensitive project facts", () => {
-        // Fixture must avoid plausible machine usernames ("test", "runner",
-        // "admin"): sanitize replaces the current login name anywhere it
-        // appears, so a fixture containing it flips sensitive on that box
-        // (bench machines log in as "test", CI as "runner").
+        // Fixtures must avoid usernames because sanitization redacts the current login name anywhere in a value.
+        // Fixtures must avoid usernames because sanitization redacts the current login name anywhere in a value.
+        // Fixtures must avoid usernames because sanitization redacts the current login name anywhere in a value.
         expect(
             hasShareabilitySensitiveText("Migration v45 adds the retrospective watermark column."),
         ).toBe(false);

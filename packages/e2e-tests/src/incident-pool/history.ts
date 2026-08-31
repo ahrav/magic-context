@@ -1,11 +1,10 @@
 /**
- * Append-only incident lifecycle: whole-ledger atomic replay and
- * repository-baseline comparison (U1, R3, KTD1).
+ * The ledger accepts only appended incident events.
  *
- * Replay fails closed on ANY invalid event — it never skips an event to fold
- * a later baseline. Comparison rejects edits/deletions of accepted rows and
- * ledger-prefix rewrites; the sole destructive exception is a digest-bound
- * emergency-redaction event naming the protected base.
+ * Replay rejects the entire ledger after any invalid event; it never skips an event to use a later baseline.
+ * Comparison rejects edits and deletions of accepted rows.
+ * Comparison rejects ledger-prefix rewrites.
+ * An emergency-redaction event may change only the digest-bound protected base it names.
  */
 
 import { createHash } from "node:crypto";
@@ -26,7 +25,7 @@ import {
     type SourceItem,
 } from "./contract";
 
-/** Deterministic serialization (sorted object keys) for row digests. */
+/* */
 export function canonicalJson(value: unknown): string {
     if (value === null || typeof value !== "object")
         return JSON.stringify(value);
@@ -45,7 +44,7 @@ export function rowDigest(value: unknown): string {
         .digest("hex");
 }
 
-/** Split JSONL text into lines; a single trailing newline is tolerated. */
+/* */
 export function splitLedgerLines(text: string): string[] {
     const body = text.endsWith("\n") ? text.slice(0, -1) : text;
     return body === "" ? [] : body.split("\n");
@@ -78,10 +77,7 @@ export interface LedgerState {
 }
 
 /**
- * Atomic whole-ledger replay. Every rule failure throws immediately:
- * duplicate event IDs, per-identity sequence gaps, forward/cross-identity/
- * double supersession, baseline rebinding (a new baseline must supersede the
- * current unsuperseded baseline), and events after retirement.
+ * A new baseline must supersede the current unsuperseded baseline.
  */
 export function replayAdjudicationLedger(
     events: AdjudicationEvent[],
@@ -153,8 +149,8 @@ export interface IncidentHistoryInput {
 }
 
 export interface HistorySnapshot extends IncidentHistoryInput {
-    /** Label the protected repository baseline; emergency redactions must
-     *  name this base to authorize a byte change against it. */
+    /** The protected-baseline label binds emergency-redaction authorization to that baseline.
+     * An emergency-redaction event must name the protected base it authorizes. */
     baseLabel: string;
 }
 
@@ -195,9 +191,6 @@ function parseJsonArtifact<T>(
 }
 
 /**
- * Parse and cross-check one full incident history: strict artifacts, atomic
- * ledger replay, and structural cross-checks (orphans, verifier bindings,
- * lane/baseline correspondence, fingerprint binding).
  */
 export function validateIncidentHistory(
     input: IncidentHistoryInput,
@@ -258,9 +251,8 @@ export function validateIncidentHistory(
             }
         }
         for (const variant of family.variants) {
-            // A variant inherits its incident from the enclosing family, so a
-            // claim linked only to a DIFFERENT family would silently move the
-            // variant's provenance out from under the family that owns it.
+            // A variant inherits its incident from its enclosing family.
+            // A claim linked only to a different family would move the variant's provenance outside its owning family.
             for (const claimId of variant.source_claims) {
                 if (!claimIds.has(claimId)) {
                     throw new Error(
@@ -292,13 +284,11 @@ export function validateIncidentHistory(
     for (const variant of variantById.values()) {
         const history = ledger.byIdentity.get(variant.id);
         if (EXECUTABLE_LANES.includes(variant.lane)) {
-            // Every noncanonical harness needs a reviewed reason, not just some
-            // of them. A partial `omitted` list is structurally valid, so the
-            // parser accepts it and the remaining harness ends up with neither
-            // applicability nor a rationale — which `buildRunSnapshot` then
-            // papers over with its generic "canonical harness is ..." fallback.
-            // Enforced here rather than in the parser because this is a policy
-            // over the committed catalog, not a shape rule for every caller.
+            // The validator requires a reason for every noncanonical harness.
+            // A partial `omitted` list is structurally valid.
+            // The parser accepts a partial `omitted` list, leaving unlisted harnesses without applicability or rationale.
+            // buildRunSnapshot replaces missing harness rationale with its generic canonical-harness fallback.
+            // The validator enforces noncanonical-harness rationale outside the parser because the rule applies only to committed catalogs.
             const applicability = variant.applicability;
             if (applicability !== null) {
                 const documented = new Set(
@@ -355,7 +345,7 @@ export function validateIncidentHistory(
     return { inventory, catalog, events, ledger, redactions };
 }
 
-/** Scalar row of a source item (claims are compared individually). */
+/* */
 function itemRow(item: SourceItem): Record<string, unknown> {
     return {
         id: item.id,
@@ -364,7 +354,7 @@ function itemRow(item: SourceItem): Record<string, unknown> {
     };
 }
 
-/** Scalar row of a family (variants are compared individually). */
+/* */
 function familyRow(family: IncidentFamily): Record<string, unknown> {
     return {
         id: family.id,
@@ -422,11 +412,8 @@ function requireRowIntegrity(
 }
 
 /**
- * Compare a candidate history against the accepted repository-baseline
- * snapshot (U1 approach step 4). Accepted rows and the ledger prefix are
- * immutable; ordinary changes must append events, and only a digest-bound
- * emergency-redaction event naming the accepted base authorizes a byte
- * rewrite. Identities absent from the accepted snapshot remain editable.
+ * Only a digest-bound emergency-redaction event naming the accepted base authorizes a byte rewrite.
+ * Identities absent from the accepted snapshot remain editable.
  */
 export function compareWithAcceptedSnapshot(
     accepted: HistorySnapshot,
@@ -466,8 +453,7 @@ export function compareWithAcceptedSnapshot(
         appendedBaselineIdentities: new Set<string>(),
     };
 
-    // Adjudication ledger: byte-exact prefix, except a digest-bound redaction
-    // that preserves the event's logical identity and position.
+    // The adjudication ledger prefix is byte-exact except for a digest-bound redaction that preserves an event's logical identity and position.
     if (
         candidate.adjudicationLines.length < accepted.adjudicationLines.length
     ) {
@@ -574,17 +560,12 @@ export function compareWithAcceptedSnapshot(
                 context.appendedIdentities,
                 "family",
             );
-            // A variant's semantic content may change only through a NEW
-            // fingerprint-bound baseline adjudication (KTD9) or a redaction.
+            // A variant's semantic content may change only through an appended fingerprint-bound baseline adjudication or a redaction.
             requireOrderedRow(
                 before.variants,
                 after.variants,
                 `variant of ${before.id}`,
                 (variantBefore, variantAfter) => {
-                    // An appended baseline authorizes the rewrite, but it must
-                    // not let one immutable revision id denote two different
-                    // contracts across history: a changed fingerprint means the
-                    // semantic content moved, so the id has to move with it.
                     if (
                         variantBefore.semantic_revision.fingerprint !==
                             variantAfter.semantic_revision.fingerprint &&

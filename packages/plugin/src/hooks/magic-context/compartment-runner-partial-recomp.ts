@@ -51,11 +51,9 @@ export interface SnappedPartialRange {
 }
 
 /**
- * Preview-only snap computation. Shown in the first-tap confirmation warning so
- * the user sees which compartments will be replaced before executing.
+ * This function only previews the snapped range.
  *
- * Returns an error string when the requested range cannot be snapped (e.g. no
- * compartments exist yet, or the range is entirely after the last compartment).
+ * Returns an error when the range is invalid or overlaps no compartment.
  */
 export function snapRangeToCompartments(
     compartments: Compartment[],
@@ -67,8 +65,7 @@ export function snapRangeToCompartments(
         };
     }
 
-    // Compartments come from getCompartments sorted by sequence ASC which is
-    // the same as sorted by start_message ASC for any valid (contiguous) state.
+    // Sequence order must match startMessage order for contiguous compartments.
     const sorted = compartments.slice().sort((a, b) => a.sequence - b.sequence);
 
     const { start, end } = range;
@@ -114,9 +111,7 @@ function compartmentToInput(c: Compartment, newSequence: number): CompartmentInp
         endMessageId: c.endMessageId,
         title: c.title,
         content: c.content,
-        // v2: preserve paraphrase tiers + scoring on prior/tail compartments that
-        // a partial recomp keeps UNCHANGED. Dropping these would re-write them as
-        // flat (NULL-tier, legacy=0) rows and break decay rendering.
+        // Preserve tiers and scoring: dropping them writes NULL-tier legacy=0 rows and breaks decay rendering.
         p1: c.p1,
         p2: c.p2,
         p3: c.p3,
@@ -148,7 +143,6 @@ export async function executePartialRecompInternal(
     updateSessionMeta(db, sessionId, { compartmentInProgress: true });
 
     try {
-        // ── Snap to compartment boundaries ─────────────────────────────────
         const existingCompartments = getCompartments(db, sessionId);
         const snapResult = snapRangeToCompartments(existingCompartments, range);
         if ("error" in snapResult) {
@@ -156,7 +150,6 @@ export async function executePartialRecompInternal(
         }
         const { snapStart, snapEnd, priorCompartments, tailCompartments } = snapResult;
 
-        // ── Resume detection: check existing staging range ─────────────────
         const storedRange = getRecompPartialRange(db, sessionId);
         const existingStaging = getRecompStaging(db, sessionId);
 
@@ -184,31 +177,18 @@ export async function executePartialRecompInternal(
             ].join("\n");
         }
 
-        // v2: facts are RETIRED as a render source (facts = promoted memories,
-        // surfaced via <project-memory>) and the recomp promote path deletes
-        // session_facts and never re-inserts. So partial recomp neither snapshots
-        // nor carries facts — staging passes get an empty fact list. (Earlier code
-        // snapshotted session_facts and reported "Facts unchanged (N)", but the
-        // promote dropped them regardless, so the snapshot was dead work and the
-        // claim was misleading.)
+        // Partial recomp passes an empty fact list because session facts are not a render source.
         const stagedFacts: { category: string; content: string }[] = [];
 
         // ── Resolve project memories for historian fact dedup context ─────
         const sessionDirectory = await resolveSessionDirectory(client, sessionId, directory);
 
-        // v2: partial-recomp keeps existing facts untouched (no promote, no
-        // dedup block) — reference blocks (seeds + recency) carry calibration.
-
-        // ── Resume state ───────────────────────────────────────────────────
         //
         // Staging layout for partial recomp: [priorCompartments, ...newBuiltSoFar]
         //   - priorCompartments always carried through unchanged
         //   - newBuiltSoFar is what historian has produced for the range so far
         //   - tailCompartments are NOT in staging — they are appended at promote time
         //
-        // Resume: if staging exists and range matches, `candidateCompartments`
-        // already includes prior + any new-built-so-far. `offset` resumes from the
-        // last built compartment's endMessage + 1, or snapStart if nothing new yet.
         let candidateCompartments: CandidateCompartment[];
         let passCount: number;
         let offset: number;
@@ -217,20 +197,15 @@ export async function executePartialRecompInternal(
         if (resumed && existingStaging) {
             candidateCompartments = existingStaging.compartments;
             passCount = existingStaging.passCount;
-            // Resume from last built compartment's end + 1; if only prior is staged
-            // (passCount 0) we start at snapStart.
             const lastInStaging = existingStaging.lastEndMessage;
             offset = lastInStaging >= snapStart ? lastInStaging + 1 : snapStart;
         } else {
-            // Fresh partial recomp: seed staging with prior compartments, record range.
             // Sequences are 0-indexed to match the invariant MAX(sequence) = count - 1.
-            // Any gap or off-by-one here propagates into incremental historian's
-            // sequenceOffset math and triggers UNIQUE constraint failures on the next run.
+            // A gap or off-by-one causes incremental historian sequenceOffset collisions and UNIQUE constraint failures on the next run.
             candidateCompartments = priorCompartments.map((c, idx) => compartmentToInput(c, idx));
             passCount = 0;
             offset = snapStart;
-            // Save initial staging (prior only, pass_number 0) so a crash right after
-            // this point still leaves discoverable staging with the correct range.
+            // Save prior-only staging with pass_number 0 so crashes leave discoverable staging for the snapped range.
             saveRecompStagingPass(db, sessionId, 0, candidateCompartments, stagedFacts);
             setRecompPartialRange(db, sessionId, { start: snapStart, end: snapEnd });
         }
@@ -247,15 +222,13 @@ export async function executePartialRecompInternal(
             notifParams(),
         );
 
-        /** Final promote path: merge prior + new + tail into one coherent set and
-         *  swap atomically. Clears compression depth for the rebuilt range so the
-         *  new compartments start fresh at depth 0. */
+        /** Promotion atomically swaps prior, rebuilt, and tail compartments into the real tables.
+         * Promotion resets compression depth to 0 for rebuilt compartments.
+         * */
         function promoteFinal(): { compartmentCount: number; lastEndMessage: number } | null {
-            // Validate the new-built range before committing.
             const newBuilt = candidateCompartments.slice(priorCompartments.length);
             if (newBuilt.length === 0) return null;
 
-            // Check that new-built range covers exactly [snapStart..snapEnd]
             // contiguously.
             const newBuiltError = (() => {
                 let expected = snapStart;
@@ -280,9 +253,7 @@ export async function executePartialRecompInternal(
                 return null;
             }
 
-            // Append tail with renumbered sequences so the final staging includes
-            // prior + new + tail. `validateStoredCompartments` then passes because
-            // the full set is contiguous from message 1.
+            // `validateStoredCompartments` requires the merged compartments to be contiguous from message 1.
             // Sequences are 0-indexed (continuing from candidateCompartments.length).
             // Starting exactly at candidateCompartments.length keeps the set
             // gapless, preserving the invariant MAX(sequence) = count - 1 that
@@ -301,8 +272,7 @@ export async function executePartialRecompInternal(
                 return null;
             }
 
-            // Save a final staging pass containing prior + new + tail. Promote
-            // replaces the real tables atomically with this set.
+            // Promotion atomically replaces the real tables with the final staging set.
             saveRecompStagingPass(db, sessionId, passCount + 1, merged, stagedFacts);
             const promoted = promoteRecompStagingWithM0Mutation(db, sessionId, leaseHolderId);
             if (!promoted) {
@@ -310,21 +280,15 @@ export async function executePartialRecompInternal(
                 return null;
             }
 
-            // Clear partial-range marker — staging is now empty.
             setRecompPartialRange(db, sessionId, null);
-            // Reset depth counters for rebuilt range so fresh compartments start
-            // at depth 0. Prior/tail depth is preserved.
+            // `clearCompressionDepthRange` resets rebuilt compartments to depth 0 without changing prior or tail depths.
             clearCompressionDepthRange(db, sessionId, snapStart, snapEnd);
             if (deps.preserveInjectionCacheUntilConsumed !== true) {
                 clearInjectionCache(sessionId);
             }
             deps.onCompartmentStatePublished?.(sessionId);
 
-            // v2: recompute raw chunk embeddings for the rebuilt compartments.
-            // Partial recomp deletes + reinserts compartments, so their chunk
-            // embeddings must be regenerated or the rebuilt rows vanish from
-            // ctx_search semantic results. Gated on memory-enabled, distinct from
-            // fact promotion (which recomp skips). Fire-and-forget, best-effort.
+            // Partial recomp bypasses fact promotion, so rebuilt compartments require regenerated chunk embeddings.
             if (deps.memoryEnabled !== false) {
                 const projectIdentity = resolveProjectIdentity(sessionDirectory);
                 const liveCompartments = getCompartments(db, sessionId);
@@ -333,10 +297,7 @@ export async function executePartialRecompInternal(
                     startMessage: c.startMessage,
                     endMessage: c.endMessage,
                 }));
-                // Register the embedding provider FIRST; embedBatchForProject
-                // silently no-ops for unregistered projects, leaving the rebuilt
-                // rows without chunk embeddings. This block is sync, so chain
-                // register→embed as fire-and-forget.
+                // `embedAndStoreCompartmentChunks` requires project registration before embedding.
                 void Promise.resolve(deps.ensureProjectRegistered?.(sessionDirectory, db)).then(
                     () =>
                         embedAndStoreCompartmentChunks(
@@ -349,17 +310,13 @@ export async function executePartialRecompInternal(
             }
 
             const lastEnd = merged[merged.length - 1]?.endMessage ?? snapEnd;
-            // Plan v6 §6: partial recomp is explicit (eager cache clear). Apply
-            // the marker directly here AND CAS-clear any stale pending blob a
-            // prior in-flight incremental publish may have left behind — partial
-            // recomp now owns the boundary up to lastEnd.
+            // Partial recomp CAS-clears a stale pending blob because it owns the boundary through `lastEnd`.
             if (lastEnd > 0) {
                 advanceCompactionMarkerAndClearStalePending(db, sessionId, lastEnd, deps.directory);
             }
             return { compartmentCount: merged.length, lastEndMessage: lastEnd };
         }
 
-        // ── Main loop: rebuild snapStart..snapEnd in historian chunks ──────
         while (offset <= snapEnd) {
             const chunk = readSessionChunk(
                 sessionId,
@@ -376,9 +333,8 @@ export async function executePartialRecompInternal(
                 return `## Magic Recomp — Failed\n\nPartial recomp stopped because the raw chunk could not be represented safely: ${chunkCoverageError}\n\nOriginal state preserved (staging kept for retry).`;
             }
 
-            // v2 bounded reference model: 4 rotating seeds + last-6 recency
-            // (the compartments rebuilt so far in this partial-recomp run provide
-            // continuity). Structural rebuild → no <project-memory> dedup block.
+            // Use four rotating seeds and the six most recent compartments because rebuilt compartments provide continuity.
+            // Structural rebuilds omit the `<project-memory>` dedup block.
             const references = buildReferenceBlocks({
                 sessionId,
                 chunkStart: chunk.startIndex,
@@ -390,8 +346,7 @@ export async function executePartialRecompInternal(
                 sessionReferences: references.sessionReferences,
                 projectMemory: "",
                 inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunk.text}`,
-                // Partial recomp is structural-only — never emit facts (locked
-                // rule: no re-promotion into the curated memory store).
+                // Partial recomp never promotes facts into the curated memory store.
                 memoryEnabled: false,
                 extractionFree: true,
             });
@@ -459,9 +414,7 @@ export async function executePartialRecompInternal(
                 ...candidateCompartments,
                 ...(validatedPass.compartments ?? []),
             ];
-            // Intentional: partial recomp ignores historian's fact output entirely.
-            // Facts are retired as a render source in v2 (= promoted memories), so
-            // staging always carries the empty stagedFacts list.
+            // Partial recomp ignores the historian's fact output.
 
             passCount += 1;
             currentTokenBudget = historianChunkTokens;
@@ -478,7 +431,6 @@ export async function executePartialRecompInternal(
             offset = nextOffset;
         }
 
-        // ── Final promote ──────────────────────────────────────────────────
         const finalResult = promoteFinal();
         if (!finalResult) {
             return `## Magic Recomp — Failed\n\nPartial recomp completed historian passes but the final compartment set failed validation. Original state preserved (staging kept for inspection).`;
@@ -497,16 +449,11 @@ export async function executePartialRecompInternal(
         return `## Magic Recomp — Failed\n\nPartial recomp failed unexpectedly: ${message}\n\nStaging preserved for resume on next attempt.`;
     } finally {
         updateSessionMeta(db, sessionId, { compartmentInProgress: false });
-        // Best-effort cleanup: if staging is somehow left over without a matching
-        // range marker, clear it. Normal success already cleared via promoteFinal.
         const leftoverStaging = getRecompStaging(db, sessionId);
         const leftoverRange = getRecompPartialRange(db, sessionId);
         if (leftoverStaging && leftoverRange) {
-            // Intentional: staging intentionally kept on failure paths above so the
-            // user can re-run with the same args and resume. Do NOT clear here.
+            // Failure paths retain staging for retry.
         } else if (leftoverStaging && !leftoverRange) {
-            // Unexpected: staging without range marker in a partial-recomp context.
-            // Clear to avoid a future full recomp resuming into partial state.
             log(
                 `[magic-context] partial recomp cleanup: clearing orphaned staging without range marker for session ${sessionId}`,
             );

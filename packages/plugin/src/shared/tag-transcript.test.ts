@@ -236,8 +236,6 @@ describe("tagTranscript tool aggregation", () => {
             result = targets.get(tag ?? -1)?.truncate?.();
         }).not.toThrow();
         expect(result).toBe("truncated");
-        // Skeleton-drop now renders the one canonical placeholder, not a
-        // separate "[truncated]" vocabulary.
         expect(toolUse.getText()).toBe(`[dropped \u00a7${tag}\u00a7]`);
     });
 
@@ -467,8 +465,6 @@ describe("tagTranscript tool aggregation", () => {
                         parts: [new TestPart("tool_use", callId, '{"path":"a"}')],
                     },
                     {
-                        // Pi folds the tool result into this following user entry, so
-                        // reuse is decided from the user's stable id.
                         info: { id: "user-fold-target", role: "user" },
                         parts: [new TestPart("tool_result", callId, resultText)],
                     },
@@ -536,13 +532,7 @@ describe("tagTranscript tool aggregation", () => {
 
         const tag = tagger.getToolTag("session-1", "read:image", "assistant-1");
         expect(tag).toBeDefined();
-        // byte_size is OUTPUT-only: the tag reserves at 0 on the tool_use
-        // occurrence (args live in inputByteSize), then updates to the real
-        // result payload size when the tool_result (incl. the non-text image
-        // block) is seen — proving non-text content is byte-accounted.
         expect(tagger.byteSizes.get(tag ?? -1)).toBe(0);
-        // Two tool_result blocks (caption text + image) under one callId; the
-        // tag byte_size climbs to the LARGEST output block (the image > 512B).
         const updatesForTag = db.byteSizeUpdates.filter((u) => u.tagNumber === tag);
         expect(updatesForTag.length).toBeGreaterThanOrEqual(1);
         expect(Math.max(...updatesForTag.map((u) => u.byteSize))).toBeGreaterThan(512);

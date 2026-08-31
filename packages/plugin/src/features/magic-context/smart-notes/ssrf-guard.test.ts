@@ -187,11 +187,11 @@ describe("smart-note SSRF guard", () => {
 });
 
 describe("createPinnedLookup", () => {
-    // Regression: Node 20+ https.request defaults to autoSelectFamily
-    // (Happy-Eyeballs), which calls the lookup hook with { all: true } and
-    // expects the ARRAY callback form. The original hook only ever used the
-    // 3-arg form, so Node's lookupAndConnectMultiple ran results.sort() on
-    // undefined → "results.sort is not a function" broke every network check.
+    // Node 20+ https.request defaults to autoSelectFamily.
+    // Happy-Eyeballs calls the lookup hook with { all: true }.
+    // Node expects the array callback form when all is true.
+    // lookupAndConnectMultiple calls results.sort() on the all:true callback result.
+    // A non-array callback result makes `lookupAndConnectMultiple` throw when it calls `results.sort()`.
     test("returns the ARRAY form when Node asks for all candidates", () => {
         const hook = createPinnedLookup({ address: "93.184.216.34", family: 4 });
         let received: unknown;
@@ -217,7 +217,6 @@ describe("createPinnedLookup", () => {
 
     test("pins to the validated IP without re-querying DNS", () => {
         const hook = createPinnedLookup({ address: "203.0.113.7", family: 4 });
-        // Even though the hostname differs, the hook must return the pinned IP.
         let received: unknown;
         hook("attacker-rebind.test", { all: true }, (_err, addresses) => {
             received = addresses;
@@ -228,10 +227,7 @@ describe("createPinnedLookup", () => {
 
 describe("guarded HTTPS request agent", () => {
     test("does not use a pre-seeded keep-alive global agent", async () => {
-        // Intercept at addRequest: every request routed through an Agent must
-        // enter addRequest, and it exists on every supported runtime — bun's
-        // stable node:https shim leaves globalAgent.createConnection undefined,
-        // so spying on createConnection only works on canary builds.
+        // Every request routed through an Agent calls addRequest.
         const originalAddRequest = https.globalAgent.addRequest;
         const globalAddRequest = mock(originalAddRequest.bind(https.globalAgent));
         https.globalAgent.addRequest = globalAddRequest;

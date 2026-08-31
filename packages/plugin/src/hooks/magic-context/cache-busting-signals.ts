@@ -5,7 +5,7 @@ export interface DeferredConsumptionArgs {
     contextPercentage: number;
     /** True when this pass awaited a run that actually published new compartment state. */
     justAwaitedPublication: boolean;
-    /** True when an active run would block materialization below the emergency bypass. */
+    /** True when an active run blocks materialization unless `justAwaitedPublication` is true. */
     activeRunBlocksMaterialization: boolean;
     forceMaterializationPercentage?: number;
 }

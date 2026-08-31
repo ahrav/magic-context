@@ -1,14 +1,8 @@
 /// <reference types="bun-types" />
 
 /**
- * v3.3.1 Layer C: tag-messages.ts FIFO pairing + composite-key
- * collision handling tests.
  *
- * The bug class this guards: two assistant turns reusing the same
- * OpenCode-generated callID (e.g. `read:32`) used to bind to the same
- * tag, so dropping the first turn's tag silently propagated to the
- * second turn's content. With composite keys keyed by
- * `(ownerMsgId, callId)`, each turn gets its own independent tag.
+ * Composite keys `(ownerMsgId, callId)` prevent reused call IDs from sharing tags across assistant turns.
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
@@ -36,7 +30,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* The cleanup suppresses removal errors, including Windows EBUSY. */
         }
     }
     tempDirs.length = 0;
@@ -112,9 +106,6 @@ function createOpenCodeMessageDb(
 
 describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () => {
     it("two assistant turns reusing the same callId get distinct tags", () => {
-        //#given — two assistant turns, both invoking `read:32`. Pre-fix
-        // these would have shared one tag; dropping the first would
-        // corrupt the second.
         useTempDataHome("collision-cross-turn-");
         const db = openDatabase();
         const tagger = createTagger();
@@ -145,15 +136,12 @@ describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () =>
         //#when
         tagMessages("ses-1", messages, tagger, db);
 
-        //#then — the two turns' tags must be distinct.
         const tag1 = tagger.getToolTag("ses-1", "read:32", "m-asst-1");
         const tag2 = tagger.getToolTag("ses-1", "read:32", "m-asst-2");
         expect(tag1).toBeDefined();
         expect(tag2).toBeDefined();
         expect(tag1).not.toBe(tag2);
 
-        // DB rows reflect the same: two distinct tool tags with
-        // different `tool_owner_message_id` values.
         const tags = getTagsBySession(db, "ses-1").filter((t) => t.type === "tool");
         expect(tags).toHaveLength(2);
         const owners = tags.map((t) => t.toolOwnerMessageId).sort();
@@ -218,8 +206,6 @@ describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () =>
     });
 
     it("FIFO pairing: invocation+result sequences pair correctly across messages", () => {
-        //#given — interleaved invocations and results: A1, A2, R1, R2.
-        // This is the OpenCode-shape FIFO test from plan Test #14.
         useTempDataHome("collision-fifo-");
         const db = openDatabase();
         const tagger = createTagger();
@@ -258,8 +244,8 @@ describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () =>
         //#when
         tagMessages("ses-1", messages, tagger, db);
 
-        //#then — FIFO pairing: R1 pairs with A1, R2 pairs with A2.
-        // Two distinct tags should exist, owned by m-asst-A1 and
+        // FIFO pairing: R1 pairs with A1, R2 pairs with A2.
+        // R1 and R2 must produce distinct tags owned by `m-asst-A1` and `m-asst-A2`, respectively.
         // m-asst-A2 respectively.
         const tagA1 = tagger.getToolTag("ses-1", "grep:1", "m-asst-A1");
         const tagA2 = tagger.getToolTag("ses-1", "grep:1", "m-asst-A2");
@@ -269,11 +255,8 @@ describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () =>
     });
 
     it("result-only window with no OC-DB attached falls back to result message id", () => {
-        //#given — invocation has been compacted away; only the result
-        // shows up in the visible window. Without OC-DB attached, the
-        // nearest-prior fallback fails, so we land on the last-resort
-        // path: owner == result's own message id. This keeps tag
-        // identity stable even in degraded states.
+        // tagMessages uses the result message ID as the owner when neither an invocation nor a database owner exists.
+        // Using the result message ID as owner keeps tag identity stable when owner lookup fails.
         useTempDataHome("collision-result-only-");
         const db = openDatabase();
         const tagger = createTagger();
@@ -294,7 +277,6 @@ describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () =>
         //#when
         tagMessages("ses-1", messages, tagger, db);
 
-        //#then — fallback owner = result message id.
         const tag = tagger.getToolTag("ses-1", "read:99", "m-tool-orphan");
         expect(tag).toBeDefined();
         const tags = getTagsBySession(db, "ses-1").filter((t) => t.type === "tool");
@@ -303,15 +285,7 @@ describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () =>
     });
 
     it("Anthropic-shape observations populate the FIFO queue but tag allocation is Pi's job", () => {
-        //#given — `tag-messages.ts` is the OpenCode-shape pipeline. It
-        // only allocates tags for OpenCode `type='tool'` parts via the
-        // `isToolPartWithOutput` block. Anthropic-shape `tool_use` /
-        // `tool_result` parts are recognized by
-        // `extractToolCallObservation` (so the FIFO queue is populated
-        // and `toolCallIndex` records the occurrences for drop-target
-        // mutation), but the actual tag allocation for those happens
-        // in Pi's `tag-transcript.ts` pipeline, not here. This test
-        // documents that division.
+        // `tagMessages` allocates tags only for OpenCode `type='tool'` output parts; Anthropic parts only populate FIFO and drop targets.
         useTempDataHome("collision-anthropic-shape-");
         const db = openDatabase();
         const tagger = createTagger();
@@ -336,16 +310,11 @@ describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () =>
         //#when
         tagMessages("ses-1", messages, tagger, db);
 
-        //#then — no DB rows allocated by tag-messages.ts for
-        // Anthropic-shape parts; `tag-transcript.ts` is the Anthropic
-        // pipeline (covered by tag-transcript tests).
         expect(getTagsBySession(db, "ses-1")).toHaveLength(0);
     });
 
     it("idempotent across multiple passes — same composite key produces same tag", () => {
-        //#given — cache stability: tagging the same messages twice must
-        // return the same tag numbers. This protects Anthropic prompt-
-        // cache prefix stability for replay passes.
+        // Tagging identical messages twice returns the same tag numbers.
         useTempDataHome("collision-idempotent-");
         const db = openDatabase();
         const tagger = createTagger();
@@ -370,20 +339,12 @@ describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () =>
         //#then
         expect(tagAfterFirstPass).toBeDefined();
         expect(tagAfterSecondPass).toBe(tagAfterFirstPass);
-        // Only one DB row (no duplicates).
         const tags = getTagsBySession(db, "ses-1").filter((t) => t.type === "tool");
         expect(tags).toHaveLength(1);
     });
 
     it("scoped load: invocation whose tool tag is below the floor self-heals to the exact persisted number", () => {
-        //#given — a tool tag persisted at a LOW number (2), and the tagger
-        // loaded with a high scoping floor so that tag is NOT preloaded into
-        // the in-memory map (simulating a straddling tool whose invocation sits
-        // below the live-wire boundary). This is the Oracle #2 case: the
-        // invocation-only observation path used to only try NULL-owner adoption
-        // and would MISS an existing composite-keyed tag, leaving it unbound
-        // (a queued drop could then be mis-detected). The #2 fix adds a
-        // composite DB lookup so it rebinds the EXACT persisted number.
+        // The scoping floor excludes persisted tag 2 from the in-memory map.
         useTempDataHome("scoped-straddle-");
         const db = openDatabase();
         db.prepare(
@@ -392,7 +353,6 @@ describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () =>
 
         const tagger = createTagger();
         tagger.initFromDb("ses-1", db, 100); // floor=100 excludes tag 2
-        // precondition: below-floor tag is NOT preloaded.
         expect(tagger.getToolTag("ses-1", "read:50", "m-asst-old")).toBeUndefined();
 
         const messages: MessageLike[] = [
@@ -405,8 +365,8 @@ describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () =>
         //#when
         tagMessages("ses-1", messages, tagger, db);
 
-        //#then — the #2 fix rebound the EXACT persisted number (byte-identical
-        // §N§), and created no duplicate row.
+        // The invocation rebinds the exact persisted tag number.
+        // Rebinding does not create a duplicate row.
         expect(tagger.getToolTag("ses-1", "read:50", "m-asst-old")).toBe(2);
         const toolTags = getTagsBySession(db, "ses-1").filter((t) => t.type === "tool");
         expect(toolTags).toHaveLength(1);

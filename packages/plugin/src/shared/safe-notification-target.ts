@@ -1,33 +1,20 @@
 import { log } from "./logger";
 
 /**
- * Guard for ignored-message notification posting: only post into sessions
- * that already carry a REAL title.
+ * Post ignored notifications only to sessions with non-default titles.
  *
- * Why: OpenCode's title generation (SessionPrompt.ensureTitle) silently and
- * PERMANENTLY skips a session once it contains more than one non-synthetic
- * user message. Our notification posts (config warnings, conflict warnings,
- * schema-fence warnings, startup announcements) are `ignored: true` — hidden
- * from the LLM — but NOT `synthetic: true`, so the title gate counts them as
- * real user messages. A notification landing in a fresh session before the
- * user's first prompt therefore suppressed that session's title forever
- * (issue #129; only repros where the new session is the project's only one,
- * e.g. fresh non-git directories).
+ * OpenCode permanently skips title generation after a session has more than one non-synthetic user message.
+ * Ignored notifications remain non-synthetic user messages.
+ * Posting an ignored notification before the first prompt can permanently suppress title generation.
  *
- * We deliberately do NOT mark our posts `synthetic: true` instead: the
- * Desktop renderer (UserMessageDisplay) picks the first NON-synthetic text
- * part, so synthetic would blank the message on Desktop — the only surface
- * these posts exist for.
+ * Do not mark notifications `synthetic: true`: Desktop renders only non-synthetic text parts.
  *
- * ensureTitle short-circuits on `!isDefaultTitle(session.title)` before the
- * message count, so posting into an already-titled session can never affect
- * titling. Callers must NOT mark a notification as delivered when this guard
- * returns "skip", so the next startup retries.
+ * Posting to a session with a non-default title cannot affect title generation.
+ * Do not mark skipped notifications as delivered; retry them at the next startup.
  */
 
 /**
- * Mirrors OpenCode's Session.isDefaultTitle (session.ts): a default title is
- * `New session - <ISO>` or `Child session - <ISO>`.
+ * Keep this regex aligned with OpenCode's `Session.isDefaultTitle`.
  */
 const DEFAULT_TITLE_RE =
     /^(New session - |Child session - )\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -37,10 +24,6 @@ export function isDefaultSessionTitle(title: string): boolean {
 }
 
 /**
- * Read a session's current title via the SDK client. Returns null when the
- * title cannot be determined (missing API, transport error, unexpected
- * shape) — callers treat that as "fail open" and post, preserving delivery
- * on clients/tests that don't expose session.get.
  */
 async function readSessionTitle(client: unknown, sessionId: string): Promise<string | null> {
     try {
@@ -49,8 +32,6 @@ async function readSessionTitle(client: unknown, sessionId: string): Promise<str
         };
         if (typeof c.session?.get !== "function") return null;
         const raw = await Promise.resolve(c.session.get({ path: { id: sessionId } }));
-        // SDK response shapes vary across versions: `{ data: { title } }` or
-        // the session object directly.
         const obj = raw as { data?: { title?: unknown }; title?: unknown } | null;
         const title = obj && typeof obj === "object" ? (obj.data?.title ?? obj.title) : undefined;
         return typeof title === "string" ? title : null;
@@ -60,25 +41,19 @@ async function readSessionTitle(client: unknown, sessionId: string): Promise<str
 }
 
 export interface SafeTargetOptions {
-    /** Total title checks before giving up (default 4). */
+    /* */
     attempts?: number;
-    /** Delay between checks in ms (default 15s). */
+    /* */
     delayMs?: number;
 }
 
 /**
- * Resolve whether `sessionId` is safe to receive an ignored-message post.
  *
- * - "safe": the session has a real (non-default) title, or the title is
  *   unreadable (fail-open).
- * - "skip": the session still has OpenCode's default title after all
- *   attempts — posting now could permanently suppress its title generation.
- *   The caller must leave its delivered/seen marker unset so a later
+ * On `"skip"`, posting can permanently suppress the session's title generation.
+ * The caller must leave the delivered/seen marker unset so the next startup retries the notification.
  *   startup retries.
  *
- * The retry window exists for the common startup case: plugin init fires a
- * few seconds after launch, the user prompts shortly after, and the title
- * lands within seconds of that first prompt.
  */
 export async function waitForSafeNotificationTarget(
     client: unknown,

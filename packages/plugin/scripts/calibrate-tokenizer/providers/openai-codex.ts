@@ -1,14 +1,6 @@
 /**
- * OpenAI ChatGPT-Plus (Codex/Responses API) backend.
  *
- * For users authenticated via the ChatGPT Plus OAuth flow, OpenCode routes
- * requests through `https://chatgpt.com/backend-api/codex/responses` instead
- * of `api.openai.com`. The endpoint speaks the Responses API shape, not Chat
- * Completions: `{ model, input, max_output_tokens, instructions? }`. System
- * prompt goes through `instructions`, not as a `system`-role message.
  *
- * Detection: when `auth.openai.type === "oauth"`, use this backend; otherwise
- * fall back to the standard openai-compatible backend.
  */
 
 interface ModelTest {
@@ -35,7 +27,7 @@ interface ResponsesUsage {
     output_tokens?: number;
 }
 
-/** Decode the JWT access token to extract the chatgpt_account_id claim. */
+/* */
 function extractAccountId(accessToken: string): string | undefined {
     try {
         const parts = accessToken.split(".");
@@ -104,7 +96,6 @@ async function streamResponses(
                     usage = u;
                 }
             } catch {
-                // Ignore malformed events
             }
         }
     }
@@ -135,17 +126,9 @@ export async function measureOpenAICodex(
         },
     ];
 
-    // The Codex backend rejects requests without `instructions`. To isolate the
-    // contribution of our real system prompt, we send a tiny placeholder as the
-    // baseline `instructions`, then re-send with the placeholder *plus* our
-    // real system prompt, and take the difference. This way the constant Codex
-    // overhead (mandatory framing) cancels out.
     const PLACEHOLDER = ".";
 
-    // Baseline: minimal user message, placeholder instructions, no tools.
-    // Note: Codex backend rejects `max_output_tokens` for some models (e.g.
-    // gpt-5.2). We omit it entirely; the request still streams and reports
-    // input_tokens before any meaningful output is generated.
+    // `gpt-5.2` rejects `max_output_tokens`; omit the field.
     const baselineBody: Record<string, unknown> = {
         model: test.modelId,
         input: baseInput,
@@ -153,7 +136,6 @@ export async function measureOpenAICodex(
     };
     const baseline = await streamResponses(baselineBody, access, accountId);
 
-    // System: placeholder + our system prompt
     const systemBody: Record<string, unknown> = {
         model: test.modelId,
         input: baseInput,
@@ -161,7 +143,6 @@ export async function measureOpenAICodex(
     };
     const systemTotal = await streamResponses(systemBody, access, accountId);
 
-    // Tools: convert Anthropic tool shape to Responses API tool shape (flat)
     const responsesTools = (toolsArray as Array<Record<string, unknown>>).map((t) => ({
         type: "function",
         name: t.name,
