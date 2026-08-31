@@ -291,6 +291,118 @@ fn staged_entry_modes_distinguish_file_kinds() {
 }
 
 #[test]
+fn assume_valid_entries_are_content_hashed() {
+    use gix::index::entry::Flags;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("trusted.txt", "original\n")],
+        "seed",
+        1,
+    );
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let mut index = fixture.repo.open_index().expect("index opens");
+    let position = index
+        .entry_index_by_path("trusted.txt".into())
+        .expect("entry exists");
+    index.entries_mut()[position].flags |= Flags::ASSUME_VALID;
+    index
+        .write(gix::index::write::Options::default())
+        .expect("index writes");
+
+    let budget = EvalBudget::unbounded();
+    let before = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert!(before
+        .dirty_entries()
+        .iter()
+        .any(|entry| entry.path == "trusted.txt" && entry.status == "assume_valid"));
+
+    // The status walk trusts the flag; the content hash detects changes to
+    // assume-valid files.
+    write_worktree_file(&fixture.repo, "trusted.txt", "edited\n");
+    let after = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(
+        before.dirty_fingerprint(),
+        after.dirty_fingerprint(),
+        "editing an assume-valid file changes the key"
+    );
+}
+
+#[test]
+fn dirty_submodules_fingerprint_their_head() {
+    use gix::index::entry::{Flags, Mode, Stat};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path().join("parent").as_path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    // A nested repository represents a checked-out submodule.
+    let workdir = fixture.repo.workdir().unwrap().to_path_buf();
+    let sub = init_repo(workdir.join("sub").as_path());
+    let sub_one = commit_snapshot(&sub.repo, "main", &[], &[("inner.txt", "one\n")], "one", 1);
+    git_fixtures::set_head(&sub.repo, "main");
+    materialize(&sub.repo, sub_one);
+
+    // Track the gitlink at a stale commit so the scan reports it dirty.
+    let stale = gix::ObjectId::from_hex("dd".repeat(20).as_bytes()).unwrap();
+    let mut index = fixture.repo.open_index().expect("index opens");
+    index.dangerously_push_entry(
+        Stat::default(),
+        stale,
+        Flags::empty(),
+        Mode::COMMIT,
+        "sub".into(),
+    );
+    index.sort_entries();
+    index
+        .write(gix::index::write::Options::default())
+        .expect("index writes");
+    // Submodule status participation requires a `.gitmodules` entry.
+    write_worktree_file(
+        &fixture.repo,
+        ".gitmodules",
+        "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+    );
+
+    let budget = EvalBudget::unbounded();
+    let first = snapshot_checkout(&fixture.root, &budget).unwrap();
+    let gitlink_hash = |snapshot: &mc_store::kernel::applicability::CheckoutSnapshot| {
+        snapshot
+            .dirty_entries()
+            .iter()
+            .find(|entry| entry.path == "sub" && entry.content_hash.starts_with("gitlink:"))
+            .map(|entry| entry.content_hash.clone())
+    };
+    let first_hash = gitlink_hash(&first).expect("dirty gitlink is hashed by submodule HEAD");
+    assert_eq!(first_hash, format!("gitlink:{sub_one}"));
+
+    // Moving the submodule HEAD moves the fingerprint.
+    let sub_two = commit_snapshot(
+        &sub.repo,
+        "main",
+        &[sub_one],
+        &[("inner.txt", "two\n")],
+        "two",
+        2,
+    );
+    materialize(&sub.repo, sub_two);
+    let second = snapshot_checkout(&fixture.root, &budget).unwrap();
+    assert_eq!(
+        gitlink_hash(&second).expect("gitlink stays dirty"),
+        format!("gitlink:{sub_two}")
+    );
+    assert_ne!(first.dirty_fingerprint(), second.dirty_fingerprint());
+}
+
+#[test]
 fn sparse_checkout_state_alters_the_fingerprint() {
     use std::io::Write;
 

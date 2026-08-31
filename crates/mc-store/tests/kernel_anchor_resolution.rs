@@ -790,7 +790,7 @@ fn old_algorithm_capture_still_resolves_through_the_tree_rung() {
 
 #[test]
 fn exhausted_budget_stops_patch_id_computation() {
-    use mc_store::kernel::applicability::BudgetExhaustedInResolve;
+    use mc_store::kernel::applicability::ResolveObstacle;
 
     let dir = tempfile::tempdir().unwrap();
     let fixture = init_repo(dir.path());
@@ -804,7 +804,7 @@ fn exhausted_budget_stops_patch_id_computation() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(
         compute_patch_id(repo, child, &exhausted),
-        Err(BudgetExhaustedInResolve)
+        Err(ResolveObstacle::BudgetExhausted)
     );
 }
 
@@ -872,6 +872,42 @@ fn non_utf8_changed_paths_do_not_block_patch_resolution() {
         ladder.evaluate(&reachable_from(anchored, captures)),
         GitConditionOutcome::Holds,
         "an empty path prefilter falls back to pure patch-ID matching"
+    );
+}
+
+#[test]
+fn unreadable_candidate_blobs_leave_resolution_uncertain() {
+    use mc_store::kernel::applicability::ResolveObstacle;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let budget = EvalBudget::unbounded();
+    let base = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "base", 1);
+    let child = commit_snapshot(
+        repo,
+        "main",
+        &[base],
+        &[("f.txt", "one\n"), ("g.txt", "unique payload\n")],
+        "child",
+        2,
+    );
+
+    // Deleting the loose blob simulates a partial clone with an unfetched
+    // object.
+    let blob = repo.write_blob(b"unique payload\n").unwrap().detach();
+    let hex = blob.to_string();
+    let object_path = repo
+        .git_dir()
+        .join("objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    std::fs::remove_file(&object_path).expect("loose blob removable");
+
+    assert_eq!(
+        compute_patch_id(repo, child, &budget),
+        Err(ResolveObstacle::UnreadableObject),
+        "an unavailable blob is an obstacle, not a missing identity"
     );
 }
 

@@ -186,8 +186,12 @@ impl<'s> ResolutionLadder<'s> {
                 .snapshot
                 .repo()
                 .find_commit(candidate)
-                .map_err(|_| Budget)?;
-            Ok(commit.tree_id().map_err(|_| Budget)?.detach() == tree)
+                .map_err(|_| ResolveObstacle::UnreadableObject)?;
+            Ok(commit
+                .tree_id()
+                .map_err(|_| ResolveObstacle::UnreadableObject)?
+                .detach()
+                == tree)
         }) {
             WindowMatch::None => unmatched,
             decided => decided,
@@ -196,7 +200,7 @@ impl<'s> ResolutionLadder<'s> {
 
     fn match_candidates(
         &self,
-        mut matches: impl FnMut(ObjectId) -> Result<bool, Budget>,
+        mut matches: impl FnMut(ObjectId) -> Result<bool, ResolveObstacle>,
     ) -> WindowMatch {
         let Some(window) = self.candidate_window() else {
             return WindowMatch::Budget;
@@ -213,7 +217,8 @@ impl<'s> ResolutionLadder<'s> {
                     }
                 }
                 Ok(false) => {}
-                Err(Budget) => return WindowMatch::Budget,
+                Err(ResolveObstacle::BudgetExhausted) => return WindowMatch::Budget,
+                Err(ResolveObstacle::UnreadableObject) => return WindowMatch::Unreadable,
             }
         }
         match found {
@@ -244,7 +249,7 @@ impl<'s> ResolutionLadder<'s> {
         Some(window)
     }
 
-    fn cached_patch_id(&self, candidate: ObjectId) -> Result<Option<String>, Budget> {
+    fn cached_patch_id(&self, candidate: ObjectId) -> Result<Option<String>, ResolveObstacle> {
         if let Some(cached) = self.patch_id_cache.borrow().get(&candidate) {
             return Ok(cached.clone());
         }
@@ -317,6 +322,10 @@ impl<'s> ResolutionLadder<'s> {
             return None;
         }
         let bases = repo.merge_bases_many(ancestor, &[descendant]).ok()?;
+        // Do not return a graph result after the budget expires.
+        if self.budget.is_exhausted() {
+            return None;
+        }
         Some(bases.iter().any(|base| base.detach() == ancestor))
     }
 }
@@ -332,8 +341,6 @@ enum WindowMatch {
     Unreadable,
 }
 
-struct Budget;
-
 impl GraphOracle for ResolutionLadder<'_> {
     fn is_ancestor_or_equal(&self, ancestor: &str, descendant: &str) -> Option<bool> {
         let ancestor = ObjectId::from_hex(ancestor.as_bytes()).ok()?;
@@ -348,7 +355,7 @@ pub fn compute_patch_id(
     repo: &gix::Repository,
     commit: ObjectId,
     budget: &EvalBudget,
-) -> Result<Option<String>, BudgetExhaustedInResolve> {
+) -> Result<Option<String>, ResolveObstacle> {
     let Some(changes) = first_parent_blob_changes(repo, commit, budget)? else {
         return Ok(None);
     };
@@ -358,7 +365,7 @@ pub fn compute_patch_id(
     let mut file_hashes = Vec::with_capacity(changes.len());
     for change in &changes {
         if budget.is_exhausted() {
-            return Err(BudgetExhaustedInResolve);
+            return Err(ResolveObstacle::BudgetExhausted);
         }
         let Some(file_hash) = file_change_hash(repo, change, budget)? else {
             return Ok(None);
@@ -385,7 +392,7 @@ fn first_parent_blob_changes(
     repo: &gix::Repository,
     commit: ObjectId,
     budget: &EvalBudget,
-) -> Result<Option<Vec<gix::object::tree::diff::ChangeDetached>>, BudgetExhaustedInResolve> {
+) -> Result<Option<Vec<gix::object::tree::diff::ChangeDetached>>, ResolveObstacle> {
     let Ok(commit) = repo.find_commit(commit) else {
         return Ok(None);
     };
@@ -416,7 +423,7 @@ fn first_parent_blob_changes(
     let mut changes = Vec::new();
     let outcome = platform.for_each_to_obtain_tree(&new_tree, |change| {
         if budget.is_exhausted() {
-            return Err(BudgetExhaustedInResolve);
+            return Err(ResolveObstacle::BudgetExhausted);
         }
         if !change.entry_mode().is_tree() {
             changes.push(change.detach());
@@ -429,34 +436,40 @@ fn first_parent_blob_changes(
         Err(gix::object::tree::diff::for_each::Error::ForEach(_))
         | Err(gix::object::tree::diff::for_each::Error::Diff(
             gix::diff::tree_with_rewrites::Error::ForEach(_),
-        )) => Err(BudgetExhaustedInResolve),
+        )) => Err(ResolveObstacle::BudgetExhausted),
         Err(_) => Ok(None),
     }
 }
 
-/// Typed budget signal raised from inside patch-ID computation.
+/// Typed non-answers raised from inside patch-ID computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BudgetExhaustedInResolve;
+pub enum ResolveObstacle {
+    /// Deadline exceeded or interrupt raised.
+    BudgetExhausted,
+    /// A required object could not be read from the object database.
+    UnreadableObject,
+}
 
-impl std::fmt::Display for BudgetExhaustedInResolve {
+impl std::fmt::Display for ResolveObstacle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("evaluation budget exhausted during anchor resolution")
+        match self {
+            Self::BudgetExhausted => {
+                f.write_str("evaluation budget exhausted during anchor resolution")
+            }
+            Self::UnreadableObject => {
+                f.write_str("required object unreadable during anchor resolution")
+            }
+        }
     }
 }
 
-impl std::error::Error for BudgetExhaustedInResolve {}
-
-impl From<BudgetExhaustedInResolve> for Budget {
-    fn from(_: BudgetExhaustedInResolve) -> Self {
-        Budget
-    }
-}
+impl std::error::Error for ResolveObstacle {}
 
 fn file_change_hash(
     repo: &gix::Repository,
     change: &gix::object::tree::diff::ChangeDetached,
     budget: &EvalBudget,
-) -> Result<Option<[u8; 32]>, BudgetExhaustedInResolve> {
+) -> Result<Option<[u8; 32]>, ResolveObstacle> {
     use gix::object::tree::diff::ChangeDetached as Change;
     use gix::objs::tree::EntryMode;
     type Side = Option<(ObjectId, EntryMode)>;
@@ -518,16 +531,16 @@ fn file_change_hash(
                     hash.update(id.as_slice());
                 } else {
                     if budget.is_exhausted() {
-                        return Err(BudgetExhaustedInResolve);
+                        return Err(ResolveObstacle::BudgetExhausted);
                     }
                     let Ok(header) = repo.find_header(id) else {
-                        return Ok(None);
+                        return Err(ResolveObstacle::UnreadableObject);
                     };
                     if header.size() > MAX_PATCH_BLOB_BYTES {
                         return Ok(None);
                     }
                     let Ok(blob) = repo.find_blob(id) else {
-                        return Ok(None);
+                        return Err(ResolveObstacle::UnreadableObject);
                     };
                     // Fixed-width inner digests keep content boundaries
                     // unambiguous.

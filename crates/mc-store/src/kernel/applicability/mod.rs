@@ -11,6 +11,6 @@ pub use checkout::{
     open_isolated, snapshot_checkout, CheckoutSnapshot, DirtyEntry, EvalBudget, SnapshotError,
 };
 pub use resolve::{
-    capture_anchor_representation, compute_patch_id, BudgetExhaustedInResolve, GitConditionOutcome,
-    ResolutionLadder, CANDIDATE_WINDOW, PATCH_ID_ALGORITHM,
+    capture_anchor_representation, compute_patch_id, GitConditionOutcome, ResolutionLadder,
+    ResolveObstacle, CANDIDATE_WINDOW, PATCH_ID_ALGORITHM,
 };

@@ -70,6 +70,46 @@ impl EvalBudget {
     }
 }
 
+struct DeadlineWatchdog {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DeadlineWatchdog {
+    /// TICK bounds deadline detection and drop-time join latency to 25 ms.
+    const TICK: std::time::Duration = std::time::Duration::from_millis(25);
+
+    fn arm(budget: &EvalBudget) -> Option<Self> {
+        let deadline = budget.deadline?;
+        let interrupt = budget.interrupt_flag();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_signal.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                if now >= deadline {
+                    interrupt.store(true, Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep((deadline - now).min(Self::TICK));
+            }
+        });
+        Some(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for DeadlineWatchdog {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Why a checkout snapshot could not be taken. Every variant renders the
 /// request's objects uncertain; none of them is a store failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +237,9 @@ pub fn snapshot_checkout(
         .map_err(|_| SnapshotError::NoHead)?
         .detach()
         .to_string();
+    // The scan polls between items and a clean checkout emits none;
+    // `DeadlineWatchdog` interrupts the scan at `budget`'s deadline.
+    let _watchdog = DeadlineWatchdog::arm(budget);
     let dirty_entries = scan_dirty_entries(&repo, budget)?;
     // A concurrent checkout, reset, or branch switch can pair old HEAD with
     // new index/worktree state; the scan rejects that inconsistent snapshot.
@@ -210,7 +253,7 @@ pub fn snapshot_checkout(
             "HEAD moved during the status scan".to_string(),
         ));
     }
-    let dirty_fingerprint = fingerprint_entries(&dirty_entries, &sparse_state(&repo));
+    let dirty_fingerprint = fingerprint_entries(&dirty_entries, &sparse_state(&repo, budget)?);
     Ok(CheckoutSnapshot {
         repo,
         identity,
@@ -275,6 +318,23 @@ fn scan_dirty_entries(
         }
     }
     budget.check()?;
+    // The status walk skips stats for assume-valid entries; hash their
+    // worktree content to preserve key correctness.
+    let index = repo
+        .index_or_empty()
+        .map_err(|error| SnapshotError::Scan(error.to_string()))?;
+    for entry in index.entries() {
+        if !entry.flags.contains(gix::index::entry::Flags::ASSUME_VALID) {
+            continue;
+        }
+        budget.check()?;
+        let rela_path = entry.path(&index);
+        entries.insert(DirtyEntry {
+            content_hash: worktree_content_hash(repo, rela_path, budget)?,
+            path: path_string(rela_path),
+            status: "assume_valid",
+        });
+    }
     Ok(entries.into_iter().collect())
 }
 
@@ -431,6 +491,11 @@ fn worktree_content_hash(
         return Ok(format!("symlink:{:x}", hash.finalize()));
     }
     if !file_type.is_file() {
+        if file_type.is_dir() {
+            // A dirty tracked gitlink resolves to a directory; its HEAD is
+            // the content that moved.
+            return Ok(submodule_head_hash(&path));
+        }
         return Ok("not-a-regular-file".to_string());
     }
     let Ok(mut file) = std::fs::File::open(&path) else {
@@ -532,16 +597,44 @@ fn fingerprint_entries(entries: &[DirtyEntry], sparse_state: &[u8]) -> String {
     format!("{:x}", hash.finalize())
 }
 
+fn submodule_head_hash(path: &Path) -> String {
+    let Ok(submodule) = gix::open_opts(path, gix::open::Options::isolated()) else {
+        return "not-a-regular-file".to_string();
+    };
+    match submodule.head_id() {
+        Ok(head) => format!("gitlink:{}", head.detach()),
+        Err(_) => "gitlink-unborn".to_string(),
+    }
+}
+
 /// Sparse-checkout configuration and patterns determine which paths
 /// materialize.
-fn sparse_state(repo: &gix::Repository) -> Vec<u8> {
+fn sparse_state(repo: &gix::Repository, budget: &EvalBudget) -> Result<Vec<u8>, SnapshotError> {
     let config = repo.config_snapshot();
     let mut state = vec![
         config.boolean("core.sparseCheckout").unwrap_or(false) as u8,
         config.boolean("core.sparseCheckoutCone").unwrap_or(false) as u8,
     ];
-    if let Ok(patterns) = std::fs::read(repo.git_dir().join("info/sparse-checkout")) {
-        state.extend_from_slice(&patterns);
+    let patterns_path = repo.git_dir().join("info/sparse-checkout");
+    // Opening a FIFO here can block indefinitely.
+    let is_regular = std::fs::symlink_metadata(&patterns_path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false);
+    if !is_regular {
+        return Ok(state);
     }
-    state
+    let Ok(mut file) = std::fs::File::open(&patterns_path) else {
+        return Ok(state);
+    };
+    let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
+    loop {
+        budget.check()?;
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => state.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    Ok(state)
 }
