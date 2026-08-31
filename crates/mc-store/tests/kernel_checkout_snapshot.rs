@@ -245,6 +245,98 @@ fn conflict_stage_changes_alter_the_fingerprint() {
 }
 
 #[test]
+fn staged_entry_modes_distinguish_file_kinds() {
+    use gix::index::entry::{Flags, Mode, Stat};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let stage = |mode: Mode| {
+        let mut index = fixture.repo.open_index().expect("index opens");
+        index.remove_entries(|_, path, _| path == "link");
+        let blob = fixture
+            .repo
+            .write_blob(b"target")
+            .expect("blob writes")
+            .detach();
+        index.dangerously_push_entry(Stat::default(), blob, Flags::empty(), mode, "link".into());
+        index.sort_entries();
+        index
+            .write(gix::index::write::Options::default())
+            .expect("index writes");
+    };
+    let staged_hash = |snapshot: &mc_store::kernel::applicability::CheckoutSnapshot| {
+        snapshot
+            .dirty_entries()
+            .iter()
+            .find(|entry| entry.path == "link" && entry.status == "staged_added")
+            .expect("staged entry present")
+            .content_hash
+            .clone()
+    };
+
+    let budget = EvalBudget::unbounded();
+    stage(Mode::FILE);
+    let as_file = snapshot_checkout(dir.path(), &budget).unwrap();
+    stage(Mode::SYMLINK);
+    let as_symlink = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(
+        staged_hash(&as_file),
+        staged_hash(&as_symlink),
+        "one blob staged under two file kinds must produce distinct entries"
+    );
+}
+
+#[test]
+fn sparse_checkout_state_alters_the_fingerprint() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("a.txt", "a\n"), ("sub/b.txt", "b\n")],
+        "seed",
+        1,
+    );
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let budget = EvalBudget::unbounded();
+    let dense = snapshot_checkout(dir.path(), &budget).unwrap();
+
+    let git_dir = fixture.repo.git_dir().to_path_buf();
+    let mut config = std::fs::OpenOptions::new()
+        .append(true)
+        .open(git_dir.join("config"))
+        .expect("config opens");
+    writeln!(config, "[core]\n\tsparseCheckout = true").expect("config writes");
+    drop(config);
+    std::fs::create_dir_all(git_dir.join("info")).expect("info dir creatable");
+    std::fs::write(git_dir.join("info/sparse-checkout"), "/a.txt\n").expect("patterns write");
+
+    let sparse = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(
+        dense.dirty_fingerprint(),
+        sparse.dirty_fingerprint(),
+        "enabling sparse checkout changes the key"
+    );
+
+    std::fs::write(git_dir.join("info/sparse-checkout"), "/sub/\n").expect("patterns rewrite");
+    let other_layout = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(
+        sparse.dirty_fingerprint(),
+        other_layout.dirty_fingerprint(),
+        "switching sparse layouts changes the key"
+    );
+}
+
+#[test]
 fn worktree_path_rejects_paths_outside_the_checkout() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = init_repo(dir.path());

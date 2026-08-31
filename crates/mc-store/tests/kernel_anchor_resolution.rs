@@ -747,6 +747,135 @@ fn gitlink_changes_keep_a_patch_identity() {
 }
 
 #[test]
+fn old_algorithm_capture_still_resolves_through_the_tree_rung() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "base", 1);
+    let anchored = commit_snapshot(
+        repo,
+        "topic",
+        &[base],
+        &[("f.txt", "one\n"), ("g.txt", "change\n")],
+        "anchored",
+        2,
+    );
+    let mut captures = captures_for(repo, &[anchored]);
+    captures
+        .get_mut(&anchored.to_string())
+        .unwrap()
+        .patch_id
+        .as_mut()
+        .expect("capture has a patch id")
+        .algorithm = "mc-patch-id-v0".to_string();
+
+    // The reworded commit has an identical tree but a different OID.
+    let reworded = commit_snapshot(
+        repo,
+        "main",
+        &[base],
+        &[("f.txt", "one\n"), ("g.txt", "change\n")],
+        "reworded message",
+        3,
+    );
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, reworded);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    assert_eq!(
+        ladder.evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::Holds,
+        "the tree rung is algorithm-independent"
+    );
+}
+
+#[test]
+fn exhausted_budget_stops_patch_id_computation() {
+    use mc_store::kernel::applicability::BudgetExhaustedInResolve;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "base", 1);
+    let child = commit_snapshot(repo, "main", &[base], &[("f.txt", "two\n")], "child", 2);
+
+    let exhausted = EvalBudget::unbounded();
+    exhausted
+        .interrupt_flag()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        compute_patch_id(repo, child, &exhausted),
+        Err(BudgetExhaustedInResolve)
+    );
+}
+
+#[test]
+fn non_utf8_changed_paths_do_not_block_patch_resolution() {
+    use gix::bstr::BString;
+    use gix::objs::tree::{Entry, EntryKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let budget = EvalBudget::unbounded();
+    let base = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "base", 1);
+
+    // The anchored commit adds only a file with a non-UTF-8 name.
+    let tree_with = |extra_blob: gix::ObjectId, f_content: &str| {
+        let f_blob = repo.write_blob(f_content.as_bytes()).unwrap().detach();
+        let mut entries = vec![
+            Entry {
+                mode: EntryKind::Blob.into(),
+                filename: "f.txt".into(),
+                oid: f_blob,
+            },
+            Entry {
+                mode: EntryKind::Blob.into(),
+                filename: BString::from(&b"bad\xffname"[..]),
+                oid: extra_blob,
+            },
+        ];
+        entries.sort();
+        repo.write_object(&gix::objs::Tree { entries })
+            .unwrap()
+            .detach()
+    };
+    let change_blob = repo.write_blob(b"topic change\n").unwrap().detach();
+    let anchored = commit_tree(
+        repo,
+        "topic",
+        &[base],
+        tree_with(change_blob, "one\n"),
+        "anchored",
+        2,
+    );
+    let capture = capture_anchor_representation(repo, anchored, &budget).expect("capture builds");
+    assert!(
+        capture.changed_paths.is_empty(),
+        "the non-UTF-8 location is dropped rather than stored lossily"
+    );
+    let mut captures = BTreeMap::new();
+    captures.insert(capture.commit_oid.clone(), capture);
+
+    // The rebased equivalent replays the same change onto a moved base.
+    let advanced = commit_snapshot(repo, "main", &[base], &[("f.txt", "two\n")], "advance", 3);
+    let rebased = commit_tree(
+        repo,
+        "main",
+        &[advanced],
+        tree_with(change_blob, "two\n"),
+        "anchored",
+        4,
+    );
+    let snapshot = checkout(&fixture, rebased);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    assert_eq!(
+        ladder.evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::Holds,
+        "an empty path prefilter falls back to pure patch-ID matching"
+    );
+}
+
+#[test]
 fn patch_id_ignores_repository_diff_configuration() {
     use std::io::Write;
 

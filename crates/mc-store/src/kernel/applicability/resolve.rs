@@ -145,15 +145,16 @@ impl<'s> ResolutionLadder<'s> {
         let Some(capture) = capture else {
             return WindowMatch::None;
         };
-        // Patch IDs from a different algorithm cannot establish anchor movement.
-        if capture
+        // A patch ID using a different algorithm cannot establish anchor movement.
+        // The algorithm-independent tree rung can still establish anchor movement.
+        let patch_unreadable = capture
             .patch_id
             .as_ref()
-            .is_some_and(|patch| patch.algorithm != PATCH_ID_ALGORITHM)
-        {
-            return WindowMatch::Unreadable;
-        }
-        let stored_patch_id = capture.patch_id.as_ref();
+            .is_some_and(|patch| patch.algorithm != PATCH_ID_ALGORITHM);
+        let stored_patch_id = capture
+            .patch_id
+            .as_ref()
+            .filter(|patch| patch.algorithm == PATCH_ID_ALGORITHM);
         if let Some(stored) = stored_patch_id {
             match self.match_candidates(|candidate| {
                 if !self.commit_touches_paths(candidate, &capture.changed_paths) {
@@ -167,20 +168,30 @@ impl<'s> ResolutionLadder<'s> {
                 decided => return decided,
             }
         }
+        // With an unreadable patch ID, a tree miss cannot rule out a
+        // patch-rung match.
+        let unmatched = if patch_unreadable {
+            WindowMatch::Unreadable
+        } else {
+            WindowMatch::None
+        };
         let Some(tree_oid) = capture.tree_oid.as_deref() else {
-            return WindowMatch::None;
+            return unmatched;
         };
         let Ok(tree) = ObjectId::from_hex(tree_oid.as_bytes()) else {
-            return WindowMatch::None;
+            return unmatched;
         };
-        self.match_candidates(|candidate| {
+        match self.match_candidates(|candidate| {
             let commit = self
                 .snapshot
                 .repo()
                 .find_commit(candidate)
                 .map_err(|_| Budget)?;
             Ok(commit.tree_id().map_err(|_| Budget)?.detach() == tree)
-        })
+        }) {
+            WindowMatch::None => unmatched,
+            decided => decided,
+        }
     }
 
     fn match_candidates(
@@ -338,7 +349,7 @@ pub fn compute_patch_id(
     commit: ObjectId,
     budget: &EvalBudget,
 ) -> Result<Option<String>, BudgetExhaustedInResolve> {
-    let Some(changes) = first_parent_blob_changes(repo, commit) else {
+    let Some(changes) = first_parent_blob_changes(repo, commit, budget)? else {
         return Ok(None);
     };
     if changes.is_empty() {
@@ -369,37 +380,71 @@ pub fn compute_patch_id(
 /// Tree changes do not identify blobs; excluding them prevents blob lookup
 /// failures.
 ///
-/// Default diff options keep repository `diff.renames` out of the identity.
+/// Default diff options prevent repository `diff.renames` from changing the identity.
 fn first_parent_blob_changes(
     repo: &gix::Repository,
     commit: ObjectId,
-) -> Option<Vec<gix::object::tree::diff::ChangeDetached>> {
-    let commit = repo.find_commit(commit).ok()?;
+    budget: &EvalBudget,
+) -> Result<Option<Vec<gix::object::tree::diff::ChangeDetached>>, BudgetExhaustedInResolve> {
+    let Ok(commit) = repo.find_commit(commit) else {
+        return Ok(None);
+    };
     let parents: Vec<_> = commit.parent_ids().collect();
     if parents.len() > 1 {
-        return None;
+        return Ok(None);
     }
-    let new_tree = commit.tree().ok()?;
-    let old_tree = match parents.first() {
-        Some(parent) => Some(repo.find_commit(parent.detach()).ok()?.tree().ok()?),
-        None => None,
+    let Ok(new_tree) = commit.tree() else {
+        return Ok(None);
     };
-    let changes = repo
-        .diff_tree_to_tree(
-            old_tree.as_ref(),
-            Some(&new_tree),
-            Some(gix::diff::Options::default()),
-        )
-        .ok()?
-        .into_iter()
-        .filter(|change| !change.entry_mode().is_tree())
-        .collect();
-    Some(changes)
+    let old_tree = match parents.first() {
+        Some(parent) => {
+            let Some(tree) = repo
+                .find_commit(parent.detach())
+                .ok()
+                .and_then(|parent| parent.tree().ok())
+            else {
+                return Ok(None);
+            };
+            tree
+        }
+        None => repo.empty_tree(),
+    };
+    let Ok(mut platform) = old_tree.changes() else {
+        return Ok(None);
+    };
+    platform.options(|options| *options = gix::diff::Options::default());
+    let mut changes = Vec::new();
+    let outcome = platform.for_each_to_obtain_tree(&new_tree, |change| {
+        if budget.is_exhausted() {
+            return Err(BudgetExhaustedInResolve);
+        }
+        if !change.entry_mode().is_tree() {
+            changes.push(change.detach());
+        }
+        Ok(gix::object::tree::diff::Action::Continue(()))
+    });
+    match outcome {
+        Ok(_) => Ok(Some(changes)),
+        // The callback's budget signal surfaces wrapped in either layer.
+        Err(gix::object::tree::diff::for_each::Error::ForEach(_))
+        | Err(gix::object::tree::diff::for_each::Error::Diff(
+            gix::diff::tree_with_rewrites::Error::ForEach(_),
+        )) => Err(BudgetExhaustedInResolve),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Typed budget signal raised from inside patch-ID computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetExhaustedInResolve;
+
+impl std::fmt::Display for BudgetExhaustedInResolve {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("evaluation budget exhausted during anchor resolution")
+    }
+}
+
+impl std::error::Error for BudgetExhaustedInResolve {}
 
 impl From<BudgetExhaustedInResolve> for Budget {
     fn from(_: BudgetExhaustedInResolve) -> Self {
@@ -521,10 +566,14 @@ pub fn capture_anchor_representation(
 ) -> Option<AnchorCapture> {
     let commit = repo.find_commit(commit_oid).ok()?;
     let tree_oid = commit.tree_id().ok()?.detach();
-    let changed_paths = first_parent_blob_changes(repo, commit_oid)
+    // A lossily converted path would miss real tree entries in
+    // `commit_touches_paths`, so non-UTF-8 locations are dropped.
+    let changed_paths = first_parent_blob_changes(repo, commit_oid, budget)
+        .ok()?
         .unwrap_or_default()
         .iter()
-        .map(|change| change.location().to_string())
+        .filter_map(|change| std::str::from_utf8(change.location()).ok())
+        .map(str::to_owned)
         .collect();
     let patch_id = compute_patch_id(repo, commit_oid, budget)
         .ok()?

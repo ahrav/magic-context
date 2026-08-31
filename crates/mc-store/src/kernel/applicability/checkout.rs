@@ -210,7 +210,7 @@ pub fn snapshot_checkout(
             "HEAD moved during the status scan".to_string(),
         ));
     }
-    let dirty_fingerprint = fingerprint_entries(&dirty_entries);
+    let dirty_fingerprint = fingerprint_entries(&dirty_entries, &sparse_state(&repo));
     Ok(CheckoutSnapshot {
         repo,
         identity,
@@ -356,19 +356,37 @@ fn path_string(rela_path: &BStr) -> String {
 fn tree_index_entry(change: &gix::diff::index::Change) -> DirtyEntry {
     use gix::diff::index::Change;
     let (status, location, id): (&'static str, _, _) = match change {
-        Change::Addition { location, id, .. } => {
-            ("staged_added", location, id.as_ref().to_string())
-        }
+        Change::Addition {
+            location,
+            id,
+            entry_mode,
+            ..
+        } => (
+            "staged_added",
+            location,
+            format!("{}:{:o}", id.as_ref(), entry_mode.bits()),
+        ),
         Change::Deletion { location, .. } => ("staged_removed", location, "absent".to_string()),
-        Change::Modification { location, id, .. } => {
-            ("staged_modified", location, id.as_ref().to_string())
-        }
+        Change::Modification {
+            location,
+            id,
+            entry_mode,
+            ..
+        } => (
+            "staged_modified",
+            location,
+            format!("{}:{:o}", id.as_ref(), entry_mode.bits()),
+        ),
         Change::Rewrite {
             location,
-            entry_mode: _,
+            entry_mode,
             id,
             ..
-        } => ("staged_rewritten", location, id.as_ref().to_string()),
+        } => (
+            "staged_rewritten",
+            location,
+            format!("{}:{:o}", id.as_ref(), entry_mode.bits()),
+        ),
     };
     DirtyEntry {
         path: path_string(location.as_ref()),
@@ -493,9 +511,13 @@ fn contained_path(workdir: &Path, rela_path: &Path) -> Option<PathBuf> {
     Some(joined)
 }
 
-fn fingerprint_entries(entries: &[DirtyEntry]) -> String {
+fn fingerprint_entries(entries: &[DirtyEntry], sparse_state: &[u8]) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"mc-dirty-fingerprint-v2\0");
+    hash.update(b"mc-dirty-fingerprint-v3\0");
+    // Sparse state distinguishes layouts that materialize different files
+    // from the same HEAD.
+    hash.update((sparse_state.len() as u64).to_le_bytes());
+    hash.update(sparse_state);
     for entry in entries {
         // Length prefixes make adjacent fields unambiguous.
         for field in [
@@ -508,4 +530,18 @@ fn fingerprint_entries(entries: &[DirtyEntry]) -> String {
         }
     }
     format!("{:x}", hash.finalize())
+}
+
+/// Sparse-checkout configuration and patterns determine which paths
+/// materialize.
+fn sparse_state(repo: &gix::Repository) -> Vec<u8> {
+    let config = repo.config_snapshot();
+    let mut state = vec![
+        config.boolean("core.sparseCheckout").unwrap_or(false) as u8,
+        config.boolean("core.sparseCheckoutCone").unwrap_or(false) as u8,
+    ];
+    if let Ok(patterns) = std::fs::read(repo.git_dir().join("info/sparse-checkout")) {
+        state.extend_from_slice(&patterns);
+    }
+    state
 }
