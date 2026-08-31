@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "57f00fbb0f1d3c10a3e9395fa8b7f4f319639dbd6f7c06c281112a231635ae73";
+    "8254f84240f14f712536d9823f4624f166fd8fa6715723f18209d0dbed47ba71";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -445,6 +445,30 @@ fn latest_lineage_decision_sql(alias: &str, commit_bound: &str) -> String {
     )
 }
 
+/// Returns the strictest sensitivity from decisions visible at the snapshot.
+/// An unrecognized class sorts strictest, so it fails closed.
+fn strictest_sensitivity_sql(commit_bound: &str) -> String {
+    let lineage = same_lineage_as_object("h");
+    let normal = Sensitivity::Normal.as_str();
+    let sensitive = Sensitivity::Sensitive.as_str();
+    format!(
+        "(
+    SELECT h.sensitivity_class
+    FROM admission_decisions h
+    WHERE (
+            (h.subject_object_id=o.object_id AND h.commit_seq>=o.created_commit_seq)
+            OR h.subject_object_id IS NULL
+          )
+      AND {lineage}
+      AND h.commit_seq IS NOT NULL
+      {commit_bound}
+    ORDER BY CASE h.sensitivity_class
+                 WHEN '{normal}' THEN 0 WHEN '{sensitive}' THEN 1 ELSE 2 END DESC
+    LIMIT 1
+)"
+    )
+}
+
 // policy-digest:serving-end
 
 // policy-digest:authority-start
@@ -479,6 +503,10 @@ const APPROVAL_OBJECT_PREDICATE: &str = "o.object_kind='decision'
    AND d.decision_kind='adr_accepted'
    AND d.invalidated_commit_seq IS NULL";
 
+/// Accepted decision objects one lineage may hold before a candidate-scoped
+/// decision refuses to write rather than leave an unbounded cascade unproven.
+const MAX_LINEAGE_AUTHORITY_BEARERS: usize = 64;
+
 /// Longest authority chain [`validate_approval`] walks, counted in hops from the
 /// approval to its root. A chain of this many hops holds this many plus one members,
 /// which is what the walk's row count is compared against.
@@ -490,10 +518,6 @@ const APPROVAL_OBJECT_PREDICATE: &str = "o.object_kind='decision'
 ///
 /// A chain is human-authored accepted decisions, so real ones are short; the bound
 /// only stops a pathological graph from making validation unbounded.
-/// Accepted decision objects one lineage may hold before a candidate-scoped
-/// decision refuses to write rather than leave an unbounded cascade unproven.
-const MAX_LINEAGE_AUTHORITY_BEARERS: usize = 64;
-
 const MAX_AUTHORITY_CHAIN_DEPTH: usize = 64;
 
 /// Ties a decision to the registry row's lineage. The enclosing query must bind
@@ -506,17 +530,32 @@ fn same_lineage_as_object(alias: &str) -> String {
     )
 }
 
-/// The field set a decision must satisfy to carry approval authority, bound to
-/// one `admission_decisions` alias.
+/// Derives allowed pairs from `source_allows_taint` to prevent SQL policy drift.
+fn allowed_classification_pairs(alias: &str) -> String {
+    let pairs = SourceClass::ALL
+        .iter()
+        .flat_map(|source| {
+            TaintClass::ALL
+                .iter()
+                .filter(|taint| source_allows_taint(*source, **taint))
+                .map(move |taint| format!("('{}','{}')", source.as_str(), taint.as_str()))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("({alias}.source_class,{alias}.taint_class) IN (VALUES {pairs})")
+}
+
 /// What a lineage decision must look like to leave an object's own standing
 /// intact. It only has to withhold nothing; carrying authority is the own row's
 /// job. `alias` binds it to `admission_decisions`.
 fn non_restrictive_row_fields(alias: &str) -> String {
+    let pairs = allowed_classification_pairs(alias);
     format!(
         "{alias}.disposition='active'
    AND {alias}.visibility='automatic'
    AND {alias}.sensitivity_class='normal'
-   AND {alias}.policy_revision={POLICY_REVISION}"
+   AND {alias}.policy_revision={POLICY_REVISION}
+   AND {pairs}"
     )
 }
 
@@ -1845,7 +1884,6 @@ struct DecidedColumns {
     sensitivity_class: &'static str,
     policy_revision: &'static str,
     approval_object_id: &'static str,
-    outcome: &'static str,
 }
 
 const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
@@ -1858,7 +1896,6 @@ const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
     sensitivity_class: "d_sensitivity_class",
     policy_revision: "d_policy_revision",
     approval_object_id: "d_approval_object_id",
-    outcome: "d_outcome",
 };
 
 const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
@@ -1871,7 +1908,6 @@ const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
     sensitivity_class: "s_sensitivity_class",
     policy_revision: "s_policy_revision",
     approval_object_id: "s_approval_object_id",
-    outcome: "s_outcome",
 };
 
 /// The strongest surface a single stored decision can justify, its sensitivity
@@ -1882,13 +1918,6 @@ fn decided_row(
     columns: &DecidedColumns,
 ) -> rusqlite::Result<Option<(VisibilityRow, Sensitivity, bool)>> {
     let accepted_decision = row.get::<_, bool>("accepted_decision")?;
-    // Only a row that granted an elevation claims to have earned it. A denial or a
-    // demotion carries forward the level its subject already held, and the approval
-    // that justified it lives on the earlier row.
-    let granted = row
-        .get::<_, Option<String>>(columns.outcome)?
-        .and_then(|value| Outcome::try_from(value.as_str()).ok())
-        .is_some_and(|outcome| matches!(outcome, Outcome::Admit | Outcome::Promote));
     let Some(revision) = row.get::<_, Option<i64>>(columns.policy_revision)? else {
         return Ok(None);
     };
@@ -1942,7 +1971,6 @@ fn decided_row(
                             )
                             .rank()
                             || approval.is_some()
-                            || !granted
                     }
                     _ => false,
                 } =>
@@ -1979,6 +2007,7 @@ impl KernelStore {
     ) -> Result<VisibleAsOf, KernelError> {
         let own = latest_own_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
         let lineage = latest_lineage_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
+        let history = strictest_sensitivity_sql("AND h.commit_seq<=:governing_as_of");
         let (tip, rows) = self.read_snapshot(requested, |tx| {
             let mut statement = tx
                 .prepare(&format!(
@@ -1991,7 +2020,6 @@ impl KernelStore {
                             d.policy_revision AS d_policy_revision,
                             d.sensitivity_class AS d_sensitivity_class,
                             d.approval_object_id AS d_approval_object_id,
-                            d.outcome AS d_outcome,
                             s.maturity AS s_maturity,
                             s.effective_maturity AS s_effective_maturity,
                             s.disposition AS s_disposition,s.visibility AS s_visibility,
@@ -1999,15 +2027,16 @@ impl KernelStore {
                             s.policy_revision AS s_policy_revision,
                             s.sensitivity_class AS s_sensitivity_class,
                             s.approval_object_id AS s_approval_object_id,
-                            s.outcome AS s_outcome,
                             EXISTS(
                                 SELECT 1 FROM decisions ad
                                 WHERE ad.object_id=o.object_id
+                                  AND o.object_kind='decision'
                                   AND ad.decision_kind='adr_accepted'
                                   AND ad.created_commit_seq<=:governing_as_of
                                   AND (ad.invalidated_commit_seq IS NULL
                                        OR :governing_as_of<ad.invalidated_commit_seq)
-                            ) AS accepted_decision
+                            ) AS accepted_decision,
+                            {history} AS history_sensitivity_class
                      FROM object_registry o
                      JOIN admission_decisions d
                        ON d.admission_decision_id={own}
@@ -2046,6 +2075,10 @@ impl KernelStore {
                             );
                             sensitivity = sensitivity.restrictive(lineage_sensitivity);
                         }
+                        sensitivity = sensitivity.restrictive(Sensitivity::from_stored(
+                            &row.get::<_, Option<String>>("history_sensitivity_class")?
+                                .unwrap_or_default(),
+                        ));
                         object.sensitivity = object.sensitivity.restrictive(sensitivity);
                         let visibility =
                             surface_visibility(visibility_row_value, surface, object.sensitivity);
