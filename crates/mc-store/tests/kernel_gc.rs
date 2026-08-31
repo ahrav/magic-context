@@ -526,3 +526,172 @@ fn orphan_mtime_grace_and_budget_facts_are_reconciled_from_objects() {
         2
     );
 }
+
+fn seed_pending_unlink(root: &std::path::Path, digest: &str) {
+    let connection = Connection::open(root.join("core.sqlite")).unwrap();
+    let commit_seq: i64 = connection
+        .query_row("SELECT MAX(commit_seq) FROM commit_log", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let reference = format!("objects/{}/{}", &digest[..2], &digest[2..]);
+    connection
+        .execute(
+            "INSERT INTO artifact_purge_tombstones(artifact_digest,artifact_reference,operator_id,reason,purged_at,commit_seq)
+             VALUES (?1,?2,'operator','secret',1,?3)",
+            params![digest, reference, commit_seq],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO artifact_pending_unlinks(artifact_digest,artifact_reference,created_at)
+             VALUES (?1,?2,1)",
+            params![digest, reference],
+        )
+        .unwrap();
+}
+
+/// A directory where the object file belongs makes `unlink_artifact` fail for that
+/// digest alone.
+fn poison_object_path(root: &std::path::Path, digest: &str) {
+    let path = object_path(root, digest);
+    fs::create_dir_all(&path).unwrap();
+    fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn one_unreclaimable_candidate_does_not_starve_the_rest() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open_with_artifact_cap_for_test(root.path(), 1024).unwrap();
+    seed_domain(&store);
+    let poison_digest = "a".repeat(64);
+    let orphan_digest = "b".repeat(64);
+    poison_object_path(root.path(), &poison_digest);
+    seed_pending_unlink(root.path(), &poison_digest);
+    write_object(root.path(), &orphan_digest, b"orphan");
+    File::options()
+        .write(true)
+        .open(object_path(root.path(), &orphan_digest))
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
+        .unwrap();
+
+    let result = store.run_staging_maintenance(2 * HOUR_MS).unwrap();
+
+    assert_eq!(result.artifact_gc.failed_candidates, 1);
+    assert_eq!(result.artifact_gc.reclaimed_objects, 1);
+    assert_eq!(result.artifact_gc.reclaimed_bytes, 6);
+    assert!(!object_path(root.path(), &orphan_digest).exists());
+    assert!(object_path(root.path(), &poison_digest).exists());
+}
+
+#[test]
+fn an_unreclaimable_candidate_does_not_block_store_open() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let poison_digest = "c".repeat(64);
+    poison_object_path(root.path(), &poison_digest);
+    seed_pending_unlink(root.path(), &poison_digest);
+    drop(store);
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(
+        reopened
+            .run_staging_maintenance(HOUR_MS)
+            .unwrap()
+            .artifact_gc
+            .failed_candidates,
+        1
+    );
+}
+
+#[test]
+fn reclaimed_digests_stop_being_gc_candidates() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(request("settled", b"settled"))
+        .unwrap();
+    invalidate(root.path(), &handle.evidence_id, 0);
+
+    assert_eq!(
+        store
+            .run_staging_maintenance(15 * DAY_MS)
+            .unwrap()
+            .artifact_gc
+            .reclaimed_objects,
+        1
+    );
+    assert!(!object_path(root.path(), &handle.digest).exists());
+
+    // A digest whose bytes and control rows are already gone must not re-enter the
+    // write path on every later pass.
+    let reservations_before: i64 = Connection::open(root.path().join("core.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_ingestion_reservations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let commits_before: i64 = Connection::open(root.path().join("core.sqlite"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM commit_log", [], |row| row.get(0))
+        .unwrap();
+
+    for pass in 1..=3 {
+        let result = store.run_staging_maintenance(15 * DAY_MS + pass).unwrap();
+        assert_eq!(result.artifact_gc.reclaimed_objects, 0);
+        assert_eq!(result.artifact_gc.failed_candidates, 0);
+    }
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_ingestion_reservations",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        reservations_before
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM commit_log", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        commits_before
+    );
+}
+
+#[test]
+fn resumed_purge_sweeps_digest_temps() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = store.ingest_artifact(request("temps", b"temps")).unwrap();
+    seed_pending_unlink(root.path(), &handle.digest);
+    let leftover = root
+        .path()
+        .join("artifacts/tmp")
+        .join(format!(".artifact-{}-7.tmp", handle.digest));
+    fs::write(&leftover, b"temps").unwrap();
+
+    assert_eq!(
+        store
+            .run_staging_maintenance(HOUR_MS)
+            .unwrap()
+            .artifact_gc
+            .reclaimed_objects,
+        1
+    );
+
+    assert!(!object_path(root.path(), &handle.digest).exists());
+    assert!(
+        !leftover.exists(),
+        "resumed purge left plaintext under artifacts/tmp"
+    );
+}

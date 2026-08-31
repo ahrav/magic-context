@@ -633,24 +633,8 @@ fn verify_object(path: &std::path::Path, digest: &str) -> Result<(), ArtifactErr
 }
 
 fn current_usage(artifacts_path: &std::path::Path) -> Result<u64, ArtifactError> {
-    regular_file_bytes(&artifacts_path.join("objects"))
-}
-
-fn regular_file_bytes(directory: &std::path::Path) -> Result<u64, ArtifactError> {
-    let mut bytes = 0_u64;
-    let entries = fs::read_dir(directory)
-        .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-    for entry in entries {
-        let entry = entry.map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-        if metadata.file_type().is_file() {
-            bytes = bytes.saturating_add(metadata.len());
-        } else if metadata.file_type().is_dir() {
-            bytes = bytes.saturating_add(regular_file_bytes(&entry.path())?);
-        }
-    }
-    Ok(bytes)
+    super::gc::object_usage(artifacts_path)
+        .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))
 }
 
 fn detection_metadata(detections: &[Detection]) -> Result<Vec<u8>, ArtifactError> {

@@ -310,7 +310,7 @@ impl KernelStore {
             affected_object_ids: state.all_object_ids,
             commit_seq: receipt.commit_seq,
             barrier_id: state.barrier_id,
-            already_applied: false,
+            already_applied: receipt.replayed,
         };
         if kind == ArtifactDeletionKind::Purge {
             if fault == Some(ArtifactDeletionFault::AfterCommit) {
@@ -342,6 +342,15 @@ impl KernelStore {
         writer: &mut rusqlite::Connection,
         digest: &str,
     ) -> Result<(), ArtifactError> {
+        // Unlinking is irreversible, so the fence is verified first.
+        let fence = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::PurgeUnlinkPending))?;
+        check_fence(&fence, self.lease_epoch())
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::PurgeUnlinkPending))?;
+        fence
+            .commit()
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::PurgeUnlinkPending))?;
         self.unlink_purged_artifact(digest)?;
         self.unlink_digest_temps(digest)?;
         let tx = writer
@@ -377,33 +386,23 @@ impl KernelStore {
     }
 
     fn unlink_digest_temps(&self, digest: &str) -> Result<(), ArtifactError> {
+        self.sweep_digest_temps(digest).map_err(|error| {
+            self.map_cas_storage_error(error, ArtifactErrorKind::PurgeUnlinkPending)
+        })
+    }
+
+    pub(super) fn sweep_digest_temps(&self, digest: &str) -> Result<(), StorageError> {
         let tmp_path = self.artifacts_path.join("tmp");
-        let tmp = File::open(&tmp_path).map_err(|error| {
-            self.map_cas_storage_error(classify_io(error), ArtifactErrorKind::PurgeUnlinkPending)
-        })?;
+        let tmp = File::open(&tmp_path).map_err(classify_io)?;
         let prefix = format!(".artifact-{digest}-");
-        for entry in fs::read_dir(&tmp_path).map_err(|error| {
-            self.map_cas_storage_error(classify_io(error), ArtifactErrorKind::PurgeUnlinkPending)
-        })? {
-            let entry = entry.map_err(|error| {
-                self.map_cas_storage_error(
-                    classify_io(error),
-                    ArtifactErrorKind::PurgeUnlinkPending,
-                )
-            })?;
+        for entry in fs::read_dir(&tmp_path).map_err(classify_io)? {
+            let entry = entry.map_err(classify_io)?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let file_type = entry.file_type().map_err(|error| {
-                self.map_cas_storage_error(
-                    classify_io(error),
-                    ArtifactErrorKind::PurgeUnlinkPending,
-                )
-            })?;
+            let file_type = entry.file_type().map_err(classify_io)?;
             if name.starts_with(&prefix) && (file_type.is_file() || file_type.is_symlink()) {
-                durable_unlink(&tmp, &name).map_err(|error| {
-                    self.map_cas_storage_error(error, ArtifactErrorKind::PurgeUnlinkPending)
-                })?;
+                durable_unlink(&tmp, &name)?;
             }
         }
         Ok(())
@@ -413,8 +412,11 @@ impl KernelStore {
         if barrier_id.trim().is_empty() {
             return Err(KernelError::InvalidInput);
         }
-        let reader = self.lock_reader()?;
-        let (digest, deletion_commit_seq, completed_at) = reader
+        let mut reader = self.lock_reader()?;
+        let tx = reader
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|_| KernelError::Io)?;
+        let (digest, deletion_commit_seq, completed_at) = tx
             .query_row(
                 "SELECT artifact_digest,delete_commit_seq,completed_at
                  FROM deletion_backfill_barriers WHERE barrier_id=?1",
@@ -430,14 +432,20 @@ impl KernelStore {
             .optional()
             .map_err(|_| KernelError::Io)?
             .ok_or(KernelError::NotFound)?;
-        let mut statement = reader
+        let mut statement = tx
             .prepare(
                 "SELECT bc.consumer_id,bc.required_checkpoint_commit_seq,
-                        c.checkpoint_commit_seq,a.operator_id,a.abandoned_at
+                        c.checkpoint_commit_seq,
+                        (SELECT a.operator_id FROM consumer_abandonments a
+                          WHERE a.consumer_id=bc.consumer_id AND a.barrier_id=bc.barrier_id
+                            AND a.commit_seq>=bc.required_checkpoint_commit_seq
+                          ORDER BY a.abandoned_at LIMIT 1),
+                        (SELECT a.abandoned_at FROM consumer_abandonments a
+                          WHERE a.consumer_id=bc.consumer_id AND a.barrier_id=bc.barrier_id
+                            AND a.commit_seq>=bc.required_checkpoint_commit_seq
+                          ORDER BY a.abandoned_at LIMIT 1)
                  FROM deletion_backfill_barrier_consumers bc
                  LEFT JOIN outbox_consumers c USING(consumer_id)
-                 LEFT JOIN consumer_abandonments a
-                   ON a.consumer_id=bc.consumer_id AND a.barrier_id=bc.barrier_id
                  WHERE bc.barrier_id=?1 ORDER BY bc.consumer_id",
             )
             .map_err(|_| KernelError::Io)?;
@@ -459,18 +467,15 @@ impl KernelStore {
             .map_err(|_| KernelError::Io)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| KernelError::Io)?;
-        let cleared = if consumers.is_empty() {
-            completed_at.is_some()
-        } else {
-            consumers.iter().all(|consumer| consumer.satisfied)
-        };
+        drop(statement);
+        tx.commit().map_err(|_| KernelError::Io)?;
         Ok(DeletionBarrierStatus {
             barrier_id: barrier_id.to_string(),
             digest,
             deletion_commit_seq,
             completed_at,
             consumers,
-            cleared,
+            cleared: completed_at.is_some(),
         })
     }
 }
@@ -511,7 +516,7 @@ fn load_artifact_state(
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
         ArtifactDeletionIdentity::EvidenceId(evidence_id) if !evidence_id.trim().is_empty() => {
-            connection
+            let stored: String = connection
                 .query_row(
                     "SELECT artifact_digest FROM evidence_meta WHERE evidence_id=?1",
                     [evidence_id],
@@ -519,7 +524,11 @@ fn load_artifact_state(
                 )
                 .optional()
                 .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?
-                .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable))?
+                .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable))?;
+            if !is_artifact_digest(&stored) {
+                return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
+            }
+            stored
         }
         ArtifactDeletionIdentity::EvidenceId(_) => {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));

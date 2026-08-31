@@ -5,7 +5,7 @@ use std::time::UNIX_EPOCH;
 use rusqlite::{params, TransactionBehavior};
 
 use super::is_artifact_digest;
-use crate::kernel::durable_fs::{durable_unlink, open_or_create_secure_directory, StorageError};
+use crate::kernel::durable_fs::{durable_unlink, open_secure_directory, StorageError};
 use crate::kernel::envelope::check_fence;
 use crate::kernel::{KernelError, KernelStore};
 
@@ -17,6 +17,7 @@ const ORPHAN_GRACE_MS: i64 = HOUR_MS;
 pub struct ArtifactGcResult {
     pub reclaimed_objects: usize,
     pub reclaimed_bytes: u64,
+    pub failed_candidates: usize,
 }
 
 #[cfg(feature = "test-support")]
@@ -29,12 +30,14 @@ pub enum ArtifactGcFault {
 struct Candidate {
     digest: String,
     modified_at: Option<i64>,
+    has_object: bool,
+    has_reclaim_state: bool,
 }
 
 impl KernelStore {
     pub(in crate::kernel) fn run_artifact_gc(
         &self,
-        now: impl FnMut() -> i64,
+        now: i64,
         hook: Option<&mut dyn FnMut()>,
         fault_after_reclaiming: bool,
     ) -> Result<ArtifactGcResult, KernelError> {
@@ -42,97 +45,119 @@ impl KernelStore {
         if let Some(hook) = hook {
             hook();
         }
-        let mut now = now;
         let mut result = ArtifactGcResult::default();
         for candidate in candidates {
-            let mut writer = self.lock_writer()?;
-            let tx = writer
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|_| KernelError::Io)?;
-            check_fence(&tx, self.lease_epoch())?;
-            let observed_now = now();
-            if observed_now < 0 {
-                return Err(KernelError::InvalidInput);
-            }
-            if !prepare_reclaim(&tx, &candidate, observed_now, self.lease_epoch())? {
-                tx.commit().map_err(|_| KernelError::Io)?;
+            if !candidate.has_object && !candidate.has_reclaim_state {
                 continue;
             }
-            tx.commit().map_err(|_| KernelError::Io)?;
-            drop(writer);
-
-            if fault_after_reclaiming {
-                return Err(KernelError::Fault);
-            }
-            let (removed, bytes) = self.unlink_artifact(&candidate.digest)?;
-
-            let mut writer = self.lock_writer()?;
-            let tx = writer
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|_| KernelError::Io)?;
-            check_fence(&tx, self.lease_epoch())?;
-            tx.execute(
-                "DELETE FROM artifact_ingestion_reservations
-                 WHERE artifact_digest=?1 AND state='Reclaiming'",
-                [&candidate.digest],
-            )
-            .map_err(|_| KernelError::Io)?;
-            tx.execute(
-                "DELETE FROM artifact_pending_unlinks WHERE artifact_digest=?1",
-                [&candidate.digest],
-            )
-            .map_err(|_| KernelError::Io)?;
-            tx.execute(
-                "DELETE FROM capture_pin_refs
-                 WHERE released_at IS NOT NULL AND evidence_id IN (
-                     SELECT evidence_id FROM evidence_meta WHERE artifact_digest=?1
-                 )",
-                [&candidate.digest],
-            )
-            .map_err(|_| KernelError::Io)?;
-            tx.commit().map_err(|_| KernelError::Io)?;
-            if removed {
-                result.reclaimed_objects += 1;
-                result.reclaimed_bytes = result.reclaimed_bytes.saturating_add(bytes);
+            match self.reclaim_candidate(&candidate, now, fault_after_reclaiming) {
+                Ok(Some(bytes)) => {
+                    result.reclaimed_objects += 1;
+                    result.reclaimed_bytes = result.reclaimed_bytes.saturating_add(bytes);
+                }
+                Ok(None) => {}
+                Err(error @ (KernelError::FenceLost | KernelError::Fault)) => return Err(error),
+                Err(_) => result.failed_candidates += 1,
             }
         }
         Ok(result)
+    }
+
+    fn reclaim_candidate(
+        &self,
+        candidate: &Candidate,
+        now: i64,
+        fault_after_reclaiming: bool,
+    ) -> Result<Option<u64>, KernelError> {
+        let mut writer = self.lock_writer()?;
+        let tx = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| KernelError::Io)?;
+        check_fence(&tx, self.lease_epoch())?;
+        if !prepare_reclaim(&tx, candidate, now, self.lease_epoch())? {
+            tx.commit().map_err(|_| KernelError::Io)?;
+            return Ok(None);
+        }
+        tx.commit().map_err(|_| KernelError::Io)?;
+        drop(writer);
+
+        if fault_after_reclaiming {
+            return Err(KernelError::Fault);
+        }
+        let (removed, bytes) = self.unlink_artifact(&candidate.digest)?;
+        self.sweep_digest_temps(&candidate.digest)
+            .map_err(|error| self.map_gc_storage_error(error))?;
+
+        let mut writer = self.lock_writer()?;
+        let tx = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| KernelError::Io)?;
+        check_fence(&tx, self.lease_epoch())?;
+        tx.execute(
+            "DELETE FROM artifact_ingestion_reservations
+             WHERE artifact_digest=?1 AND state='Reclaiming'",
+            [&candidate.digest],
+        )
+        .map_err(|_| KernelError::Io)?;
+        tx.execute(
+            "DELETE FROM artifact_pending_unlinks WHERE artifact_digest=?1",
+            [&candidate.digest],
+        )
+        .map_err(|_| KernelError::Io)?;
+        tx.execute(
+            "DELETE FROM capture_pin_refs
+             WHERE released_at IS NOT NULL AND evidence_id IN (
+                 SELECT evidence_id FROM evidence_meta WHERE artifact_digest=?1
+             )",
+            [&candidate.digest],
+        )
+        .map_err(|_| KernelError::Io)?;
+        tx.commit().map_err(|_| KernelError::Io)?;
+        Ok(removed.then_some(bytes))
     }
 
     fn snapshot_gc_candidates(&self) -> Result<Vec<Candidate>, KernelError> {
         let reader = self.lock_reader()?;
         let mut statement = reader
             .prepare(
-                "SELECT artifact_digest FROM evidence_meta
-                 UNION SELECT artifact_digest FROM artifact_ingestion_reservations
-                 UNION SELECT artifact_digest FROM artifact_pending_unlinks",
+                "SELECT artifact_digest,0 FROM evidence_meta
+                 UNION ALL SELECT artifact_digest,1 FROM artifact_ingestion_reservations
+                           WHERE state='Reclaiming'
+                 UNION ALL SELECT artifact_digest,1 FROM artifact_pending_unlinks",
             )
             .map_err(|_| KernelError::Io)?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? == 1))
+            })
             .map_err(|_| KernelError::Io)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| KernelError::Io)?;
         drop(statement);
         drop(reader);
 
-        let mut candidates = rows
-            .into_iter()
-            .filter(|digest| is_artifact_digest(digest))
-            .map(|digest| {
-                (
-                    digest.clone(),
-                    Candidate {
-                        digest,
-                        modified_at: None,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let mut candidates: BTreeMap<String, Candidate> = BTreeMap::new();
+        for (digest, has_reclaim_state) in rows {
+            if !is_artifact_digest(&digest) {
+                continue;
+            }
+            candidates
+                .entry(digest.clone())
+                .and_modify(|candidate| candidate.has_reclaim_state |= has_reclaim_state)
+                .or_insert(Candidate {
+                    digest,
+                    modified_at: None,
+                    has_object: false,
+                    has_reclaim_state,
+                });
+        }
         for object in scan_objects(&self.artifacts_path.join("objects"))? {
             candidates
                 .entry(object.digest.clone())
-                .and_modify(|candidate| candidate.modified_at = object.modified_at)
+                .and_modify(|candidate| {
+                    candidate.modified_at = object.modified_at;
+                    candidate.has_object = true;
+                })
                 .or_insert(object);
         }
         Ok(candidates.into_values().collect())
@@ -142,14 +167,19 @@ impl KernelStore {
         let path = self.artifact_object_path(digest);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_file() => metadata,
-            Ok(_) => return self.fail_gc_storage(),
+            Ok(_) => return Err(self.latch_gc_failure()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((false, 0)),
-            Err(_) => return self.fail_gc_storage(),
+            Err(_) => return Err(self.latch_gc_failure()),
         };
         let objects =
             File::open(self.artifacts_path.join("objects")).map_err(|_| self.latch_gc_failure())?;
-        let shard = open_or_create_secure_directory(&objects, &digest[..2])
-            .map_err(|error| self.map_gc_storage_error(error))?;
+        let shard = match open_secure_directory(&objects, &digest[..2]) {
+            Ok(shard) => shard,
+            Err(StorageError::Other(source)) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((false, 0))
+            }
+            Err(error) => return Err(self.map_gc_storage_error(error)),
+        };
         durable_unlink(&shard, &digest[2..]).map_err(|error| self.map_gc_storage_error(error))?;
         Ok((true, metadata.len()))
     }
@@ -164,10 +194,6 @@ impl KernelStore {
     fn latch_gc_failure(&self) -> KernelError {
         self.latch_cas_failure();
         KernelError::Io
-    }
-
-    fn fail_gc_storage<T>(&self) -> Result<T, KernelError> {
-        Err(self.latch_gc_failure())
     }
 }
 
@@ -307,17 +333,24 @@ fn elapsed(now: i64, since: i64, duration: i64) -> bool {
 fn scan_objects(root: &std::path::Path) -> Result<Vec<Candidate>, KernelError> {
     let mut objects = Vec::new();
     for shard in fs::read_dir(root).map_err(|_| KernelError::Io)? {
-        let shard = shard.map_err(|_| KernelError::Io)?;
-        let shard_type = shard.file_type().map_err(|_| KernelError::Io)?;
+        let Ok(shard) = shard else { continue };
+        let Ok(shard_type) = shard.file_type() else {
+            continue;
+        };
         let Some(prefix) = shard.file_name().to_str().map(str::to_owned) else {
             continue;
         };
         if !shard_type.is_dir() || prefix.len() != 2 {
             continue;
         }
-        for entry in fs::read_dir(shard.path()).map_err(|_| KernelError::Io)? {
-            let entry = entry.map_err(|_| KernelError::Io)?;
-            let metadata = entry.metadata().map_err(|_| KernelError::Io)?;
+        let Ok(entries) = fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
             let Some(suffix) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
@@ -331,6 +364,8 @@ fn scan_objects(root: &std::path::Path) -> Result<Vec<Candidate>, KernelError> {
                 objects.push(Candidate {
                     digest,
                     modified_at,
+                    has_object: true,
+                    has_reclaim_state: false,
                 });
             }
         }
@@ -344,9 +379,14 @@ pub(in crate::kernel) fn object_usage(
     let mut bytes = 0_u64;
     let mut pending = vec![artifacts_path.join("objects")];
     while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(directory).map_err(|_| KernelError::Io)? {
-            let entry = entry.map_err(|_| KernelError::Io)?;
-            let metadata = fs::symlink_metadata(entry.path()).map_err(|_| KernelError::Io)?;
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
             if metadata.file_type().is_file() {
                 bytes = bytes.saturating_add(metadata.len());
             } else if metadata.file_type().is_dir() {

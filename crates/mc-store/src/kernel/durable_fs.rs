@@ -309,7 +309,9 @@ pub(super) fn durable_unlink(directory: &File, name: &str) -> Result<(), Storage
     validate_name(name)?;
     match rfs::unlinkat(directory, name, AtFlags::empty()) {
         Ok(()) => sync_directory(directory),
-        Err(rustix::io::Errno::NOENT) => Ok(()),
+        // A retry after `unlinkat` succeeded but `sync_directory` failed observes NOENT,
+        // and the directory entry removal is still unsynced at that point.
+        Err(rustix::io::Errno::NOENT) => sync_directory(directory),
         Err(error) => Err(classify_errno(error)),
     }
 }

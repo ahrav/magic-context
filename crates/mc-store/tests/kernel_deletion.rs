@@ -771,3 +771,167 @@ fn purge_reissue_after_simulated_restore_recreates_control_facts_and_effects() {
         1
     );
 }
+
+#[test]
+fn abandoning_a_consumer_clears_every_barrier_it_blocks() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let first = ingest(&store, "multi-one", b"multi-one");
+    let second = ingest(&store, "multi-two", b"multi-two");
+    store
+        .commit(intent("register-multi"), |envelope| {
+            envelope.register_outbox_consumer("search", 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+    let first_deletion = store
+        .delete_artifact(delete_request(
+            "multi-one",
+            &first.digest,
+            ArtifactDeletionKind::Delete,
+        ))
+        .unwrap();
+    let second_deletion = store
+        .delete_artifact(delete_request(
+            "multi-two",
+            &second.digest,
+            ArtifactDeletionKind::Delete,
+        ))
+        .unwrap();
+    for barrier in [&first_deletion.barrier_id, &second_deletion.barrier_id] {
+        assert!(!store.deletion_barrier(barrier).unwrap().cleared);
+    }
+
+    store
+        .commit(intent("abandon-multi"), |envelope| {
+            envelope.abandon_outbox_consumer(
+                "search",
+                ConsumerAbandonment {
+                    operator_id: "operator-1".to_string(),
+                    reason: "retired".to_string(),
+                    abandoned_at: 20,
+                    barrier_id: None,
+                },
+            )?;
+            Ok("abandoned".to_string())
+        })
+        .unwrap();
+
+    for barrier in [&first_deletion.barrier_id, &second_deletion.barrier_id] {
+        let status = store.deletion_barrier(barrier).unwrap();
+        assert!(status.cleared, "barrier {barrier} stayed blocked");
+        assert!(status.completed_at.is_some());
+        assert_eq!(status.consumers.len(), 1);
+        assert_eq!(
+            status.consumers[0].abandoned_by.as_deref(),
+            Some("operator-1")
+        );
+    }
+}
+
+#[test]
+fn deregistering_a_caught_up_consumer_clears_its_barriers() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "deregister", b"deregister");
+    store
+        .commit(intent("register-deregister"), |envelope| {
+            envelope.register_outbox_consumer("search", 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+    let deletion = store
+        .delete_artifact(delete_request(
+            "deregister",
+            &handle.digest,
+            ArtifactDeletionKind::Delete,
+        ))
+        .unwrap();
+    assert!(
+        !store
+            .deletion_barrier(&deletion.barrier_id)
+            .unwrap()
+            .cleared
+    );
+    store
+        .acknowledge_outbox("search", deletion.commit_seq, 5)
+        .unwrap();
+    store
+        .commit(intent("deregister-search"), |envelope| {
+            envelope.deregister_outbox_consumer("search", 6)?;
+            Ok("deregistered".to_string())
+        })
+        .unwrap();
+
+    let status = store.deletion_barrier(&deletion.barrier_id).unwrap();
+    assert!(status.cleared);
+    assert!(status.completed_at.is_some());
+}
+
+#[test]
+fn abandonment_does_not_satisfy_a_later_deletion_of_the_same_digest() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "generation", b"generation");
+    store
+        .commit(intent("register-generation"), |envelope| {
+            envelope.register_outbox_consumer("search", 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+    let first = store
+        .delete_artifact(delete_request(
+            "generation-one",
+            &handle.digest,
+            ArtifactDeletionKind::Delete,
+        ))
+        .unwrap();
+    store
+        .commit(intent("abandon-generation"), |envelope| {
+            envelope.abandon_outbox_consumer(
+                "search",
+                ConsumerAbandonment {
+                    operator_id: "operator-1".to_string(),
+                    reason: "retired".to_string(),
+                    abandoned_at: 9,
+                    barrier_id: Some(first.barrier_id.clone()),
+                },
+            )?;
+            Ok("abandoned".to_string())
+        })
+        .unwrap();
+    assert!(store.deletion_barrier(&first.barrier_id).unwrap().cleared);
+
+    let readmitted = ingest(&store, "generation-again", b"generation");
+    assert_eq!(readmitted.digest, handle.digest);
+    store
+        .commit(intent("register-generation-again"), |envelope| {
+            envelope.register_outbox_consumer("search", 10)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+    let second = store
+        .delete_artifact(delete_request(
+            "generation-two",
+            &handle.digest,
+            ArtifactDeletionKind::Delete,
+        ))
+        .unwrap();
+
+    let status = store.deletion_barrier(&second.barrier_id).unwrap();
+    assert!(
+        !status.cleared,
+        "an abandonment recorded for an earlier deletion cleared a later one"
+    );
+    assert_eq!(status.consumers.len(), 1);
+    assert_eq!(status.consumers[0].abandoned_by, None);
+    assert!(!status.consumers[0].satisfied);
+
+    store
+        .acknowledge_outbox("search", second.commit_seq, 12)
+        .unwrap();
+    assert!(store.deletion_barrier(&second.barrier_id).unwrap().cleared);
+}

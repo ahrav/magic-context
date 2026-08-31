@@ -77,6 +77,9 @@ impl Envelope<'_> {
         if checkpoint < self.pre_operation_tip()? {
             return Err(KernelError::ConsumerPending);
         }
+        // A missing `outbox_consumers` row counts as checkpoint -1, below every
+        // `required_checkpoint_commit_seq`, so barriers settle before the delete.
+        complete_satisfied_barriers(self.tx, recorded_at)?;
         self.tx
             .execute(
                 "DELETE FROM outbox_consumers WHERE consumer_id=?1",
@@ -127,24 +130,52 @@ impl Envelope<'_> {
             }
         }
         let abandonment_id = format!("{}:{}", self.commit_seq, consumer_id.text);
-        self.tx
+        // Deleting `outbox_consumers` removes the consumer checkpoint. Record one
+        // abandonment per blocked barrier so each can still satisfy its
+        // `required_checkpoint_commit_seq`.
+        let recorded = self
+            .tx
             .execute(
                 "INSERT INTO consumer_abandonments(
                      abandonment_id,consumer_id,barrier_id,operator_id,
                      last_checkpoint_commit_seq,reason,abandoned_at,commit_seq
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                 )
+                 SELECT ?1 || ':' || bc.barrier_id,?2,bc.barrier_id,?3,?4,?5,?6,?7
+                 FROM deletion_backfill_barrier_consumers bc
+                 JOIN deletion_backfill_barriers b USING(barrier_id)
+                 WHERE bc.consumer_id=?2
+                   AND (b.completed_at IS NULL OR b.barrier_id=?8)",
                 params![
                     abandonment_id,
                     consumer_id.text,
-                    barrier_id.as_ref().map(|value| value.text.as_str()),
                     operator_id.text,
                     checkpoint,
                     reason.text,
                     abandonment.abandoned_at,
                     self.commit_seq,
+                    barrier_id.as_ref().map(|value| value.text.as_str()),
                 ],
             )
             .map_err(|_| KernelError::Io)?;
+        if recorded == 0 {
+            self.tx
+                .execute(
+                    "INSERT INTO consumer_abandonments(
+                         abandonment_id,consumer_id,barrier_id,operator_id,
+                         last_checkpoint_commit_seq,reason,abandoned_at,commit_seq
+                     ) VALUES (?1,?2,NULL,?3,?4,?5,?6,?7)",
+                    params![
+                        abandonment_id,
+                        consumer_id.text,
+                        operator_id.text,
+                        checkpoint,
+                        reason.text,
+                        abandonment.abandoned_at,
+                        self.commit_seq,
+                    ],
+                )
+                .map_err(|_| KernelError::Io)?;
+        }
         self.tx
             .execute(
                 "DELETE FROM outbox_consumers WHERE consumer_id=?1",
@@ -152,9 +183,7 @@ impl Envelope<'_> {
             )
             .map_err(|_| KernelError::Io)?;
         let audit_owner_id = consumer_id.text.clone();
-        if let Some(barrier_id) = &barrier_id {
-            complete_satisfied_barriers(self.tx, abandonment.abandoned_at, Some(&barrier_id.text))?;
-        }
+        complete_satisfied_barriers(self.tx, abandonment.abandoned_at)?;
         self.push_control_change(
             &audit_owner_id,
             "consumer_abandon",
@@ -369,7 +398,7 @@ impl KernelStore {
             params![checkpoint_commit_seq, updated_at, consumer_id.text],
         )
         .map_err(|_| KernelError::Io)?;
-        complete_satisfied_barriers(&tx, updated_at, None)?;
+        complete_satisfied_barriers(&tx, updated_at)?;
         tx.commit().map_err(|_| KernelError::Io)
     }
 
@@ -406,12 +435,10 @@ impl KernelStore {
 fn complete_satisfied_barriers(
     tx: &rusqlite::Transaction<'_>,
     completed_at: i64,
-    barrier_id: Option<&str>,
 ) -> Result<(), KernelError> {
     tx.execute(
         "UPDATE deletion_backfill_barriers AS b SET completed_at=?1
          WHERE b.completed_at IS NULL
-           AND (?2 IS NULL OR b.barrier_id=?2)
            AND EXISTS(
                SELECT 1 FROM deletion_backfill_barrier_consumers bc
                WHERE bc.barrier_id=b.barrier_id
@@ -424,9 +451,10 @@ fn complete_satisfied_barriers(
                  AND NOT EXISTS(
                      SELECT 1 FROM consumer_abandonments a
                      WHERE a.barrier_id=bc.barrier_id AND a.consumer_id=bc.consumer_id
+                       AND a.commit_seq>=bc.required_checkpoint_commit_seq
                  )
            )",
-        params![completed_at, barrier_id],
+        params![completed_at],
     )
     .map_err(|_| KernelError::Io)?;
     Ok(())

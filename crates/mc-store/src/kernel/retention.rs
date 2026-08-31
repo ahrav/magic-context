@@ -151,7 +151,7 @@ impl KernelStore {
             .map_err(|_| KernelError::Io)?;
         tx.commit().map_err(|_| KernelError::Io)?;
         drop(writer);
-        let artifact_gc = self.run_artifact_gc(|| now, hook, fault_after_reclaiming)?;
+        let artifact_gc = self.run_artifact_gc(now, hook, fault_after_reclaiming)?;
         Ok(StagingMaintenanceResult {
             abandoned,
             deleted_runs,
