@@ -223,6 +223,7 @@ fn cas_control_tables_and_lookup_indexes_are_frozen_into_epoch_two() {
         "idx_purge_tombstones_commit_fk",
         "idx_deletion_barriers_commit",
         "idx_deletion_barriers_incomplete",
+        "idx_deletion_barriers_open",
         "idx_deletion_barrier_consumers_checkpoint",
         "idx_abandonments_barrier_fk",
         "idx_capture_pins_purge_degraded",
@@ -264,6 +265,19 @@ fn cas_control_rows_preserve_reclaim_purge_and_backfill_state() {
     conn.execute(
         "UPDATE artifact_ingestion_reservations
          SET state='Reclaiming',reclaim_started_at=3 WHERE reservation_id='reservation-1'",
+        [],
+    )
+    .unwrap();
+    assert!(conn
+        .execute(
+            "UPDATE artifact_ingestion_reservations
+             SET artifact_reference='retargeted' WHERE reservation_id='reservation-1'",
+            [],
+        )
+        .is_err());
+    conn.execute(
+        "UPDATE artifact_ingestion_reservations
+         SET heartbeat_at=4,lease_expires_at=6 WHERE reservation_id='reservation-1'",
         [],
     )
     .unwrap();
@@ -420,6 +434,29 @@ fn plain_delete_backfill_barrier_does_not_require_a_purge_tombstone() {
         .unwrap(),
         0
     );
+
+    assert!(
+        conn.execute(
+            "INSERT INTO deletion_backfill_barriers(
+                 barrier_id,artifact_digest,artifact_reference,delete_commit_seq,created_at
+             ) VALUES ('second-open','plain-digest','plain-ref',?1,3)",
+            [commit_seq],
+        )
+        .is_err(),
+        "one open barrier per digest"
+    );
+    conn.execute(
+        "UPDATE deletion_backfill_barriers SET completed_at=4 WHERE barrier_id='plain-barrier'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO deletion_backfill_barriers(
+             barrier_id,artifact_digest,artifact_reference,delete_commit_seq,created_at
+         ) VALUES ('second-cycle','plain-digest','plain-ref',?1,5)",
+        [commit_seq],
+    )
+    .expect("a re-ingested digest must accept a new barrier after completion");
 }
 
 #[test]

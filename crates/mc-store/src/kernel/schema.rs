@@ -80,7 +80,7 @@ const COMPONENTS: [(&str, &str); KERNEL_SCHEMA_COMPONENT_NAMES.len()] = [
     ),
     (
         "deletion_backfill_barriers",
-        r#"CREATE TABLE deletion_backfill_barriers(barrier_id TEXT PRIMARY KEY,artifact_digest TEXT NOT NULL,artifact_reference TEXT NOT NULL,delete_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,created_at INTEGER NOT NULL,completed_at INTEGER,UNIQUE(artifact_digest)) STRICT; CREATE INDEX idx_deletion_barriers_commit ON deletion_backfill_barriers(delete_commit_seq,barrier_id); CREATE INDEX idx_deletion_barriers_incomplete ON deletion_backfill_barriers(completed_at,barrier_id);"#,
+        r#"CREATE TABLE deletion_backfill_barriers(barrier_id TEXT PRIMARY KEY,artifact_digest TEXT NOT NULL,artifact_reference TEXT NOT NULL,delete_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,created_at INTEGER NOT NULL,completed_at INTEGER) STRICT; CREATE UNIQUE INDEX idx_deletion_barriers_open ON deletion_backfill_barriers(artifact_digest) WHERE completed_at IS NULL; CREATE INDEX idx_deletion_barriers_commit ON deletion_backfill_barriers(delete_commit_seq,barrier_id); CREATE INDEX idx_deletion_barriers_incomplete ON deletion_backfill_barriers(completed_at,barrier_id);"#,
     ),
     (
         "deletion_backfill_barrier_consumers",
@@ -100,7 +100,7 @@ const COMPONENTS: [(&str, &str); KERNEL_SCHEMA_COMPONENT_NAMES.len()] = [
     ),
     (
         "artifact_ingestion_reservations",
-        r#"CREATE TABLE artifact_ingestion_reservations(reservation_id TEXT PRIMARY KEY,artifact_digest TEXT NOT NULL,artifact_reference TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('Live','Reclaiming')),writer_epoch INTEGER NOT NULL,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,reclaim_started_at INTEGER,CHECK((state='Live' AND reclaim_started_at IS NULL) OR (state='Reclaiming' AND reclaim_started_at IS NOT NULL))) STRICT; CREATE INDEX idx_reservations_digest ON artifact_ingestion_reservations(artifact_digest,reservation_id); CREATE INDEX idx_reservations_reference ON artifact_ingestion_reservations(artifact_reference,reservation_id); CREATE INDEX idx_reservations_reclaim ON artifact_ingestion_reservations(state,lease_expires_at,reservation_id);"#,
+        r#"CREATE TABLE artifact_ingestion_reservations(reservation_id TEXT PRIMARY KEY,artifact_digest TEXT NOT NULL,artifact_reference TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('Live','Reclaiming')),writer_epoch INTEGER NOT NULL,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,reclaim_started_at INTEGER,CHECK((state='Live' AND reclaim_started_at IS NULL) OR (state='Reclaiming' AND reclaim_started_at IS NOT NULL))) STRICT; CREATE INDEX idx_reservations_digest ON artifact_ingestion_reservations(artifact_digest,reservation_id); CREATE INDEX idx_reservations_reference ON artifact_ingestion_reservations(artifact_reference,reservation_id); CREATE INDEX idx_reservations_reclaim ON artifact_ingestion_reservations(state,lease_expires_at,reservation_id); CREATE TRIGGER artifact_ingestion_reservations_identity_immutable BEFORE UPDATE ON artifact_ingestion_reservations WHEN NEW.reservation_id IS NOT OLD.reservation_id OR NEW.artifact_digest IS NOT OLD.artifact_digest OR NEW.artifact_reference IS NOT OLD.artifact_reference BEGIN SELECT RAISE(ABORT,'reservation identity is immutable'); END;"#,
     ),
     (
         "artifact_purge_tombstones",
