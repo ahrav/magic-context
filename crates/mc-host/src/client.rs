@@ -1946,6 +1946,7 @@ fn start_ring_bridge(
                 if setup_peer_closed(&setup) {
                     break;
                 }
+                let mut wrote = false;
                 match write_rx.try_recv() {
                     Ok(write) => {
                         let deadline = write.deadline;
@@ -1957,6 +1958,7 @@ fn start_ring_bridge(
                         if failed {
                             break;
                         }
+                        wrote = true;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -2004,6 +2006,9 @@ fn start_ring_bridge(
                     }
                     Ok(None) => {}
                     Err(_) => break,
+                }
+                if wrote {
+                    continue;
                 }
                 match endpoint.from_host.arm_data_wait() {
                     Ok(false) => continue,
@@ -4161,7 +4166,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ring_bridge_drains_inbound_between_sustained_writes() {
+    async fn ring_bridge_drains_inbound_and_queued_writes() {
         let rings = mc_shm_transport::backend::ring::DuplexRing::create(
             &crate::ring_transport::ring_profile(),
         )
@@ -4189,8 +4194,9 @@ mod tests {
         }
         .encode()
         .to_vec();
-        for _ in 0..9 {
-            let (completed, _rx) = oneshot::channel();
+        let mut completions = Vec::new();
+        for _ in 0..8 {
+            let (completed, rx) = oneshot::channel();
             write
                 .tx
                 .try_send(RingWrite {
@@ -4199,6 +4205,7 @@ mod tests {
                     deadline: StdInstant::now() + Duration::from_secs(1),
                 })
                 .expect("queue write without waking worker");
+            completions.push(rx);
         }
         rings
             .first
@@ -4225,6 +4232,13 @@ mod tests {
             .expect("inbound frame starved behind queued writes")
             .expect("bridge closed");
         assert_eq!(frame.0.ty, FrameType::Response);
+        for completion in completions {
+            tokio::time::timeout(Duration::from_millis(250), completion)
+                .await
+                .expect("queued write stranded after eventfd drain")
+                .expect("bridge dropped write completion")
+                .expect("queued write failed");
+        }
     }
 
     #[test]
