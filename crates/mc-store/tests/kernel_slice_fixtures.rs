@@ -117,6 +117,7 @@ fn observation(
         payload: ObservationPayload {
             summary: format!("{scope_id} cache implementation"),
             classification: classification.to_string(),
+            detail: None,
         },
         observed_at: source_revision,
         dependencies: vec![ObservationDependencySpec {

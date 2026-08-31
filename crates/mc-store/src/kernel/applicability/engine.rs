@@ -459,6 +459,32 @@ impl ApplicabilityEngine {
     }
 }
 
+impl ObjectApplicability {
+    /// Uncertain verdict for a candidate whose checkout could not be
+    /// snapshotted; carries a degenerate token no cache entry ever matches.
+    pub(super) fn uncertain_without_snapshot(
+        candidate: &ApplicabilityCandidate,
+        evidence: String,
+    ) -> Self {
+        Self {
+            object_id: candidate.object_id.clone(),
+            object_revision: candidate.object_revision,
+            state: ApplicabilityState::Uncertain,
+            evidence,
+            failed_check: None,
+            append_pending: false,
+            token: ClassificationToken(ObjectCacheKey {
+                checkout_identity: String::new(),
+                object_id: candidate.object_id.clone(),
+                object_revision: candidate.object_revision,
+                head: String::new(),
+                dirty_fingerprint: String::new(),
+                inputs_digest: String::new(),
+            }),
+        }
+    }
+}
+
 enum AnchorVerdict {
     Holds,
     Historical(String),

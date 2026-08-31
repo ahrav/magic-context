@@ -67,6 +67,7 @@ fn observation(index: i64, dependency_object_id: &str) -> ObservationSpec {
         payload: ObservationPayload {
             summary: format!("observed {index}"),
             classification: "implemented".to_string(),
+            detail: None,
         },
         observed_at: index,
         dependencies: vec![ObservationDependencySpec {

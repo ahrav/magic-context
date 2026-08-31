@@ -56,12 +56,15 @@ struct RedactedObservation {
 struct RedactedObservationPayload {
     summary: RedactedField,
     classification: RedactedField,
+    detail: Option<RedactedField>,
 }
 
 #[derive(Serialize)]
 struct StoredObservationPayload<'a> {
     summary: &'a str,
     classification: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
 }
 
 struct RedactedDependency {
@@ -434,6 +437,7 @@ impl RedactedObservation {
             payload: RedactedObservationPayload {
                 summary: redact(&spec.payload.summary),
                 classification: redact(&spec.payload.classification),
+                detail: spec.payload.detail.as_deref().map(redact),
             },
             observed_at: spec.observed_at,
             dependencies,
@@ -486,6 +490,11 @@ impl RedactedObservation {
                 self.payload.classification.clone(),
             ),
         ];
+        push_optional(
+            &mut fields,
+            "observation_payload.detail",
+            &self.payload.detail,
+        );
         push_optional(&mut fields, "proposition_id", &self.proposition_id);
         push_optional(&mut fields, "scope_id", &self.scope_id);
         push_optional(&mut fields, "anchor_id", &self.anchor_id);
@@ -630,6 +639,11 @@ fn insert_observation(
     let payload = serde_json::to_vec(&StoredObservationPayload {
         summary: &spec.payload.summary.text,
         classification: &spec.payload.classification.text,
+        detail: spec
+            .payload
+            .detail
+            .as_ref()
+            .map(|value| value.text.as_str()),
     })
     .map_err(|_| KernelError::InvalidInput)?;
     tx.execute(

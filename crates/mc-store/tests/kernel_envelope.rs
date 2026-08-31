@@ -86,6 +86,7 @@ fn seed_projection_inputs(root: &std::path::Path) -> i64 {
                 payload: ObservationPayload {
                     summary: "fixture".to_string(),
                     classification: "implemented".to_string(),
+                    detail: None,
                 },
                 observed_at: 1,
                 dependencies: vec![ObservationDependencySpec {
