@@ -370,6 +370,54 @@ fn checksum_backed_rules_reject_undecodable_checksums() {
     }
 }
 
+/// `(?i)` makes Grafana prefixes case-insensitive; mixed-case prefixes must still reject invalid checksums.
+#[test]
+fn offline_validators_check_prefixes_case_insensitively() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let body = "AbCdEfGhIjKlMnOpQrStUvWxYz012345";
+    for prefix in ["glsa_", "GLSA_", "Glsa_"] {
+        let report = scanner.scan(&format!("{prefix}{body}_00000000 ")).unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "grafana-service-account-token"),
+            "{prefix} bypassed checksum rejection"
+        );
+    }
+}
+
+/// `entropy.min_len` is a sampling threshold, not a minimum credential length,
+/// so a bypassed entropy check must not veto a candidate on its own.
+#[test]
+fn credentials_below_the_entropy_sampling_length_are_still_reported() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    for (input, rule_id, value) in [
+        (
+            "curl -u abc:def https://api.corp-internal.net/v1/x",
+            "curl-auth-user",
+            "abc:def",
+        ),
+        (
+            "curl -u admin:s3cr3t99 https://api.corp-internal.net/v1/x",
+            "curl-auth-user",
+            "admin:s3cr3t99",
+        ),
+    ] {
+        let finding = scanner
+            .scan(input)
+            .unwrap()
+            .findings
+            .into_iter()
+            .find(|finding| finding.rule_id == rule_id)
+            .unwrap_or_else(|| panic!("{rule_id} produced no finding for {input:?}"));
+        assert_eq!(
+            &input[finding.value_span.start()..finding.value_span.end()],
+            value
+        );
+    }
+}
+
 #[test]
 fn local_context_key_names_match_case_insensitively() {
     let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();

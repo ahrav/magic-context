@@ -281,9 +281,12 @@ fn evaluate_candidate(
     if matches!(offline, Some(OfflineVerdict::Valid)) {
         confidence += 5;
     }
-    let minimum = rule.declaration.min_confidence.unwrap_or_else(|| {
-        if rule.declaration.keywords_any.is_some() && rule.declaration.entropy.is_some() {
+    // The confidence threshold requires entropy only when measured; otherwise values below `entropy.min_len` bypass entropy and create an undeclared credential minimum.
+    let minimum = rule.declaration.min_confidence.unwrap_or({
+        if rule.declaration.keywords_any.is_some() && entropy_measured {
             3
+        } else if rule.declaration.keywords_any.is_some() {
+            2
         } else {
             0
         }
@@ -651,14 +654,18 @@ fn offline_verdict(spec: &OfflineValidationSpec, value: &[u8]) -> OfflineVerdict
             )
         }
         OfflineValidationKind::GithubFineGrainedPat => {
-            if value.len() < 93 || !value.starts_with(b"github_pat_") {
+            if value.len() < 93 || !starts_with_ignore_ascii_case(value, b"github_pat_") {
                 OfflineVerdict::Indeterminate
             } else {
                 crc_verdict(&value[..87], &value[87..93])
             }
         }
+        // Compared case-insensitively because the rule pattern uses `(?i)`. A case-sensitive test returns `Indeterminate` for `GLSA_…`, which does not reject.
         OfflineValidationKind::GrafanaServiceAccount => {
-            if value.len() < 46 || !value.starts_with(b"glsa_") || value.get(37) != Some(&b'_') {
+            if value.len() < 46
+                || !starts_with_ignore_ascii_case(value, b"glsa_")
+                || value.get(37) != Some(&b'_')
+            {
                 OfflineVerdict::Indeterminate
             } else {
                 checksum_verdict(&value[..37], parse_hex_u32(&value[38..46]))
@@ -702,6 +709,12 @@ fn checksum_verdict(body: &[u8], expected: Option<u32>) -> OfflineVerdict {
         Some(expected) if crc32(body) == expected => OfflineVerdict::Valid,
         Some(_) | None => OfflineVerdict::Invalid,
     }
+}
+
+fn starts_with_ignore_ascii_case(value: &[u8], prefix: &[u8]) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 fn base62_u32(bytes: &[u8]) -> Option<u32> {
