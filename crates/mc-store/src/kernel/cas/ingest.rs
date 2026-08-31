@@ -10,6 +10,7 @@ use super::ArtifactIngestFault;
 use super::{
     is_artifact_digest, read_capped, ArtifactError, ArtifactErrorKind, ArtifactHandle,
     ArtifactIngestRequest, ProviderEgress, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_DETECTIONS,
+    MAX_TEXT_FIELD_BYTES,
 };
 use crate::current_time_ms;
 use crate::kernel::durable_fs::{
@@ -60,6 +61,21 @@ impl PreparedArtifact {
         }
         if !is_artifact_digest(&request.intent.request_digest) {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
+        }
+        if [
+            request.evidence_id.as_str(),
+            request.object_id.as_str(),
+            request.object_kind.as_str(),
+            request.domain_id.as_str(),
+            request.source_kind.as_str(),
+            request.source_id.as_str(),
+            request.media_type.as_str(),
+            request.retention_class.as_str(),
+        ]
+        .into_iter()
+        .any(|field| field.len() > MAX_TEXT_FIELD_BYTES)
+        {
+            return Err(ArtifactError::new(ArtifactErrorKind::TextFieldTooLong));
         }
         if request.evidence_id.trim().is_empty()
             || request.object_id.trim().is_empty()

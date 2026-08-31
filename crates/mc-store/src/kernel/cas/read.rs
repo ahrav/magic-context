@@ -7,6 +7,7 @@ use super::{
     is_artifact_digest, read_capped, ArtifactDestination, ArtifactEligibility, ArtifactError,
     ArtifactErrorKind, ArtifactHandle, EligibilityDeniedReason, ProviderEgress,
 };
+use crate::kernel::durable_fs::{open_regular_nofollow, open_secure_directory};
 use crate::kernel::{KernelStore, Sensitivity};
 
 impl KernelStore {
@@ -47,17 +48,13 @@ impl KernelStore {
         if tombstoned {
             return Err(ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable));
         }
-        let path = self.artifact_object_path(&handle.digest);
-        let metadata = fs::symlink_metadata(&path).map_err(|_| {
+        let objects = fs::File::open(self.artifacts_path.join("objects")).map_err(|_| {
             ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
         })?;
-        if !metadata.file_type().is_file() {
-            return Err(ArtifactError::for_digest(
-                ArtifactErrorKind::CorruptObject,
-                &handle.digest,
-            ));
-        }
-        let object = fs::File::open(&path).map_err(|_| {
+        let shard = open_secure_directory(&objects, &handle.digest[..2]).map_err(|_| {
+            ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
+        })?;
+        let object = open_regular_nofollow(&shard, &handle.digest[2..]).map_err(|_| {
             ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
         })?;
         let Some(bytes) = read_capped(object).map_err(|_| {
