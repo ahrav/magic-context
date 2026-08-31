@@ -802,6 +802,35 @@ function interventionFingerprint(value: unknown): string | null {
     }
 }
 
+/** The contract owns which health each reason may carry, and it exposes that as a validator rather than a table, so the pairing is discovered by asking `parseArmedCellResult` instead of restating its rules here: a narrowed admissible set, or a new reason code, changes this answer without an edit. `preferred` is tried first, so a reason admitting several healths keeps the one that describes how the rollout actually ended. commentlint: allow(JUDGE) */
+function healthFor(reasonCode: ReasonCode | null, preferred: RunHealth): RunHealth {
+    if (reasonCode === null) return "completed";
+    const candidates = [
+        preferred,
+        ...RUN_HEALTHS.filter((health) => health !== "completed" && health !== preferred),
+    ];
+    return candidates.find((runHealth) => contractAdmits(reasonCode, runHealth)) ?? preferred;
+}
+
+function contractAdmits(reasonCode: ReasonCode, runHealth: RunHealth): boolean {
+    try {
+        parseArmedCellResult({
+            armId: "mc-on",
+            checksPassed: 0,
+            checksTotal: 0,
+            criticalPassed: 0,
+            criticalTotal: 0,
+            invalidSuccess: false,
+            runHealth,
+            reasonCode,
+        });
+        return true;
+    } catch (error) {
+        if (!(error instanceof PairedDeltaContractError)) throw error;
+        return false;
+    }
+}
+
 function completedRecord(
     options: RunPairedDeltaOptions,
     coordinate: RolloutCoordinate,
@@ -857,14 +886,9 @@ function completedRecord(
                     : !declarationMatches
                         ? "invalid-result"
                         : null;
-    /** `REASON_CODE_HEALTHS` admits `arm-identity-mismatch` only with `malformed`; pairing it with `unavailable` emits a cell the contract's own parser rejects and reads as a provider-availability failure. commentlint: allow(JUDGE) */
-    let runHealth: RunHealth = reasonCode === null
-        ? "completed"
-        : reasonCode === "harness-failure"
-            ? "crash"
-            : reasonCode === "invalid-result" || reasonCode === "arm-identity-mismatch"
-                ? "malformed"
-                : "unavailable";
+    let runHealth: RunHealth = healthFor(reasonCode, reasonCode === "harness-failure"
+        ? "crash"
+        : "unavailable");
     let checks: CheckResult[] = [];
     if (runHealth === "completed") {
         try {
@@ -941,6 +965,11 @@ function failedRecord(
     /** Reported ahead of the rollout's own failure for the same reason the status is: a timeout bounded this arm, an unreclaimed harness threatens the ones after it. commentlint: allow(JUDGE) */
     const providerUnavailable = !disposalFailed && failure instanceof ProviderUnavailableError;
     const deadlineExceeded = !disposalFailed && failure instanceof RolloutDeadlineError;
+    const reasonCode: ReasonCode = providerUnavailable
+        ? "provider-unavailable"
+        : deadlineExceeded
+            ? "deadline-exceeded"
+            : "harness-failure";
     const worstCase = worstCaseUsd(scenario, options.pricesPerMillionTokens);
     return {
         schema: ROLLOUT_RECORD_SCHEMA,
@@ -959,16 +988,11 @@ function failedRecord(
             criticalPassed: 0,
             criticalTotal: 0,
             invalidSuccess: false,
-            runHealth: providerUnavailable
-                ? "unavailable"
-                : deadlineExceeded
-                    ? "timeout"
-                    : "crash",
-            reasonCode: providerUnavailable
-                ? "provider-unavailable"
-                : deadlineExceeded
-                    ? "deadline-exceeded"
-                    : "harness-failure",
+            runHealth: healthFor(
+                reasonCode,
+                providerUnavailable ? "unavailable" : deadlineExceeded ? "timeout" : "crash",
+            ),
+            reasonCode,
         },
         checks: [],
         usage: ZERO_USAGE,

@@ -8,7 +8,10 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { storageSubtreePath } from "../../../plugin/src/shared/data-path";
-import { isSecretKey } from "../../../plugin/src/shared/redaction";
+import {
+    credentialValueFormat,
+    isCredentialBearingConfigKey,
+} from "../../../plugin/src/shared/redaction";
 import { createDirectTestDatabase } from "../../../plugin/src/features/magic-context/test-database";
 import { initializeIsolatedContextDb as initializeContextDbFromRelease } from "../initialize-context-db";
 import { waitForChildExit } from "../process-exit";
@@ -250,54 +253,14 @@ function writeConfigs(
 
 }
 
-/** `isSecretKey` requires one of its qualifier segments before a secret word, and splits only on case transitions and separators, so compound and glued names — `masterKey`, `dbPassword`, `webhookSecret`, `APIKEY` — read as benign. Config keys need the wider rule: a name whose final word names a credential is one, whatever qualifies it. commentlint: allow(JUDGE) */
-const CREDENTIAL_TAIL_WORDS = [
-    "key",
-    "keys",
-    "secret",
-    "secrets",
-    "password",
-    "passwd",
-    "passphrase",
-    "credential",
-    "credentials",
-    "cookie",
-    "authorization",
-    "auth",
-    "bearer",
-    "dsn",
-];
-
-/** `token` is the one credential word that also counts things — `maxTokens`, `promptTokens` — so it is credential-shaped only under a qualifier that names an issued credential. commentlint: allow(JUDGE) */
-const TOKEN_CREDENTIAL_QUALIFIERS = [
-    "access",
-    "id",
-    "refresh",
-    "bearer",
-    "auth",
-    "session",
-    "api",
-    "client",
-    "service",
-    "private",
-    "secret",
-    "oauth",
-];
-
-function isCredentialShapedConfigKey(key: string): boolean {
-    if (isSecretKey(key)) return true;
-    /** Separators are dropped rather than split on, so a glued `APIKEY` is judged by the same rule as `api_key`. commentlint: allow(JUDGE) */
-    const compact = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-    if (CREDENTIAL_TAIL_WORDS.some((word) => compact.endsWith(word))) return true;
-    if (compact.endsWith("token") || compact.endsWith("tokens")) {
-        return TOKEN_CREDENTIAL_QUALIFIERS.some((qualifier) => compact.startsWith(qualifier));
-    }
-    return false;
-}
-
 /**
- * `assertConfigHasNoCredentials` matches key names and never values, so
- * `opencode.json` can still contain a credential stored under an innocuous key.
+ * `assertConfigHasNoCredentials` refuses a credential-shaped key name and a value in a named
+ * credential format. Neither test reads a value into a diagnostic: a match is reported by
+ * format name, so a refusal never puts the secret in a log.
+ *
+ * A credential in no recognized format, under an innocuous name, still reaches
+ * `opencode.json` — `extraEnv` remains the only channel that is governed by shape rather
+ * than by recognition.
  */
 function assertConfigHasNoCredentials(value: unknown): void {
     const seen = new WeakSet<object>();
@@ -306,11 +269,20 @@ function assertConfigHasNoCredentials(value: unknown): void {
         seen.add(current);
         for (const [key, child] of Object.entries(current)) {
             const childPath = `${path}.${key}`;
-            if (!Array.isArray(current) && isCredentialShapedConfigKey(key)) {
+            if (!Array.isArray(current) && isCredentialBearingConfigKey(key)) {
                 throw new Error(
                     `config contains credential-shaped key: ${childPath}; ` +
                         "pass credentials through extraEnv",
                 );
+            }
+            if (typeof child === "string") {
+                const format = credentialValueFormat(child);
+                if (format !== null) {
+                    throw new Error(
+                        `config contains a ${format} value at ${childPath}; ` +
+                            "pass credentials through extraEnv",
+                    );
+                }
             }
             visit(child, childPath);
         }

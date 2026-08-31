@@ -171,6 +171,34 @@ describe("opencode child lifecycle", () => {
             // Counting keys keep working: `token` alone is not a credential word.
             expect(write({ maxTokens: 4096, promptTokens: 12, tokenBudget: 7 })).not.toThrow();
 
+            // A credential under a header name that names nothing: the value's own
+            // format is what refuses it, and the diagnostic never carries it.
+            for (const [value, format] of [
+                ["Bearer sk-live-abcdefghijklmnop", "HTTP authorization scheme"],
+                ["sk-ant-abcdefghijklmnopqrstuv", "Anthropic-style key"],
+                ["ghp_abcdefghijklmnopqrstuvwxyz012345", "GitHub token"],
+                ["postgres://user:hunter2@db.internal/app", "credential-bearing URI"],
+            ] as const) {
+                const attempt = () =>
+                    __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                        mockProviderURL: "http://127.0.0.1:4321",
+                        openCodeConfigExtra: {
+                            mcp: { docs: { headers: { "x-trace": value } } },
+                        },
+                    });
+                expect(attempt).toThrow(new RegExp(`a ${format} value at .*x-trace`));
+                expect(attempt).not.toThrow(new RegExp(value.slice(0, 12)));
+            }
+            // An ordinary header value still passes.
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                    openCodeConfigExtra: {
+                        mcp: { docs: { headers: { "x-trace": "run-42" } } },
+                    },
+                })
+            ).not.toThrow();
+
             for (const header of ["Cookie", "Proxy-Authorization", "set-cookie"]) {
                 expect(() =>
                     __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {

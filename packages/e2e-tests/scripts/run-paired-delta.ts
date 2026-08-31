@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, sep } from "node:path";
 import {
     FileRolloutStore,
     ProviderUnavailableError,
@@ -67,8 +67,10 @@ function relativeTo(root: string, target: string): string | null {
     const rooted = resolve(root);
     const path = resolve(target);
     if (path === rooted) return null;
-    const prefix = rooted.endsWith("/") ? rooted : `${rooted}/`;
-    return path.startsWith(prefix) ? path.slice(prefix.length) : null;
+    /** `resolve` returns the platform's separator, while a git pathspec always takes `/`. commentlint: allow(JUDGE) */
+    const prefix = rooted.endsWith(sep) ? rooted : `${rooted}${sep}`;
+    if (!path.startsWith(prefix)) return null;
+    return path.slice(prefix.length).split(sep).join("/");
 }
 
 /** A resume must not skip coordinates recorded by a different checkout: `bindingMatches` compares `repoCommit`, so a constant would let a post-change smoke report success without executing the changed code. commentlint: allow(JUDGE) */

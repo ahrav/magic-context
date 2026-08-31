@@ -4,7 +4,9 @@ import { describe, expect, test } from "bun:test";
 
 import vocabulary from "./fixtures/redaction-vocabulary-v1.json";
 import {
+    credentialValueFormat,
     hasShareabilitySensitiveText,
+    isCredentialBearingConfigKey,
     redactSecretText,
     SECRET_QUALIFIERS,
     SECRET_WORDS,
@@ -108,5 +110,52 @@ describe("hasShareabilitySensitiveText", () => {
     test("a public IP / port alone is not flagged by the private-range rules", () => {
         // 8.8.8.8 is public; no private-range or localhost pattern should match.
         expect(hasShareabilitySensitiveText("DNS resolver at 8.8.8.8")).toBe(false);
+    });
+});
+
+describe("isCredentialBearingConfigKey", () => {
+    test("judges a config key by its final word, unlike the redaction predicate", () => {
+        // `isSecretKey` needs a qualifier before the secret word, which is right for
+        // masking and wrong for a guard that refuses to write a credential to disk.
+        for (const key of [
+            "masterKey",
+            "dbPassword",
+            "webhookSecret",
+            "signingSecret",
+            "encryptionKey",
+            "APIKEY",
+            "apikey",
+            "Cookie",
+            "Proxy-Authorization",
+            "idToken",
+            "accessToken",
+        ]) {
+            expect(isCredentialBearingConfigKey(key)).toBe(true);
+        }
+
+        // `token` also counts things, so it stays qualified.
+        for (const key of ["maxTokens", "promptTokens", "tokenBudget", "baseURL", "models"]) {
+            expect(isCredentialBearingConfigKey(key)).toBe(false);
+        }
+    });
+});
+
+describe("credentialValueFormat", () => {
+    test("names the format a credential announces, and nothing else", () => {
+        expect(credentialValueFormat("Bearer sk-live-abcdefghij")).toBe(
+            "HTTP authorization scheme",
+        );
+        expect(credentialValueFormat("sk-ant-abcdefghijklmnopqrstuv")).toBe(
+            "Anthropic-style key",
+        );
+        expect(credentialValueFormat("ghp_abcdefghijklmnopqrstuvwxyz012345")).toBe("GitHub token");
+        expect(credentialValueFormat("postgres://user:pw@host/db")).toBe(
+            "credential-bearing URI",
+        );
+        expect(credentialValueFormat("-----BEGIN RSA PRIVATE KEY-----")).toBe("PEM private key");
+
+        for (const value of ["run-42", "application/json", "https://example.test/path", ""]) {
+            expect(credentialValueFormat(value)).toBeNull();
+        }
     });
 });

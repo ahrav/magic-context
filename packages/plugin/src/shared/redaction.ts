@@ -105,6 +105,83 @@ export function isSecretKey(key: string): boolean {
     return false;
 }
 
+/**
+ * `isSecretKey` requires a qualifier segment before a secret word, which is right for
+ * redaction: masking a benign field is a cosmetic loss, so it stays conservative.
+ *
+ * A configuration guard has the opposite failure cost — a missed credential is written to
+ * disk — so it judges the key's final word instead, catching `masterKey`, `dbPassword`,
+ * `webhookSecret`, and the glued `APIKEY` that no case transition splits.
+ */
+const CREDENTIAL_TAIL_WORDS = [
+    "key",
+    "keys",
+    "secret",
+    "secrets",
+    "password",
+    "passwd",
+    "passphrase",
+    "credential",
+    "credentials",
+    "cookie",
+    "authorization",
+    "auth",
+    "bearer",
+    "dsn",
+];
+
+/** `token` is the one credential word that also counts things — `maxTokens`, `promptTokens`, `injection_budget_tokens` — so it needs a qualifier that names an issued credential. */
+const TOKEN_CREDENTIAL_QUALIFIERS = [
+    "access",
+    "id",
+    "refresh",
+    "bearer",
+    "auth",
+    "session",
+    "api",
+    "client",
+    "service",
+    "private",
+    "secret",
+    "oauth",
+];
+
+export function isCredentialBearingConfigKey(key: string): boolean {
+    if (isSecretKey(key)) return true;
+    // Separators are dropped rather than split on, so `APIKEY` is judged like `api_key`.
+    const compact = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (CREDENTIAL_TAIL_WORDS.some((word) => compact.endsWith(word))) return true;
+    if (compact.endsWith("token") || compact.endsWith("tokens")) {
+        return TOKEN_CREDENTIAL_QUALIFIERS.some((qualifier) => compact.startsWith(qualifier));
+    }
+    return false;
+}
+
+/**
+ * Named credential formats, not entropy guessing: each pattern is a shape a credential
+ * announces about itself, so a match can be reported by format name without ever putting
+ * the value in a diagnostic.
+ */
+const CREDENTIAL_VALUE_FORMATS: ReadonlyArray<{ label: string; pattern: RegExp }> = [
+    { label: "HTTP authorization scheme", pattern: /^(?:bearer|basic|digest|token)\s+\S+/i },
+    { label: "JWT", pattern: /^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./ },
+    // Ordered before the general `sk-` shape, which would otherwise claim it.
+    { label: "Anthropic-style key", pattern: /^sk-ant-[A-Za-z0-9_-]{16,}/ },
+    { label: "OpenAI-style key", pattern: /^sk-[A-Za-z0-9_-]{16,}/ },
+    { label: "GitHub token", pattern: /^gh[pousr]_[A-Za-z0-9]{20,}/ },
+    { label: "AWS access key id", pattern: /^(?:AKIA|ASIA)[0-9A-Z]{12,}/ },
+    { label: "Google API key", pattern: /^AIza[0-9A-Za-z_-]{30,}/ },
+    { label: "Slack token", pattern: /^xox[abprs]-[0-9A-Za-z-]{10,}/ },
+    { label: "PEM private key", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+    { label: "credential-bearing URI", pattern: /^[a-z][a-z0-9+.-]*:\/\/[^/@\s:]+:[^/@\s]+@/i },
+];
+
+/** Returns the format a value announces itself as, or null. The label never contains the value. */
+export function credentialValueFormat(value: string): string | null {
+    const trimmed = value.trim();
+    return CREDENTIAL_VALUE_FORMATS.find(({ pattern }) => pattern.test(trimmed))?.label ?? null;
+}
+
 /** `sanitizePathStringPortable` rewrites generic home-directory patterns without reading the host's home directory or username.
  * Use `sanitizePathStringPortable` when output must be identical across hosts.
  * Use `sanitizePathString` when diagnostics must redact the local identity. */
