@@ -82,7 +82,7 @@ classes the original map did not name.
 | F10 macOS ring execution | A macOS host that actually constructs a `Ring` | **No** — the macOS CI step names two integration files and excludes the lib target, so no macOS job reaches `Ring::create` |
 | F11 non-4096 page host | A kernel page size other than 4096, or an injectable page size in the layout and prefault paths | **No** — and note CI already provisions a 16 KiB host every run, which is precisely the one that constructs no `Ring` |
 | F12 duplex-capable peer | A peer harness able to hold frames outstanding in both directions at once | **No** — the test peer's send and receive are both synchronous and thread-confined |
-| F13 iceoryx cross-process pairing (moot: `0f336d3c` deleted the iceoryx backend) | Two processes sharing one iceoryx service | **No, and not constructible** — the service name is random, private, and has no accessor; the port bounds are consumed by the creator. Requires an API change |
+| F13 iceoryx cross-process pairing (invalidated: `0f336d3c` deleted the iceoryx backend) | Two processes sharing one iceoryx service | **No, and not constructible** — the service name is random, private, and has no accessor; the port bounds are consumed by the creator. Requires an API change |
 
 | Property | Required faults and enabling state | Non-vacuous today |
 | --- | --- | --- |
@@ -96,11 +96,11 @@ classes the original map did not name.
 | macos-object-creation-leaks-no-shm-name | F10 plus F3 on `shm_unlink`, or a kill in the open-to-unlink window, plus an oracle over the Darwin shm namespace | No |
 | layout-region-offsets-are-real-page-aligned | F11 | No |
 | page-size-dependent-setup-runs-on-a-non-4096-page-host | F11 | No |
-| iceoryx-descriptor-rejection-is-terminal-or-declared (moot: backend deleted by `0f336d3c`) | A sequence or identity mismatch in a delivered sample: either an external config setting the discard strategy, or F2 against the provider segment | No |
-| iceoryx-receive-expectation-tracks-the-delivered-stream (moot: backend deleted by `0f336d3c`) | A delivered-versus-expected sequence divergence: a restart (blocked by F13), a malformed sample (F2), or a discard-strategy config plus a full buffer | No |
-| iceoryx-cross-process-pairing-is-reachable-or-declared (moot: backend deleted by `0f336d3c`) | F13 | No, and not constructible without an API change |
-| iceoryx-completion-is-observable-to-the-host (moot: backend deleted by `0f336d3c`) | None; the gap is visible in the public surface | No — there is no observation to assert against |
-| iceoryx-saturation-is-bounded-non-blocking-backpressure (moot: backend deleted by `0f336d3c`) | None; count operations past each cap. Publish arm hangs, so needs a terminating timeout in the harness | No |
+| iceoryx-descriptor-rejection-is-terminal-or-declared (invalidated: backend deleted by `0f336d3c`) | A sequence or identity mismatch in a delivered sample: either an external config setting the discard strategy, or F2 against the provider segment | No |
+| iceoryx-receive-expectation-tracks-the-delivered-stream (invalidated: backend deleted by `0f336d3c`) | A delivered-versus-expected sequence divergence: a restart (blocked by F13), a malformed sample (F2), or a discard-strategy config plus a full buffer | No |
+| iceoryx-cross-process-pairing-is-reachable-or-declared (invalidated: backend deleted by `0f336d3c`) | F13 | No, and not constructible without an API change |
+| iceoryx-completion-is-observable-to-the-host (invalidated: backend deleted by `0f336d3c`) | None; the gap is visible in the public surface | No — there is no observation to assert against |
+| iceoryx-saturation-is-bounded-non-blocking-backpressure (invalidated: backend deleted by `0f336d3c`) | None; count operations past each cap. Publish arm hangs, so needs a terminating timeout in the harness | No |
 | wire-header-fully-validated-before-any-consumer-acts | A peer-authored header satisfying the transport's two checks and violating one host rule | Partial — one such header exists in a test, but only the downstream quarantine is asserted |
 | ingress-charge-matches-the-bytes-copied-from-shared-storage | None to pin it; F2 writing the descriptor page to demonstrate impact | No |
 | every-shm-header-consumer-applies-its-role-gate | A role-invalid publish into each direction; the peer arm needs the frame to originate host-side | Partial — host arm only, one type |
@@ -139,7 +139,6 @@ Counting the full 58-record catalog:
 7. **F8, cross-artifact assertions** — 3 properties.
 8. **F13** — requires an API change, so it is a design decision rather than a
    harness investment.
-
 
 ## Coverage checks to add
 
@@ -213,7 +212,7 @@ What changed: F1's availability now records that
 `crates/mc-host/tests/support/shm_process.rs`, the harness that implemented it,
 was deleted by `ed487e11` along with the provider it drove, so the kill harness
 this file assumed no longer exists. F13 and the five iceoryx property rows are
-marked moot, because `0f336d3c` deleted the iceoryx backend, its tests, and its
+marked invalidated, because `0f336d3c` deleted the iceoryx backend, its tests, and its
 Cargo feature. Everything else, including the transport-side fault classes and
 the leverage ranking, is unchanged.
 

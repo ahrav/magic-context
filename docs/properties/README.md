@@ -23,6 +23,12 @@ production runtime enforcement.
   byte-identical across that range, and of the `mc-host` files Part 1 cites only
   `generation.rs` changed, which no record depends on. The gap-closure records
   added in Groups I through M were verified against the later commit.
+- Eventfd reconciliation, 2026-08-31: Part 1 was reconciled against HEAD
+  `46278f47a` after PR #131 (merge `5d638e3e8`) replaced polling with sparse
+  eventfd delivery and confirmed the iceoryx2 backend's removal. This covers
+  the range from the `9c1eb4d1`/`e447c927` anchoring era to `46278f47a`, and
+  normalizes Part 1's interim `superseded-by-refactor` status to `invalidated`
+  per METHOD's `active | invalidated` vocabulary.
 
 ### External references consulted
 

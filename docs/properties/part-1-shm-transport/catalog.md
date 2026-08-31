@@ -10,6 +10,20 @@ deleted.
 Provenance and the external-reference list are in [../README.md](../README.md).
 System `/local/home/ahrav/scratch/magic-context` at `9c1eb4d1`, 2026-08-29.
 
+## Eventfd reconciliation pass, 2026-08-31
+
+This catalog, `existing-checks.md`, and `fault-map.md` were reconciled against
+HEAD `46278f47a` after PR #131 (merge `5d638e3e8`) replaced polling with sparse
+eventfd delivery. The iceoryx2 backend, deleted earlier by `0f336d3c`, remains
+absent at that HEAD: `crates/mc-shm-transport/src/backend/` holds only
+`mod.rs`, `ring.rs`, and `sample.rs`. The interim status value
+`superseded-by-refactor` is normalized to `invalidated`, the vocabulary
+declared in [../METHOD.md](../METHOD.md). The seven records that carried it —
+the five Group K iceoryx records, `custody-terminal-transition-exactly-once`,
+and `clean-reclamation-is-reachable` — now read `Status: invalidated`, each
+naming the removal commit. Record bodies are kept as the evidence of what the
+removed mechanisms did and did not guarantee.
+
 ## Citation refresh pass, 2026-08-30
 
 A targeted refresh re-anchored this catalog's host-side citations after the
@@ -36,8 +50,10 @@ Disposition of the 16 records:
   `clean-reclamation-is-reachable` cite mechanisms with no successor anywhere in
   the tree: `CandidateCustody` and its phase machine, `ShmRecoveryBackend`,
   `CleanupOutcome`, `ProviderReadiness`, and provider incarnations are all gone.
-  Both keep `Status: superseded-by-refactor` and an `Impact:` sentence naming the
-  commit and the current owner of the obligation, if any.
+  Both carry `Status: invalidated` (recorded at the time under the interim
+  label `superseded-by-refactor`, normalized by the 2026-08-31 pass above) and
+  an `Impact:` sentence naming the commit and the current owner of the
+  obligation, if any.
 - **2 reachability changes without a status change.**
   `quarantine-charge-transition-is-atomic` and `release-failure-is-observable`
   guard code that still exists in `crates/mc-shm-transport`, so the property
@@ -60,10 +76,12 @@ The remaining 42 records were checked and cite only live paths
 (`crates/mc-shm-transport`, `packages/mc-shm-native`, `packages/plugin`,
 `crates/mc-host/tests/`, and `docs/`); they were not modified.
 
-`Status: superseded-by-refactor` is outside the `active | invalidated` vocabulary
-declared in [../METHOD.md](../METHOD.md). It is used deliberately here and
-`part-2a-host-lifecycle` already uses it, but the schema question is open and
-belongs to a human.
+This pass introduced the interim status value `superseded-by-refactor`, outside
+the `active | invalidated` vocabulary declared in [../METHOD.md](../METHOD.md).
+Resolved 2026-08-31: this catalog's vocabulary is normalized to METHOD's
+`active | invalidated`, and every record that carried the interim value now
+reads `invalidated` with the removal commit named. `part-2a-host-lifecycle`
+still uses the interim value and is out of that pass's scope.
 
 Not audited by that pass, and now closed by the sweep below: citations into
 `crates/mc-shm-transport` and `packages/mc-shm-native` had also drifted, far more
@@ -192,11 +210,11 @@ decide whether to ship the transport. A defect there is live today.
 | [macos-object-creation-leaks-no-shm-name](#macos-object-creation-leaks-no-shm-name) | safety | medium | no |
 | [layout-region-offsets-are-real-page-aligned](#layout-region-offsets-are-real-page-aligned) | safety | high | no |
 | [page-size-dependent-setup-runs-on-a-non-4096-page-host](#page-size-dependent-setup-runs-on-a-non-4096-page-host) | reachability | high | no |
-| [iceoryx-descriptor-rejection-is-terminal-or-declared](#iceoryx-descriptor-rejection-is-terminal-or-declared) | safety | high | n/a — superseded-by-refactor |
-| [iceoryx-receive-expectation-tracks-the-delivered-stream](#iceoryx-receive-expectation-tracks-the-delivered-stream) | safety | high | n/a — superseded-by-refactor |
-| [iceoryx-cross-process-pairing-is-reachable-or-declared](#iceoryx-cross-process-pairing-is-reachable-or-declared) | reachability | high | n/a — superseded-by-refactor |
-| [iceoryx-completion-is-observable-to-the-host](#iceoryx-completion-is-observable-to-the-host) | safety | high | n/a — superseded-by-refactor |
-| [iceoryx-saturation-is-bounded-non-blocking-backpressure](#iceoryx-saturation-is-bounded-non-blocking-backpressure) | liveness | high | n/a — superseded-by-refactor |
+| [iceoryx-descriptor-rejection-is-terminal-or-declared](#iceoryx-descriptor-rejection-is-terminal-or-declared) | safety | high | n/a — invalidated |
+| [iceoryx-receive-expectation-tracks-the-delivered-stream](#iceoryx-receive-expectation-tracks-the-delivered-stream) | safety | high | n/a — invalidated |
+| [iceoryx-cross-process-pairing-is-reachable-or-declared](#iceoryx-cross-process-pairing-is-reachable-or-declared) | reachability | high | n/a — invalidated |
+| [iceoryx-completion-is-observable-to-the-host](#iceoryx-completion-is-observable-to-the-host) | safety | high | n/a — invalidated |
+| [iceoryx-saturation-is-bounded-non-blocking-backpressure](#iceoryx-saturation-is-bounded-non-blocking-backpressure) | liveness | high | n/a — invalidated |
 | [wire-header-fully-validated-before-any-consumer-acts](#wire-header-fully-validated-before-any-consumer-acts) | safety | high | yes |
 | [ingress-charge-matches-the-bytes-copied-from-shared-storage](#ingress-charge-matches-the-bytes-copied-from-shared-storage) | safety | high | yes |
 | [every-shm-header-consumer-applies-its-role-gate](#every-shm-header-consumer-applies-its-role-gate) | safety | medium | yes |
@@ -258,6 +276,7 @@ reused" (`docs/mc-host-shm-transport.md:79`). Under the documented same-user
 trust model this may be in-contract; the point is that it is unstated and
 unchecked.
 Open questions:
+
 - Is the flag deliberately shared so the *peer* observes quarantine, and if so
   what protects the local decision? A local `Cell<bool>` OR'd into
   `is_quarantined()` would close this without a layout change.
@@ -302,6 +321,7 @@ The abort path matters most where quarantine was raised *because* a JavaScript
 alias may still be attached to the aborted range
 (`packages/mc-shm-native/src/lib.rs:265-269`).
 Open questions:
+
 - Is "a reservation admitted before quarantine may still publish" the intended
   contract? If so it belongs in the documented close ordering, which currently
   reads as unconditional.
@@ -433,6 +453,7 @@ Existing check: none.
 Impact: `active` diverges permanently from the live set, so admission refuses
 candidates the host can afford, or accepts ones it cannot.
 Open questions:
+
 - Under what conditions can `checked_sub` actually fail here? If it is
   unreachable, this becomes `always-or-unreached` plus a reachability check
   rather than a live risk. (partial: the arithmetic is reachable only through a
@@ -443,12 +464,12 @@ Open questions:
 Type: safety
 Reachability: test-only — when live, `CandidateCustody` and
 `ShmRecoveryBackend` sat behind the negotiated-transport provider registry,
-which shipped empty, so only tests drove custody. Superseded rather than live:
+which shipped empty, so only tests drove custody. Invalidated rather than live:
 the phase machine, the backend, and provider incarnations are all deleted, and
 `crates/mc-host/src/ring_transport.rs:291` now releases charges
 unconditionally.
 Reaches production: no
-Status: superseded-by-refactor
+Status: invalidated
 Exercised: not yet — needs a release carrying a superseded provider incarnation.
 Guarantee: Each candidate's charges are released or quarantined exactly once,
 and a stale release is rejected without touching aggregate counters.
@@ -488,13 +509,15 @@ strictly a doc defect: `docs/mc-host-shm-transport.md:79` describes an
 incarnation-bearing release protocol that never existed and whose surrounding
 machinery has since been removed.
 Open questions:
+
 - Does the documented sentence describe intended future behaviour, or is it
   simply wrong and should be deleted? Adding an incarnation-bearing release
   protocol would be a real design change, so this needs an owner's decision
   rather than a code fix. (needs human input)
-- Should a record whose mechanism no longer exists stay in the catalog as
-  `superseded-by-refactor`, or be marked `invalidated` per the METHOD schema?
-  (needs human input)
+- Resolved 2026-08-31: a record whose mechanism no longer exists is marked
+  `invalidated` per the METHOD schema. The interim `superseded-by-refactor`
+  value is retired from this catalog; see the eventfd reconciliation pass at
+  the top of this file.
 
 ### reservation-charge-visible-with-non-free-state
 
@@ -537,6 +560,7 @@ under-counts producer-reserved bytes. The larger finding is the contract-vs-code
 contradiction in a SAFETY comment, which is exactly the kind of statement a
 future reader will rely on.
 Open questions:
+
 - Which is wrong, the comment or the order? Either store `reservation_len`
   before the CAS, or stop trusting it in `conservation()`.
 - Are `conservation()` and `probe()` test-only? If any cross-process production
@@ -589,6 +613,7 @@ hazard plus an accounting-accuracy bug rather than undefined behaviour. It
 becomes unsoundness the moment any reader reaches descriptor or arena bytes from
 slot state.
 Open questions:
+
 - Is the relaxed state store intentional, given `abort_reservation` and
   `reclaim_completed` use `Release` for the same field (`ring.rs:1148`, `:1161`)?
   If intentional, the reasoning belongs in the code.
@@ -660,6 +685,7 @@ rather than commit success. Status unaudited.
 Impact: a sender that believes a frame was published when it was not, with no
 retry, on a transport whose failure mode is otherwise fail-closed.
 Open questions:
+
 - Does the client's `FrameSendTicket.cancel()`/`onPublish` contract mean "handed
   to the transport" or "committed"? The two differ only on commit failure.
   (needs human input)
@@ -725,6 +751,7 @@ existing assertion. If a future caller retains a committed identity — for
 instance to implement producer-side reclamation — this becomes a
 read-after-recycle on leased bytes with no malformed input required.
 Open questions:
+
 - Should `Ring::release` remain public? There is a real constraint behind it:
   the addon needs lease-independent completion because `poll` forgets the lease
   and tracks the identity in its own table. So this is a design trade-off, not
@@ -864,6 +891,7 @@ Impact: a stranded charge or an unreclaimed frame with no counter, no log, and
 no suspect record. The operator learns nothing, and the arena bytes stay
 unreclaimable.
 Open questions:
+
 - Is silent loss on the drop path intended, given the addon `mem::forget`s
   leases and releases through its own table instead?
 
@@ -910,6 +938,7 @@ Impact: permanent, silent loss of lease and descriptor capacity, reported as
 ordinary backpressure. The `LifecyclePage` has no holder count, attach epoch,
 heartbeat, or peer pid, so there is no field a reconciliation could read.
 Open questions:
+
 - Is a peer crash meant to be recoverable at all? If yes, something must reset
   the cursors or force quarantine; today it does neither. (needs human input)
 
@@ -987,6 +1016,7 @@ shared-memory eligibility for the process. The catalog entry exists because
 `docs/mc-host-shm-transport.md:57` states the accounting claim without this
 exception.
 Open questions:
+
 - Which behaviour is normative when a liveness policy is configured — retention,
   or quarantine via a failed publish? Both are currently reachable for the same
   fault.
@@ -1032,6 +1062,7 @@ Impact: silent single-frame loss on a channel whose documented failure posture i
 fail-closed. If the channel is meant to be lossless up to close, `consumed`
 advancing before delivery is the wrong commit point.
 Open questions:
+
 - Is losing one acquired-but-undelivered frame on cancel or overload an accepted
   contract term? (needs human input)
 
@@ -1114,6 +1145,7 @@ while its siblings in the same file avoid the issue. Additionally
 the addon wires it into external buffers for *receive* segments too, so
 JavaScript can write memory the host is concurrently reading.
 Open questions:
+
 - Is `checksum` reachable from any non-bench caller? If it is bench-only,
   gating it removes the finding; if it is part of the intended read API, the
   slice needs to go. (partial: the only observed call sites are the bench and
@@ -1150,6 +1182,7 @@ Impact: the reclaim cursor can be pushed past bytes still under a live lease.
 Later underflow is caught (`arena.rs:104-108`), so this is corruption and
 denial of service rather than an out-of-bounds access.
 Open questions:
+
 - Was the atomic `reservation_len` (`ring.rs:112`) intended to be the producer's
   trusted record? It is written but never read by `reclaim_completed`. A
   producer-local table would be trustworthy; is that feasible given `Ring` is
@@ -1226,6 +1259,7 @@ Impact: this is the mechanism behind defect `daf6e244`, where a stale hardcoded
 layout total silently weakened five hardening tests for over a day. The
 arrangement guarantees recurrence.
 Open questions:
+
 - Is the depth-32 fixture a deliberate model of `create_test_pair` (which uses
   `ring_profile`), in which case the profile string is knowingly overloaded
   across two geometries? (needs human input)
@@ -1268,6 +1302,7 @@ gap: nothing binds a grant to its direction — field *position* is the only rol
 assignment, so swapped fields would put two producers on one single-producer
 lane.
 Open questions:
+
 - Can any caller reach native `attach` with attacker-ordered or
   bug-ordered lane fields, making the role confusion reachable rather than
   latent?
@@ -1328,6 +1363,7 @@ Impact: the zero-copy selection gate cannot detect a copy. A body copy added to
 a nominally zero-copy arm would report `body_copies == 0` and pass. This is the
 gate that decides whether a shared-memory provider may ship.
 Open questions:
+
 - Is `OperationCounters` intended to be wired to real instrumentation, or is it
   permanently a report-schema type? If the latter, the "counts copies" language
   in `docs/mc-host-shm-transport.md:25` overstates what any artifact can prove.
@@ -1387,6 +1423,7 @@ Required faults and enabling state: none.
 Confidence: high — [evidence](evidence/traceability-pointers-resolve.md).
 The 11 unresolved pointers classify into three groups, and only the first is a
 defect:
+
 - **Definitively stale, 2 distinct across 5 citation instances.** The record
   cites `tests/ring.rs#lease_limit_rejects_then_recovers_after_release` where the
   test is `lease_limit_reports_backpressure_then_recovers_after_release`
@@ -1487,6 +1524,7 @@ requirement PASS, but the PASS rests on a type nothing in production drives. The
 documented "drains published data" stage has no counterpart in either real close
 path.
 Open questions:
+
 - Is the state machine intended to become the driver, or is it a specification
   artifact? If specification-only, which code is normative for close ordering?
   (needs human input)
@@ -1521,6 +1559,7 @@ Impact: `docs/mc-host-shm-transport.md:42` states "any failure returns
 `available: false` with a bounded reason", which is falsified for one of the
 eight enumerated steps.
 Open questions:
+
 - An earlier draft asserted that the code's step order differs from the
   document's numbering. That is **not supported**: steps one through eight appear
   in documented order. Two real divergences replace it. There is an undocumented
@@ -1534,11 +1573,11 @@ Open questions:
 Type: reachability
 Reachability: test-only — when live, the clean-reclamation branch and the
 incarnation mint were reached only through the fake recovery backend, as this
-record's own evidence states. Superseded rather than live:
+record's own evidence states. Invalidated rather than live:
 `provider_recovery.rs` and `ShmRecoveryBackend` are deleted, and
 `crates/mc-host/src/ring_transport.rs:291` releases charges unconditionally
 with no reclamation outcome.
-Status: superseded-by-refactor
+Status: invalidated
 Exercised: not yet — reachable only through a fake backend today.
 Guarantee: For the shipped provider, the clean-reclamation outcome — charges
 returned exactly once and a new incarnation minted — actually occurs at least
@@ -1574,6 +1613,7 @@ reclamation proof. `docs/mc-host-shm-transport.md:87-90` still presents clean
 reclamation and quarantine as two distinct outcomes with distinct experiments,
 and now describes no code at all.
 Open questions:
+
 - The documentation at `docs/mc-host-shm-transport.md:87-90` now describes a
   two-outcome recovery model that no longer exists. Should it be rewritten to the
   unconditional-release behaviour, or is the recovery model intended to return?
@@ -1613,6 +1653,7 @@ from JavaScript, the cleanup probe is an arbitrary-path file write at teardown,
 and the buffer detach operates on buffers the addon never created. The addon is
 also shipped from a debug build, so release behaviour is never exercised.
 Open questions:
+
 - Is a `cfg`- or feature-gated split intended before this transport becomes
   selectable, or is the surface considered acceptable because the transport is
   test-only? (needs human input)
@@ -1673,6 +1714,7 @@ nowhere in the tree. Narrowing `GRANT_BYTES` turns `ring.rs:426` into an
 unconditional panic on every call, and a harness offset edit does the same to
 `read_u64`; no property currently forbids either.
 Open questions:
+
 - Should `GRANT_BYTES` be derived from its field widths, as `SAMPLE_PREFIX_BYTES`
   is (`sample.rs:24`), rather than written as a literal?
 - Is the harness's zero-margin offset arithmetic deliberate? (needs human input)
@@ -1724,6 +1766,7 @@ oracle and the one whose offsets are hand-written literals. A change making a
 region inert leaves the length gate satisfied and every read in bounds, so
 whether any test notices depends on which seeds happen to distinguish the fields.
 Open questions:
+
 - Is `SamplePrefix`'s prefix-plus-slack policy permanent, or an accommodation for
   iceoryx loan granularity that another backend would not need? (needs human
   input)
@@ -1779,6 +1822,7 @@ that stops progressing with no terminal state and no operator-visible fault, the
 same end state `crashed-producer-does-not-wedge-the-sequence` reaches by another
 route.
 Open questions:
+
 - Is omitting the schema check in `Ring::release` intentional, on the grounds
   that the release path builds no body view? If so it belongs in a comment,
   because the field is read from peer-writable memory by the next reader.
@@ -1833,6 +1877,7 @@ rather than rejecting it. The only thing standing against that is the fuzz
 round-trip assertion, which is doing forward-compatibility work its comment does
 not claim.
 Open questions:
+
 - Is `encode`'s unconditional zeroing intended to make the type version-2-only,
   or should a relay preserve unknown reserved bytes? (needs human input)
 - Should the descriptor's 12 padding bytes get the same declared-and-enforced
@@ -1892,6 +1937,7 @@ total keeps the length gate satisfied and the bit count at 864. And two of the
 five identity conditions in the load-bearing `validate` function are covered only
 by tabled unit cases, never by fuzzing.
 Open questions:
+
 - Should the harness encode the shared struct's 120-byte image rather than a
   packed 108-byte private shape? Keeping them different is defensible and
   cheaper; unifying them would give the padding a decode contract and force
@@ -1949,6 +1995,7 @@ the 40-character name, fixing it silently activates the whole untested macOS pat
 at once: creation without seals, attach without a type check, and a mapping whose
 descriptor was dropped.
 Open questions:
+
 - Which step fails, and with which errno? Needs one macOS run. (needs human
   input)
 - Is the macOS ring intended to become functional, or is `ObjectSetupFailed` the
@@ -2009,6 +2056,7 @@ property is no longer that attach is structurally unreachable — only that no C
 job executes it. A descriptor whose size is reduced after `fstat` is mapped
 `MAP_SHARED | PROT_READ | PROT_WRITE` at its validated length.
 Open questions:
+
 - The former question about the Darwin `st_mode` premise is resolved by deletion:
   `b5dc778e` removed the carve-out and took the `S_IFREG` branch on both
   platforms, so whatever the Darwin premise was, the code no longer relies on it.
@@ -2062,6 +2110,7 @@ reports the same `ObjectSetupFailed` from a different line, which would also
 corrupt the attribution the sibling record establishes. Linux is unaffected:
 `memfd_create` objects are anonymous.
 Open questions:
+
 - Can `shm_unlink` fail after a successful `O_EXCL` `shm_open` on Darwin? If
   provably not, mark this record invalidated with that reason. (needs human
   input)
@@ -2109,6 +2158,7 @@ page read-only to one role, can no longer separate control state from payload.
 The arena start is likewise off a real page boundary, and at depth 2 and 8 the
 mapping carries 8192 addressable, never-initialised bytes past `mapping.len`.
 Open questions:
+
 - Are `arena` and `lifecycle` contractually page-separated, or is 4096 standing
   in for cacheline separation? Nothing records the intent, and the answer decides
   whether this is a defect or over-alignment. (needs human input)
@@ -2157,6 +2207,7 @@ future change reintroducing a 4096 assumption into the residency path.
 provisions a 16 KiB host every run, and it is precisely the host on which no
 `Ring` is constructed.
 Open questions:
+
 - Add an aarch64 Linux job with a large-page kernel, or make the page size
   injectable so the path can be driven on any host? (needs human input)
 - The claim that `macos-latest` provisions arm64 with a 16384-byte page is
@@ -2173,7 +2224,9 @@ Open questions:
 collapsed the crate to the fixed ring transport. Every parity question this group
 asked — which guarantees the second implementation also owes, and where it
 diverges from the ring — is therefore moot, and all five records below carry
-`Status: superseded-by-refactor`. Their citations into `iceoryx.rs` and
+`Status: invalidated`: `0f336d3c` removed the backend, and the removal holds at
+HEAD `46278f47a` after PR #131 (merge `5d638e3e8`). Their citations into
+`iceoryx.rs` and
 `tests/iceoryx.rs` resolve against `9c1eb4d1`, not against the current tree, and
 are kept as the record of what the removed backend did and did not guarantee.
 
@@ -2202,11 +2255,11 @@ Type: safety
 Reachability: test-only — when live, the `iceoryx` backend was a default Cargo
 feature at `9c1eb4d1` but was constructed only from
 `crates/mc-shm-transport/tests/iceoryx.rs` and the e2e mutation harness; no
-host or client path referenced it. Superseded rather than live: the feature and
+host or client path referenced it. Invalidated rather than live: the feature and
 `src/backend/iceoryx.rs` are gone, and
 `crates/mc-shm-transport/src/backend/mod.rs:4-6` now declares only `ring` and
 `sample`.
-Status: superseded-by-refactor
+Status: invalidated
 Exercised: not yet — no test makes `try_receive` return `Err`; the seven tests in
 `tests/iceoryx.rs` are same-instance and the loopback publisher always writes the
 sequence the receiver expects, so the rejection at `iceoryx.rs:167` never fires.
@@ -2246,16 +2299,20 @@ pages; release identity validation is absent and soundly so, because the move
 makes a wrong or duplicate identity unpresentable; incarnation fencing compares
 against a locally minted value that is never exchanged, so it discriminates
 nothing; quarantine and conservation reporting are absent with no substitute.
-Superseded: `0f336d3c` deleted the backend, so there is no code left to hold or
+Invalidated: `0f336d3c` deleted the backend, so there is no code left to hold or
 violate this property. What the record established is that the removed backend
 had no terminal state after a rejected descriptor — the ring's quarantine had no
 counterpart — and that the absence was invisible because `backend/mod.rs`
 declared no trait, so no parity gap was a compile error.
 Open questions:
+
 - Is the loopback shape intended to be permanent? The ledger reads differently
   under each answer and no repository file states one. (needs human input)
 - If iceoryx is meant to reach a designated host, does it owe a terminal state at
   all, or does the provider layer above it own condemnation? (needs human input)
+
+Invalidated 2026-08-31: the iceoryx2 backend was removed by `0f336d3c` and
+remains absent at HEAD `46278f47a` after PR #131 (merge `5d638e3e8`).
 
 ### iceoryx-receive-expectation-tracks-the-delivered-stream
 
@@ -2263,11 +2320,11 @@ Type: safety
 Reachability: test-only — when live, the `iceoryx` backend was a default Cargo
 feature at `9c1eb4d1` but was constructed only from
 `crates/mc-shm-transport/tests/iceoryx.rs` and the e2e mutation harness; no
-host or client path referenced it. Superseded rather than live: the feature and
+host or client path referenced it. Invalidated rather than live: the feature and
 `src/backend/iceoryx.rs` are gone, and
 `crates/mc-shm-transport/src/backend/mod.rs:4-6` now declares only `ring` and
 `sample`.
-Status: superseded-by-refactor
+Status: invalidated
 Exercised: not yet — `sequences_progress_exactly_and_wrap_attempts_fail_closed`
 (`tests/iceoryx.rs:123`) commits and receives one frame per iteration, so both
 cursors advance in lockstep and never diverge.
@@ -2302,16 +2359,20 @@ Impact: a permanently unreadable stream on which the producer keeps consuming
 loan capacity for frames the receiver will never accept, with no shared cursor to
 reconcile against, no terminal state, and one opaque error variant. This record
 and the previous one share a code point from two sides: this one owns the cursor
-obligation, that one owns the fail-closed obligation. Superseded: `0f336d3c`
+obligation, that one owns the fail-closed obligation. Invalidated: `0f336d3c`
 deleted the backend. What the record established is that the removed backend's
 receive cursor was an unconditionally-advanced dequeue paired with a conditional
 expectation advance, over process-local `Cell<u64>` rather than shared pages, so
 one rejected sample stranded the expectation permanently with no shared cursor to
 reconcile against.
 Open questions:
+
 - Was the `Cell<u64>` pair intended as a same-instance smoke-test device rather
   than a transport cursor? If so the record scopes down to a documentation
   obligation. (needs human input)
+
+Invalidated 2026-08-31: the iceoryx2 backend was removed by `0f336d3c` and
+remains absent at HEAD `46278f47a` after PR #131 (merge `5d638e3e8`).
 
 ### iceoryx-cross-process-pairing-is-reachable-or-declared
 
@@ -2319,11 +2380,11 @@ Type: reachability
 Reachability: test-only — when live, the `iceoryx` backend was a default Cargo
 feature at `9c1eb4d1` but was constructed only from
 `crates/mc-shm-transport/tests/iceoryx.rs` and the e2e mutation harness; no
-host or client path referenced it. Superseded rather than live: the feature and
+host or client path referenced it. Invalidated rather than live: the feature and
 `src/backend/iceoryx.rs` are gone, and
 `crates/mc-shm-transport/src/backend/mod.rs:4-6` now declares only `ring` and
 `sample`.
-Status: superseded-by-refactor
+Status: invalidated
 Exercised: not yet, and not constructible without an API change;
 `IceoryxBackend::create(profile, lane)` accepts neither an inbound service name
 nor an inbound incarnation.
@@ -2361,18 +2422,22 @@ same-instance test structurally cannot prove any property whose predicate ranges
 over two address spaces or two incarnations: publication visibility across a real
 release-acquire edge, peer authentication at attach, geometry binding, restart
 reconciliation, stale-cursor handling. Those are not untested; they are
-unprovable on such a backend as constructed. Superseded: `0f336d3c` deleted the
+unprovable on such a backend as constructed. Invalidated: `0f336d3c` deleted the
 backend, and the manifest's `selectable` list with it — the arms block now reads
 `"transport": ["ring"]` (`benches/manifests/v1.json:107`) with no second candidate
 to declare. What the record established, and the part that outlives the backend,
 is the topology argument in the preceding paragraph: it is a statement about
 same-instance harnesses, so it binds any future second backend.
 Open questions:
+
 - The two questions about `selectable: true` and about disjoint loopback-smoke and
   `selectable` lists are moot: `0f336d3c` left one transport arm and removed the
   `selectable` key. The general form survives and belongs to whichever gate
   reintroduces a second arm: must a same-instance arm be barred from the
   candidate list? (needs human input)
+
+Invalidated 2026-08-31: the iceoryx2 backend was removed by `0f336d3c` and
+remains absent at HEAD `46278f47a` after PR #131 (merge `5d638e3e8`).
 
 ### iceoryx-completion-is-observable-to-the-host
 
@@ -2380,11 +2445,11 @@ Type: safety
 Reachability: test-only — when live, the `iceoryx` backend was a default Cargo
 feature at `9c1eb4d1` but was constructed only from
 `crates/mc-shm-transport/tests/iceoryx.rs` and the e2e mutation harness; no
-host or client path referenced it. Superseded rather than live: the feature and
+host or client path referenced it. Invalidated rather than live: the feature and
 `src/backend/iceoryx.rs` are gone, and
 `crates/mc-shm-transport/src/backend/mod.rs:4-6` now declares only `ring` and
 `sample`.
-Status: superseded-by-refactor
+Status: invalidated
 Exercised: not yet — needs leases disposed both ways with an assertion that some
 observation distinguishes outstanding from reclaimed; no such observation exists
 to assert against.
@@ -2423,16 +2488,20 @@ indistinguishable from one leaked into a long-lived collection, up to the borrow
 cap, where the symptom surfaces on the other side as `ReceiveFailed` attributed
 to the receive mechanism rather than to retained leases. Combined with the
 constant counters, a body copy added anywhere in `run_iceoryx` would change none
-of the six fields the gate names as required. Superseded: `0f336d3c` deleted the
+of the six fields the gate names as required. Invalidated: `0f336d3c` deleted the
 backend, and `ed487e11` had already deleted the host-side readiness consumer. What
 the record established is that the removed backend met exactly-once completion by
 move semantics rather than by a check — sound, but silent — so it exposed no
 observation from which outstanding samples could be counted, and an explicitly
 released lease was indistinguishable from an abandoned one.
 Open questions:
+
 - Is `stale_node_observed` (`iceoryx.rs:178-189`) intended as the readiness
   surface? It is an associated function over global dead-node entries, keyed to
   nothing about a given instance's samples. (needs human input)
+
+Invalidated 2026-08-31: the iceoryx2 backend was removed by `0f336d3c` and
+remains absent at HEAD `46278f47a` after PR #131 (merge `5d638e3e8`).
 
 ### iceoryx-saturation-is-bounded-non-blocking-backpressure
 
@@ -2440,11 +2509,11 @@ Type: liveness
 Reachability: test-only — when live, the `iceoryx` backend was a default Cargo
 feature at `9c1eb4d1` but was constructed only from
 `crates/mc-shm-transport/tests/iceoryx.rs` and the e2e mutation harness; no
-host or client path referenced it. Superseded rather than live: the feature and
+host or client path referenced it. Invalidated rather than live: the feature and
 `src/backend/iceoryx.rs` are gone, and
 `crates/mc-shm-transport/src/backend/mod.rs:4-6` now declares only `ring` and
 `sample`.
-Status: superseded-by-refactor
+Status: invalidated
 Exercised: not yet — every test receives and releases immediately after each
 commit, so neither configured cap is ever reached.
 Guarantee: When a configured capacity limit binds, the backend returns control to
@@ -2484,19 +2553,23 @@ channel-ending faults. The iceoryx path violates both halves: the publisher can
 hang forever with no deadline parameter, and normal receive backpressure is
 reported as a fault. Both caps are handed to the provider and never consulted
 locally, so the backend cannot report saturation in its own vocabulary.
-Superseded: `0f336d3c` deleted the backend. What the record established is that the
+Invalidated: `0f336d3c` deleted the backend. What the record established is that the
 removed backend inherited its backpressure strategy from an external
 `iceoryx2.toml` rather than pinning it, so a full publish queue blocked
 indefinitely on the one thread that could have drained it, and ordinary receive
 backpressure was reported as a channel-ending fault — the opposite of the ring's
 `Exhausted`-plus-`Ok(None)` split, which survives.
 Open questions:
+
 - Does any designated host's global config override the backpressure strategy? No
   repository file sets it and no test asserts it, and the two possible values give
   opposite uncontracted outcomes: unbounded blocking, or silent frame loss.
   (needs human input)
 - Should the backend pin the strategy explicitly rather than inherit it from an
   external file? (needs human input)
+
+Invalidated 2026-08-31: the iceoryx2 backend was removed by `0f336d3c` and
+remains absent at HEAD `46278f47a` after PR #131 (merge `5d638e3e8`).
 
 ---
 
@@ -2564,6 +2637,7 @@ frame deadline on a frame already known illegal, and the transport cannot
 compensate, because `mc-host` depends on `mc-shm-transport` and so `FrameType`,
 `Flags`, and the protocol version are unreachable from the validating crate.
 Open questions:
+
 - The control-cap branch (`ring_transport.rs:474-485`) releases the lease and
   answers `Rejected` rather than closing, a fourth disposition. Is a per-channel
   body cap a header rule or an admission rule? (needs human input)
@@ -2616,6 +2690,7 @@ balanced-but-wrong case, charge 64 MiB and copy 64 bytes, is a cheap
 budget-exhaustion primitive, because the ingress wait loop is what other receives
 block on and the resulting overload close is classified clean.
 Open questions:
+
 - Should the equality also be asserted host-side, given the host owns the header
   format while the transport owns the only check? (needs human input)
 - Whether any consumer above the inbound event compares the header length to the
@@ -2664,6 +2739,7 @@ stays open, with no diagnostic, counter, or close reason, which is the implicit
 profile extension the wire document forbids. The record straddles the part
 boundary, since the peer consumer lives in `packages/plugin`, assigned to Part 5.
 Open questions:
+
 - Is the shared-memory frame channel reachable in any shipped configuration, or
   only through an injected factory? Empty registries are reported for Part 1 as a
   whole and were not re-derived for the client package. (partial)
@@ -2726,6 +2802,7 @@ and sees `Exhausted` then `Deadline`, codes meaning try again later. In neither
 case is the failing field recorded anywhere, and `enter_quarantine` is itself
 best-effort, no-oping if the lifecycle pointer computation fails.
 Open questions:
+
 - Is the transport path's ring quarantine intended for all header rejections, or
   an artifact of descriptor validation sitting below the trust boundary? The
   documented close ordering covers unknown alias state, not a protocol rejection.
@@ -2785,6 +2862,7 @@ denial primitive. What is actually worth guarding is a belief: a future change
 storing something real here would inherit an authentication covering only the
 container.
 Open questions:
+
 - Is the directory a remnant of an earlier file-backed design, or a deliberate
   environment sanity check? The doc comment at `ring.rs:543` implies the object is
   under it; it is not. Git archaeology was not performed. (needs human input)
@@ -2853,6 +2931,7 @@ progress in normal operation. A recovery-chain defect presents as
 cancelled generation, and a suspect record: a transport fault reported on a
 channel whose peer was draining correctly.
 Open questions:
+
 - What inner bound should the cross-process arm assert? The existing test pairs a
   50 ms sleep with a five-second deadline, three orders of magnitude of slack, so
   it measures no latency and a per-pass reclaimer would pass it.
@@ -2902,6 +2981,7 @@ later receive returns what an idle channel returns. The endpoint keeps polling a
 no error, quarantine, or counter fires: the silent capacity-loss signature of
 `attach-reconciles-or-refuses-stale-shared-cursors`, reached with no crash.
 Open questions:
+
 - Does the addon receive path saturate where the Rust host cannot? It retains
   leases deliberately, per the reachability analysis in
   `release-authority-bound-to-lease-ownership`, so it is the one shipped consumer
@@ -2953,6 +3033,7 @@ retired generation or an unclean close attributed to the transport. Because the
 endpoint owns its thread and runtime, the damage is confined to the opposite lane
 rather than other host tasks, which is also why no existing test would notice.
 Open questions:
+
 - What is the normative service ratio? `frame_deadline` is caller-supplied, so the
   worst case cannot be derived from this crate and a test must pin it from its own
   configuration. (needs human input)
@@ -3053,6 +3134,7 @@ made the existing assertion weak. A never-fired marker is itself the finding: it
 reports that the shipped host configuration cannot exercise lease backpressure at
 all.
 Open questions:
+
 - Should a second profile with a cap above one be added purely to make this
   situation reachable, or should the eight-lease cap be reconsidered given that no
   shipped consumer can approach it? (needs human input)
@@ -3103,6 +3185,7 @@ ratio arm evaluates a condition over an empty set and its drain arm degrades int
 a plain round-trip test the suite already performs. A never-fired marker reports a
 harness gap rather than an implementation defect, which is the honest reading.
 Open questions:
+
 - Do the addon or TypeScript client suites already drive both directions
   concurrently? They were not examined, so the harness gap may be narrower than
   stated.

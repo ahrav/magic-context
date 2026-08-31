@@ -50,7 +50,9 @@ runtime invariant guards belong to
 ### `crates/mc-shm-transport/tests/iceoryx.rs` — 7 tests, requires the `iceoryx` feature
 
 **Gone at `e447c927`.** `0f336d3c` deleted this suite, the `iceoryx` backend, and
-the `iceoryx` Cargo feature. The entry is kept as a record of what used to be
+the `iceoryx` Cargo feature; the removal holds at HEAD `46278f47a` after PR #131
+(merge `5d638e3e8`), and the five Group K catalog records covering this backend
+are `Status: invalidated`. The entry is kept as a record of what used to be
 checked; everything in it resolves against `9c1eb4d1`. Covered allocation slack never reaching the decoder, stale-node observation
 without disturbing a live backend, exact sequence progression, producer
 rejection of oversized and underfilled commits, decoder rejection of truncation
@@ -188,7 +190,8 @@ Code with no executed check:
    validation rejects.
 9. Runtime-directory revalidation is never negative-tested.
 10. The iceoryx segment-growth path never executed; every test wrote tiny
-    payloads. Moot at `e447c927`: `0f336d3c` deleted the backend.
+    payloads. Invalidated at `e447c927`: `0f336d3c` deleted the backend, and the
+    covering catalog records are `Status: invalidated`.
 11. Fuzzing never runs in normal CI.
 12. Three hand-synchronised copies of the ring geometry with no cross-check.
 13. `docs/AUDIT-KNOWN-ISSUES.md` contains no shared-memory entries. The only

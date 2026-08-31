@@ -1,5 +1,8 @@
 # iceoryx-descriptor-rejection-is-terminal-or-declared
 
+Record invalidated 2026-08-31: iceoryx2 backend removed in `0f336d3c`; absent at
+HEAD `46278f47a` after PR #131 (merge `5d638e3e8`).
+
 ## Discovery trigger
 
 The ring treats a descriptor that fails validation as a condemnation, not an
