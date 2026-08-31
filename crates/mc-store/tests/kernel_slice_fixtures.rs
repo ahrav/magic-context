@@ -15,7 +15,8 @@ const PRODUCER: &str = "session-cache-fixture";
 const ACTOR: &str = "hand-authored-test";
 const MAIN_SCOPE: &str = "scope-main";
 const BRANCH_SCOPE: &str = "scope-redis-branch";
-const STAGING_ONLY_TEXT: &str = "staging-only-redis-candidate";
+const CANDIDATE_ID: &str = "candidate-object";
+const CANDIDATE_TEXT: &str = "unreviewed-redis-candidate";
 const OPERATION_KEYS: [&str; 6] = [
     "fixture/domain",
     "fixture/scopes",
@@ -249,14 +250,14 @@ fn build_fixture(root: &std::path::Path) -> Fixture {
         .commit_seq;
     store
         .stage_candidate(StagingCandidateSpec {
-            extraction_run_id: "fixture-staging-run".to_string(),
-            candidate_id: "fixture-staging-candidate".to_string(),
+            extraction_run_id: "fixture-extraction-run".to_string(),
+            candidate_id: CANDIDATE_ID.to_string(),
             extractor: "fixture".to_string(),
             source_kind: "repository".to_string(),
             source_id: "unreviewed-cache-note".to_string(),
             source_revision: 1,
             candidate_kind: "observation".to_string(),
-            payload: STAGING_ONLY_TEXT.to_string(),
+            payload: CANDIDATE_TEXT.to_string(),
             provenance: Some(RepositoryProvenance {
                 repository_id: "fixture-repository".to_string(),
                 revision: "abc123".to_string(),
@@ -435,12 +436,37 @@ fn branch_alignment_then_main_acceptance_preserves_redis_lineage() {
             &"redis-branch-observation".to_string()
         )]
     );
+    assert_eq!(
+        fixture
+            .store
+            .alignment_as_of(fixture.pre_acceptance)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| (row.decision_id.as_str(), row.observation_id.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("lru-decision", "lru-observation"),
+            ("redis-branch-decision", "redis-branch-observation"),
+        ]
+    );
 
     let accepted = alignment_in_scope(&fixture.store, fixture.accepted, MAIN_SCOPE);
     assert_eq!(accepted.len(), 1);
     assert_eq!(accepted[0].decision_id, "redis-main-decision");
     assert_eq!(accepted[0].observation_id, "redis-main-observation");
     assert!(alignment_in_scope(&fixture.store, fixture.accepted, BRANCH_SCOPE).is_empty());
+    assert_eq!(
+        fixture
+            .store
+            .alignment_as_of(fixture.accepted)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| (row.decision_id.as_str(), row.observation_id.as_str()))
+            .collect::<Vec<_>>(),
+        [("redis-main-decision", "redis-main-observation")]
+    );
     let history = fixture
         .store
         .object_history_as_of(fixture.accepted)
@@ -506,6 +532,10 @@ fn false_lru_classification_is_corrected_append_only() {
         None
     );
     let corrected = fixture.store.slice_as_of(fixture.pre_acceptance).unwrap();
+    assert!(corrected
+        .observations
+        .iter()
+        .all(|row| row.observation_id != "lru-observation-wrong"));
     assert_eq!(
         corrected
             .observations
@@ -515,6 +545,23 @@ fn false_lru_classification_is_corrected_append_only() {
             .payload
             .classification,
         "implemented"
+    );
+    let history = fixture
+        .store
+        .object_history_as_of(fixture.pre_acceptance)
+        .unwrap();
+    let replaced = history
+        .objects
+        .iter()
+        .find(|row| row.object_id == "lru-observation-wrong-object")
+        .unwrap();
+    assert_eq!(
+        replaced.invalidated_commit_seq,
+        Some(fixture.pre_acceptance)
+    );
+    assert_eq!(
+        replaced.superseded_by.as_deref(),
+        Some("lru-observation-object")
     );
     assert_eq!(
         query_count(root.path(), "SELECT COUNT(*) FROM observations"),
@@ -566,23 +613,25 @@ fn staged_candidate_never_enters_canonical_state() {
     assert!(known
         .objects
         .iter()
-        .all(|row| !row.object_id.contains("staging")));
+        .all(|row| row.object_id != CANDIDATE_ID));
     assert!(history
         .objects
         .iter()
-        .all(|row| !row.object_id.contains("staging")));
+        .all(|row| row.object_id != CANDIDATE_ID));
     assert!(slice
         .decisions
         .iter()
-        .all(|row| !row.payload.summary.contains(STAGING_ONLY_TEXT)));
+        .all(|row| !row.payload.summary.contains(CANDIDATE_TEXT)
+            && !row.payload.rationale.contains(CANDIDATE_TEXT)));
     assert!(slice
         .observations
         .iter()
-        .all(|row| !row.payload.summary.contains(STAGING_ONLY_TEXT)));
+        .all(|row| !row.payload.summary.contains(CANDIDATE_TEXT)
+            && !row.payload.classification.contains(CANDIDATE_TEXT)));
     assert!(alignment
         .rows
         .iter()
-        .all(|row| !row.alignment_payload.contains(STAGING_ONLY_TEXT)));
+        .all(|row| !row.alignment_payload.contains(CANDIDATE_TEXT)));
     assert_eq!(
         query_strings(root.path(), "SELECT DISTINCT producer FROM commit_log"),
         [PRODUCER.to_string()].into()
@@ -605,8 +654,16 @@ fn staged_candidate_never_enters_canonical_state() {
     assert_eq!(
         query_count(
             root.path(),
-            "SELECT COUNT(*) FROM alignment_projection
-             WHERE alignment_payload LIKE '%staging-only%'"
+            "SELECT (
+                 SELECT COUNT(*) FROM decisions
+                 WHERE CAST(decision_payload AS TEXT) LIKE '%unreviewed-redis-candidate%'
+             ) + (
+                 SELECT COUNT(*) FROM observations
+                 WHERE CAST(observation_payload AS TEXT) LIKE '%unreviewed-redis-candidate%'
+             ) + (
+                 SELECT COUNT(*) FROM alignment_projection
+                 WHERE alignment_payload LIKE '%unreviewed-redis-candidate%'
+             )"
         ),
         0
     );
