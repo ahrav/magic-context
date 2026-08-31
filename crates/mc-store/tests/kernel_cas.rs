@@ -1167,3 +1167,63 @@ fn nested_directory_under_a_shard_is_not_charged_against_the_cap() {
         .unwrap();
     assert_eq!(store.read_artifact(&handle).unwrap(), b"nested usage");
 }
+
+#[test]
+fn secret_in_repository_provenance_is_refused_rather_than_proving_provenance() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    for provenance in [
+        RepositoryProvenance {
+            repository_id: format!("repo key={SECRET}"),
+            revision: "abc123".to_string(),
+        },
+        RepositoryProvenance {
+            repository_id: "repo".to_string(),
+            revision: format!("abc key={SECRET}"),
+        },
+    ] {
+        let mut tainted = request("provenance-secret", b"clean payload".to_vec());
+        tainted.asserted_sensitivity = Sensitivity::Normal;
+        tainted.provenance = Some(provenance);
+        let error = store.ingest_artifact(tainted).unwrap_err();
+
+        assert_eq!(error.kind(), ArtifactErrorKind::InvalidInput);
+    }
+
+    assert!(!tree_bytes(root.path())
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
+fn oversized_repository_provenance_is_rejected_before_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    for provenance in [
+        RepositoryProvenance {
+            repository_id: "r".repeat(4000),
+            revision: "abc123".to_string(),
+        },
+        RepositoryProvenance {
+            repository_id: "repo".to_string(),
+            revision: "v".repeat(4000),
+        },
+    ] {
+        let mut flooded = request("provenance-flood", b"clean payload".to_vec());
+        flooded.provenance = Some(provenance);
+        let error = store.ingest_artifact(flooded).unwrap_err();
+
+        assert_eq!(error.kind(), ArtifactErrorKind::TextFieldTooLong);
+    }
+
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}

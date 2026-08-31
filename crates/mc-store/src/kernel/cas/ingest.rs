@@ -62,6 +62,13 @@ impl PreparedArtifact {
         if !is_artifact_digest(&request.intent.request_digest) {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
+        let (repository_id, revision) =
+            request.provenance.as_ref().map_or(("", ""), |provenance| {
+                (
+                    provenance.repository_id.as_str(),
+                    provenance.revision.as_str(),
+                )
+            });
         if [
             request.evidence_id.as_str(),
             request.object_id.as_str(),
@@ -75,6 +82,8 @@ impl PreparedArtifact {
             request.intent.operation_key.as_str(),
             request.intent.actor.as_str(),
             request.intent.cause.as_str(),
+            repository_id,
+            revision,
         ]
         .into_iter()
         .any(|field| field.len() > MAX_TEXT_FIELD_BYTES)
@@ -88,6 +97,8 @@ impl PreparedArtifact {
             request.domain_id.as_str(),
             request.source_kind.as_str(),
             request.source_id.as_str(),
+            repository_id,
+            revision,
         ]
         .into_iter()
         .any(|field| identity(field).is_err())
