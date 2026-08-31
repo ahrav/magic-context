@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { isValidPublicClaimId } from "../../../../plugin/src/features/magic-context/memory/claim-operation-contract";
+import { revealsAnswer } from "../contract";
 import type { AnswerMatch, ScenarioDeclaration, VerifierContext } from "../contract";
 
 interface ScenarioSpec {
@@ -12,6 +13,14 @@ interface ScenarioSpec {
     /** `exact` only where reproducing the answer's casing is itself the thing under test. */
     answerMatch: AnswerMatch;
     locatorId: string;
+}
+
+/** A pre-search gate for the runner: the resolved ids are interpolated into the model-visible prompt, and a random `mcm_<32hex>` id contains a given two-digit answer roughly one run in nine, which would expose the gold before any retrieval. On true the runner reseeds to obtain different ids rather than scoring the cell — the sample is preserved because reseeding is free, where invalidating would bias against the scenarios with short numeric answers. commentlint: allow(JUDGE) */
+export function r1QueryLeaksAnswer(
+    declaration: ScenarioDeclaration,
+    resolvedLocatorIds: readonly string[],
+): boolean {
+    return resolvedLocatorIds.some((id) => revealsAnswer(declaration.expectedAnswer, id));
 }
 
 /** A validity gate, not a scored check: `ArmedCellResult` keeps only aggregate counts, so scoring this on R1 alone would give R1 a larger denominator than the arms it is subtracted from and manufacture a retrieval delta. A runner calls this and, on false, records the R1 cell as not completed instead of letting it contribute a score. Keyed on the declaration's full handle set, because a runner that resolves only some handles would otherwise pass while R1 held less gold than R2. Matches the delivered memory-row marker (`[memory] ... id=<publicClaimId>`), not a bare id: the empty-results renderer echoes the query back, and a locator query *is* the resolved ids, so a bare substring test passes on zero retrieval. commentlint: allow(JUDGE) */
@@ -80,8 +89,9 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
                 insertAfterTurnId: "turn-burial",
                 locatorIds: [spec.locatorId],
             },
+            /** The same gold content R3 receives, so `R3 - R2` isolates representation rather than also comparing a bare answer against a distractor-bearing sentence — which would make R2 the easier arm. commentlint: allow(JUDGE) */
             r2: {
-                memories: [{ claim: spec.answer, evidence: spec.evidence }],
+                memories: [{ claim: spec.evidence, evidence: spec.evidence }],
             },
             /** Gold evidence verbatim, matching the R3 arm contract; injecting the bare answer would make the critical check trivially satisfiable and collapse the representation regret rung. commentlint: allow(JUDGE) */
             r3: { evidence: spec.evidence },

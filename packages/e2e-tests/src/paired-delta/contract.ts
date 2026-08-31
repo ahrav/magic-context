@@ -55,6 +55,11 @@ export const CHECK_ID_RE = idPattern("check");
 export const TURN_ID_RE = idPattern("turn");
 export const MEMORY_ID_RE = idPattern("mem");
 
+/** A leak asks "could the model read the gold here", so any occurrence counts and case is folded: a model can re-case what it reads. Deliberately wider than the complete-value match used for gold presence, because the two fail safe in opposite directions. Shared so the freeze-time guard and a runner's pre-search gate cannot diverge. commentlint: allow(JUDGE) */
+export function revealsAnswer(expectedAnswer: string, text: string): boolean {
+    return text.toLowerCase().includes(expectedAnswer.toLowerCase());
+}
+
 export class PairedDeltaContractError extends Error {
     readonly diagnostics: readonly string[];
 
@@ -215,9 +220,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         p.fail("scenario.expectedAnswer: not-trimmed");
     }
     const answerMatch = p.enumeration(root.answerMatch, ANSWER_MATCHES, "scenario.answerMatch");
-    /** Deliberately the opposite bound from `suppliesAnswer` below, because the two guards fail safe in opposite directions. A leak asks "could the model read the gold here", so any occurrence counts and a wider match is the conservative one: `alpha-170` exposes `alpha-17`. commentlint: allow(JUDGE) */
-    const revealsAnswer = (text: string): boolean =>
-        text.toLowerCase().includes(expectedAnswer.toLowerCase());
+    const leaks = (text: string): boolean => revealsAnswer(expectedAnswer, text);
     /** Gold presence asks "can the arm derive the exact answer here", so only a complete value counts and a narrower match is the conservative one: `147` does not supply `47`. It also honors the declared casing policy, unlike the leak guard: under `exact` the verifier rejects a differently-cased answer, so folding here would certify gold the arm can never produce. Boundaries are code-point aware through `u`-flag lookaround rather than index arithmetic, which would read one UTF-16 unit and see an astral letter's low surrogate as a separator. Letters, numbers, combining marks, `_`, and `-` are value characters; `.`, `;`, and `,` are not, so a trailing sentence period still matches. commentlint: allow(JUDGE) */
     const suppliesAnswer = (text: string): boolean => {
         const fold = (value: string): string =>
@@ -242,7 +245,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     /** From the insertion turn inclusive: the ballast precedes that turn, so an answer repeated there is not buried either and stays visible to every arm. Runs after the ordering and evidence-gold rules so a misplaced evidence turn reports its own diagnostic instead of surfacing here. commentlint: allow(JUDGE) */
     const postInsertionLeak = (): void => {
         if (
-            turnScript.slice(insertIndex).some(({ content }) => revealsAnswer(content))
+            turnScript.slice(insertIndex).some(({ content }) => leaks(content))
         ) {
             p.fail("scenario.turnScript: post-insertion-answer-leak");
         }
@@ -257,7 +260,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         p.fail("scenario.interventions.r1.locatorIds: exceeds-search-limit");
     }
     /** The resolved handles become the search query, which `scriptedCtxSearchTurn` interpolates into the model-visible prompt, so a handle named after the answer would let R1 pass its critical check with no retrieval. commentlint: allow(JUDGE) */
-    if (locatorIds.some(revealsAnswer)) {
+    if (locatorIds.some(leaks)) {
         p.fail("scenario.interventions.r1.locatorIds: contains-answer");
     }
     const r2 = p.record(interventions.r2, "scenario.interventions.r2");

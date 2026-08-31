@@ -3,8 +3,8 @@
   "scenarios": [
     {
       "scenarioId": "var-compaction-deploy-region",
-      "semanticFingerprint": "6b9fb856c7c1cceb3adb36ccf99cdba4b55addeef7692d271e2c82149538f67d",
-      "verifierBundleDigest": "4a718447bd6444fcf1b50194dd4ae2e1182d1116b18c02490e5eb19f62d590e0",
+      "semanticFingerprint": "125a83bbc3dbe1f92615b77f0f8010222ef806c8fcc0c755f7c8c62174616473",
+      "verifierBundleDigest": "450a994114936ed548053932f3a5770657234cb88ceff07450ddc64cc0bba533",
       "runModes": [
         "calibration",
         "weekly",
@@ -13,16 +13,16 @@
     },
     {
       "scenarioId": "var-compaction-feature-state",
-      "semanticFingerprint": "8fbc5ca97a9f287d291e8da61d88837d8cfa3eaed40b099ccfaa643f4bab27bf",
-      "verifierBundleDigest": "1d8e951844769599871d2bfed2e47005252a97e7129487608d74c3d9364dcf9d",
+      "semanticFingerprint": "bf30d4ac1a59e22905deb9bdb034806d1fa3a749fb6651f5abfd94dc28e04b98",
+      "verifierBundleDigest": "1a3172b5a46125e02026316ed08fa853984850972996eb8d0329538a486a90b8",
       "runModes": [
         "release"
       ]
     },
     {
       "scenarioId": "var-compaction-schema-version",
-      "semanticFingerprint": "2beaf9ad03f4d5f8522b0ae0a5bb853a37c7f68c8a6ba1118efabc0054ef0bc2",
-      "verifierBundleDigest": "7a81950ceab71fe32eb5dfbdda321e3bc5b7cd05cd3f2f431b5a906b680ea6ad",
+      "semanticFingerprint": "a1cb41dcd7702d83d73cc1aa310970d332c2fcc4b5c2c809f04a1e186ea1a869",
+      "verifierBundleDigest": "091c0565a3591301b5a79fca5c301c0f64af6976f55720489ad896a579c7f42b",
       "runModes": [
         "calibration",
         "weekly",
@@ -31,16 +31,16 @@
     },
     {
       "scenarioId": "var-exact-path",
-      "semanticFingerprint": "10d7d8635194cbc5e7445fd5ef175b1d1bbc5763893928b7ccb9260d2d0e020a",
-      "verifierBundleDigest": "a4e1a47b2e9bba41f570536b6b2548b193a7c6ac42bfd82707041dc1161f3b70",
+      "semanticFingerprint": "77fda9fee86abcfb016c1d787ea921dc1daa550a41b366f32b2a23449ce2f076",
+      "verifierBundleDigest": "04bda14d98c3c7efccf85383288ac521c1c60e69acb8386bd5b57df25039aec0",
       "runModes": [
         "release"
       ]
     },
     {
       "scenarioId": "var-exact-symbol",
-      "semanticFingerprint": "b778ce7f328d5e7995636ca4b803bb333f923dde5fdedc8217237d396e0467af",
-      "verifierBundleDigest": "e82e81924473ad18f9c7bf43f7c79f7f2b8f29f03df9d459c5abab3eef6d6c32",
+      "semanticFingerprint": "c8dbbc76e97a7644f8081eff575b4262236eb7689174ab28c7ddcc0c48ae4e92",
+      "verifierBundleDigest": "c09d6461e99a3e224133e0510fce012034812240fc04f3d4de3f9d91547a181b",
       "runModes": [
         "calibration",
         "weekly",
@@ -49,16 +49,16 @@
     },
     {
       "scenarioId": "var-exact-ticket",
-      "semanticFingerprint": "25ea1c62212ae9ca4ccce7a519f65b6e0bafd5027ff4757bb2941a63f014b3f3",
-      "verifierBundleDigest": "e8c38717706fc2cd45c0811fa944fa4b89819247a7cdc2f17336a7634e84e7c8",
+      "semanticFingerprint": "ab7c4b176f8d8bac2d99318f885ed81788e7c07b09f3fe75f4eea1552287ee4b",
+      "verifierBundleDigest": "5066f5a837ace86a422ec9145831c4994a487658eb7d109492206fd6ec61ae1b",
       "runModes": [
         "release"
       ]
     },
     {
       "scenarioId": "var-rejected-database",
-      "semanticFingerprint": "c2187397d937eabe36348d818636ca39b3bb12090894c318c5b6f1dc03460e52",
-      "verifierBundleDigest": "7df454fc85bd4d29d9da50ddddaa2f6cd23d769d10639a8ebeac40eb28303c38",
+      "semanticFingerprint": "34f1e97d514644218b81d735b1a1b102d4d9a5b515528d479533b5265f12357e",
+      "verifierBundleDigest": "de6b155c070a64d48085779d144d3d4404a2b364015056cf650c83dd23598b50",
       "runModes": [
         "calibration",
         "weekly",
@@ -67,24 +67,24 @@
     },
     {
       "scenarioId": "var-rejected-queue",
-      "semanticFingerprint": "9aab79ecf70c147566d8683c65f50d1d5582b427fe09ecc493729991de5c5b39",
-      "verifierBundleDigest": "895614d80e03424442da0a250f0454cba1aefbd6809501237fe4f3929734af64",
+      "semanticFingerprint": "1b27304dc3a5b8c09287f7060ce2301df0254175256fe8f5d0742ad1f4071f8f",
+      "verifierBundleDigest": "824a6e69305c4d7943331b5cd760821d06d7f7994fad9372398f54f241f97283",
       "runModes": [
         "release"
       ]
     },
     {
       "scenarioId": "var-superseded-owner",
-      "semanticFingerprint": "5aadad127e59442378f66f6bc12ef116d5a7c7139b7819e4a109fc85290df4de",
-      "verifierBundleDigest": "762d819280d71d308920712ce631bd8fbf78b398106e1875f47586268bcb157c",
+      "semanticFingerprint": "6fea0534b15b04787c442b85a6f3073a4e6ad59ca688ec85ccc51dd384e83c3e",
+      "verifierBundleDigest": "117afb769c963cc551e68b103ff7b9d523452a22245e1c6fd028023d042758af",
       "runModes": [
         "release"
       ]
     },
     {
       "scenarioId": "var-superseded-timeout",
-      "semanticFingerprint": "4c0fbb37e66b02697aee915ace837c4dce5746e34b7e424144a22432b4e9690a",
-      "verifierBundleDigest": "83eb4a87d2a2fd40f5ae68c448110af5b8051e12b47a1c6695dc6702b59d6920",
+      "semanticFingerprint": "476ce992d7b022d8e47372561d8faa6c2f7a6d69acafce02b20679a07b7eb686",
+      "verifierBundleDigest": "6aff1e13feb898a11ccfb468803fe60d9c211ae7611f0b544ae9712262c66296",
       "runModes": [
         "calibration",
         "weekly",

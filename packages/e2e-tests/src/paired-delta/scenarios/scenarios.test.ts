@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { validateCheckVector } from "../contract";
 import { CHARS_PER_TOKEN } from "../../ballast";
 import { pairedDeltaScenarios } from "./index";
-import { r1WireDelivered } from "./support";
+import { r1QueryLeaksAnswer, r1WireDelivered } from "./support";
 import { packSearchResults } from "../../../../plugin/src/tools/ctx-search/render";
 import type { MemorySearchResult } from "../../../../plugin/src/features/magic-context/search";
 
@@ -75,6 +75,17 @@ describe("paired-delta authored scenarios", () => {
             } finally {
                 rmSync(root, { recursive: true, force: true });
             }
+        });
+
+        it(`${scenario.scenarioId} carries the same gold in R2 and R3`, () => {
+            expect(scenario.interventions.r2.memories.map(({ claim }) => claim))
+                .toContain(scenario.interventions.r3.evidence);
+        });
+
+        it(`${scenario.scenarioId} flags a resolved id that reveals the answer`, () => {
+            expect(r1QueryLeaksAnswer(scenario, ["mcm_" + "a".repeat(32)])).toBe(false);
+            const leaking = `mcm_${scenario.expectedAnswer.toLowerCase()}${"a".repeat(32)}`;
+            expect(r1QueryLeaksAnswer(scenario, [leaking])).toBe(true);
         });
 
         it(`${scenario.scenarioId} gates R1 wire delivery outside the scored checks`, async () => {
