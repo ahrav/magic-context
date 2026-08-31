@@ -195,7 +195,15 @@ export function isCredentialBearingConfigKey(key: string): boolean {
         segments.pop();
     }
     // Separators are dropped rather than split on, so `APIKEY` is judged like `api_key`.
-    const compact = segments.join("");
+    let compact = segments.join("");
+    /** An all-caps glued name gives the camel-case split nothing to break on, so `DBPASSWORDVALUE` arrives as one segment and the loop above cannot reach its descriptor. Peeling the descriptor off the compacted form reads it the same way `dbPasswordValue` is read. commentlint: allow(JUDGE) */
+    for (;;) {
+        const descriptor = [...TRAILING_DESCRIPTORS].find(
+            (word) => compact.length > word.length && compact.endsWith(word),
+        );
+        if (descriptor === undefined) break;
+        compact = compact.slice(0, -descriptor.length);
+    }
     // The qualifier is read from the adjacent segment, not from any prefix of the compacted
     // key: `identityTokens` and `idleTokens` both begin with `id`.
     const qualifier = segments.length > 1 ? segments.at(-2) : undefined;
@@ -237,8 +245,8 @@ const CREDENTIAL_VALUE_FORMATS: ReadonlyArray<{ label: string; pattern: RegExp }
     { label: "AWS access key id", pattern: /^(?:AKIA|ASIA)[0-9A-Z]{12,}/ },
     { label: "Google API key", pattern: /^AIza[0-9A-Za-z_-]{30,}/ },
     { label: "Hugging Face token", pattern: /^hf_[A-Za-z0-9]{30,}/ },
-    /** The same prefix set `SECRET_TEXT_PATTERNS` redacts: `xoxu`, `xoxv`, and `xoxc` are user, bot-refresh, and browser-session tokens, no less usable than the `xoxb` shape. commentlint: allow(JUDGE) */
-    { label: "Slack token", pattern: /^xox[abprsuvc]-[0-9A-Za-z-]{10,}/ },
+    /** The same prefix set `SECRET_TEXT_PATTERNS` redacts: `xoxu`, `xoxv`, and `xoxc` are user, bot-refresh, and browser-session tokens, and `xapp-` is the app-level token, none of them less usable than the `xoxb` shape. commentlint: allow(JUDGE) */
+    { label: "Slack token", pattern: /^(?:xox[abprsuvc]|xapp)-[0-9A-Za-z-]{10,}/ },
     { label: "PEM private key", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
     /** Any userinfo at all: the password may be empty (`redis://:secret@host`) or absent (`https://ghp_token@host`), and a bare token in the username position is the shape a personal access token takes. commentlint: allow(JUDGE) */
     { label: "credential-bearing URI", pattern: /^[a-z][a-z0-9+.-]*:\/\/[^/@\s]+@/i },
@@ -303,7 +311,7 @@ const SECRET_TEXT_PATTERNS: Array<{
         replacement: "<AWS_ACCESS_KEY_ID_REDACTED>",
     },
     {
-        pattern: /\bxox[abprsuvc]-[A-Za-z0-9-]{10,}/g,
+        pattern: /\b(?:xox[abprsuvc]|xapp)-[A-Za-z0-9-]{10,}/g,
         replacement: "<SLACK_TOKEN_REDACTED>",
     },
     {

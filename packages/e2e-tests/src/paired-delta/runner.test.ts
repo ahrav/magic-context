@@ -1259,6 +1259,31 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("rejects a records file total that cannot be summed and frees the claim", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-file-total-"));
+        try {
+            const path = join(root, "records.json");
+            const half = Number.MAX_VALUE * 0.6;
+            writeFileSync(
+                path,
+                JSON.stringify([
+                    { ...storedRecord("mc-on"), costUsd: half, maxAttemptCostUsd: half },
+                    { ...storedRecord("mc-off"), costUsd: half, maxAttemptCostUsd: half },
+                ]),
+            );
+
+            const store = new FileRolloutStore(path);
+            expect(() => store.list()).toThrow(/spend-total-invalid/);
+            // Parsing releases the claim, so a corrected path is usable in this process.
+            writeFileSync(path, JSON.stringify([storedRecord("mc-on")]));
+            const retried = new FileRolloutStore(path);
+            expect(retried.list()).toHaveLength(1);
+            retried.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("reserves the failure estimate before starting an arm", async () => {
         const store = new MemoryStore();
         // A first arm priced far below the scenario's full-context fallback.

@@ -146,6 +146,11 @@ describe("isCredentialBearingConfigKey", () => {
             "masterKeyId",
             "apiKeyHeader",
             "accessTokenValue",
+            // An all-caps glued name gives the camel-case split nothing to break on, so its descriptor has to come off the compacted form.
+            "DBPASSWORDVALUE",
+            "MASTERKEYID",
+            "APIKEYHEADER",
+            "ACCESSTOKENVALUE",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(true);
         }
@@ -168,6 +173,11 @@ describe("isCredentialBearingConfigKey", () => {
             // Structural keys keep their descriptors too.
             "primaryKeyId",
             "foreignKeyValue",
+            // Peeling a descriptor off the compacted form must not promote a structural key.
+            "PRIMARYKEYID",
+            "FOREIGNKEYVALUE",
+            "HOTKEY",
+            "PARTITIONKEY",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(false);
         }
@@ -200,7 +210,17 @@ describe("credentialValueFormat", () => {
         expect(credentialValueFormat("hf_abcdefghijklmnopqrstuvwxyz0123456789")).toBe(
             "Hugging Face token",
         );
-        for (const prefix of ["xoxa", "xoxb", "xoxp", "xoxr", "xoxs", "xoxu", "xoxv", "xoxc"]) {
+        for (const prefix of [
+            "xoxa",
+            "xoxb",
+            "xoxp",
+            "xoxr",
+            "xoxs",
+            "xoxu",
+            "xoxv",
+            "xoxc",
+            "xapp",
+        ]) {
             expect(credentialValueFormat(`${prefix}-0123456789abcdef`)).toBe("Slack token");
         }
 

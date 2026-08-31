@@ -149,7 +149,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             "<AWS_ACCESS_KEY_ID_REDACTED>",
         ),
         fixed(
-            r"(?-u:\b)xox[abprsuvc]-[A-Za-z0-9-]{10,}",
+            r"(?-u:\b)(?:xox[abprsuvc]|xapp)-[A-Za-z0-9-]{10,}",
             "slack_token",
             "<SLACK_TOKEN_REDACTED>",
         ),

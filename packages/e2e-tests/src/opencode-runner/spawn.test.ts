@@ -181,6 +181,7 @@ describe("opencode child lifecycle", () => {
                 ["hf_abcdefghijklmnopqrstuvwxyz0123456789", "Hugging Face token"],
                 ["xoxu-0123456789abcdef", "Slack token"],
                 ["xoxc-0123456789abcdef", "Slack token"],
+                ["xapp-1-A0123456789-1234567890123-abcdef", "Slack token"],
                 ["postgres://user:hunter2@db.internal/app", "credential-bearing URI"],
             ] as const) {
                 const attempt = () =>

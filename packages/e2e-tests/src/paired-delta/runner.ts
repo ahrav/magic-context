@@ -299,6 +299,14 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
         }
         seen.add(key);
     });
+    /** Every attempt cost is non-negative, so a finite total over the whole file makes every subset total finite too — including the matrix subset the pre-scan bills. Checked here rather than at the pre-scan because the store releases its claim when parsing rejects, which leaves a corrected records path retryable in the same process. commentlint: allow(JUDGE) */
+    const total = (raw as RolloutRecord[]).reduce(
+        (sum, record) => sum + record.priorAttemptsCostUsd + record.costUsd,
+        0,
+    );
+    if (!Number.isFinite(total)) {
+        throw new Error(`rollout store ${path}: spend-total-invalid`);
+    }
     return raw as RolloutRecord[];
 }
 
@@ -555,6 +563,11 @@ function validateRunOptions(options: RunPairedDeltaOptions): void {
     }
 }
 
+/**
+ * A caller that owns the store releases it on rejection before retrying in the same process.
+ * `RolloutStore` cannot release claims acquired by `store.list()`, so retries after rejection can fail with `RolloutStoreBusyError`.
+ * commentlint: allow(JUDGE)
+ */
 export async function runPairedDelta(
     options: RunPairedDeltaOptions,
     dependencies: RunnerDependencies,
@@ -602,7 +615,7 @@ export async function runPairedDelta(
         /** The reserve is the expected price of the next single call, so it takes the dearest attempt this coordinate has seen — not the cumulative total, which several cheap failures would inflate into a budget the next rollout cannot fit. commentlint: allow(JUDGE) */
         reserveUsd = Math.max(reserveUsd, record.costUsd, record.maxAttemptCostUsd);
         spentUsd += record.priorAttemptsCostUsd + record.costUsd;
-        /** The parser bounds each record's own attempt total, which leaves the sum across records unbounded: enough near-maximal records make `spentUsd` infinite, and from there every cap comparison is false and the summary serializes the figure as `null`. The ledger is refused at the first accumulation that leaves the finite range rather than admitting rollouts against it. commentlint: allow(JUDGE) */
+        /** `parseRolloutRecords` bounds the file's whole total, but `RolloutStore` is an interface any caller can implement, so a store that skips that check still cannot hand this loop an unbounded ledger: an infinite `spentUsd` makes every cap comparison false and serializes as `null`. A store reaching this throw holds no records claim to release, because the file store rejects the same total while parsing. commentlint: allow(JUDGE) */
         if (!Number.isFinite(spentUsd)) {
             throw new Error(
                 `records file spend total overflows the finite range at ` +
