@@ -158,7 +158,8 @@ function writeConfigs(
     const pluginSpec = `file://${pluginEntry}`;
     const extra = opts.openCodeConfigExtra ?? {};
     const contributedProviders = extra.provider;
-    assertProviderConfigHasNoCredentials(contributedProviders);
+    /** Everything in `openCodeConfigExtra` is written into the config an unauthenticated serve reads, not just the provider map, so an MCP `Authorization` header would sit behind the same remotely reachable API. commentlint: allow(JUDGE) */
+    assertConfigHasNoCredentials(extra);
     const extraWithoutProvider = { ...extra };
     delete extraWithoutProvider.provider;
 
@@ -250,10 +251,10 @@ function writeConfigs(
 }
 
 /**
- * `assertProviderConfigHasNoCredentials` matches key names and never values, so
+ * `assertConfigHasNoCredentials` matches key names and never values, so
  * `opencode.json` can still contain a credential stored under an innocuous key.
  */
-function assertProviderConfigHasNoCredentials(value: unknown): void {
+function assertConfigHasNoCredentials(value: unknown): void {
     const seen = new WeakSet<object>();
     const visit = (current: unknown, path: string): void => {
         if (current === null || typeof current !== "object" || seen.has(current)) return;
@@ -262,14 +263,14 @@ function assertProviderConfigHasNoCredentials(value: unknown): void {
             const childPath = `${path}.${key}`;
             if (!Array.isArray(current) && isSecretKey(key)) {
                 throw new Error(
-                    `provider config contains credential-shaped key: ${childPath}; ` +
+                    `config contains credential-shaped key: ${childPath}; ` +
                         "pass credentials through extraEnv",
                 );
             }
             visit(child, childPath);
         }
     };
-    visit(value, "provider");
+    visit(value, "openCodeConfigExtra");
 }
 
 /**
@@ -430,7 +431,7 @@ function isInheritableEnvKey(key: string): boolean {
  * Checking the assembled environment would reject every default spawn because it contains the fake `ANTHROPIC_API_KEY`.
  *
  * `assertSecretsBoundToLoopback` does not inspect credentials embedded in `openCodeConfigExtra`.
- * `writeConfigs` applies `assertProviderConfigHasNoCredentials` to that channel instead.
+ * `writeConfigs` applies `assertConfigHasNoCredentials` to that channel instead.
  *
  * `Pick<SpawnOptions>` permits forwarding `extraEnv` without `hostname`.
  * Omitting `hostname` uses the all-interfaces default.

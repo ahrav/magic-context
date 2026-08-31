@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     FileRolloutStore,
+    RolloutStoreBusyError,
     ProviderUnavailableError,
     baseScriptFingerprint,
     computeRegretRungs,
@@ -696,6 +697,71 @@ describe("paired-delta runner", () => {
         ).rejects.toThrow(/duplicates the fixture route/);
     });
 
+    it("persists a rollout whose other observation fields are not JSON-safe", async () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-unwritable-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            const result = await runPairedDelta(
+                { ...options(), store },
+                dependencies((armId) => {
+                    const value = observation(armId);
+                    if (armId === "mc-off") {
+                        value.turns = 2n as unknown as number;
+                        value.echoedModelId = { id: "snapshot" } as unknown as string;
+                    }
+                    return value;
+                }),
+            );
+            const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+            expect(malformed?.cell).toMatchObject({
+                runHealth: "malformed",
+                reasonCode: "invalid-result",
+            });
+            expect(malformed?.turns).toBe(0);
+            expect(malformed?.echoedModelId).toBeNull();
+            store.release();
+            expect(new FileRolloutStore(path).list().filter(({ armId }) => armId === "mc-off"))
+                .toHaveLength(1);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("refuses a second runner over a records path already in use", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-lock-"));
+        // A live process other than this one, standing in for the concurrent
+        // runner that would pay for the same coordinates and then publish a
+        // snapshot erasing the other's records.
+        const other = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+        try {
+            const path = join(root, "records.json");
+            writeFileSync(`${path}.lock`, `${other.pid}\n`);
+
+            expect(() => new FileRolloutStore(path).list()).toThrow(RolloutStoreBusyError);
+
+            other.kill();
+        } finally {
+            other.kill();
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("reclaims a lock whose owner is gone", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-stale-lock-"));
+        try {
+            const path = join(root, "records.json");
+            // A pid that cannot be running: a crashed run leaves its lock behind
+            // and must not wedge the next one.
+            writeFileSync(`${path}.lock`, "2147483646\n");
+
+            expect(() => new FileRolloutStore(path).list()).not.toThrow();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("classifies a malformed check vector as an exclusion and continues", async () => {
         const result = await runPairedDelta(
             options(),
@@ -1149,6 +1215,7 @@ describe("file rollout store", () => {
 
             for (const patch of [
                 { cell: { ...record.cell, reasonCode: "harness-failure" } },
+                { cell: { ...record.cell, invalidSuccess: true } },
                 { cell: { ...record.cell, checksTotal: 0, checksPassed: 0 } },
                 { checks: [] as typeof record.checks },
             ]) {

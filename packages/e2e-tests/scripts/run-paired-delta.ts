@@ -52,8 +52,17 @@ function parseArgs(argv: string[]): CliArgs {
     return { recordsPath: resolve(recordsPath), resume, maxCostUsd, deadlineMinutes };
 }
 
+/** Returns the worktree-relative path, or null when the target sits outside the worktree and cannot appear in its status. commentlint: allow(JUDGE) */
+function relativeTo(root: string, target: string): string | null {
+    const rooted = resolve(root);
+    const path = resolve(target);
+    if (path === rooted) return null;
+    const prefix = rooted.endsWith("/") ? rooted : `${rooted}/`;
+    return path.startsWith(prefix) ? path.slice(prefix.length) : null;
+}
+
 /** A resume must not skip coordinates recorded by a different checkout: `bindingMatches` compares `repoCommit`, so a constant would let a post-change smoke report success without executing the changed code. commentlint: allow(JUDGE) */
-function smokeRepoCommit(): string {
+function smokeRepoCommit(recordsPath: string): string {
     const started = resolve(import.meta.dir, "..");
     const at = (cwd: string) => (args: string[]): string => {
         const run = Bun.spawnSync(["git", ...args], { cwd });
@@ -66,10 +75,19 @@ function smokeRepoCommit(): string {
     const root = at(started)(["rev-parse", "--show-toplevel"]).trim();
     const git = at(root);
     const commit = git(["rev-parse", "HEAD"]).trim();
-    const status = git(["status", "--porcelain", "--untracked-files=all"]).trim();
+    /** The runner writes its own records file, so hashing it would change the binding on every run and reject every completed coordinate the resume exists to reuse. commentlint: allow(JUDGE) */
+    const relative = relativeTo(root, recordsPath);
+    const scope = relative === null ? ["."] : [".", `:(exclude)${relative}`];
+    const status = git([
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--",
+        ...scope,
+    ]).trim();
     if (status === "") return commit;
     /** An uncommitted worktree shares its parent's commit, so the digest covers the working content itself: paths and status codes alone stay identical when a file's bytes change, and a resume would reuse records written before the edit. commentlint: allow(JUDGE) */
-    const untracked = git(["ls-files", "--others", "--exclude-standard", "-z"])
+    const untracked = git(["ls-files", "--others", "--exclude-standard", "-z", "--", ...scope])
         .split("\0")
         .filter(Boolean);
     const contents = untracked.map((path) => {
@@ -80,7 +98,7 @@ function smokeRepoCommit(): string {
             return `${path}\n<unreadable>`;
         }
     });
-    const pending = [status, git(["diff", "HEAD"]), ...contents].join("\n");
+    const pending = [status, git(["diff", "HEAD", "--", ...scope]), ...contents].join("\n");
     return `${commit}-dirty-${Bun.hash(pending).toString(16)}`;
 }
 
@@ -170,7 +188,7 @@ async function main(): Promise<void> {
         {
             scenarios: SCENARIOS,
             poolManifestFingerprint: "smoke-pool-v1",
-            repoCommit: smokeRepoCommit(),
+            repoCommit: smokeRepoCommit(args.recordsPath),
             pinnedProviderId: "mock-live",
             pinnedSnapshotId: "mock-snapshot-2026-08-31",
             replicateCount: 1,

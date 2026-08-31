@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
 import {
@@ -299,6 +300,8 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
         if (armedCell.runHealth === "completed") {
             if (
                 armedCell.reasonCode !== null ||
+                /** A live record sets this flag only for a claimed success that failed a critical check, so the combination cannot have been produced by a run and would inflate invalid-success counts. commentlint: allow(JUDGE) */
+                (armedCell.invalidSuccess && armedCell.criticalPassed >= armedCell.criticalTotal) ||
                 armedCell.checksTotal === 0 ||
                 vector.length !== armedCell.checksTotal ||
                 vector.filter((check) => check.passed).length !== armedCell.checksPassed
@@ -321,17 +324,72 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
     return raw as RolloutRecord[];
 }
 
+/** Two runners over one records path each cache the pre-run array and publish a private snapshot, so the later rename erases the other's record after both paid calls happened — and the erased spend is then repeated on resume. The lock is taken before the first read, because by the time a write conflicts the money is already gone. commentlint: allow(JUDGE) */
+export class RolloutStoreBusyError extends Error {}
+
+
 export class FileRolloutStore implements RolloutStore {
     private records: RolloutRecord[] | null = null;
     private indexByCoordinate = new Map<string, number>();
+    private readonly lockPath: string;
+    private lockHeld = false;
+    private readonly releaseOnExit = () => this.release();
 
-    constructor(private readonly path: string) {}
+    constructor(private readonly path: string) {
+        this.lockPath = `${path}.lock`;
+    }
 
     list(): RolloutRecord[] {
+        this.acquire();
         return [...this.load()];
     }
 
+    /** Removes this process's claim on the records path. Safe to call when no lock is held. commentlint: allow(JUDGE) */
+    release(): void {
+        if (!this.lockHeld) return;
+        this.lockHeld = false;
+        process.off("exit", this.releaseOnExit);
+        try {
+            rmSync(this.lockPath, { force: true });
+        } catch {
+            /** A lock file left behind is reclaimed by the next run's liveness check. commentlint: allow(JUDGE) */
+        }
+    }
+
+    private acquire(): void {
+        if (this.lockHeld) return;
+        /** The records path's directory is created by the first publish, so the lock cannot assume it exists. commentlint: allow(JUDGE) */
+        mkdirSync(dirname(this.lockPath), { recursive: true });
+        try {
+            writeFileSync(this.lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+            /** A crashed run cannot release its lock, so an owner that no longer exists is not a conflict; `kill(pid, 0)` is the liveness test and `ESRCH` means the process is gone. commentlint: allow(JUDGE) */
+            const owner = Number.parseInt(readFileSync(this.lockPath, "utf8").trim(), 10);
+            if (Number.isSafeInteger(owner) && owner > 0 && owner !== process.pid) {
+                try {
+                    process.kill(owner, 0);
+                    throw new RolloutStoreBusyError(
+                        `rollout store ${this.path} is in use by pid ${owner}`,
+                    );
+                } catch (probe) {
+                    if (probe instanceof RolloutStoreBusyError) throw probe;
+                    if ((probe as NodeJS.ErrnoException).code === "EPERM") {
+                        throw new RolloutStoreBusyError(
+                            `rollout store ${this.path} is in use by pid ${owner}`,
+                        );
+                    }
+                }
+            }
+            rmSync(this.lockPath, { force: true });
+            writeFileSync(this.lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+        }
+        this.lockHeld = true;
+        process.on("exit", this.releaseOnExit);
+    }
+
     put(record: RolloutRecord): void {
+        this.acquire();
         const records = this.load();
         const key = coordinateKey(record);
         const index = this.indexByCoordinate.get(key);
@@ -737,6 +795,14 @@ function completedRecord(
         observedInterventionFingerprint !== null &&
         observedInterventionFingerprint === interventionFingerprint(expectedIntervention);
     const usage = finiteUsage(observation.usage);
+    /** Every field copied onto the record crosses the adapter boundary, and one value `JSON.stringify` refuses makes the whole record unwritable — which loses the paid coordinate instead of recording it as malformed. commentlint: allow(JUDGE) */
+    const echoesAreStrings = (observation.echoedProviderId === null ||
+        typeof observation.echoedProviderId === "string") &&
+        (observation.echoedModelId === null || typeof observation.echoedModelId === "string");
+    const shapeIsWritable = echoesAreStrings &&
+        typeof observation.baseScriptFingerprint === "string" &&
+        Number.isSafeInteger(observation.turns) &&
+        (observation.turns as number) >= 0;
     /** These gates decide whether the rollout counts as evidence, and a JSON-derived `"false"` is truthy, so a non-boolean would pass the exclusion it is supposed to trip. commentlint: allow(JUDGE) */
     const gatesAreBoolean = typeof observation.absencePreconditionHeld === "boolean" &&
         typeof observation.armIdentityMatches === "boolean" &&
@@ -744,7 +810,7 @@ function completedRecord(
     /** A harness that would not dispose may still be running and contaminating later arms, so its result cannot stand as evidence however well the rollout itself went. Non-finite usage is checked next because a cost derived from it would poison `spentUsd` for every later cap comparison. commentlint: allow(JUDGE) */
     let reasonCode: ReasonCode | null = disposalFailed
         ? "harness-failure"
-        : usage === null || !gatesAreBoolean
+        : usage === null || !gatesAreBoolean || !shapeIsWritable
             ? "invalid-result"
             : !observation.absencePreconditionHeld
                 ? "absence-precondition-unmet"
@@ -783,9 +849,11 @@ function completedRecord(
         repoCommit: options.repoCommit,
         pinnedProviderId: options.pinnedProviderId,
         pinnedSnapshotId: options.pinnedSnapshotId,
-        echoedProviderId: observation.echoedProviderId,
-        echoedModelId: observation.echoedModelId,
-        baseScriptFingerprint: observation.baseScriptFingerprint,
+        echoedProviderId: echoesAreStrings ? observation.echoedProviderId : null,
+        echoedModelId: echoesAreStrings ? observation.echoedModelId : null,
+        baseScriptFingerprint: typeof observation.baseScriptFingerprint === "string"
+            ? observation.baseScriptFingerprint
+            : expectedFingerprint,
         /** A descriptor the canonicalizer refuses is also one `JSON.stringify` refuses, and the store must be able to write this record: an unwritable malformed record loses the paid coordinate. It is never read as evidence, because only completed records reach the regret comparison. commentlint: allow(JUDGE) */
         intervention: observedInterventionFingerprint === null
             ? expectedIntervention
@@ -812,7 +880,9 @@ function completedRecord(
         priorAttemptsCostUsd,
         costSource: usage === null ? "estimated" : "observed",
         wallClockMs,
-        turns: observation.turns,
+        turns: Number.isSafeInteger(observation.turns) && observation.turns >= 0
+            ? observation.turns
+            : 0,
         harnessDisposed,
     };
 }

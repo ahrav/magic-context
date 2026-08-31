@@ -105,7 +105,9 @@ describe("opencode child lifecycle", () => {
                         },
                     },
                 }),
-            ).toThrow(/provider config contains credential-shaped key: provider\.anthropic\.options\.apiKey/);
+            ).toThrow(
+                /credential-shaped key: openCodeConfigExtra\.provider\.anthropic\.options\.apiKey/,
+            );
             expect(existsSync(join(env.configDir, "opencode.json"))).toBe(false);
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -130,12 +132,25 @@ describe("opencode child lifecycle", () => {
         try {
             for (const dir of Object.values(env)) mkdirSync(dir, { recursive: true });
             expect(write({ headers: { "x-api-key": "sk-live" } })).toThrow(
-                /credential-shaped key: provider\.anthropic\.options\.headers\.x-api-key/,
+                /credential-shaped key: openCodeConfigExtra\.provider\.anthropic\.options\.headers\.x-api-key/,
             );
             expect(write({ accessToken: "sk-live" })).toThrow(/accessToken/);
             expect(write({ clientSecret: "sk-live" })).toThrow(/clientSecret/);
             expect(write({ secret_access_key: "sk-live" })).toThrow(/secret_access_key/);
             expect(write({ maxTokens: 4096, baseURL: "http://127.0.0.1:1" })).not.toThrow();
+
+            // Everything in the extra config reaches the same serve config, so a
+            // credential outside `provider` is refused as well.
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                    openCodeConfigExtra: {
+                        mcp: { docs: { headers: { Authorization: "Bearer sk-live" } } },
+                    },
+                })
+            ).toThrow(
+                /credential-shaped key: openCodeConfigExtra\.mcp\.docs\.headers\.Authorization/,
+            );
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
