@@ -26,8 +26,6 @@ md5 = "0.7"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [features]
-# Public seed helpers for sibling crates' tests (mc-module composes over this store
-# and needs to populate it). Gated so the writers never ship in production builds.
 test-support = []
 
 # The benchmark reuses `tests/support/git_fixtures.rs` via `#[path]`. The
@@ -47,3 +45,7 @@ gix = { workspace = true }
 criterion = "=0.8.2"
 proptest = "1"
 tempfile = "3"
+
+[[bench]]
+name = "scope_algebra"
+harness = false

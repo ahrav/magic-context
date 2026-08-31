@@ -5,6 +5,5 @@ edition = "2021"
 publish = false
 description = "STRICT compile-closure stub. subc-core is a declared-only dev-dependency edge (no `use subc_core` anywhere); the stub is deliberately empty. Never run."
 
-# Standalone workspace root: cargo invoked in this evidence dir must not try
-# to join the enclosing repo workspace, which does not list these stubs.
+# Cargo must treat this directory as a workspace root to avoid joining the enclosing workspace.
 [workspace]

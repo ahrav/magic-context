@@ -51,6 +51,40 @@ fn exact_anchor_compares_against_the_context_token() {
 }
 
 #[test]
+fn redaction_placeholders_evaluate_uncertain_never_current() {
+    // Distinct secrets collapse onto one redaction token, so equality on a
+    // placeholder would report two unrelated values as the same anchor.
+    for token in ["<REDACTED:token>", "<GITHUB_PAT_REDACTED>"] {
+        let stored_placeholder = decode(&AnchorRowSpec {
+            exact_value: Some(format!("deploy={token}")),
+            ..row("exact")
+        });
+        let matching_ctx = QueryContext {
+            exact_token: Some(format!("deploy={token}")),
+            ..QueryContext::default()
+        };
+        assert_eq!(
+            evaluate_non_git(&stored_placeholder, &matching_ctx),
+            AnchorEvaluation::Uncertain,
+            "{token} stored value must never hold"
+        );
+        let plain = decode(&AnchorRowSpec {
+            deployment_revision: Some("rev-42".to_string()),
+            ..row("deployment_revision")
+        });
+        let placeholder_ctx = QueryContext {
+            deployment_revision: Some(format!("rev-{token}")),
+            ..QueryContext::default()
+        };
+        assert_eq!(
+            evaluate_non_git(&plain, &placeholder_ctx),
+            AnchorEvaluation::Uncertain,
+            "{token} context value must never decide"
+        );
+    }
+}
+
+#[test]
 fn deployment_and_config_revisions_hold_fail_and_stay_uncertain() {
     for (kind, context_field) in [
         ("deployment_revision", "deployment"),
@@ -122,14 +156,21 @@ fn platform_version_coerces_non_semver_context_values() {
         evaluate_non_git(&condition, &with_version("14.4")),
         AnchorEvaluation::Holds
     );
-    // Vendor-suffixed build strings demote the suffix to a pre-release
-    // rather than failing the parse; pre-releases do not match a plain
-    // range, so the verdict is a definite non-match, not a panic.
-    let vendored = evaluate_non_git(&condition, &with_version("14.4.1ubuntu3"));
-    assert!(matches!(
-        vendored,
-        AnchorEvaluation::Holds | AnchorEvaluation::DoesNotHold { .. }
-    ));
+    // Vendor suffixes become SemVer build metadata, which comparison
+    // ignores.
+    assert_eq!(
+        evaluate_non_git(&condition, &with_version("14.4.1ubuntu3")),
+        AnchorEvaluation::Holds
+    );
+    assert_eq!(
+        evaluate_non_git(&condition, &with_version("14.4.0-91-generic")),
+        AnchorEvaluation::Holds
+    );
+    // Four-component platform versions truncate to the semver core.
+    assert_eq!(
+        evaluate_non_git(&condition, &with_version("14.4.1041.7")),
+        AnchorEvaluation::Holds
+    );
     // Unparseable strings are uncertain, never a match and never a panic.
     assert_eq!(
         evaluate_non_git(&condition, &with_version("not-a-version")),
@@ -257,4 +298,87 @@ fn corrupt_capture_payload_only_disables_fallback_rungs() {
         }
         other => panic!("expected reachable_from, got {other:?}"),
     }
+}
+
+#[test]
+fn rows_populating_another_kinds_column_fail_decode() {
+    // A migration that leaves a stale column behind must not decode as the
+    // narrower condition its `anchor_kind` names.
+    assert_eq!(
+        AnchorCondition::decode(&AnchorRowSpec {
+            exact_value: Some("pinned-token".to_string()),
+            reachable_from_oid: Some(oid(1)),
+            ..row("exact")
+        })
+        .unwrap_err(),
+        AnchorDecodeError::ConflictingColumns(AnchorKind::Exact)
+    );
+    assert_eq!(
+        AnchorCondition::decode(&AnchorRowSpec {
+            exact_value: Some("pinned-token".to_string()),
+            deployment_revision: Some("r1".to_string()),
+            ..row("exact")
+        })
+        .unwrap_err(),
+        AnchorDecodeError::ConflictingColumns(AnchorKind::Exact)
+    );
+    assert_eq!(
+        AnchorCondition::decode(&AnchorRowSpec {
+            platform_version_range: Some(">=1.0.0".to_string()),
+            wall_clock_start: Some(1),
+            ..row("platform_version")
+        })
+        .unwrap_err(),
+        AnchorDecodeError::ConflictingColumns(AnchorKind::PlatformVersion)
+    );
+    // Only the git kinds own the capture payload.
+    assert_eq!(
+        AnchorCondition::decode(&AnchorRowSpec {
+            config_revision: Some("c1".to_string()),
+            payload: Some(b"{}".to_vec()),
+            ..row("config_revision")
+        })
+        .unwrap_err(),
+        AnchorDecodeError::ConflictingColumns(AnchorKind::ConfigRevision)
+    );
+    let with_captures = decode(&AnchorRowSpec {
+        reachable_from_oid: Some(oid(1)),
+        payload: Some(encode_anchor_captures(&[])),
+        ..row("reachable_from")
+    });
+    assert!(matches!(
+        with_captures,
+        AnchorCondition::Git(GitCondition::ReachableFrom { .. })
+    ));
+}
+
+#[test]
+fn redacted_platform_version_is_uncertain() {
+    let condition = decode(&AnchorRowSpec {
+        platform_version_range: Some("=1.2.3".to_string()),
+        ..row("platform_version")
+    });
+    for raw in ["1.2.3-<REDACTED:password>", "1.2.3+<GITHUB_TOKEN_REDACTED>"] {
+        assert_eq!(
+            evaluate_non_git(
+                &condition,
+                &QueryContext {
+                    platform_version: Some(raw.to_string()),
+                    ..QueryContext::default()
+                }
+            ),
+            AnchorEvaluation::Uncertain,
+            "a replacement token must not leave the numeric core deciding {raw}"
+        );
+    }
+    assert_eq!(
+        evaluate_non_git(
+            &condition,
+            &QueryContext {
+                platform_version: Some("1.2.3".to_string()),
+                ..QueryContext::default()
+            }
+        ),
+        AnchorEvaluation::Holds
+    );
 }

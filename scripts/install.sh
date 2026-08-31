@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Magic Context — Interactive Setup
-# Usage: curl -fsSL https://raw.githubusercontent.com/ahrav/magic-context/main/scripts/install.sh | bash
+# Run the installer with `curl -fsSL https://raw.githubusercontent.com/ahrav/magic-context/main/scripts/install.sh | bash`.
 
 PACKAGE="@cortexkit/magic-context"
 MIN_NODE_MAJOR=20
 MIN_NODE_MINOR=12
 
-# Return 0 if system node satisfies the minimum version (Clack prompts need
-# node:util.styleText which landed in Node 20.12).
+# Clack prompts require `node:util.styleText`, introduced in Node 20.12.
 check_node_version() {
   if ! command -v node &>/dev/null; then
     return 1
@@ -33,14 +31,9 @@ main() {
   echo "  ────────────────────────"
   echo ""
 
-  # Always pin "@latest": without an explicit version, npx resolves from its
-  # on-disk cache rather than re-resolving the npm dist-tag. A user who
-  # previously installed (e.g.) v0.15.4 would keep getting the cached bundle
-  # even after a patch ships. "@latest" forces a registry round-trip that
-  # respects the moving npm tag.
+  # Use `@latest` so npx resolves the current npm dist-tag instead of reusing its cache.
   #
-  # Stdin is redirected from /dev/tty so @clack/prompts can read interactive
-  # input even when the parent shell is `curl | bash` (no stdin).
+  # Redirect stdin from `/dev/tty` so `@clack/prompts` stays interactive under `curl | bash`.
   if check_node_version && command -v npx &>/dev/null; then
     NODE_VERSION=$(node -v 2>/dev/null | sed 's/^v//')
     echo "  → Using npx (Node $NODE_VERSION)"

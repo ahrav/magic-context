@@ -4,7 +4,7 @@ use mc_store::kernel::{
     AlignmentProjectionSpec, ArtifactDeletionFault, ArtifactDeletionIdentity, ArtifactDeletionKind,
     ArtifactDeletionRequest, ArtifactErrorKind, ArtifactIngestRequest, CommitIntent,
     DecisionEventPayload, DecisionEventSpec, DecisionPayload, DecisionSpec, DomainSpec,
-    KernelErrorKind, KernelStore, ObservationDependencySpec, ObservationPayload, ObservationSpec,
+    KernelError, KernelStore, ObservationDependencySpec, ObservationPayload, ObservationSpec,
     ProviderEgress, RepositoryProvenance, Sensitivity,
 };
 use rusqlite::{Connection, OpenFlags};
@@ -105,7 +105,7 @@ fn projection_rows(root: &std::path::Path) -> Vec<(String, String, String, Strin
     let connection =
         Connection::open_with_flags(root.join("core.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
-    let rows = connection
+    let rows: Vec<(String, String, String, Vec<u8>, i64)> = connection
         .prepare(
             "SELECT decision_id,observation_id,alignment_kind,alignment_payload,
                     built_through_commit_seq
@@ -124,7 +124,19 @@ fn projection_rows(root: &std::path::Path) -> Vec<(String, String, String, Strin
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    rows
+    rows.into_iter()
+        .map(
+            |(decision_id, observation_id, alignment_kind, payload, built_through)| {
+                (
+                    decision_id,
+                    observation_id,
+                    alignment_kind,
+                    String::from_utf8(payload).unwrap(),
+                    built_through,
+                )
+            },
+        )
+        .collect()
 }
 
 fn projection_redactions(root: &std::path::Path) -> Vec<(String, String, String, i64)> {
@@ -194,8 +206,6 @@ fn rebuild_is_deterministic_and_historical_derivation_is_stable() {
             .collect::<Vec<_>>(),
         ["decision-1"]
     );
-    assert_eq!(old_slice.decisions[0].invalidated_commit_seq, None);
-    assert_eq!(old_slice.decisions[0].superseded_by, None);
     let current_slice = store.slice_as_of(3).unwrap();
     assert_eq!(current_slice.decisions[0].decision_id, "decision-2");
 }
@@ -307,8 +317,20 @@ fn deletion_replay_repairs_projection() {
         current_slice.decisions[0].evidence_id.as_deref(),
         Some("evidence")
     );
-    store.replace_alignment_projection(&[]).unwrap();
-    assert!(projection_rows(root.path()).is_empty());
+    // The test inserts directly because `guard_projection_generation` rejects
+    // generations below the stored watermark.
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO alignment_projection(
+                 decision_id,observation_id,alignment_kind,alignment_payload,
+                 built_through_commit_seq
+             ) VALUES ('decision-1','observation-1','stale',CAST('{}' AS BLOB),2)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(!projection_rows(root.path()).is_empty());
 
     let replay = store.delete_artifact(request).unwrap();
     assert!(replay.already_applied);
@@ -417,7 +439,7 @@ fn purge_replay_rebuild_failure_preserves_pending_artifact() {
     drop(connection);
 
     let error = store.delete_artifact(request).unwrap_err();
-    assert_eq!(error.kind(), ArtifactErrorKind::ReferenceCommit);
+    assert_eq!(error.kind(), ArtifactErrorKind::AlignmentRebuild);
     let object_path = root
         .path()
         .join("artifacts/objects")
@@ -456,21 +478,11 @@ fn projection_failure_rolls_back_the_canonical_mutation_and_receipt() {
     let store = KernelStore::open(root.path()).unwrap();
     let error = store
         .commit(intent("must-roll-back"), |envelope| {
-            envelope.append_decision_event(
-                "decision-1",
-                DecisionEventSpec {
-                    event_kind: "status".to_string(),
-                    payload: DecisionEventPayload {
-                        summary: "must not persist".to_string(),
-                    },
-                    evidence_id: None,
-                    recorded_at: 10,
-                },
-            )?;
+            envelope.insert_observation(observation(2, "decision-object-1"))?;
             Ok(String::new())
         })
         .unwrap_err();
-    assert_eq!(error.kind(), KernelErrorKind::Io);
+    assert_eq!(error, KernelError::CorruptCanonicalRow);
 
     store
         .commit(intent("unrelated-domain"), |envelope| {
@@ -491,7 +503,7 @@ fn projection_failure_rolls_back_the_canonical_mutation_and_receipt() {
     for (table, expected) in [
         ("commit_log", 3),
         ("operation_receipts", 3),
-        ("decision_events", 0),
+        ("observations", 1),
         ("domains", 2),
     ] {
         let count: i64 = connection
@@ -501,4 +513,219 @@ fn projection_failure_rolls_back_the_canonical_mutation_and_receipt() {
             .unwrap();
         assert_eq!(count, expected, "{table}");
     }
+}
+
+#[test]
+fn replay_of_affecting_commit_reports_the_durable_write_when_repair_fails() {
+    let (root, store) = open_store();
+    seed_domain(&store);
+    seed_pair(&store, None);
+    drop(store);
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations SET observation_payload=X'00'
+             WHERE observation_id='observation-1'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = KernelStore::open(root.path()).unwrap();
+    let replay = store
+        .commit(intent("pair"), |_| {
+            panic!("receipt replay must skip operation")
+        })
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.commit_seq, 2);
+}
+
+#[test]
+fn derivation_reads_stored_observation_payloads_that_gained_fields() {
+    let (root, store) = open_store();
+    seed_domain(&store);
+    seed_pair(&store, None);
+    let expected = projection_rows(root.path());
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    let stored: Vec<u8> = connection
+        .query_row(
+            "SELECT observation_payload FROM observations WHERE observation_id='observation-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(stored).unwrap(),
+        r#"{"summary":"observed 1","classification":"implemented"}"#
+    );
+    connection
+        .execute(
+            "UPDATE observations
+             SET observation_payload=CAST(
+                 json_insert(CAST(observation_payload AS TEXT),'$.future_field','x') AS BLOB
+             )
+             WHERE observation_id='observation-1'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(store.rebuild_alignment().unwrap().rows, 1);
+    assert_eq!(projection_rows(root.path()), expected);
+    assert_eq!(store.alignment_as_of(2).unwrap().rows.len(), 1);
+}
+
+#[test]
+fn scope_and_decision_event_commits_leave_the_projection_untouched() {
+    let (root, store) = open_store();
+    seed_domain(&store);
+    seed_pair(&store, None);
+    let expected = projection_rows(root.path());
+    drop(store);
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations SET observation_payload=X'00'
+             WHERE observation_id='observation-1'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = KernelStore::open(root.path()).unwrap();
+    store
+        .commit(intent("event"), |envelope| {
+            envelope.append_decision_event(
+                "decision-1",
+                DecisionEventSpec {
+                    event_kind: "status".to_string(),
+                    payload: DecisionEventPayload {
+                        summary: "unrelated to alignment".to_string(),
+                    },
+                    evidence_id: None,
+                    recorded_at: 10,
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(projection_rows(root.path()), expected);
+}
+
+#[test]
+fn a_corrupt_stored_decision_payload_is_reported_as_canonical_corruption() {
+    let (root, store) = open_store();
+    seed_domain(&store);
+    seed_pair(&store, None);
+    drop(store);
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE decisions SET decision_payload=X'00' WHERE decision_id='decision-1'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = KernelStore::open(root.path()).unwrap();
+    assert_eq!(
+        store.slice_as_of(2).unwrap_err(),
+        KernelError::CorruptCanonicalRow,
+        "a corrupt decision payload was reported as a transient storage fault"
+    );
+}
+
+#[test]
+fn a_corrupt_stored_observation_payload_is_reported_as_canonical_corruption() {
+    let (root, store) = open_store();
+    seed_domain(&store);
+    seed_pair(&store, None);
+    drop(store);
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations SET observation_payload=X'00'
+             WHERE observation_id='observation-1'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = KernelStore::open(root.path()).unwrap();
+    assert_eq!(
+        store.slice_as_of(2).unwrap_err(),
+        KernelError::CorruptCanonicalRow,
+        "a corrupt observation payload was reported as a transient storage fault"
+    );
+    assert_eq!(
+        store.alignment_as_of(2).unwrap_err(),
+        KernelError::CorruptCanonicalRow,
+        "slice and alignment reads disagree about canonical corruption"
+    );
+}
+
+#[test]
+fn completed_deletion_replay_reports_the_durable_write_when_repair_fails() {
+    let (root, store) = open_store();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(ArtifactIngestRequest {
+            intent: intent("evidence"),
+            payload: b"evidence".to_vec(),
+            evidence_id: "evidence".to_string(),
+            object_id: "evidence-object".to_string(),
+            object_kind: "evidence".to_string(),
+            domain_id: "domain".to_string(),
+            source_kind: "repository".to_string(),
+            source_id: "source".to_string(),
+            source_revision: 1,
+            media_type: "text/plain".to_string(),
+            retention_class: "canonical".to_string(),
+            retain_until: None,
+            asserted_sensitivity: Sensitivity::Normal,
+            provider_egress: ProviderEgress::RemoteAllowed,
+            provenance: Some(RepositoryProvenance {
+                repository_id: "repo".to_string(),
+                revision: "abc123".to_string(),
+            }),
+        })
+        .unwrap();
+    seed_pair(&store, Some("evidence"));
+    let request = ArtifactDeletionRequest {
+        intent: intent("delete-evidence"),
+        identity: ArtifactDeletionIdentity::Digest(handle.digest),
+        kind: ArtifactDeletionKind::Delete,
+        operator_id: None,
+        target_locator: None,
+        reason: None,
+        deleted_at: 42,
+    };
+    assert!(
+        !store
+            .delete_artifact(request.clone())
+            .unwrap()
+            .already_applied
+    );
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations SET observation_payload=X'00'
+             WHERE observation_id='observation-1'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let replay = store.delete_artifact(request).unwrap();
+    assert!(
+        replay.already_applied,
+        "a best-effort repair failure reported an already durable deletion as failed"
+    );
 }

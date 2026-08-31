@@ -166,11 +166,10 @@ describe("compiled smart-note QuickJS runner", () => {
     });
 
     test("serializes concurrent checks whose host calls suspend (shared-module asyncify safety)", async () => {
-        // Regression for QuickJSUseAfterFree: the asyncify module has ONE
-        // suspension stack; before serialization, two checks suspended in host
-        // awaits at once corrupted it and resumed against a disposed context.
-        // Each check here suspends in an async host call (readFile) that waits a
-        // tick, maximizing overlap. With the lock, all must succeed.
+        // The shared asyncify module has one suspension stack.
+        // Concurrent checks that suspend in host awaits share that stack.
+        // Concurrent host awaits corrupt the shared suspension stack.
+        // Serialization must let all eight checks succeed.
         const slowCap: SmartNoteCapabilityApi = {
             ...fakeCap,
             readFile: async (path) => {

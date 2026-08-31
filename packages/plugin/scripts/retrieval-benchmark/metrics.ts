@@ -1,19 +1,15 @@
 /**
- * Versioned quality-metric contract (U4: R49-R52, KTD5/KTD6).
+ * `METRIC_POLICY_VERSION` versions the quality-metric contract.
  *
- * Pure functions over parent-plan U4 facade DTOs: resolved ranked results
- * (`resolveRankedLocators`) and per-query judged grades. Relevance truth is
- * canonical-identity based; duplicate aliases keep their diagnostic rank
- * positions but earn relevance credit once (AE3), and an unjudged pair is
- * NEVER coerced to grade 0 — it is excluded from condensed scoring and
- * reported through coverage counts instead (R50).
+ * The metric functions are pure over resolved ranked results and per-query judged grades.
+ * Metrics use canonical identities; duplicate aliases retain their diagnostic rank.
+ * Unjudged entries are excluded from condensed scoring and reported through coverage counts.
+ * Unjudged entries are never coerced to grade 0.
  *
- * Cutoff semantics (KTD5): each cutoff applies to the PHYSICAL ranking
- * first; the condensed judged view then re-ranks the judged non-duplicate
- * entries inside that physical window. Both rank views are retained.
+ * Each cutoff applies to the physical ranking first.
+ * The condensed judged view re-ranks judged, non-duplicate entries after applying the physical cutoff.
  *
- * Any change to a gain, discount, condensation, or aggregation rule opens a
- * new METRIC_POLICY_VERSION and therefore a new baseline (KTD6).
+ * Changing a gain, discount, condensation, or aggregation rule requires a new METRIC_POLICY_VERSION.
  */
 
 import type { JudgmentsArtifact } from "./contract";
@@ -27,16 +23,15 @@ export const NDCG_CUTOFF: MetricCutoff = 10;
 
 export type JudgedGrade = 0 | 1 | 2;
 
-/** Relevance under this policy: judged grade >= 1 (KTD6). */
+/* */
 export function isRelevantGrade(grade: JudgedGrade): boolean {
     return grade >= 1;
 }
 
 export class MetricError extends Error {}
 
-/** documentId -> grade for one query, extracted from the judgments artifact.
- *  Document ids map 1:1 onto canonical relevance identities (parseCorpus
- *  rejects payload twins), so identity-unique crediting can key on either. */
+/**
+ * */
 export function judgedGradesByQuery(
     judgments: JudgmentsArtifact,
 ): Map<string, ReadonlyMap<string, JudgedGrade>> {
@@ -52,8 +47,8 @@ export function judgedGradesByQuery(
     return byQuery;
 }
 
-/** One physical-rank entry with its judgment annotation retained. Duplicates
- *  keep their diagnostic position and judgment but earn no credit. */
+/** Duplicates retain their diagnostic position and judgment but earn no credit.
+ * */
 export type PhysicalRankEntry =
     | {
           rank: number;
@@ -64,8 +59,8 @@ export type PhysicalRankEntry =
       }
     | { rank: number; status: "unresolved"; reason: "malformed" | "unknown-alias" };
 
-/** One condensed-rank entry: judged, non-duplicate, inside the physical
- *  cutoff window, re-ranked 1..m (the versioned judged-list condensation). */
+/**
+ * A condensed-rank entry is judged, non-duplicate, within the physical cutoff, and re-ranked 1..m. */
 export interface CondensedRankEntry {
     condensedRank: number;
     physicalRank: number;
@@ -87,13 +82,13 @@ export interface CutoffMetrics {
     physical: readonly PhysicalRankEntry[];
     condensed: readonly CondensedRankEntry[];
     coverage: JudgmentCoverage;
-    /** Unique judged relevant identities retrieved within the cutoff. */
+    /* */
     relevantRetrieved: number;
-    /** Unique judged relevant identities for the query (recall denominator). */
+    /** `relevantTotal` counts unique judged relevant identities for the query. */
     relevantTotal: number;
-    /** null when the query has no judged relevant identity. */
+    /** `recall` is null when the query has no judged relevant identity. */
     recall: number | null;
-    /** duplicates / total physical entries within the cutoff; null when empty. */
+    /** `duplicateRate` is duplicates divided by total physical entries within the cutoff, or null when the cutoff is empty. */
     duplicateRate: number | null;
 }
 
@@ -101,20 +96,20 @@ export interface QueryMetrics {
     metricPolicyVersion: typeof METRIC_POLICY_VERSION;
     queryId: string;
     cutoffs: readonly CutoffMetrics[];
-    /** 1 / first judged relevant PHYSICAL rank over the full resolved list;
-     *  0 when no judged relevant identity was retrieved. */
+    /** `reciprocalRank` is 1 divided by the first judged relevant physical rank in the full resolved list; it is 0 when none is retrieved.
+     * */
     reciprocalRank: number;
     firstRelevantPhysicalRank: number | null;
     firstRelevantCondensedRank: number | null;
-    /** Condensed linear-gain nDCG at NDCG_CUTOFF; null when IDCG is zero. */
+    /** `ndcgAt10` is condensed linear-gain nDCG at `NDCG_CUTOFF`, or null when IDCG is zero. */
     ndcgAt10: number | null;
 }
 
 export interface QueryScoringInput {
     queryId: string;
-    /** Physical ranking already resolved through `resolveRankedLocators`. */
+    /** `resolved` contains the physical ranking resolved through `resolveRankedLocators`. */
     resolved: readonly ResolvedRankedResult[];
-    /** documentId -> judged grade for this query. Absent = unjudged. */
+    /** `judgedGrades` maps each document ID to its judged grade; absent IDs are unjudged. */
     judgedGrades: ReadonlyMap<string, JudgedGrade>;
 }
 
@@ -135,8 +130,8 @@ function annotate(
     };
 }
 
-/** Judged-list condensation over one physical window: judged non-duplicate
- *  entries re-ranked 1..m. Unjudged entries are OMITTED, never graded 0. */
+/** Condensation re-ranks judged, non-duplicate entries within one physical cutoff window.
+ * Condensation re-ranks judged, non-duplicate entries within the physical cutoff from 1 through m. Unjudged entries are omitted and never assigned grade 0. */
 function condense(
     window: readonly ResolvedRankedResult[],
     judgedGrades: ReadonlyMap<string, JudgedGrade>,
@@ -161,14 +156,14 @@ function discountedGain(grade: JudgedGrade, rank: number): number {
     return grade / Math.log2(rank + 1);
 }
 
-/** Ideal DCG at `cutoff` from every judged grade for the query. */
+/** `idealDcg` computes ideal DCG at `cutoff` from every judged grade for the query. */
 function idealDcg(judgedGrades: ReadonlyMap<string, JudgedGrade>, cutoff: number): number {
     const grades = [...judgedGrades.values()].sort((a, b) => b - a).slice(0, cutoff);
     return grades.reduce((sum: number, grade, i) => sum + discountedGain(grade, i + 1), 0);
 }
 
-/** Score one query under METRIC_POLICY_VERSION. Rejects a ranking whose
- *  physical ranks are not consecutive one-based positions. */
+/** Reject rankings whose physical ranks are not consecutive one-based positions.
+ * */
 export function computeQueryMetrics(input: QueryScoringInput): QueryMetrics {
     const { resolved, judgedGrades } = input;
     for (const [i, entry] of resolved.entries()) {
@@ -211,8 +206,7 @@ export function computeQueryMetrics(input: QueryScoringInput): QueryMetrics {
         };
     });
 
-    // First judged relevant occurrence over the FULL resolved list, in both
-    // rank views (KTD5 retains both). Duplicates never earn the credit.
+    // Duplicates never earn reciprocal-rank credit.
     const fullCondensed = condense(resolved, judgedGrades);
     const firstRelevant = fullCondensed.find((entry) => isRelevantGrade(entry.grade)) ?? null;
 
@@ -236,7 +230,6 @@ export function computeQueryMetrics(input: QueryScoringInput): QueryMetrics {
 }
 
 // ---------------------------------------------------------------------------
-// Reranker lift (R51) and context tokens per useful delivered result.
 // ---------------------------------------------------------------------------
 
 export type RerankerLift =
@@ -248,9 +241,9 @@ export type RerankerLift =
           delta: number | null;
       };
 
-/** `not_applicable` until BOTH a before and an after ranking exist; a
- *  computed lift is a same-candidate delta, so differing credited identity
- *  sets reject rather than comparing incomparable rankings. */
+/** Return `not_applicable` unless both before and after rankings exist.
+ * Compute lift only as a delta over the same credited identity.
+ * Return `reject` when the rankings are incomparable. */
 export function computeRerankerLift(
     before: readonly ResolvedRankedResult[] | null,
     after: readonly ResolvedRankedResult[] | null,
@@ -285,9 +278,9 @@ export function computeRerankerLift(
     };
 }
 
-/** Delivered token cost per useful delivered result: useful = unique judged
- *  relevant identities that survived packing. Zero useful results yields
- *  null, never a division by zero or an implicit infinity (R51). */
+/**
+ * The function returns null when no resolved entry has a relevant judged grade.
+ * */
 export function contextTokensPerUsefulResult(
     deliveredTokens: number,
     delivered: readonly ResolvedRankedResult[],
@@ -306,7 +299,7 @@ export function contextTokensPerUsefulResult(
 }
 
 // ---------------------------------------------------------------------------
-// Macro aggregation (KTD6, R52): paraphrase group -> partition x mode.
+// Macro aggregation averages queries within each paraphrase group, then averages groups equally within each partition and mode.
 // ---------------------------------------------------------------------------
 
 export type Partition = "development" | "holdout";
@@ -337,7 +330,7 @@ export interface MacroAggregate {
     ndcgAt10: number | null;
 }
 
-/** Extract the aggregation-facing values from full query metrics. */
+/* */
 export function scoredQueryValues(metrics: QueryMetrics): ScoredQuery["values"] {
     const at = (cutoff: number): number | null =>
         metrics.cutoffs.find((c) => c.cutoff === cutoff)?.recall ?? null;
@@ -356,9 +349,7 @@ function meanOrNull(values: readonly (number | null)[]): number | null {
 }
 
 /**
- * Macro-average per (partition, mode): queries average within their
- * paraphrase group first, then groups average with equal weight, so a
- * heavily paraphrased intent cannot overweight its base intent (KTD6).
+ * For each (partition, mode), average queries within each paraphrase group, then average groups equally so paraphrase count cannot change an intent's weight.
  * Null query values are excluded, never treated as zero.
  */
 export function macroAggregate(queries: readonly ScoredQuery[]): MacroAggregate[] {
@@ -402,8 +393,8 @@ export function macroAggregate(queries: readonly ScoredQuery[]): MacroAggregate[
     );
 }
 
-/** Regression gates consume holdout aggregates only (R52); development
- *  aggregates stay diagnostic. Explicit and automatic remain separate cells. */
+/**
+ * */
 export function gateAggregates(aggregates: readonly MacroAggregate[]): MacroAggregate[] {
     return aggregates.filter((aggregate) => aggregate.partition === "holdout");
 }

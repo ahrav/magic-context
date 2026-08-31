@@ -13,17 +13,6 @@
       "runtime_versions": "UNSET",
       "compiler": "UNSET",
       "power_settings": "UNSET"
-    },
-    "macos": {
-      "status": "UNSET_REQUIRES_DESIGNATED_HOST",
-      "redacted_identity": "UNSET",
-      "cpu_topology": "UNSET",
-      "memory_topology": "UNSET",
-      "clock_policy": "UNSET",
-      "kernel": "UNSET",
-      "runtime_versions": "UNSET",
-      "compiler": "UNSET",
-      "power_settings": "UNSET"
     }
   },
   "workload_classes": [
@@ -79,35 +68,28 @@
     "mixed_size_full_duplex",
     "oldest_lease_retention"
   ],
-  "scheduling_families": [
-    "hot_pinned_poll",
-    "cold_park_wake"
-  ],
+  "fixed_profile": "eventfd_sparse_ring",
+  "connection_counts": [1, 8, 64],
+  "callback_budget": "UNSET_REQUIRES_REACTOR_SWEEP",
+  "supported_tmpfs_cgroup_envelope": "UNSET_REQUIRES_DESIGNATED_HOST",
   "arms": {
-    "non_selectable_hardware_controls": [
+    "hardware_controls": [
       "h0_metadata_cacheline_ping_pong",
       "h1_raw_descriptor_ring_payload_touch"
     ],
-    "non_selectable_runtime_controls": [
+    "runtime_controls": [
       "h2_rust_napi_runtime_crossing"
     ],
-    "non_selectable_ownership_ablations": [
+    "ownership_ablations": [
       "copied_producer_copied_receiver",
       "copied_producer_leased_receiver",
       "direct_producer_copied_receiver",
       "direct_producer_leased_receiver"
     ],
-    "non_selectable_context_controls": [
-      "unix_socket",
-      "tcp"
-    ],
-    "non_selectable_gate_controls": [
+    "gate_controls": [
       "injected_avoidable_operations"
     ],
-    "selectable": [
-      "ring",
-      "iceoryx_0_9_3"
-    ]
+    "transport": ["ring"]
   },
   "reservation_strategies": [
     "counting_pass",
@@ -130,64 +112,8 @@
       "ABBA",
       "BAAB"
     ],
-    "simultaneous_family": "metric_by_workload_by_scheduling",
+    "simultaneous_family": "metric_by_workload_by_connection_count",
     "early_stopping": false,
-    "unfavorable_extension": false,
-    "retained_failure_handling": "retain_and_disqualify"
-  },
-  "verdict_predicates": {
-    "WINNER": "eligible arm's simultaneous paired interval beats every other eligible arm by more than frozen equivalence margin and envelope residual is within margin or fully attributed to required semantics",
-    "HARDWARE_EQUIVALENT": "every top-set member beats every nonmember by more than margin, all within-set intervals lie inside margin, and every residual is within margin or fully attributed",
-    "INCONCLUSIVE": "neither WINNER nor HARDWARE_EQUIVALENT predicate is statistically resolved"
-  },
-  "selection_gate": {
-    "h1_requires_analytic_validation": true,
-    "copied_arms_selectable": false,
-    "native_only_shortcut_selectable_for_runtime_profiles": false,
-    "required_counter_fields": [
-      "body_copies",
-      "native_allocations",
-      "syscalls",
-      "park_wakes",
-      "generic_queue_hops",
-      "scheduler_handoffs"
-    ],
-    "injected_gate_control_must_be_disqualified": true,
-    "no_qualifying_arm_action": "ship_no_shared_memory_provider"
-  },
-  "failure_hardening": {
-    "status": "UNSET_REQUIRES_YMC12_RETAINED_RESULT",
-    "tuple_schema": {
-      "description": "Shape magic-context-ymc.12 freezes for each retained_tuples entry. status becomes FROZEN once the retained-provider result lands; until then the matrix gate fails before tuple-specific execution.",
-      "os": "linux | macos",
-      "runtime": "rust | bun | node",
-      "provider": "one of arms.selectable",
-      "profile": "target profile id",
-      "descriptor_geometry": {
-        "slot_size": "bytes per descriptor slot (positive integer)",
-        "slot_count": "descriptor slots per lane (positive integer)",
-        "arena_bytes": "payload arena bytes per direction (positive integer)",
-        "lane_count": "SPSC lanes (positive integer)"
-      },
-      "host_limits": {
-        "active": {
-          "arena_bytes": "active arena-byte cap (non-negative integer)",
-          "descriptors": "active descriptor cap (non-negative integer)",
-          "leases": "active receive-lease cap (non-negative integer)",
-          "mappings": "active mapping cap (non-negative integer)",
-          "pinned_workers": "active pinned-worker cap (non-negative integer)"
-        },
-        "quarantine": {
-          "arena_bytes": "quarantined arena-byte cap (non-negative integer)",
-          "descriptors": "quarantined descriptor cap (non-negative integer)",
-          "leases": "quarantined receive-lease cap (non-negative integer)",
-          "mappings": "quarantined mapping cap (non-negative integer)",
-          "pinned_workers": "quarantined pinned-worker cap (non-negative integer)"
-        }
-      },
-      "expectation": "active | omission (every retained tuple must be active)"
-    },
-    "active_platforms": [],
-    "retained_tuples": []
+    "unfavorable_extension": false
   }
 }

@@ -8,6 +8,7 @@ import {
     type CatalogEntry,
     type HostStatusSnapshot,
     McHostClient,
+    type McHostClientOptions,
     sameDaemonId,
 } from "../mc-host-client";
 import { BootstrapError, checkPlatform, type PlatformReaders, parseTrustIndex } from "./bootstrap";
@@ -28,6 +29,7 @@ import {
     type LifecyclePolicyOptions,
     McHostLifecyclePolicy,
     type ObservationalHealth,
+    ReadinessProbeControlError,
 } from "./policy";
 
 const MAX_PARENT_WALK = 8;
@@ -63,10 +65,6 @@ function storageState(metrics: Record<string, unknown>): "ready" | "starting" | 
 }
 
 /**
- * The storage probe observed an incarnation other than the one compatibility
- * certified. It escapes `probeManagedStorage`'s catch-all because it is not a
- * storage observation at all: reducing it to `unavailable` would blame storage
- * for a rotation and send remediation at the wrong component.
  */
 class StorageProbeDaemonMismatchError extends Error {
     constructor() {
@@ -87,13 +85,7 @@ function assertStorageProbePeer(
 }
 
 /**
- * Poll storage readiness on its own connection until it leaves `starting`.
  *
- * `expectedDaemonId` binds the observation to the incarnation compatibility
- * certified. The probe cannot share the compatibility connection because it
- * waits across restarts of `host.status`, so it re-checks identity after the
- * handshake and after every response instead: a rotation mid-poll makes the
- * reading describe a daemon the caller will never publish to.
  */
 async function probeManagedStorage(
     root: string,
@@ -101,13 +93,15 @@ async function probeManagedStorage(
     expectedDaemonId?: Uint8Array,
 ): Promise<"ready" | "starting" | "unavailable"> {
     const deadline = Date.now() + budgetMs;
-    let client: McHostClient | null = null;
+    const options: McHostClientOptions = {
+        connectionFile: connectionFilePath(root),
+        handshakeTimeoutMs: Math.max(1, budgetMs),
+        requestTimeoutMs: Math.max(1, budgetMs),
+    };
+    // A cached client is shared; closing it would disconnect a concurrent probe for the same root and budget, which would report a healthy daemon as unavailable.
+    let client: McHostClient | undefined;
     try {
-        client = await McHostClient.connect({
-            connectionFile: connectionFilePath(root),
-            handshakeTimeoutMs: Math.max(1, budgetMs),
-            requestTimeoutMs: Math.max(1, budgetMs),
-        });
+        client = await McHostClient.connect(options);
         assertStorageProbePeer(client, expectedDaemonId);
         for (;;) {
             const snapshot = await client.hostStatus({
@@ -127,7 +121,8 @@ async function probeManagedStorage(
         if (error instanceof StorageProbeDaemonMismatchError) throw error;
         return Date.now() >= deadline ? "starting" : "unavailable";
     } finally {
-        await client?.closeAsync().catch(() => {});
+        // The connected channel holds a referenced interval, so a one-shot caller stays alive until this client closes.
+        if (client !== undefined) await client.closeAsync().catch(() => undefined);
     }
 }
 
@@ -150,19 +145,8 @@ interface CompatibilityProbeResult {
 }
 
 /**
- * Read one ordered daemon/modules/epochs observation from a single authenticated
- * peer, stopping at the first stage that cannot pass and re-checking the peer
- * across every await so a rotation cannot produce a mixed snapshot.
  *
- * The returned snapshot is an observation, not a verdict: `evaluatedThrough`
- * names the last stage actually reached, and the policy layer owns the verdict
- * so one place decides precedence and remediation. `status` is null exactly when
- * the probe short-circuited before `host.status`, meaning storage and Synapse
- * were never observed.
  *
- * Every request is bounded by the time left until `deadline`, not by the
- * client-wide request timeout, so a slow handshake cannot leave a later stage
- * free to spend another full budget past the aggregate the caller promised.
  */
 async function readCompatibilityProbe(
     client: ManagedCompatibilityClient,
@@ -225,8 +209,7 @@ async function readCompatibilityProbe(
     if (signal?.aborted) throw signal.reason ?? new Error("compatibility probe aborted");
     const components = asRecord(status.metrics.components);
     const magicContextMetrics = asRecord(asRecord(components?.["magic-context"])?.metrics);
-    // The probe only reports what it observed; the compatibility verdict is
-    // owned by exactly one place, `McHostLifecyclePolicy.applyCompatibility`.
+    // The probe reports observations, not a compatibility verdict.
     const snapshot = {
         authenticatedPeer: {
             ...authenticated,
@@ -259,6 +242,7 @@ async function probeManagedCompatibility(
         connectionFile: connectionFilePath(root),
         handshakeTimeoutMs: Math.max(1, budgetMs),
         requestTimeoutMs: Math.max(1, budgetMs),
+        shutdownDeadlineMs: Math.max(1, budgetMs),
     });
     try {
         return await readCompatibilityProbe(client, deadline, signal);
@@ -269,78 +253,85 @@ async function probeManagedCompatibility(
 
 async function probeManagedReadiness(root: string, budgetMs: number): Promise<ObservationalHealth> {
     const deadline = Date.now() + budgetMs;
+    // A private client, like the storage probe's. The residual budget varies per
+    // call and `ownerKey` includes the timeouts, so a shared owner would cache a
+    // new client — and prefault another ring — on every status or doctor, until
+    // admission is exhausted.
     const client = await McHostClient.connect({
         connectionFile: connectionFilePath(root),
         handshakeTimeoutMs: Math.max(1, budgetMs),
         requestTimeoutMs: Math.max(1, budgetMs),
-        identity: {
-            project_root: root,
-            harness: "mc-host-lifecycle",
-            session: "compatibility",
-        },
     });
+    let probe: CompatibilityProbeResult;
     try {
-        const { snapshot: compatibility, status } = await readCompatibilityProbe(client, deadline);
-        if (status === null) {
-            // The probe short-circuited at the daemon or module stage, so
-            // `host.status` never ran and storage and Synapse were never
-            // observed. Report only what the handshake proved and leave the
-            // unobserved components absent rather than asserting failures that
-            // would point remediation away from the version mismatch.
-            return {
-                ...compatibility,
-                readiness: { transport: { state: "ready", reason: "healthy" } },
-            };
-        }
-        const components = asRecord(status.metrics.components);
-        const storage = storageState(status.metrics);
-        const synapseMetrics = asRecord(asRecord(components?.synapse)?.metrics);
-        const synapseState = synapseMetrics?.synapse_state;
-        const synapse =
-            synapseState === "ready"
-                ? { state: "ready" as const, reason: "healthy" as const }
-                : synapseState === "unsupported"
-                  ? {
+        probe = await readCompatibilityProbe(client, deadline);
+    } catch (error) {
+        if (client.isClosed || client.authenticated === null) throw error;
+        throw new ReadinessProbeControlError(error);
+    } finally {
+        // Teardown is not part of the observation, and `closeAsync` opens its own
+        // shutdown deadline, so awaiting it here could settle this promise after
+        // the lifecycle command's aggregate expired.
+        void client.closeAsync().catch(() => undefined);
+    }
+    const { snapshot: compatibility, status } = probe;
+    if (status === null) {
+        // The probe short-circuited at the daemon or module stage, so
+        // `host.status` never ran and storage and Synapse were never
+        // observed. Report only what the handshake proved and leave the
+        // unobserved components absent rather than asserting failures that
+        // would point remediation away from the version mismatch.
+        return {
+            ...compatibility,
+            readiness: { transport: { state: "ready", reason: "healthy" } },
+        };
+    }
+    const components = asRecord(status.metrics.components);
+    const storage = storageState(status.metrics);
+    const synapseMetrics = asRecord(asRecord(components?.synapse)?.metrics);
+    const synapseState = synapseMetrics?.synapse_state;
+    const synapse =
+        synapseState === "ready"
+            ? { state: "ready" as const, reason: "healthy" as const }
+            : synapseState === "unsupported"
+              ? {
+                    state: "unsupported" as const,
+                    reason: "synapse_unsupported" as const,
+                }
+              : synapseState === "starting"
+                ? { state: "starting" as const, reason: "synapse_starting" as const }
+                : synapseState === undefined
+                  ? // The status payload omits a component whose state it
+                    // cannot report: the daemon skips any module missing from
+                    // `components`, missing a usable `status`, or missing its
+                    // state key. Absence means the lane is not offered, so it
+                    // reports `unsupported` — the one non-failing readiness
+                    // state, which `addCheck` maps to a skipped check. Calling
+                    // it `degraded` would make `status` and `doctor` answer
+                    // `ok: false` for a daemon that is serving correctly and
+                    // simply has no Synapse lane, which is the normal shape on
+                    // every platform the model lane does not cover.
+                    {
                         state: "unsupported" as const,
                         reason: "synapse_unsupported" as const,
                     }
-                  : synapseState === "starting"
-                    ? { state: "starting" as const, reason: "synapse_starting" as const }
-                    : synapseState === undefined
-                      ? // The status payload omits a component whose state it
-                        // cannot report: the daemon skips any module missing from
-                        // `components`, missing a usable `status`, or missing its
-                        // state key. Absence means the lane is not offered, so it
-                        // reports `unsupported` — the one non-failing readiness
-                        // state, which `addCheck` maps to a skipped check. Calling
-                        // it `degraded` would make `status` and `doctor` answer
-                        // `ok: false` for a daemon that is serving correctly and
-                        // simply has no Synapse lane, which is the normal shape on
-                        // every platform the model lane does not cover.
-                        {
-                            state: "unsupported" as const,
-                            reason: "synapse_unsupported" as const,
-                        }
-                      : { state: "degraded" as const, reason: "synapse_degraded" as const };
-        return {
-            ...compatibility,
-            readiness: {
-                transport: { state: "ready", reason: "healthy" },
-                storage: {
-                    state: storage,
-                    reason:
-                        storage === "ready"
-                            ? "healthy"
-                            : storage === "starting"
-                              ? "storage_starting"
-                              : "storage_unavailable",
-                },
-                synapse,
+                  : { state: "degraded" as const, reason: "synapse_degraded" as const };
+    return {
+        ...compatibility,
+        readiness: {
+            transport: { state: "ready", reason: "healthy" },
+            storage: {
+                state: storage,
+                reason:
+                    storage === "ready"
+                        ? "healthy"
+                        : storage === "starting"
+                          ? "storage_starting"
+                          : "storage_unavailable",
             },
-        };
-    } finally {
-        await client.closeAsync().catch(() => {});
-    }
+            synapse,
+        },
+    };
 }
 
 export interface ManagedLifecyclePolicyOptions
@@ -368,7 +359,7 @@ function findDeclaringParentRoot(moduleUrl: string, packageName: string): string
                     return current;
                 }
             } catch {
-                // Keep walking; malformed or unrelated ancestors are not authority.
+                // The search ignores malformed and unrelated ancestors.
             }
         }
         const parent = dirname(current);
@@ -382,8 +373,6 @@ function findDeclaringParentRoot(moduleUrl: string, packageName: string): string
 }
 
 /**
- * Build the shared policy lazily at a real lifecycle demand site. Importing
- * this module performs no filesystem or package lookup.
  */
 export function createManagedLifecyclePolicy(
     options: ManagedLifecyclePolicyOptions,
@@ -396,18 +385,10 @@ export function createManagedLifecyclePolicy(
     const platform = checkPlatform(readers);
     if (!platform.ok) return new McHostLifecyclePolicy({ ...options, env });
 
-    // Admission runs before anything is prepared, because preparation WRITES:
-    // `prepareManagedLaunchTarget` can resolve the payload and call
-    // `stageBootstrap`, which creates directories and copies an executable into
-    // the data root. Admission otherwise happened for the first time in
-    // `preflight()`, at command time, so a root on an unsupported filesystem —
-    // NFS, or a `noexec` mount — was mutated by the very call that was about to
-    // reject it. A rejection that claims to be pre-native must leave no trace.
+    // Admission precedes preparation because preparation writes to the data root.
+    // A pre-native rejection must leave no trace.
     //
-    // The verdict itself is deliberately not reported here. Returning a policy
-    // with no launch target keeps `preflight()` the single authority on the
-    // outcome: it re-runs admission and answers with `admission.reason`, so the
-    // caller still sees `unsupported_filesystem` rather than a substitute.
+    // `preflight()` is the sole authority for the admission outcome.
     if (!admitLifecycleFilesystem(root.root, options.admissionIo).ok) {
         return new McHostLifecyclePolicy({ ...options, env });
     }
@@ -428,21 +409,13 @@ export function createManagedLifecyclePolicy(
                 ? {}
                 : { explicitExternalRoot: options.explicitExternalRoot }),
         });
-        // The default compatibility probe's `host.status` reply already
-        // carries the storage state, so the demand path's storage probe can
-        // consume that observation instead of opening a second connection and
-        // re-issuing `host.status`. The observation is single-use and only a
-        // terminal state short-circuits; a `starting` observation still runs
-        // the polling probe so it can wait out startup within its own budget.
+        // Reuse the `host.status` response so readiness and compatibility describe the same observation.
+        // Only terminal observations short-circuit; a `starting` observation still runs the polling probe.
+        // The polling probe can wait for startup within its own budget.
         //
-        // The observation is tagged with the daemon incarnation whose
-        // `host.status` produced it and is only consumed by a demand that
-        // certified that same incarnation. Concurrent probes share this slot:
-        // `sharedCompatibility` dedupes per data root, so a real-root and a
-        // no-root key can be in flight together, and a non-`magic-context`
-        // demand writes an observation it never consumes. Untagged reuse would
-        // let a waiter read a state observed on a different request or daemon
-        // generation and publish module traffic against it.
+        // Concurrent probes share the observation slot.
+        // Demand tags observations because untagged reuse could return a state from another request or daemon.
+        // Demand tags observations because untagged reuse could return a state from another request or daemon.
         let observedStorage: {
             daemonId: Uint8Array;
             state: "ready" | "starting" | "unavailable";

@@ -42,9 +42,7 @@ function buildIndex(messages: MessageLike[]): ToolCallIndex {
                     hasResult: false,
                 };
                 entry.occurrences.push({ message: msg, part, kind: observation.kind });
-                // Mirror production (tag-messages.ts): an OpenCode `{ type: "tool" }`
-                // part is a "result" observation by type even while pending, so gate
-                // hasResult on an actual completed result.
+                // OpenCode `{ type: "tool" }` parts are result observations while pending; set `hasResult` only after completion.
                 if (observation.kind === "result" && partHasCompletedResult(part))
                     entry.hasResult = true;
                 index.set(observation.callId, entry);
@@ -354,7 +352,7 @@ describe("tool-drop-target", () => {
                     expect(hasCall(messages, "call-3")).toBe(true);
                     expect(messages).toHaveLength(3);
 
-                    // The wire copies now in the message array carry the sentinel...
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
                     const wireToolPart = messages[1]?.parts[0] as {
                         state: Record<string, unknown>;
                     };
@@ -372,9 +370,9 @@ describe("tool-drop-target", () => {
                     const wireResultPart = messages[2]?.parts[0] as { content: string };
                     expect(wireResultPart.content).toBe("[dropped \u00a77\u00a7]");
 
-                    // ...while the LIVE part objects OpenCode handed us stay
-                    // byte-identical: the clamp swaps in a clone and never touches
-                    // the originals (mutation-safety guarantee).
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
                     expect(toolPart.state as Record<string, unknown>).toEqual({
                         input: {
                             query: "abcdef",
@@ -423,7 +421,7 @@ describe("tool-drop-target", () => {
 
                     expect(target.truncate()).toBe("truncated");
 
-                    // The wire copy now in the message array carries the clamp...
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
                     const wireToolPart = messages[1]?.parts[0] as {
                         state: Record<string, unknown>;
                     };
@@ -436,8 +434,8 @@ describe("tool-drop-target", () => {
                         output: "[dropped \u00a79\u00a7]",
                     });
 
-                    // ...while the LIVE part object stays byte-identical (long
-                    // prompt intact) so a still-executing tool is never corrupted.
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
                     expect(toolPart.state as Record<string, unknown>).toEqual({
                         input: {
                             query: largeQuery,
@@ -470,15 +468,14 @@ describe("tool-drop-target", () => {
                     const batch = new ToolMutationBatch(messages);
                     const target = createToolDropTarget("call-task", [], index, batch, 11);
 
-                    // Open arc (invocation with no completed result) is excluded
-                    // from EVERY selector: canDrop, drop, truncate, editMarker.
+                    // Invocations without completed results are ineligible for canDrop, drop, truncate, and editMarker.
                     expect(target.canDrop()).toBe(false);
                     expect(target.truncate()).toBe("incomplete");
                     expect(target.drop()).toBe("incomplete");
                     expect(target.editMarker()).toBe("incomplete");
 
-                    // The live part object is byte-identical and still the same
-                    // reference in the wire array.
+                    // `ToolMutationBatch` does not mutate parts that OpenCode still references.
+                    // `ToolMutationBatch` does not mutate parts that OpenCode still references.
                     expect(JSON.stringify(taskPart)).toBe(pristine);
                     expect(messages[0]?.parts[0]).toBe(taskPart);
                 });
@@ -508,7 +505,7 @@ describe("tool-drop-target", () => {
                     expect(target.canDrop()).toBe(true);
                     expect(target.truncate()).toBe("truncated");
 
-                    // The wire copy now in the array is clamped + sentinelled...
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
                     const wire = messages[0]?.parts[0] as {
                         state: { input: Record<string, unknown>; output: string };
                     };
@@ -516,9 +513,9 @@ describe("tool-drop-target", () => {
                     expect(wire.state.output).toBe("[dropped \u00a712\u00a7]");
                     expect(wire.state.input.prompt).toBe("Inves...[truncated]");
 
-                    // ...but the LIVE object OpenCode still holds is byte-identical
-                    // to before the reclaim pass — the long prompt is intact, so a
-                    // child agent spawning from it is never corrupted.
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
                     expect(JSON.stringify(taskPart)).toBe(pristine);
                     expect(taskPart.state.input.prompt).toBe(longPrompt);
                 });
@@ -545,13 +542,11 @@ describe("tool-drop-target", () => {
                     const batch = new ToolMutationBatch(messages);
                     const target = createToolDropTarget("call-err", [], index, batch, 13);
 
-                    // Errored arm is closed → eligible for every selector (this is
-                    // the reclaim the old type-based gate also allowed; the new
-                    // gate must NOT leak it).
+                    // Errored completed results remain eligible for canDrop, drop, truncate, and editMarker.
                     expect(target.canDrop()).toBe(true);
                     expect(target.truncate()).toBe("truncated");
 
-                    // Wire copy carries the clamp + sentinel...
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
                     const wire = messages[0]?.parts[0] as {
                         state: { input: Record<string, unknown>; output: string };
                     };
@@ -559,8 +554,8 @@ describe("tool-drop-target", () => {
                     expect(wire.state.output).toBe("[dropped \u00a713\u00a7]");
                     expect(wire.state.input.content).toBe("zzzzz...[truncated]");
 
-                    // ...live object stays byte-identical: reclaimed via a clone,
-                    // never by mutating the original part.
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
+                    // `ToolMutationBatch` replaces the message part with a clamped sentinel clone and does not mutate OpenCode's original part.
                     expect(JSON.stringify(failedWrite)).toBe(pristine);
                     expect(failedWrite.state.input.content).toBe(bigContent);
                 });

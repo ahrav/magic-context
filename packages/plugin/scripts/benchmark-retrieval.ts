@@ -1,14 +1,11 @@
 #!/usr/bin/env bun
 
 /**
- * Machine-readable JSON goes to stdout ONLY; every diagnostic goes to
- * stderr, so automation can parse stdout without filtering.
+ * Machine-readable JSON goes only to stdout; diagnostics go to stderr so automation can parse stdout without filtering.
  *
  * Exit codes:
  *   0  complete report / pass / quality-only where latency is not required
- *   1  invalid input / contract violation / fail-closed resume /
- *      policy failure / non-comparable / needs_judgment /
- *      quality-only where the gate requires latency
+ * 1  invalid input, contract violation, fail-closed resume, policy failure, non-comparable result, needs_judgment, or quality-only where the gate requires latency
  *   2  incomplete evidence
  *   3  structurally invalid evidence / A/A mechanical failure
  */
@@ -177,9 +174,7 @@ function parseArgs(command: "check" | "matrix", rest: string[]): CliArgs {
     if (args.profile.length === 0) {
         throw new RunnerError(["usage: matrix requires --profile"]);
     }
-    // The default release directory ships in reviewed source; any other
-    // directory needs a trust anchor from outside itself because approval
-    // records inside it cannot authenticate themselves.
+    // Custom --release directories require --release-fingerprint because a release directory cannot authenticate its own approval records.
     if (
         args.releaseFingerprint === null &&
         resolve(args.releaseDir) !== resolve(DEFAULT_RELEASE_DIR)
@@ -215,9 +210,8 @@ function readHostEvidenceFile(path: string): HostEvidence {
     return parseHostEvidence(parsed);
 }
 
-/** Atomic artifact write: a process killed mid-serialization must not leave
- *  a truncated JSON file at the path automation treats as the validated
- *  artifact. Same temp-then-rename discipline as the runner's checkpoints. */
+/**
+ * */
 async function writeArtifact(path: string, text: string): Promise<void> {
     const tmp = `${path}.tmp`;
     await Bun.write(tmp, text);
@@ -264,9 +258,6 @@ async function runBaselineCreate(rest: string[]): Promise<void> {
             throw new RunnerError([`usage: unknown claim eligibility ${claimEligibility}`]);
         }
         const artifact = buildQualityBaseline({ policy, reports, claimEligibility });
-        // A mode whose metrics are zero across every run publishes a vacuous
-        // gate: loss is bounded below by zero, so no regression in that mode
-        // can ever fail. Refuse to publish it; fix the lane first.
         const vacuousModes = vacuousBaselineModes(artifact);
         if (vacuousModes.length > 0) {
             throw new RunnerError(
@@ -297,9 +288,6 @@ async function runBaselineCreate(rest: string[]): Promise<void> {
             "usage: baseline-create --kind latency requires --host-class arm-neon|x86-avx2",
         ]);
     }
-    // The reports carry their profile's host class; a mismatched --host-class
-    // would publish a mislabeled latency baseline that host-fingerprint
-    // checks alone cannot catch.
     for (const [index, report] of reports.entries()) {
         const reportHostClass = (report.semantic.config as Record<string, unknown>).hostClass;
         if (reportHostClass !== hostClass) {
@@ -389,8 +377,6 @@ async function runRegression(rest: string[]): Promise<void> {
     } | null = null;
     const latencyBaselinePath = flags.single.get("--latency-baseline");
     if (!latencyBaselinePath && flags.repeated.has("--host-evidence")) {
-        // Silently dropping the evidence would yield a quality-only verdict
-        // indistinguishable from an intended one.
         throw new RunnerError(["usage: --host-evidence requires --latency-baseline"]);
     }
     if (latencyBaselinePath) {
@@ -528,8 +514,6 @@ async function runCheckOrMatrix(command: "check" | "matrix", rest: string[]): Pr
         if (result.report.status === "incomplete") process.exitCode = 2;
         else if (result.report.status === "invalid") process.exitCode = 3;
     } finally {
-        // A caller-supplied --work-dir is the caller's to keep; the
-        // harness only removes the temp directory it created itself.
         if (createdTempWorkDir) rmSync(workDir, { recursive: true, force: true });
     }
 }

@@ -19,11 +19,11 @@ function getOpenCodeConfigRoot(): string {
     return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "opencode");
 }
 
-/** Root directory OpenCode uses for cached npm plugin wrapper installs. */
+/* */
 export const CACHE_DIR = join(getOpenCodeCacheRoot(), "packages");
 
-/** Primary OpenCode configuration file path (standard JSON). */
+/* */
 export const USER_OPENCODE_CONFIG = join(getOpenCodeConfigRoot(), "opencode.json");
 
-/** Alternative OpenCode configuration file path (JSON with Comments). */
+/* */
 export const USER_OPENCODE_CONFIG_JSONC = join(getOpenCodeConfigRoot(), "opencode.jsonc");

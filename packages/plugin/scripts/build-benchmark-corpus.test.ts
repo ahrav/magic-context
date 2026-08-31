@@ -151,11 +151,7 @@ describe("checked-in release", () => {
     });
 
     it("passes the release lint command shape used by CI", () => {
-        // Trust anchor recomputed from reviewed source (authored artifacts +
-        // pinned approvals): a checked-in release with fabricated approvals
-        // is internally consistent, so the unanchored load alone would
-        // accept it — this test IS the CI gate that binds the release bytes
-        // to code review.
+        // The recomputed expectedManifestFingerprint prevents a checked-in release from approving its own manifest.
         const expectedManifestFingerprint = canonicalFingerprint(
             buildManifest({
                 ...buildCorpusArtifacts(),

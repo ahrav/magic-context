@@ -1,29 +1,17 @@
 import type { ContextLimitProvenance } from "../../shared/context-limit-provenance";
 
 /**
- * Provider-agnostic context-overflow error detection.
  *
- * When a provider rejects a request because the prompt exceeds its context
- * window, we want to react:
- *   1. Trigger emergency recovery (historian + aggressive drops) so the next
  *      turn fits.
- *   2. If the error message reveals the real context limit, persist it as a
- *      session-specific override so pressure math is accurate going forward.
  *
- * Pattern list adapted from OpenCode's `packages/opencode/src/provider/error.ts`
- * (BSD-licensed). We keep our own copy rather than importing OpenCode internals
- * so the plugin stays decoupled from OpenCode versioning.
+ * We copy OpenCode's BSD-licensed logic to avoid coupling the plugin to OpenCode versions.
  *
  * References:
- *   - OpenCode overflow detection (origin of patterns):
  *     https://github.com/sst/opencode/blob/main/packages/opencode/src/provider/error.ts
- *   - Adapted originally from:
  *     https://github.com/earendil-works/pi-mono/blob/main/packages/ai/src/utils/overflow.ts
  */
 
 /**
- * Regexes that match provider-reported context-overflow errors. Keep in sync
- * with upstream OpenCode patterns — new providers can be added here as they
  * emerge.
  */
 export const OVERFLOW_PATTERNS: ReadonlyArray<RegExp> = [
@@ -51,11 +39,9 @@ export const OVERFLOW_PATTERNS: ReadonlyArray<RegExp> = [
 ];
 
 /**
- * Regex set for extracting the reported context limit from error messages.
  * Each pattern's first capture group is the numeric token limit.
  *
- * Not every provider reports a number. When we cannot extract one, the caller
- * still benefits from the overflow signal even without the limit.
+ * The caller can still use the overflow signal when no numeric limit is available.
  */
 interface LimitExtractionPattern {
     pattern: RegExp;
@@ -75,14 +61,11 @@ const LIMIT_EXTRACTION_PATTERNS: ReadonlyArray<LimitExtractionPattern> = [
         pattern: /too large for model with (\d+) maximum context length/i,
         provenance: "combined",
     }, // Mistral
-    // Non-greedy digit gap: a greedy `.*` here backtracks to a single-digit
-    // capture ("limit 200000 tokens" → "0"), which the plausibility clamp then
-    // discards — so the limit was silently never extracted for llama.cpp-style
-    // messages. Anchor the capture to the first ≥4-digit number after the phrase.
+    // Limit the gap to 40 non-digits so the capture selects the first four-or-more-digit token count.
+    // An unbounded `.*` gap can skip the intended token count.
     { pattern: /context size[^0-9]{0,40}(\d{4,})\s*tokens?/i, provenance: "combined" }, // llama.cpp variants
-    // "input length N exceeds the context length of M" — we want M (the limit),
-    // NOT N (the actual prompt size). Explicit pattern keeps the fallback below
-    // from greedily matching N.
+    // Capture the context limit rather than the prompt size.
+    // The explicit pattern prevents the fallback from extracting the prompt size.
     { pattern: /exceeds? the context length of (\d+)/i, provenance: "combined" }, // vLLM overflow
     {
         pattern: />\s*(\d+)\s*(?:tokens?\s*)?(?:maximum|max|limit)\b/i,
@@ -91,14 +74,12 @@ const LIMIT_EXTRACTION_PATTERNS: ReadonlyArray<LimitExtractionPattern> = [
     { pattern: /max(?:imum)?.*context.*?(\d+)/i, provenance: "unknown" }, // generic fallback
 ];
 
-/** Minimum plausible context limit. Anything smaller is probably a match
- *  against an unrelated number in the error (e.g., error code). Kept at 1024
- *  (NOT the [20k,3M] trusted-limit band): overflow detection honors a provider
- *  EXPLICITLY stating its limit, and real small-context models exist (4096/8192
- *  local llama.cpp) — raising this floor would discard a legitimate signal. */
+/**
+ * Reject limits below 1024 to avoid unrelated numeric fields such as error codes.
+ * */
 const MIN_PLAUSIBLE_LIMIT = 1024;
-/** Maximum plausible context limit. Anything larger is very likely a false
- *  match against a token-count field rather than a limit. */
+/**
+ * Reject larger values to avoid matching token-count fields instead of limits. */
 const MAX_PLAUSIBLE_LIMIT = 10_000_000;
 
 export interface ReportedContextLimit {
@@ -107,27 +88,23 @@ export interface ReportedContextLimit {
 }
 
 export interface OverflowDetection {
-    /** True if the error message matches a known overflow pattern. */
+    /* */
     isOverflow: boolean;
-    /** Reported context limit in tokens, if extractable from the message. */
+    /* */
     reportedLimit?: number;
-    /** Whether the number is a prompt-only ceiling or a combined context window. */
+    /** The provenance identifies whether the limit covers the prompt alone or the combined context window. */
     reportedLimitProvenance?: ContextLimitProvenance;
-    /** The pattern that matched, useful for logging/diagnostics. */
+    /* */
     matchedPattern?: string;
 }
 
 /**
- * Extract an error message from any reasonable shape. Events from OpenCode can
- * deliver errors as strings, Error instances, or plain objects with `message`.
+ * OpenCode events deliver errors as strings, Error instances, or objects with `message`.
  */
 export function extractErrorMessage(error: unknown): string {
     if (!error) return "";
     if (typeof error === "string") return error;
-    // Check for nested provider-SDK shape BEFORE handling Error instances.
-    // Some SDKs throw an Error subclass but ALSO attach the real error on
-    // `error.error.message` (e.g., Anthropic SDK APIError). If we returned
-    // `error.message` first we'd miss the real overflow message entirely.
+    // Checking `error.error.message` first preserves nested provider error messages.
     if (typeof error === "object") {
         const obj = error as Record<string, unknown>;
         const nested = obj.error as Record<string, unknown> | undefined;
@@ -139,10 +116,7 @@ export function extractErrorMessage(error: unknown): string {
     if (typeof error === "object") {
         const obj = error as Record<string, unknown>;
         if (typeof obj.message === "string") return obj.message;
-        // responseBody as fallback — providers sometimes put the real error
-        // inside a JSON-stringified HTTP body.
         if (typeof obj.responseBody === "string") return obj.responseBody;
-        // Try toString() as a last resort (captures error.name in most SDKs).
         try {
             return JSON.stringify(error);
         } catch {
@@ -153,8 +127,6 @@ export function extractErrorMessage(error: unknown): string {
 }
 
 /**
- * Detect whether an error represents a provider-side context-overflow
- * rejection, and optionally extract the reported limit.
  */
 export function detectOverflow(error: unknown): OverflowDetection {
     const message = extractErrorMessage(error);
@@ -162,8 +134,6 @@ export function detectOverflow(error: unknown): OverflowDetection {
         return { isOverflow: false };
     }
 
-    // Also treat HTTP 413 status code as overflow (Cerebras, Mistral sometimes
-    // send this without a body).
     const hasStatus413 =
         /\b413\b/.test(message) && /(entity|payload|context|prompt)/i.test(message);
 
@@ -190,9 +160,6 @@ export function detectOverflow(error: unknown): OverflowDetection {
 }
 
 /**
- * Extract the reported context-limit (in tokens) from an error message if one
- * of the known patterns matches. Returns undefined when no plausible number
- * can be extracted. Guards against false matches via plausibility clamp.
  */
 export function parseReportedLimit(message: string): ReportedContextLimit | undefined {
     if (!message) return undefined;

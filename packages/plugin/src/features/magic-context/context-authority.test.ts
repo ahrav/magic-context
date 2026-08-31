@@ -975,7 +975,6 @@ describe("memory authority protocol", () => {
             deadline: Date.now() + 1000,
         });
         expect(drained).toEqual(["b"]);
-        // Disposing one checkout's bridge leaves the sibling registered.
         await import("./context-authority").then((m) =>
             m.disposeModuleNoteEvaluationBridges([keyA]),
         );

@@ -1,13 +1,11 @@
-//! The Pi subprocess adapter (KTD8, R16).
 //!
-//! Print-mode JSON with no persisted session, no tools, a private `0600`
-//! system-prompt file, an explicit model with canonical-to-Pi provider
-//! prefix mapping, and an optional thinking level. Extension discovery is
-//! disabled (`--no-approve --no-extensions`); only the trusted runtime
-//! descriptor's ordered daemon-owner provider extensions load, followed by
-//! the bundled Broca payload hook LAST so it owns the final generation
-//! contract. The existing Magic Context Pi recursion guard suppresses full
-//! plugin startup in the child.
+//! Pi runs print-mode JSON without a persisted session or tools.
+//! Pi stores the system prompt in a private `0600` file.
+//! Pi maps canonical provider names to Pi prefixes and accepts an optional thinking level.
+//! Pi disables extension discovery with `--no-approve --no-extensions`.
+//! Pi loads only daemon-owned provider extensions in descriptor order.
+//! Pi loads the bundled Broca payload hook last so it owns the final generation contract.
+//! The Magic Context Pi recursion guard suppresses full plugin startup in the child.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -23,27 +21,24 @@ use super::subprocess::{
 };
 use crate::harness_closure::ValidatedHarnessClosure;
 
-/// The existing Magic Context Pi recursion guard
-/// (`packages/pi-plugin/src/index.ts` checks it and returns before full
+/// The Magic Context Pi recursion guard causes the plugin to return before full extension registration.
 /// extension registration).
 pub const MAGIC_CONTEXT_PI_SUBAGENT_ENV: &str = "MAGIC_CONTEXT_PI_SUBAGENT";
 
-/// Adapter-owned control variables carrying the requested generation values
-/// to the bundled payload hook. Bounded numbers only — never request text.
+/// PiBackend passes requested generation values to the bundled payload hook.
+/// The variables carry only bounded numbers, never requested text.
 pub const BROCA_MAX_OUTPUT_TOKENS_ENV: &str = "MC_BROCA_MAX_OUTPUT_TOKENS";
 pub const BROCA_TEMPERATURE_ENV: &str = "MC_BROCA_TEMPERATURE";
 
-/// The bundled Broca payload hook (KTD8), embedded at compile time and
-/// materialized per run into an owner-only temp file loaded as the FINAL
+/// Pi materializes the hook per run in an owner-only temporary file and loads it last.
 /// explicit extension.
 pub const PI_BROCA_EXTENSION_BYTES: &[u8] = include_bytes!("../../assets/pi-broca-extension.mjs");
 
-/// File name the hook is materialized under inside the run's private dir.
+/// Pi materializes the hook in each run's private directory under this name.
 pub const PI_BROCA_EXTENSION_FILE: &str = "pi-broca-extension.mjs";
 
-/// Trusted Pi runtime closure retained by the daemon. Node names resolve
-/// only inside the content-addressed closure, and extension order is frozen
-/// by its U9 manifest.
+/// The daemon retains a trusted Pi runtime closure.
+/// Node names resolve only inside the content-addressed closure.
 #[derive(Clone, Debug)]
 pub struct PiRuntimeDescriptor {
     pub closure: Arc<ValidatedHarnessClosure>,
@@ -52,11 +47,9 @@ pub struct PiRuntimeDescriptor {
     pub provider_extension_nodes: Vec<String>,
 }
 
-/// [`LlmExecutionBackend`] adapter that runs Pi print-mode JSON under the
-/// shared hardened subprocess runner.
 pub struct PiBackend {
     descriptor: PiRuntimeDescriptor,
-    /// Optional `--thinking <level>` (R16); absent means Pi's own
+    /// Pi receives `--thinking <level>` only when `thinking_level` is set; otherwise Pi resolves the level.
     /// resolution runs.
     thinking_level: Option<String>,
     limits: SubprocessLimits,
@@ -91,7 +84,7 @@ impl LlmExecutionBackend for PiBackend {
         cancel: CancellationToken,
     ) -> BackendFuture {
         // A run bound to another harness must fail, not silently execute
-        // under this CLI with this harness's provider aliases and
+        // PiBackend must not execute a non-Pi request with Pi provider aliases or credentials.
         // credentials.
         if request.harness != Harness::Pi {
             let terminal = backend::harness_mismatch(Harness::Pi, request.harness);
@@ -120,9 +113,8 @@ impl LlmExecutionBackend for PiBackend {
     }
 }
 
-/// Canonical-to-Pi provider prefix mapping (plan "OpenCode and Pi
-/// selection"), mirroring `harness-provider-map.ts`: known auth-plugin
-/// aliases translate, unknown providers pass through unchanged.
+/// Known auth-plugin aliases map to Pi provider prefixes.
+/// Known auth-plugin aliases map to Pi provider prefixes; unknown providers pass through unchanged.
 pub fn pi_model_ref(provider: &str, model: &str) -> String {
     let pi_provider = match provider {
         "openai" => "openai-codex",
@@ -132,14 +124,12 @@ pub fn pi_model_ref(provider: &str, model: &str) -> String {
     format!("{pi_provider}/{model}")
 }
 
-/// Runs the aliased Pi provider first, then retries the canonical provider
-/// once on a credential failure: a user authenticated through the direct
-/// `openai`/`google` API-key providers has no credentials under the
-/// subscription-extension aliases, and `subagent-runner.ts` resolves the
-/// same ambiguity with the same alias-then-canonical order. Both attempts
-/// share one wall-clock budget — the retry gets only the remainder — and a
+/// Pi tries the aliased provider first and retries the canonical provider once after a credential failure.
+/// Direct `openai` and `google` API-key users lack credentials under subscription-extension aliases.
+/// Pi tries each provider at most once.
+/// Both attempts share one wall-clock budget; the retry receives only the remainder.
 /// first attempt whose private-directory cleanup failed forfeits the retry,
-/// so a masking success can never hide material left on disk.
+/// A first-attempt cleanup failure blocks the retry so retry success cannot mask disk residue.
 async fn run_pi_with_provider_fallback(
     descriptor: PiRuntimeDescriptor,
     thinking_level: Option<String>,
@@ -151,8 +141,8 @@ async fn run_pi_with_provider_fallback(
 ) -> BackendTerminal {
     let aliased = pi_model_ref(&request.provider, &request.model);
     let canonical = format!("{}/{}", request.provider, request.model);
-    // No alias means no possible retry: the request moves straight through
-    // with no clone, so the common path holds one prompt copy, not two.
+    // Requests without an alias do not retry.
+    // The no-alias path creates no clone, so it holds one prompt copy rather than two.
     if aliased == canonical {
         return run_pi(
             descriptor,
@@ -178,10 +168,8 @@ async fn run_pi_with_provider_fallback(
         aliased,
     )
     .await;
-    // An attempt that left private prompt material on disk must surface
-    // that failure, not be replaced by a retry's unqualified success. The
-    // marker is the shared constant `merge_cleanup`'s text is built from,
-    // so a rewording cannot silently change this gate.
+    // An attempt that left private prompt material on disk must surface its cleanup failure.
+    // A first-attempt cleanup failure blocks the retry.
     let credential_failure = matches!(
         &first,
         BackendTerminal::Failed(error) if error.class == ErrorClass::AuthRequired
@@ -196,9 +184,7 @@ async fn run_pi_with_provider_fallback(
     if remaining.is_zero() {
         return first;
     }
-    // The first terminal (and its potentially transcript-sized error text)
-    // is no longer needed once the retry is committed; dropping it keeps
-    // the concurrent-buffer peak inside the declared capture headroom.
+    // The retry drops `first` before retrying to keep concurrent capture buffers within the declared headroom.
     drop(first);
     let mut retry_limits = limits;
     retry_limits.run_timeout = remaining;
@@ -236,10 +222,7 @@ async fn run_pi(
         Ok(dir) => dir,
         Err(err) => return subprocess::spawn_failure(HarnessName::Pi, &err),
     };
-    // The bundled hook is materialized privately per run (0600 file inside
-    // the 0700 dir) rather than shipped as an installed file: the loaded
-    // bytes are exactly the compiled-in asset, so no installed path can be
-    // swapped underneath the daemon (KTD8).
+    // `run_pi` writes the compiled-in hook bytes to a 0600 file in the per-run 0700 directory so no installed hook path can be swapped under the daemon.
     let hook_path = match dir.write_private(PI_BROCA_EXTENSION_FILE, PI_BROCA_EXTENSION_BYTES) {
         Ok(path) => path,
         Err(err) => {
@@ -249,8 +232,7 @@ async fn run_pi(
             )
         }
     };
-    // The system prompt is caller-private content (R19): a private 0600
-    // file, never argv.
+    // `run_pi` writes caller-private system prompts to a private 0600 file instead of passing them through argv.
     let system_prompt_path = match &request.system {
         None => None,
         Some(system) => match dir.write_private("system-prompt.txt", system.as_bytes()) {
@@ -264,26 +246,19 @@ async fn run_pi(
         },
     };
 
-    // Argument order mirrors `subagent-runner.ts`'s print-mode pattern:
-    // fixed mode flags, isolation flags, explicit extensions (descriptor
-    // order, bundled hook last), private system prompt, model, thinking.
-    // The prompt travels only over stdin, so no positional message exists.
+    // `request.prompt` travels only over stdin, so `run_pi` passes no positional message.
     let mut args = vec![
         "--print".to_owned(),
         "--mode".to_owned(),
         "json".to_owned(),
-        // No persisted session (R16): the result comes back over stdout and
-        // hidden model work must not appear in the user's session picker.
         "--no-session".to_owned(),
         "--no-skills".to_owned(),
         "--no-prompt-templates".to_owned(),
         "--no-context-files".to_owned(),
-        // Closed tool surface (R28): the run is a pure prompt-to-text
+        // The run exposes a closed tool surface: it maps the prompt to text.
         // transform.
         "--no-tools".to_owned(),
-        // `--no-approve` keeps project-local settings and extensions
-        // untrusted for the run; `--no-extensions` disables discovery so
-        // ONLY the explicit `--extension` list below loads (R16).
+        // `--no-approve` treats project-local settings and extensions as untrusted for the run.
         "--no-approve".to_owned(),
         "--no-extensions".to_owned(),
     ];
@@ -305,9 +280,7 @@ async fn run_pi(
             return subprocess::harness_unavailable_failure(HarnessName::Pi, "closure_incomplete")
         }
     };
-    // Node reads the entrypoint as data and resolves its sibling modules
-    // relative to it, so this must be a path the loader can walk back to the
-    // closure tree — not every platform's descriptor path can.
+    // Node resolves sibling modules relative to the entrypoint path, so the descriptor path must lead back to the closure tree.
     args.insert(0, entrypoint.module_path().to_string_lossy().into_owned());
     let mut resolved_extensions = Vec::with_capacity(descriptor.provider_extension_nodes.len());
     for extension_node in &descriptor.provider_extension_nodes {
@@ -356,15 +329,11 @@ async fn run_pi(
         args,
         env: child_env,
         working_dir: dir.path().to_path_buf(),
-        // Moved, not cloned: the prompt is the request's dominant byte cost
-        // and nothing after spec construction reads it.
+        // The runner moves the prompt because no code reads it after spec construction.
         stdin: request.prompt.into_bytes(),
-        // Exactly the descriptors the child's own arguments name: the
-        // exec'd interpreter, plus the module descriptors only where
-        // `module_path` is descriptor-rooted. The closure directory
-        // descriptor is deliberately absent — no argument references it, and
-        // inheriting it would hand the harness a rename-immune handle it can
-        // write back through into the validated closure tree.
+        // The child does not inherit the closure directory descriptor because no argument references it.
+        // Inheriting the closure directory descriptor would give the harness a rename-immune handle.
+        // The harness could write through that handle into the validated closure tree.
         inherit_fds: std::iter::once(interpreter.inherited_fd())
             .chain(entrypoint.module_inherited_fd())
             .chain(
@@ -389,18 +358,14 @@ async fn run_pi(
     subprocess::finalize(HarnessName::Pi, &result, parsed, &limits, dir.cleanup())
 }
 
-/// Reports whether a region of newly completed stdout lines contains the
-/// decisive terminal event, so the drain loop can arm its grace instead of
-/// waiting for pipe EOF: Pi's print mode often finishes the agent loop
-/// without exiting (the shutdown gap `subagent-runner.ts` documents), and
-/// its open stdout would otherwise hold the run until the full timeout and
-/// discard the completed answer. The caller feeds each complete line
-/// exactly once, so probing stays linear; arming early on a transcript the
-/// full parse later rejects only shortens the wait for the same failure.
+/// The probe starts the drain grace after a terminal stdout event.
+/// Pi can finish an agent loop without closing stdout.
+/// Open stdout would otherwise hold the run until the full timeout.
+/// The caller supplies each complete line once, so probing is linear.
+/// Arming on a transcript that parsing later rejects only shortens the wait for the same failure.
 fn pi_terminal_probe(lines: &[u8]) -> ProbeSignal {
-    // The LAST meaningful line in the region wins: one read can carry a
-    // failed turn's terminal and the retry's opening message together, and
-    // only their order says whether the run is over.
+    // The last non-quiet line wins so a retry's opening event overrides a preceding failed terminal event.
+    // The last non-quiet line determines whether the run is over.
     lines
         .split(|byte| *byte == b'\n')
         .map(pi_line_probe_signal)
@@ -410,39 +375,23 @@ fn pi_terminal_probe(lines: &[u8]) -> ProbeSignal {
         })
 }
 
-/// One-line check for the event that ENDS a Pi print-mode run, used only to
-/// rearm the run deadline to the short drain grace.
+/// The probe returns terminal events so the drain loop can start its short grace.
 ///
-/// Print mode does not emit `agent_end` on stdout at all: that event lives
-/// on Pi's internal extension channel, while the stdout stream comes from
-/// `session.subscribe` and carries `message_*`, `tool_execution_*`,
-/// `compaction_*`, `session_info_changed`, `thinking_level_changed`,
-/// `queue_update`, and `auto_retry_end` (`subagent-runner.ts`). Completion
-/// is therefore detected the way the runner itself detects it — a terminal
-/// assistant `message_end` — because Pi routinely finishes its agent loop
-/// and then sits idle until killed, which is exactly what the drain grace
+/// Pi print mode emits terminal assistant `message_end` on stdout, not `agent_end`.
 /// exists for.
 ///
-/// `stop` and `length` are decisive. `error` and `aborted` are the same
-/// terminals to the runner, and they must arm the drain too: an aliased
-/// provider with no credentials fails exactly this way, and letting that run
-/// idle to its full timeout would replace the credential failure with
-/// `TimedOut` — which is not `AuthRequired`, so the canonical-provider
-/// fallback would never fire. They arm revocably instead of decisively,
-/// because Pi can retry a failed turn on its own; a following `message_start`
-/// or `auto_retry_*` restores the full deadline, which the runner's one-shot
-/// latch cannot do. `agent_end` is decisive for a runtime that emits it.
-/// A completion still requesting tools is an intermediate turn, never this
-/// tool-less run's terminal. Noise and malformed lines say nothing; the full
-/// parse renders that verdict.
+/// `stop` and `length` are decisive; `error` and `aborted` are provisional.
+/// A full-timeout idle run yields `TimedOut` rather than `AuthRequired`, preventing canonical-provider fallback.
+/// `error` and `aborted` arm the drain provisionally because Pi can retry a failed turn.
+/// `message_start` and `auto_retry_*` restore the full deadline because the runner's one-shot latch cannot.
+/// A completion that still requests tools is an intermediate turn, not terminal.
+/// Noise and malformed lines do not arm the drain; the full parse determines their verdict.
 fn pi_line_probe_signal(line: &[u8]) -> ProbeSignal {
     let Ok(text) = std::str::from_utf8(line) else {
         return ProbeSignal::Quiet;
     };
-    // The probe parses every completed line while capture is still live, so
-    // it observes the same node-graph bound as the full parse; an
-    // over-structured line is not a terminal here and the full parse
-    // renders the bounded failure verdict.
+    // The probe applies the full parser's node-graph bound to every completed line.
+    // A line exceeding the node-graph bound does not arm the drain.
     if !subprocess::json_nodes_within_bound(text) {
         return ProbeSignal::Quiet;
     };
@@ -450,8 +399,8 @@ fn pi_line_probe_signal(line: &[u8]) -> ProbeSignal {
         return ProbeSignal::Quiet;
     };
     let message = match value.get("type").and_then(serde_json::Value::as_str) {
-        // A turn opening, or a retry announcing itself, means the run is
-        // still working: whatever provisional terminal preceded it is stale.
+        // `message_start` and `auto_retry_*` indicate that the run is not over.
+        // `message_start` and `auto_retry_*` clear a preceding provisional terminal.
         Some("message_start" | "auto_retry_start" | "auto_retry_end") => {
             return ProbeSignal::Continues;
         }
@@ -487,26 +436,15 @@ fn pi_line_probe_signal(line: &[u8]) -> ProbeSignal {
     }
 }
 
-/// Parses the closed Pi print-mode JSON vocabulary (R18). The terminal
-/// assistant `message_end` (stopReason `stop`, `length`, `error`, or
-/// `aborted` with no tool calls — the run is tool-less) decides the run;
-/// when the `agent_end` compatibility shape carries a decisive final
-/// assistant message (the authoritative array `subagent-runner.ts` prefers
-/// over accumulated message events), that decision replaces the provisional
+/// The parser accepts only the Pi print-mode JSON vocabulary.
+/// A decisive final assistant message in `agent_end` replaces a provisional `message_end` decision.
 /// `message_end` one.
-/// Documented nonterminal events that occur on ordinary tool-less runs
-/// (lifecycle, compaction, retry, queue, and session-state notifications;
-/// `--thinking` emits `thinking_level_changed`) are ignored — except the
-/// continuation events (`message_start`, `auto_retry_*`), which clear the
-/// provisional decision they supersede — but
-/// `tool_execution_*` events are rejected: this path is a zero-tool
-/// transform, so observed tool activity is a transcript-contract failure —
-/// the same rule the OpenCode parser applies to `tool_use`. Lines that do
-/// not claim to be JSON objects are extension stdout noise (a co-loaded
-/// provider extension printing "[Worker] Ready" — the classification
-/// `subagent-runner.ts` uses) and are skipped; a line that starts with `{`
-/// but fails to parse, or any undocumented event, still fails to one
-/// bounded terminal whose detail never quotes the line (R19).
+/// Lifecycle, compaction, retry, queue, and session-state events do not decide the run.
+/// `message_start` and `auto_retry_*` clear the provisional decision they supersede.
+/// `tool_execution_*` events violate this zero-tool transform's transcript contract.
+/// Lines that do not claim to be JSON objects are skipped as extension stdout noise.
+/// Lines that start with `{` but fail to parse are failures, not extension stdout noise.
+/// Malformed or undocumented JSON returns one error without including the input line.
 fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTerminal), String> {
     let mut provisional: Option<(Option<BackendEvent>, BackendTerminal)> = None;
     let mut agent_end_final: Option<(serde_json::Value, usize)> = None;
@@ -526,8 +464,6 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
         let Ok(text) = std::str::from_utf8(line) else {
             return Err(format!("non-utf8 output at line {line_no}"));
         };
-        // Bounded before the DOM exists: an unbounded node graph would
-        // escape the capture budget this scan is charged against.
         if !subprocess::json_nodes_within_bound(text) {
             return Err(format!("json structure too large at line {line_no}"));
         }
@@ -548,15 +484,7 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
             | "queue_update"
             | "session_info_changed"
             | "thinking_level_changed" => {}
-            // A turn opening or a retry announcing itself means the run is
-            // still working — the same events `pi_line_probe_signal` treats
-            // as `Continues` — so whatever provisional terminal preceded it
-            // is superseded. A transcript that ends after this continuation
-            // without the successor's terminal must fail as a missing
-            // terminal, never resurrect the superseded attempt: an obsolete
-            // auth failure would otherwise drive the canonical-provider
-            // fallback, and other stale classes would advance the model
-            // chain for a run whose real outcome was never observed.
+            // `message_start`, `auto_retry_start`, and `auto_retry_end` clear `provisional`; without a later terminal, parsing returns a missing-terminal error rather than a superseded result.
             "message_start" | "auto_retry_start" | "auto_retry_end" => {
                 provisional = None;
             }
@@ -572,23 +500,13 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
                 if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
                     continue;
                 }
-                // Provisional, not committed: Pi's automatic retry emits a
-                // terminal `message_end` for the failed attempt and another
-                // for the retry, so a later decision SUPERSEDES an earlier
-                // one (together with its assistant text) instead of
-                // colliding with it under first-terminal-wins arbitration,
-                // which would reject a legitimately retried run as a
+                // A later terminal supersedes a retried attempt's terminal and assistant text; first-terminal-wins would reject valid retries.
                 // contradictory transcript.
                 if let Some(decision) = assistant_message_terminal(message, line_no)? {
                     provisional = Some(decision);
                 }
             }
             "agent_end" => {
-                // The authoritative final state on runtimes that emit it:
-                // `subagent-runner.ts` prefers this array over accumulated
-                // message events. The decision is deferred to the end of
-                // the parse so it replaces any provisional `message_end`
-                // terminal instead of conflicting with it.
                 if let Some(message) = value
                     .get("messages")
                     .and_then(serde_json::Value::as_array)
@@ -605,9 +523,7 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
             _ => return Err(format!("unknown event type at line {line_no}")),
         }
     }
-    // The agent_end decision wins when it is decisive; a nonterminal final
-    // assistant (or no agent_end at all) falls back to the last provisional
-    // `message_end` decision so modern transcripts are unaffected.
+    // A decisive `agent_end` decision overrides `message_end`; a nonterminal final assistant or missing `agent_end` uses the last provisional `message_end` decision.
     if let Some((message, line_no)) = &agent_end_final {
         if let Some((text, terminal)) = assistant_message_terminal(message, *line_no)? {
             return Ok((text.into_iter().collect(), terminal));
@@ -619,14 +535,9 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
     Ok((text.into_iter().collect(), terminal))
 }
 
-/// The terminal decision for one assistant message plus the assistant text
-/// that belongs with it, shared by `message_end` and the authoritative
-/// `agent_end` shape: `stop` and `length` complete the run unless the
-/// content still requests tools, `error`/`aborted` fail it, and intermediate
-/// spellings are not this run's terminal (`None`).
+/// `message_end` and `agent_end` share this classification: `stop` and `length` succeed unless content requests tools; `error` and `aborted` fail; other spellings return `None`.
 ///
-/// Only the winning decision's text is published, so a superseded attempt
-/// cannot contribute its text to the answer.
+/// The executor publishes only the winning decision's assistant text.
 fn assistant_message_terminal(
     message: &serde_json::Value,
     line_no: usize,
@@ -636,15 +547,10 @@ fn assistant_message_terminal(
         .and_then(serde_json::Value::as_str);
     let text = assistant_text(message);
     let decision = match stop_reason {
-        // Intermediate assistant turns (no tools run here, but
-        // the vocabulary tolerates the spelling) are ignored for
-        // the terminal decision.
+        // This executor does not run tools.
+        // The parser accepts `toolUse` as an intermediate stop-reason spelling.
         None | Some("toolUse") => None,
-        // A completion that still requests tools is an
-        // intermediate turn shape, not this tool-less run's
-        // terminal (`subagent-runner.ts` applies the same rule):
-        // committing it would publish text beside an unexecuted
-        // tool request as the answer.
+        // `stop` and `length` messages with tool requests are not terminal because this executor does not execute tools.
         Some("stop" | "length") if message_requests_tools(message) => None,
         Some("stop") => Some((
             Some(BackendEvent::AssistantText {
@@ -655,9 +561,6 @@ fn assistant_message_terminal(
                 finish_reason: FinishReason::Completed,
             },
         )),
-        // A length stop is still a completion (AE13): the exact
-        // length-class reason rides both the unit and the
-        // terminal so producer policy sees `length_capped`.
         Some("length") => Some((
             Some(BackendEvent::AssistantText {
                 text,
@@ -674,10 +577,7 @@ fn assistant_message_terminal(
                 .unwrap_or_default();
             Some((
                 None,
-                // The provider text steers classification but never rides
-                // the wire — it can echo prompt or credential content
-                // (R19); the emitted message is host-authored from the
-                // closed stop-reason vocabulary.
+                // The emitted message uses the stop reason rather than provider text.
                 BackendTerminal::Failed(BackendError {
                     class: subprocess::classify_failure_text(provider_text),
                     retry_after_secs: subprocess::retry_after_secs_in_text(provider_text),
@@ -693,9 +593,6 @@ fn assistant_message_terminal(
     Ok(decision)
 }
 
-/// Concatenates the `{type: "text"}` blocks of one Pi assistant message —
-/// the same extraction `extractFinalAssistant` performs in
-/// `subagent-runner.ts` (reasoning and tool blocks are excluded).
 fn assistant_text(message: &serde_json::Value) -> String {
     let Some(content) = message.get("content").and_then(serde_json::Value::as_array) else {
         return String::new();
@@ -711,9 +608,7 @@ fn assistant_text(message: &serde_json::Value) -> String {
     text
 }
 
-/// Whether an assistant message's content still carries a `toolCall` block:
-/// `subagent-runner.ts` treats a stop as terminal only when no such block is
-/// present, and this run executes without tools.
+/// `stop` is non-terminal when `message_requests_tools(message)` is true because this executor does not execute tools.
 fn message_requests_tools(message: &serde_json::Value) -> bool {
     message
         .get("content")

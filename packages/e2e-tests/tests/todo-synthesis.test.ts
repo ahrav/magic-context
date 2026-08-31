@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";

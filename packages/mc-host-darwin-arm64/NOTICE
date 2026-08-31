@@ -1,9 +1,0 @@
-Third-party notices for @cortexkit/mc-host-darwin-arm64
-========================================================
-
-This package ships:
-
-- ck-mc-host (this repository) — MIT. See LICENSE.
-
-Synapse is unsupported on darwin-arm64: this package contains no ONNX Runtime
-and no model bytes, so no third-party model or runtime notices apply.

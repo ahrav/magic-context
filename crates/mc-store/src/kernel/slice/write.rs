@@ -1,11 +1,16 @@
 use rusqlite::{params, OptionalExtension, Transaction};
+use serde::Serialize;
 
 use super::{
     DecisionEventOutcome, DecisionEventSpec, DecisionSpec, DecisionWriteOutcome,
     ObservationDependencySpec, ObservationSpec, ObservationWriteOutcome, RetirementOutcome,
 };
 use crate::kernel::envelope::{Envelope, ObjectRow, PendingChange};
-use crate::kernel::redaction::{record, redact, RedactedField};
+use crate::kernel::object_write::{
+    insert_registry, invalidate, map_write_error, record_fields, record_registry_fields,
+    set_successor,
+};
+use crate::kernel::redaction::{redact, RedactedField};
 use crate::kernel::{KernelError, Sensitivity};
 
 struct RedactedDecision {
@@ -81,8 +86,6 @@ struct RedactedEvent {
 struct StoredEventPayload<'a> {
     summary: &'a str,
 }
-
-use serde::Serialize;
 
 impl Envelope<'_> {
     pub fn insert_decision(
@@ -202,9 +205,11 @@ impl Envelope<'_> {
     ) -> Result<DecisionWriteOutcome, KernelError> {
         let replaced_object_id = redact(replaced_object_id);
         let old = load_live_typed_object(self.tx, &replaced_object_id.text, "decision")?;
+        let granted_before = self.subject_grants_authority(Some(&replaced_object_id.text))?;
         let replacement = RedactedDecision::new(replacement)?;
         validate_successor(
             &old,
+            &replacement.domain_id,
             &replacement.source_kind,
             &replacement.source_id,
             replacement.source_revision,
@@ -229,10 +234,16 @@ impl Envelope<'_> {
         self.changes.push(PendingChange {
             object: replacement.object_row(self.commit_seq),
             kind: "decision_correct",
-            replaced_object_id: Some(replaced_object_id.text),
+            replaced_object_id: Some(replaced_object_id.text.clone()),
             redactions,
             audit: None,
         });
+        if granted_before {
+            self.demote_dependents_if_authority_lost(
+                Some(&replaced_object_id.text),
+                "authority corrected",
+            )?;
+        }
         Ok(outcome)
     }
 
@@ -246,6 +257,7 @@ impl Envelope<'_> {
         let replacement = RedactedObservation::new(replacement)?;
         validate_successor(
             &old,
+            &replacement.domain_id,
             &replacement.source_kind,
             &replacement.source_id,
             replacement.source_revision,
@@ -296,6 +308,10 @@ impl Envelope<'_> {
     ) -> Result<RetirementOutcome, KernelError> {
         let object_id = redact(object_id);
         let mut object = load_live_typed_object(self.tx, &object_id.text, object_kind)?;
+        // Retiring an accepted decision withdraws any authority it granted, so its
+        // dependents follow exactly as they do for an explicit revocation. Sampled
+        // before the invalidation, which is what removes that authority.
+        let granted_before = self.subject_grants_authority(Some(&object_id.text))?;
         invalidate(
             self.tx,
             self.commit_seq,
@@ -314,6 +330,9 @@ impl Envelope<'_> {
             redactions: vec![("object_id".to_string(), object_id.clone())],
             audit: None,
         });
+        if granted_before {
+            self.demote_dependents_if_authority_lost(Some(&object_id.text), "authority retired")?;
+        }
         Ok(RetirementOutcome {
             object_id: object_id.text,
             object_kind: object_kind.to_string(),
@@ -735,67 +754,6 @@ fn require_live(
         .ok_or(KernelError::NotFound)
 }
 
-fn insert_registry(
-    tx: &Transaction<'_>,
-    commit_seq: i64,
-    object: &ObjectRow,
-) -> Result<(), KernelError> {
-    tx.execute(
-        "INSERT INTO object_registry(
-             object_id,object_kind,domain_id,source_kind,source_id,source_revision,
-             created_commit_seq,sensitivity_class
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![
-            object.object_id,
-            object.object_kind,
-            object.domain_id,
-            object.source_kind,
-            object.source_id,
-            object.source_revision,
-            commit_seq,
-            object.sensitivity.as_str(),
-        ],
-    )
-    .map(|_| ())
-    .map_err(map_write_error)
-}
-
-fn record_registry_fields(
-    tx: &Transaction<'_>,
-    owner_id: &str,
-    domain_id: &RedactedField,
-    object_id: &RedactedField,
-    source_kind: &RedactedField,
-    source_id: &RedactedField,
-    commit_seq: i64,
-) -> Result<(), KernelError> {
-    record_fields(
-        tx,
-        "object_registry",
-        owner_id,
-        &[
-            ("domain_id".to_string(), domain_id.clone()),
-            ("object_id".to_string(), object_id.clone()),
-            ("source_kind".to_string(), source_kind.clone()),
-            ("source_id".to_string(), source_id.clone()),
-        ],
-        commit_seq,
-    )
-}
-
-fn record_fields(
-    tx: &Transaction<'_>,
-    owner_kind: &str,
-    owner_id: &str,
-    fields: &[(String, RedactedField)],
-    commit_seq: i64,
-) -> Result<(), KernelError> {
-    for (name, field) in fields {
-        record(tx, owner_kind, owner_id, name, field, Some(commit_seq))?;
-    }
-    Ok(())
-}
-
 fn load_live_decision_object(
     tx: &Transaction<'_>,
     decision_id: &str,
@@ -848,61 +806,17 @@ fn row_to_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRow> {
     })
 }
 
-fn invalidate(
-    tx: &Transaction<'_>,
-    commit_seq: i64,
-    table: &str,
-    column: &str,
-    object_id: &str,
-) -> Result<(), KernelError> {
-    let changed = tx
-        .execute(
-            "UPDATE object_registry SET invalidated_commit_seq=?1
-             WHERE object_id=?2 AND invalidated_commit_seq IS NULL",
-            params![commit_seq, object_id],
-        )
-        .map_err(|_| KernelError::Io)?;
-    if changed != 1 {
-        return Err(KernelError::NotFound);
-    }
-    let sql = format!(
-        "UPDATE {table} SET invalidated_commit_seq=?1
-         WHERE {column}=?2 AND invalidated_commit_seq IS NULL"
-    );
-    if tx
-        .execute(&sql, params![commit_seq, object_id])
-        .map_err(|_| KernelError::Io)?
-        != 1
-    {
-        return Err(KernelError::NotFound);
-    }
-    Ok(())
-}
-
-fn set_successor(
-    tx: &Transaction<'_>,
-    table: &str,
-    old_object_id: &str,
-    new_object_id: &str,
-) -> Result<(), KernelError> {
-    tx.execute(
-        "UPDATE object_registry SET superseded_by=?1 WHERE object_id=?2",
-        params![new_object_id, old_object_id],
-    )
-    .map_err(|_| KernelError::Io)?;
-    let sql = format!("UPDATE {table} SET superseded_by=?1 WHERE object_id=?2");
-    tx.execute(&sql, params![new_object_id, old_object_id])
-        .map_err(|_| KernelError::Io)?;
-    Ok(())
-}
-
 fn validate_successor(
     old: &ObjectRow,
+    domain_id: &RedactedField,
     source_kind: &RedactedField,
     source_id: &RedactedField,
     source_revision: i64,
 ) -> Result<(), KernelError> {
-    if old.source_kind != source_kind.text || old.source_id != source_id.text {
+    if old.domain_id != domain_id.text
+        || old.source_kind != source_kind.text
+        || old.source_id != source_id.text
+    {
         return Err(KernelError::InvalidInput);
     }
     if source_revision <= old.source_revision {
@@ -929,18 +843,5 @@ fn push_optional(
 ) {
     if let Some(field) = field {
         fields.push((name.to_string(), field.clone()));
-    }
-}
-
-fn map_write_error(error: rusqlite::Error) -> KernelError {
-    match error {
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::ConstraintViolation,
-                ..
-            },
-            _,
-        ) => KernelError::Conflict,
-        _ => KernelError::Io,
     }
 }

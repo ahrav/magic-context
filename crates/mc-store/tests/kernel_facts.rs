@@ -51,49 +51,36 @@ fn file_len(path: &Path) -> u64 {
 }
 
 #[test]
-fn main_size_warning_flips_at_threshold_and_excludes_wal() {
+fn main_file_bytes_names_the_main_file_and_family_bytes_adds_every_sidecar() {
     let root = private_dir();
     let store = KernelStore::open(root.path()).unwrap();
     insert_domain(&store, 1);
     let main = root.path().join("core.sqlite");
     let wal = root.path().join("core.sqlite-wal");
+    let shm = root.path().join("core.sqlite-shm");
     let main_bytes = file_len(&main);
     let wal_bytes = file_len(&wal);
+    let shm_bytes = file_len(&shm);
+    assert!(main_bytes > 0);
     assert!(wal_bytes > 0);
     assert_eq!(MAIN_FILE_WARN_BYTES, 1024 * 1024 * 1024);
-    assert_eq!(
-        store.facts(1).unwrap().main_file_warn,
-        main_bytes >= MAIN_FILE_WARN_BYTES
-    );
 
-    let below = store
-        .facts_with_warn_threshold_for_test(1, main_bytes + 1)
-        .unwrap();
-    let at = store
-        .facts_with_warn_threshold_for_test(1, main_bytes)
-        .unwrap();
-    let above = store
-        .facts_with_warn_threshold_for_test(1, main_bytes.saturating_sub(1))
-        .unwrap();
-    assert!(!below.main_file_warn);
-    assert!(at.main_file_warn);
-    assert!(above.main_file_warn);
-    assert_eq!(at.main_file_bytes, main_bytes);
-    assert_eq!(
-        at.family_bytes,
-        main_bytes + wal_bytes + file_len(&root.path().join("core.sqlite-shm"))
-    );
+    let facts = store.facts(1).unwrap();
+    assert_eq!(facts.main_file_bytes, main_bytes);
+    assert_eq!(facts.family_bytes, main_bytes + wal_bytes + shm_bytes);
+    assert!(facts.family_bytes > facts.main_file_bytes);
+    assert!(facts.main_file_bytes < MAIN_FILE_WARN_BYTES);
     assert_eq!(insert_domain(&store, 2), 2);
 }
 
 #[test]
-fn no_consumers_have_zero_lag_and_no_oldest_age() {
+fn no_consumers_report_absent_lag_rather_than_zero() {
     let root = private_dir();
     let store = KernelStore::open(root.path()).unwrap();
     insert_domain(&store, 1);
     let facts = store.facts(i64::MAX).unwrap();
     assert_eq!(facts.minimum_required_checkpoint, None);
-    assert_eq!(facts.event_lag, 0);
+    assert_eq!(facts.commit_lag, None);
     assert_eq!(facts.oldest_unconsumed_age_ms, None);
 }
 
@@ -119,7 +106,7 @@ fn lag_uses_slowest_consumer_and_oldest_age_grows_exactly() {
     );
     let empty_commit_lag = store.facts(i64::MAX).unwrap();
     assert_eq!(empty_commit_lag.minimum_required_checkpoint, Some(2));
-    assert_eq!(empty_commit_lag.event_lag, 1);
+    assert_eq!(empty_commit_lag.commit_lag, Some(1));
     assert_eq!(empty_commit_lag.oldest_unconsumed_age_ms, None);
 
     store
@@ -142,12 +129,12 @@ fn lag_uses_slowest_consumer_and_oldest_age_grows_exactly() {
     let first = store.facts(created_at + 17).unwrap();
     let second = store.facts(created_at + 42).unwrap();
     assert_eq!(first.minimum_required_checkpoint, Some(2));
-    assert_eq!(first.event_lag, 3);
+    assert_eq!(first.commit_lag, Some(3));
     assert_eq!(first.oldest_unconsumed_age_ms, Some(17));
     assert_eq!(second.oldest_unconsumed_age_ms, Some(42));
 
     store.acknowledge_outbox("required", 5, 5).unwrap();
     let caught_up = store.facts(i64::MAX).unwrap();
-    assert_eq!(caught_up.event_lag, 0);
+    assert_eq!(caught_up.commit_lag, Some(0));
     assert_eq!(caught_up.oldest_unconsumed_age_ms, None);
 }

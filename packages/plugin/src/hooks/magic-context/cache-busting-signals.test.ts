@@ -2,13 +2,6 @@ import { describe, expect, it } from "bun:test";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 
 /**
- * `canConsumeDeferredOnThisPass` is the mid-turn-aware gate that decides whether
- * a deferred publication signal (deferred history refresh / materialization) may
- * be consumed on THIS transform pass. It takes the MID-TURN-ADJUSTED scheduler
- * decision, so a deferred publish that lands mid-turn (decision downgraded to
- * "defer") is NOT consumed until the next non-mid-turn execute/force pass. Pi
- * now mirrors this exact logic (it previously read the raw deferred-set
- * membership, draining mid-turn where OpenCode stayed deferred).
  */
 describe("canConsumeDeferredOnThisPass", () => {
     it("defers when mid-turn (decision=defer) and below force threshold", () => {

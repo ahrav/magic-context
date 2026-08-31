@@ -1,5 +1,2 @@
-# Keep direct plugin imports in e2e tests away from the user's shared database.
-# This is especially important for Pi subagent tests, which open storage without
-# first booting the isolated Pi harness process.
 [test]
 preload = ["../plugin/test-preload.ts"]

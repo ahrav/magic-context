@@ -1,14 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Generates the docs-site configuration reference page from the Zod config
- * schema — the same single source of truth as build-schema.ts, so the rendered
- * docs can never drift from runtime validation.
  *
- * Walks the JSON Schema produced by buildSchema() (draft-7, input shape) and
- * emits one Markdown section per top-level key with a table of leaf fields:
- * dotted path, type, default, and the `.describe()` text.
  *
- * Run: bun packages/plugin/scripts/build-config-docs.ts
  * Output: packages/docs/src/content/docs/reference/configuration.md
  */
 
@@ -66,7 +59,7 @@ function escapeCell(text: string): string {
     return text.replaceAll("|", "\\|").replaceAll("\n", " ").trim();
 }
 
-/** Flattens nested object properties into dotted-path leaf rows. */
+/* */
 function collectLeaves(schema: JsonSchema, prefix: string, rows: LeafRow[]): void {
     const props = schema.properties;
     if (!props || Object.keys(props).length === 0) {
@@ -80,9 +73,7 @@ function collectLeaves(schema: JsonSchema, prefix: string, rows: LeafRow[]): voi
     }
     for (const [key, child] of Object.entries(props)) {
         const childPath = prefix ? `${prefix}.${key}` : key;
-        // Objects with their own properties recurse; everything else is a leaf.
         if (child.properties && Object.keys(child.properties).length > 0) {
-            // Emit a group row when the object itself carries a description.
             if (child.description) {
                 rows.push({
                     path: childPath,
@@ -174,15 +165,9 @@ function renderTable(rows: LeafRow[]): string {
     return `${header}\n${body}`;
 }
 
-// Developer-only keys excluded from the public reference. They stay in the
-// generated JSON schema (so editors validate them) but are not user-facing
-// features; documenting them would invite support questions about internal
-// tooling that requires a local daemon setup users do not have.
+// Public docs exclude developer-only keys even though the generated JSON Schema retains them.
 const DEV_ONLY_KEYS = new Set<string>([
     "shadow_embedding",
-    // Unsupported until the fleet stack ships publicly: activating it requires a
-    // subc daemon no public install has, and documenting it would let the dev
-    // gate calcify into a de-facto public mode before the cutover release.
     "transform_mode",
 ]);
 
@@ -223,9 +208,7 @@ export function buildConfigDocs(): string {
         }
     }
 
-    // Drift guard: any top-level schema key not covered by SECTION_ORDER lands
-    // in a trailing section so new config fields are never silently missing
-    // from the docs (and the parity test can assert coverage).
+    // The trailing section emits unassigned top-level schema keys so generated docs omit none.
     const uncovered = Object.keys(props).filter((k) => !covered.has(k));
     if (uncovered.length > 0) {
         const rows: LeafRow[] = [];

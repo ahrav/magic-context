@@ -1,22 +1,12 @@
 /**
- * Transform-time auto-search hint runner.
  *
- * When a new user message arrives, optionally run ctx_search against the user's
- * prompt and append a caveman-compressed "vague recall" fragment hint to that
- * message. The hint nudges the agent to run ctx_search for full context rather
- * than injecting the content directly.
+ * The packed hint directs the agent to run `ctx_search` for full context instead of receiving retrieved content directly.
  *
  * Cache safety:
- *   - Attaches to the latest user message (the message that triggered the turn),
- *     never to message[0] or to any assistant message. Appending to the current
- *     user message happens BEFORE it reaches Anthropic's cache because this
- *     transform runs on the prompt path — same property as note nudges.
- *   - Idempotent via in-memory turn cache + `.includes()` guard in
- *     appendReminderToUserMessageById. On defer passes we re-append the same
- *     text; `.includes()` makes that a no-op.
- *   - New user turn (different message id) → compute fresh hint, new append.
- *   - Process restart → cache cleared; next pass will recompute but the user
- *     message is a fresh turn anyway, no provider cache to preserve yet.
+ * The transform appends hints only to the triggering user message before Anthropic caches it.
+ * The in-memory turn cache and `appendReminderToUserMessageById`'s `.includes()` guard make repeated deferred passes idempotent.
+ * A new user turn with a different message ID computes and appends a fresh hint.
+ * The transform recomputes the hint after a process restart because the in-memory turn cache is empty.
  */
 
 import {
@@ -65,11 +55,9 @@ export type AutoSearchDeliveryReason =
     | "packer-empty"
     | "timeout";
 
-/** Below-threshold, empty, packer-empty, and timeout are completed
- *  empty-delivery outcomes. Search failures are incomplete evidence, not
- *  empty rankings. The delivered variant carries a non-null hint by
- *  construction (the packer-empty branch already rejected a null pack), so
- *  consumers need no defensive null re-check after discriminating on
+/** Below-threshold, empty, packer-empty, and timeout are completed empty-delivery outcomes.
+ * Search failures are incomplete evidence, not empty rankings.
+ * The delivered variant carries a non-null hint because the packer-empty branch rejects a null pack.
  *  `reason`. */
 export type AutoSearchDelivery =
     | {
@@ -108,8 +96,7 @@ function emptyDelivery(
 }
 
 /**
- * `runAutoSearchHint` delegates here, so structured callers observe the same
- * source restrictions, timeout, and packing the transform applies.
+ * `runAutoSearchHint` gives structured callers the transform's source restrictions, timeout, and packing.
  * Persistence and message mutation stay with the transform caller.
  */
 export async function executeAutoSearchDelivery(args: {
@@ -120,8 +107,8 @@ export async function executeAutoSearchDelivery(args: {
     searchOptions: UnifiedSearchOptions;
     scoreThreshold: number;
     timeoutMs?: number;
-    /** Reference clock for hint age wording (defaults to the live clock);
-     *  the benchmark injects the scenario's fixed reference time. */
+    /** The reference clock defaults to the live clock for hint-age wording.
+     * */
     packNowMs?: number;
 }): Promise<AutoSearchDelivery> {
     let results: UnifiedSearchResult[] | null;
@@ -146,10 +133,6 @@ export async function executeAutoSearchDelivery(args: {
     if (results[0].score < args.scoreThreshold) {
         return emptyDelivery("below-threshold", results);
     }
-    // The gate above tests only the top result, and the packer reserves the
-    // first fragment for a warning. Handing it the threshold is what stops a
-    // strong hit from another lane promoting a weakly matched rejection warning
-    // to the head of the hint; the packer owns it so both harnesses inherit it.
     const packed = packAutoSearchHint(results, {
         warningScoreThreshold: args.scoreThreshold,
         ...(args.packNowMs === undefined ? {} : { nowMs: args.packNowMs }),
@@ -183,14 +166,11 @@ export interface AutoSearchRunnerOptions {
 export function collectUserPromptParts(message: MessageLike): string {
     let collected = "";
     for (const part of message.parts) {
-        // Persisted parts can hydrate as null (invalid JSON or a literal
-        // "null" row); one malformed part must not abort the whole message.
+        // The collector ignores null parts so a malformed part does not abort collection.
         if (part === null || typeof part !== "object") continue;
         const p = part as { type?: string; text?: string; ignored?: boolean };
         if (p.type !== "text" || typeof p.text !== "string") continue;
-        // Skip plugin-internal ignored notifications (conflict warnings, TUI setup
-        // notices, startup announcements, etc.). They're persisted as ordinary
-        // user-role messages but should never reach embeddings or hint detection.
+        // The transform skips ignored plugin notifications so they do not reach downstream prompt processing.
         if (p.ignored === true) continue;
         collected += (collected.length > 0 ? "\n" : "") + p.text;
     }
@@ -198,18 +178,9 @@ export function collectUserPromptParts(message: MessageLike): string {
 }
 
 function extractUserPromptText(message: MessageLike): string {
-    // Strip all plugin-owned injections AND any other XML/HTML markup so the
-    // embedded prompt is just what the user actually typed. Without this:
+    // The transform strips markup before embedding to exclude plugin-owned tags.
     //
-    //  - Every embedded query would carry "§NNN§ " tag prefixes, temporal
-    //    markers, plugin nudges, and any other XML the user (or an upstream
-    //    extension) included in their message. That noise distorts semantic
-    //    similarity scores and leaks plugin-internal markup into local
-    //    embedding endpoint logs (LMStudio, openai-compatible, etc).
     //
-    //  - Specific allowlists missed real cases: pasted code with `<Component>`,
-    //    quoted XML from another tool's output, ALFONSO/OMO markers we hadn't
-    //    enumerated yet, and so on. A generic strip catches all of them.
     return extractBoundedAutoSearchQuery(collectUserPromptParts(message));
 }
 
@@ -218,13 +189,7 @@ function findLatestMeaningfulUserMessage(messages: MessageLike[]): MessageLike |
         const msg = messages[i];
         if (msg.info.role !== "user") continue;
         if (typeof msg.info.id !== "string") continue;
-        // hasMeaningfulUserText filters parts that should never reach embeddings:
-        //   - ignored: true notifications (announcement, conflict warning, TUI setup)
-        //   - system reminders, OMO internal initiator markers
-        //   - system-directive-only stubs
-        // The previous inline check accepted any non-empty text part, which let
-        // ignored plugin-internal messages (e.g. the v0.21.7 startup announcement)
-        // reach the embedding endpoint as if they were real user prompts.
+        // The embedding collector excludes ignored notifications, system reminders, and directive-only stubs.
         if (hasMeaningfulUserText(msg.parts)) {
             return msg;
         }
@@ -233,10 +198,6 @@ function findLatestMeaningfulUserMessage(messages: MessageLike[]): MessageLike |
 }
 
 /**
- * Entry point. Called from transform post-processing. No-op when disabled,
- * when there is no meaningful user message, when prompt is too short, when
- * search returns nothing strong enough, or when the hint has already been
- * appended for this turn.
  */
 export async function runAutoSearchHint(args: {
     sessionId: string;
@@ -251,8 +212,8 @@ export async function runAutoSearchHint(args: {
     if (!userMsg || typeof userMsg.info.id !== "string") return AUTO_SEARCH_OK;
     const userMsgId = userMsg.info.id;
 
-    // Persisted anti-memory warnings never replay; each warning requires a
-    // fresh search. Ordinary hints carry no memory fragments and can replay.
+    // Persisted anti-memory warnings never replay; each warning requires a fresh search.
+    // Ordinary hints carry no memory fragments and can replay.
     const replayHintIfEligible = (decision: AutoSearchHintDecision): void => {
         if (decision.decision !== "hint") return;
         if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
@@ -272,16 +233,7 @@ export async function runAutoSearchHint(args: {
         return AUTO_SEARCH_OK;
     }
 
-    // Live-tail gate: only compute a NEW hint when the meaningful user message is
-    // the actual last element of the array (a just-arrived user turn the assistant
-    // has not answered yet). `findLatestMeaningfulUserMessage` returns the latest
-    // user message even when it is BURIED behind a queued-message race or a
-    // mid-turn assistant tail — appending a fresh hint there would mutate an
-    // already-cached message and bust everything after it (the Bust-B class). On a
-    // non-tail pass we only replay persisted decisions (handled above); we never
-    // create a new one. A note-nudger-style `triggerMessageId` deferral would be
-    // wrong here: auto-search has no trigger event and runs every pass, so a
-    // deferral gate would either no-op or permanently suppress.
+    // The transform creates hints only for the final message because mutating an earlier message invalidates cached later messages.
     if (messages.length === 0 || messages[messages.length - 1].info.id !== userMsgId) {
         return AUTO_SEARCH_OK;
     }
@@ -299,8 +251,7 @@ export async function runAutoSearchHint(args: {
         return AUTO_SEARCH_OK;
     };
 
-    // New turn — compute hint fresh. Suppression check must run BEFORE stripping
-    // because the stripper removes the exact tags that signal "already augmented".
+    // The transform checks raw text for augmentation tags before stripping them because stripping removes the duplicate-augmentation signal.
     const rawPartsText = collectUserPromptParts(userMsg);
     if (hasStackedAugmentation(rawPartsText)) {
         sessionLog(
@@ -341,11 +292,6 @@ export async function runAutoSearchHint(args: {
                 return result;
             },
             isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
-            // Hard-filter memories already rendered in <session-history>.
-            // unifiedSearch applies this during memory merging so ranking
-            // can't be distorted by already-visible hits.
-            // Primers v1 are cache-neutral: they surface via explicit ctx_search
-            // and dashboard only, never transform-time auto-search prompt hints.
             sources: [...AUTO_SEARCH_SOURCES],
         };
         delivery = await executeAutoSearchDelivery({
@@ -361,9 +307,7 @@ export async function runAutoSearchHint(args: {
     }
 
     if (delivery.status === "incomplete") {
-        // Retryable failure — do NOT persist a permanent no-hint decision, or the
-        // hint would be suppressed forever for this message even though the next
-        // pass might succeed. Just skip this pass; a later pass re-evaluates.
+        // On retryable failure, the transform does not persist a no-hint decision so a later pass re-evaluates the message.
         log(
             `[auto-search] unified search failed for session ${sessionId} (will retry next pass): ${delivery.error instanceof Error ? delivery.error.message : String(delivery.error)}`,
         );
@@ -371,7 +315,7 @@ export async function runAutoSearchHint(args: {
     }
 
     if (delivery.reason === "timeout") {
-        // Timeout is also retryable — skip without persisting a no-hint decision.
+        // On timeout, the transform skips persistence of a no-hint decision so a later pass re-evaluates the message.
         sessionLog(
             sessionId,
             `auto-search: timed out after ${AUTO_SEARCH_TIMEOUT_MS}ms, skipping hint for this turn (will retry)`,
@@ -391,15 +335,10 @@ export async function runAutoSearchHint(args: {
         return writeNoHintAndReconcile("below-threshold");
     }
 
-    // All non-delivered reasons returned above, so the type system proves
-    // hintText is a non-null string here.
     const hintText = delivery.hintText;
 
-    // Prefix with double newline so the hint is a separate block, not glued
-    // onto the last word of the user's prompt.
     const payload = `\n\n${hintText}`;
     // Any anti-memory fragment marks the persisted decision as non-replayable.
-    // Warning delivery always requires a fresh search rather than stored text.
     const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
         delivery.delivered,
     );
@@ -413,8 +352,6 @@ export async function runAutoSearchHint(args: {
         sessionLog(sessionId, `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`);
         return { ok: false, kind: "cas-exhaustion" };
     }
-    // Deliver this call's fresh CAS winner directly. Concurrently persisted
-    // decisions replay only when they contain no anti-memory fragment.
     if (outcome.kind === "appended" && warningResults.length > 0) {
         appendReminderToUserMessageById(messages, userMsgId, payload);
         recordDeliveredAntiMemoryUsage(db, warningResults);
@@ -429,6 +366,4 @@ export async function runAutoSearchHint(args: {
 }
 
 /** Session cleanup hook — call on session.deleted. */
-export function clearAutoSearchForSession(_sessionId: string): void {
-    // Decisions are session_meta state and are removed by clearSession().
-}
+export function clearAutoSearchForSession(_sessionId: string): void {}

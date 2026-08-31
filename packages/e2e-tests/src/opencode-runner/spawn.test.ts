@@ -35,13 +35,7 @@ function childProcess(fake: FakeChild): ChildProcess {
 
 describe("opencode child lifecycle", () => {
     it("resolves the plugin entry when spawning, not when this module was imported", () => {
-        // A module-level `existsSync` snapshot is taken before any caller code
-        // runs, so a caller that builds the bundle and then spawns in the same
-        // process got the pre-build answer — and with no bundle present the entry
-        // latched to `src/` permanently, making that process load a different
-        // plugin entrypoint than a caller that prebuilt while reporting the same
-        // identity. This module has already been imported by the time this test
-        // body runs, which is exactly the window that has to stay live.
+        // Each spawn resolves the plugin entry so it uses a bundle created after module import.
         const repoRoot = resolve(import.meta.dir, "../../../..");
         const dist = join(repoRoot, "packages/plugin/dist/index.js");
         const distExisted = existsSync(dist);
@@ -64,8 +58,6 @@ describe("opencode child lifecycle", () => {
             if (distExisted) renameSync(dist, stash);
             expect(pluginOf()).toBe(`file://${join(repoRoot, "packages/plugin/src/index.ts")}`);
 
-            // Same process, same already-imported module: creating the bundle now
-            // must move the resolved entry.
             mkdirSync(dirname(dist), { recursive: true });
             writeFileSync(dist, distExisted ? readFileSync(stash) : "// built after import\n");
             expect(pluginOf()).toBe(`file://${dist}`);

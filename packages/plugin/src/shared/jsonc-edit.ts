@@ -17,8 +17,7 @@ interface TokenLocation {
 }
 
 /**
- * jsonc-parser exposes SyntaxKind as a const enum, which cannot be referenced
- * from this isolated TypeScript module. Keep the scanner token values local.
+ * Isolated modules cannot reference jsonc-parser's const-enum SyntaxKind.
  */
 const TOKEN_COMMA = 5;
 const TOKEN_LINE_COMMENT = 12;
@@ -90,8 +89,8 @@ function inlineCommentEnd(
 }
 
 /**
- * Keep comments written inline after a preceding separator with that preceding
- * entry. Comments on a later line belong to the entry that follows the comma.
+ * Inline comments after a comma belong to the preceding entry.
+ * Comments after a comma on a later line belong to the following entry.
  */
 function startAfterPrecedingInlineComments(
     text: string,
@@ -105,7 +104,7 @@ function startAfterPrecedingInlineComments(
     return nextNewline === -1 ? commentEnd : nextNewline + 1;
 }
 
-/** Remove inline comments following a removed entry's comma with that entry. */
+/** The removal range includes inline comments after the removed entry's comma. */
 function endAfterFollowingInlineComments(
     text: string,
     comma: TokenLocation,
@@ -237,9 +236,9 @@ function appendArrayValue(text: string, array: Node, value: unknown): string {
 }
 
 /**
- * Replace one JSONC value without reserializing the rest of the document. New
- * paths use jsonc-parser's structural edit so the original document remains
- * untouched outside the inserted property.
+ * The editor replaces values without reserializing the rest of the document.
+ * When the target path is absent, the editor uses jsonc-parser's structural edit.
+ * The structural edit preserves bytes outside its edit ranges.
  */
 export function setJsoncValue(text: string, path: JSONPath, value: unknown): string {
     const node = findNode(text, path);
@@ -253,8 +252,7 @@ export function setJsoncValue(text: string, path: JSONPath, value: unknown): str
 }
 
 /**
- * Remove matching array entries while retaining the exact bytes for survivor
- * comments and surrounding JSONC regions.
+ * The remover preserves the exact bytes of surviving comments and surrounding JSONC regions.
  */
 export function removeJsoncArrayEntries(
     text: string,
@@ -279,7 +277,7 @@ export function removeJsoncArrayEntries(
     }
 }
 
-/** Append values to an existing JSONC array without reserializing sibling fields. */
+/** The appender adds values without reserializing sibling fields. */
 export function appendJsoncArrayValues(text: string, path: JSONPath, values: unknown[]): string {
     let nextText = text;
 

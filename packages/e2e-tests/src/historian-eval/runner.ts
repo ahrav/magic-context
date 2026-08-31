@@ -1,18 +1,15 @@
 /**
- * Historian structural eval lane — replay runner (U2).
  *
- * Drives one scenario end-to-end through the REAL historian path: the e2e
- * harness boots `opencode serve`, the MockProvider scripts every main-agent
- * turn of the authored transcript, and the historian agent routes either to
- * a live model (operator runs) or to a scripted matcher (deterministic
- * tests). Everything scoring needs is captured into a run record; infra
- * failures are separated from model behavior (R6): they surface as a run
- * record `error`, never as a scored FAIL.
+ * `runScenario` drives an authored transcript through the production historian path.
+ * `TestHarness` boots `opencode serve`.
+ * `MockProvider` scripts every main-agent turn in the authored transcript.
+ * The historian agent uses a live model for operator runs and a scripted matcher for deterministic tests.
+ * The runner captures scoring inputs in the run record.
+ * Infrastructure failures surface as run-record `error`, never as a scored FAIL.
  *
- * Fresh temp environment per attempt (KTD9): each `runScenario` call boots
- * its own harness, and an artifact directory that already holds a run record
- * is refused — retrying in a reused environment would replay stale
- * idempotency receipts and score first-attempt state.
+ * Each `runScenario` call boots its own harness.
+ * `runScenario` refuses an artifact directory that already contains a run record.
+ * Retrying in a reused environment replays stale idempotency receipts.
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -29,7 +26,7 @@ import {
     MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES,
 } from "../../../plugin/src/hooks/magic-context/internal-agent-signatures";
 import { openTestDb } from "../test-db";
-import { TestHarness, type TestHarnessOptions } from "../harness";
+import { DEFAULT_PROMPT_TIMEOUT_MS, TestHarness, type TestHarnessOptions } from "../harness";
 import { MockProvider, type MockResponse } from "../mock-provider/server";
 import {
     EXECUTE_THRESHOLD_PERCENTAGE,
@@ -66,35 +63,28 @@ import { verifyAllActiveClaims } from "./verification-bridge";
 export type { InjectedClaimRecord } from "./claim-read";
 
 /**
- * Run-record schema identity. The scorer keys record MEANING off this string —
- * it rejects any other value outright — so a change to the required record
- * shape has to move it. `v2` added `system.opencodeVersion` and `v3` adds
- * `system.bunVersion`, both of which the scorer requires: left unchanged, one
- * identifier would name two incompatible shapes and a record written by an earlier
- * producer would be rejected as `record-malformed` rather than as the older schema
+ * The scorer rejects run records whose schema identity differs from the required value.
+ * Changing the record shape requires a new schema identity.
+ * Schema `v3` requires `system.opencodeVersion` and `system.bunVersion`.
+ * Changing the record shape without changing its identifier would make one identifier denote incompatible schemas.
+ * The scorer classifies records with earlier schema identities as `record-malformed`.
  * it is.
  */
 /**
- * Non-request work inside one live historian pass, bounded generously.
+ * Each live historian pass reserves two minutes for non-request work.
  *
- * Child-session setup, output validation, repair-prompt construction, compartment
- * and claim persistence, and the quiescence poll all sit between and after the two
- * provider requests, and none is individually bounded. Two minutes is far above what
- * local SQLite writes and a poll loop take, and it is the difference between the
- * lane's wait exceeding the plugin's own bound and expiring exactly on it.
+ * Two minutes prevents the lane wait from expiring at the plugin timeout.
+ * The reserve covers local SQLite writes and the quiescence poll.
  */
 const LIVE_HISTORIAN_OVERHEAD_MS = 120_000;
 
-/** Claim-capture-time database image; see `ScenarioRunner.capturedClaims`. */
+/* */
 const PRE_PROBE_SNAPSHOT_FILE = "context-db-snapshot-pre-probe.sqlite";
 
 export const RUN_RECORD_SCHEMA = "historian-eval-run-record/v3";
 
 /**
- * The canonical internal-agent signature containing `needle`. Request routing
- * keys off production's exported signature list rather than a local copy, so a
- * prompt rewording surfaces as a loud module-load failure here instead of
- * silently misrouting every scenario into script-drift ERRORs.
+ * The matcher uses production's exported signature list so prompt rewording fails module loading instead of silently misrouting scenarios.
  */
 function requireSignature(signatures: readonly string[], needle: string): string {
     const found = signatures.find((signature) => signature.includes(needle));
@@ -105,26 +95,22 @@ function requireSignature(signatures: readonly string[], needle: string): string
 }
 
 /**
- * Marker-based historian request detection (pattern proven by
- * tests/historian-success.test.ts). The historian's system prompt carries
- * this signature line; its user content carries the `<new_messages>` block.
  */
 const HISTORIAN_SYSTEM_MARKER = requireSignature(MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES, "Historian");
 
-/** OpenCode's auxiliary title-generation agent, from the canonical signature list. */
+/* */
 const TITLE_SYSTEM_MARKER = requireSignature(INTERNAL_OPENCODE_AGENT_SIGNATURES, "title generator");
 
 
 
 /**
- * Ordinals the scenario's authored turns occupy in the rendered transcript.
+ * `authoredTurnOrdinals` identifies authored turns in the rendered transcript.
  *
- * Harness-owned filler turns precede the authored ones whenever the scenario is
- * shorter than `MIN_BUILD_TURNS`, so the layout is fully determined by the
- * scenario and nothing else. Exported because the scorer validates a stored
- * record's `authoredTurnOrdinals` against it: that field decides which
- * compartments count toward gold's minimum, and a second derivation of the same
- * layout is how the two could disagree about which rows are authored.
+ * Harness-owned filler turns precede authored turns when a scenario has fewer than `MIN_BUILD_TURNS` turns.
+ * The scenario alone determines the resulting layout.
+ * The scorer validates stored `authoredTurnOrdinals` against this layout.
+ * `authoredTurnOrdinals` determines which compartments count toward gold's minimum.
+ * `authoredTurnOrdinals` prevents a second derivation from classifying different rows as authored.
  */
 export function authoredTurnOrdinalsFor(scenario: HistorianEvalScenario): Array<[number, number]> {
     const fillerCount = Math.max(0, MIN_BUILD_TURNS - scenario.transcript.turns.length);
@@ -136,7 +122,7 @@ export function authoredTurnOrdinalsFor(scenario: HistorianEvalScenario): Array<
 
 const POISON_TEXT = "HISTORIAN-EVAL-POISON: unscripted main-agent turn reached the default response";
 
-/** Infra causes (R6). None of these may be attributed to historian quality. */
+/** The scorer does not attribute infrastructure failures to historian quality. */
 export type RunErrorReason =
     | "lease-lost"
     | "no-op-promotion"
@@ -156,17 +142,17 @@ export interface RunRecordError {
     detail: string;
 }
 
-/** Per historian run: the raw output artifact plus healing evidence (R9). */
+/* */
 export interface HistorianRunArtifact {
     runIndex: number;
-    /** Raw output text, extracted exactly as production validated it (KTD5). */
+    /* */
     rawOutput: string | null;
     status: "success" | "failed" | "noop";
     failureReason: string | null;
     repairUsed: boolean;
     attemptCount: number;
     discardedLast: boolean;
-    /** chunkEndOrdinal - max persisted compartment end; null when unknowable. */
+    /** `chunkEndOrdinal` is the maximum persisted compartment end and is `null` when unknown. */
     lookaheadMargin: number | null;
     emittedCompartments: number;
     persistedCompartments: number;
@@ -174,56 +160,33 @@ export interface HistorianRunArtifact {
     chunkStartOrdinal: number | null;
     chunkEndOrdinal: number | null;
     /**
-     * Promotion evidence this run added under the scenario's project — claims
-     * created plus evidence rows attached to existing ones.
+     * Each run records claims created and evidence rows attached to existing claims under the scenario's project.
      *
-     * Recorded per run because a scenario-wide count cannot separate them: run 1
-     * promoting successfully leaves the total non-zero, so run 2's silently
-     * skipped promotion passes the plumbing guard and its missing fact is then
-     * charged to historian recall instead. Evidence attachments count because a
-     * fact an earlier run already promoted is deduplicated onto that claim rather
-     * than creating another.
+     * Each run records promotion evidence because scenario-wide totals can hide skipped promotions, and repeated facts attach to existing claims.
      */
     promotionEvidenceAdded: number;
     /**
-     * The ordinal the output stopped processing at, or null when it consumed its chunk.
+     * `unprocessedFrom` is the first ordinal the historian did not process; it is null when the historian consumes its chunk.
      *
-     * The chunk is what the historian was HANDED; this is how much of it the output
-     * actually processed. A successful output may emit early compartments and then set
-     * `<unprocessed_from>` before a later turn, so chunk coverage alone does not prove the
-     * authored transcript was seen — and a hard negative in the unprocessed suffix would
-     * pass its absence check vacuously.
+     * `unprocessedFrom` can follow early emitted compartments; therefore chunk coverage does not prove the historian saw the authored transcript, and absence checks exclude the unprocessed suffix.
      */
     unprocessedFrom: number | null;
 }
 
 /**
- * A later probe's gold answer stated in the text OUTSIDE this response's answer
- * envelope, or null.
+ * `probeResponseLeak` returns a later probe's gold answer found outside the sending response's accepted answer envelope, or null.
  *
- * `extractAnswerEnvelope` requires exactly one envelope and ignores everything
- * around it, which is deliberate — a model that prefixes "Sure, here you go" has
- * still answered, and failing the turn on that would convert ordinary chattiness
- * into `probe-envelope-malformed`. But probes share one resumed session and probe
- * turns are not compartment-covered, so an assistant reply stays raw in the
- * history the NEXT probe reads. Commentary that happens to state a later probe's
- * answer therefore hands it over, and no other gate covers it: `goldRangeLeak`
- * searches for authored TRANSCRIPT text, and the freeze-time probe guards cannot
- * know what the model will volunteer.
+ * `extractAnswerEnvelope` accepts exactly one envelope and ignores surrounding text, so prefatory chat does not trigger `probe-envelope-malformed`.
+ * Because assistant turns are not compartment-covered, later probes read raw replies, including commentary that states a later probe's answer.
+ * `goldRangeLeak` searches authored `TRANSCRIPT` text.
  *
- * Scoped to the answer's own envelope being excluded and to LATER probes only,
- * for the same reasons the freeze-time guard is: this probe's own answer inside
- * its envelope is the point of the exchange, and a probe already asked cannot be
- * influenced by a reply that comes after it.
+ * A reply cannot influence a probe that was already asked.
  *
- * The exemption is for the ACCEPTED envelope only, which is why `extractAnswerEnvelope`
- * decides it rather than a blanket strip. A reply carrying two envelopes is REJECTED
- * as an answer and re-asked, but it stays in the session all the same — so stripping
- * every envelope would exempt text that is not this probe's answer and never will be,
- * and `<answer>x</answer><answer>later-gold</answer>` would pass a scan that sees
- * neither value. When nothing was accepted, nothing is exempt.
+ * Replies with two envelopes are rejected and re-asked but remain in session history.
+ * Stripping every envelope would exempt rejected envelopes that contain later probes' gold answers.
+ * `<answer>x</answer><answer>later-gold</answer>` contains a later gold answer in a rejected envelope.
  *
- * Complete values, so a reply mentioning "4096" does not count as stating the
+ * `containsCompleteValue` matches complete values, so mentioning `4096` does not match `4`.
  * answer "4".
  */
 export function probeResponseLeak(args: {
@@ -237,18 +200,13 @@ export function probeResponseLeak(args: {
     const outside = outsideAcceptedEnvelope(responseText, (content) =>
         own !== undefined &&
         own.answerType !== "claim-id" &&
-        // The same decoded equality `compareProbeAnswer` uses. Otherwise an escaped but
-        // CORRECT answer would be scored as a pass there and scanned as foreign text here,
-        // so a probe answering its own question could report a leak against itself.
+        // `probeResponseLeak` decodes XML entities before normalizing to match `compareProbeAnswer`.
+        // Without decoding, an escaped correct answer could pass `compareProbeAnswer` but remain outside the exempted envelope.
         normalizeContent(decodeXmlEntities(content)) === normalizeContent(decodeXmlEntities(own.goldAnswer)),
     );
     for (const later of probes.slice(probeIndex + 1)) {
-        // Claim-id answers are not checked here. Their accepted value is a runtime id
-        // whose acceptance depends on the LATER probe's own injected set, which does not
-        // exist yet while this probe is being asked — resolving it from the whole
-        // surface flagged ids that probe could never have been credited with, turning a
-        // valid run into an ERROR. `probeResponseClaimIdLeak` does that half once every
-        // probe's injection evidence is captured.
+        // `probeResponseLeak` skips claim-id answers because their accepted IDs depend on each later probe's injected set, which is unavailable while this probe runs.
+        // `probeResponseClaimIdLeak` checks claim-id leaks after every probe's injection evidence is captured.
         if (later.answerType === "claim-id") continue;
         if (containsCompleteValue(outside, later.goldAnswer)) {
             return `response text outside the answer envelope states a later probe's (${later.id}) gold answer`;
@@ -258,23 +216,13 @@ export function probeResponseLeak(args: {
 }
 
 /**
- * The reply text a later probe can copy from: everything except an envelope holding
- * a CORRECT answer to the probe that sent it.
+ * A later probe can copy all reply text except an envelope containing the sending probe's correct answer.
  *
- * Two conditions, and both are load-bearing. Syntactic acceptance alone is not
- * enough — an envelope is exempt because a probe answering its own question is the
- * point of the exchange, and a reply of `<answer>4096</answer>` from a probe whose
- * gold is `in-process lru` is not that. It is a wrong answer that happens to state
- * some other probe's value, so exempting it let the later probe copy it. And a reply
- * that `extractAnswerEnvelope` rejected — two envelopes, or an empty one — was never
- * this probe's answer and never will be, yet it was still sent and still sits in the
- * shared session, so nothing in it is exempt either.
+ * A correct envelope is exempt so the sending probe can answer its own question.
+ * Exempting a wrong reply would let a later probe copy another probe's gold answer.
+ * Malformed envelopes remain copyable, so no content in them is exempt.
  *
- * `isCorrectAnswer` is supplied because correctness is per probe type: an exact or
- * multiple-choice answer compares against the authored gold, while a claim-id answer
- * is a runtime id only the deferred scan can resolve. A caller that cannot decide
- * returns false, which scans the envelope too — conservative in the direction that
- * cannot hide a leak.
+ * Exact and multiple-choice answers use authored gold; unresolved claim IDs return false so the scan does not exempt their envelopes.
  */
 function outsideAcceptedEnvelope(responseText: string, isCorrectAnswer: (content: string) => boolean): string {
     const accepted = extractAnswerEnvelope(responseText);
@@ -284,28 +232,12 @@ function outsideAcceptedEnvelope(responseText: string, isCorrectAnswer: (content
 }
 
 /**
- * An earlier reply naming a runtime claim id that would be ACCEPTED for a later
- * claim-id probe, or null.
  *
- * Deferred until every probe's injection evidence exists, because acceptance is
- * per-probe: `compareProbeAnswer` credits a claim-id answer only when the claim
- * matches that probe's gold AND its locator is in THAT probe's
- * `injectedRevisionLocators`. A gold predicate can match several visible claims, and
- * claim-memory budgeting can leave one of them out of the later probe's set — an id
- * the later probe could never be credited with. Resolving from the whole injected
- * surface therefore reported leaks that could not have produced a PASS, which charges
- * a valid run as infrastructure.
  *
- * Shared by the runner (after its claim capture) and the scorer (over the stored
- * record), so the live abort and the replay refusal resolve acceptance identically.
  */
 /**
- * Runtime public claim ids `compareProbeAnswer` would credit for one claim-id probe:
- * claims matching its gold whose locator is in THAT probe's injected set.
  *
- * Both halves matter. Matching alone names claims the probe was never shown, and the
- * locator set alone names claims that answer a different expectation — crediting
- * either would flag a value that could not have produced a PASS.
+ * Only claims that match the gold and whose locators were injected for the probe can produce PASS.
  */
 function acceptedClaimIds(
     scenario: HistorianEvalScenario,
@@ -332,17 +264,14 @@ export function probeResponseClaimIdLeak(args: {
     for (const [index, earlier] of scenario.probes.entries()) {
         const earlierExchange = exchangeById.get(earlier.id);
         if (earlierExchange === undefined) continue;
-        // Every reply this probe sent, not only the one its answer came from. A
-        // discarded malformed reply is still in the session for the next probe to read.
+        // `probeResponseClaimIdLeak` scans every earlier reply because discarded malformed replies remain in the session.
         const replies = [
             ...earlierExchange.discardedResponseTexts,
             ...(earlierExchange.responseText === null ? [] : [earlierExchange.responseText]),
         ];
         if (replies.length === 0) continue;
-        // The earlier probe's OWN correct answers, so its envelope is exempt for the
-        // same reason an exact probe's is: answering its own question is the exchange.
-        // For a claim-id probe that means the ids accepted for IT, which this pass can
-        // resolve because it holds the same evidence.
+        // `probeResponseClaimIdLeak` excludes an earlier probe's correct answer envelopes because self-answers are not leaks.
+        // For claim-id probes, `probeResponseClaimIdLeak` exempts only IDs that `acceptedClaimIds` accepts for the earlier probe.
         const ownCorrect = new Set(
             acceptedClaimIds(scenario, earlier, exchangeById.get(earlier.id), injectedClaims).map(normalizeContent),
         );
@@ -366,22 +295,17 @@ export function probeResponseClaimIdLeak(args: {
 }
 
 /**
- * The transcript each run EXPOSED the model to: its chunk, for every run that made a
  * historian request.
  *
- * What makes an absence check vacuous is text the model was never SHOWN — not text it saw
- * and declined to compartmentalize. So a validation-exhausted run counts in full (it was
- * shown its chunk and produced nothing, which the score reports as model behaviour), and a
+ * Only text not included in a model request makes an absence check vacuous.
+ * Text the model saw but did not compartmentalize does not make an absence check vacuous.
+ * A validation-exhausted run counts in full because the model received its chunk and produced no output.
  * `noop` run counts for nothing (it made no request at all).
  *
- * KNOWN GAP: this is what each run was HANDED, not what its output consumed. A successful
- * output may declare `<unprocessed_from>` inside its chunk, and its ordinal is now recorded
- * on the artifact and cross-checked against the snapshot — but it is deliberately NOT
- * subtracted here yet. Truncating at `unprocessedFrom - 1` aborted six harness tests whose
- * runs are otherwise healthy, which says the persisted value does not mean "the first
- * ordinal this output did not read" in the way the subtraction assumes. Establishing what
- * it does mean against a real run is a prerequisite for closing the gap, and guessing would
- * convert healthy runs into coverage aborts.
+ * `exposedRanges` reports each run's handed chunk, not the ordinals its output consumed.
+ * A successful output may declare `<unprocessed_from>` inside its chunk; the artifact records and the snapshot cross-checks its ordinal.
+ * `unprocessedFrom` does not identify the first ordinal the output did not read.
+ * `exposedRanges` must not infer unread ordinals from `unprocessedFrom`; incorrect truncation converts healthy runs into coverage aborts.
  */
 export function exposedRanges(
     runs: readonly HistorianRunArtifact[],
@@ -393,42 +317,39 @@ export function exposedRanges(
 
 export interface ProbeExchange {
     probeId: string;
-    /** Envelope contents of the final answer attempt; null when malformed twice. */
+    /** Returns the final answer attempt's envelope contents; returns null after two malformed attempts. */
     answerRaw: string | null;
     reAsked: boolean;
-    /** revisionLocators recorded as injected for the probe turn. */
+    /* */
     injectedRevisionLocators: string[];
-    /** Captured probe-turn request payload (mock-captured; null on live routes). */
+    /** Stores the mock-captured probe-turn request payload; stores null for live routes. */
     payloadText: string | null;
     /**
-     * The FINAL captured request of the turn — the one that produced the accepted answer.
+     * Stores the final request captured for the turn, which produced the accepted answer.
      *
-     * `payloadText` spans every request in the probe's window, which the leak gate wants
-     * because each one's text reached the session. Per-turn EVIDENCE wants the opposite:
-     * on a re-ask, a claim or compartment block rendered for the discarded first attempt
-     * says nothing about what the answering request carried, and reading the combined
-     * text let a stale block suppress `error-trimmed` for a guessed retry.
+     * `payloadText` includes every request in the probe's window so leak detection sees discarded attempts.
+     * Per-turn evidence uses `finalRequestPayloadText` rather than `payloadText`.
+     * A re-ask's discarded attempt can render claim or compartment blocks absent from the accepted-answer request.
+     * `payloadText` can let stale blocks from a discarded attempt suppress `error-trimmed` on a guessed retry.
      */
     finalRequestPayloadText: string | null;
     /**
-     * Assistant text the answer was extracted from.
+     * Stores the assistant text from which the answer was extracted.
      *
-     * `answerRaw` is a derivation, and on its own an unfalsifiable one: rescoring
-     * a stored record trusted it as the model's response with nothing to check it
-     * against, so editing a wrong answer to the gold value turned a probe FAIL
-     * into a PASS while every integrity check still passed. Keeping the response
-     * makes the extraction reproducible, so the two must agree.
+     * `answerRaw` alone cannot verify that the stored value came from the model response.
+     * `responseText` lets rescoring verify that `answerRaw` came from the model response.
+     * Without `responseText`, editing a wrong answer to the gold value can turn a probe failure into a pass without failing integrity checks.
+     * `answerRaw` must agree with the answer extracted from `responseText`.
      */
     responseText: string | null;
     /**
-     * Replies from attempts whose answer was REJECTED, in the order they were sent.
+     * `discardedResponseTexts` stores replies from attempts whose answers were REJECTED, in send order.
      *
-     * `responseText` holds only the reply the answer came from, and a re-asked probe
-     * discards the first one — but that reply was already sent, so it stays raw in the
-     * shared session and a later probe still reads it. The authored-value scan runs per
-     * attempt and covers it live; the claim-id scan is deferred until every probe's
-     * injection evidence exists, by which point only the recorded exchange remains. So
-     * the discarded replies are recorded, and the deferred scan reads them too.
+     * `responseText` holds only the reply that produced the answer.
+     * Discarded replies remain in the shared session, so later probes can read them.
+     * The authored-value scan covers each attempt before deferred claim-id scans run.
+     * The claim-id scan runs only after every probe's injection evidence exists.
+     * The deferred claim-id scan reads discarded replies from the recorded exchanges.
      */
     discardedResponseTexts: string[];
 }
@@ -436,23 +357,19 @@ export interface ProbeExchange {
 export interface SystemVersionTuple {
     repoCommitSha: string;
     /**
-     * `Bun.version` of the process that ran the lane.
      *
-     * Bun both builds the plugin bundle and executes the runner, so two runs on
-     * different Bun releases execute different bytes. The scheduled workflow pins
-     * it, which makes it a function of the recorded commit THERE — but a direct
-     * operator run uses whatever `bun` is on the path, and the documented
-     * multi-run stability audit is exactly the case where that variance would be
-     * invisible. Recording it makes the difference visible wherever the pin does
+     * Bun builds the plugin bundle and runs the runner; different Bun releases execute different bytes.
+     * Scheduled runs pin Bun by commit; direct runs use the `bun` on PATH.
+     * Without `bunVersion`, multi-run audits cannot distinguish differing Bun releases.
+     * `bunVersion` distinguishes unpinned direct runs.
      * not reach.
      */
     bunVersion: string;
     /**
-     * Resolved OpenCode release the harness ran against. The installer serves
-     * whatever is current, so two otherwise identical scheduled runs can sit on
-     * different harness runtimes; without this field they record the same system
-     * identity and look longitudinally comparable when they are not. "unknown"
-     * when the version cannot be resolved.
+     * `opencodeVersion` identifies the resolved OpenCode release.
+     * The installer can serve different OpenCode releases to otherwise identical scheduled runs.
+     * Without `opencodeVersion`, different harness runtimes share the same system identity.
+     * `opencodeVersion` is `"unknown"` when the version cannot be resolved.
      */
     opencodeVersion: string;
     historianModelId: string;
@@ -472,30 +389,29 @@ export interface HistorianEvalRunRecord {
     scenarioId: string;
     scenarioFingerprint: string;
     /**
-     * Fingerprint of the trigger recipe this attempt executed under.
+     * `triggerFingerprint` identifies the trigger recipe executed for this attempt.
      *
-     * Stored beside `scenarioFingerprint` rather than folded into it: the
-     * scenario fingerprint is the release-facing semantic identity approvals bind
-     * to, and trigger pressure is harness-owned, so moving it there would
-     * invalidate approvals on a pressure retune. Recorded separately, the values
-     * still bind an artifact to the recipe that produced it. See
+     * `triggerFingerprint` remains separate so trigger retunes do not invalidate scenario approvals.
+     * `scenarioFingerprint` is the release-facing semantic identity that approvals bind to.
+     * Including harness-owned trigger pressure in `scenarioFingerprint` would invalidate approvals on pressure retunes.
+     * `triggerFingerprint` binds each artifact to the trigger recipe that produced it.
      * `triggerFingerprint`.
      */
     triggerFingerprint: string;
     sessionId: string;
-    /** Workspace identity claims were promoted under; scoring reads need it. */
+    /** Scoring reads require the workspace identity under which claims were promoted. */
     projectIdentity: string;
-    /** Wall clock pinned at capture time; every scorer read threads this (KTD1). */
+    /** `nowMs` fixes the clock for every scorer read. */
     nowMs: number;
     system: SystemVersionTuple;
     expectedHistorianRuns: number;
     historianRuns: HistorianRunArtifact[];
-    /** Ordinal of each authored turn's [user, assistant] message. */
+    /* */
     authoredTurnOrdinals: Array<[number, number]>;
     perGoldPredicate: PerGoldPredicateCount[];
     injectedClaims: InjectedClaimRecord[];
     probes: ProbeExchange[];
-    /** Claims verified by the lane-owned verification bridge (0 in ERROR records). */
+    /** ERROR records contain 0 verified claims. */
     verifiedClaimCount: number;
     contextDbSnapshotPath: string;
     error: RunRecordError | null;
@@ -504,13 +420,12 @@ export interface HistorianEvalRunRecord {
 export interface ScriptedHistorianMode {
     kind: "scripted";
     /**
-     * Responses served to successive historian requests (initial, repair,
-     * second run...). A function entry receives the ordinal range parsed from
-     * the request's `<new_messages>` block so scripts can cover whatever
-     * chunk the plugin actually built.
+     * Historian responses are ordered by request: initial, repair, then second run.
+     * A function entry receives the ordinal range parsed from the request's `<new_messages>` block.
+     * The parsed ordinal range lets scripts cover the chunk the plugin built.
      */
     outputs: Array<string | ((range: { start: number; end: number }) => string)>;
-    /** Scripted probe-answer responses, consumed one per probe attempt. */
+    /** The runner consumes one scripted probe response per probe attempt. */
     probeResponses?: string[];
 }
 
@@ -518,9 +433,9 @@ export interface LiveHistorianMode {
     kind: "live";
     apiKey: string;
     /**
-     * User-tier historian route, e.g. "anthropic/claude-sonnet-4-5".
-     * Well-known providers resolve from OpenCode's built-in registry with
-     * the key supplied via `extraEnv`.
+     * `historianModel` selects a user-tier historian route, such as "anthropic/claude-sonnet-4-5".
+     * Well-known providers resolve from OpenCode's built-in registry.
+     * The runner supplies the provider key through `extraEnv`.
      */
     historianModel: string;
     probeModel: { providerID: string; modelID: string };
@@ -528,63 +443,122 @@ export interface LiveHistorianMode {
 
 export interface RunScenarioOptions {
     mode: ScriptedHistorianMode | LiveHistorianMode;
-    /** Directory the run record and DB snapshot are written into. */
+    /** The runner writes the run record and DB snapshot to `artifactDir`. */
     artifactDir: string;
     repoCommitSha?: string;
-    /** Resolved `opencode --version`; recorded in the system tuple. */
+    /** The runner records the resolved `opencode --version` in the system tuple. */
     opencodeVersion?: string;
     /**
-     * Per-run historian completion wait. Defaults per mode — see
      * `historianWaitBudgetMs`.
      */
     historianWaitMs?: number;
 }
 
 /**
- * How long to wait for one declared historian run to complete, by mode.
  *
- * A scripted historian answers from a local mock, so the old flat 90s was
- * generous. For a LIVE historian it was below the plugin's ceiling for a SINGLE
- * prompt attempt (`DEFAULT_HISTORIAN_TIMEOUT_MS`), let alone a pass that also
- * runs a validation-repair prompt — so this runner, not the historian's own
- * timeout, decided the run "never fired", and it did so after the API tokens were
- * already spent. That converts a slow provider into an invalidated experiment.
  *
- * The live budget covers the healthy path: the initial prompt plus one repair
- * prompt, each bounded by the plugin's own per-attempt timeout, PLUS the work that
- * is not a provider request. Summing only the two request timeouts made the outer
- * wait expire at exactly their total, so two responses landing near their limits
- * left no room for child-session setup, output validation, repair-prompt
- * construction, persistence, or the quiescence poll — and the lane recorded
- * `run-never-fired` while the plugin was still legitimately finishing a valid
- * repaired pass it had already paid for. Deliberately NOT
- * the pathological path — `runHistorianPrompt` retries transient failures
- * `MAX_HISTORIAN_RETRIES` times, and budgeting for every retry of both ladders
- * would put one stuck scenario above 30 minutes, enough for a single scenario to
- * consume the whole 240-minute job budget for the corpus's 26 declared runs.
- * Sitting above every non-retrying live pass keeps the plugin's timeout as the
- * authority on "the historian took too long", while a genuine retry storm still
- * surfaces as `run-never-fired` for that one scenario — a recoverable ERROR
- * rather than a silently truncated job. Callers with a different budget override
- * it through `historianWaitMs`.
+ * The live budget allows two prompt attempts plus overhead.
  */
-function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
+export function historianWaitBudgetMs(mode: RunScenarioOptions["mode"]): number {
     return mode.kind === "live" ? 2 * DEFAULT_HISTORIAN_TIMEOUT_MS + LIVE_HISTORIAN_OVERHEAD_MS : 90_000;
 }
 
+/** A probe is asked once, then re-asked at most once when its envelope is malformed. */
+export const MAX_PROBE_ATTEMPTS = 2;
+
+
 /**
- * System identity for a run, derived entirely from its OPTIONS — nothing about a
- * scenario enters it.
+ * Harness-owned turns the runner prepends and appends around the authored
+ * transcript. Pure functions of the scenario, and exported for that reason:
+ * anything budgeting a role's wall clock must count the SAME turns the run will
+ * send, and a second copy of these rules drifts from them silently.
+ */
+export function fillerTurnCountFor(scenario: HistorianEvalScenario): number {
+    return Math.max(0, MIN_BUILD_TURNS - scenario.transcript.turns.length);
+}
+
+export function paddingTurnCountFor(scenario: HistorianEvalScenario): number {
+        const trigger = scenario.trigger;
+        const target = deriveProtectedTailTokenTarget({
+            contextLimit: trigger.modelContextLimit,
+            executeThresholdPercentage: EXECUTE_THRESHOLD_PERCENTAGE,
+            usagePercentage: (trigger.spikeUsageTokens / trigger.modelContextLimit) * 100,
+        });
+        // Sized from the ballast the padding turns actually carry. Assuming a
+        // 100-token floor over-counted every turn's contribution whenever the
+        // recipe configured less (the contract admits zero), so the padding came
+        // out short, the protected tail still covered the authored gold, and the
+        // scenario ended as `run-never-fired` or `probe-gold-uncovered` instead of
+        // evaluating anything. The prose itself is a few tokens, which is not
+        // enough to close that gap and is deliberately not counted as if it were.
+        const tokensPerTurn = Math.max(1, trigger.ballastTokensPerTurn);
+        // One extra turn absorbs rounding; the spike turn itself also carries
+        // ballast and joins the tail. Capped so degenerate pressure numbers
+        // (huge context limits push the tail target to its 96K ceiling)
+        // cannot stretch a scenario into hundreds of padding turns.
+        // The cap can still leave the tail short; `lintScenario` reports that at
+        // freeze time, where it does not pre-empt the runtime diagnostics a
+        // genuinely unreachable trigger produces on its own.
+        return Math.min(MAX_PADDING_TURNS, Math.ceil(target.N / tokensPerTurn) + 1);
+    }
+
+/** Trigger turns per declared historian run: one spike, one kick. */
+export const TRIGGER_TURNS_PER_HISTORIAN_RUN = 2;
+
+/**
+ * Every prompt one role sends, derived from the scenario rather than listed by
+ * hand.
  *
- * Exported because of that independence: a caller can build the same tuple before
- * the first scenario starts, which is what lets an interrupted first run publish a
- * partial report that still names the commit, the OpenCode version, and the model
- * routes that consumed the tokens. Without it that artifact carries `system: null`
- * and is useless for the longitudinal comparison the report schema exists for.
+ * The role's wall clock is dominated by prompts, and each one the runner sends
+ * without an explicit `timeoutMs` is bounded only by `DEFAULT_PROMPT_TIMEOUT_MS`.
+ * Counting them phase by phase is what went wrong three times: the transcript
+ * turns, then the probe re-asks, then the per-run trigger turns were each missed
+ * in turn, and every omission silently under-reserved the deadline. Deriving the
+ * count from the scenario covers all of them at once, and
+ * `sends no more prompts than the role budget counts` pins it against a real run
+ * so a newly added prompt fails loudly instead of shrinking the reserve.
+ */
+export function liveRolePromptCount(scenario: HistorianEvalScenario): number {
+    const transcript = fillerTurnCountFor(scenario)
+        + scenario.transcript.turns.length
+        + paddingTurnCountFor(scenario);
+    const triggers = scenario.trigger.expectedHistorianRuns * TRIGGER_TURNS_PER_HISTORIAN_RUN;
+    const probes = scenario.probes.length * MAX_PROBE_ATTEMPTS;
+    return transcript + triggers + probes;
+}
+
+/**
+ * Upper bound on ONE scenario role's wall clock, for callers that must decide
+ * whether to START a role under an external kill bound.
  *
- * One definition, two call sites, so the pre-run tuple and the recorded one cannot
- * drift — and `resolveRepoCommitSha` caches per process, so both resolve the same
- * sha even though the digest is computed lazily.
+ * Two kinds of wait, and both are counted:
+ *
+ *   - every prompt the role sends (`liveRolePromptCount`), each bounded only by
+ *     `DEFAULT_PROMPT_TIMEOUT_MS` because the runner passes no `timeoutMs`;
+ *   - the completion wait after each declared historian run, plus the
+ *     post-probe quiescence wait, each bounded by `historianWaitBudgetMs`.
+ *
+ * `historianWaitBudgetMs` alone is NOT this bound. It covers only the run
+ * completion waits, so a caller reserving just that admits a role that then
+ * spends the whole transcript, trigger, and probe prompt sequence beyond it.
+ *
+ * This is an upper bound on waits, not a prediction: a healthy role finishes far
+ * inside it. Callers wanting the smaller number should measure, not shrink this.
+ */
+export function liveRoleWallClockBudgetMs(
+    scenario: HistorianEvalScenario,
+    mode: RunScenarioOptions["mode"],
+): number {
+    const historianWait = historianWaitBudgetMs(mode);
+    const prompts = liveRolePromptCount(scenario) * DEFAULT_PROMPT_TIMEOUT_MS;
+    const completionWaits = (scenario.trigger.expectedHistorianRuns + 1) * historianWait;
+    return prompts + completionWaits;
+}
+
+/**
+ * The system tuple excludes scenario data.
+ *
+ *
  */
 export function runSystemTuple(
     options: Pick<RunScenarioOptions, "mode"> & { repoCommitSha?: string; opencodeVersion?: string },
@@ -614,19 +588,12 @@ class RunAbort extends Error {
 }
 
 /**
- * Marker-based historian request detection, scoped to `body.system`.
  *
- * Scoping matters: the `<new_messages>` tag also travels inside ordinary
- * main-agent traffic — an authored transcript that discusses prompt shapes, a
- * probe prompt, or an echoed repair payload all carry it in `messages`, and
- * every later request retains it in history. Keying off message content there
- * would route a main-agent turn into `historianResponse`, consuming a scripted
- * historian output (script-drift) or tripping the live-mode `fallback-engaged`
- * abort. The system marker alone is sufficient and is how the existing lanes
- * route historian traffic (tests/pi-long-running-session.test.ts,
- * tests/compaction-off.test.ts). If the marker ever stops appearing, historian
- * requests fall through to the poison default and surface as a loud
- * script-drift ERROR rather than silently misrouting.
+ * `isHistorianRequest` detects historian requests from the `system` marker, not `messages`.
+ * Main-agent histories can retain marker-bearing content in `messages`.
+ * Matching `messages` can route a main-agent turn to `historianResponse`.
+ * Misrouting consumes a scripted historian output and causes script drift.
+ * If the `system` marker is absent, historian requests must fail with `script-drift`.
  */
 function isHistorianRequest(body: Record<string, unknown>): boolean {
     const system = body.system;
@@ -642,9 +609,6 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
 }
 
 /**
- * OpenCode fires an auxiliary title-generation request per session. It is
- * not part of the transcript script, so the matcher answers it benignly
- * instead of letting it consume a scripted turn or hit the poison default.
  */
 function isTitleRequest(body: Record<string, unknown>): boolean {
     const system = body.system;
@@ -653,11 +617,9 @@ function isTitleRequest(body: Record<string, unknown>): boolean {
 }
 
 /**
- * Concatenated plain text of every user message in an Anthropic-shaped
- * request body. Turn matching CONTAINS-matches against this: the plugin's
- * injection pass can prepend blocks to or splice user messages, so neither
- * "last user message" nor an exact-equality match survives contact with the
- * real request shape.
+ * The matcher uses substring matching for `<new_messages>` because injection can alter user-message boundaries and content.
+ * The plugin's injection pass can prepend blocks to or splice user messages.
+ * The matcher must not inspect only the last user message or require exact equality.
  */
 function allUserText(body: Record<string, unknown>): string {
     const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -680,13 +642,11 @@ function allUserText(body: Record<string, unknown>): string {
 }
 
 /**
- * Ordinal range the historian request covers, parsed from the `Messages X-Y:`
- * chunk header inside `<new_messages>`. `buildCompartmentAgentPrompt` places
- * the pre-formatted `inputSource` immediately after the opening tag, so the
- * first header match after the marker is authoritative. Scanning for bare
- * `[N]` ordinals instead would let bracketed numbers in authored transcript
- * text or an echoed repair payload corrupt the range and misattribute the
- * resulting validation failure to the historian (R6).
+ * The parser reads the ordinal range from the `Messages X-Y:` header in `<new_messages>`.
+ * `buildCompartmentAgentPrompt` places `inputSource` immediately after the opening `<new_messages>` tag.
+ * The parser treats the first `Messages X-Y:` header after `<new_messages>` as authoritative.
+ * The parser must not parse bare `[N]` ordinals because transcript text and echoed repair payloads can contain them.
+ * Bare `[N]` matches can corrupt the range and misattribute validation failures to the historian.
  */
 export function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
     const text = JSON.stringify(body.messages ?? "");
@@ -698,9 +658,7 @@ export function findOrdinalRange(body: Record<string, unknown>): { start: number
 }
 
 export function buildProbePrompt(probe: Probe): string {
-    // Composed from the contract's constants, not from literals here: the freeze
-    // lint searches those same strings for probe-answer collisions, and a copy would
-    // let the two drift so lint measures a prompt no runner sends.
+    // The runner uses contract constants so freeze lint checks the prompt it sends.
     if (probe.answerType === "exact") {
         return `${PROBE_PROMPT_SHARED}\n${PROBE_PROMPT_QUESTION_LABEL} ${probe.question}\n${PROBE_PROMPT_EXACT_SUFFIX}`;
     }
@@ -711,13 +669,9 @@ export function buildProbePrompt(probe: Probe): string {
 }
 
 /**
- * Contents of the response's single answer envelope, or null.
  *
- * Exactly one envelope is required. Taking the first of several would let
- * `<answer>correct</answer><answer>wrong</answer>` pass on an ambiguous or
- * self-contradictory reply, and because the extracted prefix is non-null the
- * runner would not re-ask. Null sends the probe back through the re-ask path,
- * and a second malformed reply is `probe-envelope-malformed`.
+ * `<answer>` validation requires exactly one envelope to reject ambiguous replies.
+ * `<answer>` validation rejects multiple envelopes instead of accepting a prefix.
  */
 export function extractAnswerEnvelope(text: string | null): string | null {
     if (text === null) return null;
@@ -728,10 +682,6 @@ export function extractAnswerEnvelope(text: string | null): string | null {
 }
 
 /**
- * Blocks the plugin splices into a request: materialized history, rendered
- * claim memory, the mural, and the auto-search hint. Their contents are
- * historian-authored or claim-derived, never the raw messages the injection
- * splice is responsible for removing.
  */
 const INJECTED_BLOCK_TAGS = [
     "session-history",
@@ -744,12 +694,10 @@ const INJECTED_BLOCK_TAGS = [
 ] as const;
 
 /**
- * Drop injected Magic Context blocks so what remains is raw history.
  *
- * Sound only when the transcript does not author these tags itself — see
- * `carriesInjectedBlockTag`, which callers must consult first. A block whose
- * closing tag was lost to budget trimming does not match and its contents stay
- * in the searched text, which is the safe direction for a leak gate.
+ * `stripInjectedBlocks` is sound only when the transcript does not contain injected-block tags.
+ * `carriesInjectedBlockTag` must run before `stripInjectedBlocks`; blocks with trimmed closing tags remain unmatched, so `stripInjectedBlocks` retains their contents.
+ * Retaining unmatched contents prevents `stripInjectedBlocks` from hiding potential leaks.
  */
 export function stripInjectedBlocks(text: string): string {
     let remaining = text;
@@ -760,14 +708,7 @@ export function stripInjectedBlocks(text: string): string {
 }
 
 /**
- * The compartment-derived injected surfaces: historian-authored summary text a
- * probe can read, as distinct from `<project-memory>`, which carries the claims.
  *
- * The split matters for trimming attribution. A probe is told it may answer from
- * project memory AND session history, so a gold claim missing from the claim
- * surface does not make the probe unanswerable — the same fact can still be stated
- * in a compartment summary. Keeping those tags in one list keeps that judgement
- * from being made against an ad-hoc subset.
  */
 export const COMPARTMENT_BLOCK_TAGS = [
     "session-history",
@@ -777,12 +718,7 @@ export const COMPARTMENT_BLOCK_TAGS = [
 ] as const satisfies readonly (typeof INJECTED_BLOCK_TAGS)[number][];
 
 /**
- * Concatenated contents of the given injected blocks, or "" when none appear.
  *
- * The inverse of `stripInjectedBlocks` and subject to the same limitation: a block
- * whose closing tag budget trimming removed does not match, so its contents are
- * absent here. For a trimming judgement that is the safe direction — an
- * unreadable surface is not counted as evidence the probe was answerable.
  */
 export function injectedBlockContents(text: string, tags: readonly string[]): string {
     const chunks: string[] = [];
@@ -795,27 +731,15 @@ export function injectedBlockContents(text: string, tags: readonly string[]): st
 }
 
 /**
- * Whether text opens or closes an injected-block tag itself.
  *
- * `stripInjectedBlocks` treats every matching tag span as injected, which an
- * authored transcript can forge: a user message opening `<session-history>` and
- * a later assistant reply closing it makes the raw gold text between them look
- * like an injected span, so stripping would remove the very bytes the leak gate
- * is searching for and hide a real leak. A scenario whose authored text carries
- * these tags therefore keeps the unstripped payload.
+ * `stripInjectedBlocks` must not process payloads whose authored text contains injected-block tags, because forged tag pairs could hide leaked gold text.
  */
 export function carriesInjectedBlockTag(text: string): boolean {
     return INJECTED_BLOCK_TAGS.some((tag) => text.includes(`<${tag}>`) || text.includes(`</${tag}>`));
 }
 
 /**
- * Whether every ordinal in `range` lies inside some compartment.
  *
- * Union coverage, not containment: adjacent compartments legitimately tile a
- * multi-turn gold range, so requiring one enclosing compartment would
- * misclassify valid output as uncovered. Exported because the scorer applies the
- * same precondition when rescoring a stored artifact, which never passes through
- * the runner's live gate.
  */
 export function rangeCoveredByCompartments(
     range: readonly [number, number],
@@ -830,20 +754,8 @@ export function rangeCoveredByCompartments(
 }
 
 /**
- * Raw gold text surviving in a captured probe payload, or null.
  *
- * Exported so the scorer can reapply the gate to a persisted artifact's recorded
- * payload: a stored record never passes through the live check, and a copied or
- * older record whose captured request still holds raw gold text would otherwise
- * score from that leaked answer.
  *
- * Injected Magic Context blocks are excluded, since a summary may legitimately
- * restate an authored sentence verbatim — unless the transcript authors those
- * tags itself, in which case a tag span is not evidence of injection and
- * stripping could hide a real leak. The probe prompt is removed because it is in
- * the payload by construction and may quote its own gold source turn. An empty
- * authored side is skipped: `includes("")` matches everything, and an empty
- * message has no bytes to survive the splice.
  */
 export function goldRangeLeak(args: {
     scenario: HistorianEvalScenario;
@@ -858,12 +770,8 @@ export function goldRangeLeak(args: {
     );
     const withoutPrompt = probePrompt.length === 0 ? payloadText : payloadText.split(probePrompt).join("\n");
     const rawHistory = authoredCarriesTag ? withoutPrompt : stripInjectedBlocks(withoutPrompt);
-    // The prompt is stripped because we SENT it, so its text is not surviving raw history.
-    // But the strip is a global replacement, and an authored message that CONTAINS the prompt
-    // has the substring cut out of its leaked copy too — after which the exact-match below can
-    // never fire and the gold value travels unguarded. Such a message is searched in the
-    // unstripped payload instead: a match there cannot be our own prompt, since the prompt
-    // alone is shorter than the message that contains it.
+    // `rawHistory` omits an exact `probePrompt` match after prompt removal, so the matcher searches `unstripped` when `raw` contains `probePrompt`.
+    // A match in `unstripped` can include the prompt itself.
     const unstripped = authoredCarriesTag ? payloadText : stripInjectedBlocks(payloadText);
     for (const claim of goldClaims) {
         for (let turn = claim.sourceTurnRange[0]; turn <= claim.sourceTurnRange[1]; turn += 1) {
@@ -881,7 +789,7 @@ export function goldRangeLeak(args: {
     return null;
 }
 
-/** Ids of the messages in a session-messages response. */
+/* */
 function messageIds(messages: unknown): string[] {
     if (!Array.isArray(messages)) return [];
     const ids: string[] = [];
@@ -895,12 +803,7 @@ function messageIds(messages: unknown): string[] {
 }
 
 /**
- * Tool invocations recorded in messages absent from `known`.
  *
- * OpenCode records a tool call as a message part whose `type` carries "tool".
- * The name key has moved between SDK versions, so an invocation whose name
- * cannot be read reports as `<unnamed>` rather than being dropped — the gate
- * cares that a tool ran at all.
  */
 function toolInvocationsInNewMessages(messages: unknown, known: ReadonlySet<string>): string[] {
     if (!Array.isArray(messages)) return [];
@@ -926,11 +829,6 @@ function toolInvocationsInNewMessages(messages: unknown, known: ReadonlySet<stri
 }
 
 /**
- * Concrete checkout SHA for the system-version tuple, resolved once per
- * process. A recorded `unknown` cannot identify the code that produced a live
- * artifact or be compared across system changes, so callers that omit
- * `repoCommitSha` get the real checkout; `unknown` survives only where git
- * cannot answer (exported tree, tarball checkout).
  */
 let cachedRepoCommitSha: string | null = null;
 function resolveRepoCommitSha(): string {
@@ -941,12 +839,6 @@ function resolveRepoCommitSha(): string {
         const candidate = head.success ? head.stdout.toString().trim() : "";
         if (/^[0-9a-f]{40}$/.test(candidate)) {
             sha = candidate;
-            // A dirty worktree did not execute HEAD. Recording the clean SHA
-            // would let two experiments built from different uncommitted trees
-            // carry the same system tuple and be combined into one report, so the
-            // local modifications become part of the identity: the digest covers
-            // the tracked diff plus the porcelain status, which names untracked
-            // files (their contents stay outside it).
             const status = Bun.spawnSync(["git", "status", "--porcelain"], { stdout: "pipe", stderr: "ignore" });
             const porcelain = status.success ? status.stdout.toString() : "";
             if (porcelain.trim().length > 0) {
@@ -954,25 +846,7 @@ function resolveRepoCommitSha(): string {
                 const hasher = new Bun.CryptoHasher("sha256");
                 hasher.update(porcelain);
                 hasher.update(diff.success ? diff.stdout.toString() : "");
-                // `git diff HEAD` covers tracked modifications only, so untracked
-                // file CONTENTS have to be hashed explicitly: two trees whose
-                // untracked files share names but differ in bytes would otherwise
-                // produce the same identity, which is the collision this whole
-                // branch exists to prevent. `--exclude-standard` keeps ignored
-                // paths (build output, node_modules) out of the walk.
-                // Anchored at the repository root, because `git ls-files` walks from the
-                // CWD and the lane's own scripts run through
-                // `bun run --cwd packages/e2e-tests`. Unanchored, the walk covered that
-                // subtree ALONE: an untracked file anywhere else in the repository was
-                // named by the porcelain above — so the tree was not mistaken for clean —
-                // but its CONTENTS never reached the digest, and two trees whose
-                // root-level untracked files share names while differing in bytes carried
-                // the same dirty identity. That is exactly the collision the explicit
-                // content hashing exists to prevent, reached by the other route.
                 //
-                // `git status --porcelain` and `git diff HEAD` above are already
-                // whole-repository from any CWD, so only this walk needed anchoring.
-                // Paths come back root-relative under `-C`, hence the join.
                 const topLevel = Bun.spawnSync(["git", "rev-parse", "--show-toplevel"], {
                     stdout: "pipe",
                     stderr: "ignore",
@@ -990,17 +864,9 @@ function resolveRepoCommitSha(): string {
                         try {
                             contents = readFileSync(repoRoot.length === 0 ? path : join(repoRoot, path));
                         } catch {
-                            // Unreadable or vanished between listing and reading: the path
-                            // is still framed into the digest, so the tree is not mistaken
                             // for clean.
                             contents = "<unreadable>";
                         }
-                        // Length-framed, because concatenation alone is ambiguous. Feeding
-                        // path and contents as bare successive updates means files
-                        // (a="xb", b="y") and (a="x", b="by") produce the identical byte
-                        // stream `axbby` — with identical porcelain and tracked diff — so
-                        // two different trees carried one identity. Prefixing each field
-                        // with its byte length makes the boundaries unambiguous.
                         const pathBytes = Buffer.from(path, "utf8");
                         hasher.update(`${pathBytes.length}:`);
                         hasher.update(pathBytes);
@@ -1019,13 +885,7 @@ function resolveRepoCommitSha(): string {
 }
 
 /**
- * Both live routes must resolve to Anthropic.
  *
- * `boot` exports the single `apiKey` as `ANTHROPIC_API_KEY`, so a model on any
- * other provider reaches it with no credential and the run records an
- * authentication failure as though the models had been evaluated. Refusing the
- * mode up front turns that into a `harness-failure` ERROR naming the offending
- * route, which is the R6-correct attribution.
  */
 function assertLiveProvidersCredentialed(mode: LiveHistorianMode): void {
     const routes: Array<{ label: string; providerId: string }> = [
@@ -1052,32 +912,15 @@ class ScenarioRunner {
     private historianScriptExhausted = false;
     private historianScriptQueue: Array<string | ((range: { start: number; end: number }) => string)> | null = null;
     private historianRangeUnparseable = false;
-    // Partial evidence accumulated as the scenario progresses, so an ERROR
-    // record still carries whatever the run produced before the abort (R6).
     private collectedRuns: HistorianRunArtifact[] = [];
     private collectedProbes: ProbeExchange[] = [];
-    // Authoritative claim read, taken before the probe tier can abort. A
-    // false-authoritative promotion is run-fatal (R8/KTD8), so its evidence
-    // must survive a probe-stage ERROR rather than being cleared with the rest
-    // of the record.
     private capturedClaims: {
         nowMs: number;
         injectedClaims: InjectedClaimRecord[];
         perGoldPredicate: PerGoldPredicateCount[];
         /**
-         * Database image taken WITH the claim read above, not after the abort.
          *
-         * The scorer binds an aborted record's claim array to its snapshot by
-         * requiring the two claim sets to be identical, which holds only if they
-         * describe the same instant. A snapshot taken when the abort unwinds does
-         * not: `driveProbes` waits for an undeclared historian pass to FINISH
-         * before reporting it, and a finished pass can promote claims — so the
-         * post-abort store may legitimately differ from this array, and the
-         * scorer would read that as an unbindable artifact and drop an already
-         * observed run-fatal promotion to an integrity ERROR.
          *
-         * Superseded and deleted on the completion path, where the end-of-run
-         * snapshot is the one facts are scored from.
          */
         snapshotPath: string;
     } | null = null;
@@ -1089,18 +932,9 @@ class ScenarioRunner {
     ) {}
 
     async run(): Promise<HistorianEvalRunRecord> {
-        // Resolve the checkout identity BEFORE anything is written. The DB
-        // snapshot and logs land in `artifactDir`, which may sit inside the
-        // checkout, so they would be untracked files feeding the dirty-worktree
-        // digest — making two runs from the same clean commit record different
-        // SHAs, and making the value depend on where in the flow `baseRecord()`
-        // happened to be reached first. Cached per process, so this call fixes it
-        // for every later reader.
         resolveRepoCommitSha();
         const recordPath = join(this.options.artifactDir, "run-record.json");
         if (existsSync(recordPath)) {
-            // Fresh-environment invariant (KTD9): a reused attempt directory
-            // means a reused environment; refuse rather than replay receipts.
             throw new Error(
                 `historian-eval: run record already exists at ${recordPath}; each attempt needs a fresh artifact directory`,
             );
@@ -1127,9 +961,7 @@ class ScenarioRunner {
     }
 
     /**
-     * The fields every run-record variant shares. Variants override the rest
-     * explicitly, so ERROR vs scoreable-exhaustion vs full-record semantics
-     * stay visible as diffs from this base (R6/KTD4).
+     * Variants override the remaining fields explicitly so ERROR, scoreable-exhaustion, and full-record semantics remain visible as diffs from this base.
      */
     private baseRecord(): Omit<
         HistorianEvalRunRecord,
@@ -1149,11 +981,7 @@ class ScenarioRunner {
     }
 
     private emptyRecord(error: RunRecordError): HistorianEvalRunRecord {
-        // The snapshot taken WITH the claim capture, when there is one: the scorer
-        // requires an aborted record's claim array and snapshot to describe the same
-        // instant, and a snapshot taken here does not (see `capturedClaims`). Only
-        // when nothing was captured does a fresh best-effort image apply — an ERROR
-        // record with the database beside it is diagnosable without re-running.
+        // `emptyRecord` stores a context-database snapshot so failures are diagnosable without rerunning.
         let snapshotPath = this.capturedClaims?.snapshotPath ?? "";
         if (snapshotPath === "") {
             try {
@@ -1176,17 +1004,15 @@ class ScenarioRunner {
             probes: this.collectedProbes,
             verifiedClaimCount: 0,
             contextDbSnapshotPath: snapshotPath,
-            // Harness-failure details splice in child stdout/stderr verbatim;
-            // scrub the live credential before the record hits disk.
+            // Harness-failure details can include child stdout and stderr verbatim.
+            // redactSecrets removes the live API key before the record reaches disk.
             error: { reason: error.reason, detail: this.redactSecrets(error.detail) },
         };
     }
 
     /**
-     * Strip the live-mode API key from text destined for durable artifacts
-     * (run records, persisted server logs). The live child process holds the
-     * real key in its environment, and harness error messages and server
-     * stderr are captured unfiltered.
+     * redactSecrets replaces a nonempty live API key in durable artifacts with `[REDACTED]`.
+     * Harness errors and server stderr can contain the live API key because both are captured unfiltered.
      */
     private redactSecrets(text: string): string {
         const mode = this.options.mode;
@@ -1195,41 +1021,14 @@ class ScenarioRunner {
     }
 
     private fillerCount(): number {
-        return Math.max(0, MIN_BUILD_TURNS - this.scenario.transcript.turns.length);
+        return fillerTurnCountFor(this.scenario);
     }
 
     /**
-     * Harness-owned padding turns AFTER the authored epilogue (excluded from
-     * gold and the fingerprint, R5/KTD3). The protected-tail boundary keeps
-     * the newest ~N tokens of raw history away from the historian; without
-     * padding, N lands squarely on the authored transcript and no run can
-     * ever cover the gold-fact ranges. Sized from the production tail-target
-     * math at the scenario's own pressure numbers so recipe and product
-     * cannot drift apart.
+     * Harness-owned padding turns after the authored epilogue are excluded from gold and the fingerprint.
      */
     private paddingTurnCount(): number {
-        const trigger = this.scenario.trigger;
-        const target = deriveProtectedTailTokenTarget({
-            contextLimit: trigger.modelContextLimit,
-            executeThresholdPercentage: EXECUTE_THRESHOLD_PERCENTAGE,
-            usagePercentage: (trigger.spikeUsageTokens / trigger.modelContextLimit) * 100,
-        });
-        // Sized from the ballast the padding turns actually carry. Assuming a
-        // 100-token floor over-counted every turn's contribution whenever the
-        // recipe configured less (the contract admits zero), so the padding came
-        // out short, the protected tail still covered the authored gold, and the
-        // scenario ended as `run-never-fired` or `probe-gold-uncovered` instead of
-        // evaluating anything. The prose itself is a few tokens, which is not
-        // enough to close that gap and is deliberately not counted as if it were.
-        const tokensPerTurn = Math.max(1, trigger.ballastTokensPerTurn);
-        // One extra turn absorbs rounding; the spike turn itself also carries
-        // ballast and joins the tail. Capped so degenerate pressure numbers
-        // (huge context limits push the tail target to its 96K ceiling)
-        // cannot stretch a scenario into hundreds of padding turns.
-        // The cap can still leave the tail short; `lintScenario` reports that at
-        // freeze time, where it does not pre-empt the runtime diagnostics a
-        // genuinely unreachable trigger produces on its own.
-        return Math.min(MAX_PADDING_TURNS, Math.ceil(target.N / tokensPerTurn) + 1);
+        return paddingTurnCountFor(this.scenario);
     }
 
     private systemTuple(): SystemVersionTuple {
@@ -1251,10 +1050,8 @@ class ScenarioRunner {
         }
         this.assertNoScriptDrift(harness);
 
-        // Live historian whose every attempt fails validation is model
-        // behavior, not infrastructure (KTD4): return a scoreable record
-        // (the scorer maps it to FAIL:invalid-output). Probes and claim
-        // capture are meaningless with nothing published.
+        // A live historian whose every attempt fails validation is model behavior, not infrastructure failure.
+        // The scorer maps this record to `FAIL:invalid-output`; no published claims exist to capture or probe.
         if (runs.every((run) => run.status === "failed")) {
             return {
                 ...this.baseRecord(),
@@ -1271,23 +1068,11 @@ class ScenarioRunner {
         this.assertAuthoredEvidenceWasChunked(runs);
         this.assertPromotionNotSilentlySkipped(harness, sessionId, runs);
 
-        // Lane-owned verification bridge: historian promotions land as
-        // CANDIDATE (`model_inference`) and the visibility policy hides them
-        // from automatic surfaces until VERIFIED. The lane measures
-        // formation, not the orthogonal maturity gate, so it verifies every
-        // active claim through the production verification operation before
-        // the injection-dependent probe tier runs. See verification-bridge.ts.
+        // Historian promotions enter as `CANDIDATE` with source `model_inference`; the visibility policy hides candidates from automatic surfaces until `VERIFIED`.
         //
-        // The bridge applies one claim at a time and fails closed on a
-        // non-applied outcome, and it runs BEFORE the authoritative capture
-        // below — so an abort here unwound with `capturedClaims` still null.
-        // `emptyRecord` then wrote an empty identity and claim array while the
-        // snapshot already held whatever had been verified, including a
-        // forbidden promotion, and the always-run-fatal outcome came back as an
-        // ordinary `harness-failure`. Capturing before the rethrow keeps that
-        // evidence exactly as a probe-stage abort keeps it. The capture runs
-        // after the partial application, so it sees the claims verification had
-        // actually made visible rather than a pre-bridge guess.
+        // The authoritative-claim bridge runs before authoritative capture; an abort leaves `capturedClaims` null.
+        // The catch block captures claims before rethrowing so the record matches the verified snapshot.
+        // The catch block captures claims after partial verification so captured claims reflect claims made visible by verification.
         let verifiedClaimCount: number;
         try {
             verifiedClaimCount = this.runVerificationBridge(harness);
@@ -1296,14 +1081,9 @@ class ScenarioRunner {
             throw error;
         }
 
-        // Read the authoritative claim state BEFORE the probe tier. A probe
-        // stage can abort (`probe-envelope-malformed`, `probe-gold-uncovered`,
-        // `probe-response-leak`, `probe-tool-use`), and reading afterwards
-        // means such an abort discards an already-observed false-authoritative
-        // promotion — the one outcome that is always run-fatal, downgraded to
-        // an ordinary ERROR because `emptyRecord` carries no claims. Probes ask
-        // questions and do not mutate claims, so the read is equivalent here,
-        // and pinning the clock with it keeps re-scoring time-independent
+        // The probe stage can abort with `probe-envelope-malformed`, `probe-gold-uncovered`, `probe-response-leak`, or `probe-tool-use`.
+        // The code captures claim state before probes so an abort cannot discard an observed false-authoritative promotion.
+        // `nowMs` makes re-scoring time-independent.
         // (KTD1).
         const nowMs = Date.now();
         const { injectedClaims, perGoldPredicate } = this.captureClaimState(harness, nowMs);
@@ -1315,24 +1095,15 @@ class ScenarioRunner {
         };
 
         const probes = await this.driveProbes(harness, sessionId);
-        // Again, because the probe phase is provider traffic too. The call before the
-        // all-failed branch covers only the transcript and run phases; `driveProbes`
-        // registers its own turn scripts and can draw auxiliary requests, so a request
-        // falling through to the poison default during the probe phase — while each
-        // probe still received its correct scripted reply — raised `defaultHits` after
-        // the earlier check had already passed. Re-running it closes the attempt rather
-        // than a prefix of it.
+        // A probe-phase request that reaches the poison default increments `defaultHits` even when every probe receives its scripted reply.
+        // `assertNoScriptDrift` runs after `driveProbes` to validate the complete attempt.
         this.assertNoScriptDrift(harness);
 
-        // The claim-id half of the response-leak gate, deferred to here because
-        // acceptance is per-probe: it needs every probe's injected locator set and the
-        // captured claims, which is exactly the pair the scorer replays from.
+        // The claim-ID response-leak check runs after every probe's injected locator set is available.
         const claimIdLeak = probeResponseClaimIdLeak({ scenario: this.scenario, exchanges: probes, injectedClaims });
         if (claimIdLeak !== null) throw new RunAbort("probe-response-leak", claimIdLeak);
         const snapshotPath = this.snapshotContextDb(harness);
-        // The completion path scores facts from THIS image, and `driveProbes` has
-        // already proven no undeclared pass moved the store, so the pre-probe copy is
-        // redundant here rather than a second answer to archive.
+        // The completion path scores the snapshot created after `driveProbes`.
         rmSync(join(this.options.artifactDir, PRE_PROBE_SNAPSHOT_FILE), { force: true });
 
         return {
@@ -1349,13 +1120,8 @@ class ScenarioRunner {
     }
 
     /**
-     * Workaround for the pre-existing HEAD breakage tracked as a P1 bug:
-     * TS-mode `openDatabase()` builds legacy-format databases (migrations
-     * ceiling v89) that never install the claim-memory fragment, so the
-     * production publish transaction's direct-claims promotion throws
-     * "no such table" and rolls the whole publish back. The lane installs
-     * the fragment with the production schema factory before any historian
-     * run; remove once the runtime installs it itself.
+     * `openDatabase()` in TS mode creates schemas without the claim-memory fragment.
+     * The runner installs the claim-memory fragment with the production schema factory before historian runs.
      */
     private async installClaimMemoryFragment(harness: TestHarness): Promise<void> {
         await harness.waitFor(() => harness.hasContextDb(), { label: "context.db created" });
@@ -1382,8 +1148,7 @@ class ScenarioRunner {
     private async boot(): Promise<TestHarness> {
         const mode = this.options.mode;
         if (mode.kind === "live") assertLiveProvidersCredentialed(mode);
-        // Dedicated deterministic embedding endpoint (KTD9): fire-and-forget
-        // embedding dispatch must never race teardown against a real network.
+        // The runner uses a deterministic embedding endpoint so fire-and-forget embedding dispatch cannot race teardown with real network traffic.
         this.embedMock = new MockProvider();
         const { baseURL: embeddingEndpoint } = await this.embedMock.start();
 
@@ -1394,11 +1159,6 @@ class ScenarioRunner {
                 two_pass: false,
                 disallowed_tools: ["*"],
                 fallback_models: [],
-                // Always pinned explicitly: an unset historian model lets the
-                // agent resolve an ambient default (a real provider on a
-                // developer machine), and `historian.model` also gates the
-                // memory migration that installs the claim-memory schema —
-                // without it, fact promotion throws on a fresh database.
                 model: mode.kind === "live" ? mode.historianModel : "mock-anthropic/mock-sonnet",
             },
             embedding: {
@@ -1433,22 +1193,11 @@ class ScenarioRunner {
     }
 
     /**
-     * All main-agent scripting is matcher-keyed on the exact prompt the
-     * runner sent, never on request order: OpenCode fires auxiliary
-     * requests (title generation) that would silently steal queue-ordered
-     * responses and misalign every later turn. Aux traffic gets a benign
-     * reply; anything unrecognized falls through to the poison default and
-     * trips the script-drift ERROR.
      */
     private installMatchers(harness: TestHarness): void {
         const mode = this.options.mode;
-        // Held on the runner, not in this closure: `assertNoScriptDrift` has to be
-        // able to see what is LEFT. Over-consumption already surfaces (the queue
-        // empties and `historianScriptExhausted` trips), but under-consumption was
-        // invisible — a scripted repair or fallback output that no request ever asked
-        // for stayed here silently, and the attempt PASSED without exercising the
-        // path the script was written to exercise. Main-agent turns were already
-        // checked for exactly this; the historian queue was the asymmetry.
+        // The runner stores `historianScriptQueue` so `assertNoScriptDrift` can detect unconsumed outputs.
+        // `assertNoScriptDrift` rejects unconsumed historian outputs.
         this.historianScriptQueue = mode.kind === "scripted" ? [...mode.outputs] : null;
         const scripted = this.historianScriptQueue;
         harness.mock.addMatcher((body) => {
@@ -1472,8 +1221,6 @@ class ScenarioRunner {
         scripted: Array<string | ((range: { start: number; end: number }) => string)> | null,
     ): MockResponse {
         if (scripted === null) {
-            // Live mode: a historian request reaching the mock means the
-            // production fallback chain terminated at the session model.
             this.historianMarkerMockHits += 1;
             return {
                 error: { status: 500, type: "historian_eval_fallback", message: "fallback engaged" },
@@ -1481,9 +1228,6 @@ class ScenarioRunner {
         }
         const next = scripted.shift();
         if (next === undefined) {
-            // An under-scripted historian is harness misconfiguration, not
-            // model behavior: without this flag the poison text would fail
-            // validation and masquerade as FAIL:invalid-output.
             this.historianScriptExhausted = true;
             return { text: POISON_TEXT, usage: { input_tokens: 100, output_tokens: 10 } };
         }
@@ -1491,9 +1235,7 @@ class ScenarioRunner {
         if (typeof next === "function") {
             const range = findOrdinalRange(body);
             if (range === null) {
-                // A range-taking script cannot cover an unparseable chunk; an
-                // invented range would fail validation and masquerade as
-                // FAIL:invalid-output, so flag it as drift instead (R6).
+                // A range-taking script cannot cover an unparseable chunk.
                 this.historianRangeUnparseable = true;
                 return { text: POISON_TEXT, usage: { input_tokens: 100, output_tokens: 10 } };
             }
@@ -1507,7 +1249,7 @@ class ScenarioRunner {
         };
     }
 
-    /** Register the scripted reply for one prompt, then send it. */
+    /* */
     private async scriptedTurn(
         harness: TestHarness,
         sessionId: string,
@@ -1520,10 +1262,7 @@ class ScenarioRunner {
     }
 
     /**
-     * Render the transcript: harness-owned filler turns first (excluded from
-     * gold and fingerprint), then the authored turns, each user prompt
-     * carrying deterministic ballast so the size-based protected-tail
-     * boundary sees real content mass (R5/KTD3).
+     * driveTranscript places harness-owned filler before authored turns and adds deterministic ballast to each user prompt so the protected-tail boundary accounts for content mass.
      */
     private async driveTranscript(harness: TestHarness, sessionId: string, fillerCount: number): Promise<void> {
         const usage = {
@@ -1546,8 +1285,7 @@ class ScenarioRunner {
                 { text: turn.assistant, usage },
             );
         }
-        // Post-epilogue padding: pushes the protected tail past the authored
-        // content so the historian chunk can reach every gold-fact range.
+        // Post-epilogue padding pushes the protected tail past authored content so the historian chunk can reach every gold-fact range.
         const paddingBase = fillerCount + this.scenario.transcript.turns.length;
         for (let index = 0; index < this.paddingTurnCount(); index += 1) {
             await this.scriptedTurn(
@@ -1564,9 +1302,7 @@ class ScenarioRunner {
     }
 
     /**
-     * Spike + kick pattern from tests/historian-success.test.ts: one turn
-     * carries the threshold-crossing usage; the following turn gives the
-     * transform a fresh pass to actually start the historian.
+     * The spike turn starts the historian in a fresh pass.
      */
     private async driveHistorianRun(
         harness: TestHarness,
@@ -1580,13 +1316,12 @@ class ScenarioRunner {
         const markerHitsBefore = this.historianMarkerMockHits;
         const promotionEvidenceBefore = this.scopedPromotionEvidenceCount(harness);
 
-        // Exactly the rows the earlier declared runs produced, checked BEFORE the spike.
-        // A filler, authored, or padding turn that unexpectedly crossed the live
-        // execution threshold leaves a row here, and the wait below only requires
-        // `>= runIndex` — so that early pass would be adopted as this declared run,
-        // having evaluated a different trigger point and a different chunk. It also
-        // consumed the scripted output, which empties the queue and leaves
-        // `assertNoScriptDrift` with nothing to report.
+        // Before the spike, the row count must equal the number of earlier declared runs.
+        // A pre-spike turn that crosses the execution threshold can add a row.
+        // The `>= runIndex` wait can adopt an earlier pass as the declared run.
+        // The adopted early pass evaluates a different trigger point and chunk.
+        // The early pass consumes its scripted output.
+        // An empty scripted-output queue leaves no unconsumed historian output for `assertNoScriptDrift` to report.
         const rowsBeforeSpike = this.historianRunRows(harness, sessionId).length;
         if (rowsBeforeSpike !== runIndex - 1) {
             throw new RunAbort(
@@ -1594,12 +1329,12 @@ class ScenarioRunner {
                 `historian run ${runIndex} found ${rowsBeforeSpike} run row(s) before its spike turn; ${runIndex - 1} expected, so a pass fired against an undeclared trigger point`,
             );
         }
-        // Quiescent too, because the row is written only when an asynchronous pass
-        // FINISHES. An earlier turn's pass can already be in flight with the row count
-        // still correct — and then the declared spike cannot start its own pass, the wait
-        // below adopts the in-flight one as this run, and because that pass consumed the
-        // scripted output the drift check stays clean as well. The count proves no pass has
-        // completed; this proves none is running.
+        // The row is written only after an asynchronous pass finishes.
+        // An earlier pass can remain in flight while the row count is correct.
+        // An in-flight earlier pass can prevent the declared spike from starting its own pass.
+        // The wait can adopt the in-flight pass as the declared run.
+        // Consuming the in-flight pass's scripted output leaves no unconsumed historian output for `assertNoScriptDrift` to report.
+        // `historianQuiesced` proves that no pass is running.
         if (!this.historianQuiesced(harness, sessionId)) {
             throw new RunAbort(
                 "harness-failure",
@@ -1636,43 +1371,27 @@ class ScenarioRunner {
         if (row.status === "failed" && /lease/i.test(row.failure_reason ?? "")) {
             throw new RunAbort("lease-lost", row.failure_reason ?? "lease lost");
         }
-        // Fallback detection must not consume the evidence it sits in front of.
+        // Failed validation takes precedence over fallback detection.
         //
-        // Production's fallback chain ends at the live SESSION model as a last
-        // resort, and this runner drives the source session with the
-        // MockProvider — so a live historian that returns invalid output on both
-        // its attempts necessarily lands a marker request on the mock. Aborting
-        // on that alone converted precisely the live model behavior this lane
-        // measures into `ERROR:fallback-engaged`, so `FAIL:invalid-output` could
-        // never be recorded for a live run. A row that already failed validation
-        // is that evidence, and it takes precedence.
+        // The production fallback chain ends with the live `SESSION` model.
+        // This runner drives the source session with `MockProvider`.
+        // A live historian that returns invalid output on both attempts sends a marker request to the mock.
+        // A marker request on the mock shows that fallback reached the source session.
+        // Aborting on that marker request converts invalid live-model output into `ERROR:fallback-engaged`.
+        // That abort prevents recording `FAIL:invalid-output` for the live run.
+        // A row that failed validation provides evidence of invalid live-model output.
+        // A failed-validation row takes precedence over fallback detection.
         //
-        // Counted per run rather than cumulatively: the marker counter spans the
-        // whole scenario, so an earlier run's fallback would otherwise abort a
-        // later, healthy one.
+        // `markerHitsBefore` scopes the marker counter to one run.
+        // `markerHitsBefore` prevents an earlier run's fallback from aborting a later healthy run.
         const markerHitsDuringRun = this.historianMarkerMockHits - markerHitsBefore;
         // The `validation: ` prefix is NOT proof the historian produced output.
-        // `runValidatedHistorianPass` returns `{ok: false}` for a provider error, an
-        // auth failure, a timeout, a child session it could not create, and "returned
-        // no assistant output" as readily as for unusable compartments — and
-        // `compartment-runner-incremental` prefixes every one of them the same way. So
-        // the prefix alone cannot separate "the model emitted garbage" (KTD4 model
-        // behavior) from "the model never ran" (infrastructure).
+        // `runValidatedHistorianPass` returns `{ ok: false }` for provider errors, auth failures, timeouts, child-session creation failures, and missing assistant output.
+        // `compartment-runner-incremental` prefixes each `{ ok: false }` result with `validation: `.
         //
-        // `subagent_invocations.status` can: production records `completed` for an
-        // attempt that returned text and `failed` for one that did not. Requiring a
-        // completed attempt in THIS run's window is what makes the prefix mean what the
-        // branches below read it as — without it, a live outage suppressed the
-        // fallback abort and was scored FAIL:invalid-output, charging an infrastructure
-        // failure to model quality, which is precisely the attribution R6 forbids.
+        // `failedValidation` requires a completed invocation in the current run before treating `validation: ` as model output.
         const completedDuringRun =
             this.countHistorianInvocations(harness, sessionId, "completed") - completedInvocationsBefore;
-        // No FAILED attempt either, not merely one completed. Attributing validation
-        // exhaustion to the model means every attempt it needed produced text to
-        // validate — and a mixed window breaks that: the primary attempt returns
-        // malformed output (completed) while the repair never executes (failed) and the
-        // session-model fallback lands on the mock. One completed attempt then suppressed
-        // the fallback abort and recorded FAIL:invalid-output for a run whose repair the
         // provider refused.
         const failedDuringRun =
             this.countHistorianInvocations(harness, sessionId, "failed") - failedInvocationsBefore;
@@ -1687,21 +1406,7 @@ class ScenarioRunner {
                 `${markerHitsDuringRun} historian-marker request(s) reached the MockProvider during a live run`,
             );
         }
-        // `status: "failed"` is not by itself model behavior. Production records
-        // it for infrastructure conditions too — `stale_snapshot`,
-        // `chunk-coverage: ...`, a missing protected-tail boundary snapshot,
-        // drain-quota exhaustion, `exception: ...` — and only `validation: ...`
-        // means the historian emitted unusable output. Letting the others reach
-        // the scorer's all-attempts-invalid path would charge a runner or
-        // database regression to historian quality as FAIL:invalid-output,
-        // which is exactly the attribution R6 forbids. An unexplained failure
-        // is not evidence of model behavior either, so it takes this path too.
-        // A `noop` row means the pass ended without a historian request at all —
-        // no eligible head, drain quota exhausted. The inventory check cannot
-        // see it because the row occupies the expected index, so the declared
-        // run would be accepted as complete while its scripted output was never
-        // consumed; if an earlier run already covers the gold, probes and
-        // structural scoring could then PASS for a run that did not happen.
+        // Non-`validation:` failures abort instead of being scored as invalid output.
         if (row.status === "noop") {
             throw new RunAbort(
                 "run-never-fired",
@@ -1717,9 +1422,7 @@ class ScenarioRunner {
 
         const rawOutput = await this.captureChildOutput(harness, sessionId);
         if (rawOutput === null && row.status === "success") {
-            // A successful publish with no capturable child output means the
-            // SDK surface drifted or the child session vanished — evidence
-            // loss, never model behavior (R6).
+            // A successful row with no capturable child output aborts because the run has no model-output evidence.
             throw new RunAbort(
                 "harness-failure",
                 `historian run ${runIndex} published but its child-session output could not be captured`,
@@ -1752,9 +1455,6 @@ class ScenarioRunner {
     }
 
     /**
-     * Promotion evidence under the scenario's project, read from the LIVE
-     * database. Sampled before and after each run so the difference is that run's
-     * own contribution; see `promotionEvidenceCount` for what counts and why.
      */
     private scopedPromotionEvidenceCount(harness: TestHarness): number {
         const db = openTestDb(harness.contextDbPath(), { readonly: true });
@@ -1806,13 +1506,8 @@ class ScenarioRunner {
     }
 
     /**
-     * Historian subagent invocations for the session, optionally narrowed to one
      * recorded status.
      *
-     * `completed` versus `failed` is the only evidence that separates an attempt which
-     * returned text from one that never executed — production records the former when
-     * it has messages to validate and the latter on a model error — and the run's
-     * failure reason cannot, because every unsuccessful pass is prefixed `validation: `.
      */
     private countHistorianInvocations(harness: TestHarness, sessionId: string, status?: string): number {
         if (!harness.hasContextDb()) return 0;
@@ -1844,10 +1539,6 @@ class ScenarioRunner {
     }
 
     /**
-     * Read the historian child session immediately after the pass
-     * (`keep_subagents: true` keeps it alive) and extract the raw output
-     * artifact with production's own extraction, so a reasoning-only payload
-     * yields exactly what production validated (KTD5).
      */
     private async captureChildOutput(harness: TestHarness, sessionId: string): Promise<string | null> {
         const childrenRes = await harness.client.session.children({ path: { id: sessionId } });
@@ -1862,11 +1553,6 @@ class ScenarioRunner {
                     !this.capturedChildIds.has(child.id),
             )
             .sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0));
-        // Claim every candidate up front, not one per loop iteration. The loop
-        // returns on the newest child that yields text, so marking inside it
-        // leaves the older repair-attempt children eligible; a later run that
-        // creates no capturable child of its own would then adopt one of them
-        // and record another run's output as its `rawOutput`.
         for (const child of candidates) {
             this.capturedChildIds.add(child.id as string);
         }
@@ -1893,9 +1579,6 @@ class ScenarioRunner {
         if (unconsumed > 0) {
             throw new RunAbort("script-drift", `${unconsumed} scripted main-agent turn(s) never consumed`);
         }
-        // Every declared run has been driven by the time this is reached, and probes
-        // consume a separate queue, so anything still here was scripted for a
-        // historian request that never happened.
         const unconsumedHistorian = this.historianScriptQueue?.length ?? 0;
         if (unconsumedHistorian > 0) {
             throw new RunAbort(
@@ -1910,22 +1593,8 @@ class ScenarioRunner {
     }
 
     /**
-     * Every pre-epilogue authored ordinal reached a declared run's chunk.
      *
-     * A chunk is token-capped, and the budget the freeze lint measures against is the
-     * production FALLBACK context limit — the live historian's own limit is unknown at
-     * lint time. When the real budget is smaller, production returns a SUCCESSFUL chunk
-     * with `chunk.hasMore` and simply stops short, so a suffix of the authored transcript
-     * is never shown to the model. Nothing downstream notices: the artifact records only
-     * the range that WAS processed, gold ranges earlier in the transcript stay covered,
-     * probes still answer — and an `expectedAbsent` hard negative sitting in the omitted
-     * suffix passes vacuously, reporting a family as exercised that the model never saw.
      *
-     * `hasMore` is not persisted to `historian_runs`, so this proves the equivalent from
-     * the recorded ranges instead: the union of the declared runs' chunks must cover
-     * every authored ordinal before the epilogue, which is where `lintScenario` requires
-     * absence predicates to be authored. A short union is a recipe-versus-model budget
-     * mismatch — infrastructure, not historian quality.
      */
     private assertAuthoredEvidenceWasChunked(runs: readonly HistorianRunArtifact[]): void {
         const ordinals = this.authoredTurnOrdinals();
@@ -1947,27 +1616,13 @@ class ScenarioRunner {
     }
 
     /**
-     * Silent no-op promotion (R6): facts were emitted but no claim ever
-     * reached the store. That is a plumbing loss (empty promotion directory,
-     * skipped unanchored promotion on every run), not historian quality.
      *
-     * Runs that discarded their provisional last compartment are excluded:
-     * production skips that pass's unanchored promotion outright
-     * (`skipUnanchoredPromotion` in compartment-runner-incremental), deferring
-     * the range to a healing run, so their emitted facts are expected to reach
-     * no claim. Counting them would report a deliberate deferral as a plumbing
-     * loss and, for a scenario declaring only that run, replace the structural
-     * unhealed-discard FAIL the scorer derives from the same evidence.
      */
     private assertPromotionNotSilentlySkipped(
         harness: TestHarness,
         sessionId: string,
         runs: HistorianRunArtifact[],
     ): void {
-        // Per run, not scenario-wide. A run that emitted facts without discarding
-        // its provisional tail must have changed the claim state; checking only
-        // whether the scenario ended with any claims lets an earlier success mask a
-        // later run's lost promotion.
         const lostPromotion = runs.filter(
             (run) => !run.discardedLast && run.factsEmitted > 0 && run.promotionEvidenceAdded === 0,
         );
@@ -1987,12 +1642,6 @@ class ScenarioRunner {
             .reduce((sum, run) => sum + run.factsEmitted, 0);
         if (totalFacts === 0) return;
         try {
-            // Scoped to the scenario's project, not the whole database. The
-            // verification bridge and the authoritative claim read are both scoped
-            // to this identity, so claims promoted under a different one — after
-            // session-directory or identity-normalization drift — satisfy a global
-            // count while leaving those reads empty. The scorer would then report
-            // FAIL:recall, charging a project-routing fault to the historian.
             if (this.scopedPromotionEvidenceCount(harness) === 0) {
                 throw new RunAbort(
                     "no-op-promotion",
@@ -2006,34 +1655,16 @@ class ScenarioRunner {
     }
 
     /**
-     * Hidden probes (KTD6): resume the source session; the production
-     * injection splice removes compartment-covered raw messages on the next
-     * prompt, so the probe model answers from compartments and claim-backed
      * memories only.
      */
     private async driveProbes(harness: TestHarness, sessionId: string): Promise<ProbeExchange[]> {
         const exchanges = this.collectedProbes;
-        // Watermark the transcript phase's messages so the per-probe tool-use
-        // gate inspects only what the probe turns themselves add.
         const seed = await harness.client.session.messages({ path: { id: sessionId } });
         for (const id of messageIds(seed.data)) this.seenProbeMessageIds.add(id);
-        // Probe turns are ordinary prompts, so the transform can start another
-        // historian pass on one — reachable whenever a probe reply's usage crosses
-        // the execution threshold. That pass is invisible to everything that has
-        // already run: `assertNoScriptDrift` is done, `collectedRuns` is closed,
-        // and the claim snapshot is taken after this loop, so its compartments and
-        // claims would reach structural, recall, and later-probe scoring without
-        // appearing in the run inventory. The declared schedule is the experiment,
-        // so an extra pass invalidates the run rather than adding to it.
         const runRowsBefore = this.historianRunRows(harness, sessionId).length;
         for (const [probeIndex, probe] of this.scenario.probes.entries()) {
             exchanges.push(await this.driveProbe(harness, sessionId, probe, probeIndex));
         }
-        // Quiesce first. `startCompartmentAgent` launches asynchronously and
-        // `compartment-runner-incremental` writes its `historian_runs` row in a
-        // `finally`, so counting rows immediately can still read the pre-probe
-        // number while an undeclared pass is mid-flight — and then the snapshot is
-        // taken with its compartments present but its row absent.
         try {
             await harness.waitFor(() => this.historianQuiesced(harness, sessionId), {
                 timeoutMs: this.options.historianWaitMs ?? historianWaitBudgetMs(this.options.mode),
@@ -2052,11 +1683,6 @@ class ScenarioRunner {
                 `${runRowsAfter - runRowsBefore} undeclared historian run(s) fired during the probe phase; the scenario's declared schedule is ${this.scenario.trigger.expectedHistorianRuns}`,
             );
         }
-        // The probe queue's under-consumption, checked here for the same reason
-        // `assertNoScriptDrift` checks the historian queue's: every probe has been
-        // asked, and a re-ask consumes another entry, so a leftover response was
-        // scripted for an attempt that never happened. Running OUT already aborts as
-        // drift; having too many was silent.
         if (this.probeResponseQueue.length > 0) {
             throw new RunAbort(
                 "script-drift",
@@ -2082,11 +1708,6 @@ class ScenarioRunner {
         const toolNames = new Set(first.toolNames);
         let reAsked = false;
         const discardedResponseTexts: string[] = [];
-        // Every attempt's reply, not only the recorded one: a malformed first
-        // attempt is discarded as an answer but its text still lands in the session
-        // and reaches the next probe. The record keeps only the final reply, so
-        // replay can reapply this to that one alone — which is why the abort has to
-        // happen here, where both are in hand.
         this.assertNoProbeResponseLeak(probe, probeIndex, first.responseText);
         if (answerRaw === null) {
             reAsked = true;
@@ -2106,12 +1727,6 @@ class ScenarioRunner {
             }
         }
 
-        // A probe that retrieved anything is no longer a hidden probe: the
-        // production main-agent prompt encourages `ctx_search`/`ctx_expand` for
-        // prior context, and those reach the compartment-covered history the
-        // splice just removed. Its answer would then prove nothing about what
-        // the injected payload carried, so an invocation invalidates the
-        // measurement rather than earning a score.
         if (toolNames.size > 0) {
             throw new RunAbort(
                 "probe-tool-use",
@@ -2121,12 +1736,6 @@ class ScenarioRunner {
 
         const payloadText = this.capturedProbePayload(harness, requestCountBefore);
         this.assertNoGoldRangeLeak(probe, payloadText, buildProbePrompt(probe));
-        // The FINAL request alone decides whether a block was rendered for the answer that
-        // was accepted. `capturedProbePayload` concatenates every request in the window, so
-        // on a re-ask a block rendered for the discarded FIRST attempt kept the combined
-        // text looking block-bearing — and the cached locators were then recorded as
-        // evidence for a retry whose own request withheld it. The leak gate still reads the
-        // whole window, because every request's text reached the session.
         const finalRequestPayload = this.capturedProbePayload(harness, requestCountBeforeFinalAsk);
         return {
             probeId: probe.id,
@@ -2153,12 +1762,6 @@ class ScenarioRunner {
             }
             await this.scriptedTurn(harness, sessionId, prompt, {
                 text: next,
-                // The build turn's declared usage, which `lintScenario` already proves is
-                // below the execution threshold. A fixed 200 crossed it whenever
-                // `modelContextLimit` was 500 or less — 200/500 is the pinned 40% — so a
-                // lint-clean recipe started an undeclared historian pass on a PROBE turn
-                // and `driveProbes` aborted it. Inheriting the proven value ties the probe
-                // phase to the same guarantee instead of adding a second number nothing
                 // checks.
                 usage: {
                     input_tokens: this.scenario.trigger.usageTokensPerTurn,
@@ -2183,16 +1786,7 @@ class ScenarioRunner {
     }
 
     /**
-     * The gold claim a probe's leakage/coverage gates must protect (KTD6).
      *
-     * Every probe type carries exactly one gold reference — `expectedClaimRef`
-     * for claim-id, `sourceClaimRef` for exact and multiple-choice — and
-     * `parseScenario` proves it resolves. Resolving it here matches how the
-     * scorer resolves the probe's backing claim, so the gates cover exactly
-     * what this probe's answer depends on. Returning every gold claim instead
-     * would make one unrelated historian omission ERROR a probe whose own
-     * backing range is compartment-covered; that omission is recall evidence
-     * and the facts tier already scores it.
      */
     private probeGoldClaims(probe: Probe): typeof this.scenario.gold.expectedClaims {
         const reference = probe.answerType === "claim-id" ? probe.expectedClaimRef : probe.sourceClaimRef;
@@ -2200,10 +1794,8 @@ class ScenarioRunner {
     }
 
     /**
-     * Leakage-gate precondition (KTD6), scoped to what injection can
-     * promise: each probe-relevant gold-fact ordinal range must be covered
-     * by published compartment rows, or the splice cannot have removed its
-     * raw messages. Uncovered gold range → ERROR, never a scored FAIL.
+     * The leakage gate requires every probe-relevant gold-fact ordinal range to be covered by published compartment rows.
+     * Uncovered ranges cause ERROR rather than scored FAIL because the splice may not have removed their raw messages.
      */
     private assertProbeGoldCovered(harness: TestHarness, sessionId: string, probe: Probe): void {
         const compartments = harness
@@ -2224,19 +1816,13 @@ class ScenarioRunner {
     }
 
     /**
-     * Plain text of every message (user AND assistant) across every request
-     * captured during the probe turn's window, decoded from structured
-     * content blocks so JSON escaping cannot hide a leak. Mock-captured, so
-     * scripted mode only; live probe routes go to the live provider (the
-     * compartment-coverage precondition still enforces the gate there).
      */
     private capturedProbePayload(harness: TestHarness, requestCountBefore: number): string | null {
         if (this.options.mode.kind === "live") return null;
         const probeRequests = harness.mock.requests().slice(requestCountBefore);
-        // Scripted mode IS the capture-capable route, so zero captured requests
-        // is capture drift, not an absent payload. Returning null would make
-        // `assertNoGoldRangeLeak` skip silently and let the probe take a normal
-        // PASS with the evidence its verdict depends on never collected.
+        // Zero captured requests indicate capture drift, not an absent payload.
+        // Returning null would make `assertNoGoldRangeLeak` skip silently.
+        // Without captured evidence, the probe could receive a normal PASS without evidence required for its verdict.
         if (probeRequests.length === 0) {
             throw new RunAbort(
                 "harness-failure",
@@ -2263,19 +1849,16 @@ class ScenarioRunner {
 
     /**
      * Gold-fact-bearing raw ranges must not survive in the probe payload.
-     * The gate is scoped to gold ranges: an uncovered non-gold tail (the
-     * epilogue and harness-owned kick turns) is allowed to remain raw.
+     * The gate permits raw epilogue and harness-owned kick turns outside gold ranges.
      *
-     * Injected Magic Context blocks are excluded before the search. They carry
-     * historian-authored summaries and claim text, and a summary may legitimately
-     * restate an authored sentence verbatim — most likely for a short factual
-     * assistant reply. Searching them too would convert a correct splice into a
-     * `gold-range-leak` ERROR on summarization wording alone.
+     * Magic Context blocks contain historian-authored summaries and claim text.
+     * A summary may legitimately restate an authored sentence verbatim.
+     * Searching them would falsely report leakage from a correct splice.
+     * Searching injected blocks can raise `gold-range-leak` on summary wording alone.
      *
-     * The exclusion is skipped for a scenario whose own transcript authors those
-     * tags, because there a tag span is not evidence of injection and stripping
-     * could hide a real leak. Such a scenario keeps the unstripped search, which
-     * can over-report but never conceals surviving raw text.
+     * The exclusion is skipped when the scenario transcript contains `<project-memory>` tags.
+     * A transcript-authored tag span is not evidence of injection, so stripping it could hide a real leak.
+     * Such scenarios use the unstripped search, which can over-report but cannot conceal surviving raw text.
      */
     private assertNoProbeResponseLeak(probe: Probe, probeIndex: number, responseText: string | null): void {
         const leak = probeResponseLeak({ probes: this.scenario.probes, probeIndex, responseText });
@@ -2294,29 +1877,22 @@ class ScenarioRunner {
 
 
     /**
-     * Revision locators recorded as injected for the probe turn.
      *
-     * A read or parse failure is NOT an empty injected set. Exact and
-     * multiple-choice probes that answer correctly pass before locator-based
-     * trimming is ever consulted, so swallowing the failure would let an
-     * exact/choice-only scenario PASS with its per-probe injection evidence
-     * never captured. An absent row or absent column value is a legitimate
-     * empty; anything else aborts.
+     * A read or parse failure aborts; only an absent row or absent column value produces an empty locator set.
+     * Correct exact and multiple-choice probes can pass before locator-based trimming runs.
+     * Swallowing a locator-read failure would let correct exact or multiple-choice probes pass without recorded injection evidence.
+     * A correct exact or multiple-choice probe must not pass without per-probe injection evidence.
      */
     /**
-     * Locators injected for THIS probe turn, reconciled against the turn's own request.
      *
-     * `session_meta.memory_block_ids` is a cache, not per-turn evidence: production
-     * skips the update when the claim lane is unstable (`inject-compartments`), so the
-     * row can still carry the PREVIOUS turn's locators while this request rendered no
-     * `<project-memory>` block at all. Reading it alone recorded those stale locators as
-     * this turn's injection, and the availability gate then accepted a correctly guessed
-     * answer on a request that carried no answer-bearing claim.
+     * `session_meta.memory_block_ids` can retain locators from a previous turn.
+     * When `inject-compartments` skips the cache update, `memory_block_ids` can remain stale.
+     * The cache can contain previous-turn locators even when the request renders no `<project-memory>` block.
+     * Stale cached locators could make the availability gate accept a correctly guessed answer without an answer-bearing claim.
+     * The availability gate must not accept a correctly guessed answer when the request carries no answer-bearing claim.
      *
-     * The captured request settles it: no rendered block means nothing was injected,
-     * whatever the cache says. Scripted routes only — a live route captures no payload,
-     * so the cache is the sole evidence there and the recorded set stays as-is. That is
-     * the same live-mode capture gap the replayed leak and trimming gates already carry.
+     * For a captured request, no rendered `<project-memory>` block means no locators were injected.
+     * When `payloadText` is `null`, the cache remains the only injection evidence.
      */
     private injectedLocatorsForTurn(
         harness: TestHarness,
@@ -2356,10 +1932,8 @@ class ScenarioRunner {
         if (!Array.isArray(parsed)) {
             throw new RunAbort("harness-failure", `probe injection metadata is not an array: ${typeof parsed}`);
         }
-        // Filtering a wrong-typed entry out would reproduce the same silent
-        // evidence loss one level down: `[42]` would become an empty injected
-        // set, and a correctly answered exact or multiple-choice probe passes
-        // without ever consulting locators.
+        // A wrong-typed locator entry must abort rather than be filtered out.
+        // Treating `[42]` as an empty locator set would silently discard invalid evidence.
         const malformed = parsed.filter((entry) => typeof entry !== "string");
         if (malformed.length > 0) {
             throw new RunAbort(
@@ -2371,26 +1945,16 @@ class ScenarioRunner {
     }
 
     /**
-     * The authoritative claim read: the literal injection surface
-     * (`auto_inject`, active lifecycle, stale retry) with the pinned clock
-     * (KTD1). A snapshot still stale after the built-in retry is ERROR.
      */
     /**
-     * Claim capture on an abort path, best effort.
      *
-     * Never overwrites an existing capture — the authoritative read wins — and
-     * never throws: a capture that fails must not replace the abort that is
-     * actually being reported. Leaving `capturedClaims` null on failure returns
-     * the previous behaviour for that case, which is the correct floor.
+     * Capture failures must not replace the original abort.
      */
     private captureClaimStateForAbort(harness: TestHarness): void {
         if (this.capturedClaims !== null) return;
         try {
             const nowMs = Date.now();
             const { injectedClaims, perGoldPredicate } = this.captureClaimState(harness, nowMs);
-            // Paired with the read, for the same reason the pre-probe capture is:
-            // the scorer requires an aborted record's claims and snapshot to
-            // describe one instant.
             this.capturedClaims = {
                 nowMs,
                 injectedClaims,
@@ -2398,7 +1962,6 @@ class ScenarioRunner {
                 snapshotPath: this.snapshotContextDb(harness, PRE_PROBE_SNAPSHOT_FILE),
             };
         } catch {
-            // Intentionally swallowed; see above.
         }
     }
 
@@ -2429,9 +1992,8 @@ class ScenarioRunner {
 
     private snapshotContextDb(harness: TestHarness, fileName = "context-db-snapshot.sqlite"): string {
         const snapshotPath = join(this.options.artifactDir, fileName);
-        // VACUUM INTO produces a complete single-file image regardless of the
-        // live database's WAL state; a plain file copy would silently drop
-        // committed pages still sitting in `-wal`.
+        // `VACUUM INTO` produces a complete single-file image regardless of the live database's WAL state.
+        // A plain file copy can omit committed pages still in `-wal`.
         const db = openTestDb(harness.contextDbPath(), { readwrite: true });
         try {
             db.exec(`VACUUM INTO '${snapshotPath.replaceAll("'", "''")}'`);
@@ -2441,15 +2003,10 @@ class ScenarioRunner {
         return snapshotPath;
     }
 
-    /** Teardown never fails the scenario (KTD9). */
+    /* */
     private async teardown(): Promise<void> {
-        // Give fire-and-forget embedding dispatch a moment to quiesce against
-        // the deterministic endpoint before the temp tree is removed.
         await Bun.sleep(250);
         try {
-            // Server logs are run evidence: infra ERRORs are diagnosed from
-            // them without re-running the scenario. Redacted: a live child
-            // holds the real API key in its environment.
             if (this.harness !== null) {
                 writeFileSync(
                     join(this.options.artifactDir, "opencode-stderr.log"),
@@ -2462,7 +2019,6 @@ class ScenarioRunner {
         try {
             await this.harness?.dispose();
         } catch {
-            // Logged failures are tolerated; teardown ordering never fails a scenario.
         }
         try {
             await this.embedMock?.stop();

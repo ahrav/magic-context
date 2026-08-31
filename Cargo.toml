@@ -1,16 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/mc-core", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer", "crates/mc-shm-transport", "packages/mc-shm-native"]
-# The evidence probe depends on the PUBLISHED subc crates from crates.io rather than the
-# sibling sources, so it must never join this workspace's dependency graph.
-# The cargo-fuzz workspace under crates/mc-shm-transport/fuzz declares its own
-# [workspace] and stays excluded here.
+# Exclude docs/evidence/subc-surface-probe because it uses published subc crates from crates.io rather than sibling sources.
+# Exclude crates/mc-shm-transport/fuzz because it declares its own [workspace].
 exclude = ["docs/evidence/subc-surface-probe", "crates/mc-shm-transport/fuzz"]
 
 [workspace.dependencies]
-# CortexKit cache-stability core + storage substrate. Sibling path-deps for local
-# co-dev (not yet published); pin a published version at first release. magic-context
-# is a sibling of commons/ and subconscious/, so these resolve identically to the
 # alfonso-core arrangement.
 cortexkit-cache-core = { path = "../commons/crates/cortexkit-cache-core" }
 cortexkit-store = { path = "../commons/crates/cortexkit-store" }
@@ -21,22 +16,18 @@ cortexkit-lease = { path = "../commons/crates/cortexkit-lease" }
 mc-core = { path = "crates/mc-core" }
 mc-store = { path = "crates/mc-store" }
 
-# Third-party. rusqlite pinned to the same version+features cortexkit-store uses so
-# the Connection/Transaction types unify across the with_conn boundary.
+# Pin rusqlite to cortexkit-store's version and features so Connection and Transaction types unify across with_conn.
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 # 0.39 bundles SQLite 3.51.3, including the complete WAL-reset race fix
-# (sqlite.org/wal.html#walresetbug). commentlint: allow(JUDGE)
+# (sqlite.org/wal.html#walresetbug).
 # The sibling `../commons` `cortexkit-store` crate uses `rusqlite` 0.39 as well,
 # because `libsqlite3-sys` declares `links = "sqlite3"` and Cargo permits one
-# `sqlite3` links crate per dependency graph. commentlint: allow(JUDGE)
+# `sqlite3` links crate per dependency graph.
 rusqlite = { version = "0.39", features = ["bundled"] }
 regex = "1"
 sha2 = "0.10"
-# Pure-Rust git access avoids subprocesses and libgit2 entirely. The non-default
-# feature set keeps network transports, credential helpers, and filter-driver
-# command execution out of the dependency graph; `status` and `revision` cover
-# dirty scans and ancestry walks. commentlint: allow(JUDGE)
-gix = { version = "0.87", default-features = false, features = ["revision", "status", "sha1", "parallel"] }
 semver = "1"
+# `default-features = false` excludes network transports, credential helpers, and filter-driver command execution from the dependency graph.
+gix = { version = "0.87", default-features = false, features = ["revision", "status", "sha1", "parallel"] }

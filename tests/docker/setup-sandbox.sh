@@ -1,20 +1,10 @@
 #!/usr/bin/env bash
 #
-# Build + run the interactive Magic Context setup/doctor sandbox.
 #
-# Installs the PUBLISHED @cortexkit/magic-context (latest by default) in a clean
-# container with OpenCode + Pi present, then drops you into a shell to drive the
-# setup/doctor wizards by hand and inspect where config lands (the CortexKit
-# location). Rebuild after a release to pick up the newest published version.
 #
 # Usage:
-#   tests/docker/setup-sandbox.sh                  # build @latest + run shell
-#   tests/docker/setup-sandbox.sh 0.27.1           # pin a specific version
-#   tests/docker/setup-sandbox.sh --build-only     # just (re)build the image
 #
-# Driven from a PTY: build with --build-only first, then
 #   docker run --rm -it --platform linux/amd64 mc-setup-sandbox
-# in a PTY session so the wizard's interactive prompts work.
 
 set -euo pipefail
 
@@ -31,7 +21,7 @@ for arg in "$@"; do
   esac
 done
 
-# Resolve repo root from this script's location so it works from anywhere.
+# The script resolves REPO_ROOT from its own location, so it works from any working directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 

@@ -35,13 +35,7 @@ export interface GraduationCandidate {
 }
 
 /**
- * A case yields one pair per execution coordinate, so the disposition is a property of the whole
- * coordinate set rather than of any single cell: one passing model, seed, or platform says nothing
- * about the others. Accepted behavior therefore requires every coordinate to have completed with
- * both arms passing, and any incomplete or failing coordinate makes the case a regression.
- * `buildGraduationCandidate` and `validateGraduationPairBindings` read the disposition through this
- * one predicate so a stamped disposition cannot disagree with the validated one. Callers reject an
- * empty set first, because `every` over no coordinates is vacuously true.
+ * `buildGraduationCandidate` rejects empty sets because `every` is vacuously true for them.
  */
 function dispositionFor(casePairs: readonly PairedCaseFact[]): GraduationCandidate["disposition"] {
     const allPass = casePairs.every((pair) =>
@@ -75,13 +69,11 @@ export function buildGraduationCandidate(input: {
     }
     const [first] = input.pairs;
     if (!first) throw new HoldoutContractError(["graduation: pair-set-empty"]);
-    // The set has to be exactly one case's coordinates, because the case identity it carries
-    // selects the admitted case and every field the candidate copies out of it.
+    // All pairs must share `caseId`, because the candidate binds to that admitted case.
     if (input.pairs.some((pair) => pair.caseId !== first.caseId)) {
         throw new HoldoutContractError(["graduation: pair-set-multi-case"]);
     }
-    // The candidate carries one implementation fingerprint for the whole set, so the coordinates
-    // have to agree on it rather than the first one speaking for the rest.
+    // All pairs must share `implementationFingerprint`; the candidate stores only one.
     const implementationFingerprint = first.implementationFingerprint;
     if (input.pairs.some((pair) => pair.implementationFingerprint !== implementationFingerprint)) {
         throw new HoldoutContractError(["graduation: pair-set-implementation-drift"]);
@@ -176,20 +168,12 @@ export function parseGraduationCandidate(raw: unknown): GraduationCandidate {
 }
 
 /**
- * Installs one candidate under its own name in the graduation directory.
  *
- * Every entry in that directory is a candidate: readers scan it and require each filename to
- * be `case-<32 hex>.json`, so a name staged there and left behind is read as a malformed
- * candidate rather than as work in progress. Staging therefore lives in the directory's parent,
- * the epoch root, under the `.staging-` prefix `mkdtempSync` completes — the same shape the
- * artifact publishers stage under there, which readers of an epoch root already recognise as
- * runtime state and skip. A publisher killed before its cleanup leaves that directory holding
- * the bytes it had written, beside the graduation directory instead of inside it, so the scan
- * still sees only candidates and the identical retry below republishes.
+ * The candidate directory contains only candidates; readers parse every entry as `case-<32 hex>.json`.
+ * Staging files under an epoch-root `.staging-` directory prevents candidate scans from parsing partial writes.
+ * If cleanup is interrupted, staged bytes remain outside the candidate directory.
+ * A retry can republish identical bytes without exposing staging entries to candidate scans.
  *
- * `linkSync` is what installs the destination, and it fails rather than replacing an existing
- * name, so a retry lands on the byte comparison and an unequal candidate is reported instead of
- * overwriting the installed one.
  */
 export function appendGraduationCandidate(candidate: GraduationCandidate, destination: string): void {
     const bytes = `${JSON.stringify(candidate, null, 2)}\n`;
@@ -214,9 +198,8 @@ export function validateGraduationPairBindings(
     pairs: readonly PairedCaseFact[],
 ): void {
     for (const candidate of candidates) {
-        // A case yields one pair per execution coordinate. Selecting a single pair would let a
-        // regression in any other coordinate pass, so every pair for the case has to agree
-        // with the candidate, and its disposition is derived from all of them together.
+        // Every execution coordinate contributes a pair; selecting one pair could hide another coordinate's regression.
+        // Every pair for the case must pass because a regression in any coordinate fails the case.
         const casePairs = pairs.filter((entry) => entry.caseId === candidate.source.case_id);
         if (
             casePairs.length === 0 ||

@@ -1,11 +1,5 @@
-//! The OpenCode subprocess adapter (KTD7, R15).
 //!
-//! Every run is configured entirely from trusted ephemeral state: a private
-//! per-run `OPENCODE_DB`, an inline `OPENCODE_CONFIG_CONTENT` registering
-//! one zero-tool agent that carries the system role, project configuration
-//! disabled, the Broca-child recursion guard set, and the prompt delivered
-//! over stdin. The user's ordinary OpenCode database and any
-//! project-controlled configuration are never read or written.
+//! Each run uses a private per-run `OPENCODE_DB`, inline zero-tool-agent config, disabled project config, the Broca-child guard, and a stdin prompt; it never accesses the user's database or project-controlled config.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -22,27 +16,19 @@ use super::subprocess::{
 };
 use crate::harness_closure::ValidatedHarnessClosure;
 
-/// Environment guard the globally installed OpenCode plugin checks at the
-/// very start of its entry (KTD7): a Broca child must exit Magic Context
-/// initialization before configuration migration, database access, hooks,
-/// timers, or RPC startup. The name mirrors the existing Pi guard
-/// `MAGIC_CONTEXT_PI_SUBAGENT`; the literal is duplicated in
+/// `MAGIC_CONTEXT_BROCA_CHILD_ENV` makes a Broca child exit plugin initialization before migration, database access, hooks, timers, or RPC startup.
 /// `packages/plugin/src/index.ts`.
 pub const MAGIC_CONTEXT_BROCA_CHILD_ENV: &str = "MAGIC_CONTEXT_BROCA_CHILD";
 
-/// The zero-tool agent name registered through the inline config and
-/// selected with `--agent`.
+/// `OPENCODE_BROCA_AGENT` names the inline-config agent selected by `--agent`.
 pub const OPENCODE_BROCA_AGENT: &str = "broca";
 
-/// Trusted daemon-owned OpenCode runtime closure.
 #[derive(Clone, Debug)]
 pub struct OpenCodeRuntime {
     pub closure: Arc<ValidatedHarnessClosure>,
     pub executable_node: String,
 }
 
-/// [`LlmExecutionBackend`] adapter that runs `opencode run` under the
-/// shared hardened subprocess runner.
 pub struct OpenCodeBackend {
     runtime: OpenCodeRuntime,
     limits: SubprocessLimits,
@@ -74,8 +60,7 @@ impl LlmExecutionBackend for OpenCodeBackend {
         events: EventSink,
         cancel: CancellationToken,
     ) -> BackendFuture {
-        // A run bound to another harness must fail, not silently execute
-        // under this CLI with this harness's provider aliases and
+        // A harness mismatch must fail rather than run under OpenCode with OpenCode-specific provider aliases and credentials.
         // credentials.
         if request.harness != Harness::OpenCode {
             let terminal = backend::harness_mismatch(Harness::OpenCode, request.harness);
@@ -95,13 +80,9 @@ impl LlmExecutionBackend for OpenCodeBackend {
     }
 }
 
-/// The inline `OPENCODE_CONFIG_CONTENT` document (KTD7): one primary
-/// zero-tool agent carrying the system role and temperature, plus a model
-/// output-limit override carrying the bounded token budget (R6, R18).
 fn inline_config(request: &BackendRequest) -> String {
     let mut agent = serde_json::json!({
         "mode": "primary",
-        // `{"*": false}` disables every tool for the agent — R15's
         // zero-tool contract.
         "tools": { "*": false },
         "temperature": request.temperature,
@@ -139,9 +120,7 @@ async fn run_opencode(
         }
     };
     let config_content = inline_config(&request);
-    // Linux caps one env string at MAX_ARG_STRLEN (~128 KiB); a config over
-    // that fails exec(2) with E2BIG, an opaque permanent spawn failure.
-    // Rejecting early names the real bound in the terminal instead.
+    // Reject configurations over `MAX_OPENCODE_CONFIG_BYTES` before spawning because Linux limits one environment string to `MAX_ARG_STRLEN` (~128 KiB), and exceeding that limit makes `exec(2)` fail with `E2BIG`.
     if config_content.len() > MAX_OPENCODE_CONFIG_BYTES {
         return BackendTerminal::Failed(BackendError {
             class: ErrorClass::Permanent,
@@ -162,8 +141,7 @@ async fn run_opencode(
     let args = vec![
         "run".to_owned(),
         "--model".to_owned(),
-        // The canonical `provider/model` reaches OpenCode unchanged (plan
-        // "OpenCode and Pi selection": no alias mapping on this side).
+        // `OpenCodeBackend` passes the canonical `provider/model` to OpenCode unchanged and performs no alias mapping.
         format!("{}/{}", request.provider, request.model),
         "--agent".to_owned(),
         OPENCODE_BROCA_AGENT.to_owned(),
@@ -191,8 +169,7 @@ async fn run_opencode(
         OsString::from("OPENCODE_CONFIG_CONTENT"),
         OsString::from(config_content),
     ));
-    // Project config, `.opencode/` directories, and local rule files stay
-    // unread (KTD7): hidden model work must not load project-controlled
+    // `OpenCodeBackend` never reads project configuration, `.opencode/` directories, or local rule files.
     // behavior.
     child_env.push((
         OsString::from("OPENCODE_DISABLE_PROJECT_CONFIG"),
@@ -210,16 +187,14 @@ async fn run_opencode(
         env: child_env,
         working_dir: dir.path().to_path_buf(),
         stdin: request.prompt.clone().into_bytes(),
-        // Only the exec'd executable's descriptor, which is the one path the
-        // child's arguments name. The closure directory descriptor is
-        // deliberately absent: nothing references it, and inheriting it would
-        // hand the harness a rename-immune handle it can write back through
-        // into the validated closure tree.
+        // The closure directory descriptor is absent because no argument references it.
+        // The harness receives a rename-immune handle for writing into the validated closure tree.
+        // The harness receives a rename-immune handle for writing into the validated closure tree.
         inherit_fds: vec![executable_node.inherited_fd()],
     };
 
-    // No terminal probe: the OpenCode CLI closes its streams and exits when
-    // the run finishes, so EOF plus the drain grace already bound the tail.
+    // The OpenCode CLI closes its streams and exits when the run finishes, so EOF and the drain grace bound the tail without a terminal probe.
+    // The OpenCode CLI closes its streams and exits when the run finishes, so EOF and the drain grace bound the tail without a terminal probe.
     let result = match subprocess::run(spec, &limits, &cancel, None).await {
         Ok(result) => result,
         Err(err) => {
@@ -230,8 +205,8 @@ async fn run_opencode(
         }
     };
 
-    // A transcript is trusted only after a clean end; abnormal ends map to
-    // one canonical failure in `finalize` regardless of what was printed.
+    // `finalize` trusts a transcript only after a clean end and maps every abnormal end to one canonical failure regardless of printed output.
+    // `finalize` trusts a transcript only after a clean end and maps every abnormal end to one canonical failure regardless of printed output.
     let parsed = subprocess::parse_clean_transcript(&result, &events, parse_opencode_transcript);
     subprocess::finalize(
         HarnessName::OpenCode,
@@ -242,13 +217,10 @@ async fn run_opencode(
     )
 }
 
-/// Parses the closed `opencode run --format json` vocabulary (R18):
-/// `step_start`, `text`, `step_finish`, and `error`. A `tool_use` event is
-/// recognized but rejected — this path is a zero-tool transform, so a tool
-/// invocation is a contract failure, not lifecycle metadata. Anything
-/// else — malformed JSON, non-UTF-8, unknown types, unknown finish reasons,
-/// contradictory terminals, or a missing terminal — is rejected with a
-/// structural detail that never quotes the line (R19).
+/// The parser accepts only `step_start`, `text`, `step_finish`, and `error`; it rejects `tool_use` because a tool invocation violates the zero-tool contract.
+/// The parser accepts only `step_start`, `text`, `step_finish`, and `error`; it rejects `tool_use` because a tool invocation violates the zero-tool contract.
+/// The parser accepts only `step_start`, `text`, `step_finish`, and `error`; it rejects `tool_use` because a tool invocation violates the zero-tool contract.
+/// The parser reports structural rejection details without quoting the input line.
 fn parse_opencode_transcript(
     stdout: &[u8],
 ) -> Result<(Vec<BackendEvent>, BackendTerminal), String> {
@@ -262,8 +234,8 @@ fn parse_opencode_transcript(
         let Ok(text) = std::str::from_utf8(line) else {
             return Err(format!("non-utf8 output at line {line_no}"));
         };
-        // Bounded before the DOM exists: an unbounded node graph would
-        // escape the capture budget this scan is charged against.
+        // The parser bounds the scan before constructing the DOM because an unbounded node graph would escape the charged capture budget.
+        // The parser bounds the scan before constructing the DOM because an unbounded node graph would escape the charged capture budget.
         if !subprocess::json_nodes_within_bound(text) {
             return Err(format!("json structure too large at line {line_no}"));
         }
@@ -275,18 +247,16 @@ fn parse_opencode_transcript(
         };
         match event_type {
             "step_start" => {}
-            // Broca advertises this path as a zero-tool prompt-to-text
-            // transform: a tool invocation means the run executed something
-            // the contract forbids, so its text must not be published.
+            // A tool invocation violates the zero-tool contract, so the transform must not publish its text.
+            // A tool invocation violates the zero-tool contract, so the transform must not publish its text.
             "tool_use" => {
                 return Err(format!(
                     "tool_use event in a tool-less run at line {line_no}"
                 ));
             }
             "text" => {
-                // A completed or failed run cannot grow its answer: content
-                // after the terminal is transcript corruption, and appending
-                // it would extend what subscribers already saw settled.
+                // The transcript rejects content after a terminal because completed or failed runs cannot grow their answer.
+                // The transcript rejects content after a terminal because completed or failed runs cannot grow their answer.
                 if terminal.is_some() {
                     return Err(format!("text event after the terminal at line {line_no}"));
                 }
@@ -308,12 +278,9 @@ fn parse_opencode_transcript(
                     .and_then(|part| part.get("reason"))
                     .and_then(serde_json::Value::as_str);
                 let finish_reason = match reason {
-                    // A tool-calls step continues the run; a reason-less
-                    // step is nonterminal in the supported vocabulary.
                     Some("tool-calls") | None => continue,
                     Some("stop") => FinishReason::Completed,
-                    // The exact length-class spelling is preserved (R18):
-                    // OpenCode's AI-SDK reason is "length".
+                    // OpenCode's AI-SDK finish reason is `length`.
                     Some("length") => FinishReason::Length,
                     Some(_) => {
                         return Err(format!("unknown finish reason at line {line_no}"));
@@ -337,10 +304,7 @@ fn parse_opencode_transcript(
     Ok((events, terminal))
 }
 
-/// Maps one OpenCode `error` event to the classified failure the producer
-/// consumes (R18): class, retry delay, and the provider's error name as the
-/// diagnostic code. The message forwarded is the provider's bounded
-/// human-readable message; the protocol encoder truncates it before replay.
+/// The provider's error name is the diagnostic code.
 fn error_terminal(value: &serde_json::Value) -> BackendTerminal {
     let error = value.get("error");
     let name = error
@@ -375,15 +339,10 @@ fn error_terminal(value: &serde_json::Value) -> BackendTerminal {
         .and_then(|data| data.get("retryAfter"))
         .and_then(serde_json::Value::as_u64)
         .or_else(|| subprocess::retry_after_secs_in_text(message))
-        // The provider-supplied field is as untrusted as the message text:
-        // both are clamped so a hostile value cannot schedule a durable
-        // backoff decades out.
         .map(|secs| secs.min(subprocess::MAX_RETRY_AFTER_SECS));
     BackendTerminal::Failed(BackendError {
         class,
-        // Host-authored: the provider text above steers classification but
-        // never rides the wire — it can echo prompt, memory-pool, or
-        // credential content (R19).
+        // The provider text affects classification but is excluded from `BackendError::message`.
         message: match status_code {
             Some(code) => format!("opencode provider reported an error (status {code})"),
             None => "opencode provider reported an error".to_owned(),

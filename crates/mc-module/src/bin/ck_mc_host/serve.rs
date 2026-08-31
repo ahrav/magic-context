@@ -1,11 +1,10 @@
-//! `ck-mc-host serve`: the daemon mode.
+//! `ck-mc-host serve` runs as a daemon.
 //!
-//! Reads one bounded, strictly decoded startup envelope from stdin (the
-//! launcher's intentional pipe), revalidates the staged generation named by
-//! the envelope, composes the fixed Magic Context + Synapse + Broca profile,
-//! and runs the existing mc-host runtime. Lock acquisition (lifetime fence
-//! then runtime lock), the `starting` record, publication, and the
-//! post-publication activation split all live inside `mc_host::run`.
+//! The daemon reads one size-capped, strictly decoded startup envelope from the launcher's pipe.
+//! The daemon revalidates the staged generation named by the envelope.
+//! The daemon composes the fixed Magic Context, Synapse, and Broca profile.
+//! `mc_host::run` acquires the lifetime fence before the runtime lock and writes the `starting` record before publication.
+//! `mc_host::run` performs activation after publication.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -42,13 +41,12 @@ const MAX_DESCRIPTOR_ITEMS: usize = 32;
 const MAX_DESCRIPTOR_ITEM_BYTES: usize = 4096;
 const CREDENTIAL_NAMES: [&str; 3] = ["ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY"];
 
-/// The bounded launcher-to-serve startup envelope (KTD18). Strict: unknown
-/// fields are rejected, every path is absolute, and the whole document is
-/// size-capped before decoding.
+/// The startup envelope is size-capped before decoding.
+/// Startup-envelope decoding rejects unknown fields and requires absolute paths.
 ///
-/// The launcher materializes qualified harness candidates before detach, so
-/// this serve envelope carries only retained closure digests or closed
-/// per-harness unavailability reasons. Source paths never cross into serve.
+/// The launcher materializes qualified harness candidates before detaching.
+/// The serve envelope carries retained closure digests or per-harness unavailability reasons.
+/// The serve envelope carries no source paths.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartupEnvelope {
@@ -63,9 +61,9 @@ pub struct StartupEnvelope {
     pub credentials: BTreeMap<String, String>,
 }
 
-/// Parent-to-launcher input. The launcher adds its admitted data root and
-/// selected generation digest before handing the immutable snapshot to
-/// `serve`; values travel only through stdin and the intentional native pipe.
+/// The launcher receives parent input.
+/// The launcher adds its admitted data root and selected generation digest before invoking `serve`.
+/// The launcher sends the immutable snapshot only through stdin and the native pipe.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LauncherEnvelope {
@@ -92,8 +90,7 @@ pub enum HarnessSnapshot {
     Unavailable { reason: HarnessUnavailableReason },
 }
 
-/// The closed set of per-harness unavailability reasons the launcher may
-/// hand to serve.
+/// The launcher may hand `serve` only the defined per-harness unavailability reasons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessUnavailableReason {
@@ -112,7 +109,6 @@ impl HarnessUnavailableReason {
     }
 }
 
-/// Current startup envelope schema.
 pub const STARTUP_ENVELOPE_SCHEMA: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -207,17 +203,16 @@ impl LauncherEnvelope {
     ) -> Result<PreparedLauncherEnvelope, &'static str> {
         let closure_root = data_dir.join("cortexkit").join("mc-host-harness-closures");
         let store = HarnessClosureStore::open(&closure_root).ok();
-        // One memo for the whole call: the recorded selection, the supplied
-        // candidates, and the merged selection routinely name the same digests,
-        // and each `validate` re-hashes the entire closure tree.
+        // The validator memoizes results because recorded, supplied, and merged selections can cite the same digest; each `validate` re-hashes the closure tree.
+        // The recorded, supplied, and merged selections can cite the same digest.
+        // Each `validate` re-hashes the entire closure tree.
         let mut validator = ClosureValidator::new(store.as_ref());
         let running = matches!(mode, SelectionMode::Running { .. });
         let (previous, mut credential_identities, require_previous_credentials) = match mode {
             SelectionMode::Fresh => {
-                // A fresh start discards the previous selection, so a stale one
-                // (its cited closure no longer qualified or validatable) is
-                // tolerated here: the commit that follows a successful start
-                // replaces the file. Hostile or unsupported shapes still fail.
+                // A successful fresh start replaces the previous selection.
+                // A selection is stale when its cited closure no longer qualifies or validates.
+                // A successful start commits a replacement selection.
                 read_selection(&closure_root, &mut validator)?;
                 (
                     HarnessSelection {
@@ -238,10 +233,10 @@ impl LauncherEnvelope {
                         schema: 1,
                         ..HarnessSelection::default()
                     },
-                    // The running daemon's committed selection cites a closure
-                    // this binary can no longer qualify or validate, so no
-                    // merge can honor it. `stop` clears stale selections and a
-                    // fresh start replaces them, which is the recovery path.
+                    // The validator rejects a committed selection whose closure this binary cannot qualify or validate.
+                    // A committed selection cannot be merged when this binary cannot qualify or validate its closure.
+                    // `stop` clears stale selections.
+                    // A fresh start replaces stale selections.
                     SelectionState::Stale => return Err("active harness selection is stale"),
                 },
                 credential_identities(&self.credentials, credential_identity_key),
@@ -293,8 +288,8 @@ impl LauncherEnvelope {
             &mut validator,
         );
         let pi = selected_snapshot("pi", selection.pi.as_deref(), pi_candidate, &mut validator);
-        // Pruning follows all validation and materialization. Protect every
-        // digest visible in the active, candidate, or merged selection so a
+        // Pruning runs after validation and materialization.
+        // The pruner protects every digest referenced by the active, candidate, or merged selection from pruning.
         // failed validation cannot delete the only recoverable closure.
         if let Some(store) = store.as_ref() {
             let mut protected = candidate_digests;
@@ -338,9 +333,6 @@ fn merge_selection(
     if require_previous_credentials && changed {
         return Err("restart cannot change the active harness selection");
     }
-    // Only reachable with `changed`, so no `require_previous_credentials`
-    // disjunct: a restart that reaches here matched the previous selection
-    // exactly, which already implies identical credential identities.
     if changed
         && previous
             .credential_identities
@@ -465,8 +457,6 @@ fn validate_snapshot(snapshot: Option<&HarnessSnapshot>) -> Result<(), &'static 
                 Err("harness snapshot digest is noncanonical")
             }
         }
-        // The reason set is closed by the `HarnessUnavailableReason` enum:
-        // serde already rejected anything outside it during decode.
         Some(HarnessSnapshot::Unavailable { .. }) => Ok(()),
     }
 }
@@ -489,8 +479,6 @@ fn qualified_manifest(
     {
         return Err(HarnessUnavailableReason::DescriptorInvalid);
     }
-    // The variant mismatch has its own reason so operators see "this build
-    // does not speak the qualified argument shape" rather than a generic
     // invalid descriptor.
     if manifest.argument_variant != "run_prompt" {
         return Err(HarnessUnavailableReason::ArgumentVariantInvalid);
@@ -498,21 +486,8 @@ fn qualified_manifest(
     Ok(manifest)
 }
 
-/// One `prepare()`-scoped memo over `HarnessClosureStore::validate`.
 ///
-/// `validate` re-opens and re-hashes the whole closure tree on every call, and
-/// a single `prepare()` asks the same question up to three times about the same
-/// digest: once in `read_selection` to classify the recorded selection, once
-/// inside `HarnessClosureStore::materialize`, and once in `selected_snapshot`
-/// for the merged selection. With the committed closures totalling hundreds of
-/// megabytes across thousands of files, and `start`/`stop` holding the
-/// exclusive lifecycle lock across the call, that repetition is the dominant
-/// cost of a demand-start against an already-running daemon.
 ///
-/// Memoizing is sound only because the store is immutable for the lifetime of
-/// one `prepare()`: it is keyed by content digest, the process holds the
-/// lifecycle transaction lock, and a digest that validated once cannot become
-/// invalid without a concurrent writer the lock excludes.
 struct ClosureValidator<'a> {
     store: Option<&'a HarnessClosureStore>,
     validated: BTreeMap<String, bool>,
@@ -530,8 +505,6 @@ impl<'a> ClosureValidator<'a> {
         self.store
     }
 
-    /// Whether `digest` names a closure this binary can validate, hashing the
-    /// tree at most once per digest.
     fn is_valid(&mut self, digest: &str) -> bool {
         if let Some(known) = self.validated.get(digest) {
             return *known;
@@ -544,8 +517,7 @@ impl<'a> ClosureValidator<'a> {
         valid
     }
 
-    /// Records a digest proven valid by a successful `materialize`, so the
-    /// `selected_snapshot` pass over the same digest does not re-hash it.
+    /// The validator records digests validated by `materialize`.
     fn note_valid(&mut self, digest: &str) {
         self.validated.insert(digest.to_owned(), true);
     }
@@ -566,9 +538,6 @@ fn materialize_snapshot(
             reason: HarnessUnavailableReason::ClosureIncomplete,
         });
     };
-    // A digest already proven valid in this `prepare()` needs no second pass:
-    // `materialize` itself short-circuits on `validate`, so reusing the memo is
-    // the same decision without re-hashing the tree.
     if validator.is_valid(&candidate.manifest_sha256) {
         return Some(HarnessSnapshot::Ready {
             manifest_sha256: candidate.manifest_sha256,
@@ -611,23 +580,10 @@ fn selected_snapshot(
     })
 }
 
-/// What one read of the active-selection file established.
 ///
-/// The split between `Stale` and an `Err` is load-bearing for recovery: an
-/// error names a shape this binary must not touch (hostile metadata, malformed
-/// bytes, or a schema owned by a newer binary), while `Stale` names well-formed
-/// schema-1 state whose cited closure this binary can no longer qualify or
-/// validate — the residue of a qualified-set rotation or a pruned closure
-/// store. Owners may remove stale state and a fresh start may ignore it;
-/// collapsing it into the error class would wedge `stop`, `start`, and
-/// `restart` on a file only manual deletion could clear.
 enum SelectionState {
-    /// No selection file exists.
     Absent,
-    /// A well-formed selection whose cited closures all qualify and validate.
     Active(HarnessSelection),
-    /// A well-formed schema-1 selection citing a closure that is no longer
-    /// qualified or no longer validates.
     Stale,
 }
 
@@ -751,10 +707,6 @@ pub fn clear_active_selection() -> Result<(), &'static str> {
     }
     let store = HarnessClosureStore::open(&closure_root)
         .map_err(|_| "active harness selection root is unavailable")?;
-    // Every readable state — active, absent, or stale — is removable stale
-    // state once the owner decided to clear it. Only hostile shapes and
-    // schemas owned by a newer binary keep failing, preserving the file as
-    // evidence for the binary that understands it.
     read_selection(&closure_root, &mut ClosureValidator::new(Some(&store)))?;
     #[cfg(debug_assertions)]
     if std::env::var_os("CK_MC_HOST_TEST_FAIL_SELECTION_REMOVAL").is_some() {
@@ -769,9 +721,6 @@ pub fn clear_active_selection() -> Result<(), &'static str> {
     }
 }
 
-/// Typed stand-in for a harness with no startup descriptor: every run
-/// resolves to one host-authored permanent failure carrying the closed
-/// `harness_unavailable` subreason and nothing else.
 struct UnavailableBackend {
     subreason: &'static str,
 }
@@ -892,10 +841,6 @@ fn read_envelope() -> Result<StartupEnvelope, &'static str> {
 }
 
 pub fn read_launcher_envelope() -> Result<LauncherEnvelope, &'static str> {
-    // A terminal never sends EOF on its own, so reading to end would hang an
-    // interactive `ck-mc-host start` forever. A TTY carries no envelope by
-    // definition — the launcher always redirects or closes stdin — so treat it as
-    // the absent envelope it is instead of blocking on a human.
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return Ok(LauncherEnvelope::empty());
     }
@@ -918,16 +863,8 @@ pub fn read_launcher_envelope() -> Result<LauncherEnvelope, &'static str> {
 }
 
 fn storage_init(root: &Path) -> Result<HostInit, &'static str> {
-    // The managed segment is the library's definition, not a second copy: a
-    // rename here would otherwise leave the store outside the tree that
-    // `mc_host::run` creates and validates.
     let managed =
         mc_host::managed_dir_path(Some(root)).map_err(|_| "managed directory path failed")?;
-    // Mode is applied by mkdir(2) at creation rather than by a follow-up
-    // chmod: `set_permissions` follows symlinks, so on a pre-existing
-    // symlinked path it would change the mode of the target instead. The
-    // authoritative owner-only creation and ancestor validation of this tree
-    // stay with `mc_host::run`.
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -967,13 +904,9 @@ fn synapse_component(generation: &ValidatedGeneration) -> SynapseComponent {
         };
         let descriptor_root = generation.descriptor_root_path();
         let bundle_dir = descriptor_root.join(BUNDLE_DIR);
-        // The generation manifest is the trust root: its digest already covers
-        // these bytes, so carrying the bundle manifest's own hash forward binds
-        // every artifact `load_bundle` verifies to the generation that was
-        // selected. Presence alone was not enough — the loader would then prove
-        // only that whatever sits at this pathname is self-consistent, so a
-        // directory replaced after validation could serve different embedding
-        // bytes under a generation the daemon still reported as valid.
+        // The generation manifest carries `bundle_manifest.sha256` forward because it authenticates the bundle; otherwise, a replaced bundle can remain self-consistent while serving different embeddings.
+        // The generation manifest carries `bundle_manifest.sha256` forward because it authenticates the bundle; otherwise, a replaced bundle can remain self-consistent while serving different embeddings.
+        // The generation manifest carries `bundle_manifest.sha256` forward because it authenticates the bundle; otherwise, a replaced bundle can remain self-consistent while serving different embeddings.
         let Some(bundle_manifest) = generation
             .manifest
             .files
@@ -992,14 +925,11 @@ fn synapse_component(generation: &ValidatedGeneration) -> SynapseComponent {
     }
 }
 
-/// Runs the daemon. Errors are bounded static strings written to stderr by
-/// `main` — which detached start redirects to the owner-only daemon log.
 pub fn run() -> Result<(), &'static str> {
     let envelope = read_envelope()?;
     let root = envelope.data_dir.clone();
 
-    // Revalidate the staged generation named by the envelope before serving
-    // (U2 approach step 5). Serve never selects another generation.
+    // The daemon serves only the generation selected by the envelope.
     let store = GenerationStore::open_probe(Some(&root))
         .map_err(|_| "generation store probe failed")?
         .ok_or("generation store is missing")?;
@@ -1020,11 +950,6 @@ pub fn run() -> Result<(), &'static str> {
     )
     .map_err(|_| "credential snapshot exceeds bounds")?;
     let synapse = synapse_component(&generation);
-    // The credential verifier fails closed on every Broca send, so it is
-    // installed only when the launcher actually admitted credential rows —
-    // an envelope with none (older parents, credential-less deployments)
-    // keeps the harness lane on its pre-credential behavior instead of
-    // hard-failing every send with `credential_snapshot_mismatch`.
     let backend: Arc<dyn LlmExecutionBackend> = Arc::new(harness_backend(&envelope, &env));
     let broca = if envelope.credentials.is_empty() {
         BrocaComponent::new(backend)
@@ -1060,19 +985,7 @@ pub fn run() -> Result<(), &'static str> {
     let shutdown = CancellationToken::new();
     runtime.block_on(async {
         let signal_shutdown = shutdown.clone();
-        // Installed before the host future starts. Creating a stream inside the
-        // spawned task races `mc_host::run`: a signal arriving before
-        // registration takes the default disposition and kills the daemon
-        // outright, so the runtime never observes the cancellation and the
-        // fenced teardown in `mc_host::run` never runs. An installation failure
-        // is also fatal to the shutdown path, so it fails startup here rather
-        // than panicking a detached task and leaving `run` serving with no
-        // signal handling and nothing reporting it.
         //
-        // SIGINT is handled alongside SIGTERM: the spawn path resets every
-        // inherited disposition to its default, so an interrupt from an operator
-        // or a process supervisor would otherwise terminate the daemon without
-        // draining routes and components.
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .map_err(|_| "SIGTERM handler installation failed")?;
@@ -1236,9 +1149,6 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
-    /// Plants a well-formed schema-1 selection citing a digest outside the
-    /// qualified closure set, the residue an upgrade that rotates the
-    /// qualified inputs leaves behind.
     fn plant_stale_selection(closure_root: &Path) {
         std::fs::create_dir_all(closure_root).expect("closure root");
         std::fs::set_permissions(closure_root, std::fs::Permissions::from_mode(0o700))
@@ -1281,14 +1191,10 @@ mod tests {
             pi: None,
             credentials: BTreeMap::new(),
         };
-        // A fresh start discards the previous selection, so stale residue must
-        // not block it; the wedge it would otherwise cause has no CLI recovery.
         let prepared = envelope()
             .prepare(data_dir.clone(), SelectionMode::Fresh)
             .expect("fresh start ignores a stale selection");
         assert!(!prepared.changed);
-        // A running merge cannot honor a selection whose closure is gone, and
-        // must refuse without adopting or rewriting it.
         match envelope().prepare(
             data_dir,
             SelectionMode::Running {
@@ -1301,12 +1207,6 @@ mod tests {
         }
     }
 
-    /// `HarnessClosureStore::validate` re-hashes the whole closure tree, and one
-    /// `prepare()` asks about the same digest up to three times. The memo must
-    /// answer identically while consulting the store only once per digest,
-    /// including for the negative answer: an unqualified digest that re-hashed
-    /// on every ask is what made a demand-start against an already-running
-    /// daemon pay for the closure set two to three times over.
     #[test]
     fn the_closure_validator_answers_each_digest_once() {
         let root = tempfile::tempdir().expect("closure root");
@@ -1323,13 +1223,10 @@ mod tests {
         assert_eq!(validator.validated.len(), 1);
         assert_eq!(validator.validated.get(&absent), Some(&false));
 
-        // A digest proven valid by `materialize` is recorded, so the later
-        // `selected_snapshot` pass over the merged selection reuses it.
         validator.note_valid(&absent);
         assert!(validator.is_valid(&absent));
         assert_eq!(validator.validated.len(), 1);
 
-        // Absent stores answer negatively without consulting anything.
         let mut storeless = ClosureValidator::new(None);
         assert!(!storeless.is_valid(&absent));
         assert!(storeless.store().is_none());

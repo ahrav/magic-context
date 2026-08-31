@@ -61,7 +61,7 @@ function parseValidateArgs(args: readonly string[]): ValidateInvocation {
     return { root, recomputersSpecifier };
 }
 
-/** An export passes only when it carries both the sibling owner id and its recomputation method. */
+/* */
 function adapterOwner(value: unknown, method: string): string | undefined {
     if (typeof value !== "object" || value === null) return undefined;
     const adapter = value as Record<string, unknown>;
@@ -70,8 +70,7 @@ function adapterOwner(value: unknown, method: string): string | undefined {
 }
 
 async function loadRecomputers(specifier: string): Promise<ReportRecomputers> {
-    // Path-like specifiers resolve against the process working directory; bare ones stay
-    // untouched so the module resolver keeps its own lookup rules.
+    // Path-like specifiers resolve against the working directory; bare specifiers preserve module-resolution lookup rules.
     const target = /^[./]/.test(specifier) ? resolve(specifier) : specifier;
     let loaded: Record<string, unknown>;
     try {
@@ -100,8 +99,7 @@ function appendPrebuiltTransition(command: string, ledgerPath: string, eventPath
     if (!TRANSITIONS[command]!.includes(event.state)) {
         throw new HoldoutContractError([`${command}: event-state-invalid`]);
     }
-    // The lock sits beside the ledger file rather than inside a directory of its
-    // own, so the ledger's directory has to exist before the lock can be created.
+    // The ledger directory must exist before withRecoverableLock creates `${ledgerPath}.lock`.
     mkdirSync(dirname(ledgerPath), { recursive: true });
     withRecoverableLock(`${ledgerPath}.lock`, { busyCode: "lifecycle: append-busy" }, () => {
         const prior = readLifecycle(ledgerPath);

@@ -1,23 +1,15 @@
 /**
- * Strip injected `§N§` tag prefixes AND defensively strip cargo-cult MC tag
- * notation from assistant text before Pi persists the message.
  *
- * Mirrors OpenCode's `text-complete.ts` via {@link stripPersistedAssistantText}:
- * whole `§N§` pairs globally, malformed hybrids, then stray `§`. Does not strip
- * bare leading digits on the transform path.
  *
- * Pi persists raw assistant text from `message_end`; this hook mutates text parts
- * before `agent-session.ts:appendMessage()` writes jsonl.
  *
- * Only `assistant` messages are stripped. User/tool messages keep intentional tags.
  */
 
 import { stripPersistedAssistantText } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 
 /**
- * Mutate the given assistant message's text parts in place to strip MC tag notation.
+ * `stripTagPrefixFromAssistantMessage` mutates text parts in `assistant` messages in place.
  *
- * Returns true if any text was modified. Production callers use `registerStripTagPrefix`.
+ * `stripTagPrefixFromAssistantMessage` returns `true` after modifying at least one text part.
  */
 
 export function stripTagPrefixFromAssistantMessage(message: {

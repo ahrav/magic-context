@@ -72,13 +72,22 @@ fn artifact_path(root: &std::path::Path, digest: &str) -> std::path::PathBuf {
         .join(&digest[2..])
 }
 
-fn invalidate_evidence(root: &std::path::Path, evidence_id: &str) {
+fn invalidate_evidence(store: &KernelStore, root: &std::path::Path, evidence_id: &str) {
+    // invalidated_commit_seq must reference a commit strictly later than the one
+    // that created the row, so take a real later sequence rather than reusing
+    // created_commit_seq.
+    let commit_seq = store
+        .commit(
+            intent(&format!("invalidate-{evidence_id}"), evidence_id.as_bytes()),
+            |_| Ok(evidence_id.to_string()),
+        )
+        .unwrap()
+        .commit_seq;
     let connection = Connection::open(root.join("core.sqlite")).unwrap();
     connection
         .execute(
-            "UPDATE evidence_meta SET invalidated_commit_seq=created_commit_seq
-             WHERE evidence_id=?1",
-            [evidence_id],
+            "UPDATE evidence_meta SET invalidated_commit_seq=?2 WHERE evidence_id=?1",
+            params![evidence_id, commit_seq],
         )
         .unwrap();
 }
@@ -274,7 +283,7 @@ fn invalidated_retained_object_still_consumes_cap() {
     let retained = store
         .ingest_artifact(request("retained", b"12345678".to_vec()))
         .unwrap();
-    invalidate_evidence(root.path(), &retained.evidence_id);
+    invalidate_evidence(&store, root.path(), &retained.evidence_id);
 
     let error = store
         .ingest_artifact(request("over-retained-cap", b"9".to_vec()))
@@ -465,7 +474,7 @@ fn failed_repopulation_commit_keeps_invalidated_retained_object_bytes() {
     let existing = store
         .ingest_artifact(request("dedup-existing", payload.clone()))
         .unwrap();
-    invalidate_evidence(root.path(), &existing.evidence_id);
+    invalidate_evidence(&store, root.path(), &existing.evidence_id);
     let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
     let commit_seq: i64 = connection
         .query_row(
@@ -667,7 +676,7 @@ fn invalidated_classification_still_restricts_re_admission_of_identical_bytes() 
     let mut asserted = request("classified", payload.clone());
     asserted.asserted_sensitivity = Sensitivity::Secret;
     let first = store.ingest_artifact(asserted).unwrap();
-    invalidate_evidence(root.path(), &first.evidence_id);
+    invalidate_evidence(&store, root.path(), &first.evidence_id);
 
     let mut relaxed = request("reclassified", payload);
     relaxed.asserted_sensitivity = Sensitivity::Normal;
@@ -822,33 +831,399 @@ fn oversized_replaced_object_is_rejected_without_reading_it_whole() {
 }
 
 #[test]
-fn change_payload_redactions_cover_every_emitted_object_field() {
+fn secret_in_an_identity_field_is_refused_rather_than_redacted() {
     let root = tempfile::tempdir().unwrap();
     let store = KernelStore::open(root.path()).unwrap();
     seed_domain(&store);
 
-    let mut tainted = request("ledger", b"ledger payload".to_vec());
-    tainted.object_kind = format!("evidence key={SECRET}");
-    tainted.source_kind = format!("repository token={SECRET}");
+    for mutate in [
+        (|r: &mut ArtifactIngestRequest| r.evidence_id = format!("evidence key={SECRET}"))
+            as fn(&mut ArtifactIngestRequest),
+        |r: &mut ArtifactIngestRequest| r.object_id = format!("object key={SECRET}"),
+        |r: &mut ArtifactIngestRequest| r.object_kind = format!("evidence key={SECRET}"),
+        |r: &mut ArtifactIngestRequest| r.source_kind = format!("repository key={SECRET}"),
+        |r: &mut ArtifactIngestRequest| r.source_id = format!("src key={SECRET}"),
+    ] {
+        let mut tainted = request("identity-secret", b"identity payload".to_vec());
+        mutate(&mut tainted);
+        let error = store.ingest_artifact(tainted).unwrap_err();
+        assert_eq!(error.kind(), ArtifactErrorKind::InvalidInput);
+    }
+
+    assert!(!tree_bytes(root.path())
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+    assert_eq!(reservation_count(root.path()), 0);
+    assert_eq!(staged_entries(root.path()), 0);
+}
+
+#[test]
+fn secret_in_artifact_metadata_raises_the_classification() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    let mut tainted = request("metadata-secret", b"clean payload".to_vec());
+    tainted.media_type = format!("text/plain; key={SECRET}");
     let handle = store.ingest_artifact(tainted).unwrap();
-    assert!(!handle.digest.is_empty());
+
+    assert_eq!(
+        store
+            .artifact_eligibility(&handle, ArtifactDestination::Local)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::Secret)
+    );
+    assert!(!tree_bytes(root.path())
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+}
+
+#[test]
+fn oversized_intent_field_is_rejected_before_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    let mut flooded = request("intent-flood", b"small payload".to_vec());
+    flooded.intent.cause = "key=a ".repeat(4000);
+    let error = store.ingest_artifact(flooded).unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::TextFieldTooLong);
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
+fn oversized_existing_object_is_rejected_during_ingest_verification() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"verification bait".to_vec();
+    let digest = format!("{:x}", Sha256::digest(&payload));
+
+    let shard = root.path().join("artifacts/objects").join(&digest[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    fs::set_permissions(&shard, fs::Permissions::from_mode(0o700)).unwrap();
+    let object = shard.join(&digest[2..]);
+    fs::write(&object, vec![b'z'; 64 * MIB + 1]).unwrap();
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let error = store
+        .ingest_artifact(request("oversize-verify", payload))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::CorruptObject);
+    assert_eq!(reservation_count(root.path()), 0);
+    assert_eq!(staged_entries(root.path()), 0);
+}
+
+#[test]
+fn evidence_metadata_redactions_reach_the_ledger() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    let mut tainted = request("meta-ledger", b"metadata ledger".to_vec());
+    tainted.media_type = format!("text/plain; key={SECRET}");
+    tainted.retention_class = format!("canonical token={SECRET}");
+    let handle = store.ingest_artifact(tainted).unwrap();
 
     let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
     let mut statement = connection
         .prepare(
-            "SELECT DISTINCT field_name FROM durable_text_redactions
-             WHERE owner_kind='outbox' ORDER BY field_name",
+            "SELECT field_name FROM durable_text_redactions
+             WHERE owner_kind='evidence' AND owner_id=?1 ORDER BY field_name",
         )
         .unwrap();
     let fields = statement
-        .query_map([], |row| row.get::<_, String>(0))
+        .query_map([&handle.evidence_id], |row| row.get::<_, String>(0))
         .unwrap()
         .map(|row| row.unwrap())
         .collect::<Vec<_>>();
-    for expected in ["object_kind", "source_kind"] {
+    for expected in ["media_type", "retention_class"] {
         assert!(
             fields.iter().any(|field| field == expected),
-            "outbox redaction ledger is missing {expected}: {fields:?}"
+            "evidence ledger is missing {expected}: {fields:?}"
         );
     }
+}
+
+#[test]
+fn replayed_intent_still_merges_a_stronger_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"policy escalation on replay".to_vec();
+
+    let first = store
+        .ingest_artifact(request("policy-replay", payload.clone()))
+        .unwrap();
+    assert_eq!(
+        store
+            .artifact_eligibility(&first, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Allowed
+    );
+
+    let mut stronger = request("policy-replay", payload);
+    stronger.provider_egress = ProviderEgress::LocalOnly;
+    stronger.asserted_sensitivity = Sensitivity::Sensitive;
+    let replayed = store.ingest_artifact(stronger).unwrap();
+
+    assert_eq!(replayed.digest, first.digest);
+    assert_eq!(
+        store
+            .artifact_eligibility(&replayed, ArtifactDestination::Remote)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::SensitiveRemote)
+    );
+}
+
+#[test]
+fn detection_dense_payload_is_rejected_before_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = "key=a ".repeat(5000).into_bytes();
+
+    let error = store
+        .ingest_artifact(request("detection-flood", payload))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::DetectionLimit);
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
+fn fifo_at_the_digest_destination_does_not_block_ingest() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"fifo bait".to_vec();
+    let digest = format!("{:x}", Sha256::digest(&payload));
+
+    let shard = root.path().join("artifacts/objects").join(&digest[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    fs::set_permissions(&shard, fs::Permissions::from_mode(0o700)).unwrap();
+    let fifo = shard.join(&digest[2..]);
+    let made = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo failed");
+
+    let error = store.ingest_artifact(request("fifo", payload)).unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::MissingObject);
+    assert_eq!(reservation_count(root.path()), 0);
+    assert_eq!(staged_entries(root.path()), 0);
+}
+
+#[test]
+fn symlinked_directory_under_objects_is_not_followed_when_totaling_usage() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let first = store
+        .ingest_artifact(request("usage-base", b"usage base".to_vec()))
+        .unwrap();
+
+    let objects = root.path().join("artifacts/objects");
+    std::os::unix::fs::symlink(&objects, objects.join("zz")).unwrap();
+    let outside = root.path().join("outside-bulk");
+    fs::write(&outside, vec![b'q'; 4096]).unwrap();
+    std::os::unix::fs::symlink(&outside, objects.join("zy")).unwrap();
+
+    let second = store
+        .ingest_artifact(request("usage-after", b"usage after".to_vec()))
+        .unwrap();
+
+    assert_ne!(first.digest, second.digest);
+    assert_eq!(
+        store.read_artifact(&second).unwrap(),
+        b"usage after".to_vec()
+    );
+}
+
+#[test]
+fn oversized_metadata_field_is_rejected_before_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    let mut flooded = request("metadata-flood", b"small payload".to_vec());
+    flooded.media_type = "key=a ".repeat(4000);
+    let error = store.ingest_artifact(flooded).unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::TextFieldTooLong);
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
+fn fifo_swapped_under_a_live_reference_does_not_block_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(request("swap", b"swap payload".to_vec()))
+        .unwrap();
+
+    let path = artifact_path(root.path(), &handle.digest);
+    fs::remove_file(&path).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo failed");
+
+    let error = store.read_artifact(&handle).unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::MissingObject);
+}
+
+#[test]
+fn oversized_identity_field_is_rejected_before_redaction() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    for mutate in [
+        (|r: &mut ArtifactIngestRequest| r.evidence_id = "key=a ".repeat(4000))
+            as fn(&mut ArtifactIngestRequest),
+        |r: &mut ArtifactIngestRequest| r.object_id = "key=a ".repeat(4000),
+        |r: &mut ArtifactIngestRequest| r.object_kind = "key=a ".repeat(4000),
+        |r: &mut ArtifactIngestRequest| r.domain_id = "key=a ".repeat(4000),
+        |r: &mut ArtifactIngestRequest| r.source_kind = "key=a ".repeat(4000),
+        |r: &mut ArtifactIngestRequest| r.source_id = "key=a ".repeat(4000),
+    ] {
+        let mut flooded = request("identity-flood", b"small payload".to_vec());
+        mutate(&mut flooded);
+        let error = store.ingest_artifact(flooded).unwrap_err();
+
+        assert_eq!(error.kind(), ArtifactErrorKind::TextFieldTooLong);
+    }
+
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
+fn swapped_objects_directory_is_not_followed_when_reading() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(request("swap-read", b"swap read bytes".to_vec()))
+        .unwrap();
+    assert_eq!(store.read_artifact(&handle).unwrap(), b"swap read bytes");
+
+    let artifacts = root.path().join("artifacts");
+    let objects = artifacts.join("objects");
+    let shard = &handle.digest[..2];
+    let name = &handle.digest[2..];
+
+    let foreign = root.path().join("foreign-objects");
+    fs::create_dir(&foreign).unwrap();
+    fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+    let foreign_shard = foreign.join(shard);
+    fs::create_dir(&foreign_shard).unwrap();
+    fs::set_permissions(&foreign_shard, fs::Permissions::from_mode(0o700)).unwrap();
+    let foreign_object = foreign_shard.join(name);
+    fs::write(
+        &foreign_object,
+        fs::read(objects.join(shard).join(name)).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&foreign_object, fs::Permissions::from_mode(0o600)).unwrap();
+
+    fs::rename(&objects, artifacts.join("objects-real")).unwrap();
+    std::os::unix::fs::symlink(&foreign, &objects).unwrap();
+
+    let error = store.read_artifact(&handle).unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::MissingObject);
+}
+
+#[test]
+fn nested_directory_under_a_shard_is_not_charged_against_the_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open_with_artifact_cap_for_test(root.path(), 4096).unwrap();
+    seed_domain(&store);
+
+    let nested = root.path().join("artifacts/objects/zz/nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("bulk"), vec![b'q'; 8192]).unwrap();
+
+    let handle = store
+        .ingest_artifact(request("nested-usage", b"nested usage".to_vec()))
+        .unwrap();
+    assert_eq!(store.read_artifact(&handle).unwrap(), b"nested usage");
+}
+
+#[test]
+fn secret_in_repository_provenance_is_refused_rather_than_proving_provenance() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    for provenance in [
+        RepositoryProvenance {
+            repository_id: format!("repo key={SECRET}"),
+            revision: "abc123".to_string(),
+        },
+        RepositoryProvenance {
+            repository_id: "repo".to_string(),
+            revision: format!("abc key={SECRET}"),
+        },
+    ] {
+        let mut tainted = request("provenance-secret", b"clean payload".to_vec());
+        tainted.asserted_sensitivity = Sensitivity::Normal;
+        tainted.provenance = Some(provenance);
+        let error = store.ingest_artifact(tainted).unwrap_err();
+
+        assert_eq!(error.kind(), ArtifactErrorKind::InvalidInput);
+    }
+
+    assert!(!tree_bytes(root.path())
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
+fn oversized_repository_provenance_is_rejected_before_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    for provenance in [
+        RepositoryProvenance {
+            repository_id: "r".repeat(4000),
+            revision: "abc123".to_string(),
+        },
+        RepositoryProvenance {
+            repository_id: "repo".to_string(),
+            revision: "v".repeat(4000),
+        },
+    ] {
+        let mut flooded = request("provenance-flood", b"clean payload".to_vec());
+        flooded.provenance = Some(provenance);
+        let error = store.ingest_artifact(flooded).unwrap_err();
+
+        assert_eq!(error.kind(), ArtifactErrorKind::TextFieldTooLong);
+    }
+
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
 }

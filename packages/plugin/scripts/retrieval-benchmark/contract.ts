@@ -1,9 +1,7 @@
 /**
- * Strict artifact contracts for the judged retrieval corpus (KTD2, R38-R42).
  *
- * Four versioned artifacts — corpus, judgments, synthetic profiles, manifest —
- * each parsed with recursively-strict schemas (unknown fields reject) and
- * diagnostics that carry only JSON paths and codes, never field values.
+ * Schemas reject unknown fields recursively.
+ * Diagnostics expose only JSON paths and codes, never field values.
  */
 
 import { z } from "zod";
@@ -26,14 +24,7 @@ import { dialectNamespace, relevanceIdentity } from "./identity";
 
 export const CORPUS_SCHEMA_VERSION = "retrieval-benchmark-corpus/v1";
 
-/** Canonical-decimal numeric locator production can actually emit: SQLite
- *  AUTOINCREMENT ids start at 1 (so "0" is never producible — the cursor
- *  advance would set sqlite_sequence to -1 and the emitted row would come
- *  back as id 1), the value must be a safe integer (seeding subtracts from
- *  and sorts it as a JS number), and production interpolates the id
- *  through a JS number, so it must survive a Number -> String round-trip
- *  byte-exactly (rejects "042" and ids above MAX_SAFE_INTEGER). One
- *  predicate shared by corpus validation and seeding so both gates agree
+/**
  *  on producibility. */
 export function isProducibleNumericLocator(locator: string): boolean {
     const numeric = Number(locator);
@@ -72,8 +63,8 @@ export const DOCUMENT_KINDS = [
 ] as const;
 export type DocumentKind = (typeof DOCUMENT_KINDS)[number];
 
-/** ctx-search source filter vocabulary. `satisfies` ties this to the tool's
- *  `sources` arg type, so vocabulary drift is a compile error. */
+/**
+ * */
 export const SOURCE_FILTERS = [
     "memory",
     "message",
@@ -100,24 +91,24 @@ const querySchema = z.strictObject({
     category: z.enum(QUERY_CATEGORIES),
     mode: z.enum(["explicit", "automatic"]),
     queryText: z.string().min(1),
-    /** null = all enabled sources (the tool's omitted-sources meaning). */
+    /** A null `sourceFilters` value selects all enabled sources, matching the tool's omitted-sources behavior. */
     sourceFilters: z.array(z.enum(SOURCE_FILTERS)).nullable(),
     fixtureScope: scopeSchema,
     visibleState: z.strictObject({
         visibleMemoryIds: z.array(z.number().int().nonnegative()),
-        /** Inclusive maximum message ordinal, or null for no cutoff. The
+        /** The message ordinal cutoff is inclusive; null disables the cutoff.
          *  production automatic path searches ALL indexed history (null);
          *  the explicit path always computes a compartment-boundary cutoff
-         *  (non-null). parseCorpus enforces the mode pairing. */
+         * parseCorpus requires a non-null compartment-boundary cutoff in explicit mode. */
         messageOrdinalCutoff: z.number().int().nonnegative().nullable(),
     }),
     referenceTimeMs: z.number().int().nonnegative(),
     partition: z.enum(["development", "holdout"]),
-    /** Base-intent group: paraphrases of one intent share this value. */
+    /** Paraphrases of one intent share a base-intent group. */
     paraphraseGroup: z.string().min(1),
-    /** Bounded by the production ceiling: unifiedSearch silently clamps to
-     *  MAX_SEARCH_RESULT_LIMIT, so a larger declared limit would execute
-     *  fewer results than the approved scenario states. */
+    /** Declared limits cannot exceed MAX_SEARCH_RESULT_LIMIT because unifiedSearch clamps larger values.
+     * A declared limit above MAX_SEARCH_RESULT_LIMIT executes fewer results than the scenario declares.
+     * */
     resultLimit: z.number().int().positive().max(MAX_SEARCH_RESULT_LIMIT),
     provenance: z.strictObject({
         origin: z.enum(["recovered", "curated"]),
@@ -128,8 +119,8 @@ export type QueryScenario = z.infer<typeof querySchema>;
 const documentSchema = z.strictObject({
     id: z.string().regex(/^d-[a-z0-9-]+$/),
     kind: z.enum(DOCUMENT_KINDS),
-    /** Immutable semantic content; the canonical relevance identity hashes
-     *  a versioned projection of exactly this value. */
+    /** The canonical relevance identity hashes a versioned projection of the immutable semantic content.
+     * */
     semanticPayload: z.strictObject({
         kind: z.enum(DOCUMENT_KINDS),
         title: z.string(),
@@ -176,9 +167,9 @@ const syntheticProfileSchema = z.strictObject({
     id: z.string().regex(/^syn-[a-z0-9-]+$/),
     generatorVersion: z.string().min(1),
     prng: z.literal("splitmix32"),
-    /** splitmix32 state is unsigned 32-bit (`seed >>> 0`): a larger seed
-     *  would silently collide with its low 32 bits, so the release would
-     *  not execute the seed it declares. */
+    /** splitmix32 retains only the low 32 bits of `seed` through `seed >>> 0`.
+     * Seeds must fit unsigned 32 bits; larger seeds collide with their low 32 bits.
+     * */
     seed: z.number().int().nonnegative().max(0xffff_ffff),
     scale: z.union([
         z.literal(SYNTHETIC_SCALES[0]),
@@ -216,7 +207,7 @@ export type ReleaseTuple = z.infer<typeof releaseTupleSchema>;
 const approvalSchema = z.strictObject({
     kind: z.enum(["privacy", "relevance-intent"]),
     approver: z.string().min(1),
-    /** canonicalFingerprint of the manifest's releaseTuple. */
+    /* */
     releaseTupleFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
 });
 export type Approval = z.infer<typeof approvalSchema>;
@@ -241,8 +232,8 @@ export class ContractError extends Error {
     }
 }
 
-/** Path + code only — never the offending value (privacy: diagnostics are an
- *  output channel too). */
+/**
+ * */
 export function formatIssues(artifact: string, error: z.ZodError): string[] {
     return error.issues
         .map((issue) => `${artifact}.${issue.path.join(".")}: ${issue.code}`)
@@ -263,8 +254,8 @@ export function parseCorpus(value: unknown): CorpusArtifact {
     for (const [i, query] of corpus.queries.entries()) {
         if (queryIds.has(query.id)) diagnostics.push(`corpus.queries[${i}].id: duplicate`);
         queryIds.add(query.id);
-        // The same query text in both partitions exposes the holdout intent
-        // to development tuning even when the paraphrase groups differ.
+        // The same query text must not appear in both partitions because it exposes the holdout intent.
+        // Cross-partition duplicate text exposes holdout queries to development tuning.
         const normalized = normalizeQueryText(query.queryText);
         const existing = partitionByNormalizedText.get(normalized);
         if (existing && existing.partition !== query.partition) {
@@ -279,36 +270,34 @@ export function parseCorpus(value: unknown): CorpusArtifact {
                 queryId: query.id,
             });
         }
-        // A query production search cannot execute as written is a structural
-        // defect, not a ranking signal: explicit mode rejects out-of-bounds
-        // queries (QueryBoundsError) and trims whitespace-only ones to no
-        // results; automatic mode silently truncates, which would replay a
-        // DIFFERENT query than the one that was judged.
+        // The benchmark treats queries that production cannot execute as structural defects, not ranking signals.
+        // Explicit mode rejects out-of-bounds queries.
+        // Explicit mode returns no results for whitespace-only queries.
+        // Automatic mode silently truncates queries.
+        // Truncation replays a query different from the judged query.
         if (query.mode === "explicit") {
             const prepared = prepareExplicitQuery(query.queryText);
             if (!prepared.ok || prepared.query.length === 0) {
                 diagnostics.push(`corpus.queries[${i}].queryText: not-executable`);
             }
-            // Production explicit search short-circuits ID-shaped queries
-            // (`9101`, `#9101`) to a direct lookup that never touches
-            // unified retrieval; benchmarking them through unifiedSearch
-            // would report a miss the real tool answers.
+            // Production explicit search routes ID-shaped queries to direct lookup.
+            // ID-shaped queries such as `9101` and `#9101` never reach unified retrieval.
+            // Benchmarking ID-shaped queries through `unifiedSearch` reports misses that production answers.
             if (parseIdShapedQuery(query.queryText) !== null) {
                 diagnostics.push(`corpus.queries[${i}].queryText: id-shaped-bypasses-retrieval`);
             }
         } else {
-            // The LIVE extractor, not only the bounds preflight: the
-            // automatic path strips plugin markup and collapses whitespace,
-            // so the approved text must survive that whole pipeline
-            // unchanged or production would search a different query.
+            // The live extractor must validate automatic queries, not only the bounds preflight.
+            // The automatic path strips plugin markup and collapses whitespace.
+            // Approved text must survive the automatic pipeline unchanged.
+            // Changing approved text makes production search a different query.
             const prepared = extractBoundedAutoSearchQuery(query.queryText);
             if (prepared.length === 0 || prepared !== query.queryText.trim()) {
                 diagnostics.push(`corpus.queries[${i}].queryText: not-executable`);
             }
-            // The production automatic path always searches exactly
-            // AUTO_SEARCH_SOURCES; a narrower declared filter would drop
-            // competing lanes and inflate the target's rank, a broader or
-            // null one would not benchmark automatic behavior at all.
+            // The production automatic path always uses exactly `AUTO_SEARCH_SOURCES`.
+            // A narrower declared filter drops competing lanes and inflates the target's rank.
+            // A broader or null declared filter does not benchmark automatic behavior.
             const declared = [...(query.sourceFilters ?? [])].sort();
             const required = [...AUTO_SEARCH_SOURCES].sort();
             if (
@@ -317,20 +306,20 @@ export function parseCorpus(value: unknown): CorpusArtifact {
             ) {
                 diagnostics.push(`corpus.queries[${i}].sourceFilters: automatic-mismatch`);
             }
-            // The automatic path also fixes its result limit; a different
-            // declared cutoff would change recall against production.
+            // The automatic path uses `AUTO_SEARCH_RESULT_LIMIT`.
+            // A declared result limit changes recall relative to production.
             if (query.resultLimit !== AUTO_SEARCH_RESULT_LIMIT) {
                 diagnostics.push(`corpus.queries[${i}].resultLimit: automatic-mismatch`);
             }
-            // Production automatic search applies NO message cutoff; a
-            // bounded replay would drop competing results above it.
+            // Production automatic search applies no message cutoff.
+            // A bounded replay drops competing results above the message cutoff.
             if (query.visibleState.messageOrdinalCutoff !== null) {
                 diagnostics.push(
                     `corpus.queries[${i}].visibleState.messageOrdinalCutoff: automatic-mismatch`,
                 );
             }
         }
-        // The explicit path always computes a compartment-boundary cutoff;
+        // The explicit path always computes a compartment-boundary cutoff.
         // an unbounded explicit scenario cannot occur in production.
         if (query.mode === "explicit" && query.visibleState.messageOrdinalCutoff === null) {
             diagnostics.push(
@@ -347,21 +336,20 @@ export function parseCorpus(value: unknown): CorpusArtifact {
         if (doc.semanticPayload.kind !== doc.kind) {
             diagnostics.push(`corpus.documents[${i}].semanticPayload.kind: mismatch`);
         }
-        // Two documents with one semantic payload collapse to one canonical
-        // relevance identity: judgments and partition checks keyed by
-        // document id would silently disagree with identity-keyed crediting.
+        // Documents with one semantic payload share one canonical relevance identity.
+        // Document-ID-keyed judgments and partition checks disagree with identity-keyed crediting.
         const identity = relevanceIdentity(doc.semanticPayload);
         if (documentByIdentity.has(identity)) {
             diagnostics.push(`corpus.documents[${i}].semanticPayload: duplicate-identity`);
         } else {
             documentByIdentity.set(identity, i);
         }
-        // The memories table enforces UNIQUE(project_path, category,
-        // normalized_hash), reviewed memories all seed under one category,
-        // and normalization collapses case and whitespace — so two memory
-        // documents that pass the exact-byte identity check above can still
-        // collide at insert time with a raw SQLite constraint error. Reject
-        // the collision here, where it is diagnosable.
+        // `memories` enforces `UNIQUE(project_path, category, normalized_hash)`.
+        // Reviewed memories seed under one category.
+        // Normalization collapses case and whitespace.
+        // Documents that pass exact-byte identity checks can still collide at insert time.
+        // SQLite then raises a raw constraint error.
+        // The validator rejects normalized-content collisions before SQLite raises a raw constraint error.
         if (doc.kind === "memory") {
             const normalized = normalizeMemoryContent(
                 `${doc.semanticPayload.title} ${doc.semanticPayload.body}`,
@@ -391,16 +379,13 @@ export function parseJudgments(value: unknown): JudgmentsArtifact {
 
 export function parseSyntheticProfiles(value: unknown): SyntheticProfilesArtifact {
     const artifact = parseArtifact(syntheticProfilesSchema, "syntheticProfiles", value);
-    // Every scale exactly once: a release missing a scale leaves U5 without
-    // a descriptor for a required run, and a duplicate makes the run set
-    // ambiguous — both despite the release otherwise loading successfully.
+    // Each scale must appear exactly once; a missing scale leaves U5 without a descriptor for a required run, and duplicates make the run set ambiguous.
     const diagnostics: string[] = [];
     const seen = new Map<number, number>();
     const profileIds = new Set<string>();
     for (const [i, profile] of artifact.profiles.entries()) {
         seen.set(profile.scale, (seen.get(profile.scale) ?? 0) + 1);
-        // Synthetic document ids embed the profile id (`syn:<id>:<i>`), so
-        // two profiles sharing an id collide across their scale runs.
+        // Synthetic document IDs embed profile IDs, so duplicate profile IDs collide across scale runs.
         if (profileIds.has(profile.id)) {
             diagnostics.push(`syntheticProfiles.profiles[${i}].id: duplicate`);
         }
@@ -438,10 +423,6 @@ export function parseManifest(value: unknown): ManifestArtifact {
 }
 
 /**
- * Cross-artifact referential and partition validation (R39-R40):
- * dangling references, unjudged pooled pairs, judgments outside their pool,
- * missing positive judgments, cross-partition paraphrase groups or target
- * documents, and category coverage across both partitions.
  */
 export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArtifact): void {
     const diagnostics: string[] = [];
@@ -458,9 +439,7 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
         const ids = new Set<string>();
         for (const [j, documentId] of pool.documentIds.entries()) {
             if (!documentIds.has(documentId)) {
-                // Dangling entries get this diagnostic only; keeping them out
-                // of the pool set stops the unjudged loop from echoing the
-                // unconstrained (non-corpus) id into diagnostics.
+                // Excluding dangling entries from the pool set prevents the unjudged loop from reporting non-corpus IDs.
                 diagnostics.push(`judgments.pools[${i}].documentIds[${j}]: dangling`);
                 continue;
             }
@@ -494,10 +473,7 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
         byDoc.set(judgment.documentId, judgment);
     }
 
-    // Every corpus document must be judged somewhere: a document absent
-    // from every pool would ship (and could be seeded and returned) with no
-    // reviewed relevance label for any scenario, silently expanding the
-    // benchmark with unreviewed content.
+    // Every corpus document must appear in a pool; otherwise seeded content can ship without a reviewed relevance label.
     const pooledDocuments = new Set<string>();
     for (const pool of pooled.values()) {
         for (const documentId of pool) pooledDocuments.add(documentId);
@@ -524,8 +500,7 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
         if (!hasPositive) diagnostics.push(`judgments: no positive judgment for ${query.id}`);
     }
 
-    // Diagnostics echo regex-bounded query ids, never the free-form
-    // paraphraseGroup value (diagnostics are an output channel too).
+    // Diagnostics echo regex-bounded query IDs, never free-form paraphraseGroup values, because diagnostics are an output channel.
     const groupPartitions = new Map<
         string,
         { partitions: Set<string>; categories: Set<string>; queryIds: string[] }
@@ -546,8 +521,7 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                 `corpus: paraphrase group crosses partitions (${group.queryIds.sort().join(", ")})`,
             );
         }
-        // One base intent has one category; a mixed group would count the
-        // same intent toward multiple category-coverage cells.
+        // Each base intent must have one category; mixed groups count one intent toward multiple category-coverage cells.
         if (group.categories.size > 1) {
             diagnostics.push(
                 `corpus: paraphrase group mixes categories (${group.queryIds.sort().join(", ")})`,
@@ -555,13 +529,9 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
         }
     }
 
-    // A document positively judged from both partitions leaks holdout targets
-    // into development tuning. Keyed on the canonical relevance identity so a
-    // payload twin under a different document id cannot re-register holdout
-    // content in development (parseCorpus rejects twins; this holds even for
-    // corpora that bypassed it). Grade-0 occurrences count as exposure too:
-    // a holdout target sitting in a development pool as a labeled distractor
-    // reveals its exact content and identity to development tuning.
+    // A document with positive judgments in both partitions exposes holdout targets to development tuning; canonical relevance identity prevents payload twins under different IDs from bypassing this check.
+    // The canonical relevance-identity key detects payload twins under different document IDs.
+    // Grade-0 occurrences count as exposure because a holdout target in a development pool reveals its exact content and identity.
     const identityByDocument = new Map(
         corpus.documents.map((d) => [d.id, relevanceIdentity(d.semanticPayload)]),
     );
@@ -605,25 +575,19 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
         }
     }
 
-    // A positive target that the scenario's own visible state can never
-    // return is a structural recall loss, not a ranking signal: message and
-    // compartment search treat the cutoff as an inclusive maximum ordinal and
-    // ordinals are 1-based, so cutoff 0 excludes every such document. The
-    // same holds for source filters (compartment chunks ride the "message"
-    // lane; every other kind is its own filter name), for automatic-mode
-    // scenarios (the production automatic path queries AUTO_SEARCH_SOURCES
-    // only), and for alias scope (resolution tries the scenario's session
-    // scope, then the project-only fallback — an alias bound to a different
-    // project or session can never resolve).
+    // A positive target unavailable through the scenario's visible state is a structural recall loss, not a ranking signal.
+    // Message and compartment searches use an inclusive, 1-based ordinal cutoff.
+    // A cutoff of 0 excludes every message and compartment document.
+    // Compartment chunks use the `message` source filter; every other kind uses its kind name.
+    // Alias resolution falls back from the scenario session scope to the project-only scope.
+    // An alias bound to another project or session cannot resolve.
     const automaticSources: ReadonlySet<string> = new Set(AUTO_SEARCH_SOURCES);
     const documentById = new Map(corpus.documents.map((d) => [d.id, d]));
-    // Resolution prefers a session-scoped alias over the project fallback:
-    // a project-scoped alias whose (namespace, locator, project) is claimed
-    // by ANOTHER document for the scenario's session can never resolve to
-    // this document under that scenario.
-    // Keys use the resolver's namespace canonicalization: `compartment` and
-    // `chunk` are one namespace, so a dialect spelling shadows exactly like
-    // the production spelling does.
+    // Session-scoped aliases take precedence over project-scoped aliases.
+    // A session-scoped alias for another document shadows a project-scoped alias with the same namespace, locator, and project.
+    // The shadowed project-scoped alias cannot resolve to its document in that scenario.
+    // `compartment` and `chunk` share an alias namespace.
+    // `compartment` and `chunk` aliases shadow each other.
     const aliasOwner = new Map<string, string>();
     for (const doc of corpus.documents) {
         for (const alias of doc.aliases) {
@@ -646,11 +610,8 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
             if (!document) continue;
             const kind = document.kind;
             const laneFilter = kind === "compartment" ? "message" : kind;
-            // Reachability-of-intent checks apply to POSITIVE targets: an
-            // unreachable positive is a structural recall loss. Alias scope
-            // and producibility below apply to EVERY judged document — a
-            // grade-0 distractor with an unresolvable alias would surface as
-            // unjudged instead of applying its reviewed grade.
+            // An unreachable positive is a structural recall loss.
+            // An unresolvable grade-0 distractor is unjudged instead of receiving its reviewed grade.
             if (judgment.grade > 0) {
                 if (
                     query.visibleState.messageOrdinalCutoff === 0 &&
@@ -677,8 +638,6 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                 if (alias.sessionScope !== null) {
                     return alias.sessionScope === scope.sessionScope;
                 }
-                // Project fallback: unreachable when a session-scoped alias
-                // of a DIFFERENT document shadows the same key.
                 if (scope.sessionScope !== null) {
                     const shadowOwner = aliasOwner.get(
                         JSON.stringify([
@@ -697,13 +656,10 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                     `corpus: target has no alias in scenario scope (${queryId}, ${documentId})`,
                 );
             } else {
-                // (applies to every judged document, grade 0 included)
-                // At least one scoped alias must be producible by the CURRENT
-                // search path: production encodes results as
-                // SOURCE_LOCATOR_KIND[kind]:<locator>, with numeric ids for
-                // memories, compartments, primers, and notes — so a target
-                // carrying only migration-dialect or wrong-shape aliases can
-                // never resolve. Migration aliases remain valid as
+                // At least one scoped alias must match an identifier the active search path can produce.
+                // Production encodes results as `SOURCE_LOCATOR_KIND[kind]:<locator>`.
+                // Memories, compartments, primers, and notes require numeric locators.
+                // A target with only migration-dialect or wrong-shape aliases cannot resolve.
                 // ADDITIONAL spellings.
                 const producibleNamespace = SOURCE_LOCATOR_KIND[document.kind];
                 const numericLocator =
@@ -721,10 +677,8 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                         `corpus: target has no production-producible alias (${queryId}, ${documentId})`,
                     );
                 }
-                // Production memory search hard-filters every id in
-                // visibleMemoryIds; a memory target whose PRODUCIBLE aliases
-                // are all hidden is unretrievable even when a migration
-                // spelling survives, because production cannot emit it.
+                // Memory search returns only IDs in `visibleMemoryIds`.
+                // A memory target whose producible aliases are all hidden is unretrievable.
                 const visible = new Set(query.visibleState.visibleMemoryIds.map(String));
                 const allHidden =
                     judgment.grade > 0 &&

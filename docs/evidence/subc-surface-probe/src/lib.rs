@@ -1,5 +1,5 @@
-//! Compile probe: replays every `subc` API shape mc-module uses, against the
-//! LATEST PUBLISHED crates. Compiler success == shape-compatible evidence.
+//! This probe exercises the `subc` API shapes mc-module uses.
+//! Compiler success verifies API-shape compatibility with the resolved dependencies.
 #![allow(dead_code, unused_variables)]
 
 use std::{path::Path, path::PathBuf, time::Duration};
@@ -25,7 +25,6 @@ use subc_transport::{
 };
 use tokio::net::TcpStream;
 
-// ---- R-PROTO: manifest construction (mc-module lib.rs::manifest) ----
 pub fn manifest(module_id: &str) -> ModuleManifest {
     ModuleManifest {
         module_id: module_id.to_string(),
@@ -42,7 +41,6 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
         consumes: vec![ConsumerRole::ServiceClient {
             of: vec!["thalamus".to_string()],
         }],
-        // DELTA-1 (probe-only line, absent from mc-module's literal):
         scheduled_tasks: Vec::new(),
         bindings: Bindings {
             storage: StorageBinding {
@@ -76,17 +74,14 @@ fn module_tools() -> Vec<Tool> {
     ]
 }
 
-/// mc-module lib.rs:20945 — tool list decoded back off a module response.
 pub fn decode_tools(v: Value) -> Result<Vec<Tool>, serde_json::Error> {
     serde_json::from_value::<Vec<Tool>>(v)
 }
 
-/// mc-module prompt_surface tests compare execution_mode values.
 pub fn execution_mode_eq(a: &Tool, b: &Tool) -> bool {
     a.execution_mode == b.execution_mode
 }
 
-// ---- R-CLIENT: provider role (mc-module lib.rs::McHandler) ----
 pub struct Handler;
 
 fn resolve_descriptor(storage: Option<&Value>) -> bool {
@@ -135,12 +130,9 @@ fn dispatch(request: Value) -> HandlerOutcome {
     HandlerOutcome::Response(b"{}".to_vec())
 }
 
-/// mc-module matches all four HandlerOutcome variants (lib.rs:8852, 29106).
 pub fn outcome_code(outcome: &HandlerOutcome) -> Option<&str> {
     match outcome {
         HandlerOutcome::Error { code, .. } => Some(code),
-        // DELTA-3 (mc-module also has this arm; absent from 0.3.0):
-        // HandlerOutcome::ErrorWithDetail { code, .. } => Some(code),
         HandlerOutcome::Response(_) | HandlerOutcome::Streamed => None,
     }
 }
@@ -151,7 +143,6 @@ pub async fn boot(connection_file: &Path, module_id: &str) -> Result<(), Box<dyn
     Ok(())
 }
 
-// ---- R-CLIENT: consumer role (mc-module session_resolver) ----
 fn consumer_options() -> ConsumerOptions {
     ConsumerOptions {
         handshake_timeout: Duration::from_secs(2),
@@ -213,7 +204,6 @@ fn call_error_to_string(error: CallError) -> String {
     }
 }
 
-// ---- R-TRANSPORT + R-CONTROL: the raw producer client (mc-module historian_producer) ----
 #[derive(Debug)]
 pub enum ProducerError {
     ConnectionFile { path: PathBuf, source: ConnectionFileError },
@@ -429,7 +419,6 @@ fn error_body(body: &[u8]) -> ProducerErrorBody {
     }
 }
 
-// ---- attribute-macro re-export used on mc-module's OWN traits (historian.rs) ----
 #[subc_client_rs::async_trait]
 pub trait ProducerDriver: Send {
     async fn bind_session(&mut self, session_id: &str) -> Result<(), ProducerError>;

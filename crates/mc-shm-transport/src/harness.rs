@@ -1,9 +1,6 @@
-//! Fuzz and corpus-replay entry points over the strict byte decoders.
+//! This module provides fuzz and corpus-replay entry points for strict byte decoders.
 //!
-//! Every function here is restricted to immutable byte decoding: no file
-//! descriptor, mapping, provider, or thread effects. Fuzz targets under
-//! `fuzz/fuzz_targets/` and the stable corpus replay test call these same
-//! functions, so both exercise the production decoders directly.
+//! Every function performs immutable byte decoding and has no file-descriptor, mapping, provider, or thread effects.
 
 use crate::arena::{ArenaSpan, MAX_FRAME_BYTES};
 use crate::backend::ring::RingGrant;
@@ -12,7 +9,6 @@ use crate::descriptor::{
     FrameDescriptor, Incarnation, ReleaseIdentity, MAX_SPANS, WIRE_V2_HEADER_BYTES,
 };
 
-/// Exact encoded length accepted by [`frame_descriptor`].
 pub const FRAME_DESCRIPTOR_BYTES: usize =
     2 + WIRE_V2_HEADER_BYTES + 16 + 4 + 8 + 8 + 8 + 8 + 1 + 32;
 
@@ -22,11 +18,8 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(buffer)
 }
 
-/// Decodes and validates one frame-descriptor snapshot from raw bytes.
 ///
-/// Inputs that are not exactly [`FRAME_DESCRIPTOR_BYTES`] long are rejected
-/// as truncated or suffixed. A successful validation is checked against the
-/// arena bound so no accepted descriptor can describe an out-of-range view.
+/// Successful validation rejects descriptors whose spans exceed the arena bound.
 pub fn frame_descriptor(bytes: &[u8]) -> bool {
     if bytes.len() != FRAME_DESCRIPTOR_BYTES {
         return false;
@@ -72,7 +65,6 @@ pub fn frame_descriptor(bytes: &[u8]) -> bool {
         spans,
     );
 
-    // Accept path: the expected identity equals the decoded identity.
     let accepted = if let Ok(validated) = descriptor.validate(identity, MAX_FRAME_BYTES) {
         assert!(validated.body_len() <= MAX_FRAME_BYTES as u64);
         assert!((1..=MAX_SPANS as u8).contains(&validated.span_count()));
@@ -92,9 +84,7 @@ pub fn frame_descriptor(bytes: &[u8]) -> bool {
         false
     };
 
-    // Reject path: an identity derived from the decoded one with a flipped
-    // lane is guaranteed distinct, so validation must fail — a fixed
-    // sentinel could coincide with decoded input and silently pass.
+    // Flipping the decoded lane yields a distinct identity; validation must reject it because a fixed sentinel could match decoded input.
     let foreign = ReleaseIdentity::new(Incarnation::from_bytes(incarnation), lane ^ 1, sequence);
     assert!(
         descriptor.validate(foreign, MAX_FRAME_BYTES).is_err(),
@@ -103,10 +93,7 @@ pub fn frame_descriptor(bytes: &[u8]) -> bool {
     accepted
 }
 
-/// Decodes one ring attachment grant from raw bytes.
 ///
-/// A successful decode must re-encode to the identical input, proving exact
-/// consumption with no ignored or defaulted region.
 pub fn provider_grant(bytes: &[u8]) -> bool {
     if let Ok(grant) = RingGrant::decode_slice(bytes) {
         assert_eq!(
@@ -120,15 +107,12 @@ pub fn provider_grant(bytes: &[u8]) -> bool {
     }
 }
 
-/// Decodes one complete-frame sample payload.
 ///
-/// A successful validation must yield a body range inside the allocation;
-/// allocation bytes past the declared body stay outside the range.
+/// Successful validation yields a body range inside the allocation; bytes past the declared body remain outside the range.
 pub fn provider_sample(bytes: &[u8]) -> bool {
     let Ok(prefix) = SamplePrefix::snapshot(bytes) else {
         return false;
     };
-    // Accept path: the expected identity equals the snapshotted identity.
     let accepted = if let Ok(validated) = prefix.validate(bytes.len(), prefix.identity()) {
         let range = validated.body_range();
         assert_eq!(range.start, SAMPLE_PREFIX_BYTES);
@@ -142,9 +126,7 @@ pub fn provider_sample(bytes: &[u8]) -> bool {
     } else {
         false
     };
-    // Reject path: flipping the lane of the snapshotted identity yields a
-    // guaranteed-distinct identity, so validation must fail — a fixed
-    // sentinel could coincide with snapshotted input and silently pass.
+    // Flipping the snapshotted lane yields a distinct identity; validation must reject it because a fixed sentinel could match snapshotted input.
     let identity = prefix.identity();
     let foreign = ReleaseIdentity::new(
         identity.incarnation(),

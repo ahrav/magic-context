@@ -1,14 +1,6 @@
 /**
- * Generate the differential token golden for the Rust mc-tokenizer crate.
  *
- * For a diverse corpus, emits each string with ai-tokenizer's EXACT ordinary
- * token-ID sequence (encode(_, "all"), which is byte-BPE with no special
- * handling — see the crate docs). The Rust `token_golden` test asserts
- * `encode_ordinary(s) == ids` for every case, which proves the port's merges are
- * bit-identical to ai-tokenizer (stronger than matching the count alone).
  *
- * ai-tokenizer is a DEV-only dependency (resolved from packages/plugin, like the
- * vocab generator). Re-run alongside gen-claude-vocab.ts when ai-tokenizer bumps:
  *   bun crates/mc-tokenizer/gen/gen-token-golden.ts
  */
 import { writeFileSync } from "node:fs";
@@ -30,8 +22,6 @@ async function main(): Promise<void> {
     const tk = new Tokenizer(enc);
     const encode = (text: string): number[] => Array.from(tk.encode(text, "all"));
 
-    // A deliberately adversarial corpus: the merge-sensitive and byte-boundary
-    // cases where a naive port would diverge from ai-tokenizer.
     const corpus: Array<[string, string]> = [
         ["empty", ""],
         ["single-space", " "],

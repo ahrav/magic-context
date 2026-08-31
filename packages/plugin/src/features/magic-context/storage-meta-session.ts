@@ -52,19 +52,8 @@ const SESSION_META_FALLBACK_SELECTS: Partial<
     upgrade_reminder_count: "0 AS upgrade_reminder_count",
 };
 
-// Per-connection memo of the resolved projection SQL. getOrCreateSessionMeta is
-// on the hot transform path (many calls per pass), and the old code ran
-// `PRAGMA table_info(session_meta)` + rebuilt the ~50-column list on EVERY
-// call. The schema shape is fixed for a connection's lifetime — ensureColumn
-// and migrations run only inside initializeDatabase/runMigrations at startup,
-// before any getOrCreateSessionMeta call — so the projection never changes
-// after init and is safe to cache per Database (same pattern as the prepared-
-// statement WeakMaps in compartment-storage.ts).
 const sessionMetaSelectColumnsCache = new WeakMap<Database, string>();
 
-// Prepared once per connection: the projection spans ~50 columns, so re-parsing
-// the statement on every call costs more than the row fetch itself. Safe for
-// the same reason the projection string is: the schema is fixed after init.
 const sessionMetaSelectStatementCache = new WeakMap<Database, ReturnType<Database["prepare"]>>();
 
 function getSessionMetaSelectStatement(db: Database): ReturnType<Database["prepare"]> {
@@ -96,18 +85,7 @@ export function getOrCreateSessionMeta(db: Database, sessionId: string): Session
         return toSessionMeta(result);
     }
 
-    // Fresh row creation: bridge the race between OpenCode creating the
-    // session (which writes `parent_id` synchronously) and the async
-    // `session.created` event reaching our handler. Without this, child
-    // sessions default to `isSubagent: false` on their first transform pass,
-    // triggering primary-mode behavior (§N§ prefixes, system adjuncts, etc.)
-    // that then has to be corrected on the next pass — busting prompt-cache.
     //
-    // Harness gate: this fallback opens OpenCode's opencode.db read-only to
-    // probe `session.parent_id`. Pi has no opencode.db and no concept of
-    // OpenCode-style subagents — calling the fallback there throws "unable
-    // to open database file" and floods the shared log. Skip on non-opencode
-    // harnesses; Pi sessions always default to isSubagent=false.
     const defaults = getDefaultSessionMeta(sessionId);
     const fallbackSubagent =
         getHarness() === "opencode" ? resolveIsSubagentFromOpenCodeDb(sessionId) : null;
@@ -224,8 +202,6 @@ export function retryPendingSessionCleanups(
 }
 
 export function clearSession(db: Database, sessionId: string): void {
-    // Every session-scoped table must be cleared here; the structural storage-db
-    // test discovers tables with session_id and seeds each one to enforce this list.
     db.transaction(() => {
         db.prepare("DELETE FROM pending_ops WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM source_contents WHERE session_id = ?").run(sessionId);
@@ -242,9 +218,6 @@ export function clearSession(db: Database, sessionId: string): void {
         db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM user_memory_candidates WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM primer_candidates WHERE session_id = ?").run(sessionId);
-        // v2: m[0]/m[1] delta log + historian-extracted events are session-scoped
-        // and must be cleared on session deletion (both have session_id). Without
-        // this they leak orphaned rows when a session is deleted.
         db.prepare("DELETE FROM m0_mutation_log WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM compartment_events WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM subagent_invocations WHERE session_id = ?").run(sessionId);

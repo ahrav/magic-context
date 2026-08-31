@@ -7,16 +7,16 @@ export interface NotificationParams {
     variant?: string;
     providerId?: string;
     modelId?: string;
-    /** TUI toast lifetime in milliseconds (default: 5000). */
+    /* */
     toastDurationMs?: number;
 }
 
 export type NotificationDeliveryDisposition = "sent" | "queued" | "skipped" | "failed";
 
 /**
- * Notifications are status lines, not user input. Keep only the newest entries
- * while a real turn is active so a long background run cannot grow memory or
- * manufacture a backlog of user rows at the next idle boundary.
+ * Because notifications are status lines rather than user input, the queue keeps only the newest entries.
+ * The per-session limit prevents an active turn from accumulating more than 16 queued notifications.
+ * The limit caps an idle-boundary backlog at 16 user rows.
  */
 export const MAX_QUEUED_IGNORED_NOTIFICATIONS = 16;
 
@@ -74,13 +74,13 @@ async function trySendTuiToast(
         );
         return true;
     } catch {
-        // RPC enqueue failed — fall through to the persisted ignored-message path.
+        // An RPC enqueue failure falls through to the persisted ignored-message path.
         sessionLog(sessionId, "TUI RPC toast enqueue failed, falling back to ignored message");
         return false;
     }
 }
 
-/** Test seams for the process-local queue; production uses the read-only OpenCode DB signal. */
+/** Production reads the OpenCode DB signal; tests replace it through __ignoredNotificationTest. */
 export const __ignoredNotificationTest = {
     pendingTexts(sessionId: string): string[] {
         return (queuedIgnoredNotifications.get(sessionId) ?? []).map((item) => item.text);
@@ -115,7 +115,6 @@ function hasNotificationSessionClient(client: unknown): client is NotificationCl
 }
 
 /**
- * Map notification text to a TUI toast variant based on content heuristics.
  */
 function inferToastVariant(text: string): "success" | "error" | "warning" | "info" {
     const lower = text.toLowerCase();
@@ -133,13 +132,10 @@ function inferToastVariant(text: string): "success" | "error" | "warning" | "inf
 }
 
 /**
- * Extract a short title from notification text (first line or first sentence).
  */
 function extractToastTitle(text: string): string {
-    // Use first markdown heading if present
     const headingMatch = text.match(/^#+\s+(.+)/m);
     if (headingMatch) return headingMatch[1].trim();
-    // Use first line if short enough
     const firstLine = text.split("\n")[0].trim();
     if (firstLine.length <= 80) return firstLine;
     return "Magic Context";
@@ -152,27 +148,24 @@ async function sendIgnoredMessageNow(
     params: NotificationParams,
     forcePersist: boolean,
 ): Promise<NotificationDeliveryDisposition> {
-    // A final active-run check closes the window created by the title/context
-    // lookups below. The normal caller checks before entering this function too.
+    // A final active-run check closes the window created by title and prompt-context lookups.
     if (midTurnDetector(sessionId)) {
         queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
         return "queued";
     }
 
-    // Title-safety guard (issue #129): an ignored message is hidden from the
-    // LLM but NOT `synthetic`, so OpenCode's title gate counts it as a real
-    // user message — one post into a not-yet-titled session permanently
-    // suppresses that session's title generation. Only persist into sessions
-    // that already have a real title (the toast path above is unaffected).
+    // Persistence requires a real session title.
+    // Ignored messages are hidden from the LLM but are not `synthetic`, so OpenCode counts them as real user messages for title generation.
+    // A notification persisted before title generation permanently suppresses that session's title generation.
     const { waitForSafeNotificationTarget } = await import("../../shared/safe-notification-target");
     if ((await waitForSafeNotificationTarget(client, sessionId)) === "skip") {
         sessionLog(sessionId, "notification skipped (session not titled yet)");
         return "skipped";
     }
 
-    // Check again immediately before constructing the prompt. This prevents an
-    // active run that began during title lookup or prompt-context resolution
-    // from receiving a new user row.
+    // The second active-run check prevents runs that begin during title or prompt-context lookup from receiving a user row.
+    // The second check runs after title and prompt-context lookup to close their race window.
+    // The second check prevents a newly active run from receiving a user row.
     if (midTurnDetector(sessionId)) {
         queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
         return "queued";
@@ -193,10 +186,10 @@ async function sendIgnoredMessageNow(
     // next turn and busts the provider prefix cache the prior turn warmed.
     // Mirrors AFT's notifications.ts.
     //
-    // Caller-supplied params win; otherwise resolve from the last assistant
-    // turn. We only pin values actually resolved from real messages (never a
-    // synthesized default), and resolution failures degrade to "pin nothing"
-    // (today's behavior) — so a fresh/empty session is never made worse.
+    // Caller-supplied params win; otherwise resolve them from the last assistant message.
+    // The code pins only values resolved from real messages; it never pins synthesized defaults.
+    // Resolution failures leave prompt context unset.
+    // Leaving context unset preserves fresh and empty sessions' default behavior.
     let agent = params.agent || undefined;
     let variant = params.variant || undefined;
     let model =
@@ -213,13 +206,11 @@ async function sendIgnoredMessageNow(
                 variant = variant ?? resolved.variant;
             }
         } catch {
-            // Resolution is best-effort; on failure fall back to whatever the
-            // caller passed (possibly nothing) rather than blocking the notice.
+            // If resolution fails, use caller-supplied params without blocking the notification.
         }
     }
 
-    // The context lookup above can yield to a newly started run. Check directly
-    // before the SDK call so the final mutation gate covers that last window too.
+    // Check for an active run immediately before the SDK call to prevent a concurrent run from receiving a user row.
     if (midTurnDetector(sessionId)) {
         queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
         return "queued";
@@ -229,8 +220,8 @@ async function sendIgnoredMessageNow(
         path: { id: sessionId },
         body: {
             // noReply prevents this status line from starting a new model loop.
-            // It does not make appending during an active loop safe; the caller
-            // defers while mid-turn, which is the separate safety gate.
+            // noReply does not make appending during an active loop safe; the caller must prevent it.
+            // The caller defers while mid-turn; that check is the separate safety gate.
             noReply: true,
             agent,
             model,
@@ -268,18 +259,16 @@ export async function sendIgnoredMessage(
     sessionId: string,
     text: string,
     params: NotificationParams,
-    // When true, always persist as an ignored message instead of using the TUI
-    // toast path, so the content remains in scrollback. Use this for outcomes of
-    // long-running background work, such as a session-upgrade result, when a
-    // transient five-second toast may be missed.
+    // forcePersist always persists the notification as an ignored message instead of using the TUI.
+    // forcePersist preserves the message in scrollback.
     forcePersist = false,
 ): Promise<NotificationDeliveryDisposition> {
     // TUI notifications are already out-of-band and do not create a user row.
     if (await trySendTuiToast(sessionId, text, params, forcePersist)) return "sent";
 
-    // OpenCode's MessageV2.latest is role-based and treats an ignored-only user
-    // row as the latest user turn. Do not create that invisible chronology entry
-    // while the read-only DB signal says the assistant is still mid-turn.
+    // `MessageV2.latest` treats an ignored-only user row as the latest user turn.
+    // Do not create an ignored-only user row.
+    // `MessageV2.latest` treats an ignored-only user row as the latest user turn; do not create one when `midTurnDetector(sessionId)` returns true.
     if (midTurnDetector(sessionId)) {
         queueIgnoredNotification({ client, sessionId, text, params, forcePersist });
         return "queued";
@@ -289,9 +278,8 @@ export async function sendIgnoredMessage(
 }
 
 /**
- * Flush queued status lines after an event that may have made the session idle.
- * The event hook and tool.execute.after both call this; the same DB-backed gate
- * remains authoritative, so a non-idle event is harmless.
+ * Flush queued status lines only when the session is idle.
+ * midTurnDetector prevents sends while the session is non-idle.
  */
 export async function flushIgnoredMessages(sessionId: string): Promise<void> {
     if (flushingIgnoredNotifications.has(sessionId) || midTurnDetector(sessionId)) return;
@@ -329,8 +317,6 @@ export function clearIgnoredMessages(sessionId: string): void {
 }
 
 /**
- * Send a real user prompt that will be processed by the model (not ignored).
- * Used by /ctx-aug to inject the augmented prompt after sidekick completes.
  */
 export async function sendUserPrompt(
     client: unknown,
