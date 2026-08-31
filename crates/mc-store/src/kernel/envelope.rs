@@ -395,7 +395,9 @@ pub(super) fn commit_with_writer(
         if digest != intent.request_digest {
             return Err(KernelError::Conflict);
         }
-        super::slice::rebuild_alignment_tx(&tx)?;
+        if commit_affects_alignment(&tx, commit_seq)? {
+            super::slice::rebuild_alignment_tx(&tx)?;
+        }
         tx.commit().map_err(|_| KernelError::Io)?;
         return Ok(CommitReceipt {
             commit_seq,
@@ -430,6 +432,7 @@ pub(super) fn commit_with_writer(
         changes: Vec::new(),
     };
     let result = operation(&mut envelope)?;
+    let rebuild_alignment = envelope.changes.iter().any(change_affects_alignment);
     let result = redact(&result);
 
     for (ordinal, change) in envelope.changes.iter().enumerate() {
@@ -540,13 +543,52 @@ pub(super) fn commit_with_writer(
         &result,
         Some(commit_seq),
     )?;
-    super::slice::rebuild_alignment_tx(&tx)?;
+    if rebuild_alignment {
+        super::slice::rebuild_alignment_tx(&tx)?;
+    }
     tx.commit().map_err(|_| KernelError::Io)?;
     Ok(CommitReceipt {
         commit_seq,
         result: result.text,
         replayed: false,
     })
+}
+
+fn change_affects_alignment(change: &PendingChange) -> bool {
+    matches!(
+        change.kind,
+        "scope_insert"
+            | "decision_insert"
+            | "observation_insert"
+            | "decision_event_append"
+            | "decision_correct"
+            | "observation_correct"
+            | "decision_retire"
+            | "observation_retire"
+            | "artifact_deletion"
+    )
+}
+
+fn commit_affects_alignment(tx: &Transaction<'_>, commit_seq: i64) -> Result<bool, KernelError> {
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM change_event
+             WHERE commit_seq=?1 AND change_kind IN (
+                 'scope_insert',
+                 'decision_insert',
+                 'observation_insert',
+                 'decision_event_append',
+                 'decision_correct',
+                 'observation_correct',
+                 'decision_retire',
+                 'observation_retire',
+                 'artifact_deletion'
+             )
+         )",
+        [commit_seq],
+        |row| row.get(0),
+    )
+    .map_err(|_| KernelError::Io)
 }
 
 impl KernelStore {

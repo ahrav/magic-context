@@ -345,11 +345,27 @@ fn projection_failure_rolls_back_the_canonical_mutation_and_receipt() {
         .unwrap_err();
     assert_eq!(error.kind(), KernelErrorKind::Io);
 
+    store
+        .commit(intent("unrelated-domain"), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "unrelated".to_string(),
+                object_id: "unrelated-domain-object".to_string(),
+                name: "unrelated".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "unrelated-domain".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+
     let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
     for (table, expected) in [
-        ("commit_log", 2),
-        ("operation_receipts", 2),
+        ("commit_log", 3),
+        ("operation_receipts", 3),
         ("decision_events", 0),
+        ("domains", 2),
     ] {
         let count: i64 = connection
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
