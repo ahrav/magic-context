@@ -137,13 +137,68 @@ impl std::fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
+/// One scan's budget together with its submodule nesting depth. Recursing commentlint: allow(JUDGE)
+/// into a dirty gitlink re-enters the scan, so the depth travels with the commentlint: allow(JUDGE)
+/// budget rather than widening four private signatures. commentlint: allow(JUDGE)
+#[derive(Clone, Copy)]
+struct ScanCtx<'a> {
+    budget: &'a EvalBudget,
+    depth: u32,
+}
+
+impl<'a> ScanCtx<'a> {
+    /// Nesting beyond this depth ends the scan rather than keying a gitlink commentlint: allow(JUDGE)
+    /// whose contents went unread. commentlint: allow(JUDGE)
+    const MAX_SUBMODULE_DEPTH: u32 = 3;
+
+    fn root(budget: &'a EvalBudget) -> Self {
+        Self { budget, depth: 0 }
+    }
+
+    fn check(&self) -> Result<(), SnapshotError> {
+        self.budget.check()
+    }
+
+    /// The context one submodule deeper, or `None` at the depth limit. commentlint: allow(JUDGE)
+    fn nested(&self) -> Option<Self> {
+        (self.depth < Self::MAX_SUBMODULE_DEPTH).then_some(Self {
+            budget: self.budget,
+            depth: self.depth + 1,
+        })
+    }
+}
+
 /// One uncommitted entry: repo-relative path, status label, and a content
 /// address (blob/content hash, or a fixed token for deletions).
+///
+/// `path_encoding` distinguishes valid UTF-8 paths from lossy renderings of commentlint: allow(JUDGE)
+/// non-UTF-8 paths. Without it, a file named exactly like some byte path's commentlint: allow(JUDGE)
+/// lossy rendering yields an identical tuple, so the set keeps one entry commentlint: allow(JUDGE)
+/// while the two checkouts it stands for hold different bytes. commentlint: allow(JUDGE)
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DirtyEntry {
     pub path: String,
+    pub path_encoding: PathEncoding,
     pub status: &'static str,
     pub content_hash: String,
+}
+
+/// Whether `DirtyEntry::path` is the path itself or a lossy rendering of commentlint: allow(JUDGE)
+/// bytes that are not valid UTF-8. commentlint: allow(JUDGE)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathEncoding {
+    Utf8,
+    /// Lossy rendering with a digest of the raw bytes appended. commentlint: allow(JUDGE)
+    LossyWithDigest,
+}
+
+impl PathEncoding {
+    fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Utf8 => b"utf8",
+            Self::LossyWithDigest => b"lossy",
+        }
+    }
 }
 
 /// Frozen view of one checkout, taken once per request: identity, HEAD, and
@@ -240,7 +295,8 @@ pub fn snapshot_checkout(
     // The scan polls between items and a clean checkout emits none;
     // `DeadlineWatchdog` interrupts the scan at `budget`'s deadline.
     let _watchdog = DeadlineWatchdog::arm(budget);
-    let dirty_entries = scan_dirty_entries(&repo, budget)?;
+    let ctx = ScanCtx::root(budget);
+    let dirty_entries = scan_dirty_entries(&repo, &ctx)?;
     // A concurrent checkout, reset, or branch switch can pair old HEAD with
     // new index/worktree state; the scan rejects that inconsistent snapshot.
     let head_after = repo
@@ -253,7 +309,11 @@ pub fn snapshot_checkout(
             "HEAD moved during the status scan".to_string(),
         ));
     }
-    let dirty_fingerprint = fingerprint_entries(&dirty_entries, &sparse_state(&repo, budget)?);
+    let sparse_state = sparse_state(&repo, &ctx)?;
+    let dirty_fingerprint = fingerprint_entries(&dirty_entries, &sparse_state);
+    // Hashing a large entry set can outrun the deadline that the scan's last commentlint: allow(JUDGE)
+    // poll still satisfied, and a snapshot handed back here is cacheable. commentlint: allow(JUDGE)
+    budget.check()?;
     Ok(CheckoutSnapshot {
         repo,
         identity,
@@ -285,14 +345,14 @@ fn checkout_identity(repo: &gix::Repository) -> Result<String, SnapshotError> {
 
 fn scan_dirty_entries(
     repo: &gix::Repository,
-    budget: &EvalBudget,
+    ctx: &ScanCtx<'_>,
 ) -> Result<Vec<DirtyEntry>, SnapshotError> {
     use gix::status::Item;
 
     let platform = repo
         .status(gix::progress::Discard)
         .map_err(|error| SnapshotError::Scan(error.to_string()))?
-        .should_interrupt_owned(budget.interrupt_flag())
+        .should_interrupt_owned(ctx.budget.interrupt_flag())
         // Collapsed untracked directories share one content-less fingerprint
         // entry; `Files` also overrides `status.showUntrackedFiles`.
         .untracked_files(gix::status::UntrackedFiles::Files)
@@ -307,38 +367,49 @@ fn scan_dirty_entries(
 
     let mut entries = BTreeSet::new();
     for item in iter {
-        budget.check()?;
+        ctx.check()?;
         let item = item.map_err(|error| SnapshotError::Scan(error.to_string()))?;
         let entry = match item {
-            Item::IndexWorktree(item) => index_worktree_entry(repo, item, budget)?,
+            Item::IndexWorktree(item) => index_worktree_entry(repo, item, ctx)?,
             Item::TreeIndex(change) => Some(tree_index_entry(&change)),
         };
         if let Some(entry) = entry {
             entries.insert(entry);
         }
     }
-    budget.check()?;
-    // The status walk skips stats for assume-valid entries; hash their
-    // worktree content to preserve key correctness.
+    ctx.check()?;
+    // The status walk skips stats for assume-valid entries and reports commentlint: allow(JUDGE)
+    // skip-worktree entries clean whether or not a file is materialized, so commentlint: allow(JUDGE)
+    // both classes are keyed straight from the index instead. commentlint: allow(JUDGE)
     let index = repo
         .index_or_empty()
         .map_err(|error| SnapshotError::Scan(error.to_string()))?;
     for entry in index.entries() {
-        if !entry.flags.contains(gix::index::entry::Flags::ASSUME_VALID) {
+        use gix::index::entry::Flags;
+        let status = if entry.flags.contains(Flags::SKIP_WORKTREE) {
+            "skip_worktree"
+        } else if entry.flags.contains(Flags::ASSUME_VALID) {
+            "assume_valid"
+        } else {
             continue;
-        }
-        budget.check()?;
+        };
+        ctx.check()?;
         let rela_path = entry.path(&index);
+        let (path, path_encoding) = encode_path(rela_path);
         // A chmod moves the git entry mode while the bytes stay equal, so
-        // the mode tag participates alongside the content hash.
+        // the mode tag participates alongside the content hash. The index commentlint: allow(JUDGE)
+        // blob id separates two absent-file states whose staged content commentlint: allow(JUDGE)
+        // differs. commentlint: allow(JUDGE)
         entries.insert(DirtyEntry {
             content_hash: format!(
-                "{}:{}",
-                worktree_content_hash(repo, rela_path, budget)?,
+                "{}:{}:{}",
+                entry.id,
+                worktree_content_hash(repo, rela_path, ctx)?,
                 worktree_mode_tag(repo, rela_path)
             ),
-            path: path_string(rela_path),
-            status: "assume_valid",
+            path,
+            path_encoding,
+            status,
         });
     }
     Ok(entries.into_iter().collect())
@@ -347,7 +418,7 @@ fn scan_dirty_entries(
 fn index_worktree_entry(
     repo: &gix::Repository,
     item: gix::status::index_worktree::Item,
-    budget: &EvalBudget,
+    ctx: &ScanCtx<'_>,
 ) -> Result<Option<DirtyEntry>, SnapshotError> {
     use gix::status::index_worktree::Item;
     use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
@@ -356,25 +427,30 @@ fn index_worktree_entry(
         Item::Modification {
             rela_path, status, ..
         } => {
+            let (path, path_encoding) = encode_path(rela_path.as_ref());
             let entry = match status {
                 EntryStatus::Conflict { .. } => Some(DirtyEntry {
-                    content_hash: conflict_content_hash(repo, rela_path.as_ref(), budget)?,
-                    path: path_string(rela_path.as_ref()),
+                    content_hash: conflict_content_hash(repo, rela_path.as_ref(), ctx)?,
+                    path,
+                    path_encoding,
                     status: "conflicted",
                 }),
                 EntryStatus::Change(Change::Removed) => Some(DirtyEntry {
-                    path: path_string(rela_path.as_ref()),
+                    path,
+                    path_encoding,
                     status: "removed",
                     content_hash: "absent".to_string(),
                 }),
                 EntryStatus::Change(_) => Some(DirtyEntry {
-                    content_hash: worktree_content_hash(repo, rela_path.as_ref(), budget)?,
-                    path: path_string(rela_path.as_ref()),
+                    content_hash: worktree_content_hash(repo, rela_path.as_ref(), ctx)?,
+                    path,
+                    path_encoding,
                     status: "modified",
                 }),
                 EntryStatus::IntentToAdd => Some(DirtyEntry {
-                    content_hash: worktree_content_hash(repo, rela_path.as_ref(), budget)?,
-                    path: path_string(rela_path.as_ref()),
+                    content_hash: worktree_content_hash(repo, rela_path.as_ref(), ctx)?,
+                    path,
+                    path_encoding,
                     status: "intent_to_add",
                 }),
                 // A racy stat with unchanged content is not dirty.
@@ -386,18 +462,21 @@ fn index_worktree_entry(
             if !matches!(entry.status, gix::dir::entry::Status::Untracked) {
                 return Ok(None);
             }
+            let (path, path_encoding) = encode_path(entry.rela_path.as_ref());
             if entry.disk_kind.is_some_and(|kind| kind.is_dir()) {
                 // `UntrackedFiles::Files` emits contained files individually,
                 // so directory entries have no content to hash.
                 return Ok(Some(DirtyEntry {
-                    path: path_string(entry.rela_path.as_ref()),
+                    path,
+                    path_encoding,
                     status: "untracked",
                     content_hash: "directory".to_string(),
                 }));
             }
             Ok(Some(DirtyEntry {
-                content_hash: worktree_content_hash(repo, entry.rela_path.as_ref(), budget)?,
-                path: path_string(entry.rela_path.as_ref()),
+                content_hash: worktree_content_hash(repo, entry.rela_path.as_ref(), ctx)?,
+                path,
+                path_encoding,
                 status: "untracked",
             }))
         }
@@ -408,13 +487,16 @@ fn index_worktree_entry(
 
 /// The digest suffix distinguishes non-UTF-8 paths that share a lossy
 /// string.
-fn path_string(rela_path: &BStr) -> String {
+fn encode_path(rela_path: &BStr) -> (String, PathEncoding) {
     match rela_path.to_str() {
-        Ok(utf8) => utf8.to_owned(),
-        Err(_) => format!(
-            "{}#x{:x}",
-            rela_path.to_str_lossy(),
-            Sha256::digest(rela_path.as_bytes())
+        Ok(utf8) => (utf8.to_owned(), PathEncoding::Utf8),
+        Err(_) => (
+            format!(
+                "{}#x{:x}",
+                rela_path.to_str_lossy(),
+                Sha256::digest(rela_path.as_bytes())
+            ),
+            PathEncoding::LossyWithDigest,
         ),
     }
 }
@@ -454,8 +536,10 @@ fn tree_index_entry(change: &gix::diff::index::Change) -> DirtyEntry {
             format!("{}:{:o}", id.as_ref(), entry_mode.bits()),
         ),
     };
+    let (path, path_encoding) = encode_path(location.as_ref());
     DirtyEntry {
-        path: path_string(location.as_ref()),
+        path,
+        path_encoding,
         status,
         content_hash: id,
     }
@@ -469,9 +553,9 @@ fn tree_index_entry(change: &gix::diff::index::Change) -> DirtyEntry {
 fn worktree_content_hash(
     repo: &gix::Repository,
     rela_path: &BStr,
-    budget: &EvalBudget,
+    ctx: &ScanCtx<'_>,
 ) -> Result<String, SnapshotError> {
-    budget.check()?;
+    ctx.check()?;
     let Some(workdir) = repo.workdir() else {
         return Ok("no-worktree".to_string());
     };
@@ -498,9 +582,9 @@ fn worktree_content_hash(
     }
     if !file_type.is_file() {
         if file_type.is_dir() {
-            // A dirty tracked gitlink resolves to a directory; its HEAD is
-            // the content that moved.
-            return Ok(submodule_head_hash(&path));
+            // A dirty tracked gitlink resolves to a directory; its HEAD and commentlint: allow(JUDGE)
+            // its own uncommitted state are the content that moved. commentlint: allow(JUDGE)
+            return submodule_hash(&path, ctx);
         }
         return Ok("not-a-regular-file".to_string());
     }
@@ -510,7 +594,7 @@ fn worktree_content_hash(
     let mut hash = Sha256::new();
     let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
     loop {
-        budget.check()?;
+        ctx.check()?;
         match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => hash.update(&buffer[..read]),
@@ -527,7 +611,7 @@ fn worktree_content_hash(
 fn conflict_content_hash(
     repo: &gix::Repository,
     rela_path: &BStr,
-    budget: &EvalBudget,
+    ctx: &ScanCtx<'_>,
 ) -> Result<String, SnapshotError> {
     use gix::index::entry::Stage;
 
@@ -548,7 +632,7 @@ fn conflict_content_hash(
         }
         Err(_) => hash.update(b"index-unreadable\0"),
     }
-    let worktree = worktree_content_hash(repo, rela_path, budget)?;
+    let worktree = worktree_content_hash(repo, rela_path, ctx)?;
     hash.update(worktree.as_bytes());
     Ok(format!("conflict:{:x}", hash.finalize()))
 }
@@ -582,17 +666,17 @@ fn contained_path(workdir: &Path, rela_path: &Path) -> Option<PathBuf> {
     Some(joined)
 }
 
-fn fingerprint_entries(entries: &[DirtyEntry], sparse_state: &[u8]) -> String {
+fn fingerprint_entries(entries: &[DirtyEntry], sparse_state: &[u8; 32]) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"mc-dirty-fingerprint-v3\0");
+    hash.update(b"mc-dirty-fingerprint-v4\0");
     // Sparse state distinguishes layouts that materialize different files
     // from the same HEAD.
-    hash.update((sparse_state.len() as u64).to_le_bytes());
     hash.update(sparse_state);
     for entry in entries {
         // Length prefixes make adjacent fields unambiguous.
         for field in [
             entry.path.as_bytes(),
+            entry.path_encoding.as_bytes(),
             entry.status.as_bytes(),
             entry.content_hash.as_bytes(),
         ] {
@@ -603,14 +687,31 @@ fn fingerprint_entries(entries: &[DirtyEntry], sparse_state: &[u8]) -> String {
     format!("{:x}", hash.finalize())
 }
 
-fn submodule_head_hash(path: &Path) -> String {
-    let Ok(submodule) = gix::open_opts(path, gix::open::Options::isolated()) else {
-        return "not-a-regular-file".to_string();
+/// A gitlink's HEAD plus the submodule's own dirty fingerprint. HEAD alone commentlint: allow(JUDGE)
+/// holds still while files under the submodule path are edited, and those commentlint: allow(JUDGE)
+/// files sit inside the superproject worktree where applicability checks commentlint: allow(JUDGE)
+/// read them. commentlint: allow(JUDGE)
+fn submodule_hash(path: &Path, ctx: &ScanCtx<'_>) -> Result<String, SnapshotError> {
+    let Some(nested) = ctx.nested() else {
+        return Err(SnapshotError::Scan(format!(
+            "submodule nesting exceeds {} levels at {}",
+            ScanCtx::MAX_SUBMODULE_DEPTH,
+            path.display()
+        )));
     };
-    match submodule.head_id() {
-        Ok(head) => format!("gitlink:{}", head.detach()),
-        Err(_) => "gitlink-unborn".to_string(),
-    }
+    let Ok(submodule) = gix::open_opts(path, gix::open::Options::isolated()) else {
+        return Ok("not-a-regular-file".to_string());
+    };
+    let head = match submodule.head_id() {
+        Ok(head) => head.detach().to_string(),
+        Err(_) => "unborn".to_string(),
+    };
+    let entries = scan_dirty_entries(&submodule, &nested)?;
+    let sparse_state = sparse_state(&submodule, &nested)?;
+    Ok(format!(
+        "gitlink:{head}:{}",
+        fingerprint_entries(&entries, &sparse_state)
+    ))
 }
 
 /// Git mode class of a worktree path: `file`, `exec`, `symlink`, `dir`, or
@@ -647,33 +748,46 @@ fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
 }
 
 /// Sparse-checkout configuration and patterns determine which paths
-/// materialize.
-fn sparse_state(repo: &gix::Repository, budget: &EvalBudget) -> Result<Vec<u8>, SnapshotError> {
+/// materialize. The pattern file is folded into the digest chunk by chunk so commentlint: allow(JUDGE)
+/// its size bounds neither the working set nor the returned value. commentlint: allow(JUDGE)
+fn sparse_state(repo: &gix::Repository, ctx: &ScanCtx<'_>) -> Result<[u8; 32], SnapshotError> {
     let config = repo.config_snapshot();
-    let mut state = vec![
+    let mut hash = Sha256::new();
+    hash.update(b"mc-sparse-state-v1\0");
+    hash.update([
         config.boolean("core.sparseCheckout").unwrap_or(false) as u8,
         config.boolean("core.sparseCheckoutCone").unwrap_or(false) as u8,
-    ];
+    ]);
     let patterns_path = repo.git_dir().join("info/sparse-checkout");
     // Opening a FIFO here can block indefinitely.
     let is_regular = std::fs::symlink_metadata(&patterns_path)
         .map(|metadata| metadata.file_type().is_file())
         .unwrap_or(false);
     if !is_regular {
-        return Ok(state);
+        hash.update(b"absent\0");
+        return Ok(hash.finalize().into());
     }
-    let Ok(mut file) = std::fs::File::open(&patterns_path) else {
-        return Ok(state);
+    let mut file = match std::fs::File::open(&patterns_path) {
+        Ok(file) => file,
+        // A file removed between the stat and the open leaves no patterns; commentlint: allow(JUDGE)
+        // any other failure hides a pattern set that is still in force. commentlint: allow(JUDGE)
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hash.update(b"absent\0");
+            return Ok(hash.finalize().into());
+        }
+        Err(error) => return Err(SnapshotError::Scan(error.to_string())),
     };
+    hash.update(b"present\0");
     let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
     loop {
-        budget.check()?;
+        ctx.check()?;
         match file.read(&mut buffer) {
             Ok(0) => break,
-            Ok(read) => state.extend_from_slice(&buffer[..read]),
+            Ok(read) => hash.update(&buffer[..read]),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
+            // A prefix would key as a genuinely shorter pattern file. commentlint: allow(JUDGE)
+            Err(error) => return Err(SnapshotError::Scan(error.to_string())),
         }
     }
-    Ok(state)
+    Ok(hash.finalize().into())
 }

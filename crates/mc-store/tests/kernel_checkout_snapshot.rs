@@ -382,7 +382,7 @@ fn dirty_submodules_fingerprint_their_head() {
             .map(|entry| entry.content_hash.clone())
     };
     let first_hash = gitlink_hash(&first).expect("dirty gitlink is hashed by submodule HEAD");
-    assert_eq!(first_hash, format!("gitlink:{sub_one}"));
+    assert!(first_hash.starts_with(&format!("gitlink:{sub_one}:")));
 
     // Moving the submodule HEAD moves the fingerprint.
     let sub_two = commit_snapshot(
@@ -395,10 +395,9 @@ fn dirty_submodules_fingerprint_their_head() {
     );
     materialize(&sub.repo, sub_two);
     let second = snapshot_checkout(&fixture.root, &budget).unwrap();
-    assert_eq!(
-        gitlink_hash(&second).expect("gitlink stays dirty"),
-        format!("gitlink:{sub_two}")
-    );
+    assert!(gitlink_hash(&second)
+        .expect("gitlink stays dirty")
+        .starts_with(&format!("gitlink:{sub_two}:")));
     assert_ne!(first.dirty_fingerprint(), second.dirty_fingerprint());
 }
 
@@ -582,4 +581,230 @@ fn fixture_kit_builds_branched_rebase_and_cherry_pick_histories() {
             .detach();
         assert_eq!(resolved, tip, "branch {branch}");
     }
+}
+
+#[test]
+fn submodule_worktree_edits_move_the_gitlink_hash() {
+    use gix::index::entry::{Flags, Mode, Stat};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path().join("parent").as_path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let workdir = fixture.repo.workdir().unwrap().to_path_buf();
+    let sub = init_repo(workdir.join("sub").as_path());
+    let sub_one = commit_snapshot(&sub.repo, "main", &[], &[("inner.txt", "one\n")], "one", 1);
+    git_fixtures::set_head(&sub.repo, "main");
+    materialize(&sub.repo, sub_one);
+
+    let stale = gix::ObjectId::from_hex("dd".repeat(20).as_bytes()).unwrap();
+    let mut index = fixture.repo.open_index().expect("index opens");
+    index.dangerously_push_entry(
+        Stat::default(),
+        stale,
+        Flags::empty(),
+        Mode::COMMIT,
+        "sub".into(),
+    );
+    index.sort_entries();
+    index
+        .write(gix::index::write::Options::default())
+        .expect("index writes");
+    write_worktree_file(
+        &fixture.repo,
+        ".gitmodules",
+        "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+    );
+
+    let budget = EvalBudget::unbounded();
+    let before = snapshot_checkout(&fixture.root, &budget).unwrap();
+
+    // The submodule HEAD holds still while its worktree content changes, so
+    // a HEAD-only gitlink hash would keep the superproject key stable.
+    write_worktree_file(&sub.repo, "inner.txt", "edited\n");
+    let after = snapshot_checkout(&fixture.root, &budget).unwrap();
+    assert_ne!(
+        before.dirty_fingerprint(),
+        after.dirty_fingerprint(),
+        "an edit under the submodule path must move the key"
+    );
+
+    let gitlink = |snapshot: &mc_store::kernel::applicability::CheckoutSnapshot| {
+        snapshot
+            .dirty_entries()
+            .iter()
+            .find(|entry| entry.path == "sub" && entry.content_hash.starts_with("gitlink:"))
+            .map(|entry| entry.content_hash.clone())
+            .expect("dirty gitlink is hashed")
+    };
+    let prefix = format!("gitlink:{sub_one}:");
+    assert!(gitlink(&before).starts_with(&prefix));
+    assert!(gitlink(&after).starts_with(&prefix));
+    assert_ne!(gitlink(&before), gitlink(&after));
+}
+
+#[test]
+fn skip_worktree_entries_key_their_materialization() {
+    use gix::index::entry::Flags;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("sparse.txt", "content\n")],
+        "seed",
+        1,
+    );
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let budget = EvalBudget::unbounded();
+    let materialized = snapshot_checkout(dir.path(), &budget).unwrap();
+
+    // `git update-index --skip-worktree` marks the entry index-only, and the
+    // status scan then stays clean whether or not the file is on disk.
+    let mut index = fixture.repo.open_index().expect("index opens");
+    let position = index
+        .entry_index_by_path("sparse.txt".into())
+        .expect("entry exists");
+    // gix serializes the extended flags only for a V3 index, which it
+    // selects from `EXTENDED` being present.
+    index.entries_mut()[position].flags |= Flags::SKIP_WORKTREE | Flags::EXTENDED;
+    index
+        .write(gix::index::write::Options::default())
+        .expect("index writes");
+    std::fs::remove_file(fixture.repo.workdir().unwrap().join("sparse.txt")).unwrap();
+
+    let index_only = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert!(
+        index_only
+            .dirty_entries()
+            .iter()
+            .any(|entry| entry.path == "sparse.txt" && entry.status == "skip_worktree"),
+        "{:?}",
+        index_only.dirty_entries()
+    );
+    assert_ne!(
+        materialized.dirty_fingerprint(),
+        index_only.dirty_fingerprint(),
+        "an absent skip-worktree file must not key like a present one"
+    );
+
+    // Restoring the file under the same flag is a third distinct layout.
+    write_worktree_file(&fixture.repo, "sparse.txt", "content\n");
+    let restored = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(
+        index_only.dirty_fingerprint(),
+        restored.dirty_fingerprint(),
+        "materializing a skip-worktree file must move the key"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_utf8_name_cannot_alias_a_non_utf8_path() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+    let workdir = fixture.repo.workdir().unwrap().to_path_buf();
+
+    // The lossy rendering of this byte path, plus the digest suffix the
+    // encoder appends, is a name a repository can hold verbatim.
+    let raw = b"\xff";
+    let lossy_twin = format!(
+        "{}#x{:x}",
+        String::from_utf8_lossy(raw),
+        <sha2::Sha256 as sha2::Digest>::digest(raw)
+    );
+
+    let budget = EvalBudget::unbounded();
+    std::fs::write(
+        workdir.join(std::ffi::OsStr::from_bytes(raw)),
+        "same bytes\n",
+    )
+    .unwrap();
+    let byte_path = snapshot_checkout(dir.path(), &budget).unwrap();
+    std::fs::remove_file(workdir.join(std::ffi::OsStr::from_bytes(raw))).unwrap();
+
+    std::fs::write(workdir.join(&lossy_twin), "same bytes\n").unwrap();
+    let utf8_twin = snapshot_checkout(dir.path(), &budget).unwrap();
+
+    assert_eq!(
+        byte_path.dirty_entries().len(),
+        utf8_twin.dirty_entries().len(),
+        "both checkouts hold one untracked file"
+    );
+    assert_ne!(
+        byte_path.dirty_fingerprint(),
+        utf8_twin.dirty_fingerprint(),
+        "a UTF-8 name spelled like a lossy rendering must key differently"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_sparse_patterns_fail_the_scan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let info = fixture.repo.git_dir().join("info");
+    std::fs::create_dir_all(&info).unwrap();
+    let patterns = info.join("sparse-checkout");
+    std::fs::write(&patterns, "/*\n!/vendor/\n").unwrap();
+    std::fs::set_permissions(&patterns, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&patterns).is_ok() {
+        // A privileged test process ignores the mode bits.
+        return;
+    }
+
+    let budget = EvalBudget::unbounded();
+    // A pattern set that cannot be read leaves the materialized layout
+    // unknown, so no snapshot may key as though there were no patterns.
+    assert!(matches!(
+        snapshot_checkout(dir.path(), &budget),
+        Err(SnapshotError::Scan(_))
+    ));
+
+    std::fs::set_permissions(&patterns, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(snapshot_checkout(dir.path(), &budget).is_ok());
+}
+
+#[test]
+fn large_sparse_pattern_files_key_by_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let info = fixture.repo.git_dir().join("info");
+    std::fs::create_dir_all(&info).unwrap();
+    let patterns = info.join("sparse-checkout");
+    // Several hash chunks worth of patterns, folded in incrementally rather
+    // than held whole.
+    let bulk: String = (0..40_000).map(|n| format!("/dir{n}/\n")).collect();
+    std::fs::write(&patterns, &bulk).unwrap();
+
+    let budget = EvalBudget::unbounded();
+    let first = snapshot_checkout(dir.path(), &budget).unwrap();
+    let again = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_eq!(first.dirty_fingerprint(), again.dirty_fingerprint());
+
+    // A change in the final chunk still reaches the digest.
+    std::fs::write(&patterns, format!("{bulk}/last/\n")).unwrap();
+    let changed = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(first.dirty_fingerprint(), changed.dirty_fingerprint());
 }

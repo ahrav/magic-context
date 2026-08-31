@@ -1005,3 +1005,96 @@ fn kernel_store_sources_contain_no_subprocess_usage() {
         }
     }
 }
+
+/// Deletes the loose object backing `rela_path`'s enclosing tree in `commit`,
+/// standing in for a partial clone that has a root tree without its subtree.
+fn remove_subtree_object(fixture: &FixtureRepo, commit: gix::ObjectId, tree_path: &str) {
+    let oid = fixture
+        .repo
+        .find_commit(commit)
+        .expect("commit reads")
+        .tree()
+        .expect("tree reads")
+        .lookup_entry_by_path(tree_path)
+        .expect("lookup succeeds")
+        .expect("subtree exists")
+        .object_id();
+    let hex = oid.to_string();
+    let path = fixture
+        .root
+        .join(".git/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    std::fs::remove_file(&path).expect("loose object is removed");
+}
+
+#[test]
+fn an_unreadable_captured_path_is_uncertain_not_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("src/lib.rs", "a\n")], "base", 1);
+    let anchored = commit_snapshot(
+        repo,
+        "topic",
+        &[base],
+        &[("src/lib.rs", "a\nb\n")],
+        "anchored",
+        2,
+    );
+    let captures = captures_for(repo, &[anchored]);
+    assert_eq!(
+        captures[&anchored.to_string()].changed_paths,
+        vec!["src/lib.rs".to_string()]
+    );
+
+    let advanced = commit_snapshot(
+        repo,
+        "main",
+        &[base],
+        &[("src/lib.rs", "a\n"), ("README.md", "readme\n")],
+        "advance",
+        3,
+    );
+    // The rewrite of `anchored`, reachable from HEAD.
+    let rebased = commit_snapshot(
+        repo,
+        "main",
+        &[advanced],
+        &[("src/lib.rs", "a\nb\n"), ("README.md", "readme\n")],
+        "anchored",
+        4,
+    );
+    // HEAD drops `src` entirely, so the status scan never reads a `src` tree
+    // and the checkout snapshot survives the deletions below.
+    let head = commit_snapshot(
+        repo,
+        "main",
+        &[rebased],
+        &[("README.md", "readme\n")],
+        "drop src",
+        5,
+    );
+
+    let budget = EvalBudget::unbounded();
+    let intact = checkout(&fixture, head);
+    assert_eq!(
+        ResolutionLadder::new(&intact, &budget)
+            .evaluate(&reachable_from(anchored, captures.clone())),
+        GitConditionOutcome::Holds,
+        "with every object present the patch rung finds the rewrite"
+    );
+
+    // Both sides of the captured path now live behind a missing subtree.
+    remove_subtree_object(&fixture, rebased, "src");
+    remove_subtree_object(&fixture, advanced, "src");
+
+    let snapshot = snapshot_checkout(&fixture.root, &budget).expect("snapshot succeeds");
+    // The anchor is still present, and the window is short enough to be
+    // complete, so a swallowed lookup failure would read as a definite miss.
+    assert_eq!(
+        ResolutionLadder::new(&snapshot, &budget).evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::Uncertain,
+        "an unreadable captured path cannot yield a reachability verdict"
+    );
+}

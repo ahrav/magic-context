@@ -8,7 +8,8 @@ mod checkout;
 mod resolve;
 
 pub use checkout::{
-    open_isolated, snapshot_checkout, CheckoutSnapshot, DirtyEntry, EvalBudget, SnapshotError,
+    open_isolated, snapshot_checkout, CheckoutSnapshot, DirtyEntry, EvalBudget, PathEncoding,
+    SnapshotError,
 };
 pub use resolve::{
     capture_anchor_representation, compute_patch_id, GitConditionOutcome, ResolutionLadder,
