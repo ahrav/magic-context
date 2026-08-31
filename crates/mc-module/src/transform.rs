@@ -1,18 +1,14 @@
-//! The transform op: the CK-in / CK-out cache-stability transform.
 //!
-//! Emits the rewritten array: `pass_output.ck_messages = [m0, m1] ++ tail`.
 //! The covered sparse-but-ordered prefix is REPLACED by two frozen synthesized-region blocks
-//! (m0 cumulative baseline, frozen between HARD folds; m1 volatile delta, re-rendered
-//! on SOFT); the live tail (after the coverage watermark) is carried verbatim.
+//! m0 is a cumulative baseline frozen between HARD folds; m1 is a volatile delta re-rendered on SOFT.
+//! The live tail after the coverage watermark is carried verbatim.
 //!
-//! mc-module OWNS the render/splice; mc-core stays the pure classifier and
-//! cortexkit-cache-core stays "dumb" (freezes whatever rendered units it is handed).
+//! mc-module renders and splices; mc-core classifies; cortexkit-cache-core freezes supplied units.
 //!
-//! Cache discipline: render byte-complete units ONLY on bust passes; replay verbatim
-//! on defer; a pure defer (boundary present, no delta) writes nothing. Two paired
-//! poison-resistance invariants: synthetic items are stripped before any boundary /
-//! coverage / tail computation (PRIMARY), and the `mc_*` id namespace is reserved
-//! (BACKSTOP) so a synthetic block can never masquerade as the real boundary.
+//! Bust passes render byte-complete units; all other passes replay them verbatim.
+//! On defer, replay units verbatim. A pure defer with a boundary and no delta writes nothing.
+//! Synthetic items are stripped before boundary detection.
+//! The `mc_*` ID namespace is reserved so synthetic blocks cannot masquerade as the real boundary.
 
 use crate::ck_wire;
 use crate::compartment_coverage::{fold_m0_content_epoch, resolve_coverage, M0ContentEpoch};
@@ -79,34 +75,32 @@ use crate::ck_wire::{
     CkIngressMessage, CkWireBlock, CkWireError, CkWireMessage, FlatBlock, FlatProjection,
 };
 
-/// Max CAS retries before surfacing the conflict (the module is the single writer in
-/// the daemon case, so this rarely loops; the shared-store case re-loads and re-steps).
+/// Maximum CAS retries before returning a conflict.
+/// On a shared store, each retry reloads state and recomputes the pass.
 const MAX_CAS_RETRIES: u32 = 8;
-/// Limit consecutive passes that may ignore a coverage gap when the applied compartment
-/// watermark is missing or stale; after this limit, the gap is repaired instead of suppressed.
+/// The limit bounds consecutive passes that may suppress a coverage gap when the applied compartment watermark is missing or stale.
 const BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT: u8 = 3;
 
-/// Reserved synthetic-block ids (never carried by a real conversation item).
+/// Real conversation items never use reserved synthetic-block IDs.
 #[cfg(test)]
 const M0_ID: &str = "mc_m0";
 /// The reserved id prefix: a non-synthetic item bearing it is a contract violation.
 const RESERVED_ID_PREFIX: &str = "mc_";
 const SYNTH_REGION_KIND: &str = "synthesized-region";
 const M0_MURAL_KEY: &str = "m0-mural";
-/// Frozen-unit key prefix for a tail reduction (a reduced tool output / superseded edit).
+/// A tail reduction uses this key prefix for reduced tool output or a superseded edit.
 /// `red:<target_id>` — the target is the real tail item whose bytes are replaced.
 const RED_KEY_PREFIX: &str = "red:";
-/// Durable sentinel proving this session has adopted the renderer transition. It is stored in the
-/// existing cache-state row and never emitted; preserving it avoids a schema migration or hot-path
-/// state read while keeping the pass commit under the normal row-version CAS.
+/// The sentinel marks renderer-transition adoption and is stored only in the cache-state row.
+/// Keeping the sentinel in the cache-state row avoids a schema migration and an additional hot-path read.
+/// The normal row-version CAS commits the pass and sentinel together.
 const LEGACY_TRANSITION_CONSUMED_KEY: &str = "migration:renderer-transition-v1";
 const TRANSITION_CONSUMED_KEY: &str = "migration:renderer-transition-v2";
 const TRANSITION_EPOCH: &str = "renderer-transition-v2";
-/// Frozen text-compression units. The suffix is the stable CK text-block id.
+/// Each frozen text-compression unit uses the stable CK text-block ID as its suffix.
 const CAV_KEY_PREFIX: &str = "cav:";
-/// Repeated pending/raw ↔ present interleaving should be impossible with correctly
-/// separated upstream session keys. Five edges corresponds to three arm/clear cycles
-/// when the initial arm is not counted as evidence of multiplexing by itself.
+/// Correctly separated upstream session keys cannot produce repeated pending/raw ↔ present interleaving.
+/// Five edges correspond to three arm/clear cycles when the initial arm does not count as multiplexing evidence.
 const PENDING_REWRITE_AMBIGUOUS_EDGE_THRESHOLD: u32 = 5;
 const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 25_000;
 const CHANNEL1_GENTLE_FRACTION: f64 = 0.20;
@@ -128,9 +122,9 @@ const M1_PENDING_LOG_THRESHOLDS_MS: [i64; 3] =
 static M1_PENDING_LOG_BUCKETS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 static EMERGENCY_REASONING_EXCLUSIONS: AtomicU64 = AtomicU64::new(0);
 
-/// Number of emergency passes at >=95% pressure where reclaim excluded at least one tool arc
-/// because removing it would leave a signed, reasoning-only assistant message. Operations uses
-/// this count to distinguish low reclaim caused by that safety rule from a selector regression.
+/// The metric counts emergency passes at >=95% pressure when reclaim excludes a tool arc because removing it would leave a signed, reasoning-only assistant message.
+/// The metric counts an excluded tool arc only when removing it would leave a signed, reasoning-only assistant message.
+/// The metric distinguishes low reclaim caused by preserving signed, reasoning-only assistant messages from selector regressions.
 pub fn emergency_reasoning_exclusion_count() -> u64 {
     EMERGENCY_REASONING_EXCLUSIONS.load(Ordering::Relaxed)
 }
@@ -140,19 +134,15 @@ fn reset_emergency_reasoning_exclusion_count() {
     EMERGENCY_REASONING_EXCLUSIONS.store(0, Ordering::Relaxed);
 }
 
-// Real 5k-message sessions retain 24-55 MiB of canonical output plus typed CK trees. A 64 MiB
-// ceiling refused those single-session snapshots, turning every warm pass into a full re-encode.
 pub(crate) const SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const TAG_BASELINE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const TAG_MINT_FRONTIER_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// Both tag caches are process-global `OnceLock` singletons, so their retention
-/// is per-process rather than per-handler. Summed here so the component's
-/// declaration to the host cannot drift from the budgets actually enforced.
+/// The tag caches retain data per process, not per handler.
+/// The host declaration uses the sum of the two enforced tag-cache budgets.
 pub(crate) const TAG_CACHE_COMBINED_BUDGET_BYTES: usize =
     TAG_BASELINE_CACHE_BUDGET_BYTES + TAG_MINT_FRONTIER_CACHE_BUDGET_BYTES;
 
-/// One served CK message plus the canonical bytes used by the module response writer.
 /// The typed value stays behind an `Arc`, so a cache hit does not clone large tool output trees.
 #[derive(Debug, Clone)]
 pub struct ServedMessage {
@@ -169,12 +159,10 @@ impl ServedMessage {
         Self::from_message_reusing(message, None)
     }
 
-    /// Build a served message, reusing each projected block's retained content hash when
-    /// the served wire is still identical to that projection block.
+    /// Reuse a projected block's retained hash only when its served wire is identical.
     ///
-    /// Divergence fingerprints hash the same serialized `CkWireBlock` basis the
-    /// projection already hashed into `FlatBlock.content_hash`. Overlaid, reduced, or
-    /// otherwise rewritten blocks fall back to a fresh serialize+hash.
+    /// Divergence fingerprints use the serialized `CkWireBlock` basis of `FlatBlock.content_hash`.
+    /// Overlaid, reduced, and rewritten blocks serialize and hash afresh.
     fn from_message_reusing(
         message: CkWireMessage,
         projected_blocks: Option<&[&FlatBlock]>,
@@ -398,8 +386,6 @@ impl SerializedOutputCache {
                     })
                     .sum::<usize>(),
             )
-            // Include the outer cache bucket/control slack and its two independently allocated
-            // session keys. The three-word allowance models hash-table control and load slack.
             .saturating_add(size_of::<SerializedOutputSession>())
             .saturating_add(size_of::<usize>() * 3)
             .saturating_add(cloned_string_retained_bytes(session_id).saturating_mul(2))
@@ -521,8 +507,6 @@ pub struct ReductionDecision {
     pub payload: String,
 }
 
-/// Legacy flat request item accepted only for backward compatibility with older
-/// request fixtures. New callers send `messages` and receive bare CK messages.
 #[derive(Debug, Clone, Deserialize)]
 struct LegacyCkItemWire {
     pub id: String,
@@ -532,67 +516,38 @@ struct LegacyCkItemWire {
     pub synthetic: bool,
 }
 
-/// The project context the module composes m0/m1 FROM. Resolved once per request from the
-/// authenticated route binding (never a request body field) and threaded into the
-/// transform. Production ALWAYS supplies it; it carries the render inputs (budget,
-/// expiry cutoff) so the frozen render decision preserves them and later passes replay identical bytes.
 pub struct ProducerContext<'a> {
     pub claim_lane: Option<&'a ClaimLaneWire>,
-    /// The project identity the store reads key off (memories, mutation log, workspace).
     pub project_path: &'a str,
-    /// The note owner key resolved for this route's notes authority. Keeping it separate
-    /// lets independently transitioning domains retain one vocabulary without turning the
-    /// filesystem route into a store key.
     pub note_project_path: &'a str,
-    /// The project directory on disk, for reading ARCHITECTURE.md / STRUCTURE.md.
     pub project_directory: &'a str,
-    /// The history budget in tokens for this pass. Authority callers resolve it from the
-    /// stable model limit and may refresh it after a config change; the route binding
-    /// supplies a fallback for older callers. A cache-busting render pass freezes the selected value in m0.
     pub history_budget_tokens: f64,
-    /// Project-memory block budget resolved from the module config.
     pub memory_budget_tokens: f64,
-    /// User-profile block budget resolved from the module config.
     pub user_profile_budget_tokens: f64,
-    /// Whether memory tools and m0 memory rendering are enabled for this binding.
     pub memory_enabled: bool,
-    /// Whether the m0 project-docs block is enabled for this binding.
     pub inject_docs: bool,
-    /// Whether temporal gap overlays are enabled for this binding.
     pub temporal_awareness: bool,
-    /// The wall-clock now (ms) for THIS pass. Used only to SET `meta.expiry_cutoff_ms` on
-    /// a HARD (the first materialization freezes it); every later pass reads the frozen
-    /// meta value, never this, so expiry never drifts the bytes between passes.
     pub now_ms: i64,
-    /// Execute threshold resolved by the host for this request, or the route-bind fallback for
-    /// older hosts that omit `effective_execute_threshold`.
     pub execute_threshold_percentage: f64,
-    /// Whether the full compaction pipeline is enabled. When false, the module emits only
-    /// additive m0/m1 memory and project-doc blocks ahead of the unchanged live array.
     pub compaction_enabled: bool,
-    /// Smart-drop selector gate frozen at route bind.
+    /// Route binding freezes the smart-drop selector gate.
     pub smart_drops: bool,
-    /// Effective cache TTL used by the host-side idle predicate.
+    /// The host-side idle predicate uses this effective cache TTL.
     pub cache_ttl: String,
-    /// Whether the model-resolution walk selected a per-model entry or fell through to the default.
+    /// `cache_ttl_provenance` records whether the model-resolution walk selected a per-model entry or fell through to the default.
     pub cache_ttl_provenance: CacheTtlProvenance,
-    /// Provider/model key for threshold lookup. Per-model overrides are deferred, so
-    /// production currently supplies None.
+    /// `model_key` supplies the provider/model key for threshold lookup.
     pub model_key: Option<String>,
-    /// In-process response observation. None disables TTL-hard even if durable metadata
-    /// has an older sparse commit anchor.
+    /// `None` disables TTL-hard even when durable metadata has an older sparse commit anchor.
     pub observed_last_response_at_ms: Option<i64>,
-    /// Current `Today's date: ...` guidance line. The transform copies it only when
-    /// this pass already rewrites cached context; updating wall-clock text during an
-    /// otherwise stable pass would make the date itself a reason to rewrite again.
+    /// A pass copies `guidance_date` only when that pass already rewrites cached context.
+    /// Copying `guidance_date` during a stable pass would trigger another rewrite.
     pub guidance_date: Option<String>,
-    /// True while this process has a historian firing/awaiting/validation/publish lease.
+    /// `historian_active` remains true while this process has a historian firing, awaiting, validation, or publish lease.
     /// Ordinary reductions and deferred m1 consumption yield so publication is coalesced
-    /// into the next materializing pass.
     pub historian_active: bool,
-    /// True while `session.wrapup` owns this session's process-local round latch. The latch guard
-    /// is bounded by the 3,800-second `historian::MAX_WRAPUP_REQUEST_BUDGET` and is released on
-    /// every terminal path, so a damaged row delayed by this signal becomes eligible afterward.
+    /// `wrapup_active` is true while `session.wrapup` owns this session's process-local round latch; `session.wrapup` releases the latch on every terminal path.
+    /// Rows delayed by `wrapup_active` become eligible after latch release.
     pub wrapup_active: bool,
     #[cfg(test)]
     pub injected_reductions: Vec<ReductionDecision>,
@@ -613,7 +568,7 @@ pub struct DeclaredTrim {
     pub next_absolute_ordinal: u64,
 }
 
-/// Host-resolved context geometry. Both OpenCode and Claude Code use this host-neutral shape;
+/// The host resolves context geometry into a shape shared by OpenCode and Claude Code.
 /// `derivation` records the rule and numeric inputs used to calculate the geometry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransformGeometry {
@@ -641,194 +596,149 @@ impl BoundaryState {
     }
 }
 
-/// A transform pass request. `boundary_present` is deliberately NOT a field: it is a
-/// cache-correctness decision (replay-frozen vs reconcile) that the module computes
-/// from its own durable state, never caller-supplied (a caller-supplied value would be
-/// a poison surface — a crafted array could force a wrong replay or reconcile). The
-/// wire carries full CK messages; the module flattens them at ingress and groups them
-/// back to CK messages at egress.
+/// `boundary_present` is computed from durable state, not supplied by callers.
+/// The module computes `boundary_present` to select replay-frozen or reconcile behavior.
+/// Allowing caller-supplied `boundary_present` permits incorrect replay or reconciliation.
+/// `wire` carries full CK messages; the module flattens them at ingress.
+/// `TransformRequest` regroups flattened messages into CK messages at egress.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransformRequest {
     #[serde(default)]
     pub kind: String,
     #[serde(default = "default_wire_version")]
     pub v: u32,
-    /// Required on the v2 wire. It is a plain string at the parse layer so a missing
-    /// or unknown value can be reported with the typed contract error instead of serde's
-    /// generic malformed-request path.
+    /// The v2 wire requires `serializer_profile`; parsing it as a string permits typed errors for missing values.
+    /// Unknown `serializer_profile` values return the typed contract error rather than Serde's malformed-request error.
     pub serializer_profile: String,
     pub session_id: String,
     pub render_config: String,
-    /// Hash of the rendered Magic Context system prompt. Empty means unknown and is adopted
-    /// without forcing a fold on legacy sessions.
+    /// The module treats an empty `system_prompt_hash` as unknown and adopts it without folding legacy sessions.
     #[serde(default)]
     pub system_prompt_hash: String,
-    /// Identity of the materializer's upgrade state, stored so a change is detected as a
-    /// render-configuration change consistently with the TypeScript materializer.
+    /// The module treats `upgrade_state` changes as render-configuration changes.
     #[serde(default)]
     pub upgrade_state: String,
     /// Primary sessions compose the cache prefix; subagents retain only reduction plumbing.
     #[serde(default)]
     pub is_subagent: bool,
-    /// Number of newest active tag rows protected from emergency reduction.
+    /// `protected_tags` protects the newest active tag rows from emergency reduction.
     #[serde(default = "default_protected_tags")]
     pub protected_tags: usize,
-    /// Canonical provider id used by the native serializer gate. Empty sentinels are
-    /// safe only for the OpenCode Anthropic adapter, matching TS `modelAcceptsEmptyContent`.
+    /// The native serializer gate uses the canonical provider ID.
+    /// The native serializer gate applies only to the OpenCode Anthropic adapter, matching TS `modelAcceptsEmptyContent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
-    /// Provider/model key retained for older plugin senders that predate the explicit
-    /// provider field. The canonical `anthropic/...` prefix is the same provider gate.
+    /// `model_key` preserves provider identity for plugin senders without an explicit provider field.
+    /// The canonical `anthropic/...` prefix uses the provider gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_key: Option<String>,
-    /// Number of tag positions kept as recent reasoning before older assistant reasoning is
-    /// cleared. OpenCode removes its empty native sentinels at dispatch; Claude Code removes the
-    /// complete signed thinking block. This mirrors the TS `clear_reasoning_age` setting.
+    /// `reasoning_age` retains this many recent reasoning-tag positions before clearing older assistant reasoning.
+    /// OpenCode removes empty native sentinels at dispatch; Claude Code removes complete signed thinking blocks.
+    /// `reasoning_age` matches the TS `clear_reasoning_age` setting.
     #[serde(default = "default_clear_reasoning_age")]
     pub clear_reasoning_age: u64,
-    /// TS-resolved per-model TTL (session_meta.cacheTtl). None when the consumer does
-    /// not resolve TTLs (CC leg); the module's own config resolves then. Until this
-    /// field existed the adapter's value was silently dropped by serde, leaving every
-    /// rust-mode session on the 5m default (spurious idle-TTL HARD on a still-warm
+    /// `cache_ttl` is the TS-resolved per-model TTL; `None` lets this module resolve its configured TTL.
     /// provider cache).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<String>,
-    /// Host-resolved execute threshold for this model and usable context geometry. Absence means
-    /// the host did not send a value, so older hosts fall back to route-bind configuration.
+    /// A missing host-resolved execute threshold falls back to route-bind configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_execute_threshold: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_lane: Option<ClaimLaneWire>,
-    /// Whether automatic memory hints may be appended on an independent cache-busting pass.
+    /// `auto_search_enabled` permits automatic memory hints on an independent cache-busting pass.
     #[serde(
         default = "default_auto_search_enabled",
         skip_serializing_if = "is_default_auto_search_enabled"
     )]
     pub auto_search_enabled: bool,
-    /// Minimum normalized rank score that may admit an automatic memory hint.
+    /// The module admits an automatic memory hint only when its normalized rank score meets `auto_search_score_threshold`.
     #[serde(
         default = "default_auto_search_score_threshold",
         skip_serializing_if = "is_default_auto_search_score_threshold"
     )]
     pub auto_search_score_threshold: f64,
-    /// Minimum sanitized prompt length before automatic search is eligible.
+    /// The module considers automatic search only when the sanitized prompt reaches the configured minimum length.
     #[serde(
         default = "default_auto_search_min_prompt_chars",
         skip_serializing_if = "is_default_auto_search_min_prompt_chars"
     )]
     pub auto_search_min_prompt_chars: usize,
-    /// Whether deterministic caveman compression is enabled for this primary session.
+    /// `caveman_enabled` enables deterministic caveman compression for the primary session.
     #[serde(default)]
     pub caveman_enabled: bool,
-    /// Minimum source byte length for an eligible caveman text block.
     #[serde(default = "default_caveman_min_chars")]
     pub caveman_min_chars: usize,
-    /// Whether this request advertises the canonical reduction tool. Missing input is
-    /// deliberately false so older callers stay on the dormant byte path.
     #[serde(default)]
     pub tool_present: bool,
-    /// Combined host verdict for OpenCode's native todowrite tool (tool map and permission).
-    /// None is a provisional or legacy-sender verdict and fails closed: missing authority
-    /// must never manufacture a synthetic tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo_tool_present: Option<bool>,
-    /// Session-resolved prompt preset. Full is the wire default so older callers retain the
-    /// exact pre-prompt-surface identity.
     #[serde(default)]
     pub prompt_surface_preset: PromptSurfacePreset,
-    /// Optional epoch key used to freeze prompt-surface materialization. Production normally
-    /// sends the same provider/model key as `model_key`; the separate field lets callers avoid
-    /// coupling routing scope to the provider's opaque model identity.
+    /// `prompt_surface_model_key` shares `model_key`'s provider/model key but routes independently of opaque provider model identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_surface_model_key: Option<String>,
-    /// Stable identity of the live prompt-surface config used to coordinate guidance,
-    /// manifest, and transform selection across config reloads.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt_surface_config_identity: String,
-    /// USER-tier top-level description replacements. IDs and schemas remain module-owned.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prompt_surface_tool_descriptions: BTreeMap<String, String>,
-    /// Trusted USER-tier primary guidance bytes resolved by the host, never a filesystem path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_surface_guidance_override: Option<String>,
-    /// Optional OpenCode mural payload. Claude Code remains disabled until Thalamus image-block
-    /// support is defined; the transform profile gate prevents this field from building CC bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mural: Option<crate::m0_compose::M0MuralInput>,
-    /// Ask the module to include an OpenCode-native rendering alongside canonical CK.
-    /// Missing input is deliberately false so existing responses remain byte-identical.
     #[serde(default)]
     pub serve_native: bool,
-    /// Optional OpenCode message-with-parts ingress used to retain provider-native fields
-    /// while encoding a served response. CK-only callers may omit it; native serving still
-    /// produces valid OpenCode messages, but cannot replay fields that were not supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_messages: Option<Vec<Value>>,
-    /// Caller-owned identity for the full ingress arrays. Full requests establish this
-    /// opaque identity; a later tail delta must name the immediately preceding identity,
-    /// and success-shaped responses echo the new value for the adapter cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_array_fingerprint: Option<String>,
     pub messages: Vec<CkIngressMessage>,
-    /// Delta metadata for a request whose `messages` and `native_messages` arrays contain
-    /// only the suffix after the acknowledged ingress prefix. The handler reconstructs the
-    /// full request from its last successful snapshot and returns NEED_FULL_SYNC when that
-    /// snapshot or its prefix fingerprint is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_delta: Option<Value>,
     #[serde(default)]
     pub usage: Option<ModuleUsage>,
-    /// Host-resolved soft/hard window pair. The soft member is diagnostic redundancy because
-    /// scheduler bands continue reading `usage.context_limit_tokens` for compatibility.
+    /// Scheduler bands read `usage.context_limit_tokens` for compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry: Option<TransformGeometry>,
     #[serde(default)]
     pub provider_error: Option<String>,
-    /// Shadow-only evidence that the newest assistant tail is still streaming. When true,
-    /// identity enforcement leaves that tail provisional until a later completed pass.
     #[serde(default)]
     pub mid_turn: bool,
-    /// Proxy-observed completion time for the prior successful response on this exact
-    /// conversation key. It is request evidence only and never enters render identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_response_completed_at_ms: Option<u64>,
-    /// Proxy-observed wall-clock time at request INGRESS, before transform queueing.
-    /// The G2 gap pairs this with `prev_response_completed_at_ms`: module-side now_ms
-    /// runs after queue/blocking-arm latency (up to minutes under the emergency arms)
-    /// and would inflate every gap by that delay. Request evidence only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_observed_at_ms: Option<u64>,
-    /// Durable host Channel-2 lease state. A terminal or already-pending lease suppresses
-    /// another module directive until the host re-arms it.
+    /// A terminal or pending Channel-2 lease suppresses another module directive until the host re-arms the lease.
+    /// A terminal or pending Channel-2 lease suppresses another module directive until the host re-arms the lease.
     #[serde(default)]
     pub channel2_nudge_state: String,
-    /// Claude Code gateway acknowledgement for the directive appended to the preceding request.
+    /// The field records Claude Code gateway acknowledgement for the directive appended to the preceding request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel2_delivered_id: Option<String>,
-    /// Durable provider-overflow recovery state. It controls historian discard-last healing.
+    /// The durable provider-overflow recovery state controls historian discard-last healing.
     #[serde(default)]
     pub emergency_recovery_armed: bool,
-    /// The host exhausted recovery attempts because the remaining protected history tail has no
-    /// eligible earlier boundary that can be discarded or used for recovery. Until a new eligible
-    /// boundary appears, normal scheduling serves the prompt.
+    /// The host exhausts recovery attempts when no eligible earlier boundary remains for discard or recovery.
+    /// Normal scheduling serves the prompt until an eligible recovery boundary appears.
+    /// Until an eligible recovery boundary appears, normal scheduling serves the prompt.
     #[serde(default)]
     pub emergency_recovery_no_head_escape: bool,
-    /// Context limit parsed from a provider overflow response. Zero means no provider proof.
+    /// The module treats a zero context limit parsed from a provider-overflow response as no provider proof.
     #[serde(default)]
     pub detected_context_limit: u64,
-    /// Model key associated with `detected_context_limit`; it must match `model_key` before the
-    /// emergency-recovery latch can be cleared.
+    /// The associated model key must match `model_key` before the emergency-recovery latch can be cleared.
+    /// The emergency-recovery latch can be cleared only when the associated model key matches `model_key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_context_limit_model_key: Option<String>,
-    /// History budget resolved by the harness from the stable context limit, threshold,
-    /// and history-budget percentage. Authority transforms carry it per pass because a
-    /// route can outlive a config reload; absent values use the bind-time fallback.
+    /// The harness resolves the history budget from the stable context limit, threshold, and history-budget percentage.
+    /// Authority transforms carry the resolved history budget per pass because a route can outlive a config reload.
+    /// Absent history-budget values use the bind-time fallback because routes can outlive config reloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_budget_tokens: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_trim: Option<DeclaredTrim>,
-    /// Composed fake-compaction edge delivered by the lineage owner. Missing fields retain
-    /// legacy no-switch behavior; the module never infers a switch from summary text alone.
+    /// `lineage_switched` comes from the lineage owner's composed fake-compaction edge.
+    /// Missing edge fields preserve no-switch behavior; the module never infers a switch from summary text alone.
     #[serde(default)]
     pub lineage_switched: bool,
     #[serde(default)]
@@ -1101,7 +1011,6 @@ pub enum ServedFrom {
     DaemonLkg,
 }
 
-/// The coherent request-local reduction surface state reported to the forwarding layer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SurfaceState {
@@ -1128,10 +1037,8 @@ pub struct HostDirectives {
     pub channel2_nudge: Option<Channel2NudgeDirective>,
 }
 
-/// Per-stage transform timings and work counts for one module pass.
 ///
-/// The values are diagnostic only: stages that do not run on a pass remain zero, while
-/// the count fields describe the final pass state used to build the served response.
+/// The count fields describe the final pass state used to build the served response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TransformTimings {
     #[serde(default)]
@@ -1314,7 +1221,7 @@ pub struct TransformTimings {
     pub cache_dirty_skips: usize,
 }
 
-/// Record this pass's token-cache counter deltas into `timings`. commentlint: allow(JUDGE)
+/// Record this pass's token-cache counter deltas into `timings`.
 fn record_token_cache_delta(
     timings: &mut TransformTimings,
     start: crate::token_cache::TokenCacheStats,
@@ -1329,7 +1236,6 @@ fn record_token_cache_delta(
 
 /// Render the one-line, greppable timing record emitted after the response splice.
 ///
-/// Session ids are made whitespace-safe because each field is parsed as one `key=value` token.
 pub fn format_pass_timing_line(
     session_id: &str,
     timings: &TransformTimings,
@@ -1465,8 +1371,6 @@ pub fn format_pass_timing_line(
     )
 }
 
-/// A transform pass result. Diagnostics remain alongside the CK array, but the response
-/// messages themselves are bare CK messages: no request-only `mid` or `ordinal` sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NativeMessagesDelta {
     pub after: String,
@@ -1481,19 +1385,13 @@ pub struct TransformResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_array_fingerprint: Option<String>,
     pub action: String,
-    /// The classifier decision, duplicated from `action` for telemetry consumers that do not
-    /// need to interpret the legacy action field.
     #[serde(default)]
     pub decision: String,
-    /// The classifier's raw cause for a HARD/SOFT decision. Unknown future causes are retained.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub materialize_reason: Option<String>,
-    /// First position where the newly served block sequence differs from the previous sequence,
-    /// excluding blocks added only at the end.
+    /// The difference position excludes blocks added only at the end.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub first_divergence: Option<FirstDivergence>,
-    /// Optional diagnostic timings. Omitted only by compatibility constructors and on old
-    /// responses; normal module transform passes include this object.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub timings: Option<TransformTimings>,
     pub boundary_id: String,
@@ -1508,58 +1406,47 @@ pub struct TransformResponse {
     pub rendered_revision_locators: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub memory_snapshot_vector: Option<SnapshotVector>,
-    /// Exact composed edge id consumed by observed durable state. Omitted on ordinary,
-    /// subagent, defer-only protocol-error, and pending-build-skew responses.
+    /// The module omits `descent_edge_id` on ordinary, subagent, defer-only protocol-error, and pending-build-skew responses.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lineage_switch_consumed_id: Option<u64>,
-    /// Outcome of the resolved descent edge ("descended", "replay", or a
-    /// terminal refusal). Present exactly when an edge was resolved this
-    /// pass; lets the sender distinguish inheritance from refusal without
-    /// reading this module's store.
+    /// `descent_outcome` records the resolved descent edge outcome: `descended`, `replay`, or a terminal refusal.
+    /// The module includes `descent_outcome` exactly when it resolves a descent edge.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lineage_descent_disposition: Option<String>,
-    /// TTL the consumer must apply to every cache marker it places on this
-    /// response. Absent = inherit whatever the harness authored (today's
-    /// behaviour), so old/new module+gateway mixes are no-ops in both directions.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cache_ttl: Option<String>,
-    /// Prior lineage tail used as the provisional ordinal base for native adapters.
+    /// Native adapters use the prior lineage tail as the provisional ordinal base.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ordinal_continuation_base: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub historian: Option<HistorianDiagnostics>,
-    /// The actual output messages for this pass: synthetic m0 and m1 messages followed
-    /// by the tail messages, all expressed as bare CK messages. `None` (field ABSENT on
-    /// the wire) on a `need_full_sync` response: the consumer discriminates structurally
-    /// on array presence, and an empty array would be a third ambiguous state between
-    /// "transformed to nothing" and "re-send required". Every `ok` response carries
-    /// `Some`, even when legitimately empty.
+    /// Consumers distinguish `need_full_sync` by the presence of the `ck_messages` array.
+    /// An empty array would ambiguously mean either no transformed messages or re-send required.
+    /// Every `ok` response sets `ck_messages` to `Some`, including legitimately empty output.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ck_messages: Option<Vec<ServedMessage>>,
-    /// OpenCode message-with-parts output, present only when the request opted into native
-    /// serving and selected the `opencode-aisdk` serializer profile.
+    /// `native_messages` is present only when the request opts into native serving and selects the `opencode-aisdk` serializer profile.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub native_messages: Option<Vec<Arc<Value>>>,
-    /// Replacement suffix over the previous acknowledged native output. This keeps a warm response
-    /// proportional to the changed tail while preserving the full-array field as the fallback.
+    /// `native_messages_delta` replaces the suffix of the previous acknowledged native output.
+    /// `native_messages_delta` keeps warm responses proportional to the changed tail; `native_messages` remains the full-array fallback.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub native_messages_delta: Option<NativeMessagesDelta>,
-    /// Host-delivery instructions are additive and profile-gated. The module does not
-    /// persist delivery because the host owns the channel-2 lease and deduplication.
+    /// Host-delivery instructions are additive and profile-gated.
+    /// The module does not persist delivery because the host owns the channel-2 lease and deduplication.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_directives: Option<HostDirectives>,
-    /// Claude Code gateway instruction. It is response metadata and never enters `ck_messages`.
+    /// `channel2_directive` is Claude Code gateway metadata and never enters `ck_messages`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub channel2_directive: Option<Channel2Directive>,
-    /// Delivery ledger rows whose note bytes were included in this bust. The host sends
-    /// the existing transform.ack/nack after applying and validating the response.
+    /// Lists delivery ledger rows whose note bytes were included in this response.
+    /// The consumer sends `transform.ack` or `transform.nack` after applying and validating the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note_deliveries: Option<Vec<NoteDelivery>>,
 }
 
 impl TransformResponse {
-    /// The output array of an `ok`/passthrough response; empty for `need_full_sync`
-    /// (whose wire form omits the field entirely).
+    /// Returns the output array for `ok` and passthrough responses and an empty slice for `need_full_sync`.
     pub fn messages(&self) -> &[ServedMessage] {
         self.ck_messages.as_deref().unwrap_or(&[])
     }
@@ -1630,14 +1517,8 @@ pub struct HistorianDiagnostics {
     pub reason: Option<String>,
     pub no_fire: Option<String>,
     pub state: String,
-    /// Tail-size progress numbers from the trigger's boundary resolution, absent when the
-    /// pass never reached boundary resolution (busy, load failure, no messages). Purely
-    /// observational: lets a rig drive see eligible content approach the fire bar per pass.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<HistorianTriggerProgress>,
-    /// Detail of the most recent failed firing, from durable state. Present until a later
-    /// firing establishes its producer run; supervised deployments have no stderr capture,
-    /// so this is the only place the failure reason is visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_failure: Option<String>,
 }
@@ -1661,8 +1542,6 @@ pub(crate) struct ProjectionCacheInput {
 pub struct TransformWithProjection {
     pub response: TransformResponse,
     pub projection: FlatProjection,
-    /// Native attachment uses the same validated tag baseline as the transform, avoiding a
-    /// second numbers-only table scan after the response has been built.
     pub tag_numbers: BTreeMap<String, u64>,
     pub scheduler_pass: scheduler::PassDecision,
     pub scheduler_drain_latch_active: bool,
@@ -1670,9 +1549,6 @@ pub struct TransformWithProjection {
     pub trim_mismatch: Option<TrimMismatch>,
     pub revert_epoch: u64,
     pub reasoning_watermark: u64,
-    /// Whether unmatched native tool shells may use the transition coalescer. The durable marker
-    /// records that the compatibility salt already triggered the required cache-invalidating HARD,
-    /// so all later replays use the same encoding.
     pub transition_consumed: bool,
     pub mutation_exempt_mid: Option<String>,
     pub lineage_anchor_mid: Option<String>,
@@ -1801,48 +1677,22 @@ struct Channel1NudgeInputs<'a, 'ctx> {
     protected_tags: usize,
 }
 
-/// Transform errors. Each leaves the durable frozen-set UNCHANGED (the CAS simply does
-/// not advance), so the next pass replays the last good state or busts cleanly; the
-/// handler maps these to a clean Error frame rather than a partial/raw array.
 #[derive(Debug)]
 pub enum TransformError {
     Store(McStoreError),
-    /// Live-source ordinals must be unique + strictly increasing.
     OrdinalViolation,
-    /// A non-synthetic item used a reserved `mc_*` id.
     ReservedId,
-    /// An unknown / corrupt frozen-set shape (never destructively cleared).
     UnknownShape(&'static str),
-    /// The decider supplied a reduction for an already-frozen target with DIFFERENT
-    /// bytes — a monotonicity-contract violation (a frozen reduction is immutable
-    /// within an epoch). Fail loud instead of silently serving the stale frozen bytes.
     ReductionConflict,
-    /// A stored coverage range overlaps, or the live array proves a present raw message
-    /// would be trimmed without being covered by any compartment. Fail loud.
     CoverageGap(String),
-    /// The lexical hint query failed before a durable decision could be written.
     Search(String),
-    /// CK ingress rejected an unsupported or unpairable block before any partial projection.
     CkWire(CkWireError),
-    /// Two flattened blocks produced the same `mid#block_index` id in one request.
     DuplicateBlockId(String),
-    /// A live message's block-kind/fingerprint vector changed after first sight.
     IdentityDrift(String),
-    /// A frozen synthetic todo pair could not be replayed at its stored tail anchor.
     SyntheticTodoAnchorMissing(String),
-    /// A frozen reduction still names a live message, but that exact block disappeared.
     FrozenRedTargetVanish(String),
-    /// A bust folded/advanced coverage from a compartment, but the anchor it minted (the
-    /// last covered block's id) is empty or absent from the live input this pass. The
-    /// anchor can then never be present, so reconcile can never clear and the pass loops
-    /// as an unbounded phantom HARD. Fail loud: it signals an empty or wrong-vocabulary
-    /// compartment end_message_id (the anchor must be a flat block id, `<mid>#<index>`).
     BoundaryNotPresent(String),
-    /// The advertised flat boundary block exists, but its live message ordinal differs
-    /// from the tail compartment's claimed end. Trimming on that claim would discard a
-    /// different raw message than the anchor identifies.
     BoundaryOrdinalMismatch(String),
-    /// A delivered lineage edge or continued ordinal base violates the required lineage or
     /// ordinal-continuation rules.
     LineageProtocol(String),
 }
@@ -1937,12 +1787,8 @@ fn claim_state_vector(state: &mc_store::claim_mirror::ClaimMirrorState) -> Snaps
     }
 }
 
-/// Separate "no claim data applies" from a genuine storage failure.
+/// The claim-memory read returns `Ok(None)` only when no claim data applies and propagates storage failures.
 ///
-/// Fencing and not-seeded outcomes are ordinary states the composer handles by
-/// omitting claim memory. A storage failure must reach the caller instead, so
-/// the pass surfaces an error and retries rather than committing an m0 that
-/// silently holds no claim content.
 fn claim_mirror_read_outcome<T>(
     result: Result<T, mc_store::claim_mirror::ClaimMirrorError>,
 ) -> Result<Option<T>, McStoreError> {
@@ -1953,14 +1799,9 @@ fn claim_mirror_read_outcome<T>(
     }
 }
 
-/// The mirrored claims that apply to this request, with the vector they were
 /// read at.
 ///
-/// `Ok(None)` means no claim data applies: the request carries no enabled claim
-/// lane, or the mirror moved while it was being read. A store failure is an
-/// error instead of `Ok(None)`, because a HARD pass that treats it as "no claim
-/// memory" freezes an m0 with no claim content and commits no vector, so the
-/// omission persists for the whole epoch rather than being retried.
+/// `Ok(None)` means no claim data applies.
 fn claim_snapshot_for_context(
     store: &McStore,
     ctx: &ProducerContext<'_>,
@@ -1988,10 +1829,6 @@ fn claim_snapshot_for_context(
     if before_canonical != expected_canonical {
         return Ok(None);
     }
-    // A row the module cannot render is skipped on its own. Failing the whole
-    // collection turns one archived or attribute-incomplete row into a claim
-    // outage across every project in the mirror, because both callers convert
-    // the collection failure into "no claim memory at all".
     let Some(rows) =
         claim_mirror_read_outcome(store.list_claim_mirror(&before.database_incarnation_id, None))?
     else {
@@ -2079,10 +1916,7 @@ fn compose_m1_for_context(
     )
 }
 
-/// Apply one transform pass, retrying the whole load→classify→step→commit cycle on a
-/// CAS conflict (re-classification depends on the freshly-loaded state). `ctx` is the
-/// resolved project producer context (m0/m1 are composed from its store reads). Tail
-/// reductions are produced inside the pass from the scheduler-gated selector.
+/// The CAS retry reloads and reclassifies because classification depends on freshly loaded state.
 ///
 /// The real Claude token estimator ([`mc_tokenizer::estimate_tokens`]) is injected into
 /// the m0 compose and the legacy publication-floor backfill. Both are reached ONLY on the
@@ -2139,9 +1973,7 @@ pub(crate) fn transform_with_projection_cached(
     result
 }
 
-/// Stable passes normally skip the cache-state commit, so clear their current-pass trace
-/// separately. Diverging passes already update both current and historical trace fields in the
-/// fenced commit that accepted their new served fingerprint.
+/// Diverging passes update current and historical trace fields in the fenced commit that accepts the new served fingerprint.
 fn record_stable_pass_trace(
     store: &McStore,
     req: &TransformRequest,
@@ -2182,7 +2014,7 @@ fn pass_scheduler_observation(
 
 /// The retry wrapper around [`apply_once`], parameterized by the token estimator so tests
 /// can inject a panicking/counting one to prove the estimator is HARD-only (never called
-/// on SOFT/defer). Production always passes [`crate::token_cache::cached_estimate_tokens`]. commentlint: allow(JUDGE)
+/// on SOFT/defer). Production always passes [`crate::token_cache::cached_estimate_tokens`].
 #[cfg(test)]
 fn apply_once_with_estimator(
     store: &McStore,
@@ -2194,17 +2026,13 @@ fn apply_once_with_estimator(
     apply_once_with_estimator_and_projection(store, req, ctx, estimate_tokens, output_cache, None)
 }
 
-/// Convert MC's assumed cache lifetime into a provider-expressible Claude Code marker TTL.
+/// The provider marker represents MC's assumed cache lifetime as a Claude Code TTL.
 ///
-/// The two values describe different things: the input controls when MC assumes a cache is dead,
-/// while the output is constrained to Anthropic's complete marker vocabulary, `5m|1h`. The wire
-/// mapping is therefore deliberately lossy: assumptions such as 60m, 90m, and 300m all mean "use
-/// the long provider cache" and become `1h`. Zero is the explicit provider-default/no-paid-TTL
-/// intent, while malformed values fall back as though the setting were absent. The `1h` value is
-/// beta-gated by Anthropic's `extended-cache-ttl-2025-04-11` request token. Only the
-/// `claude-code-anthropic` consumer is known to send that token on every request, so the response
-/// profile gate is a correctness constraint; widening it without verifying the beta header would
-/// make rewritten requests fail with HTTP 400.
+/// The input lifetime controls when MC assumes a cache is dead; the output marker is limited to `5m|1h`.
+/// Assumptions of 60m, 90m, and 300m map to `1h`.
+/// Zero selects the provider default; malformed values behave as absent.
+/// `1h` requires the `extended-cache-ttl-2025-04-11` beta token.
+/// The response-profile gate must retain the beta header; omitting it makes rewritten requests return HTTP 400.
 fn claude_code_marker_ttl(assumed_lifetime: &str) -> String {
     let normalized = assumed_lifetime.trim();
     if normalized.is_empty() {
@@ -2218,13 +2046,10 @@ fn claude_code_marker_ttl(assumed_lifetime: &str) -> String {
     }
 }
 
-/// Resolve MC's assumed cache lifetime for the idle-HARD predicate.
+/// The idle-HARD predicate uses MC's assumed cache lifetime.
 ///
-/// Anthropic is the one profile here with a known one-hour provider ceiling, and Claude Code has no
-/// cache-keep warmup on this path. An assumption above that ceiling therefore cannot be true and is
-/// clamped down to one hour. Other profiles retain the raw assumption because their provider ceiling
-/// is unknown or their plugin may keep a cache warm. `never` remains the user's explicit instruction
-/// to disable TTL-driven folds and is not a finite lifetime to clamp.
+/// The `claude-code-anthropic` TTL mapping clamps finite assumptions above one hour.
+/// Unknown assumptions are not clamped; `never` disables TTL-driven folds.
 fn internal_assumed_cache_lifetime_for_profile(
     profile: Option<SerializerProfile>,
     is_subagent: bool,
@@ -2235,7 +2060,6 @@ fn internal_assumed_cache_lifetime_for_profile(
         return configured_assumed_lifetime.to_string();
     }
     if provenance == CacheTtlProvenance::Default {
-        // Claude Code authors beta-gated one-hour markers and does not run cache-keep here.
         // A five-minute assumption could trigger a fold while the provider marker is still valid.
         return "1h".to_string();
     }
@@ -2297,8 +2121,7 @@ fn apply_once_with_estimator_and_projection(
                 if attempt < MAX_CAS_RETRIES =>
             {
                 // A historian publish can win after detection but before the transform commit.
-                // Preserve the recut intent across the mandatory reload so the new m1 watermark
-                // cannot turn the already-proven inconsistency back into an ordinary defer.
+                // The reload path preserves recut intent so a new m1 watermark cannot convert a proven inconsistency into an ordinary defer.
                 boundary_divergence_retry |= boundary_divergence_detected;
                 attempt += 1;
                 continue;
@@ -2440,11 +2263,7 @@ const CONTINUATION_SUMMARY_PREFIX: &str =
 #[derive(Debug, Clone, Default)]
 struct LineagePassState {
     acknowledge_edge: Option<u64>,
-    /// Wire-visible outcome of the edge resolution ("descended", "replay",
-    /// or a terminal refusal such as "cycle_detected"). Without it the
-    /// sender cannot distinguish inheritance from refusal: consumed_id acks
-    /// terminal dispositions too, and reading our store is not an option
-    /// for the proxy seat (drive round-1 finding).
+    /// The sender needs `disposition` because `consumed_id` acknowledges terminal refusals as well as inheritance.
     disposition: Option<&'static str>,
     ordinal_base: Option<u64>,
     force_hard: bool,
@@ -2524,10 +2343,8 @@ fn validate_lineage_anchor(
             block.ordinal
         ));
     }
-    // Locate the anchor at the first NON-synthetic message, matching the seam
-    // check's boundary rule. A synthetic-marked head (e.g. a normalized
-    // synthetic-todo message) would otherwise pass the seam gate and fail here
-    // on every pass, turning a benign head into a per-pass defer.
+    // The transform skips synthetic head messages so seam and anchor validation use the same first-message boundary.
+    // Skipping synthetic head messages prevents them from passing seam validation but failing anchor validation on every pass.
     let first = req
         .messages
         .iter()
@@ -2578,19 +2395,14 @@ fn rebase_descent_ordinals(
     if first.ordinal == expected_first {
         return Ok(None);
     }
-    // A fresh replacement array restarts at the harness assigner's origin, and
-    // both origins are live in the fleet: Pi-style assigners are 1-based while
-    // the CC-leg assigner mints ordinal 0 for the first message (measured on
-    // the rig, and the same basis every non-descent pass already accepts).
-    // Rejecting basis 0 here contradicted the module's own ingress contract.
+    // The offset keeps the first replacement ordinal at `base + 1` for 0- and 1-based input.
+    // Replacement arrays may begin at ordinal 0 or 1.
     if first.ordinal > 1 {
         return Err(TransformError::LineageProtocol(format!(
             "descent replacement array starts at ordinal {}, expected a fresh origin (0 or 1) or continued ordinal {expected_first}",
             first.ordinal
         )));
     }
-    // Shift so the fresh array's FIRST ordinal lands at base+1 regardless of
-    // origin basis: offset = base+1-first (1-based keeps the historical +base).
     let offset = expected_first
         .checked_sub(first.ordinal)
         .expect("first.ordinal <= 1 <= expected_first");
@@ -2637,8 +2449,7 @@ fn lineage_protocol_passthrough(
 }
 
 fn todo_synthesis_verdict(req: &TransformRequest) -> Option<bool> {
-    // Normalize both explicit denial and missing host authority to the injection API's
-    // unavailable verdict so neither case can manufacture a synthetic tool call.
+    // Map explicit denial and missing host authority to the injection API's `unavailable` verdict so neither can create a synthetic tool call.
     Some(req.todo_tool_present.unwrap_or(false))
 }
 
@@ -2658,11 +2469,8 @@ fn compose_additive_m0(
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<AdditiveM0Composition, TransformError> {
     let claim_snapshot = claim_snapshot_for_context(store, ctx)?;
-    // The vector still advances so freshness bookkeeping matches the m0
-    // composer, but a project with memory disabled renders no claim content.
-    // The mirror carries every workspace-authorized claim, including shared
-    // foreign-project ones, so rendering it here would inject facts the project
-    // opted out of.
+    // `compose_additive_m0` advances the vector even when memory is disabled to match `m0` freshness bookkeeping, but renders no claim content.
+    // `compose_additive_m0` does not render the mirror when memory is disabled because it includes shared claims from foreign projects.
     let selected_claims = if ctx.memory_enabled {
         claim_snapshot
             .as_ref()
@@ -2891,9 +2699,8 @@ fn apply_additive_only(
         cached_m1_missing: cached_m1_missing(&loaded.core),
         render_config_changed,
         hard_fold_requested,
-        // Compaction-off returns every raw request message, so refreshing m1 cannot trim
-        // messages at a stored coverage boundary and does not require a boundary anchor. It
-        // still requires a scheduler or config event that permits provider-visible bytes to change.
+        // When compaction is off, `m1` refreshes cannot trim at a stored coverage boundary or require a boundary anchor.
+        // An `m1` refresh still requires a scheduler or configuration event that permits provider-visible bytes to change.
         boundary_present: true,
         reconcile_pending: false,
         m1_revision_changed,
@@ -3006,8 +2813,7 @@ fn apply_additive_only(
             meta.coverage_ordinal = None;
             meta.coverage_start_ordinal = None;
             meta.coverage_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
-            // Compaction-off ignores stored compartments. Record the current maximum sequence
-            // so rows created before this mode was enabled do not reappear in m1 as new history.
+            // When compaction is off, record the current maximum sequence so pre-existing rows do not appear in `m1` as new history.
             meta.folded_compartment_seq = applied_m1_signal.max_compartment_seq;
             meta.rendered_revision_locators = composition.rendered_revision_locators;
             meta.claim_snapshot_vector = composition.claim_snapshot_vector;
@@ -3252,15 +3058,9 @@ fn apply_once(
     let mut timings = TransformTimings::default();
     let token_cache_stats_at_start = crate::token_cache::local_stats();
     let mut m1_revision_read_timings = M1RevisionReadTimings::default();
-    // OpenCode transports the frozen todo pair as one marked tool part. Older adapters did not
-    // copy that marker into CK metadata, so recognize the reserved call-id namespace here too.
-    // Normalizing before projection keeps the replayed pair out of selection, coverage, and output.
     let projection_started_at = Instant::now();
     let normalized_req = normalize_synthetic_todo_ingress(req);
     let ingress_req = normalized_req.as_ref().unwrap_or(req);
-    // Recognition uses the canonical block projection before overlays, field stripping, or
-    // ordinal rewriting. Hash only the matched continuation block so changes to sibling blocks
-    // cannot invalidate the persisted anchor.
     let reusable_projection = projection_cache.filter(|cache| {
         !ingress_req.lineage_switched
             && cache.replace_from <= ingress_req.messages.len()
@@ -3357,7 +3157,6 @@ fn apply_once(
     }
     let req = rebased_req.as_ref().unwrap_or(ingress_req);
 
-    // --- ingress: CK messages -> flat blocks, then strip synthetic before cache logic ---
     let projection = if rebased_req.is_some() {
         let rebase_projection_started_at = Instant::now();
         let projection = project_messages(&req.messages)?;
@@ -3443,12 +3242,6 @@ fn apply_once(
             )
         })?;
         let compartment_end = store.max_compartment_end_ordinal(&req.session_id)?;
-        // The continuation base is a frozen fact about the descent seam, so it is
-        // validated directionally: coverage must have REACHED the seam. Coverage
-        // past the seam is the historian folding during the successor run and is
-        // legitimate; requiring equality here wedged every continued lineage on
-        // its first post-descent fold while the peer's basis stayed correctly
-        // frozen at the seam.
         if compartment_end <= 0 || (compartment_end as u64) < expected_boundary {
             return Err(TransformError::LineageProtocol(format!(
                 "continued lineage requires boundary coverage through ordinal {expected_boundary}, found compartment end {compartment_end}; refusing silent re-base-to-1 fallback"
@@ -3473,8 +3266,6 @@ fn apply_once(
             req.session_id
         );
     }
-    // Legacy sessions stored the CC latch before the generic surface latch existed.
-    // Treat that old true value as the generic latch so an upgrade does not repeat a fold.
     let persisted_tagging_surface_active =
         loaded.meta.tagging_surface_active || loaded.meta.cc_u1_active;
     let surface_transition = persisted_tagging_surface_active != tagging_surface_requested;
@@ -3486,10 +3277,6 @@ fn apply_once(
         SurfaceState::Inactive
     };
 
-    // Every module-owned byte-affecting epoch is folded before activation decisions. The
-    // tagger is active only after its non-zero epoch is present in the session's committed
-    // render identity, so an established dormant session cannot acquire tags before the
-    // coordinating cache-breaking HARD fold has committed.
     let mut content_epoch = m0_content_epoch_for_pass(
         store,
         req,
@@ -3507,12 +3294,6 @@ fn apply_once(
     let effective_render_config_base = fold_m0_content_epoch(&render_identity, &content_epoch);
     let effective_render_config =
         fold_mural_content_identity(&effective_render_config_base, &persisted_mural_hash);
-    // A brand-new session has no provider-visible prefix to invalidate, so the first requested
-    // tagging surface may mint and render tags on its bootstrap HARD. This is safe for both CC and
-    // OpenCode: the store namespace already exists when the transform snapshot and tags are loaded,
-    // and the tag rows commit atomically with that first cache-state row. Established dormant
-    // sessions still wait for the coordinating identity fold before tags can change replayed bytes.
-    // Subagents intentionally share this bootstrap arm; they have no provider-cache prefix.
     let bootstrap_tagging_active = !loaded.meta.initialized;
     let suppress_bootstrap_reduction_tag_overlay = bootstrap_tagging_active
         && serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic);
@@ -3545,9 +3326,6 @@ fn apply_once(
         Vec::new()
     };
 
-    // Check whether the boundary is present in the live messages, or through a stored
-    // trim record that matches durable coverage and the first untrimmed message. A failed
-    // trim record is treated as Absent so the existing reconciliation error paths still run.
     let coverage_resolve_started_at = Instant::now();
     let (boundary_state, trim_mismatch) =
         resolve_boundary_state(store, req, &loaded.core, &loaded.meta, &live)?;
@@ -3580,12 +3358,6 @@ fn apply_once(
         }
     }
 
-    // A share-nothing boundary absence on a session with held lineage is not a valid
-    // re-cut target. New conversations must arrive on a fresh upstream key; on an old
-    // key this is either a missed lineage switch or foreign traffic. The destructive
-    // truncate-all arm is eliminated, not gated: only a committed truncate may bump the
-    // revert epoch, and this arm never owns a truncate. It records one durable alarm and
-    // then serves raw bytes without touching identity, usage, scheduler, or core state.
     if pending_rewrite_absent_shape && loaded.meta.anchor_block_id.is_none() {
         let fingerprint = absent_shape_fingerprint(&live);
         if loaded.meta.pending_rewrite.is_some() {
@@ -3811,9 +3583,6 @@ fn apply_once(
     )?;
     timings.identity_enforce = elapsed_ms(identity_enforce_started_at);
     let mut pending_overlays = PendingOverlayDecisions::default();
-    // When caveman tagging is requested, compute tag rows from the persisted tag order even if
-    // the provider response has no visible §N§ tags. Creating these rows does not change rendered
-    // output; create the corresponding caveman units only during a bust pass.
     let caveman_tagging_requested = req.caveman_enabled && !req.is_subagent;
     if (tagging_active || caveman_tagging_requested)
         && !loaded.core.reconcile_pending
@@ -3838,9 +3607,6 @@ fn apply_once(
         timings.tag_mint_tokenized_bytes = pending_overlays.tag_mint_tokenized_bytes;
         timings.tag_overlay += pending_overlays.tag_mint_ms;
         timings.temporal += pending_overlays.temporal_ms;
-        // The cutoff captured by a bust includes tags minted by that same accepted pass.
-        // Deferring this refresh until the next request would split one eligible batch across
-        // several provider-visible rewrites as a multi-step turn keeps minting tags.
         let tag_overlay_started_at = Instant::now();
         tag_numbers = tag_number_by_message(&tag_rows);
         timings.tag_overlay += elapsed_ms(tag_overlay_started_at);
@@ -3850,10 +3616,6 @@ fn apply_once(
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
     timings.pending_drops = elapsed_ms(pending_drops_started_at);
 
-    // --- CHEAP per-pass classify signals (read EVERY pass; never the m0/m1 BODY) ---
-    // The in-session lane is pending work, not a bust trigger. The external lane and the
-    // durable project epoch remain eager-HARD inputs. The body composes only below an
-    // independently established bust opportunity.
     let m1_visibility_cutoff_ms = if loaded.meta.initialized {
         loaded.meta.expiry_cutoff_ms
     } else {
@@ -3886,9 +3648,6 @@ fn apply_once(
     } else {
         usage_percentage
     };
-    // A legacy row with no frozen publication floor receives no estimator-derived tolerance on a
-    // replay pass. If a real gap exists, the conservative recut is already HARD and backfills the
-    // floor atomically; an ordinary defer remains tokenizer-free until a natural HARD arrives.
     let fallback_tail_allowance = 0;
     let mut divergence_candidate = if req.is_subagent {
         None
@@ -3903,8 +3662,6 @@ fn apply_once(
     };
     let mut divergence_inputs_moved = false;
     if divergence_candidate.is_some() && !boundary_divergence_retry {
-        // The max-end aggregate is a separate store read. Re-read the revision afterward so a
-        // publication between those reads cannot pair the old acknowledgement with the new end.
         let revalidated = revision_signal_for_context(
             store,
             ctx.project_path,
@@ -3922,21 +3679,12 @@ fn apply_once(
         }
         m1_signal = revalidated;
     }
-    // The combined revision also contains project memories, notes, and profile state. Gate the
-    // healthy pending-publication window on its compartment component so unrelated churn cannot
-    // suppress repair. Metadata from before that component existed falls back to the combined
-    // digest, then escalates after a small number of coherent observations if it never converges.
     let compartment_revision_matches = loaded
         .meta
         .m1_compartment_seq
         .map_or(m1_signal.revision == loaded.meta.m1_revision, |applied| {
             applied == m1_signal.max_compartment_seq
         });
-    // A non-idle durable historian phase and the process-local wrapup latch are state proofs that
-    // publication may legitimately be ahead of rendered coverage. Retain prior evidence while
-    // either proof holds: incrementing would manufacture a provider-cache bust, while resetting
-    // would forget a genuinely damaged row. A damaged row seen during wrapup waits for the latch
-    // guard to end, bounded by the 3,800-second wrapup request budget documented on the context.
     let active_legitimate_publication_window = ctx.historian_active || ctx.wrapup_active;
     let mut boundary_divergence_pending_count =
         if req.is_subagent || divergence_inputs_moved || active_legitimate_publication_window {
@@ -3967,8 +3715,6 @@ fn apply_once(
     let compartment_seq_changed_since_meta = loaded.meta.initialized
         && m1_signal.max_compartment_seq != meta_coverage_compartment_seq(&loaded.meta);
     *boundary_divergence_detected = boundary_divergence_recut.is_some();
-    // Pre-gate memory-off sessions stored an ungated digest and have no durable gate marker.
-    // The next natural bust adopts the gated digest; the mismatch does not authorize a bust now.
     let memory_gate_digest_transition = !ctx.memory_enabled
         && !loaded.meta.memory_disabled
         && current_m1_digest != loaded.meta.m1_revision;
@@ -4022,10 +3768,6 @@ fn apply_once(
         emergency_recovery_armed: req.emergency_recovery_armed && !emergency_no_head_escape,
     });
     timings.decide += elapsed_ms(decide_scheduler_started_at);
-    // A trusted final-wire measurement can only clear a latch that was already
-    // active before this pass. The comparison limit must be parsed from a provider
-    // overflow response for this exact model; catalog and caller fallback limits do
-    // not prove that the recovered wire shape is safe.
     let provider_proven_limit = req
         .model_key
         .as_deref()
@@ -4045,25 +3787,11 @@ fn apply_once(
             provider_proven_limit.unwrap_or_default()
         );
     }
-    // A flush requests work on the next pass, not a new m0 fold. Promote only a normal
-    // defer to Execute; mandatory bootstrap, epoch, and pressure decisions retain priority.
     if loaded.meta.soft_refresh_pending && scheduler_outcome.pass == scheduler::PassDecision::Defer
     {
         scheduler_outcome.pass = scheduler::PassDecision::Execute;
         scheduler_outcome.deferred_execute = None;
     }
-    // First-fold HARD trigger: a never-minted boundary (empty boundary_id) means no
-    // compartment has ever folded into m0 (the fold is what mints the boundary). Once the
-    // historian publishes the session's FIRST compartment, it cannot ride m1 as a SOFT
-    // delta — a SOFT delta requires the boundary to be present so the new compartment can
-    // splice onto it, and there is no boundary yet — so without this trigger it strands on
-    // defer forever. Force a HARD to fold it and mint the first boundary. Uses a presence
-    // check, NOT max_compartment_seq (which COALESCEs a missing MAX to 0, indistinguishable
-    // from a real first compartment at sequence 0). Self-limiting: the fold mints a
-    // non-empty boundary_id, so this is false on every subsequent pass and later publishes
-    // correctly ride m1 as a SOFT delta once the boundary is present. The store query runs
-    // only in this rare never-minted window (short-circuited by is_empty), never in steady
-    // state where the boundary is present.
     let first_fold_due = if loaded.core.boundary_id.is_empty() {
         match has_compartments_cache {
             Some(value) => value,
@@ -4072,15 +3800,9 @@ fn apply_once(
     } else {
         false
     };
-    // A legacy/first-observation row has no stored identity. Adopt the current identity
-    // without folding; only a change from a non-empty durable value is a HARD trigger.
     let (render_config_changed, identity_observed, coordinator_identity) =
         render_config_change(&loaded.meta, req, &effective_render_config, transition_due);
     let reconcile_hard_due = loaded.core.reconcile_pending && !boundary_present;
-    // If Claude-code coverage advances over system messages, force a HARD render so the
-    // messages move into the m0 prefix before the byte-splice profile suppresses their
-    // separate re-emission. The full compartment rows load only when the cheap max-seq
-    // scalar says coverage may have changed since meta last recorded it.
     let system_absorb_hard_due = if serializer_profile
         == Some(SerializerProfile::ClaudeCodeAnthropic)
         && compartment_seq_changed_since_meta
@@ -4097,11 +3819,6 @@ fn apply_once(
         || system_absorb_hard_due
         || external_revision_changed
         || project_memory_epoch_hard_due;
-    // Bust-opportunity table (the deferred-work invariant): bootstrap/legacy/reconcile/shape
-    // repair, render-config or epoch HARD, requested HARD, TTL/system HARD, refresh/flush,
-    // Force/Emergency drives, first reduction application, and every ordinary Execute are
-    // opportunities. An active historian vetoes only the ordinary-pass arms so publication
-    // can be coalesced into the next materializing pass.
     let emergency_arm_engaged = matches!(
         scheduler_outcome.pass,
         scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
@@ -4125,12 +3842,6 @@ fn apply_once(
         || loaded.meta.soft_refresh_pending;
     let pass_already_busting =
         supersession_ride_available || scheduler_outcome.drain_latch.is_active();
-    // Tail reclaim gates purely on the serializer profile. Every shipping profile is a
-    // full-array consumer (healing::tail_reclaim is true for all of them), so the request
-    // array round-trips both prefix and tail mutations on every pass. The U1-era layering
-    // that OR-ed in the request-local tagging surface is gone: it existed only to grant the
-    // then-verbatim-tail Claude Code profile reclaim on tool-present passes, and the
-    // profile default now covers every pass directly.
     let tail_reclaim_enabled = serializer_profile.is_none_or(healing::tail_reclaim);
     let cached_m1_missing_due = cached_m1_missing(&loaded.core);
     let producer_gate = tail_reclaim_enabled
@@ -4142,8 +3853,6 @@ fn apply_once(
                 || hard_fold_requested
                 || cached_m1_missing_due,
         );
-    // Hard advisory requests use the normal Execute path so queued work can be processed
-    // during the fold, but only context pressure reported by the scheduler enables age reclaim.
     let selection_class = if producer_gate && !ordinary_historian_veto {
         selection_pass_class(scheduler_outcome.pass)
     } else {
@@ -4159,9 +3868,6 @@ fn apply_once(
         .collect();
     let tail_for_selection =
         tail_sel_items(&live, loaded.meta.coverage_ordinal, &tag_tokens_by_block);
-    // Todo state is deferred work just like an m1 or reduction delta: it may ride an
-    // independently scheduled bust, but it never authorizes provider-visible bytes by itself.
-    // Compute only the call-id transition here; the complete pair is built after classification.
     let todo_injection_pending = tail_reclaim_enabled
         && !req.is_subagent
         && injection_pending_after_capture(
@@ -4171,9 +3877,6 @@ fn apply_once(
             todo_synthesis_verdict(req),
         );
     let tag_window_protected_block_ids = if tagging_surface_requested {
-        // Same-pass bootstrap mints have never been provider-visible and must not protect a block
-        // from reduction before its first render. Hydrated rows retain their normal protection;
-        // the newly minted suffix becomes eligible on the next pass after this atomic commit.
         let protection_tags = if suppress_bootstrap_reduction_tag_overlay {
             &tag_rows[..hydrated_tag_count]
         } else {
@@ -4216,10 +3919,6 @@ fn apply_once(
     }
     let selection_outcome = if producer_gate {
         let frozen = frozen_red_targets(&loaded.core);
-        // No per-request gate here: producer_gate already requires
-        // tail_reclaim_enabled, which is the profile default. Gating again on the
-        // request-local tagging surface would starve the durable queue now that every
-        // shipping profile drains unconditionally (full-array tail reclaim).
         let agent_drop_ids = pending_agent_drops
             .iter()
             .map(|drop| drop.target_id.clone())
@@ -4292,10 +3991,6 @@ fn apply_once(
     };
     let selected_reductions =
         filter_reasoning_ineligible_decisions(&tail_for_selection, selected_reductions);
-    // Fail-loud monotonicity guard, BEFORE classify and on EVERY pass: a frozen
-    // reduction target re-supplied with different bytes breaks the immutable contract,
-    // and the set-membership trigger would silently skip it (already frozen) and serve
-    // the stale bytes — including on a defer. Error here instead.
     validate_reduction_monotonicity(&loaded.core, &selected_reductions)?;
 
     let reductions_pending_now = reductions_pending(
@@ -4323,16 +4018,8 @@ fn apply_once(
             || loaded.meta.soft_refresh_pending
             || todo_injection_pending,
         reductions_pending: reductions_pending_now,
-        // Scheduler Execute is a genuine deferred-work consumption opportunity even when
-        // no reduction was selected. An active historian is the one ordinary-pass veto;
-        // hard/force/emergency arms bypass it.
         bust_opportunity,
     });
-    // A todo-only delta does not need a coverage anchor: it inserts a frozen pair between the
-    // existing prefix and tail without moving the m0/m1 boundary. The generic classifier blocks
-    // boundaryless m1 deltas because they cannot splice safely, so promote only its ordinary
-    // defer result when an independent bust opportunity already exists. Reconcile defers remain
-    // untouched because they must clear or rebuild the boundary state first.
     if todo_injection_pending
         && independent_bust_opportunity
         && !loaded.core.reconcile_pending
@@ -4389,8 +4076,6 @@ fn apply_once(
     let state_evolution_started_at = Instant::now();
     meta.boundary_divergence_pending_count = boundary_divergence_pending_count;
     if !identity_observed && coordinator_identity {
-        // Persist the first provider/model/system/upgrade observation without folding. This
-        // lets an already-materialized session adopt the coordinator's identity safely.
         meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
         meta.last_model_key = req.model_key.clone().unwrap_or_default();
         meta.last_system_prompt_hash = req.system_prompt_hash.clone();
@@ -4401,8 +4086,6 @@ fn apply_once(
         scheduler_outcome.pass,
         scheduler::PassDecision::Force85 | scheduler::PassDecision::Emergency95
     ) {
-        // The emergency selector latches every acting input sample, including zero
-        // removals, so repeated pressure observations do not re-bust unchanged bytes.
         meta.last_emergency_input_sample = usage_input_tokens;
         meta.has_prior_emergency_drop = true;
     }
@@ -4469,8 +4152,6 @@ fn apply_once(
                 && user_hint_target_was_served(&loaded.meta, &hint.block_id)
                 && !is_bust_pass
             {
-                // A decision for a previously served block is immutable, but its first append
-                // must ride a later independent bust rather than rewriting the cached prefix.
                 meta.pending_user_hint_block_ids
                     .insert(hint.block_id.clone());
             }
@@ -4490,8 +4171,6 @@ fn apply_once(
         reasoning_clear_cutoff_with_tags(req, serializer_profile, is_bust_pass, &tag_numbers);
     if let Some(cutoff) = reasoning_clear_cutoff {
         meta.reasoning_cleared_through_tag = meta.reasoning_cleared_through_tag.max(cutoff);
-        // Keep the legacy ordinal watermark populated so readers that predate the tag-number
-        // watermark, including older native rendering paths, continue to observe the same cutoff.
         meta.reasoning_cleared_through_ordinal = meta.reasoning_cleared_through_ordinal.max(cutoff);
     }
     let unit_mint_started_at = Instant::now();
@@ -4573,10 +4252,6 @@ fn apply_once(
         match plan {
             PassPlan::Reject(m) => return Err(TransformError::UnknownShape(m)),
             PassPlan::Hard | PassPlan::MigrateHard => {
-                // EXPENSIVE bust-only: compose the m0 baseline from the store. now_ms freezes
-                // the expiry cutoff into meta so every later in-epoch SOFT/defer reads the
-                // SAME memory set (a memory expiring mid-epoch stays rendered until the next
-                // HARD re-freezes the cutoff — the byte-stability tradeoff).
                 let compartments_for_live_coverage = store.load_compartments(&req.session_id)?;
                 let coverage_bounds =
                     coverage_bounds_from_compartments(&compartments_for_live_coverage)?;
@@ -4606,11 +4281,6 @@ fn apply_once(
                     ctx,
                 )?;
 
-                // Live coverage guard: store-pure validation allows sparse coordinate
-                // gaps because consumer producers can retire ordinal numbers permanently.
-                // Once the live array is available, every present non-system block at or
-                // below the coverage end must fall inside some compartment range; otherwise
-                // build_output would trim unsummarized raw bytes from the tail.
                 if let Some(stray) = first_uncovered_live_block(
                     &compartments_for_live_coverage,
                     &live,
@@ -4625,25 +4295,6 @@ fn apply_once(
                     )));
                 }
 
-                // Mint-absent guard: when this fold takes its anchor from a compartment
-                // (coverage present), the minted boundary must be a block id that exists in
-                // the live input THIS pass — the anchor is the last covered block, which the
-                // producer always sends (trimming happens in our OUTPUT, and a producer-side
-                // coverage trim keeps ordinals >= coverage_ordinal, so the boundary block
-                // itself is never trimmed away). An empty or absent mint means either the
-                // compartment's end_message_id is empty or in the wrong vocabulary (it must
-                // be the flat block id `<mid>#<index>`, not a bare message id), or the store
-                // still covers messages a revert removed and has not been re-cut. Committing
-                // such an anchor makes presence impossible on every later pass, so reconcile
-                // can never clear and every pass re-materializes — an unbounded phantom-HARD
-                // loop serving summaries of content that may no longer exist. Fail loud
-                // instead, on EVERY hard including a reconcile-rematerialize: a rematerialize
-                // that cannot mint a presentable anchor has no path to clearing reconcile
-                // either. If a hard pass cannot create a live terminal anchor, keep returning an
-                // error rather than committing an anchor that cannot be presented. A later pass
-                // can commit when the anchor returns; a permanently trimmed anchor requires the
-                // store to be re-cut. Clearing all compartments is a valid revert, yields None
-                // coverage, and mints the reserved empty anchor without entering this guard.
                 if let Some(coverage_end) = comp.coverage_ordinal {
                     let minted = comp.boundary_id.as_str();
                     validate_live_boundary_ordinal(minted, coverage_end, &live)?;
@@ -4754,9 +4405,6 @@ fn apply_once(
                     }
                 }
 
-                // Keep reductions whose targets remain in the new tail; discard reductions covered
-                // by the new m0 summary or orphaned by a revert. Because apply_units cannot remove
-                // those obsolete units in place, rebuild the frozen unit set.
                 let effective = effective_reductions(
                     &core,
                     &selected_reductions,
@@ -4802,11 +4450,6 @@ fn apply_once(
                 rendered.extend(strip_survivors);
                 rendered.extend(caveman_survivors);
 
-                // A HARD re-composes m0 fully from the store, so the boundary ALWAYS reflects
-                // the current coverage — set it unconditionally (empty when no compartments,
-                // keeping boundary_id + coverage_ordinal consistent). The core only SETS on
-                // Some, so mapping empty→None would leave a stale prior anchor alongside a
-                // None coverage_ordinal — an inconsistent state.
                 core.step(PassInput {
                     proposed: Some(mc_core::Action::Hard),
                     boundary_present: boundary_token,
@@ -4850,9 +4493,6 @@ fn apply_once(
                 meta.rendered_revision_locators = comp.rendered_revision_locators;
                 meta.claim_snapshot_vector = comp.claim_snapshot_vector;
                 meta.expiry_cutoff_ms = ctx.now_ms; // FROZEN here, atomic with the m0 bytes
-                                                    // The post-fold m1 baseline digest — NOT 0. After folding up to the current
-                                                    // watermarks, "no delta" == "watermarks unchanged since this digest"; setting
-                                                    // 0 would make the next pass's non-zero digest read as a phantom SOFT.
                 let applied_m1_signal = revision_signal_for_context(
                     store,
                     ctx.project_path,
@@ -4873,11 +4513,6 @@ fn apply_once(
             }
             PassPlan::Soft => {
                 meta.memory_disabled = !ctx.memory_enabled;
-                // EXPENSIVE bust-only: compose the m1 delta body from the store against the
-                // watermarks the last HARD froze (incl. the FROZEN expiry cutoff). A
-                // reduction-only SOFT recomposes byte-identical m1 (watermarks unchanged), so
-                // the m1 unit stays stable; a new compartment extends coverage → advance the
-                // boundary anchor in this same commit.
                 let m1 = compose_m1_for_context(
                     store,
                     ctx.project_path,
@@ -4992,10 +4627,6 @@ fn apply_once(
                     );
                     core.frozen_units.clear();
                     core.pending_changes.clear();
-                    // Post-fold m1 parity with the ordinary HARD arm: everything except the
-                    // claimed notes was just folded into the recomposed m0, so rendering the
-                    // full composed body here would duplicate memories/mutations/compartments
-                    // across both layers for the rest of the epoch. Only the notes survive.
                     let refold_m1_unit = if m1.notes_block.is_empty() {
                         render_m1_placeholder()
                     } else {
@@ -5068,8 +4699,6 @@ fn apply_once(
                     ));
                     rendered.extend(new_strip_units.clone());
                     rendered.extend(new_caveman_units.clone());
-                    // A coverage-extending SOFT advances the boundary anchor (the bound core
-                    // primitive); a memory-only SOFT leaves it put (None).
                     let new_boundary_id = m1.new_coverage.as_ref().map(|(id, _)| id.clone());
                     if let Some((_, coverage_end)) = &m1.new_coverage {
                         let compartments_for_live_coverage =
@@ -5088,12 +4717,6 @@ fn apply_once(
                             )));
                         }
                     }
-                    // Mint-absent guard, SOFT arm (same invariant as the fold's guard above): an
-                    // advanced anchor must exist in the live input this pass, or presence can
-                    // never hold afterward and the session decays into a reconcile-HARD loop. A
-                    // SOFT can only reach here with reconcile clear (the classifier routes a
-                    // pending reconcile to defer/HARD), so every advance is a fresh mint and the
-                    // check is unconditional.
                     if let Some((id, coverage_end)) = m1.new_coverage.as_ref() {
                         validate_live_boundary_ordinal(id, *coverage_end, &live)?;
                         if id.is_empty()
@@ -5119,17 +4742,9 @@ fn apply_once(
                         queued: Vec::new(),
                         run_started: false,
                     });
-                    // coverage_ordinal advances ATOMICALLY with the anchor (two views of one
-                    // coverage end — they must not desync).
                     if let Some((_, ord)) = m1.new_coverage {
                         meta.coverage_ordinal = Some(ord);
                         meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
-                        // A coverage advance folds items out of the tail, so frozen red:*
-                        // units targeting them must go WITH the coverage. Only the HARD arm
-                        // rebuilds the frozen set (surviving_red_units); without this prune a
-                        // covered reduction would survive a coverage-extending SOFT as silent
-                        // bloat — and a later re-decide of that target with different bytes
-                        // would false-fire the monotonicity conflict guard.
                         prune_covered_red_units(&mut core, &live, meta.coverage_ordinal);
                         prune_covered_caveman_units(&mut core, &live, meta.coverage_ordinal);
                     } else if compartment_seq_changed_since_meta {
@@ -5182,8 +4797,6 @@ fn apply_once(
         && meta.coverage_ordinal.is_some()
         && meta.publication_floor_ordinal.is_none()
     {
-        // Freeze the estimator-derived floor only on a pass that is already rebuilding m0. Later
-        // SOFT/defer passes consume this ordinal and cannot change decisions when tokenizers change.
         meta.publication_floor_ordinal = Some(protected_tail_floor_ordinal(
             &live,
             context_limit_tokens,
@@ -5191,9 +4804,6 @@ fn apply_once(
             estimate_tokens,
         ));
     }
-    // A todo-only SOFT splice changes neither the m0/m1 divider nor the covered tail. Keep
-    // divergence evidence across that bust so repeated todo churn cannot postpone repair. A
-    // structural boundary/coverage move, or a converged observation, still closes the episode.
     if boundary_divergence_reset_allowed(
         is_bust_pass,
         active_legitimate_publication_window,
@@ -5205,9 +4815,6 @@ fn apply_once(
         meta.boundary_divergence_pending_count = 0;
     }
     if lineage_anchor_failure {
-        // The soft-pressure path can preserve an existing reconcile state but cannot create
-        // one. Because the anchor check detected a new failure, set the pending flag after the
-        // state-machine step and commit it with the no-trim response.
         core.reconcile_pending = true;
     }
     let transition_post_detection_started_at = Instant::now();
@@ -5233,9 +4840,6 @@ fn apply_once(
     let transition_newly_consumed = !newly_consumed_transition_classes.is_empty();
     let mut committed_transition_classes = consumed_transition_classes.clone();
     committed_transition_classes.extend(newly_consumed_transition_classes);
-    // A HARD rebuild reconstructs the frozen-unit vector from data-plane survivors, bypassing
-    // durability handling. Reinsert the full consumed union afterward so an unrelated fold cannot
-    // make an already-healed class eligible for another renderer transition.
     if transition_newly_consumed
         || (matches!(plan, PassPlan::Hard | PassPlan::MigrateHard)
             && !committed_transition_classes.is_empty())
@@ -5244,9 +4848,6 @@ fn apply_once(
     }
     let transition_committed = transition_renderer_active(&core) || transition_newly_consumed;
     if transition_newly_consumed {
-        // Record consumption after any bust that renders an affected shape. If the shape first
-        // appeared during a pass that was already invalidating the cache for another reason, its
-        // changed bytes rode that invalidation and replay must not trigger a second one.
         meta.last_render_config = fold_mural_content_identity(
             &stable_effective_render_config_base,
             &committed_mural_hash,
@@ -5254,10 +4855,6 @@ fn apply_once(
     }
     timings.compose_m0m1 = elapsed_ms(compose_m0m1_started_at);
 
-    // Advance whenever a pressure pass allowed the age batch to apply, even if it selected
-    // no reductions. Ordinary execute-band passes that are not already changing provider-visible
-    // bytes leave the watermark frozen; an allowed empty batch records the current tail so later
-    // arcs can age into a future batch.
     if two_pass_batch_can_apply && !loaded.core.reconcile_pending {
         meta.last_execute_ordinal = tail_for_selection
             .iter()
@@ -5267,9 +4864,6 @@ fn apply_once(
             .max(meta.last_execute_ordinal);
     }
     if is_bust_pass && selection_class == PassClass::EmergencyForce {
-        // An emergency selector pass consumes the current provider sample even when
-        // protection filtered every candidate; otherwise the same stale sample would
-        // repeatedly re-arm and re-bust the session.
         meta.last_emergency_input_sample = usage_input_tokens;
         meta.has_prior_emergency_drop = true;
     }
@@ -5298,7 +4892,6 @@ fn apply_once(
             &meta.pending_user_hint_block_ids,
         )
     } else if auto_search_active {
-        // Auto-search replays only its own persisted hint when ctx_reduce/tagging is unavailable.
         TagOverlayState {
             user_hint_by_block_id: user_hints
                 .iter()
@@ -5371,9 +4964,6 @@ fn apply_once(
         }
     }
 
-    // A persisted synthetic pair is host-facing state, not a reason to reject the entire
-    // transform when its original anchor was compacted or omitted by a later request.
-    // TypeScript drops the stale pair and continues with the current tail.
     if meta
         .synthetic_todo
         .as_ref()
@@ -5439,10 +5029,6 @@ fn apply_once(
             true,
         )?;
     }
-    // Recheck trailing blanks on every pass, including deferred passes. The build
-    // above already applied stored decisions, so removing a provider-added blank
-    // from an older message restores its previously served bytes. On a deferred
-    // pass, record only the newest assistant because no cached message follows it.
     let (trailing_blank_decisions_updated, newest_keep_updated) = refresh_trailing_blank_decisions(
         &mut core,
         req,
@@ -5529,8 +5115,6 @@ fn apply_once(
     timings.tail_units_matched = frozen_units_matched_to_tail(&core, req, meta.coverage_ordinal);
 
     let finalize_started_at = Instant::now();
-    // Compare only the served block hashes before committing the new sequence. The first pass
-    // records its baseline, and append-only tail growth is intentionally not a divergence.
     let divergence_started_at = Instant::now();
     let served_fingerprints = served_output_fingerprints(&ck_messages);
     let first_divergence =
@@ -5558,9 +5142,6 @@ fn apply_once(
         &mut meta,
     );
 
-    // Build the output before committing so a missing synthetic-todo anchor cannot
-    // persist an unusable frozen pair. Pending rows are classified from the final plan:
-    // live unfrozen targets remain durable, while applied or retired targets are consumed.
     let consumed_drop_ids = consumed_pending_drop_ids(
         &pending_agent_drops,
         &loaded.core,
@@ -5786,17 +5367,11 @@ fn enforce_block_identity(
         if stored == vector {
             continue;
         }
-        // A provider may append an invisible suffix after a message was stored.
-        // Accept it only when the stored strip/keep decision reconstructs the full
-        // message identity that was previously served.
         if trailing_blank_identity_replays_stored(req, core, mid, stored) {
             if latest_assistant_reasoning_mutation_exempt_mid(&req.messages) == Some(mid.as_str())
                 && frozen_trailing_blank_decision(core, mid)
                     == Some(FrozenTrailingBlankDecision::Strip)
             {
-                // Keep a trailing blank visible while the newest assistant may still
-                // change, and update its stored identity as the decision becomes keep.
-                // Older assistants replay strip and retain their prior identity.
                 re_adoptions.push(TailIdentityReAdoption {
                     mid: mid.clone(),
                     old_hash_prefix: block_identity_hash_prefix(stored),
@@ -5888,8 +5463,6 @@ fn apply_ingress_meta(
     re_adoptions: &[TailIdentityReAdoption],
 ) {
     if let Some(mid) = provisional_tail_mid {
-        // Remove any stale pin for a tail that became streaming again. The next completed
-        // pass must establish identity from the stable block vector, not from a partial form.
         meta.block_identity_by_mid.remove(mid);
     }
     for re_adoption in re_adoptions {
@@ -5939,11 +5512,6 @@ fn effective_context_limit_tokens(
     if usage.context_limit_tokens >= crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT {
         return usage.context_limit_tokens as f64;
     }
-    // Usage is unfilled on the first pass of a session (no observed pass yet),
-    // but geometry arrives on every request including the first. The resolved
-    // soft denominator is strictly better than the 200k constant guess: bands
-    // still read usage whenever it is present (the geometry contract's belt),
-    // so this only replaces the fallback arm.
     if let Some(geometry) = geometry {
         if geometry.usable_soft >= crate::scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT {
             return geometry.usable_soft as f64;
@@ -6009,8 +5577,6 @@ fn m0_mural_input(
     req: &TransformRequest,
     serializer_profile: Option<SerializerProfile>,
 ) -> Option<&crate::m0_compose::M0MuralInput> {
-    // OpenCode supplies an already capability-gated mural. Claude Code receives the same input
-    // only after the bound route resolves the project artifact persisted from that OC supply.
     matches!(
         serializer_profile,
         Some(SerializerProfile::OpencodeAiSdk | SerializerProfile::ClaudeCodeAnthropic)
@@ -6209,17 +5775,12 @@ fn tail_state_from_live(live: &[&FlatBlock]) -> TailState {
     TailState { mid_tool_use }
 }
 
-// --- shape predicates (mc-module reads the concrete frozen set; mc-core stays blind) ---
-
 fn is_legacy_baseline(core: &CoreState) -> bool {
     core.frozen_units.len() == 1
         && core.frozen_units[0].key == "baseline"
         && core.pending_changes.is_empty()
 }
 
-/// A valid current shape: EXACTLY one `m0`, EXACTLY one `m1`, and zero-or-more
-/// reduction, strip, caveman, or migration-marker replay units. An initialized state missing
-/// `m0`/`m1`, or carrying any other key, is an unknown shape (rejected, never cleared).
 fn cached_m1_missing(core: &CoreState) -> bool {
     let m0 = core.frozen_units.iter().filter(|u| u.key == "m0").count();
     let m1 = core.frozen_units.iter().filter(|u| u.key == "m1").count();
@@ -6287,9 +5848,6 @@ fn caveman_unit(block_id: &str, depth: u8, payload: &str) -> FrozenUnit {
         kind: "caveman".to_string(),
         frozen_payload: payload.to_string(),
         durability_class: mc_core::DurabilityClass::Lineage,
-        // The shared core intentionally treats reset_rule as opaque. The module uses it as the
-        // durable depth because a deeper bust must compare against the prior tier without
-        // re-deriving that tier from the current request.
         reset_rule: depth.to_string(),
     }
 }
@@ -6319,10 +5877,6 @@ fn caveman_target_depth(position: usize, total: usize) -> u8 {
     }
 }
 
-/// Select and render new/deeper caveman units on bust passes only. `age_basis_tag` is captured
-/// durably by the caller with the same commit as these units, so newly minted tags cannot change
-/// this cycle's eligible population. The original tag source is authoritative, so a later tier
-/// shift never compresses an already-compressed payload.
 fn new_caveman_units(
     core: &CoreState,
     req: &TransformRequest,
@@ -6383,9 +5937,6 @@ fn new_caveman_units(
             continue;
         }
         let payload = if let Some(existing) = existing {
-            // A deeper tier is allowed to replace bytes only when it does not grow the frozen
-            // payload. Equal-size output still advances depth, matching TS's persisted depth
-            // behavior for text with no additional removable material.
             assert!(
                 compressed.len() <= existing.frozen_payload.len(),
                 "caveman deeper tier grew frozen payload for {block_id}"
@@ -6403,8 +5954,6 @@ fn new_caveman_units(
     units
 }
 
-/// Keep caveman units that still point at live tail text after a HARD rebuild, plus the deeper
-/// units selected by this bust. The map merge preserves replacement semantics for same-key units.
 fn prune_covered_caveman_units(core: &mut CoreState, live: &[&FlatBlock], coverage: Option<u64>) {
     let live_ord = live
         .iter()
@@ -6457,10 +6006,6 @@ fn surviving_caveman_units(
     by_key.into_values().collect()
 }
 
-// --- reduction helpers (the tail-reducer mechanics) ---
-
-/// Is `ordinal` in the live TAIL (strictly after the coverage watermark)? None coverage
-/// = nothing folded yet = all live items are tail.
 fn frozen_units_matched_to_tail(
     core: &CoreState,
     req: &TransformRequest,
@@ -6501,8 +6046,6 @@ fn is_uncovered_leading_system(message: &CkIngressMessage, meta: &ModuleMeta) ->
     }
     match meta.coverage_start_ordinal {
         Some(start) => message.ordinal < start,
-        // Legacy metadata did not persist the first covered ordinal. Preserve the common
-        // pinned system prompt at absolute ordinal 0 rather than risk dropping it.
         None => message.ordinal == 0,
     }
 }
@@ -6546,8 +6089,6 @@ fn protected_tail_floor_ordinal(
 }
 
 fn post_end_revision_inputs_moved(before: &M1RevisionSignal, after: &M1RevisionSignal) -> bool {
-    // Sequence is the structural publication watermark. Also compare the revision so memory,
-    // note, or profile changes invalidate the aggregate observation when sequence is unchanged.
     before.max_compartment_seq != after.max_compartment_seq || before.revision != after.revision
 }
 
@@ -6599,10 +6140,6 @@ fn detect_boundary_divergence_candidate(
         .max()
         .unwrap_or(old_coverage);
 
-    // Use the recorded publication floor when available. For legacy rows without one, cap the
-    // allowance with the same token floor that sizes the historian's protected tail. Treating the
-    // entire raw ordinal range as protected could hide a rewound publication floor and prevent a
-    // genuine coverage gap from being detected.
     let live_tail_allowance =
         meta.publication_floor_ordinal
             .map_or(fallback_tail_allowance, |protected_tail_floor| {
@@ -6694,7 +6231,6 @@ fn coverage_advance_covers_new_system(
     })
 }
 
-/// The frozen payload for a target's reduction, if one is frozen.
 fn frozen_red_payload<'a>(core: &'a CoreState, target: &str) -> Option<&'a str> {
     let key = format!("{RED_KEY_PREFIX}{target}");
     core.frozen_units
@@ -6703,7 +6239,6 @@ fn frozen_red_payload<'a>(core: &'a CoreState, target: &str) -> Option<&'a str> 
         .map(|u| u.frozen_payload.as_str())
 }
 
-/// Target ids that already carry a frozen `red:*` unit.
 fn frozen_red_targets(core: &CoreState) -> std::collections::HashSet<String> {
     core.frozen_units
         .iter()
@@ -6711,9 +6246,6 @@ fn frozen_red_targets(core: &CoreState) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Seeded drops are accepted before the first projection is available. Once the
-/// first projection identifies a reasoning block, leave that unit durable for
-/// lineage idempotence but skip applying it to the signed block.
 fn log_reasoning_drop_seed_skips(core: &CoreState, live: &[&FlatBlock], session_id: &str) {
     let reasoning: HashSet<&str> = live
         .iter()
@@ -6731,7 +6263,6 @@ fn log_reasoning_drop_seed_skips(core: &CoreState, live: &[&FlatBlock], session_
     }
 }
 
-/// Commands whose first application froze at least one previously unfrozen target.
 fn first_applied_pending_command_ids(
     pending: &[PendingAgentDrop],
     loaded_core: &CoreState,
@@ -6753,8 +6284,6 @@ fn first_applied_pending_command_ids(
         .collect()
 }
 
-/// Return only queue rows whose target was frozen by this plan or is no longer a live,
-/// unfrozen tail block. Every other row remains durable for a later eligible pass.
 fn consumed_pending_drop_ids(
     pending: &[PendingAgentDrop],
     loaded_core: &CoreState,
@@ -6764,22 +6293,12 @@ fn consumed_pending_drop_ids(
 ) -> Vec<i64> {
     let frozen_before = frozen_red_targets(loaded_core);
     let frozen_after = frozen_red_targets(final_core);
-    // Retirement must be PROVEN, not inferred from absence: the request array can be
-    // a transient subset of the session (interactive side-requests), so a target
-    // missing from this pass's projection may reappear on the next one. Consuming
-    // its row on absence would silently lose an acknowledged drop. A block that is
-    // PRESENT but at-or-under the coverage watermark is permanently retired
-    // (coverage only advances), and an already-frozen target is satisfied — those
-    // are the only non-applied rows safe to consume.
     let covered = projection
         .blocks
         .iter()
         .filter(|block| !block.synthetic && !is_tail(block.ordinal, final_coverage))
         .map(|block| block.id.as_str())
         .collect::<HashSet<_>>();
-    // A drop aimed at a reasoning block is structurally unappliable (reasoning is
-    // never a reduction target), proven from this pass's projection. Retiring the
-    // row here keeps the queue from carrying it forever.
     let reasoning = projection
         .blocks
         .iter()
@@ -6803,7 +6322,6 @@ fn consumed_pending_drop_ids(
 
 const RED_SUPPRESS_TAG_OVERLAY_RULE: &str = "suppress_tag_overlay";
 
-/// Build a `red:<target>` frozen unit (Lineage — it persists + replays byte-identical).
 fn red_unit(target: &str, kind: &str, payload: &str) -> FrozenUnit {
     FrozenUnit {
         key: format!("{RED_KEY_PREFIX}{target}"),
@@ -6822,17 +6340,12 @@ fn red_unit_with_tag_policy(
 ) -> FrozenUnit {
     let mut unit = red_unit(target, kind, payload);
     if suppress_tag_overlay {
-        // The source and its reduction first become provider-visible in the same bootstrap pass.
-        // Freeze the untagged placeholder so the durable tag row cannot alter it on a later defer.
         unit.reset_rule = RED_SUPPRESS_TAG_OVERLAY_RULE.to_string();
     }
     unit
 }
 
-/// Fail-loud monotonicity guard (runs EVERY pass, before classify). If the selector
-/// supplies a reduction whose target is ALREADY frozen with DIFFERENT bytes, that
-/// breaks the immutable-once-frozen contract — and the set-membership trigger would
-/// SILENTLY skip it (already in keys) and serve the stale frozen payload. Error instead.
+/// Return TransformError::ReductionConflict.
 fn validate_reduction_monotonicity(
     core: &CoreState,
     reductions: &[ReductionDecision],
@@ -6847,8 +6360,6 @@ fn validate_reduction_monotonicity(
     Ok(())
 }
 
-/// Is there a NEW reduction to freeze: a selected reduction whose target is in the live
-/// tail AND not yet frozen. Pure id set-membership — the SOFT trigger.
 fn reductions_pending(
     core: &CoreState,
     reductions: &[ReductionDecision],
@@ -6866,8 +6377,6 @@ fn reductions_pending(
         .any(|r| tail.contains(r.target_id.as_str()) && !frozen.contains(&r.target_id))
 }
 
-/// The `red:*` units to freeze on a SOFT: each NEW selected reduction (target in the live
-/// tail, not yet frozen), deduped by target, deterministic order.
 fn new_reduction_units(
     core: &CoreState,
     reductions: &[ReductionDecision],
@@ -6881,10 +6390,6 @@ fn new_reduction_units(
         .filter(|i| is_tail(i.ordinal(), coverage))
         .map(|i| i.id())
         .collect();
-    // Defense in depth behind the selector's own exclusion: refuse to mint a
-    // frozen unit whose target is a reasoning block. A placeholder-rewritten
-    // reasoning block loses its signature and can never re-encode for
-    // Anthropic, permanently fencing the session to raw.
     let reasoning_targets: std::collections::HashSet<&str> = live
         .iter()
         .filter(|i| is_reasoning_block(&i.wire))
@@ -6904,9 +6409,6 @@ fn new_reduction_units(
     by_target.into_values().collect()
 }
 
-/// The reductions in EFFECT this pass, snapshotted BEFORE any frozen-set mutation (the
-/// HARD-fold snapshot): every frozen `red:*` (authoritative payload) ∪ every NEW selected
-/// reduction (target not yet frozen). Keyed by target_id → (kind, payload), deterministic.
 fn effective_reductions(
     core: &CoreState,
     reductions: &[ReductionDecision],
@@ -6941,11 +6443,6 @@ fn effective_reductions(
     eff
 }
 
-/// Drop frozen `red:*` units whose target is now COVERED (ordinal at/below the new
-/// coverage). Runs on a coverage-extending SOFT, where the tail shrinks but the frozen
-/// set is otherwise kept: a reduction whose target left the tail can never be applied
-/// again (`build_output` trims covered items first), so keeping it is pure bloat and a
-/// false-conflict trap if the same target id is ever re-decided after a revert.
 fn prune_covered_red_units(
     core: &mut mc_core::CoreState,
     live: &[&FlatBlock],
@@ -6958,17 +6455,11 @@ fn prune_covered_red_units(
         };
         match live_ord.get(target) {
             Some(&ord) => is_tail(ord, new_coverage),
-            // Target absent from the live array: leave it to the HARD-fold orphan GC,
-            // which sees the authoritative post-revert array.
             None => true,
         }
     });
 }
 
-/// The `red:*` units that SURVIVE a HARD rebuild: a target that is COVERED (folded into
-/// m0) is dropped; a target in the new TAIL is kept; a target ABSENT from the live array
-/// (reverted away) is dropped as an orphan. So a unit survives iff its target is in the
-/// live array AND still in the tail after the fold.
 fn surviving_red_units(
     effective: &BTreeMap<String, (String, String, String)>,
     live: &[&FlatBlock],
@@ -6990,9 +6481,6 @@ fn surviving_red_units(
         .collect()
 }
 
-// --- render helpers (the ONLY producers of frozen bytes) ---
-
-/// Build the synthetic m0 message with the optional mural immediately after its text block.
 fn synthetic_m0_message(text: String, mural: Option<&FrozenUnit>) -> CkWireMessage {
     let mut content = vec![CkWireBlock::bare(ck_wire::CkKind::Text { text })];
     if let Some(mural) = mural {
@@ -7030,13 +6518,10 @@ fn render_mural_block(mural: &crate::m0_compose::M0MuralBlock) -> FrozenUnit {
     }
 }
 
-/// The m1 placeholder unit (a HARD resets m1 to it; m1 is never fully empty).
 fn render_m1_placeholder() -> FrozenUnit {
     synth_region("m1", M1_PLACEHOLDER.to_string())
 }
 
-/// The m1 delta unit from a composed body (an empty delta composes to the placeholder
-/// body upstream, so this is a verbatim wrap).
 fn render_m1_body(body: &str) -> FrozenUnit {
     synth_region("m1", body.to_string())
 }
@@ -7094,9 +6579,6 @@ fn tail_sel_items(
 }
 
 fn tail_end_mid(req: &TransformRequest, coverage: Option<u64>) -> Option<String> {
-    // Synthetic todo state is attached to the latest non-synthetic assistant message,
-    // never to a trailing user or tool message. If no eligible assistant exists, return
-    // None so build_output can place the stable anchor after the initial metadata blocks.
     req.messages
         .iter()
         .rev()
@@ -7515,27 +6997,16 @@ fn reanchor_kept_synthetic_todo_if_folded_or_shrunk(
     let folded_by_advance =
         anchor_folded_by_coverage(req, old_coverage, meta.coverage_ordinal, &anchor_mid);
     if !folded_by_advance && !coverage_shrunk_on_bust {
-        // TypeScript skips defer replay when a persisted real anchor disappeared from
-        // the current message set. Dropping the stale pair is safer than failing back
-        // to raw/LKG and preserves the rest of the transform response.
         meta.synthetic_todo = None;
         return Ok(());
     }
 
-    // A coverage-moving bust already changes the rendered bytes: advance folds the old
-    // anchor into history, while shrink means the old anchor was in reverted-away tail. In
-    // both cases an unchanged synthetic todo can move to the new tail end without turning
-    // into an always-last floater on ordinary tail growth or defer passes.
     debug_assert!(folded_by_advance || coverage_shrunk_on_bust);
     pair.anchor_mid = tail_end_mid(req, meta.coverage_ordinal);
     Ok(())
 }
 
-/// One immutable session baseline retained between transform passes.
 ///
-/// The store generation is advanced by SQLite triggers for every tag-table mutation. The
-/// count/max pair recognizes an append-only advance, while any other generation transition
-/// requires a full refill before the cached bytes are used again.
 #[derive(Debug, Clone)]
 struct TagBaselineCacheEntry {
     store_namespace: u64,
@@ -7564,8 +7035,6 @@ impl TagBaselineCacheEntry {
     }
 }
 
-/// Bounded process-wide cache of immutable tag payloads. The lock protects only cache metadata:
-/// SQLite probes and row hydration always happen after the snapshot has been copied out.
 #[derive(Debug)]
 struct TagBaselineCache {
     sessions: HashMap<String, TagBaselineCacheEntry>,
@@ -7656,9 +7125,6 @@ fn tag_baseline_entry(
     }
 }
 
-/// Hydrate immutable tag rows from a cold baseline or an append-only tail. A post-read probe
-/// makes a concurrent mutation retry before its bytes reach the transform, and trigger-backed
-/// generations force a cold refill for replacement or deletion.
 fn load_cached_tags(
     store: &McStore,
     session_id: &str,
@@ -7726,26 +7192,14 @@ struct TagMintWork {
     tokenized_bytes: usize,
 }
 
-/// Monotonic scan cursor for tag minting over a retained projection sequence.
 ///
-/// Keyed on each block's id + content hash so an unchanged prefix keeps its frontier
-/// across defer passes; a content or identity change anywhere before the frontier
-/// invalidates it. Frozen-target membership is part of the decision key because an
-/// unfreeze can make a previously skipped block mintable again.
 #[derive(Debug, Clone, Default)]
 struct TagMintFrontierMemo {
     block_keys: Vec<[u8; 32]>,
     frozen_key: [u8; 32],
-    /// Identity of the tag-id set the frontier assumed was durable. A rejected pass
-    /// never commits its speculative mints, so the next load sees a different set and
-    /// the memo invalidates instead of skipping untagged blocks.
     tagged_key: [u8; 32],
-    /// First index that may still need a mint decision for the retained sequence.
     frontier: usize,
-    /// Candidate count for blocks strictly before `frontier` (matches a full scan).
     candidates_before_frontier: usize,
-    /// Fingerprint of the request that produced these block keys. A projection-cache hit for this
-    /// fingerprint proves its retained prefix without hashing the same block bytes again.
     projection_fingerprint: Option<String>,
 }
 
@@ -7771,9 +7225,6 @@ fn tag_mint_frozen_key(frozen: &HashSet<String>) -> [u8; 32] {
     tag_mint_id_set_key(frozen.iter().map(String::as_str))
 }
 
-/// A block is resolved for frontier purposes when it will not receive a new mint
-/// under the current frozen set: already tagged, frozen-reduced, or not taggable.
-/// Mutation-exempt mids are temporary and do not advance the frontier past them.
 fn tag_mint_block_resolved(
     block: &FlatBlock,
     frozen: &HashSet<String>,
@@ -7859,8 +7310,6 @@ fn tag_mint_frontier_store(
     );
     memo.projection_fingerprint = projection_fingerprint.map(str::to_string);
     memo.frozen_key = tag_mint_frozen_key(frozen);
-    // Assume this pass's mints become durable. If the commit is rejected, the next
-    // load's existing tag set diverges from tagged_key and the frontier is ignored.
     let mut tagged = existing_tag_ids.clone();
     for id in newly_minted {
         tagged.insert(*id);
@@ -7960,9 +7409,6 @@ fn tag_mint_inputs_from(
     work
 }
 
-/// Bounded process-wide cache of tag-mint frontiers. The frontier is rebuilt from
-/// the projection when evicted, so the cache may trade tokenization work for a
-/// bounded daemon footprint without affecting served output.
 #[derive(Debug)]
 struct TagMintFrontierCache {
     sessions: HashMap<String, TagMintFrontierMemo>,
@@ -7990,7 +7436,7 @@ impl TagMintFrontierCache {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<[u8; 32]>()),
             )
-            // Include a conservative allowance for the HashMap bucket and owned key.
+            // The estimate includes an allowance for the `HashMap` bucket and owned key.
             .saturating_add(64)
     }
 
@@ -8032,8 +7478,6 @@ impl TagMintFrontierCache {
     }
 }
 
-/// Process-wide per-session mint frontier. Invalidated when the retained projection
-/// prefix or frozen-target set no longer matches the memoized sequence identity.
 fn tag_mint_frontier_cache() -> &'static Mutex<TagMintFrontierCache> {
     static CACHE: OnceLock<Mutex<TagMintFrontierCache>> = OnceLock::new();
     CACHE.get_or_init(|| {
@@ -8066,8 +7510,8 @@ fn append_tag_mint_rows(
     start
 }
 
-/// Return exactly the span the overlay can prefix. Mint scope and overlay scope share
-/// this predicate so every visible tag number has a renderable §N§ carrier.
+/// The returned span contains exactly what the overlay can prefix.
+/// Mint and overlay scope use the same predicate so every visible tag number has a renderable §N§ carrier.
 fn taggable_source(block: &FlatBlock) -> Option<(TaggableKind, &str)> {
     if block.synthetic || block.role == "system" {
         return None;
@@ -8100,7 +7544,7 @@ fn taggable_kind(block: &FlatBlock) -> Option<TaggableKind> {
     taggable_source(block).map(|(kind, _)| kind)
 }
 
-/// Compute the newest protected tags as exact block ids over the current canonical tail.
+/// Protected tags use exact block IDs over the current canonical tail.
 /// Stored provenance must still match the live carrier before a row can occupy a slot.
 fn newest_active_tag_block_ids(
     core: &CoreState,
@@ -8191,7 +7635,7 @@ fn tag_overlay_state(
     }
 }
 
-/// Format a mint-time delta as the deterministic prefix used by the active overlay.
+/// The active overlay uses the deterministic mint-time delta as its prefix.
 pub fn temporal_gap_prefix(gap_ms: i64) -> Option<String> {
     if gap_ms < TEMPORAL_AWARENESS_THRESHOLD_MS {
         return None;
@@ -8262,9 +7706,7 @@ fn apply_tag_overlay_to_message(
                         *tag_number,
                     );
                 }
-                // A boundary-lineage alarm forces raw pass-through, so only tags stored
-                // before this request are available. Newly seen blocks wait for a normal
-                // accepted pass rather than consuming tag numbers on rejected lineage.
+                // A boundary-lineage alarm forces raw pass-through; only tags stored before the request remain available.
             }
             if let Some(prefix) = overlay.temporal_by_block_id.get(&block.id) {
                 block_changed |= prepend_temporal_to_block(target, prefix);
@@ -8276,11 +7718,7 @@ fn apply_tag_overlay_to_message(
                 block_changed |= append_channel1_to_block(target, reminder);
             }
             if block_changed {
-                // Overlay edits mutate the typed kind in place, but Serialize
-                // prefers a block's retained ingress bytes for lossless
-                // pass-through: an uncleared block silently serializes its
-                // pre-mutation form and the edit never reaches the wire. One
-                // clear site covers every overlay mutator.
+                // Overlay mutations must clear retained ingress bytes; otherwise `Serialize` emits the pre-mutation bytes.
                 target.mark_modified();
                 modified = true;
             }
@@ -8301,11 +7739,8 @@ fn apply_tag_prefix_to_block(
         (ck_wire::CkKind::Text { text }, TaggableKind::Message)
             if role == "user" || role == "assistant" =>
         {
-            // Models imitate the tag notation they see in history, sometimes at the
-            // start of a later line in one assistant completion. Strip only line-leading
-            // tokens outside code before applying the official tag; inline and prose
-            // references remain authored content. Mint provenance still hashes the
-            // verbatim ingress bytes.
+            // The strip pass removes only line-leading tokens outside code before applying the official tag; it preserves inline and prose references as authored content.
+            // Mint provenance hashes the verbatim ingress bytes.
             let base = if role == "assistant" {
                 strip_leading_tag_imitations(text)
             } else {
@@ -8420,19 +7855,13 @@ fn prepend_tag(tag_number: i64, value: &str) -> String {
     tagged
 }
 
-/// Remove exactly the prefix added for this block's registered number. This is the
-/// inverse of [`prepend_tag`]; it never trims source whitespace or interprets another
-/// block's tag-like user content.
 fn strip_tag_prefix(value: &str, tag_number: i64) -> &str {
     value.strip_prefix(&tag_prefix(tag_number)).unwrap_or(value)
 }
 
-/// Strip runs of well-formed `§N§` tokens at the start of any non-code line.
 ///
-/// The observed imitation class is line-leading, so this conservative boundary avoids
-/// rewriting genuine references such as `the tag §12§ was dropped`. Code fences and
-/// inline-code lines stay verbatim, and a token must be followed by whitespace or ASCII
-/// punctuation so malformed text is never partially consumed.
+/// Lines inside an already-open inline-code span remain unchanged.
+/// The strip pass removes a `§N§` token only when whitespace, ASCII punctuation, or end of input follows it.
 fn strip_leading_tag_imitations(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     let mut in_fenced_code = false;
@@ -8545,9 +7974,9 @@ fn is_system_reminder_transport_message(message: &CkIngressMessage) -> bool {
     if message.ck.role != "user" || message.ck.meta.synthetic || message.ck.content.is_empty() {
         return false;
     }
-    // CK intentionally has no transport-origin field for this Claude Code shape. The
-    // decoder preserves the reminder as an ordinary user text block, so the narrowest
-    // safe discriminator is a message made entirely of balanced reminder wrappers.
+    // CK has no transport-origin field for this Claude Code shape.
+    // The decoder preserves each reminder as an ordinary user text block.
+    // The decoder treats a message as a reminder only when balanced reminder wrappers cover the entire message.
     let mut saw_text = false;
     for block in &message.ck.content {
         let ck_wire::CkKind::Text { text } = &block.kind else {
@@ -8574,8 +8003,7 @@ fn is_authored_user_message(message: &CkIngressMessage) -> bool {
 
 fn eligible_authored_user_tail(req: &TransformRequest) -> Option<&CkIngressMessage> {
     // Tool results are transport messages even when a provider carries them with role=user.
-    // Skip those carriers like synthetic and system messages, while an assistant tail still
-    // closes the authored-user eligibility window.
+    // Tool-result carriers are skipped like synthetic and system messages; an assistant tail closes authored-user eligibility.
     let tail = req.messages.iter().rev().find(|message| {
         !message.ck.meta.synthetic
             && message.ck.role != "system"
@@ -8619,8 +8047,7 @@ fn compute_active_overlay_decisions(
             .iter()
             .map(|row| row.block_id.as_str())
             .collect::<HashSet<_>>();
-        // Snapshot the session frontier outside the tokenizer walk so a slow mint
-        // does not hold the process-wide cache lock.
+        // Minting snapshots the session frontier before tokenization so slow minting does not hold the process-wide cache lock.
         let mut memo = tag_mint_frontier_cache()
             .lock()
             .expect("tag mint frontier cache mutex")
@@ -8702,10 +8129,9 @@ fn compute_active_overlay_decisions(
             continue;
         }
         let marker_text = if authored_tail.is_some_and(|tail| tail.mid == message.mid) {
-            // The gap pairs the proxy's INGRESS observation with its completion
-            // observation. Module-side now_ms would add queue plus blocking-arm
-            // latency to every gap, so a missing or invalid ingress time freezes
-            // the no-marker decision rather than guessing from a later clock.
+            // The gap spans the proxy's ingress and completion observations.
+            // Using module-side `now_ms` would add queue and blocking-arm latency to every gap.
+            // A missing or invalid ingress time freezes the no-marker decision rather than using a later clock.
             let observed_now = u64::try_from(ctx.now_ms).unwrap_or(0);
             req.request_observed_at_ms
                 .filter(|observed| *observed > 0 && *observed <= observed_now)
@@ -8721,8 +8147,7 @@ fn compute_active_overlay_decisions(
                 })
                 .unwrap_or_default()
         } else {
-            // Multiple newly observed consecutive user messages have no provider response
-            // boundary. Mint times are retained only for that rare between-users fallback.
+            // Mint times are retained only for the between-users fallback.
             previous_new_user_mint
                 .and_then(|previous| current_mint.checked_sub(previous))
                 .and_then(temporal_gap_prefix)
@@ -8742,9 +8167,8 @@ fn compute_active_overlay_decisions(
         previous_new_user_mint = Some(current_mint);
     }
 
-    // Do not advance the frontier past a user whose temporal decision could not be
-    // evaluated. A frozen reduction or another mint-ineligible shape must remain eligible
-    // for a later pass instead of silently making its marker impossible to mint.
+    // The frontier must not advance past a user whose temporal decision cannot be evaluated.
+    // The user must remain eligible for a later pass instead of silently making that user's marker impossible to mint.
     let mut decided_frontier = frontier;
     for message in req
         .messages
@@ -8783,8 +8207,8 @@ fn compute_active_overlay_decisions(
     })
 }
 
-/// Decide one durable auto-search hint for a new live user tail. The caller may render the
-/// frozen decision immediately only when this request has not served the target block before.
+/// The system stores one durable auto-search hint for a new live user tail.
+/// The function freezes the decision only when this request has not served the target block before.
 #[allow(clippy::too_many_arguments)]
 fn maybe_decide_live_user_hint(
     store: &McStore,
@@ -8820,9 +8244,8 @@ fn maybe_decide_live_user_hint(
         return Ok(None);
     }
 
-    // Suppression must inspect the raw user text before sanitization removes the markers that
-    // identify an existing augmentation. Search and length admission use the same full sanitized
-    // prompt so terms late in a long authored request remain visible to ranking.
+    // Suppression must inspect raw user text before sanitization removes markers identifying an existing augmentation.
+    // Search and length admission use the full sanitized prompt so ranking sees terms late in a long authored request.
     let message_text = user_hint_message_text(message);
     let raw_prompt = sanitize_user_hint_query(&message_text);
     let hint_text = if has_stacked_user_hint_augmentation(&message_text)
@@ -8851,8 +8274,7 @@ fn lexical_tokens(text: &str) -> BTreeSet<String> {
         "and", "are", "but", "for", "from", "have", "into", "not", "that", "the", "this", "use",
         "was", "with", "you", "your",
     ];
-    // Unicode normalization is intentionally out of scope. Case folding and provider text
-    // token boundaries are sufficient for this conservative, non-semantic hint gate.
+    // The hint gate does not apply Unicode normalization.
     text.to_lowercase()
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|token| token.chars().count() >= 3 && !STOPWORDS.contains(token))
@@ -9088,8 +8510,8 @@ pub(crate) fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
-/// Keep whole Unicode scalars while measuring the prefix in UTF-16 code units, matching the
-/// TypeScript wire renderer without producing an invalid half-surrogate in Rust output.
+/// The prefix retains whole Unicode scalars while measuring length in UTF-16 code units.
+/// The prefix matches the TypeScript wire renderer without producing an invalid half-surrogate in Rust output.
 pub(crate) fn utf16_prefix(text: &str, limit: usize) -> &str {
     let mut used = 0;
     let mut end = 0;
@@ -9132,8 +8554,8 @@ fn render_user_hint(results: &[crate::memory_tool::MemorySearchResult]) -> Optio
     let footer = "If the fragments above seem relevant to the current request, you may run ctx_search to retrieve full context. Otherwise ignore.";
     let body = [header, lines.join("\n"), footer.to_string()].join("\n");
     let wrapped = format!("<ctx-search-hint>\n{body}\n</ctx-search-hint>");
-    // Native search returns memory and compartment results only, so it does not emit commit
-    // SHA/age metadata for a result without commit provenance.
+    // Native search returns only memory and compartment results.
+    // A result without commit provenance has no commit SHA or age metadata.
     let wrapped = truncate_hint_to_total_cap(&wrapped, USER_HINT_TOTAL_CHAR_CAP);
     debug_assert!(utf16_len(&wrapped) <= USER_HINT_TOTAL_CHAR_CAP);
     Some(format!("\n\n{wrapped}"))
@@ -9299,9 +8721,6 @@ fn active_tags_for_nudge(
     out
 }
 
-/// Reuse the durable CC tag accounting when present, and derive the same accounting basis
-/// from live CK text for profiles that historically did not mint overlay tags. The latter
-/// keeps OpenCode host directives useful without enabling CC-only prompt overlays.
 fn active_tags_for_channel2(
     core: &CoreState,
     meta: &ModuleMeta,
@@ -9549,8 +8968,6 @@ fn channel2_token_aggregate(baseline: Option<&TailHygieneBaseline>) -> Option<(i
     if !baseline.evaluable || baseline.generation_invalidated {
         return None;
     }
-    // Reclaimable mass is the active, unprotected subset of every tagged text, tool, and file
-    // included in the measured tail. Reasoning is excluded from both reclaimable and total mass.
     Some(effective_tail_hygiene(baseline))
 }
 
@@ -9898,8 +9315,6 @@ fn format_reclaimable_hint(hint: &[(i64, String)]) -> String {
     format!("\noldest reclaimable: {rendered}.")
 }
 
-// --- output splice: [m0, m1] ++ tail(by coverage_ordinal) ---
-
 fn strip_unit(kind: &str, mid: &str, payload: &str) -> FrozenUnit {
     FrozenUnit {
         key: format!("strip:{kind}:{mid}"),
@@ -10019,8 +9434,6 @@ fn directive_block_end(text: &str, body_start: usize) -> usize {
     text.len()
 }
 
-/// Remove known injected regions while retaining authored text around them. A returned empty
-/// string means the caller should preserve the message/block shape with its provider sentinel.
 fn strip_system_injection(text: &str) -> Option<String> {
     let has_injection = SYSTEM_INJECTION_MARKERS
         .iter()
@@ -10142,8 +9555,6 @@ fn image_block_is_large(block: &CkWireBlock) -> bool {
     else {
         return false;
     };
-    // OpenCode's TS strip checks the original data URL length, so include the
-    // MIME/prefix bytes rather than treating a remote URL as image payload.
     data.len() + format!("data:{};base64,", media.media_type).len() > 200
 }
 
@@ -10165,8 +9576,6 @@ fn block_strip_unit<'a>(core: &'a CoreState, kind: &str, block_id: &str) -> Opti
 }
 
 fn message_tag_number(message: &CkIngressMessage, tag_numbers: &BTreeMap<String, u64>) -> u64 {
-    // TypeScript represents a missing tag as age zero for processed-image stripping. Reasoning
-    // callers separately require a positive tag before mutating signed or authored text.
     tag_numbers.get(&message.mid).copied().unwrap_or(0)
 }
 
@@ -10245,8 +9654,6 @@ fn new_frozen_strip_units(
         }
         let blocks = message.ck.content.as_slice();
         if message.ck.role == "assistant" {
-            // The reverse image scan in TS treats any assistant message as evidence
-            // that older user content has already reached the model.
             has_assistant_response = true;
         }
         if index < protected_start {
@@ -10256,9 +9663,6 @@ fn new_frozen_strip_units(
                     units.insert(unit.key.clone(), unit);
                 }
             } else {
-                // Surgical replacements freeze the cleaned text itself on this bust. Later defer
-                // passes look up the block id and replay these exact bytes without re-running the
-                // marker parser, so tail growth cannot trickle additional cache changes.
                 for (block_index, block) in blocks.iter().enumerate() {
                     let ck_wire::CkKind::Text { text } = &block.kind else {
                         continue;
@@ -10278,11 +9682,6 @@ fn new_frozen_strip_units(
             }
         }
         if message.ck.role != "user" {
-            // CC cannot rewrite or truncate an Anthropic-signed thinking block. Record the
-            // message in the same durable strip-unit applied set used by merged-reasoning healing,
-            // then remove whole reasoning blocks at render time. The unit is first minted only on
-            // this already-busting pass and replays unchanged on defers; selection.rs continues to
-            // exclude every reasoning block from ReductionDecision targets.
             if message.ck.role == "assistant"
                 && reasoning_mutation_exempt_mid != Some(message.mid.as_str())
                 && cc_reasoning_cutoff.is_some_and(|cutoff| {
@@ -10331,11 +9730,7 @@ fn new_frozen_strip_units(
         }
         if has_assistant_response
             && request_accepts_empty_content(req)
-            && age_cutoff.is_some_and(|cutoff| {
-                // Missing tags are age zero in the TypeScript lane. This decision is still
-                // minted only on a bust and then frozen by message/block id for stable replay.
-                message_tag_number(message, tag_numbers) <= cutoff
-            })
+            && age_cutoff.is_some_and(|cutoff| message_tag_number(message, tag_numbers) <= cutoff)
             && blocks.iter().any(image_block_is_large)
         {
             let marker = strip_unit("processed_image", &message.mid, &sentinel);
@@ -10346,10 +9741,6 @@ fn new_frozen_strip_units(
                 if !image_block_is_large(block) {
                     continue;
                 }
-                // Images are reductions of individual media blocks, not whole-message
-                // strips. Reusing red:* keeps image replay in the same durable machinery
-                // as tool reductions while the message marker keeps replay stable if
-                // unrelated parts change their block index.
                 let target = format!("{}#{block_index}", message.mid);
                 let unit = red_unit(&target, "image", &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
@@ -10380,9 +9771,6 @@ fn remove_frozen_historical_reasoning(
     }
 
     let before = rebuilt.content.len();
-    // Anthropic signatures authenticate the complete thinking block. Removing the block is safe;
-    // replacing or truncating its text would retain an invalid signature and produce a provider
-    // 400. Perform removal after overlays so original block indexes remain valid while rendering.
     rebuilt.content.retain(|block| !is_reasoning_block(block));
     let removed = before.saturating_sub(rebuilt.content.len());
     if removed > 0 {
@@ -10497,8 +9885,6 @@ fn surviving_strip_units(core: &CoreState, req: &TransformRequest) -> Vec<Frozen
         .iter()
         .filter(|unit| unit.key.starts_with("strip:"))
         .filter(|unit| {
-            // A request may be a transient subset or revert. Keep reasoning applied-set message
-            // ids durable so their strip resumes deterministically if they return in a later
             // full-array request.
             unit.key.starts_with("strip:merged_reasoning:")
                 || unit.key.starts_with("strip:reasoning_age:")
@@ -10713,9 +10099,6 @@ impl RendererTransitionShapes {
     }
 }
 
-/// Identify only sessions whose already-frozen bytes are changed by the compatibility renderers.
-/// The reduction-key precheck keeps unaffected sessions off the projection grouping and adjacency
-/// scans entirely; no store access is performed beyond the cache snapshot already loaded by the
 /// transform.
 fn renderer_transition_shapes(
     projection: &FlatProjection,
@@ -10805,8 +10188,6 @@ fn transition_consumed_classes(core: &CoreState) -> BTreeSet<RendererTransitionC
             continue;
         }
 
-        // An empty payload is the legacy boolean representation. It records only poisoned-reasoning
-        // and unmatched-pair adoption, leaving split-coverage classes eligible for invalidation.
         if unit.frozen_payload.trim().is_empty() {
             classes.extend(v1_transition_classes());
             continue;
@@ -10869,8 +10250,6 @@ fn full_drop_tool_ids(
             .red_by_block_id(block_id)
             .map(|unit| unit.kind.as_str())
     };
-    // Tool results need the matching call's frozen kind. Index calls once instead of rescanning
-    // the full projection for every result; long sessions contain thousands of tool blocks.
     let mut call_kind_by_id = HashMap::new();
     for block in &projection.blocks {
         let ck_wire::CkKind::ToolCall { id, .. } = &block.wire.kind else {
@@ -10898,9 +10277,6 @@ fn full_drop_tool_ids(
         if frozen_kind(block.id()) != Some("drop") {
             continue;
         }
-        // A seed containing only a tool result is a complete pair, but a skeleton or edit-marker
-        // tool call also carries the newest-window message. Keep that call paired with its result
-        // shell so the canonical message representation is preserved.
         if matches!(&block.wire.kind, ck_wire::CkKind::ToolCall { .. }) {
             remove.insert(id.clone());
             continue;
@@ -11247,10 +10623,6 @@ fn assert_no_orphaned_tool_arcs(messages: &[ServedMessage]) {
     }
 }
 
-/// Last-resort provider-validity belt. The normal ingress and render paths must keep tool-use ids
-/// unique; debug and test builds fail at the first violation so the originating path is fixed.
-/// Release builds report every violation and remove only later owners (plus an otherwise orphaned
-/// adjacent result) rather than trapping a live session in a deterministic provider-400 loop.
 fn enforce_unique_tool_use_ids(
     messages: Vec<ServedMessage>,
     session_id: &str,
@@ -11347,9 +10719,6 @@ fn new_merged_reasoning_strip_units(
     let mutation_exempt_mid = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
     let mut prev_assistant = false;
     let mut units = Vec::new();
-    // Detect against the fully rendered message so earlier reductions and sentinel replacements
-    // participate in the keep rule. The preview is never served; any changed message id is frozen,
-    // then the output is rebuilt once with those durable decisions applied.
     for rendered in rendered_messages {
         let first_assistant_in_run = rendered.role == "assistant" && !prev_assistant;
         if let Some(mid) = rendered.meta.harness_id.as_deref() {
@@ -12172,9 +11541,6 @@ fn is_mutable_merged_reasoning_block(block: &CkWireBlock) -> bool {
             .is_some_and(|extras| extras.contains_key("cache_control"))
 }
 
-/// Anthropic verifies the newest assistant's signed reasoning against the original response.
-/// Keep that assistant out of every reasoning-mutation lane, regardless of profile or whether
-/// the response is still in flight.
 fn latest_assistant_reasoning_mutation_exempt_mid(messages: &[CkIngressMessage]) -> Option<&str> {
     messages
         .iter()
@@ -12183,9 +11549,6 @@ fn latest_assistant_reasoning_mutation_exempt_mid(messages: &[CkIngressMessage])
         .map(|message| message.mid.as_str())
 }
 
-/// Whole-message mutation protection is narrower than signed-reasoning protection. It keeps the
-/// existing live-response guard for tag, reduction, and overlay mutations without withholding
-/// those unrelated mutations from every completed latest assistant.
 fn latest_assistant_message_mutation_exempt_mid(
     messages: &[CkIngressMessage],
     profile: Option<SerializerProfile>,
@@ -12215,23 +11578,12 @@ fn latest_assistant_message_mutation_exempt_mid(
         .map(|message| message.mid.as_str())
 }
 
-/// Match TS `modelAcceptsEmptyContent` for the OpenCode native request.
 ///
-/// The explicit provider id is authoritative. Missing or contradictory provider metadata must
-/// use the non-empty placeholder, just as TypeScript's exact-provider helper does.
 pub(crate) fn request_accepts_empty_content(req: &TransformRequest) -> bool {
     req.provider_id.as_deref() == Some("anthropic")
 }
 
-/// Capture the next durable reasoning cutoff only on a pass that is already busting.
 ///
-/// The cutoff is the bust cycle's immutable basis, not merely the highest message changed on
-/// that pass. Persisting it even when no currently visible assistant is eligible prevents a
-/// restart or a later tail step from re-deriving a newer cutoff and trickling old reasoning out
-/// one message at a time. OpenCode clears at its final native boundary; Claude Code freezes a
-/// whole-block-removal unit because Anthropic-signed thinking may never be text-rewritten.
-/// Mid-turn busts still capture the historical cutoff; the newest live assistant remains
-/// protected by the render and native-serving exemptions.
 fn reasoning_clear_cutoff_with_tags(
     req: &TransformRequest,
     profile: Option<SerializerProfile>,
@@ -12255,15 +11607,8 @@ fn reasoning_clear_cutoff_with_tags(
     }
 }
 
-/// Apply the final OpenCode D2 replay to native message parts.
 ///
-/// The CK transform deliberately leaves ingress reasoning available to identity and block
-/// fingerprint checks. Native serving is the provider boundary, so this pass replaces only
-/// eligible historical typed reasoning with empty typed-reasoning shells after the codec has
 /// finished.
-/// That ordering is important: the codec's latest-assistant ingress shortcut cannot reintroduce
-/// a signed block after this function runs. The canonical OpenCode Anthropic adapter removes
-/// these sentinels before dispatch, so no rewritten text or stale signature reaches Anthropic.
 #[cfg(test)]
 pub(crate) fn clear_served_native_reasoning(
     profile: SerializerProfile,
@@ -12286,8 +11631,7 @@ pub(crate) fn clear_served_native_reasoning(
     )
 }
 
-// Native encoding is deliberately last: it needs both the CK result and ingress/tag
-// ownership to prevent the codec's latest-assistant shortcut from restoring old reasoning.
+// Ingress/tag ownership prevents the codec's latest-assistant shortcut from restoring old reasoning.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn clear_served_native_reasoning_with_tags(
     profile: SerializerProfile,
@@ -12889,7 +12233,6 @@ pub(crate) mod tests {
         );
         let unconfigured_response =
             serde_json::to_value(transform(&s, &unconfigured, &unconfigured_ctx).unwrap()).unwrap();
-        // When MC took marker ownership, making “no entry” assert the default changed the first-pass wire 1h -> 5m.
         assert!(unconfigured_response.get("cache_ttl").is_none());
         assert_eq!(
             internal_assumed_cache_lifetime_for_profile(
@@ -12967,10 +12310,8 @@ pub(crate) mod tests {
 
     #[test]
     fn first_pass_band_denominator_prefers_geometry_soft_over_the_constant_guess() {
-        // Turn one carries geometry (resolved at the gateway from headers) but
-        // no usage (no observed pass yet). The band denominator must read the
-        // resolved soft value, not the 200k constant; a present usage value
-        // still wins so the geometry-contract belt (bands read usage) holds.
+        // When usage is absent, bands use resolved soft geometry.
+        // Usage overrides resolved soft geometry; implausible geometry falls back to 200k.
         let geometry = TransformGeometry {
             usable_soft: 167_000,
             usable_hard: 200_000,
@@ -12980,7 +12321,6 @@ pub(crate) mod tests {
             effective_context_limit_tokens(&ModuleUsage::default(), Some(&geometry)),
             167_000.0
         );
-        // Usage present: geometry must NOT override the band denominator.
         assert_eq!(
             effective_context_limit_tokens(
                 &ModuleUsage {
@@ -12992,7 +12332,6 @@ pub(crate) mod tests {
             ),
             150_000.0
         );
-        // Implausible geometry soft falls through to the constant.
         let implausible = TransformGeometry {
             usable_soft: 12,
             usable_hard: 200_000,
@@ -13294,8 +12633,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Build the omitted-wire and explicit-false forms of one request through the
-    /// SAME wire deserialization path, differing only in tool_present presence.
     fn wire_pair_absent_and_explicit_false(
         base: TransformRequest,
     ) -> (TransformRequest, TransformRequest) {
@@ -13311,11 +12648,8 @@ pub(crate) mod tests {
         (absent, explicit)
     }
 
-    /// Build an ingress message THROUGH WIRE DESERIALIZATION, the way real traffic
-    /// arrives. Deserialized messages retain `original` pass-through bytes on the
-    /// message AND every block; typed-constructor fixtures (`from_parts`/`bare`)
-    /// don't, which is exactly how an output-overlay bug can hide from a fixture
-    /// while dropping bytes on the wire.
+    /// Wire deserialization preserves original pass-through bytes on each message and block; typed fixtures do not.
+    /// Typed fixtures cannot detect output-overlay bugs that drop pass-through bytes.
     fn wire_item(role: &str, id: &str, ordinal: u64, texts: &[&str]) -> CkIngressMessage {
         let content: Vec<Value> = texts
             .iter()
@@ -13334,11 +12668,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Mirror of the first live rig drive's beat shape: a CC session whose first
-    /// user message carries several text blocks (system-reminder wrappers around
-    /// the prompt), followed by an assistant reply and a fresh user turn, all
-    /// built through wire deserialization so blocks retain pass-through bytes.
-    /// The drive observed zero tag prefixes on the second active pass.
     #[test]
     fn rig_shape_second_active_pass_tags_wire_deserialized_tail() {
         let dir = tempfile::tempdir().unwrap();
@@ -13374,8 +12703,8 @@ pub(crate) mod tests {
             ],
         );
         // A Claude Code model with no explicit TTL inherits the harness's one-hour marker.
-        // Advance past that lifetime so the idle-TTL trigger still drives the second active pass;
-        // without an observed prior response time the pass stays SOFT-class.
+        // The 3_700_000 ms timestamp exceeds the one-hour TTL, so the idle-TTL trigger drives the second active pass.
+        // Without an observed prior response time, the scheduler classifies the pass as SOFT.
         let mut ttl_ctx = pctx("git:proj", "/nonexistent-docs", 3_700_000);
         ttl_ctx.observed_last_response_at_ms = Some(1);
         ttl_ctx.injected_reductions = spine().to_vec();
@@ -13396,9 +12725,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Wire-deserialized tool-result ingress message. `output_json` is the raw
-    /// CkToolOutput JSON so each output variant (text / error_text / content) can
-    /// be exercised with retained pass-through bytes on the block.
+    /// Wire deserialization retains pass-through bytes on each tool-result block; `output_json` contains raw CkToolOutput JSON.
     fn wire_tool_result(id: &str, ordinal: u64, output_json: Value) -> CkIngressMessage {
         let ck: CkWireMessage = serde_json::from_value(json!({
             "role": "user",
@@ -13419,7 +12746,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Wire-deserialized assistant tool-call message pairing a later tool result.
+    /// Wire deserialization creates an assistant tool-call message that pairs with a later tool result.
     fn wire_tool_call(id: &str, ordinal: u64, call_id: &str) -> CkIngressMessage {
         let ck: CkWireMessage = serde_json::from_value(json!({
             "role": "assistant",
@@ -13439,8 +12766,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Drive one session to the second active pass (tags emitting) over the given
-    /// tail and return the serialized output for byte-level assertions.
     fn second_active_pass_json(session: &str, messages: Vec<CkIngressMessage>) -> String {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -13452,10 +12777,8 @@ pub(crate) mod tests {
         serde_json::to_string(&second.ck_messages).unwrap()
     }
 
-    /// Every tool-result output variant the overlay can prefix must survive
-    /// serialization when the fixture arrives through wire deserialization
-    /// (retained pass-through bytes on the block). Each case fails if the
-    /// overlay stops clearing the mutated block's retained bytes.
+    /// Wire fixtures must preserve every prefixable tool-result output variant and each block's pass-through bytes through serialization.
+    /// Each case fails when the overlay no longer clears the retained bytes of the block it mutates.
     #[test]
     fn wire_tool_result_text_variant_tags_survive_serialization() {
         let joined = second_active_pass_json(
@@ -13533,9 +12856,7 @@ pub(crate) mod tests {
         run(&s, &req, &spine());
         s.seed_channel1_append_for_test("wire-ch1", "t1#0", "reminder: reduce spent outputs", 5)
             .unwrap();
-        // Ingress always carries the ORIGINAL bytes (tags exist only on the
-        // provider wire; raw ingress bytes are identity), so the same request
-        // replays and the append rides the shared overlay clear site.
+        // Ingress retains the original provider-wire bytes; tags exist only on the provider wire, so repeated requests replay identically and appends use the shared overlay-clear path.
         let third = run(&s, &req, &spine());
         let joined = serde_json::to_string(&third.ck_messages).unwrap();
         assert!(
@@ -13544,9 +12865,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Mixed-message canary: a mutated block must canonicalize while its untouched
-    /// sibling keeps its retained pass-through bytes VERBATIM, including unknown
-    /// fields serde would drop, and message-level provenance survives.
+    /// A mutated block must canonicalize while its untouched sibling retains its pass-through bytes verbatim, including unknown fields that serde would drop; message-level provenance must also survive.
     #[test]
     fn overlay_canonicalizes_only_the_mutated_block() {
         let dir = tempfile::tempdir().unwrap();
@@ -13684,10 +13003,7 @@ pub(crate) mod tests {
         assert_eq!(tail_bytes(&replay, "image-user"), "");
     }
 
-    /// Models copy the tag notation they see in history onto their own replies.
-    /// The overlay must strip those imitation prefixes on assistant text at any
-    /// line start while preserving mid-prose references on ACTIVE passes. False
-    /// passes serve the ingress bytes untouched.
+    /// On ACTIVE passes, the overlay strips imitation prefixes at every assistant-text line start but preserves mid-prose references; on false passes, ingress bytes remain unchanged.
     #[test]
     fn assistant_tag_imitation_prefixes_strip_on_active_passes_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -13716,7 +13032,7 @@ pub(crate) mod tests {
             "model-authored leading prefixes must not reach the wire on active passes: {joined}"
         );
 
-        // False pass on the same session: ingress bytes verbatim (no strip, no tags).
+        // A false pass on the same session preserves ingress bytes verbatim without stripping prefixes or adding tags.
         let mut inactive = cc_req("imitation", "cfg0", messages);
         inactive.tool_present = false;
         let off = run(&s, &inactive, &spine());
@@ -13727,13 +13043,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// The strip's inter-prefix separator class is full whitespace: models copy
-    /// imitation prefixes separated by spaces, tabs, or newlines, and a leaked
-    /// separator would put the imitation back on the wire behind the official
-    /// tag. Malformed shapes and mid-prose references must stay verbatim.
+    /// The strip treats all whitespace as an inter-prefix separator.
+    /// Malformed tag shapes and mid-prose references remain verbatim.
     #[test]
     fn strip_leading_tag_imitations_covers_whitespace_and_preserves_malformed() {
-        // Multi-prefix runs across every separator class strip completely.
         assert_eq!(
             strip_leading_tag_imitations("\u{a7}39\u{a7} \u{a7}40\u{a7} BEAT"),
             "BEAT"
@@ -13750,7 +13063,6 @@ pub(crate) mod tests {
             strip_leading_tag_imitations("\u{a7}39\u{a7} \n\t \u{a7}40\u{a7} BEAT"),
             "BEAT"
         );
-        // Malformed leading shapes are NOT well-formed prefixes: verbatim.
         assert_eq!(
             strip_leading_tag_imitations("\u{a7}39 BEAT"),
             "\u{a7}39 BEAT"
@@ -13759,7 +13071,6 @@ pub(crate) mod tests {
             strip_leading_tag_imitations("\u{a7}\u{a7} BEAT"),
             "\u{a7}\u{a7} BEAT"
         );
-        // Mid-prose references stay: the strip is anchored to the head.
         assert_eq!(
             strip_leading_tag_imitations("I dropped \u{a7}12\u{a7} earlier"),
             "I dropped \u{a7}12\u{a7} earlier"
@@ -13934,8 +13245,6 @@ pub(crate) mod tests {
         Vec::new()
     }
 
-    /// A store compartment covering raw ordinals `start..=end`, ending at message id
-    /// `end_id`, rendered at P1 with body `p1`. The m0 baseline is composed from these.
     fn comp(seq: i64, start: i64, end: i64, end_id: &str, p1: &str) -> StoredCompartment {
         StoredCompartment {
             sequence: seq,
@@ -14028,10 +13337,6 @@ pub(crate) mod tests {
         meta.coverage_start_ordinal = Some(1);
         meta.coverage_compartment_seq = Some(1);
         meta.folded_compartment_seq = 1;
-        // Production row read for ses_08df2045… on 2026-08-08: initialized=1,
-        // coverage_ordinal=425, m1_revision=1644131851866052375,
-        // publication_floor_ordinal=2417 (present, not rewound), and max compartment sequence 47
-        // ending near ordinal 2400. The fixture's 2401 floor is intentionally close to that row.
         meta.publication_floor_ordinal = Some(2_401);
         store
             .commit(&request.session_id, loaded.row_version, &core, &meta)
@@ -14039,8 +13344,8 @@ pub(crate) mod tests {
         request
     }
 
-    /// A producer context over a throwaway project dir (no docs on disk → empty docs
-    /// block). `now_ms` is FIXED per test (never wall-clock) so the frozen expiry cutoff
+    /// The producer context uses a throwaway project directory with no documentation files, so its docs are empty.
+    /// Each test fixes `now_ms` instead of reading the wall clock, so expiry uses a deterministic cutoff.
     /// is deterministic.
     fn pctx<'a>(project: &'a str, dir: &'a str, now_ms: i64) -> ProducerContext<'a> {
         ProducerContext {
@@ -14276,8 +13581,8 @@ pub(crate) mod tests {
         let (input, limit) = if context_limit_tokens >= min {
             (current_total_input_tokens, context_limit_tokens)
         } else if context_limit_tokens > 0 {
-            // Shorthand fixtures (e.g. 70/100 for 70% usage): scale to a plausible limit
-            // while preserving the implied percentage.
+            // The fixtures preserve the implied percentage when scaling shorthand values such as 70/100.
+            // Fixtures preserve the implied percentage when scaling shorthand values.
             let pct = current_total_input_tokens as f64 / context_limit_tokens as f64;
             let limit = 100_000u64;
             let input = (pct * limit as f64).round().max(1.0) as u64;
@@ -14306,8 +13611,8 @@ pub(crate) mod tests {
         ]
     }
 
-    /// Run a transform with a default producer context (project "git:proj", a nonexistent
-    /// docs dir, now_ms=0). Most tests don't vary the context.
+    /// The fixture fixes `now_ms` to avoid wall-clock-dependent expiry and uses an empty docs directory to avoid injected documentation.
+    /// The fixture fixes `now_ms` to avoid wall-clock-dependent expiry and uses an empty docs directory to avoid injected documentation.
     fn assert_no_duplicate_tool_use_ids(messages: &[ServedMessage]) {
         assert!(
             duplicate_tool_use_locations(messages).is_empty(),
@@ -14587,17 +13892,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// Projection content_hash reuse and tag-mint frontier scanning must not change
-    /// served bytes or divergence attribution rows versus the prior full-rehash /
+    /// Projection `content_hash` reuse and tag-mint frontier scanning preserve served bytes and divergence attribution relative to a full rehash.
+    /// Projection `content_hash` reuse and tag-mint frontier scanning preserve served bytes and divergence attribution relative to a full rehash.
     /// full-scan algorithms.
     #[test]
     fn parked_p2_fingerprint_reuse_and_tag_frontier_match_baseline() {
-        // --- unit: fingerprint reuse vs forced rehash on a mixed message ---
         let multi = wire_item("user", "multi", 0, &["alpha", "beta"]);
         let multi_proj = project_messages(std::slice::from_ref(&multi)).unwrap();
         let multi_blocks: Vec<&FlatBlock> = multi_proj.blocks.iter().collect();
         let mut multi_rendered = multi.ck.clone();
-        // Overlay only the second text block so the first stays projection-identical.
+        // The test overlays only the second text block so the first remains projection-identical.
         if let ck_wire::CkKind::Text { text } = &mut multi_rendered.content[1].kind {
             *text = format!("\u{a7}2\u{a7} {text}");
         }
@@ -14628,7 +13932,6 @@ pub(crate) mod tests {
             "overlaid block must re-hash rather than reuse the pre-overlay digest"
         );
 
-        // --- unit: tag-mint frontier memo vs full scan across append-only passes ---
         let mut memo = TagMintFrontierMemo::default();
         let core = CoreState::default();
         let pass1 = project_messages(&[
@@ -14674,7 +13977,6 @@ pub(crate) mod tests {
         assert_same_tag_mint_work(&memo2, &full2);
         assert_eq!(memo2.inputs.len(), 1, "only the appended block mints");
 
-        // --- e2e: tags + divergence-active mixed fixture ---
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let session = "p2-fingerprints-frontier";
@@ -14707,7 +14009,6 @@ pub(crate) mod tests {
             "active tagging must prefix served text: {joined}"
         );
 
-        // Stable defer: no divergence, tags retained, output byte-stable.
         let stable = run(&store, &active, &spine());
         assert!(stable.first_divergence.is_none());
         assert_eq!(
@@ -14715,7 +14016,6 @@ pub(crate) mod tests {
             serde_json::to_value(second.messages()).unwrap()
         );
 
-        // Divergence-active rewrite of a middle message.
         let diverged = active_cc_req(
             session,
             "cfg0",
@@ -14734,8 +14034,8 @@ pub(crate) mod tests {
         assert_eq!(row.block_id_old.as_deref(), Some("m1#0"));
         assert_eq!(row.block_id_new.as_deref(), Some("m1#0"));
 
-        // Fingerprints stored for the diverged pass match a forced-rehash rebuild of
-        // the same served messages (proves attribution rows stay on the same basis).
+        // The diverged-pass fingerprints match a forced-rehash rebuild of the same served messages.
+        // The diverged-pass fingerprints match a forced-rehash rebuild of the same served messages, so attribution rows use the same basis.
         let loaded = store.load(session).unwrap();
         let forced_messages: Vec<ServedMessage> = third
             .messages()
@@ -14930,7 +14230,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Call-only half used only by fixtures that append the answering result as the next message.
+    /// Fixtures use the call-only half only when they append the answering result as the next message.
     fn open_todowrite_call(mid: &str, ordinal: u64, todos: Value) -> CkIngressMessage {
         CkIngressMessage {
             mid: mid.to_string(),
@@ -14953,7 +14253,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Completed OpenCode tool-part shape: decode projects its call and result into one CK message.
+    /// `decode` projects a tool call and its result into one CK message.
     fn todowrite_call(mid: &str, ordinal: u64, todos: Value) -> CkIngressMessage {
         let mut message = open_todowrite_call(mid, ordinal, todos);
         message
@@ -15046,14 +14346,7 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    /// Cross-repo drift pin for the shared CK wire fixture. Three parties ride
-    /// this exact byte shape (llm-runner produces it, this module parses it,
-    /// the thalamus gateway produces it), and each repo vendors its own copy, so a
-    /// one-sided regeneration would leave every repo locally green while the
-    /// wire silently drifts. Each repo pins the fixture's sha256; a regen
-    /// fails the pin everywhere until each consumer deliberately re-vendors
-    /// and updates its constant. llm-runner owns the canonical fixture and
-    /// announces the new sha when it legitimately changes.
+    /// The SHA-256 pin requires an explicit expected-hash update when this fixture changes.
     #[test]
     fn ck_wire_golden_bytes_match_cross_repo_pin() {
         use sha2::{Digest, Sha256};
@@ -15112,8 +14405,7 @@ pub(crate) mod tests {
 
     #[test]
     fn opaque_and_media_project_verbatim_across_passes() {
-        // Opaque is a first-class carrier: it must project with verbatim bytes and
-        // an "opaque" kind tag rather than rejecting provider-native blocks.
+        // Opaque provider-native blocks project with verbatim bytes and an `opaque` kind tag instead of being rejected.
         let opaque = CkIngressMessage {
             mid: "opaque".to_string(),
             ordinal: 1,
@@ -15136,8 +14428,7 @@ pub(crate) mod tests {
         assert_eq!(projection.blocks.len(), 1);
         let block = &projection.blocks[0];
         assert_eq!(block.kind_tag, "opaque");
-        // Verbatim source bytes: the serialized block must round-trip the
-        // source-tagged struct shape ({"source":"wire","wire":...}) untouched.
+        // The serialized block round-trips the source-tagged shape `{"source":"wire","wire":...}` unchanged.
         assert!(block
             .bytes
             .contains("\"source\":{\"source\":\"wire\",\"wire\":\"test\"}"));
@@ -15215,8 +14506,7 @@ pub(crate) mod tests {
         let partial = assistant_form("tail", 1, &["partial"]);
         let complete = assistant_form("tail", 1, &["partial", "completed"]);
 
-        // A completed tail can grow after an earlier observation. Re-adopt the completed
-        // identity instead of rejecting a valid conversation update.
+        // The updater re-adopts a completed identity when its tail grows after an earlier observation.
         transform(
             &store,
             &req(session, "cfg0", vec![partial.clone()]),
@@ -15752,9 +15042,7 @@ pub(crate) mod tests {
         let r = run(&s, &req("roundtrip", "cfg0", inbound.clone()), &spine());
         assert_eq!(r.action, "SOFT+");
         assert!(!r.committed);
-        // This fixture starts with a covered system message. It should move out of the
-        // live message list and replay from frozen m0 while the remaining live messages
-        // keep their original bytes.
+        // The transform moves the covered system message from the live list to frozen m0 and preserves the remaining live-message bytes.
         assert!(r.messages()[0].meta.synthetic);
         assert_eq!(
             covered_system_entries(m0_bytes(&r)),
@@ -15962,10 +15250,7 @@ pub(crate) mod tests {
         );
         let first_bytes = serde_json::to_vec(&first.ck_messages).unwrap();
 
-        // Reset only the age watermark so this test remains about the emergency selector's
-        // same-sample latch. The first force pass advances the age watermark; without this
-        // reset, the second pass could legitimately select the emergency-reserved newer arc
-        // through the separate two-pass selector.
+        // The test resets the age watermark before the second force pass so the selector reserves the newer arc.
         let loaded = s.load("subagent").unwrap();
         let mut meta = loaded.meta.clone();
         meta.last_execute_ordinal = 0;
@@ -16276,8 +15561,8 @@ pub(crate) mod tests {
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.observed_last_response_at_ms = Some(0);
         let execute = transform(&s, &execute_req, &ctx).unwrap();
-        // A zero-drop execute is byte-identical and cannot move the age watermark. A
-        // pressure level is not an application edge, so residency alone remains silent.
+        // A zero-drop execute is byte-identical and cannot move the age watermark.
+        // A pressure level is not an application edge, so residency alone remains silent.
         assert_eq!(execute.action, "SOFT+");
         assert_eq!(serde_json::to_vec(&execute.ck_messages).unwrap(), before);
         assert_eq!(opencode_native_bytes(&execute, "ses"), before_native);
@@ -16286,7 +15571,7 @@ pub(crate) mod tests {
             meta.last_execute_ordinal, 0,
             "zero-drop execute must keep the two-pass watermark frozen"
         );
-        // And the pass after it, with an unchanged tail, is a true no-write defer.
+        // The next pass with an unchanged tail performs a no-write defer.
         let again = transform(&s, &execute_req, &ctx).unwrap();
         assert!(!again.committed);
         assert_eq!(serde_json::to_vec(&again.ck_messages).unwrap(), before);
@@ -16755,15 +16040,7 @@ pub(crate) mod tests {
 
     #[test]
     fn periodic_fold_cadence_batches_whole_age_sets_and_freezes_watermark_between_folds() {
-        // End-to-end periodic cadence for the age lane: a band-resident session (fill
-        // pinned above the execute threshold on EVERY pass) mints one new tool arc per
-        // pass and takes a fold bust every third pass. Between folds each pass must
-        // render byte-identically and leave the watermark frozen; at each fold the whole
-        // accumulated eligible batch must apply at once and the watermark must jump to
-        // that fold pass's tail ordinal. The pressure boot stamps the first watermark
-        // organically (an application opportunity with an empty batch), so no state is
-        // poked directly. A parallel no-pressure store renders the same message arrays
-        // as the byte-identity reference.
+        // With fill pinned above the execute threshold, every third pass folds all accumulated eligible tool arcs and advances the watermark to that pass's tail ordinal; other passes preserve bytes and leave the watermark unchanged.
         const SESSION: &str = "two-pass-periodic-cadence";
         const TOTAL_PASSES: u64 = 9;
 
@@ -16856,8 +16133,7 @@ pub(crate) mod tests {
             let bytes = canonical_output(response.messages());
             let reference_bytes = canonical_output(reference_response.messages());
             if fold {
-                // (b) + (c): the whole accumulated eligible batch applies at once and the
-                // watermark jumps to this fold pass's tail ordinal.
+                // Each fold applies all accumulated eligible reductions and advances the watermark to the fold pass's tail ordinal.
                 assert_eq!(response.action, "SOFT", "fold pass {pass} must bust");
                 let fold_index = pass / 3;
                 let first_new = if fold_index == 1 {
@@ -16901,7 +16177,7 @@ pub(crate) mod tests {
                 );
                 expected_watermark = next_ordinal - 1;
             } else {
-                // (a) + (d): byte-identity and a frozen watermark on every non-riding pass.
+                // Each non-riding pass preserves bytes and leaves the watermark unchanged.
                 assert_eq!(
                     response.action, "SOFT+",
                     "non-riding pass {pass} must stay defer-shaped"
@@ -16944,11 +16220,10 @@ pub(crate) mod tests {
 
     #[test]
     fn injected_reductions_cannot_starve_or_convey_the_watermark() {
-        // The test-only injection seam replaces the native decision set AFTER selection,
-        // so the applied batch is never the native two-pass batch. The watermark must
-        // ignore the injected decisions entirely and follow the opportunity predicate:
-        // a riding pass advances it, a pressure-free pass keeps it frozen no matter how
-        // many injected reductions bust it.
+        // The test-only injection seam replaces the native decision set after selection.
+        // The applied batch is never the native two-pass batch.
+        // The watermark ignores injected decisions and follows the opportunity predicate.
+        // A riding pass advances the watermark; a pressure-free pass keeps the watermark frozen regardless of injected reductions.
         const SESSION: &str = "injected-watermark";
 
         let dir = tempfile::tempdir().unwrap();
@@ -16976,9 +16251,8 @@ pub(crate) mod tests {
             "a no-pressure boot must not stamp the watermark"
         );
 
-        // Riding pass under injection: the native batch (empty at a zero watermark) is
-        // replaced by the injected decision, yet the opportunity predicate still advances
-        // the watermark over the whole tail — injection cannot starve it.
+        // On a riding pass under injection, the injected decision replaces the native batch, which is empty at a zero watermark.
+        // The opportunity predicate still advances the watermark over the whole tail.
         s.arm_soft_refresh(SESSION).unwrap();
         let mut riding_ctx = pctx("git:proj", "/nonexistent-docs", 0);
         riding_ctx.cache_ttl = "never".to_string();
@@ -17006,8 +16280,8 @@ pub(crate) mod tests {
             "the riding opportunity must advance the watermark despite the injection"
         );
 
-        // Defer under injection: the injected reduction forces a bust, but without
-        // pressure there is no opportunity — injection cannot convey the watermark.
+        // The injected reduction forces a bust.
+        // Without pressure, injection cannot convey the watermark.
         let mut defer_ctx = pctx("git:proj", "/nonexistent-docs", 0);
         defer_ctx.cache_ttl = "never".to_string();
         defer_ctx.injected_reductions =
@@ -18787,8 +18061,7 @@ pub(crate) mod tests {
             "the target arc must be whole-message ineligible"
         );
 
-        // Arm A is the historical as-sent failure: full removal leaves a reasoning-only
-        // assistant immediately before the next reasoning-bearing assistant.
+        // Arm A fully removes the message, leaving a reasoning-only assistant before the next reasoning-bearing assistant.
         let mut lone_reasoning = source[0].ck.clone();
         lone_reasoning.content.truncate(1);
         let arm_a = vec![
@@ -18809,12 +18082,10 @@ pub(crate) mod tests {
             .iter()
             .all(|message| reasoning_count(message) <= 1));
 
-        // Arm C performs the provider's merge explicitly and retains the same failure.
         let arm_c = merge_same_roles(&arm_a);
         assert!(arm_c.iter().any(|message| reasoning_count(message) == 2));
 
-        // Arm D removes a different assistant. It avoids duplicate thinking but leaves a
-        // reasoning-only assistant together with an unpaired ToolResult.
+        // Arm D avoids duplicate thinking but leaves a reasoning-only assistant with an unpaired ToolResult.
         let arm_d = vec![lone_reasoning, source[3].ck.clone()];
         assert!(has_reasoning_only_assistant(&arm_d));
         assert!(
@@ -19562,19 +18833,10 @@ pub(crate) mod tests {
         ));
     }
 
-    // ===== Module-integration tests: STORE STATE in → compose+core bytes out.
-    // The cache MECHANICS (defer-replay, the SOFT/HARD taxonomy, reduction freeze/replay)
-    // are owned by cortexkit-cache-core's golden vectors + the live-daemon harness; these
-    // tests prove the MC module's job: resolve → compose-from-store → wire-to-core. m0 is
-    // a compartment SUMMARY composed from the store (NOT live bytes), so "cover ordinal N"
-    // means a store compartment covering N, and the raw boundary message stays in the live
-    // input (only absent from the OUTPUT tail). =====
-
     #[test]
     fn bootstrap_with_no_compartments_is_empty_baseline_whole_array_is_tail() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        // no compartments → nothing summarized → empty boundary, the live array is all tail
         let r = run(
             &s,
             &req("ses", "cfg0", vec![item("a", 1, "<h>BASE</h>")]),
@@ -19582,7 +18844,6 @@ pub(crate) mod tests {
         );
         assert_eq!(r.action, "HARD", "first pass materializes a baseline");
         assert_eq!(r.boundary_id, "", "no compartment → no coverage anchor");
-        // m0 is the empty-history placeholder baseline (no docs/memories seeded)
         assert!(
             m0_bytes(&r).contains("<session-history></session-history>"),
             "{}",
@@ -19595,12 +18856,6 @@ pub(crate) mod tests {
 
     #[test]
     fn empty_store_bootstrap_then_defers_stably_without_hard_oscillation() {
-        // A session with no compartments keeps boundary_id = "" for its whole
-        // pre-first-compartment life. That empty id is the "no boundary ever minted"
-        // sentinel, NOT a "boundary reverted away" signal, so repeated identical passes
-        // after the bootstrap HARD must stay pure defers — never oscillate back into a
-        // HARD by treating the vacuous boundary as reconcile-pending. (The bytes stay
-        // identical either way, so this guards telemetry honesty + write churn, not a
         // prefix-cache bust.)
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -19632,33 +18887,19 @@ pub(crate) mod tests {
 
     #[test]
     fn first_compartment_published_after_empty_bootstrap_hard_folds_and_mints_boundary() {
-        // The production historian arc: a fresh session bootstraps EMPTY (boundary_id "" —
-        // never minted), runs turns, THEN the historian publishes the session's FIRST
-        // compartment mid-session. That publish cannot ride m1 as a SOFT delta (a SOFT delta
-        // needs the boundary present so the compartment can splice onto it, and none exists
-        // yet), so without the first-fold HARD trigger it would strand on defer forever. It
-        // must instead HARD-fold and MINT the first boundary.
         //
-        // The first compartment is at SEQUENCE 0 on purpose: max_compartment_seq COALESCEs a
-        // missing MAX to 0 and folded_compartment_seq defaults to 0, so a seq-comparison
-        // trigger (max > folded) reads 0 > 0 = false and silently misses exactly this case.
-        // The presence-based guard (empty boundary + a compartment exists) catches it.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
 
-        // Pass 1: empty store, two live turns → bootstrap HARD, empty boundary, all tail.
         let live1 = vec![item("a", 1, "<h>first</h>"), item("t2", 2, "turn two")];
         let boot = run(&s, &req("ses", "cfg0", live1.clone()), &spine());
         assert_eq!(boot.action, "HARD", "bootstrap HARD");
         assert_eq!(boot.boundary_id, "", "boundary never minted yet");
         assert_eq!(tail_ids(&boot), vec!["a", "t2"]);
 
-        // A defer before publish stays a pure defer (the empty-boundary no-oscillation path).
         let pre = run(&s, &req("ses", "cfg0", live1.clone()), &spine());
         assert_eq!(pre.action, "SOFT+", "no compartment yet → pure defer");
 
-        // The historian publishes the FIRST compartment at SEQUENCE 0, covering ordinal 1
-        // (raw message "a"). Same live array — "a" is still the raw covered message.
         s.replace_compartments("ses", &[comp(0, 1, 1, "a", "S0-FIRST")])
             .unwrap();
         let fold = run(&s, &req("ses", "cfg0", live1.clone()), &spine());
@@ -19681,8 +18922,6 @@ pub(crate) mod tests {
             "covered ordinal 1 trimmed from tail"
         );
 
-        // ONE-SHOT: with the boundary now minted, a defer stays a pure defer (NOT a repeated
-        // HARD) — the guard is self-limiting.
         let defer = run(&s, &req("ses", "cfg0", live1), &spine());
         assert_eq!(
             defer.action, "SOFT+",
@@ -19690,8 +18929,6 @@ pub(crate) mod tests {
         );
         assert!(!defer.committed, "a settled defer does not write");
 
-        // ONE-SHOT continued: a SECOND compartment publishes → it RIDES m1 as a SOFT delta
-        // (valid now that the boundary exists to splice onto), NOT another first-fold HARD.
         s.replace_compartments(
             "ses",
             &[
@@ -19728,13 +18965,6 @@ pub(crate) mod tests {
 
     #[test]
     fn fold_minting_wrong_vocabulary_anchor_fails_loud_instead_of_looping() {
-        // A compartment whose end_message_id is a BARE message id ("m1") instead of the
-        // flat block id ("m1#0"). Presence checks live flat block ids, so a fold that
-        // mints the bare id produces an anchor that can NEVER be present: the next pass
-        // reads boundary-absent, sets reconcile, HARDs, re-mints the same bare id — an
-        // unbounded phantom-HARD loop (each HARD byte-identical, so it is invisible to
-        // the provider cache but burns a version bump + full recompose every pass). The
-        // guard must fail the MINTING pass loudly instead.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments(
@@ -19759,17 +18989,14 @@ pub(crate) mod tests {
             Err(TransformError::BoundaryNotPresent(_)) => {}
             other => panic!("expected BoundaryNotPresent, got {other:?}"),
         }
-        // Nothing committed → the error stays visible on retry, never a silent loop.
         let retry = transform(&s, &req("ses", "cfg0", live), &ctx);
         assert!(matches!(retry, Err(TransformError::BoundaryNotPresent(_))));
     }
 
     #[test]
     fn fold_minting_empty_anchor_with_coverage_fails_loud() {
-        // An empty end_message_id with real coverage would mint boundary_id="" — the
-        // reserved no-boundary sentinel — while compartments exist. The first-fold
-        // trigger (empty boundary + compartments present) would then re-fire a HARD on
-        // every pass forever. The guard catches the empty mint at the source.
+        // An empty minted boundary with compartments present would re-trigger the first-fold HARD.
+        // The minting guard rejects an empty `end_message_id` before it can create the loop.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments(
@@ -19795,13 +19022,10 @@ pub(crate) mod tests {
 
     #[test]
     fn coverage_extending_soft_minting_absent_anchor_fails_loud() {
-        // Same invariant on the OTHER mint site: a second compartment publishing with a
-        // wrong-vocabulary end_message_id rides a coverage-extending SOFT — the advanced
-        // anchor must exist in the live array or the session decays into the same
-        // reconcile-HARD loop one pass later.
+        // The SOFT coverage-advance path must require its boundary ID to appear in the live flat block IDs.
+        // Otherwise, the next pass treats the boundary as absent and performs a reconciliation HARD.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        // Healthy first fold (flat vocabulary).
         s.replace_compartments("ses", &[comp(0, 1, 1, "a", "S0")])
             .unwrap();
         let live = vec![item("a", 1, "raw"), item("t2", 2, "turn two")];
@@ -19809,8 +19033,8 @@ pub(crate) mod tests {
         assert_eq!(boot.action, "HARD");
         assert_eq!(boot.boundary_id, "a#0");
 
-        // Second compartment publishes with a BARE end_message_id → the SOFT advance
-        // must fail loud, not mint an unpresentable anchor.
+        // A SOFT advance with a bare `end_message_id` must fail rather than store an absent boundary ID.
+        // The failure must not commit an anchor absent from the live flat block IDs.
         s.replace_compartments(
             "ses",
             &[
@@ -19837,11 +19061,6 @@ pub(crate) mod tests {
 
     #[test]
     fn reconcile_rematerialize_after_revert_is_not_blocked_by_the_mint_guard() {
-        // A reconcile-rematerialize composes from the RE-CUT store (the historian re-cuts
-        // compartments after a revert), so its minted anchor is presentable again and the
-        // mint guard must not false-fire. Here the re-cut store keeps a compartment whose
-        // anchor IS present in the post-revert live array (partial revert: the covered
-        // head survived, only the tail past it reverted).
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments(
@@ -19858,7 +19077,6 @@ pub(crate) mod tests {
         assert_eq!(boot.action, "HARD");
         assert_eq!(boot.boundary_id, "t2#0");
 
-        // Revert removes t2 (the boundary) and t3; the historian re-cuts to just C0.
         let live_reverted = vec![item("a", 1, "raw"), item("t4", 2, "new turn")];
         let revert = run(&s, &req("ses", "cfg0", live_reverted.clone()), &spine());
         assert_eq!(revert.action, "SOFT+", "revert never busts on sight");
@@ -19996,10 +19214,7 @@ pub(crate) mod tests {
 
     #[test]
     fn provider_extras_strip_canary_does_not_arm_pending_on_legitimate_extension() {
-        // Coupling canary: MC's shape fingerprint uses flattened block bytes, while the
-        // upstream lineage-switch detector keys only on role/kind. Per-turn-churning
-        // provider fields must therefore be absent from both bases before MC sees the
-        // array; changing either basis requires changing the other together.
+        // MC excludes per-turn-churning provider fields from its flattened-byte fingerprint and the lineage-switch detector's role/kind key.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "S0")])
@@ -20185,19 +19400,14 @@ pub(crate) mod tests {
 
     #[test]
     fn first_fold_error_leaves_state_unchanged_and_the_hard_retries_visibly() {
-        // Fold-failure retry semantics: if the first-fold HARD fires and the fold itself
-        // errors, the transform returns Err and commits NOTHING, so the persisted boundary
-        // stays empty and the compartment stays present — meaning the next pass re-evaluates
-        // the same guard, fires the HARD again, and surfaces the SAME error. A persistent
-        // fold failure is therefore a stream of VISIBLE transform errors (fail-loud +
-        // retry-by-construction), never a silent defer that buries a stranded compartment.
+        // If the first-fold HARD fires and the fold errors, transform returns Err without committing, leaving the boundary empty and the compartment present.
+        // The next pass re-evaluates the first-fold guard.
+        // The next pass returns the same fold error after the first-fold guard fires again.
+        // A persistent fold failure returns a transform error on every pass instead of deferring the compartment.
         //
-        // The injected failure is a real fail-loud path: a compartment that leaves a LEADING
-        // coverage gap (a live item ordinal-before the first covered ordinal) — compose
-        // refuses to drop live context it cannot account for.
+        // Compose rejects a compartment when a live item's ordinal precedes the first covered ordinal because dropping that item would lose unaccounted live context.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        // Compartment covers ordinals 5..=5, but the live array has ordinal 1 before it → gap.
         s.replace_compartments("ses", &[comp(0, 5, 5, "m5", "S")])
             .unwrap();
         let live = vec![
@@ -20211,8 +19421,6 @@ pub(crate) mod tests {
             first.is_err(),
             "first-fold HARD hits the leading-gap fail-loud path"
         );
-        // The failed pass wrote nothing → the guard re-fires and errors again (visible), it
-        // does NOT silently fall through to a defer that strands the compartment.
         let retry = transform(&s, &req("ses", "cfg0", live), &ctx);
         assert!(
             retry.is_err(),
@@ -20224,10 +19432,8 @@ pub(crate) mod tests {
     fn bootstrap_with_a_compartment_summarizes_it_and_trims_the_covered_tail() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        // a compartment covers raw ordinals 1..=10, ending at message id "m10"
         s.replace_compartments("ses", &[comp(1, 1, 10, "m10", "SUMMARY-OF-1-10")])
             .unwrap();
-        // the live array still carries the raw covered message m10 (ordinal 10) + a tail item
         let items = vec![item("m10", 10, "raw covered"), item("t11", 11, "tail")];
         let r = run(&s, &req("ses", "cfg0", items), &spine());
         assert_eq!(r.action, "HARD");
@@ -20245,7 +19451,7 @@ pub(crate) mod tests {
             !m0_bytes(&r).contains("raw covered"),
             "m0 is NOT the raw bytes"
         );
-        // the covered raw message (ordinal 10 <= coverage 10) is trimmed; only the tail remains
+        // build_output trims the covered raw message (ordinal 10 <= coverage 10), leaving only the tail.
         assert_eq!(
             tail_ids(&r),
             vec!["t11"],
@@ -20318,8 +19524,7 @@ pub(crate) mod tests {
         });
         let decoded = crate::codec::decode_opencode(std::slice::from_ref(&native_tool_message));
         let mut tool_message = decoded.messages[0].clone();
-        // The live CK ingress is projected by the host independently of the native sidecar, so it
-        // does not carry the Rust decoder's private block-origin stamps.
+        // The host projects live CK ingress independently of the native sidecar, so it does not carry Rust decoder block-origin stamps.
         tool_message.ck.content = tool_message
             .ck
             .content
@@ -20657,21 +19862,21 @@ pub(crate) mod tests {
             &before_meta,
         ));
 
-        // A todo-promoted bust on a still-damaged row must retain the evidence that drives
-        // bounded repair escalation. The synthetic splice itself moves no cache boundary.
+        // A task-list-promoted bust on a still-damaged row retains evidence for bounded repair escalation.
+        // The synthetic splice moves no cache boundary.
         assert!(!boundary_divergence_reset_allowed(
             true, false, false, false, false, false,
         ));
-        // A torn publication read is not proof that the row converged either.
+        // A torn publication read does not prove that the row converged.
         assert!(!boundary_divergence_reset_allowed(
             true, false, false, true, false, false,
         ));
 
-        // A genuine boundary/coverage move preserves the existing reset behavior.
+        // The repair-escalation counter resets only when the cache boundary or coverage changes.
         assert!(boundary_divergence_reset_allowed(
             true, false, false, false, false, true,
         ));
-        // Once the detector observes convergence, the stale episode is complete.
+        // The convergence detector completes the stale episode when it reports convergence.
         assert!(boundary_divergence_reset_allowed(
             true, false, true, false, false, false,
         ));
@@ -20944,8 +20149,7 @@ pub(crate) mod tests {
             compartments_before
         );
 
-        // The store does not need manual repair: once the producer includes the terminal
-        // compartment anchor again, the next pass can commit the already-qualified recut.
+        // After the producer restores the terminal compartment anchor, the next pass commits the already-qualified recut without manual repair.
         let recovered = run(&store, &full_request, &spine());
         assert_eq!(recovered.action, "HARD");
         assert_eq!(recovered.coverage_ordinal, Some(2_400));
@@ -20953,10 +20157,7 @@ pub(crate) mod tests {
 
     #[test]
     fn leading_coverage_gap_fails_loud_not_silent_drop() {
-        // Regression: the first compartment starts at ordinal 10, but the live array still
-        // carries raw messages at ordinals 1..9 (before the first compartment). Those are
-        // covered by no compartment, yet they sit below coverage_ordinal. build_output
-        // would silently trim those raw messages, so the live coverage guard must fail loud.
+        // The first compartment starts at ordinal 10 while live items at ordinals 1..9 are uncovered and below coverage_ordinal; build_output would trim them, so the live coverage guard must return TransformError::CoverageGap.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 10, 20, "m20", "S")])
@@ -21102,7 +20303,7 @@ pub(crate) mod tests {
             if let Some(p) = &prev_m1 {
                 assert_eq!(m1_bytes(&r), p, "m1 changed on defer");
             }
-            // tail = the verbatim live items past coverage_ordinal=1 (the covered m1msg trimmed)
+            // The tail contains verbatim live items after coverage_ordinal 1; build_output trims covered m1msg.
             let expected: Vec<String> = (2..=n).map(|k| format!("t{k}")).collect();
             assert_eq!(
                 tail_ids(&r),
@@ -21137,16 +20338,14 @@ pub(crate) mod tests {
             "healthy HARD bytes must match the pre-detector golden",
         );
 
-        // Publishing C2 (ordinals 11..=20) creates a pending m1 delta; the next
-        // materializing pass renders that delta and extends coverage to m20.
+        // Publishing C2 for ordinals 11..=20 creates a pending m1 delta; the next materializing pass renders it and extends coverage to m20.
         s.replace_compartments(
             "ses",
             &[comp(1, 1, 10, "m10", "S1"), comp(2, 11, 20, "m20", "S2")],
         )
         .unwrap();
         // Publication leaves render coverage at 10 but advances the trigger-only floor to 21.
-        // The new m1 revision proves the compartment is pending render, so this positive gap is
-        // valid until the forced soft refresh below materializes it.
+        // The new m1 revision marks the compartment pending render; the positive gap remains valid until the forced SOFT refresh materializes it.
         let published = s.load("ses").unwrap();
         let mut published_meta = published.meta.clone();
         published_meta.publication_floor_ordinal = Some(21);
@@ -21175,7 +20374,7 @@ pub(crate) mod tests {
             m1_bytes(&soft)
         );
         assert!(m1_bytes(&soft).contains("S2") && !m1_bytes(&soft).contains("title=\"C1\""));
-        // coverage advanced to 20 → raw m20 trimmed, only t21 remains
+        // Advancing coverage to 20 trims raw m20, leaving only t21.
         assert_eq!(tail_ids(&soft), vec!["t21"]);
         assert_eq!(
             canonical_response_hash(&soft),
@@ -21183,7 +20382,7 @@ pub(crate) mod tests {
             "healthy SOFT bytes must match the pre-detector golden",
         );
 
-        // a defer at the new anchor replays byte-identical
+        // A defer at the new anchor replays the prior output byte-for-byte.
         let defer = run(&s, &req("ses", "cfg0", items), &spine());
         assert_eq!(defer.action, "SOFT+");
         assert!(!defer.committed);
@@ -21199,8 +20398,7 @@ pub(crate) mod tests {
             "healthy SOFT+ bytes must match the pre-detector golden",
         );
 
-        // A share-nothing boundary absence is not a safe re-cut target. It degrades to
-        // raw pass-through and arms the pending-rewrite alarm without touching lineage.
+        // A share-nothing boundary absence degrades to raw pass-through and arms the pending-rewrite alarm without changing lineage.
         let revert = run(
             &s,
             &req("ses", "cfg0", vec![item("z", 30, "other")]),
@@ -21234,12 +20432,9 @@ pub(crate) mod tests {
         assert_eq!(reduced.action, "SOFT");
         assert_eq!(tail_bytes(&reduced, "t11"), "[dropped]");
 
-        // C2 publishes covering through t12 → the next SOFT extends coverage past
-        // When the next compartment extends coverage past t11's ordinal, the frozen
-        // reduction red:t11#0 must be removed in the same update. Its target message
-        // is no longer in the tail, so retaining the reduction would waste space and
-        // could create spurious conflicts if a later revert reuses the same message id
-        // with different content.
+        // Publishing C2 through t12 causes the next SOFT to extend coverage past t12.
+        // When coverage extends past t11's ordinal, the same update must remove frozen reduction red:t11#0.
+        // Transform removes any frozen reduction whose target is covered.
         s.replace_compartments(
             "ses",
             &[comp(1, 1, 10, "m10", "S1"), comp(2, 11, 12, "t12", "S2")],
@@ -21256,8 +20451,7 @@ pub(crate) mod tests {
         assert_eq!(folded.action, "SOFT", "new compartment rides a SOFT");
         assert_eq!(tail_ids(&folded), vec!["t13"], "coverage trimmed t11/t12");
 
-        // The invariant (fail-loud form): after a coverage advance, no frozen red:*
-        // unit may target a covered ordinal.
+        // After a coverage advance, no frozen red:* unit may target a covered ordinal.
         let loaded = s.load("ses").unwrap();
         let core = loaded.core;
         let coverage = loaded.meta.coverage_ordinal.expect("coverage advanced");
@@ -21277,13 +20471,11 @@ pub(crate) mod tests {
                 );
             }
         }
-        // And the pruned unit is gone specifically.
         assert!(
             core.frozen_units.iter().all(|u| u.key != "red:t11#0"),
             "red:t11#0 must be pruned by the coverage-extending SOFT"
         );
 
-        // Defer replays byte-identical after the prune (the prune itself must not
         // perturb replay).
         let defer = run(&s, &req("ses", "cfg0", items_v2), &spine());
         assert_eq!(defer.action, "SOFT+");
@@ -21325,7 +20517,7 @@ pub(crate) mod tests {
     fn legacy_baseline_migrates_to_clean_m0_m1() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        // seed a legacy single-"baseline"-unit state directly, initialized
+        // Pruning must not seed a legacy single-"baseline"-unit state.
         let legacy_core = CoreState {
             version: 1,
             boundary_id: "a#0".into(),
@@ -21340,7 +20532,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
         s.commit("ses", None, &legacy_core, &legacy_meta).unwrap();
-        // a compartment so the migrated m0 has real summary content
+        // The migration requires m0 to contain summary content.
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "FRESH-SUMMARY")])
             .unwrap();
 
@@ -21349,9 +20541,7 @@ pub(crate) mod tests {
             r.action, "HARD",
             "legacy shape migrates via clear-then-Hard"
         );
-        // After a stored legacy baseline is cleared and rebuilt as the current m0/m1
-        // shape, the response has no leftover baseline state: it contains exactly two
-        // synthetic messages, and m0 was re-composed from store data.
+        // After clearing and rebuilding a stored legacy baseline as m0/m1, the response contains no baseline state.
         assert_eq!(r.messages().iter().filter(|m| m.meta.synthetic).count(), 2);
         assert!(
             m0_bytes(&r).contains("FRESH-SUMMARY"),
@@ -21391,7 +20581,7 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, TransformError::UnknownShape(_)));
-        // durable state unchanged (the "junk" unit survives — not destructively cleared)
+        // Rejection preserves the durable `junk` unit.
         let reloaded = s.load("ses").unwrap();
         assert_eq!(reloaded.core.frozen_units[0].key, "junk");
     }
@@ -21402,7 +20592,6 @@ pub(crate) mod tests {
         let s = store(dir.path());
         let dc = pctx("git:proj", "/nonexistent-docs", 0);
 
-        // a non-synthetic item with a reserved mc_* id (a pre-load ingress guard)
         let reserved = transform(&s, &req("ses", "cfg0", vec![item("mc_m0", 2, "x")]), &dc);
         assert!(matches!(reserved, Err(TransformError::ReservedId)));
 
@@ -21426,12 +20615,11 @@ pub(crate) mod tests {
             &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
             &spine(),
         );
-        // feed our own synthetic m0 back in alongside the real array
         let mut stale = item(M0_ID, 0, "STALE");
         stale.ck.meta.synthetic = true;
         let items = vec![stale, item("m1msg", 1, "raw"), item("t2", 2, "tail2")];
         let r = run(&s, &req("ses", "cfg0", items), &spine());
-        // boundary m1msg still found (synthetic stripped), tail filter uncorrupted
+        // Removing synthetic messages preserves discovery of `m1msg` and tail filtering.
         assert_eq!(r.action, "SOFT+");
         assert_eq!(tail_ids(&r), vec!["t2"]);
     }
@@ -22074,11 +21262,10 @@ pub(crate) mod tests {
 
     #[test]
     fn synthetic_todo_none_anchor_stays_before_grown_tail_on_defer() {
-        // A pair frozen with anchor_mid = None (composed when the tail was empty) must be
-        // pinned immediately after m0/m1, NOT floated to the end. A later defer that grows
-        // the tail must leave the [m0, m1, pair] prefix byte-identical, with the new tail
-        // message landing AFTER the pair — otherwise the None-anchor path reintroduces the
-        // always-last floater the position-freeze exists to prevent.
+        // Pairs frozen with `anchor_mid = None` remain immediately after `m0`/`m1` when later defers grow the tail.
+        // Pairs frozen with `anchor_mid = None` remain immediately after `m0`/`m1`, not at the end of the tail.
+        // A later defer preserves the byte-identical `[m0, m1, pair]` prefix and appends new tail messages after the pair.
+        // Position freezing prevents the floater from always being last.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("none-anchor", &[comp(1, 1, 2, "todo", "SUMMARY")])
@@ -22096,7 +21283,7 @@ pub(crate) mod tests {
             ),
             &spine(),
         );
-        // Force a HARD with an empty live tail so the composed pair freezes anchor_mid = None.
+        // An empty live tail causes HARD composition to freeze `anchor_mid = None`.
         let loaded = s.load("none-anchor").unwrap();
         let mut meta = loaded.meta;
         meta.synthetic_todo = None;
@@ -22131,7 +21318,6 @@ pub(crate) mod tests {
         );
         let composed_prefix = prefix_through_synthetic_todo(&composed);
 
-        // A defer that appends a new tail message (ordinal 3, above coverage 2).
         let defer = run(
             &s,
             &req(
@@ -22147,10 +21333,8 @@ pub(crate) mod tests {
         );
 
         assert_eq!(defer.action, "SOFT+");
-        // The pair stays right after m0/m1; the new tail message lands AFTER it.
         assert_eq!(synthetic_todo_index(&defer), 2);
         assert!(message_index(&defer, "t3") > synthetic_todo_index(&defer));
-        // The whole [m0, m1, pair] prefix is byte-identical to the compose pass.
         assert_eq!(prefix_through_synthetic_todo(&defer), composed_prefix);
     }
 
@@ -22228,8 +21412,7 @@ pub(crate) mod tests {
 
     #[test]
     fn old_meta_json_without_new_fields_loads() {
-        // serde(default) lets older meta JSON (written before m1_revision and the
-        // two-watermark fields existed) deserialize cleanly — they all default.
+        // `serde(default)` lets meta JSON written before `m1_revision` and the two watermark fields deserialize with default values.
         let json = r#"{"initialized":true,"last_render_config":"cfg0","coverage_ordinal":1}"#;
         let meta: ModuleMeta = serde_json::from_str(json).unwrap();
         assert_eq!(meta.m1_revision, 0);
@@ -22245,8 +21428,6 @@ pub(crate) mod tests {
         assert_eq!(meta.caveman_age_basis_tag, 0);
         assert!(meta.initialized);
     }
-
-    // ===== slice 3: tail reducers =====
 
     fn reduce(target: &str, kind: &str, payload: &str) -> ReductionDecision {
         ReductionDecision {
@@ -22279,7 +21460,6 @@ pub(crate) mod tests {
             _ => None,
         }
     }
-    /// The bytes of a tail item (non-synthetic) by id.
     fn tail_bytes<'a>(r: &'a TransformResponse, id: &str) -> &'a str {
         let msg = r
             .messages()
@@ -22289,8 +21469,7 @@ pub(crate) mod tests {
         first_block_text(msg.content.first().unwrap()).unwrap()
     }
 
-    /// Bootstrap a session whose m0 covers ordinal 1 (compartment ends at id "a"), so the
-    /// boundary "a" is present and tail items (ordinal ≥ 2) are reducible.
+    /// m0 coverage through ordinal 1 makes boundary `a` available and tail items at ordinal 2 or later reducible.
     fn bootstrap_covering_a(s: &McStore) {
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
@@ -22713,9 +21892,8 @@ pub(crate) mod tests {
             complete.push(wire_item("user", "m3", 3, &["question"]));
             let mut active = active_cc_req("temporal", "cfg0", complete.clone());
             active.prev_response_completed_at_ms = Some(10_000);
-            // Ingress-time basis: the module clock runs 2h LATER than the proxy's
-            // ingress observation (queue plus blocking-arm delay). A now-basis
-            // implementation would render +2h here instead of +12m.
+            // The module clock is 2h later than the proxy clock at ingress.
+            // The ingress-time clock yields +12m.
             active.request_observed_at_ms = Some(730_000);
             let first = transform(
                 &s,
@@ -22845,9 +22023,8 @@ pub(crate) mod tests {
                 "cfg0",
                 vec![wire_item("user", "m1", 1, &["question"])],
             );
-            // Seed the reduction before the first active transform. The bootstrap tagger must skip
-            // the already-frozen placeholder so it does not consume the tag position or advance the
-            // temporal boundary; both remain available if the block is restored later.
+            // The bootstrap tagger skips the already-frozen placeholder so it does not consume a tag position or advance the temporal boundary.
+            // Skipping the placeholder preserves its tag position and temporal boundary if the block is restored.
             let mut core = CoreState::default();
             core.frozen_units
                 .push(red_unit("m1#0", "drop", "[dropped]"));
@@ -23355,8 +22532,7 @@ pub(crate) mod tests {
         }
         assert_eq!(cache.sessions.len(), cap);
 
-        // Replacing a live session is a fresh tagging pass and must move it to the
-        // most-recent position before the next distinct session forces eviction.
+        // A fresh tagging pass moves a replaced live session to the most-recent position before the next distinct session forces eviction.
         cache.replace("a", memo.clone());
         cache.replace("d", memo);
 
@@ -23407,7 +22583,7 @@ pub(crate) mod tests {
         let first = active_cc_req(session, "cfg0", vec![item("m1", 1, "alpha")]);
         // The first pass establishes the initial output transition from an inactive session.
         compare_pass(first.clone(), &spine());
-        // Repeating the request exercises tag minting after that transition is durable.
+        // The durable transition permits tag minting on the repeated request.
         compare_pass(first, &spine());
         let extended = active_cc_req(
             session,
@@ -23455,8 +22631,8 @@ pub(crate) mod tests {
         assert_eq!(cached[0].source_bytes, b"old");
         let before = store.tag_cache_summary(session).unwrap();
 
-        // This bypasses transform commits, so only the SQLite mutation trigger can invalidate
-        // the process-local baseline. Count and max stay unchanged to prove generation matters.
+        // The direct SQLite mutation bypasses transform commits, so only the SQLite mutation trigger can invalidate the state.
+        // The mutation trigger invalidates the process-local baseline even when count and max_tag_number do not change.
         store
             .execute_tag_sql_for_test(
                 "UPDATE mc_tags SET source_bytes = X'706f69736f6e6564'
@@ -23671,12 +22847,6 @@ pub(crate) mod tests {
 
     #[test]
     fn subc_reversibility_full_array_cc_applies_pending_drop_without_an_active_window() {
-        // U1 history: while Claude Code was a verbatim-tail (byte-splice) consumer, tail
-        // reclaim was gated on the tool-present surface, so a queued agent drop survived
-        // every tool-absent ("false") pass and only applied once an active window returned.
-        // U0 retired the byte-splice — full-array apply is the only serving path — so reclaim
-        // now gates purely on the profile and a tool-absent emergency pass applies the drop
-        // directly; no active window is required.
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let messages = (1..=30)
@@ -24362,17 +23532,11 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         // The protected set is the newest 20 ACTIVE tags as exact block ids.
-        // This fixture is built so every cheaper implementation class fails at
-        // the rank-20 boundary itself, not just at the extremes:
-        //   - ACTIVE numbers have holes: m23#0 is stale-provenance and three
-        //     "ghost" rows hold the TOP numbers (26-28) for blocks absent from
-        //     the array, so any numeric-threshold cutoff (from the active max
-        //     or the global max) lands on the wrong rows.
-        //   - Ordinal 24 carries TWO tagged blocks (m24#0, m24#1), so
-        //     one-block-per-ordinal counting shifts the boundary by one.
-        // Active numbers: {1..22, 24, 25} (24 rows). Newest 20 by number:
-        // {5..22, 24, 25} — the boundary pair is number 5 (rank 20, protected)
-        // vs number 4 (rank 21, applied), and both carry pending drops.
+        // m23#0 has stale provenance, and ghost rows 26–28 are absent from the array.
+        // Numeric thresholds based on the active or global maximum select the wrong rows.
+        // Ordinal 24 carries two tagged blocks, so counting one block per ordinal shifts the boundary by one.
+        // The 24 active rows have numbers {1..22, 24, 25}; the newest 20 have numbers {5..22, 24, 25}.
+        // Number 5 is rank 20 and protected; number 4 is rank 21 and applied.
         let mut messages = (1..=24)
             .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
             .collect::<Vec<_>>();
@@ -24384,8 +23548,7 @@ pub(crate) mod tests {
                 kind: "message".to_string(),
                 token_count: 1,
                 source_bytes: if ordinal == 23 {
-                    // Stale provenance: stored bytes no longer match the live
-                    // carrier, so this row must not occupy a protected slot.
+                    // A row whose stored bytes differ from its live carrier must not occupy a protected slot.
                     b"text from a previous life".to_vec()
                 } else {
                     format!("text {ordinal}").into_bytes()
@@ -24426,12 +23589,11 @@ pub(crate) mod tests {
         let loaded = store.load("protected").unwrap();
         // Rank 21 (number 4) is just outside the protected set: applied.
         assert_eq!(frozen_red_payload(&loaded.core, "m4#0"), Some("[dropped]"));
-        // Rank 20 (number 5) is the last protected slot: retained. Under a
-        // threshold cutoff (active-max 25 - 20, or global-max 28 - 20) or
-        // one-per-ordinal counting this row loses protection and applies.
+        // Rank 20 (number 5) is the last protected slot and retains its pending drop.
+        // Counting one block per ordinal fails to protect number 5.
         assert_eq!(frozen_red_payload(&loaded.core, "m5#0"), None);
-        // The second block on ordinal 24 is itself active and protected; an
-        // implementation that counts one block per ordinal applies this drop.
+        // m24#1 is active and protected.
+        // Counting one block per ordinal applies the pending drop for m24#1.
         assert_eq!(frozen_red_payload(&loaded.core, "m24#1"), None);
         let mut retained = store
             .load_pending_agent_drops("protected")
@@ -24467,11 +23629,9 @@ pub(crate) mod tests {
     fn frozen_row_does_not_consume_a_protection_slot() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        // 21 tagged live blocks, numbers 1..21. m21#0 is frozen by an earlier
-        // active pass, so the ACTIVE set is exactly m1..m20 — all 20 fit the
-        // protected window and the oldest row's pending drop must be retained.
-        // If frozen rows still consumed slots, m21 would take one, m1 would
-        // fall to rank 21, and its drop would apply.
+        // m21#0 is already frozen, so the 20 ACTIVE blocks m1#0 through m20#0 fit the protected window and retain m1#0's pending drop.
+        // If frozen rows consumed slots, m21 would displace m1 from the protected set.
+        // If frozen rows consumed slots, m1 would fall to rank 21 and its drop would apply.
         let messages = (1..=21)
             .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
             .collect::<Vec<_>>();
@@ -24485,10 +23645,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         store.seed_tags_for_test("slot-free", &tags, 1).unwrap();
 
-        // Pass 1 bootstraps, then the freeze is seeded directly in durable state
-        // (selection itself refuses to reduce a protected newest tag, so a
-        // pre-existing freeze — e.g. from an earlier phase with more tags — is
-        // the realistic way a high-ranked block arrives already frozen).
+        // Seed the freeze directly because selection cannot reduce a protected newest tag.
         let request = active_cc_req("slot-free", "cfg0", messages);
         run(&store, &request, &spine());
         let seeded = store.load("slot-free").unwrap();
@@ -24504,9 +23661,7 @@ pub(crate) mod tests {
             "precondition: m21#0 frozen before the tested pass"
         );
 
-        // Pass 2 (tested): a render-config change forces a producing HARD so the
-        // pending row is genuinely selected against the protected set — a defer
-        // pass would retain it regardless and prove nothing.
+        // A render-config change forces a producing HARD pass so the pending row is selected against the protected set; a defer pass would retain the pending row regardless.
         store
             .append_pending_agent_drops("slot-free", &["m1#0".to_string()], 99)
             .unwrap();
@@ -24530,11 +23685,9 @@ pub(crate) mod tests {
     fn newest_tag_block_set_excludes_stale_provenance_from_slots() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        // Exactly 21 tagged live blocks. The NEWEST row (m21#0) has stale
-        // provenance. Under exact semantics it cannot hold a slot, so the
-        // protected 20 are m20..m1 and a pending drop on m1#0 (rank 21 by
-        // number, rank 20 among ACTIVE rows) is PROTECTED. An implementation
-        // that skips the provenance re-check frees m1#0 and applies the drop.
+        // m21#0 has stale provenance and cannot occupy a protected slot.
+        // The 20 protected blocks are m20#0 through m1#0, so m1#0's pending drop remains pending.
+        // Skipping the provenance re-check frees m1#0 and applies its drop.
         let messages = (1..=21)
             .map(|ordinal| item(&format!("m{ordinal}"), ordinal, &format!("text {ordinal}")))
             .collect::<Vec<_>>();
@@ -24570,10 +23723,7 @@ pub(crate) mod tests {
 
     #[test]
     fn full_array_cc_dormant_forced_hard_applies_pending_drop_directly() {
-        // U1 history: a dormant (tool-absent) forced HARD retained a queued agent drop and
-        // only the subsequent active (tool-present) HARD applied it, because tail reclaim was
-        // gated on the tool-present surface for the then-verbatim-tail Claude Code profile.
-        // U0 retired the byte-splice, so reclaim gates purely on the profile and the dormant
+        // The profile alone gates reclaim.
         // forced HARD applies the drop itself; the active pass then finds nothing pending.
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -24617,9 +23767,8 @@ pub(crate) mod tests {
     fn obsolete_pending_row_commits_consumption_without_core_or_meta_changes() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        // "gone" is PRESENT in the array but covered by the compartment boundary:
-        // provably retired (coverage only advances), so its pending row is
-        // consumable even though nothing else about the pass changes state.
+        // "gone" is PRESENT in the array but covered by the compartment boundary, so its pending row is consumable.
+        // "gone"'s pending row is consumable even when no other pass state changes.
         store
             .replace_compartments("consume-only", &[comp(1, 1, 1, "gone", "summary")])
             .unwrap();
@@ -24664,18 +23813,15 @@ pub(crate) mod tests {
             .append_pending_agent_drops("subset-safety", &["m9#0".to_string()], 1)
             .unwrap();
 
-        // An interactive side-request arrives as a SUBSET of the session: the
-        // pending target is absent from this pass entirely. Absence proves
-        // nothing (the full array returns next pass), so the row must survive.
+        // An interactive side-request must be a subset of the session.
+        // The pending target can return in a later full array, so its absence does not consume the row.
         let subset = active_cc_req("subset-safety", "cfg0", vec![item("a", 1, "first")]);
         run(&store, &subset, &spine());
         let survived = store.load_pending_agent_drops("subset-safety").unwrap();
         assert_eq!(survived.len(), 1, "absent-target row must not be consumed");
         assert_eq!(survived[0].target_id, "m9#0");
 
-        // The full array returns: the target is live-tail again and its row is
-        // still queued for the next producing pass (drop application itself is
-        // covered by the dormant/active drain tests).
+        // The row remains queued until a producing pass applies the drop.
         run(&store, &full, &spine());
         let requeued = store.load_pending_agent_drops("subset-safety").unwrap();
         assert_eq!(requeued.len(), 1);
@@ -24686,8 +23832,7 @@ pub(crate) mod tests {
     fn owned_profile_drains_pending_drops_without_request_surface() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        // Owned-leg consumers never send the reduction-surface field; their
-        // profile default alone must keep the durable queue draining.
+        // Owned-leg consumers omit the reduction-surface field; the profile default keeps the durable queue draining.
         let request = req(
             "owned-drain",
             "cfg0",
@@ -24827,13 +23972,9 @@ pub(crate) mod tests {
                 item("b", 2, "two"),
                 item("c", 3, "three"),
             ];
-            // Both arms must deserialize from the wire (a direct struct skips the
-            // original-value retention that wire requests carry), but they must be
-            // constructed INDEPENDENTLY: the explicit arm's JSON carries a literal
-            // tool_present:false, the absent arm's JSON omits the key entirely.
-            // Cloning the deserialized absent request instead would inherit
-            // whatever default serde applied, making the comparison tautological
-            // under a wrong default.
+            // The test deserializes both arms from JSON to exercise Serde defaults.
+            // The omitted field must deserialize to the same fail-closed state as `tool_present:false`.
+            // The test deserializes each arm independently so an incorrect Serde default cannot compare equal.
             let (absent, explicit) = wire_pair_absent_and_explicit_false(profile_req(
                 profile,
                 "identity",
@@ -24867,8 +24008,7 @@ pub(crate) mod tests {
                 "{profile:?}"
             );
 
-            // Rebuild BOTH arms independently for the fold leg too: mutating one
-            // and cloning the other would reintroduce the shared-default hazard.
+            // The test rebuilds the fold inputs independently so each request receives the deserialized default.
             let (absent, explicit_fold) = wire_pair_absent_and_explicit_false(profile_req(
                 profile,
                 "identity",
@@ -24900,7 +24040,7 @@ pub(crate) mod tests {
         let s = store(dir.path());
         bootstrap_covering_a(&s);
 
-        // a new reduction on tail item t2 → SOFT, frozen → [dropped 1]
+        // A new reduction on `t2` freezes `[dropped 1]` during `SOFT`.
         let items = vec![item("a", 1, "raw"), item("t2", 2, "BIGOUTPUT")];
         let d = with_reductions(vec![reduce("t2", "drop", "[dropped 1]")]);
         let soft = run(&s, &req("ses", "cfg0", items.clone()), &d);
@@ -24941,7 +24081,7 @@ pub(crate) mod tests {
             &d,
         );
 
-        // the tail grows; the SAME reduction set re-supplied each pass → pure defer, the
+        // Re-supplying unchanged reductions after tail growth produces a pure defer: frozen payloads replay verbatim and are not first applied during a defer.
         // frozen [dropped 99999] replays verbatim, never first-applied on a defer.
         for n in 3..=6u64 {
             let mut items = vec![item("a", 1, "raw"), item("t2", 2, "OUT")];
@@ -24977,8 +24117,7 @@ pub(crate) mod tests {
         let frozen = run(&s, &req("ses", "cfg0", items1), &d1);
         assert_eq!(tail_bytes(&frozen, "edit1"), skel);
 
-        // a newer edit lands; edit1 must replay its FROZEN payload verbatim (a re-derive
-        // of the region-hint from current content would flip its bytes).
+        // A newer edit must replay `edit1`'s frozen payload verbatim because deriving its region hint from current content changes its bytes.
         let skel2 = "edit packages/app/y.ts | @@ -1,2 +1,3 @@ [dropped 2]";
         let d2 = with_reductions(vec![
             reduce("edit1", "edit_marker", skel),
@@ -24997,15 +24136,13 @@ pub(crate) mod tests {
 
     #[test]
     fn fold_gcs_a_reduction_whose_item_becomes_covered() {
-        // The new-model equivalent of "fold carries reduced bytes into m0": m0 is now a
-        // SUMMARY (never reduced raw bytes), so when a HARD's coverage crosses a reduced
-        // tail item, that item is represented by the compartment summary and its red:* unit
-        // is GC'd — no stale [dropped] leak, no double-count.
+        // `m0` stores a summary rather than reduced raw bytes.
+        // When HARD coverage crosses a reduced tail item, the compartment summary represents that item and GC removes its `red:*` unit.
+        // GC removes the `red:*` unit after coverage reaches its item, preventing stale `[dropped]` output.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         bootstrap_covering_a(&s);
 
-        // freeze a drop on tail item t2 (ordinal 2)
         let d = with_reductions(vec![reduce("t2", "drop", "[dropped 1]")]);
         run(
             &s,
@@ -25017,10 +24154,8 @@ pub(crate) mod tests {
             &d,
         );
 
-        // a compartment now covers ordinal 2 (t2 is summarized); a HARD (render_config
-        // change) re-composes m0 over both compartments — coverage advances to 2, so
-        // A compartment now covers ordinal 2, summarizing t2. A later HARD pass
-        // re-composes m0 and removes red:t2#0 because its ordinal is now covered.
+        // A `render_config` change triggers HARD recomposition over both compartments, advancing coverage to ordinal 2.
+        // A compartment covering ordinal 2 summarizes `t2`; a later HARD pass recomposes `m0` and removes `red:t2#0`.
         s.replace_compartments(
             "ses",
             &[comp(1, 1, 1, "a", "S1"), comp(2, 2, 2, "t2", "S2")],
@@ -25073,8 +24208,7 @@ pub(crate) mod tests {
         assert_eq!(boot.action, "HARD");
         assert_eq!(boot.boundary_id, "b#0");
 
-        // Freeze a drop on t3. The later revert keeps compartment a, so this exercises
-        // the surviving-prefix re-cut path rather than the share-nothing raw alarm.
+        // Because the later revert retains compartment `a`, it exercises the surviving-prefix re-cut path rather than the share-nothing raw alarm.
         let d = with_reductions(vec![reduce("t3", "drop", "[dropped 1]")]);
         let soft = run(&s, &req("ses", "cfg0", live), &d);
         assert_eq!(soft.action, "SOFT");
@@ -25110,13 +24244,11 @@ pub(crate) mod tests {
         let s = store(dir.path());
         bootstrap_covering_a(&s);
 
-        // freeze t2 → [dropped 1]
         let d = with_reductions(vec![reduce("t2", "drop", "[dropped 1]")]);
         let items = vec![item("a", 1, "raw"), item("t2", 2, "OUT")];
         run(&s, &req("ses", "cfg0", items.clone()), &d);
 
-        // re-supply t2 with DIFFERENT bytes (a contract violation) → fail loud, not a
-        // silent skip-and-serve-stale. Tested on a defer (the silent-miss surface).
+        // Re-supplying `t2` with different bytes during a defer must fail instead of serving frozen bytes.
         let bad = with_reductions(vec![reduce("t2", "drop", "[dropped DIFFERENT]")]);
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.injected_reductions = bad;
@@ -25130,8 +24262,7 @@ pub(crate) mod tests {
         let s = store(dir.path());
         bootstrap_covering_a(&s);
 
-        // a reduction sits BETWEEN live tail items; the surrounding items stay verbatim
-        // and stable across a defer (the contiguous-prefix cache holds per-item).
+        // A reduction between live tail items preserves the surrounding items verbatim across a defer because the contiguous-prefix cache stores items individually.
         let d = with_reductions(vec![reduce("t3", "drop", "[dropped 1]")]);
         let items = vec![
             item("a", 1, "raw"),
@@ -25269,15 +24400,11 @@ pub(crate) mod tests {
             tool_result("m3", 3, "call_old", "big old tool output that age-drops"),
             item("m9", 9, "newest user text"),
         ];
-        // A queued agent drop targeting the old tool result: under full-array CC it is
-        // consumable on any reclaiming pass, including a tool-absent one (it was
-        // appendable-but-never-consumable while CC was verbatim-tail).
+        // A queued agent drop targeting the old tool result is consumable on any reclaiming full-array CC pass.
         s.append_pending_agent_drops("ses", &["m3#0".to_string()], 1)
             .unwrap();
 
         let ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        // Bootstrap fold (HARD) then an emergency-class pass (96%): the tool-absent CC
-        // session reclaims the tail and drains the queued drop on a healthy pass.
         for (usage, limit) in [(1u64, 100u64), (96, 100)] {
             let _ = transform(
                 &s,
@@ -25306,13 +24433,11 @@ pub(crate) mod tests {
             0,
             "queued agent drops drain once reclaim runs"
         );
-        // The prefix fold still happens alongside tail reclaim.
+        // Prefix folding happens alongside tail reclaim.
         assert!(loaded.core.frozen_units.iter().any(|u| u.key == "m0"));
     }
 
-    /// A leading system message is exempt from coverage continuity checks: the chunk
-    /// builder never summarizes system content, so a pinned prompt before the first
-    /// chunk is not a live-coverage gap.
+    /// A leading system message is exempt from coverage continuity checks because the chunk builder never summarizes system content; a pinned prompt before the first chunk is not a live-coverage gap.
     fn declared_trim_fixture() -> (
         tempfile::TempDir,
         McStore,
@@ -26511,9 +25636,7 @@ pub(crate) mod tests {
         s.commit("staged-tfe", loaded.row_version, &loaded.core, &loaded.meta)
             .unwrap();
 
-        // The consumer base string stays frozen while the module epoch moves. Epoch pins
-        // are status assertions, not extra wire tokens; changing both identities would
-        // coordinate two folds instead of the one fold owned by the module upgrade.
+        // The consumer base string remains frozen while the module epoch moves; epoch pins are status assertions, so changing both identities would coordinate two folds instead of the module upgrade's single fold.
         let pass_a = run(&s, &request, &spine());
         assert_eq!(pass_a.action, "HARD");
         let expected_tfe3 = effective_render_config_with_epochs(
@@ -26591,8 +25714,7 @@ pub(crate) mod tests {
         assert_eq!(first.action, "HARD");
 
         let mut loaded = s.load("ses").unwrap();
-        // Keep the shared memory-render epoch current so this fixture isolates
-        // the claude-code profile epoch transition.
+        // The shared memory-render epoch matches the production epoch so this fixture isolates the Claude Code profile epoch transition.
         loaded.meta.last_render_config = global_epoch_effective_render_config(&s, "cfg0");
         loaded
             .core
@@ -26615,9 +25737,7 @@ pub(crate) mod tests {
             m0_bytes(&transitioned)
         );
         assert!(!m0_bytes(&transitioned).contains("OLD-M0"));
-        // The bumped profile epoch (2) must flow into the committed effective render
-        // config as the `mpe2` member: that token is what makes the next pass see an
-        // unchanged config and stop folding.
+        // Profile epoch 2 must be committed as the `mpe2` member of the effective render config so the next pass sees an unchanged config and stops folding.
         assert!(
             s.load("ses")
                 .unwrap()
@@ -26821,8 +25941,7 @@ pub(crate) mod tests {
             item("u2", 3, "live tail"),
         ];
 
-        // An agent drop aimed at the reasoning block must not freeze, and its
-        // pending row must retire as structurally unappliable.
+        // An agent drop aimed at the reasoning block must not freeze, and its pending row must retire as structurally unappliable.
         let active = active_cc_req("reason-guard", "cfg0", messages.clone());
         run(&s, &active, &spine());
         s.append_pending_agent_drops("reason-guard", &["a1#0".to_string()], 1)
@@ -26845,9 +25964,7 @@ pub(crate) mod tests {
         assert!(joined.contains("signed thinking a1"), "{joined}");
         assert!(joined.contains("sig-a1"), "{joined}");
 
-        // A historically poisoned unit (minted by an older binary) heals at
-        // render: the block serves verbatim signed bytes on every pass while the
-        // unit stays frozen and inert.
+        // A unit minted by an older binary serves verbatim signed bytes on every render pass while remaining frozen and inert.
         let mut poisoned = s.load("reason-guard").unwrap();
         poisoned
             .core
@@ -27349,8 +26466,7 @@ pub(crate) mod tests {
 
     #[test]
     fn stored_split_coverage_arc_salts_once_and_never_serves_an_orphaned_result() {
-        // These adapted messages model coverage ending at call 123 while its result remains live at
-        // 124, making that result the first real tail message. Adapted bytes carry no provider verdict.
+        // Coverage ends at call 123, so the live result at 124 is the first tail message. Adapted bytes carry no provider verdict.
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         let call = assistant_tool_call("split-call", 123, "toolu_split");
@@ -28165,8 +27281,7 @@ pub(crate) mod tests {
     fn rig_repro_consumed_drops_render_bare_on_false_pass() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        // Active window: enough tagged blocks that the two oldest fall outside the
-        // newest-20 protection set, so their drops actually consume.
+        // The active window contains enough tagged blocks for the two oldest to fall outside the newest-20 protection set, so their drops consume.
         let messages: Vec<CkIngressMessage> = (1..=25)
             .map(|n| {
                 item(
@@ -28181,12 +27296,11 @@ pub(crate) mod tests {
         assert_eq!(warm.action, "HARD");
         s.append_pending_agent_drops("rig-b", &["u1#0".to_string(), "u2#0".to_string()], 1)
             .unwrap();
-        // Drops drain only on bust-gated passes; a config change forces the HARD
-        // that consumes them, mirroring how the rig's drops were consumed.
+        // Drops drain only on bust-gated passes; a config change forces the HARD pass that consumes them.
         let active_busted = active_cc_req("rig-b", "cfg1", messages.clone());
         let consumed = run(&s, &active_busted, &spine());
         assert_eq!(consumed.action, "HARD");
-        // While active the numbered egress overlay is expected.
+        // Active requests render the numbered egress overlay.
         let active_joined = serde_json::to_string(&consumed.ck_messages).unwrap();
         assert!(active_joined.contains("[dropped \u{a7}"), "{active_joined}");
         // Frozen bytes stay canonical bare.
@@ -28198,7 +27312,7 @@ pub(crate) mod tests {
                 unit.frozen_payload
             );
         }
-        // False pass: hide the tool. Placeholders persist but must render BARE.
+        // `tool_present = false` preserves placeholders but renders them BARE.
         let mut hidden = cc_req("rig-b", "cfg1", messages);
         hidden.tool_present = false;
         let transition = run(&s, &hidden, &spine());
@@ -28308,8 +27422,7 @@ pub(crate) mod tests {
             .synthetic_todo
             .expect("bust freezes synthetic todo pair");
 
-        // OpenCode collapses the pair to one tool part. The pre-fix adapter replayed that part
-        // without CK's synthetic bit, so the durable pair and this apparent live owner shared an id.
+        // OpenCode represents the pair as one tool part; replay preserves CK's synthetic bit to prevent an ID collision with the durable pair.
         let mut collapsed = pair.assistant_msg.clone();
         collapsed.content.extend(pair.tool_msg.content.clone());
         collapsed.meta = ck_wire::HarnessMeta {
@@ -28329,8 +27442,8 @@ pub(crate) mod tests {
             apply_once_with_estimator(&store, &replay_request, &context, estimate, Some(&cache))
                 .unwrap();
         // Replay would insert the stored synthetic pair between a live call and its result.
-        // Return HARD instead of the previous unchanged response so later arrays keep that live
-        // tool exchange adjacent, as required by the gateway's immediate-answer contract.
+        // The renderer returns HARD to preserve adjacency between a live tool call and its result.
+        // Each live tool exchange remains adjacent.
         assert_eq!(warm.response.action, "HARD");
         assert_eq!(
             warm.response.materialize_reason.as_deref(),
@@ -28997,10 +28110,8 @@ pub(crate) mod tests {
         let first = run(&store, &request, &spine());
         assert_eq!(first.action, "HARD");
         assert_eq!(first.lineage_switch_consumed_id, Some(101));
-        // The disposition rides beside the ack so the sender can tell
-        // inheritance from a terminal refusal without reading our store
-        // (drive round-1: consumed_id alone acked a cycle_detected refusal
-        // and read as success from the proxy seat).
+        // The response places the disposition beside the acknowledgement so the sender can distinguish inheritance from a terminal refusal without reading the store.
+        // A `consumed_id` acknowledgement includes a disposition when refusal is `cycle_detected`.
         assert_eq!(
             first.lineage_descent_disposition.as_deref(),
             Some("descended")
@@ -29041,7 +28152,6 @@ pub(crate) mod tests {
         let second = run(&store, &request, &spine());
         assert_eq!(second.action, "SOFT+");
         assert_eq!(second.lineage_switch_consumed_id, Some(101));
-        // The write-free replay arm also names its outcome.
         assert_eq!(
             second.lineage_descent_disposition.as_deref(),
             Some("replay")
@@ -29222,11 +28332,9 @@ pub(crate) mod tests {
 
     #[test]
     fn continued_lineage_survives_post_descent_folds_advancing_past_the_seam() {
-        // Prod wedge f6a4ca71 (2026-08-11): the continuation base is frozen at
-        // the descent seam, but the successor's historian keeps folding. The
-        // old equality check fenced every pass after the first successor fold
-        // (+2 / +5 compartment-end overhangs); coverage PAST the seam must be
-        // accepted, coverage SHORT of it must still refuse.
+        // The continuation base remains frozen at the descent seam while the successor's historian may fold beyond it.
+        // A `compartment_end` beyond the seam does not fence a successor pass.
+        // Coverage at or beyond the seam is accepted; coverage before the seam is refused.
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_fake_compaction_prior(&store, "A");
@@ -29246,16 +28354,13 @@ pub(crate) mod tests {
         );
         assert_eq!(first.ordinal_continuation_base, Some(10));
 
-        // The successor runs on: the historian folds messages past the seam,
-        // exactly what a healthy long-lived successor does.
+        // A successor may fold messages past the seam.
         store
             .append_compartments("B", &[comp(4, 12, 14, "successor-14", "successor work")])
             .unwrap();
 
-        // An ordinary follow-up pass (no lineage switch) must NOT fence on the
-        // advanced compartment end.
-        // The successor's wire continues the predecessor's numbering: first
-        // live ordinal is base + 1, exactly as the gateway's edge counter
+        // An ordinary follow-up pass does not fence on an advanced `compartment_end`.
+        // The successor's first live ordinal is `base + 1` to continue the predecessor's numbering.
         // assigns it.
         let mut follow_up_messages = vec![
             wire_item(
@@ -29347,9 +28452,8 @@ pub(crate) mod tests {
 
     #[test]
     fn continued_lineage_tolerates_a_synthetic_head_like_the_seam_check() {
-        // The seam check finds the boundary at the first non-synthetic message;
-        // the anchor check must use the same rule or a synthetic-marked head
-        // (normalized synthetic todo) passes one gate and defers forever on the
+        // The seam check uses the first non-synthetic message so a synthetic head cannot shift the boundary.
+        // The anchor check also uses the first non-synthetic message; otherwise a synthetic head can pass the seam check and defer indefinitely.
         // other.
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -29369,8 +28473,7 @@ pub(crate) mod tests {
             Some("descended")
         );
 
-        // Follow-up pass whose head message is synthetic-marked; the anchor
-        // stays the first NON-synthetic message.
+        // The anchor uses the first non-synthetic message so a synthetic head cannot defer the check indefinitely.
         let mut synthetic_head = item("synth-head", 10, "synthetic filler");
         synthetic_head.ck.meta.synthetic = true;
         let mut follow_up_messages = vec![

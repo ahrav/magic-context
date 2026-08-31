@@ -1,7 +1,7 @@
-//! Scheduler/decide: the pass-class producer (execute/defer/force/block), the
-//! idle-TTL fire, the mid-turn deferred-execute transition, the emergency-drain
-//! latch, and provider context-overflow detection. Pure state-transition
-//! functions; durable state enters as parameters and exits in return values.
+//! This module produces execute, defer, force, and block pass classes.
+//! This module fires idle TTLs and transitions deferred work to execution mid-turn.
+//! This module manages the emergency-drain latch and detects provider context overflows.
+//! Functions in this module receive durable state as parameters and return updated state.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -11,27 +11,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::selection::PassClass;
 
-/// Default execute threshold percentage used when config has no usable value.
+/// The scheduler uses 65.0 when configuration has no usable execute threshold.
 pub const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 65.0;
-/// Maximum execute threshold percentage; higher values leave too little headroom.
 pub const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 90.0;
-/// Lowest context-usage percentage that may force materialization.
+/// The scheduler may force materialization at 85.0% context usage.
 pub const MIN_FORCE_MATERIALIZE_PERCENTAGE: f64 = 85.0;
-/// Context-usage percentage that enters the block-and-drain emergency band.
+/// The scheduler enters the emergency block-and-drain band at 95.0% context usage.
 pub const EMERGENCY_PERCENTAGE: f64 = 95.0;
-/// Default cache idle TTL used when the configured TTL string is invalid.
+/// The TTL parser returns 300_000 ms for an invalid configuration string.
 pub const DEFAULT_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
-/// Percentage points below the execute threshold required to clear the latch.
+/// The latch clears 10.0 percentage points below the execute threshold.
 pub const EMERGENCY_DRAIN_EXIT_MARGIN: f64 = 10.0;
-/// Exit percentage used when the execute threshold is missing or unusable.
+/// The latch exits at 55.0% when the execute threshold is unusable.
 pub const EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE: f64 = 55.0;
-/// Duration after a drain failure during which latch bypass is suppressed.
+/// A drain failure suppresses latch bypass for 60_000 ms.
 pub const EMERGENCY_DRAIN_FAILURE_BACKOFF_MS: u64 = 60_000;
-/// Maximum duration the emergency drain latch can remain active without re-entry.
+/// The latch expires after 1_800_000 ms without re-entry.
 pub const EMERGENCY_DRAIN_MAX_LATCH_MS: u64 = 30 * 60 * 1000;
-/// Smallest provider-reported context limit accepted as plausible.
+/// The validator accepts provider limits no smaller than 1024.
 pub const MIN_PLAUSIBLE_CONTEXT_LIMIT: u64 = 1024;
-/// Largest provider-reported context limit accepted as plausible.
+/// The validator accepts provider limits no larger than 10_000_000.
 pub const MAX_PLAUSIBLE_CONTEXT_LIMIT: u64 = 10_000_000;
 
 const OVERFLOW_PATTERN_SOURCES: &[&str] = &[
@@ -101,34 +100,28 @@ const LIMIT_EXTRACTION_PATTERN_SOURCES: &[(&str, ContextLimitProvenance)] = &[
     ),
 ];
 
-/// A parse error for cache idle TTL strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheTtlParseError;
 
-/// Percentage threshold config: one value for every model, or per-model values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ExecuteThresholdConfig {
-    /// A single percentage used for all models.
     Percentage(f64),
-    /// A map keyed by model id plus an optional `default` entry.
     ByModel(BTreeMap<String, f64>),
 }
 
-/// Tokens threshold config keyed by model id plus an optional `default` entry.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ExecuteThresholdTokensConfig {
-    /// Token thresholds. The `default` key is used when no model-specific key matches.
+    /// The `default` key is used when no model-specific key matches.
     pub values: BTreeMap<String, f64>,
 }
 
-/// Scheduler config used by the decision logic.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerConfig {
-    /// Percentage threshold config, capped by [`MAX_EXECUTE_THRESHOLD_PERCENTAGE`].
+    /// `MAX_EXECUTE_THRESHOLD_PERCENTAGE` caps the percentage threshold configuration.
     pub execute_threshold_percentage: ExecuteThresholdConfig,
-    /// Optional absolute-token threshold config; wins when a context limit is known.
+    /// The absolute-token threshold overrides the percentage threshold when a context limit is known.
     pub execute_threshold_tokens: Option<ExecuteThresholdTokensConfig>,
 }
 
@@ -143,47 +136,42 @@ impl Default for SchedulerConfig {
     }
 }
 
-/// Provider-reported context pressure for the current pass.
+/// The field records provider-reported context pressure for the current pass.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ContextUsage {
-    /// Provider-reported context fill percentage against the soft scheduling window.
+    /// The field records provider-reported context fill against the soft scheduling window.
     pub percentage: f64,
-    /// Provider-reported input tokens for this pass.
+    /// The field records provider-reported input tokens for the pass.
     pub input_tokens: f64,
-    /// Context fill percentage against the provider's absolute hard wall. Older callers omit
-    /// this value and retain the historical single-denominator behavior.
+    /// The field records context fill against the provider's absolute hard wall.
+    /// The scheduler uses the soft-window percentage when the absolute-token threshold is absent.
     #[serde(default)]
     pub hard_wall_percentage: Option<f64>,
 }
 
-/// Durable timing metadata needed for scheduler and idle-TTL predicates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMeta {
-    /// Unix milliseconds for the last completed provider response; `0` means none yet.
+    /// The field records the Unix-millisecond timestamp of the last completed provider response; `0` means none exists.
     pub last_response_time_ms: u64,
-    /// Cache idle TTL string such as `5m`, `30s`, `2h`, or a bare millisecond count.
+    /// The parser accepts `5m`, `30s`, `2h`, and bare millisecond counts.
     pub cache_ttl: String,
 }
 
-/// Base scheduler decision before pressure bands and boundary deferral.
+/// Pressure bands and boundary deferral modify the base scheduler decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseDecision {
-    /// Do not execute cache-busting work on this pass.
     Defer,
-    /// Execute cache-busting work on this pass.
     Execute,
 }
 
-/// Escalation thresholds derived from the effective execute threshold.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EscalationBands {
-    /// Dynamic force-materialization and emergency-drop threshold.
+    /// `EMERGENCY_PERCENTAGE` fixes the emergency block-and-drain threshold at 95.0%.
     pub force_materialize_percentage: f64,
-    /// Absolute provider-wall threshold; intentionally never derived from config.
+    /// The provider-wall threshold is never derived from configuration.
     pub emergency_percentage: f64,
 }
 
-/// Derive every sub-95 escalation site from the effective execute threshold.
 pub fn escalation_bands(effective_threshold_percentage: f64) -> EscalationBands {
     let threshold = if effective_threshold_percentage.is_finite() {
         effective_threshold_percentage.min(MAX_EXECUTE_THRESHOLD_PERCENTAGE)
@@ -196,27 +184,27 @@ pub fn escalation_bands(effective_threshold_percentage: f64) -> EscalationBands 
     }
 }
 
-/// Pressure band derived from provider-reported context usage.
+/// Provider-reported context usage determines the pressure band.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Band {
-    /// Below the force-materialization threshold.
+    /// `Band::Execute` applies below the force-materialization threshold.
     Normal,
-    /// At or above the derived force band, materialize and bypass mid-turn deferral.
+    /// `Band::Force85` materializes and bypasses mid-turn deferral at or above the derived force band.
     Force85,
-    /// At or above 95%, block and drain in the emergency band.
+    /// `Band::Emergency95` blocks and drains at or above 95% usage.
     Emergency95,
 }
 
-/// Final pass decision returned by the scheduler.
+/// `PassDecision` is the scheduler's final decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PassDecision {
-    /// Do not run a new cache-busting pass.
+    /// `PassDecision::Defer` prevents a new cache-busting pass.
     Defer,
-    /// Run a normal cache-busting pass.
+    /// `PassDecision::Execute` runs a normal cache-busting pass.
     Execute,
-    /// Force materialization at or above the derived escalation band.
+    /// `PassDecision::Force85` forces materialization at or above the derived escalation band.
     Force85,
-    /// Emergency block-and-drain pass at or above 95% usage.
+    /// `PassDecision::Emergency95` blocks and drains at or above 95% usage.
     Emergency95,
 }
 
@@ -225,7 +213,6 @@ impl PassDecision {
         matches!(self, PassDecision::Force85 | PassDecision::Emergency95)
     }
 
-    /// Stable diagnostic label persisted with accepted pass telemetry.
     pub const fn as_str(self) -> &'static str {
         match self {
             PassDecision::Defer => "Defer",
@@ -236,19 +223,17 @@ impl PassDecision {
     }
 }
 
-/// Live-tail state computed by the caller from typed content blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TailState {
-    /// True when the newest assistant span has a tool call without its paired result.
+    /// `mid_tool_use` is true when the newest assistant span has a tool call without its paired result.
     pub mid_tool_use: bool,
 }
 
-/// Reasons that bypass mid-turn deferral for an execute decision.
+/// `BoundaryBypass` bypasses mid-turn deferral for execute decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BoundaryBypass {
-    /// True when the user explicitly requested a cache bust.
     pub explicit_bust: bool,
-    /// True for subagent sessions, whose cache work must not wait on the parent session's tail state.
+    /// `subagent` bypasses deferral so subagent cache work does not wait on the parent session's tail state.
     pub subagent: bool,
 }
 
@@ -258,15 +243,14 @@ impl BoundaryBypass {
     }
 }
 
-/// Durable intent that an execute pass was deferred until the current tool call is resolved.
+/// `DeferredExecute` records an execute pass deferred until the current tool call resolves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeferredExecute {
-    /// Stable reason for the deferred intent.
     pub reason: String,
 }
 
 impl DeferredExecute {
-    /// Create the canonical pending execute intent recorded by mid-turn deferral.
+    /// `pending_execute` returns the canonical intent for a mid-turn-deferred execute pass.
     pub fn pending_execute() -> Self {
         Self {
             reason: "execute-none".to_string(),
@@ -274,21 +258,20 @@ impl DeferredExecute {
     }
 }
 
-/// Emergency drain latch state persisted by the caller between passes.
+/// `LatchState` persists the emergency-drain latch between passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LatchState {
-    /// Unix milliseconds when the latch armed; `None` means inactive.
+    /// `active_since_ms` stores the Unix milliseconds when the latch armed; `None` means inactive.
     pub active_since_ms: Option<u64>,
 }
 
 impl LatchState {
-    /// Return true when the emergency drain latch is currently active.
     pub fn is_active(self) -> bool {
         self.active_since_ms.is_some()
     }
 }
 
-/// Provenance of a numeric limit extracted from a provider overflow.
+/// `ContextLimitProvenance` identifies the accounting convention for a limit extracted from a provider overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextLimitProvenance {
@@ -300,74 +283,65 @@ pub enum ContextLimitProvenance {
     Unknown,
 }
 
-/// A plausible provider-reported limit with its accounting provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportedContextLimit {
-    /// Numeric token ceiling.
     pub value: u64,
-    /// Accounting convention attached to the extraction pattern.
     pub provenance: ContextLimitProvenance,
 }
 
-/// Provider context-overflow detection result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverflowDetection {
-    /// True when the error text matches a known context-overflow shape.
+    /// `is_overflow` is true when the error text matches a known context-overflow pattern.
     pub is_overflow: bool,
-    /// Reported provider context limit in tokens, when one is extractable and plausible.
+    /// `reported_limit` stores an extractable, plausible provider context limit in tokens.
     pub reported_limit: Option<u64>,
-    /// Accounting convention for `reported_limit`, when a limit was extracted.
+    /// `reported_limit_provenance` identifies the accounting convention for an extracted `reported_limit`.
     pub reported_limit_provenance: Option<ContextLimitProvenance>,
-    /// Source text of the first overflow regex that matched, for diagnostics.
+    /// `matched_pattern` stores the first matching overflow regex source for diagnostics.
     pub matched_pattern: Option<String>,
 }
 
-/// Inputs for the composed scheduler decision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerInputs {
-    /// Scheduler threshold config.
     pub config: SchedulerConfig,
-    /// Provider-reported context pressure.
+    /// `usage` contains provider-reported context pressure.
     pub usage: ContextUsage,
-    /// Durable session timing metadata.
+    /// `session` stores durable session timing metadata.
     pub session: SessionMeta,
-    /// Current time in Unix milliseconds, supplied by the caller for determinism.
+    /// `now_ms` is caller-supplied Unix time in milliseconds, which keeps decisions deterministic.
     pub now_ms: u64,
-    /// Optional provider/model key for per-model threshold lookup.
+    /// `model_key` selects per-model thresholds.
     pub model_key: Option<String>,
-    /// Optional explicit model context limit in tokens.
+    /// `context_limit` stores an explicit model context limit in tokens.
     pub context_limit: Option<f64>,
-    /// Live-tail state used by mid-turn deferral.
+    /// `tail_state` controls mid-turn deferral.
     pub tail_state: TailState,
-    /// Existing deferred execute intent, if a prior execute pass was postponed.
+    /// `deferred_execute` preserves an execute intent postponed by a prior pass.
     pub deferred_execute: Option<DeferredExecute>,
-    /// Non-pressure bypasses for mid-turn deferral.
+    /// `boundary_bypass` bypasses mid-turn deferral for non-pressure conditions.
     pub boundary_bypass: BoundaryBypass,
-    /// Current emergency drain latch state.
     pub drain_latch: LatchState,
-    /// Optional provider error text to scan for context overflow.
+    /// `overflow_error_text` supplies provider error text for context-overflow detection.
     pub overflow_error_text: Option<String>,
-    /// Durable provider-overflow recovery arm from the host. It upgrades a would-be
-    /// defer to the emergency path even when local usage is below the reported limit.
+    /// `emergency_recovery_armed` is a host-persisted provider-overflow recovery arm.
+    /// The recovery arm upgrades a would-be defer to the emergency path even when local usage is below the reported limit.
     pub emergency_recovery_armed: bool,
 }
 
-/// Composed scheduler output returned to the caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulerOutcome {
-    /// Execute/defer/force/emergency pass class.
     pub pass: PassDecision,
-    /// True only when this pass executes because the configured usage threshold was crossed.
+    /// `pressure_execute` is true only when the configured usage threshold causes execution.
     pub pressure_execute: bool,
-    /// True when the hard idle-TTL predicate fired and should be materialized.
+    /// `idle_ttl_fired` is true when the hard idle-TTL predicate fires and requires materialization.
     pub idle_ttl_fired: bool,
-    /// Updated emergency drain latch state for the caller to persist.
+    /// `drain_latch` is the updated emergency drain state the caller must persist.
     pub drain_latch: LatchState,
-    /// Updated deferred execute intent for the caller to persist.
+    /// `deferred_execute` is the updated deferred execute intent the caller must persist.
     pub deferred_execute: Option<DeferredExecute>,
-    /// Detected provider context limit in tokens, when overflow text reports one.
+    /// `detected_limit` stores the provider context limit reported in overflow text.
     pub detected_limit: Option<u64>,
-    /// Accounting convention attached to `detected_limit`.
+    /// `detected_limit_provenance` identifies `detected_limit`'s accounting convention.
     pub detected_limit_provenance: Option<ContextLimitProvenance>,
 }
 
@@ -381,7 +355,6 @@ struct CompiledLimitPattern {
     provenance: ContextLimitProvenance,
 }
 
-/// Parse a cache idle TTL string into milliseconds.
 pub fn parse_cache_ttl(ttl: &str) -> Result<u64, CacheTtlParseError> {
     let normalized = ttl.trim();
     if normalized.eq_ignore_ascii_case("never") {
@@ -406,9 +379,7 @@ pub fn parse_cache_ttl(ttl: &str) -> Result<u64, CacheTtlParseError> {
     if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
         return Err(CacheTtlParseError);
     }
-    // JavaScript's Number() accepts the syntactically valid digit sequence and yields
-    // Infinity on overflow. Saturating to u64::MAX preserves that value's practical
-    // scheduler behavior (no finite elapsed time can exceed it) instead of rejecting it.
+    // `parse_cache_ttl` saturates overflowing TTL values at `u64::MAX` because elapsed time cannot exceed `u64::MAX`.
     let milliseconds = number.parse::<f64>().map_err(|_| CacheTtlParseError)? * multiplier;
     Ok(
         if !milliseconds.is_finite() || milliseconds >= u64::MAX as f64 {
@@ -419,18 +390,15 @@ pub fn parse_cache_ttl(ttl: &str) -> Result<u64, CacheTtlParseError> {
     )
 }
 
-/// Return the scheduler's strict idle predicate (`elapsed > ttl`).
 pub fn ttl_execute_fired(now_ms: u64, last_response_time_ms: u64, ttl_ms: u64) -> bool {
     now_ms.saturating_sub(last_response_time_ms) > ttl_ms
 }
 
-/// Return the hard cache-expiry idle predicate (`last_response_time > 0 && elapsed > ttl`).
-/// The scheduler and TypeScript both defer at the exact TTL boundary.
+/// `ttl_execute_fired` and `ttl_force_fired` defer when `elapsed == ttl_ms`.
 pub fn ttl_hard_expired(now_ms: u64, last_response_time_ms: u64, ttl_ms: u64) -> bool {
     last_response_time_ms > 0 && now_ms.saturating_sub(last_response_time_ms) > ttl_ms
 }
 
-/// Resolve the effective execute threshold percentage for a model and context limit.
 pub fn resolve_execute_threshold(
     config: &ExecuteThresholdConfig,
     model_key: Option<&str>,
@@ -464,7 +432,6 @@ pub fn resolve_execute_threshold(
     resolved.min(MAX_EXECUTE_THRESHOLD_PERCENTAGE)
 }
 
-/// Compute the base scheduler execute/defer decision before pressure bands.
 pub fn should_execute(
     config: &SchedulerConfig,
     session: &SessionMeta,
@@ -503,7 +470,6 @@ pub fn should_execute(
     }
 }
 
-/// Derive the pressure band when soft scheduling and the absolute wall share a denominator.
 pub fn derive_band(usage_percentage: f64, effective_threshold_percentage: f64) -> Band {
     derive_band_with_hard_wall(
         usage_percentage,
@@ -512,8 +478,7 @@ pub fn derive_band(usage_percentage: f64, effective_threshold_percentage: f64) -
     )
 }
 
-/// Derive the pressure band while keeping execute/force geometry independent from the provider
-/// wall. Only the absolute 95% arm reads `hard_wall_percentage`; the force arm remains soft-based.
+/// The force arm uses the soft percentage; only the absolute 95% arm uses hard_wall_percentage.
 pub fn derive_band_with_hard_wall(
     usage_percentage: f64,
     hard_wall_percentage: f64,
@@ -529,7 +494,6 @@ pub fn derive_band_with_hard_wall(
     }
 }
 
-/// Apply the mid-turn boundary deferral transition to a pass decision.
 pub fn apply_boundary_deferral(
     decision: PassDecision,
     tail_state: TailState,
@@ -551,7 +515,7 @@ pub fn apply_boundary_deferral(
     (decision, pending)
 }
 
-/// Clear a deferred execute intent after the scheduled work succeeds.
+/// A successful scheduled work item clears the deferred execute intent.
 pub fn drain_deferred_after_work(
     pending: Option<DeferredExecute>,
     work_succeeded: bool,
@@ -563,7 +527,6 @@ pub fn drain_deferred_after_work(
     }
 }
 
-/// Resolve the usage percentage below which the emergency drain latch clears.
 pub fn emergency_drain_exit_threshold(execute_threshold_percentage: f64) -> f64 {
     if !execute_threshold_percentage.is_finite() || execute_threshold_percentage <= 0.0 {
         return EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE;
@@ -571,7 +534,6 @@ pub fn emergency_drain_exit_threshold(execute_threshold_percentage: f64) -> f64 
     (execute_threshold_percentage - EMERGENCY_DRAIN_EXIT_MARGIN).max(0.0)
 }
 
-/// Advance the emergency drain latch using only current usage and wall-clock input.
 pub fn advance_drain_latch(
     state: LatchState,
     usage_percentage: f64,
@@ -601,7 +563,6 @@ pub fn advance_drain_latch(
     }
 }
 
-/// Return true when an active drain latch may bypass normal scheduling constraints.
 pub fn drain_bypass_allowed(latch: LatchState, failure_at_ms: u64, now_ms: u64) -> bool {
     if !latch.is_active() {
         return false;
@@ -610,7 +571,6 @@ pub fn drain_bypass_allowed(latch: LatchState, failure_at_ms: u64, now_ms: u64) 
         && now_ms.saturating_sub(failure_at_ms) < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS)
 }
 
-/// Extract an error message from common JSON error shapes.
 pub fn extract_error_message(error: &serde_json::Value) -> String {
     match error {
         serde_json::Value::Null => String::new(),
@@ -638,7 +598,6 @@ pub fn extract_error_message(error: &serde_json::Value) -> String {
     }
 }
 
-/// Detect provider context overflow from raw error text.
 pub fn detect_overflow(error_text: &str) -> OverflowDetection {
     if error_text.is_empty() {
         return OverflowDetection {
@@ -673,13 +632,11 @@ pub fn detect_overflow(error_text: &str) -> OverflowDetection {
     }
 }
 
-/// Detect provider context overflow from a JSON-shaped error value.
 pub fn detect_overflow_value(error: &serde_json::Value) -> OverflowDetection {
     let message = extract_error_message(error);
     detect_overflow(&message)
 }
 
-/// Extract a plausible reported provider context limit from an error message.
 pub fn parse_reported_limit(message: &str) -> Option<ReportedContextLimit> {
     if message.is_empty() {
         return None;
@@ -704,7 +661,6 @@ pub fn parse_reported_limit(message: &str) -> Option<ReportedContextLimit> {
     None
 }
 
-/// Compose scheduler, pressure, boundary, latch, and overflow transitions.
 pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
     let effective_context_limit = inputs.context_limit.or_else(|| {
         if inputs.usage.percentage > 0.0 && inputs.usage.input_tokens > 0.0 {
@@ -741,9 +697,7 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
             PassDecision::Defer
         };
 
-    // The soft percentage still owns execute, force, and drain. The optional hard percentage is
-    // isolated to the absolute wall, so absent geometry and coinciding geometry preserve the old
-    // decision bytes while split geometry cannot move ordinary scheduling thresholds.
+    // The soft percentage controls execute, force, and drain decisions; hard_wall_percentage controls only the absolute wall.
     pass = match derive_band_with_hard_wall(
         inputs.usage.percentage,
         inputs
@@ -756,8 +710,7 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
         Band::Force85 => PassDecision::Force85,
         Band::Normal => pass,
     };
-    // A provider already rejected this session's wire shape. A low local usage
-    // reading cannot safely defer recovery, so mirror the ≥95% emergency path.
+    // A provider rejection of the session's wire shape requires the ≥95% emergency recovery path regardless of local usage.
     if inputs.emergency_recovery_armed && pass == PassDecision::Defer {
         pass = PassDecision::Emergency95;
     }
@@ -798,7 +751,6 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerOutcome {
     }
 }
 
-/// Convert a scheduler pass decision into the selection module's pass class.
 pub fn to_selection_pass_class(pass: PassDecision) -> PassClass {
     match pass {
         PassDecision::Defer => PassClass::Defer,
@@ -1425,10 +1377,8 @@ mod tests {
 
     #[test]
     fn never_ttl_predicates_are_always_false() {
-        // Scheduler: elapsed > u64::MAX is never true.
         assert!(!ttl_execute_fired(u64::MAX, 0, u64::MAX));
         assert!(!ttl_execute_fired(1_000_000, 0, u64::MAX));
-        // Hard: elapsed >= u64::MAX is never true.
         assert!(!ttl_hard_expired(u64::MAX, 1, u64::MAX));
         assert!(!ttl_hard_expired(1_000_000, 1, u64::MAX));
     }
@@ -1436,11 +1386,9 @@ mod tests {
     #[test]
     fn never_ttl_scheduler_stays_deferred() {
         let mut inputs = base_inputs();
-        // 10-day-old last response, well past any normal TTL
         inputs.session.last_response_time_ms = 1_000;
         inputs.session.cache_ttl = "never".to_string();
         inputs.now_ms = 1_000 + 10 * 24 * 60 * 60 * 1000;
-        // Below threshold, so TTL is the only path to execute
         inputs.usage.percentage = 50.0;
         let outcome = decide(&inputs);
         assert!(!outcome.idle_ttl_fired);

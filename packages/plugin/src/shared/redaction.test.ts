@@ -2,10 +2,20 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { hasShareabilitySensitiveText, redactSecretText } from "./redaction";
 import vocabulary from "./fixtures/redaction-vocabulary-v1.json";
+import {
+    hasShareabilitySensitiveText,
+    redactSecretText,
+    SECRET_QUALIFIERS,
+    SECRET_WORDS,
+} from "./redaction";
 
 describe("redaction vocabulary fixture", () => {
+    test("matches the cross-runtime label vocabulary", () => {
+        expect(SECRET_WORDS).toEqual(vocabulary.label_words);
+        expect([...SECRET_QUALIFIERS]).toEqual(vocabulary.label_qualifiers);
+    });
+
     test("matches the cross-runtime redacted output", () => {
         for (const fixture of vocabulary.cases) {
             expect(redactSecretText(fixture.input)).toBe(fixture.expected_redacted);
@@ -18,11 +28,8 @@ describe("redaction vocabulary fixture", () => {
     });
 
     test("preserves scalar exemptions and documents known misses", () => {
-        for (const exemption of vocabulary.exemptions) {
-            expect(redactSecretText(exemption)).toBe(exemption);
-        }
-        for (const knownMiss of vocabulary.known_misses) {
-            expect(redactSecretText(knownMiss)).toBe(knownMiss);
+        for (const unchanged of [...vocabulary.exemptions, ...vocabulary.known_misses]) {
+            expect(redactSecretText(unchanged)).toBe(unchanged);
         }
     });
 });
@@ -43,8 +50,7 @@ describe("redactSecretText — token counts and scalar diagnostics stay visible"
     });
 
     test("still redacts real secret string values", () => {
-        // High-entropy / non-scalar values must always be redacted; only bare
-        // numeric/boolean scalars are exempt from the key-based match.
+        // Key-based matching exempts numeric and boolean scalar values.
         const syntheticApiKey = "sk-abc123XYZ" + "secretvalue"; // gitleaks:allow redaction-test fixture
         expect(redactSecretText(`api_key=${syntheticApiKey}`)).toContain("<REDACTED:");
         expect(redactSecretText(`api_key=${syntheticApiKey}`)).not.toContain(syntheticApiKey);

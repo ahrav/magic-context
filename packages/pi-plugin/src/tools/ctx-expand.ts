@@ -1,20 +1,9 @@
 /**
- * Pi-side wrapper for the `ctx_expand` tool.
  *
- * Mirrors OpenCode's `packages/plugin/src/tools/ctx-expand/tools.ts`:
- * given the N-M range from a rendered `## N-M · date · title` heading, return
- * the original compacted U:/A: transcript so the agent can see the raw
- * discussion behind a summarized region.
+ * `ctx_expand` returns the original compacted U:/A: transcript for the N–M range in a rendered heading.
  *
- * Implementation: shared `readSessionChunk` reads via the per-session
- * `RawMessageProvider` registry. We register Pi's `readPiSessionMessages`
- * for the duration of this single tool call (and unregister in `finally`)
- * so we never accidentally leak the provider into other transform passes
- * which might race against this call.
  *
- * Token budget mirrors OpenCode's `CTX_EXPAND_TOKEN_BUDGET = 15_000` —
- * shared constant imported from the OpenCode tool's constants module so
- * both harnesses produce equivalent slices for the same range.
+ * The expansion is limited to the shared 15,000-token budget.
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -110,16 +99,14 @@ export function createCtxExpandTool(
 				return err("Error: no active Pi session.");
 			}
 
-			// All raw reads go through the shared provider-aware helpers, so
-			// register Pi's source for the duration of this single call.
-			// setRawMessageProvider returns an unregister fn so we don't leak the
-			// binding into concurrent transform passes.
+			// `ctx_expand` registers Pi's provider because shared readers resolve raw messages through the session provider.
+			// `finally` unregisters Pi's provider when `execute` completes or throws.
 			const unregister = setRawMessageProvider(sessionId, {
 				readMessages: () => readPiSessionMessages(ctx),
 			});
 
 			try {
-				// By-ordinal mode: full recovery of a single message from JSONL.
+				// By-ordinal mode recovers every part and tool input/output for one JSONL message.
 				if (typeof params.message === "number" && params.message >= 1) {
 					return ok(renderMessageByOrdinal(sessionId, params.message));
 				}
@@ -135,10 +122,8 @@ export function createCtxExpandTool(
 					);
 				}
 
-				// Clamp to the last compartment boundary (parity with OpenCode +
-				// ctx_search): messages after it are the live tail already visible
-				// to the agent, so re-expanding them wastes output tokens. -1 = no
-				// compartments yet → nothing compacted, so don't clamp.
+				// The expansion stops at the last compartment boundary because later messages remain visible in the live tail.
+				// `-1` means no compartments exist, so do not clamp.
 				const lastCompartmentEnd = getLastCompartmentEndMessage(
 					deps.db,
 					sessionId,
@@ -153,7 +138,6 @@ export function createCtxExpandTool(
 						? Math.min(params.end, lastCompartmentEnd)
 						: params.end;
 
-				// Verbose mode: each message separate, with ids + per-part previews.
 				if (params.verbose === true) {
 					const v = renderVerboseRange(
 						sessionId,

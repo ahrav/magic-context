@@ -74,12 +74,9 @@ export function validateProspectiveRegistry(
         ) {
             throw new HoldoutContractError(["prospective-registry: close-binding-mismatch"]);
         }
-        // A declared path that leaves the root and a declared file that is merely absent both
-        // surface out of `implementationBundleDigest` as a plain `Error`, so an escape is
-        // classified here against the resolved root instead of being recovered from a message.
-        // The predicate is the containment rule that digest enforces, so a path admitted here
-        // and rejected there as an escape cannot exist, and the catch below is left to report
-        // the file the scenario names but the tree does not hold.
+        // Reject paths outside `root` before the catch maps digest failures to `implementation-unavailable`.
+        // Reject paths outside `root` before the catch maps digest failures to `implementation-unavailable`.
+        // Reject paths outside `root` before the catch maps digest failures to `implementation-unavailable`.
         for (const file of scenario.implementationFiles) {
             if (!isWithin(root, resolve(root, file))) {
                 throw new HoldoutContractError(["prospective-registry: implementation-escapes-root"]);

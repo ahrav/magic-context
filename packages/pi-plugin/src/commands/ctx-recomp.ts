@@ -175,11 +175,6 @@ export function registerCtxRecompCommand(
 				readMessages: () => readPiSessionMessages(ctx),
 			} satisfies RawMessageProvider;
 
-			// Detached: the recomp runs in the background so the Pi REPL stays
-			// responsive (parity with OpenCode's `void runManagedRecomp`). The
-			// command handler returns right after this call. Provider registration,
-			// the `recomp` status-line flag, shutdown-drain tracking, and cleanup
-			// are owned by spawnPiRecompRun.
 			spawnPiRecompRun({
 				sessionId,
 				provider,
@@ -219,12 +214,7 @@ export function registerCtxRecompCommand(
 							historianTimeoutMs: currentDeps.historianTimeoutMs,
 							memoryEnabled: currentDeps.memoryEnabled,
 							autoPromote: currentDeps.autoPromote,
-							// Embedding substrate: register before the recomp publish
-							// path computes chunk embeddings, else rebuilt rows get
-							// none and drop out of ctx_search semantic results.
 							ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
-							// Recomp-runner model chain parity with OpenCode: configured
-							// fallbacks + the session's own model as last-ditch retry.
 							fallbackModels: currentDeps.historianFallbacks,
 							language: currentDeps.language,
 							fallbackModelId: ctx.model
@@ -234,10 +224,6 @@ export function registerCtxRecompCommand(
 						parsed.kind === "partial" ? { range: parsed.range } : {},
 					);
 					if (result.published) {
-						// A successful recomp resolves the overflow that may have armed
-						// needs_emergency_recovery — clear it so the flag stops force-
-						// bumping pressure to 95% every later pass (parity with
-						// OpenCode runManagedRecomp). detectedContextLimit is left intact.
 						try {
 							clearEmergencyRecovery(currentDeps.db, sessionId);
 						} catch (recoveryError) {
@@ -246,16 +232,6 @@ export function registerCtxRecompCommand(
 								`/ctx-recomp: clearEmergencyRecovery failed (continuing): ${describeError(recoveryError).brief}`,
 							);
 						}
-						// DEFERRED staging (background-safe): stage the native marker
-						// as a pending blob + signal a DEFERRED history refresh so the
-						// next transform pass (at a turn boundary) drains and applies
-						// it. The detached run must NOT apply the marker eagerly
-						// (appendCompaction mutates getBranch immediately, which from a
-						// background task could land mid-turn) nor use the eager
-						// history/materialization signals — those would force a
-						// materialization on whatever pass is running, possibly
-						// mid-turn, busting the cache. Mirrors the background
-						// historian's onPublished (signalPiDeferred*).
 						try {
 							stagePiRecompMarker({ db: currentDeps.db, sessionId, ctx });
 						} catch (markerError) {

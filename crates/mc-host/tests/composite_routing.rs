@@ -1,7 +1,3 @@
-//! Three-target static composition conformance: catalog contents, target
-//! classification, per-child dispatch metadata, degraded-child isolation,
-//! health aggregation, and ordered shutdown with typed redacted failures.
-
 mod support;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,8 +34,7 @@ struct FakeComponent {
     shutdown_error: Arc<Mutex<Option<String>>>,
     initialize_barrier: Arc<tokio::sync::Barrier>,
     events: Arc<Mutex<Vec<Ev>>>,
-    /// Id-tagged event log; `fake_trio` shares one across all three
-    /// components so cross-component ordering is observable.
+    /// `fake_trio` shares an ID-tagged timeline across all three components so cross-component ordering is observable.
     timeline: Arc<Mutex<Vec<(&'static str, Ev)>>>,
 }
 
@@ -319,8 +314,7 @@ async fn three_target_catalog_lists_all_modules_deterministically() {
     assert_eq!(modules[1]["roles"][0]["role"], "management_surface");
     assert_eq!(modules[2]["module_id"], "broca");
     assert_eq!(modules[2]["roles"][0]["role"], "management_surface");
-    // No composite module implements any control op; `wake.create` stays
-    // excluded so wake-plane probes fail open (AE10).
+    // `wake.create` is excluded because no composite module implements a control operation.
     support::assert_control_ops(&body["modules"], &[]);
 
     for (filter, expected) in [
@@ -513,8 +507,7 @@ async fn rejected_broca_bind_gets_exactly_one_broca_route_gone() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // The rejection stayed inside the broca child: no sibling saw a
-    // route-gone or a bind for its handle.
+    // The rejected bind is isolated to Broca; no sibling receives a bind or route-gone for its handle.
     for component in [&primary, &secondary] {
         assert!(
             component
@@ -644,7 +637,7 @@ async fn shutdown_runs_after_route_cleanup_and_orders_children() {
             component.id
         );
     }
-    // Fixed drain order: Broca before Synapse before the primary.
+    // The composite drains Broca before Synapse before the primary.
     let timeline = primary.timeline();
     let shutdown_at = |id: &str| {
         timeline
@@ -805,8 +798,7 @@ async fn invalid_manifest_sets_fail_before_publication() {
     expect_init_failure(vec![manifest("a", &["management_surface"])]).await;
 }
 
-/// A child whose shutdown always panics, for proving the composite still
-/// drains every later child before surfacing the failure.
+/// The child panics during shutdown; the composite drains every later child before surfacing the failure.
 struct PanickingShutdownChild {
     id: &'static str,
     shutdown_entered: Arc<AtomicBool>,
@@ -923,9 +915,8 @@ async fn a_child_shutdown_failure_makes_the_host_incarnation_non_graceful() {
         StaticComposite::new(primary.clone(), secondary.clone(), tertiary).expect("distinct ids");
     let host = CompositeHost::start(composite).await;
 
-    // The composite surfaced the collected failure only after every child
-    // drained; the runtime classifies the callback as failed and keeps the
-    // incarnation non-graceful while the instance fence is retained.
+    // The composite surfaces a collected shutdown failure only after every child drains.
+    // The host marks the incarnation non-graceful while retaining the instance fence.
     let result = host.shutdown().await;
     assert!(
         matches!(result, Err(HostError::LifecycleFatal(_))),
@@ -940,8 +931,8 @@ async fn a_child_shutdown_failure_makes_the_host_incarnation_non_graceful() {
     }
 }
 
-/// A child whose health probe always panics, for proving the composite
-/// reports the fault instead of unwinding into the host's fatal path.
+/// The child panics during health probing; the composite reports the fault instead of unwinding into the host's fatal path.
+/// The composite reports a child health-probe panic instead of unwinding into the host's fatal path.
 struct PanickingHealthChild {
     id: &'static str,
     health_entered: Arc<AtomicBool>,
@@ -1005,8 +996,7 @@ async fn a_panicking_broca_health_reports_failing_without_skipping_other_childre
         Some("broca health check panicked")
     );
 
-    // Other children were still polled: a degraded synapse is visible when
-    // it outranks nothing, and never masked by the broca fault below its
+    // The composite continues polling other children after Broca's health probe panics.
     // severity.
     secondary.set_health(HealthStatus::Degraded, "synapse degraded");
     let report = composite.health().await;

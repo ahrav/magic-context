@@ -125,7 +125,6 @@ describe("dream_runs claim-native change ids", () => {
             publicClaimIds: claims.map((claim) => claim.publicClaimId),
         });
 
-        // One manifest covering all three mutating action kinds at once.
         const applied = runLeaseGuardedWrite(db, holderId, leaseKey, () =>
             applyCurateManifest({
                 db: db as Database,
@@ -159,7 +158,7 @@ describe("dream_runs claim-native change ids", () => {
 
         const [row] = getDreamRuns(db, projectIdentity, 10);
         const parsed = JSON.parse(row.memory_changes_json as string);
-        // A new revision was written for the updated claim and the merge target.
+        // The update and merge target each have a new revision.
         expect(new Set(parsed.claimUpsertedIds)).toEqual(new Set([updated, mergeTarget]));
         // The archived claim and the retired merge source only changed lifecycle.
         expect(new Set(parsed.claimLifecycleIds)).toEqual(new Set([archived, mergeSource]));
@@ -167,11 +166,8 @@ describe("dream_runs claim-native change ids", () => {
     });
 
     it("leaves the legacy numeric fields empty so blob readers keep their fallback", () => {
-        // A reader of rows already written (the retired dashboard set this
-        // convention) treats "all three legacy id arrays absent" as its signal
-        // to reconstruct changes from the run's time window. Emitting []
-        // instead of omitting would satisfy its presence check and make it
-        // report an exact-but-empty change set, suppressing that fallback.
+        // Consumers treat absent legacy ID arrays as a request to reconstruct changes from the run window.
+        // Consumers treat empty legacy ID arrays as an exact empty change set rather than reconstructing changes from the run window.
         const changes = claimEffectMemoryChanges([
             {
                 effectKey: "upsert:a:r2",
@@ -186,9 +182,7 @@ describe("dream_runs claim-native change ids", () => {
         expect(changes.archivedIds).toBeUndefined();
         expect(changes.mergedIds).toBeUndefined();
         expect(changes.deletedIds).toBeUndefined();
-        // Counts stay 0: a change-presence gate ORs over every value in the
-        // blob, so a non-zero legacy count would render a block with no
-        // drill-down behind it.
+        // Legacy counts remain 0 because the change-presence gate ORs every blob value; nonzero counts render a block without drill-down.
         expect({ ...changes, claimUpsertedIds: undefined }).toEqual({
             written: 0,
             deleted: 0,

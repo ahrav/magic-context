@@ -1,7 +1,5 @@
 /**
- * Shared fixtures for historian-eval lane tests. Lives outside the `.test.ts`
- * files so contract, scorer, runner, mutation, and promote tests can share
- * one canonical scenario without importing each other's test registrations.
+ * The fixture module lives outside `.test.ts` files so tests share fixtures without importing test registrations.
  */
 
 import { parseScenario, type HistorianEvalScenario } from "./contract";
@@ -96,7 +94,7 @@ export function validScenario(): HistorianEvalScenario {
     return parseScenario(validScenarioRaw());
 }
 
-/** Gold-satisfying facts for `validScenario`. */
+/** `goldFacts` returns facts that satisfy `validScenario`'s gold. */
 export function goldFacts(): MockHistorianFact[] {
     return [
         { category: "ARCHITECTURE", content: "Sessions are cached by the in-process LRU cache; Redis was rejected because it adds an operational dependency." },
@@ -105,8 +103,7 @@ export function goldFacts(): MockHistorianFact[] {
 }
 
 /**
- * A raw historian payload that fully satisfies `validScenario`'s gold: one
- * compartment covering the whole synthetic chunk, both gold facts, no
+ * `goldHistorianPayload` returns a payload that satisfies `validScenario`'s gold.
  * forbidden formations.
  */
 export function goldenRawOutput(scenario: HistorianEvalScenario = validScenario(), facts: MockHistorianFact[] = goldFacts()): string {

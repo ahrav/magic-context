@@ -1,13 +1,8 @@
-//! Adversarial descriptor-level cases live in `src/instance.rs` unit tests,
-//! where the guard is constructible directly; this file covers what a client
-//! and a racing successor can observe from outside.
-
 mod support;
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use support::raw_client;
 use support::{TestHandler, TestHost};
 
 const UMASK_CHILD_ENV: &str = "MC_HOST_RESTRICTIVE_UMASK_CHILD";
@@ -57,7 +52,7 @@ async fn restrictive_umask_subprocess_child() {
         & 0o7777;
     assert_eq!(dir_mode, 0o700);
     assert_eq!(file_mode, 0o600);
-    raw_client::discover(&host.publication_path()).expect("publication stays readable");
+    mc_host::read_connection_file(host.publication_path()).expect("publication stays readable");
 
     host.shutdown_gracefully().await;
 }
@@ -85,22 +80,20 @@ async fn discovery_validates_the_publication_the_way_a_client_must() {
     assert_eq!(owned.wire_version, 2);
     assert_eq!(owned.key.len(), 32);
 
-    let info = raw_client::discover(&host.publication_path()).expect("valid publication");
-    assert_eq!(info.schema, 1);
+    let info = mc_host::read_connection_file(host.publication_path()).expect("valid publication");
+    assert_eq!(info.schema, 2);
     assert_eq!(info.wire_version, 2);
-    assert_eq!(info.host, "127.0.0.1");
-    assert_ne!(info.port, 0);
+    assert!(!info.setup_socket.is_empty());
     assert_eq!(info.key.len(), 32);
     assert_eq!(info.daemon_id.len(), 16);
-    assert_eq!(info.pid, u64::from(std::process::id()));
+    assert_eq!(info.pid, std::process::id());
     assert_eq!(info.daemon_ver, "mc-host/test");
 
-    // A mode-0644 copy of the same file must be refused.
     let loose = host.data_root.path().join("loose-copy.json");
     std::fs::copy(host.publication_path(), &loose).expect("copy");
     std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).expect("chmod");
     assert!(
-        raw_client::discover(&loose).is_err(),
+        mc_host::read_connection_file(&loose).is_err(),
         "an insecure mode must fail client validation"
     );
     assert!(mc_host::read_connection_file(&loose).is_err());
@@ -184,7 +177,6 @@ async fn shutdown_removes_the_publication_and_releases_the_lock() {
         "graceful shutdown must remove the publication"
     );
 
-    // The lock released: a successor starts immediately in the same root.
     let successor = TestHost::try_start_with(TestHandler::new(), {
         let path = data_root.path().to_path_buf();
         move |config| config.data_dir = Some(path)
@@ -327,16 +319,11 @@ async fn a_planted_symlink_at_the_record_name_is_replaced_not_followed() {
     host.shutdown_gracefully().await;
 }
 
-/// The crate lint is `deny(unsafe_code)`, not `forbid`, because one
-/// `pre_exec` hook must arm `PR_SET_PDEATHSIG` so harness children cannot
-/// outlive a crashed host. `deny` is locally overridable, so this test
-/// restores the hard guarantee `forbid` gave: exactly one scoped
-/// `allow(unsafe_code)` exists, in the one file entitled to it, and it
-/// carries a safety justification.
+/// `deny(unsafe_code)` permits the scoped `allow(unsafe_code)` required for the `pre_exec` hook that arms `PR_SET_PDEATHSIG` so harness children die with a crashed host.
+/// `deny(unsafe_code)` permits the scoped `allow(unsafe_code)` required for the `pre_exec` hook that arms `PR_SET_PDEATHSIG` so harness children die with a crashed host.
+/// `deny(unsafe_code)` permits the scoped `allow(unsafe_code)` required for the `pre_exec` hook that arms `PR_SET_PDEATHSIG` so harness children die with a crashed host.
 ///
-/// (Keeping crate-root `forbid` was not an option: `forbid` cannot be
-/// overridden anywhere in the same crate, so the only alternative was
-/// moving the spawn helper into a separate crate for ~20 lines.)
+/// `forbid(unsafe_code)` cannot be overridden within the crate.
 #[test]
 fn exactly_one_unsafe_escape_hatch_exists_in_the_crate() {
     const BLESSED: &str = "broca/subprocess.rs";
@@ -389,8 +376,8 @@ fn exactly_one_unsafe_escape_hatch_exists_in_the_crate() {
 }
 
 /// The coordination fences are owner-only regular files in an owner-only
-/// directory, present while the host serves and never removed by teardown
-/// (supported code never unlinks them).
+/// Coordination fences remain present while the host serves.
+/// Host teardown never unlinks coordination fences.
 #[tokio::test]
 async fn coordination_locks_are_owner_only_and_survive_teardown() {
     let data_root = tempfile::tempdir().expect("temp root");
@@ -421,7 +408,7 @@ async fn coordination_locks_are_owner_only_and_survive_teardown() {
 }
 
 /// An unknown lifecycle schema at the record name blocks startup without
-/// interpreting, migrating, or overwriting the quarantined bytes.
+/// An unknown lifecycle schema leaves quarantined bytes uninterpreted, unmigrated, and unchanged.
 #[tokio::test]
 async fn startup_refuses_to_overwrite_an_unknown_lifecycle_schema() {
     let data_root = tempfile::tempdir().expect("temp root");

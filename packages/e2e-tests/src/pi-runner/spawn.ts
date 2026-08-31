@@ -1,4 +1,4 @@
-/** Shared Pi e2e process configuration helpers. */
+/* */
 
 import { existsSync, mkdirSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -73,9 +73,9 @@ export interface PiRunnerOptions {
   magicContextConfig?: Record<string, unknown>;
   piSettingsExtra?: Record<string, unknown>;
   modelContextLimit?: number;
-  /** Compatibility option from the old spawn-per-turn runner. RPC sessions persist naturally. */
+  /** `continueSession` is ignored because RPC sessions persist without it. */
   continueSession?: boolean;
-  /** Verified immutable release root. Omitted keeps active-checkout behavior. */
+  /** `releaseRoot` selects a verified immutable release root; omitting it uses the active checkout. */
   releaseRoot?: VerifiedReleaseRoot;
 }
 
@@ -96,7 +96,7 @@ export function createPiIsolatedEnv(sharedDataDir?: string): PiIsolatedEnv {
     mkdirSync(d, { recursive: true });
   }
 
-  // Use real paths consistently to avoid /var vs /private/var identity drift on macOS.
+  // Real paths prevent `/var` and `/private/var` identity drift on macOS.
   return {
     baseDir: realpathSync(baseDir),
     configDir: realpathSync(configDir),
@@ -119,11 +119,10 @@ export function ensurePluginAvailable(env: PiIsolatedEnv, releaseRoot?: Verified
     return;
   }
   // Pi resolves an extension by reading `pi.extensions` from the `package.json`
-  // inside each `settings.packages` entry, so an entry has to be a package
-  // directory. The release root declares the built entrypoint, not the package
-  // that wraps it, so the entry is a directory built here: the frozen file is
-  // linked in and a manifest points at the link. The bytes Pi loads are still the
-  // release root's; only the wrapper naming them is local.
+  // Pi requires each `settings.packages` entry to be a package directory.
+  // The release root declares the built entrypoint rather than its package directory.
+  // `env.pluginDir` wraps the release entrypoint in a package directory.
+  // Pi loads the release-root artifact; only its package wrapper is local.
   const entrypoint = releaseRootPath(releaseRoot, "piPlugin");
   if (!existsSync(entrypoint)) {
     throw new Error(`Pi plugin artifact is missing: ${entrypoint}`);

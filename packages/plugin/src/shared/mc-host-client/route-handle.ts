@@ -1,10 +1,9 @@
-/** Leaf module: no imports from connection or facade code. */
+/* */
 
 const connectionToken = new WeakMap<RouteHandle, object>();
 
 /**
- * Only `createRouteHandle` registers a connection token, so a directly
- * constructed handle never passes `belongsToConnection`.
+ * Handles constructed with `new RouteHandle` never pass `belongsToConnection`.
  */
 export class RouteHandle {
     readonly channel: number;
@@ -49,7 +48,7 @@ export function belongsToConnection(handle: RouteHandle, token: object): boolean
     return connectionToken.get(handle) === token;
 }
 
-/** Throw `StaleRouteHandleError` unless `handle` belongs to `token`'s connection. */
+/* */
 export function assertBelongsToConnection(handle: RouteHandle, token: object): void {
     if (!belongsToConnection(handle, token)) {
         throw new StaleRouteHandleError(handle);

@@ -130,14 +130,13 @@ describe("effectiveEndMs", () => {
     });
 
     test("uses completed even when it is older than created (pathological case)", () => {
-        // Trust the data — don't second-guess absurd timestamps at this layer.
+        // effectiveEndMs does not validate timestamp ordering.
         expect(effectiveEndMs({ created: 2000, completed: 1000 })).toBe(1000);
     });
 });
 
 describe("formatDate", () => {
     test("formats a date as YYYY-MM-DD", () => {
-        // 2026-04-21 00:00:00 local time. Test with a known date.
         const ms = new Date(2026, 3, 21, 12, 0, 0).getTime(); // Apr 21 2026 noon local
         expect(formatDate(ms)).toBe("2026-04-21");
     });
@@ -183,7 +182,6 @@ describe("injectTemporalMarkers", () => {
 
     test("uses prev.time.completed when set (correct semantic for completed assistant)", () => {
         const t0 = 1_000_000_000_000;
-        // Assistant took 12 minutes to run. User replied 30 seconds after completion.
         const assistantCreated = t0;
         const assistantCompleted = t0 + 12 * 60 * 1000;
         const userCreated = assistantCompleted + 30_000; // 30s after finish
@@ -191,7 +189,6 @@ describe("injectTemporalMarkers", () => {
             makeAssistantMsg(assistantCreated, assistantCompleted, "long work"),
             makeUserMsg(userCreated, "thanks"),
         ];
-        // Gap from COMPLETED = 30s -> below threshold, no marker.
         expect(injectTemporalMarkers(messages)).toBe(0);
         expect(messages[1].parts[0].text).toBe("thanks");
     });

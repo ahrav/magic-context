@@ -121,8 +121,7 @@ describe("SmartNoteEvaluatorWorker registration", () => {
         releaseRegister?.(REGISTER_OK);
         expect(await registering).toBe(false);
         expect(w.registered).toBe(false);
-        // The minted token is released instead of heartbeating forever on a
-        // worker no drain path will ever service.
+        // Disposal unregisters a token minted during registration because no drain will heartbeat it.
         const unregister = calls.find((c) => c.method === "note.evaluation.unregister");
         expect(unregister?.body.token).toBe("tok-1");
     });
@@ -149,8 +148,7 @@ describe("SmartNoteEvaluatorWorker registration", () => {
             log: () => {},
         });
         const registering = w.register();
-        // A drain observes the wake plane while the eager registration is
-        // still in flight; joiners share the attempt and its stale snapshot.
+        // The register request uses the policy snapshot captured when registration starts.
         policy.wakeOwned = true;
         releaseRegister?.(REGISTER_OK);
         expect(await registering).toBe(true);
@@ -196,10 +194,7 @@ describe("SmartNoteEvaluatorWorker drain", () => {
     });
 
     test("an exclude-billable drain releases a recovered billable claim instead of executing it", async () => {
-        // Replayed and slot-recovered claims bypass the authority's selection,
-        // so the server-side exclude_billable filter never sees them; the
-        // zero client-side budgets are the guard that keeps a committed
-        // compile claim from billing inside a maintenance drain.
+        // Client-side zero budgets prevent recovered billable claims from running because they bypass `exclude_billable` selection.
         const { transport, calls } = stubTransport((method) => {
             if (method === "note.evaluation.register") return REGISTER_OK;
             if (method === "note.evaluation.next") return claimResponse(1, "compile");
@@ -251,8 +246,7 @@ describe("SmartNoteEvaluatorWorker drain", () => {
             if (method === "note.evaluation.next") {
                 served += 1;
                 nextIds.push(body.acquisition_id as string);
-                // A stale replayed decision says nothing about current work;
-                // the fresh poll finds the queue empty.
+                // The worker polls for current work after a replayed decision because the queue may be empty.
                 return served === 1 ? { result: "expired" } : { result: "no_work" };
             }
             return { ok: true };
@@ -276,7 +270,6 @@ describe("SmartNoteEvaluatorWorker drain", () => {
             }
             if (method === "note.evaluation.complete") {
                 completions += 1;
-                // First claim fenced by a concurrent edit; second applies.
                 return completions === 1 ? { result: "stale" } : { result: "applied" };
             }
             return { ok: true };
@@ -290,8 +283,7 @@ describe("SmartNoteEvaluatorWorker drain", () => {
             surfaced: 0,
             drained: true,
         });
-        // The fenced claim is already terminal server-side: no abandon call,
-        // and the drain moves on to the next note instead of breaking.
+        // A fenced claim is terminal server-side, so the drain skips abandon and continues to the next note.
         expect(calls.some((c) => c.method === "note.evaluation.abandon")).toBe(false);
         expect(calls.filter((c) => c.method === "note.evaluation.next")).toHaveLength(3);
         await w.dispose();
@@ -353,9 +345,7 @@ describe("SmartNoteEvaluatorWorker drain", () => {
     });
 
     test("a malformed claim response preserves the acquisition id for replay", async () => {
-        // The authority has already leased a note under the acquisition id by
-        // the time the payload is validated; discarding the id would strand
-        // that lease until expiry.
+        // The worker retains the acquisition ID after payload validation because the authority leases the note under that ID.
         let malformed = true;
         const sawAcquisitionIds: string[] = [];
         const { transport } = stubTransport((method, body) => {
@@ -400,9 +390,7 @@ describe("SmartNoteEvaluatorWorker drain", () => {
     });
 
     test("a malformed authority repeating one fallback note is bounded to one completion", async () => {
-        // The authority's in-cycle exclusion normally guarantees distinct
-        // fallback notes; this guard bounds a recovered claim or a malformed
-        // authority that replays the same note anyway.
+        // The worker tracks fallback note IDs to prevent recovered or malformed responses from replaying a note.
         const { transport, calls } = stubTransport((method) => {
             if (method === "note.evaluation.register") return REGISTER_OK;
             if (method === "note.evaluation.next") return claimResponse(7, "fallback");
@@ -422,8 +410,7 @@ describe("SmartNoteEvaluatorWorker drain", () => {
     });
 
     test("distinct fallback claims complete without defensive abandons", async () => {
-        // Authority-owned rotation hands out distinct notes; the duplicate
-        // guard must not stop valid later fallback claims.
+        // The worker rejects only repeated fallback note IDs because authority rotation can return distinct later notes.
         let served = 0;
         const { transport, calls } = stubTransport((method) => {
             if (method === "note.evaluation.register") return REGISTER_OK;
@@ -449,10 +436,7 @@ describe("SmartNoteEvaluatorWorker drain", () => {
     });
 
     test("a cursor left spent by an earlier drain costs one poll, not the pass", async () => {
-        // A drain truncated by its deadline can leave the authority's cursor
-        // spent. The next drain's first poll reports cycle_exhausted (the
-        // authority resets the cursor in that same response), so this pass must
-        // poll again rather than report a drained queue and do nothing.
+        // The worker retries `cycle_exhausted` once after a deadline-truncated drain because that response resets the cursor.
         let served = 0;
         const { transport } = stubTransport((method) => {
             if (method === "note.evaluation.register") return REGISTER_OK;
@@ -478,9 +462,7 @@ describe("SmartNoteEvaluatorWorker drain", () => {
     });
 
     test("a pass that spends its own cycle stops instead of taking a second one", async () => {
-        // Once this pass has claimed work the cursor is its own, so exhaustion
-        // is a real pass boundary: consuming it would hand out the phase quotas
-        // twice in one drain and defeat the billable per-run bounds.
+        // The worker treats `cycle_exhausted` as a pass boundary after claiming work to preserve per-run billable quotas.
         let served = 0;
         const { transport } = stubTransport((method) => {
             if (method === "note.evaluation.register") return REGISTER_OK;
@@ -503,15 +485,13 @@ describe("SmartNoteEvaluatorWorker drain", () => {
             surfaced: 0,
             drained: true,
         });
-        // Two claims plus the boundary poll: the drain did not re-poll for a
-        // second cycle's worth of quota.
+        // The worker stops after two claims and the boundary poll to avoid starting a second quota cycle.
         expect(served).toBe(3);
         await w.dispose();
     });
 
     test("repeated cycle_exhausted answers cannot spin the drain", async () => {
-        // A malformed authority that always claims exhaustion must not turn the
-        // zero-claim retry into an unbounded poll loop.
+        // The worker limits zero-claim `cycle_exhausted` retries to prevent a malformed authority from causing an unbounded poll loop.
         let served = 0;
         const { transport } = stubTransport((method) => {
             if (method === "note.evaluation.register") return REGISTER_OK;
@@ -563,7 +543,6 @@ describe("SmartNoteEvaluatorWorker drain", () => {
             log: () => {},
         });
         const drain = w.drainOnce({ deadline: Date.now() + 30_000 });
-        // Let the drain claim the note and block inside the executor.
         await new Promise((resolve) => setTimeout(resolve, 20));
         await w.dispose();
         const result = await drain;
@@ -613,9 +592,8 @@ describe("SmartNoteEvaluatorWorker drain", () => {
     });
 
     test("a drain stops issuing compiler prompts at the per-run cap", async () => {
-        // The authority's MAX_COMPILE_PER_RUN truncates one selection poll;
-        // each subsequent poll admits the next candidate, so the worker owns
-        // the whole-drain bound.
+        // The authority's `MAX_COMPILE_PER_RUN` truncates one selection poll; subsequent polls admit the next candidate, so the worker enforces the whole-drain bound.
+        // The worker enforces `MAX_COMPILE_PER_RUN` across all selection polls in one drain.
         let served = 0;
         const { transport, calls } = stubTransport((method) => {
             if (method === "note.evaluation.register") return REGISTER_OK;
@@ -675,8 +653,7 @@ describe("SmartNoteEvaluatorWorker drain", () => {
         );
         const first = w.drainOnce({ deadline: Date.now() + 30_000 });
         const second = w.drainOnce({ deadline: Date.now() + 30_000 });
-        // Let the first drain claim and block inside its executor; the second
-        // drain must not poll while the first still owns the slot.
+        // The second drain must not poll while the first drain owns the slot.
         await new Promise((resolve) => setTimeout(resolve, 20));
         const nextsWhileBlocked = calls.filter((c) => c.method === "note.evaluation.next").length;
         expect(nextsWhileBlocked).toBe(1);
@@ -690,11 +667,7 @@ describe("SmartNoteEvaluatorWorker drain", () => {
 
 /**
  * The module validates every `note.evaluation.*` body against a CLOSED field set
- * and rejects any unknown key with `bad_request`. These sets mirror the allowlists
- * in `crates/mc-module/src/lib.rs` (handle_note_evaluation_*). A body carrying a
- * field the server does not accept fails the call outright, which previously went
- * unnoticed because the stub transport accepts anything and the Rust tests hand-
- * build bodies rather than replaying the client's.
+ * The module rejects unknown keys with `bad_request`; its closed field sets mirror the allowlists.
  */
 const SERVER_ALLOWED_FIELDS: Record<EvaluatorMethod, readonly string[]> = {
     "note.evaluation.register": [
@@ -757,8 +730,7 @@ describe("SmartNoteEvaluatorWorker wire schema conformance", () => {
     test("every sent body stays within the module's closed field set", async () => {
         let served = 0;
         const { transport, calls } = stubTransport((method, body) => {
-            // Fail closed exactly like the module does, so a stray field turns
-            // into a visible test failure instead of a silently rejected call.
+            // The test helper rejects stray fields so schema violations fail the test.
             for (const key of Object.keys(body)) {
                 if (key === "method") continue;
                 if (!SERVER_ALLOWED_FIELDS[method].includes(key)) {
@@ -780,18 +752,14 @@ describe("SmartNoteEvaluatorWorker wire schema conformance", () => {
         const w = worker(transport);
         expect(await w.register()).toBe(true);
         await w.heartbeat();
-        // A rejected heartbeat silently drops the registration, so assert it
-        // survived BEFORE dispose; this is the check that catches a heartbeat
-        // body carrying a field outside the server's closed set.
+        // Registration must survive until dispose because a rejected heartbeat clears it.
         expect(w.registered).toBe(true);
         await w.drainOnce({ deadline: Date.now() + 5_000 });
-        // A nonbillable poll carries exclude_billable, which the module's
-        // closed field set for note.evaluation.next accepts.
+        // A nonbillable poll carries `exclude_billable`, which the module accepts in the closed field set for `note.evaluation.next`.
         await w.drainOnce({ deadline: Date.now() + 5_000, excludeBillable: true });
         expect(w.registered).toBe(true);
         await w.dispose();
 
-        // Exercised the registration-scoped and claim-scoped methods.
         const seen = new Set(calls.map((c) => c.method));
         expect(seen.has("note.evaluation.register")).toBe(true);
         expect(seen.has("note.evaluation.heartbeat")).toBe(true);
@@ -804,8 +772,8 @@ describe("SmartNoteEvaluatorWorker wire schema conformance", () => {
             ),
         ).toBe(true);
 
-        // The heartbeat/unregister fence must NOT carry evaluator_slot; the
-        // claim-scoped fence must.
+        // The heartbeat/unregister fence must not carry `evaluator_slot`.
+        // The claim-scoped fence must carry `evaluator_slot`.
         for (const call of calls) {
             const hasSlot = Object.hasOwn(call.body, "evaluator_slot");
             const slotAllowed = SERVER_ALLOWED_FIELDS[call.method].includes("evaluator_slot");
@@ -858,9 +826,9 @@ describe("SmartNoteEvaluatorWorker availability", () => {
         expect(await w.register()).toBe(true);
         expect(w.registered).toBe(true);
         await w.heartbeat();
-        // The module did not renew the lease, so availability must not keep
-        // reporting true; otherwise conditioned ctx_note writes are admitted
-        // against an evaluator the module has already purged.
+        // Because the module did not renew the lease, availability must not remain true.
+        // Conditioned `ctx_note` writes must not be admitted for an evaluator the module has purged.
+        // The worker must report unavailable after the module purges an evaluator to prevent conditioned `ctx_note` writes.
         expect(w.registered).toBe(false);
         await w.dispose();
     });
@@ -887,8 +855,7 @@ describe("SmartNoteEvaluatorWorker availability", () => {
         await w.heartbeat();
         expect(w.registered).toBe(false);
 
-        // Drain must recover the registration on its own, otherwise availability
-        // is a one-way latch for the life of the process.
+        // The drain must recover the registration before reporting availability.
         heartbeatShouldFail = false;
         await w.drainOnce({ deadline: Date.now() + 5_000 });
         expect(registrations).toBe(2);

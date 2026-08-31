@@ -191,11 +191,7 @@ describe("window geometry", () => {
         const cases = [
             ["openai-chatgpt-oauth", "gpt-5.6", 272_000, 128_000, 200_200],
             ["anthropic", "claude-opus-5", 1_000_000, 128_000, 629_200],
-            // Producer batch downgraded google's geometry to considered-unknown
-            // (Google's docs contradict the separate-quota reading), so the
-            // derivation demotes to shared_upfront and reserves OpenCode's
-            // actual request cap B = min(65_536, 32_000):
-            // floor(0.65 * (1_048_576 - 32_000)) — not the no-reserve 681_574.
+            // Expected execution base: floor(0.65 * (1_048_576 - 32_000)) = 660_774, not 681_574.
             ["google", "gemini-3.5-flash", 1_048_576, 65_536, 660_774],
             ["xai", "grok-4.6", 500_000, 500_000, 304_200],
             ["ollama-cloud", "deepseek-v4-flash", 1_048_576, 384_000, 660_774],

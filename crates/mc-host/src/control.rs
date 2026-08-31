@@ -1,9 +1,6 @@
-//! Bounded channel-0 control handling: strict JSON validation, operation
-//! classification, `catalog.list`, and `route.open` request parsing.
 //!
-//! Every byte limit here is enforced before handler callbacks, route
-//! reservation, or filesystem work (protocol §7.1). Metadata never grants
-//! authority; the bearer key already did.
+//! Byte limits are enforced before handler callbacks, route reservation, and filesystem work.
+//! The bearer key, not metadata, grants authority.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -23,7 +20,6 @@ pub const OP_ROUTE_OPEN: &str = "route.open";
 pub const OP_CATALOG_LIST: &str = "catalog.list";
 pub const OP_HOST_SHUTDOWN: &str = "host.shutdown";
 pub const OP_HOST_STATUS: &str = "host.status";
-pub const OP_TRANSPORT_NEGOTIATE: &str = crate::transport_negotiation::OP_TRANSPORT_NEGOTIATE;
 
 /// `TargetIndex` restricts `route.open` targets to listed `(module, kind)`
 /// pairs.
@@ -65,14 +61,11 @@ const MAX_ADMISSION_FACTS_DEPTH: usize = 32;
 /// Whole-request nesting bound: the root object plus a maximal
 /// `admission_facts` subtree. Unknown fields count toward nesting limits
 /// (protocol §7.1), so the bound applies to the complete control object
-/// before dispatching on `op`.
 const MAX_CONTROL_DEPTH: usize = MAX_ADMISSION_FACTS_DEPTH + 1;
 
-/// Catalog-state generation. Static until catalog content can change at
-/// runtime, which the direct-linked profile has no mechanism for.
+/// The direct-linked profile cannot change catalog content at runtime, so the generation is always 1.
 pub const CATALOG_GENERATION: u64 = 1;
 
-/// What a validated channel-0 request asks the host to do.
 #[derive(Debug, PartialEq)]
 pub enum ControlAction {
     CatalogList {
@@ -84,12 +77,6 @@ pub enum ControlAction {
     },
     HostShutdown,
     HostStatus,
-    TransportNegotiate(
-        Result<
-            crate::transport_negotiation::NegotiateRequest,
-            crate::transport_negotiation::NegotiationError,
-        >,
-    ),
     /// Semantic rejection with a trustworthy correlation; one terminal.
     Reject {
         code: &'static str,
@@ -104,104 +91,16 @@ fn invalid(message: &str) -> ControlAction {
     }
 }
 
-/// Tolerantly classifies a body that failed strict validation. A generic
-/// rejection commits the generation to TCP and leaves it usable, but a
-/// malformed negotiation-family body must reach the authoritative-terminal-
-/// and-close path (§7.7.1), so classification cannot depend on the body
-/// parsing under ANY reader — truncated JSON still names its operation.
-/// JSON permits escaped spellings of any string, so a raw miss is retried
-/// against a structure-blind unescape of the bytes. The needle omits the
-/// closing quote so a body truncated mid-token still classifies. The scan
-/// over-matches (the tag may appear as a value, or as the prefix of a
-/// longer operation name), which only retires a connection that already
-/// sent an invalid control body: fail closed.
-fn is_negotiation_family(body: &[u8]) -> bool {
-    const NEEDLE: &[u8] = b"\"transport.negotiate";
-    if body.windows(NEEDLE.len()).any(|window| window == NEEDLE) {
-        return true;
-    }
-    if !body.contains(&b'\\') {
-        return false;
-    }
-    let decoded = decode_json_escapes_lossy(body);
-    decoded.windows(NEEDLE.len()).any(|window| window == NEEDLE)
-}
-
-/// Structure-blind decode of JSON string escapes for classification only:
-/// `\uXXXX` (BMP; unpaired surrogates are dropped), the two-character
-/// escapes, and everything else copied through. Never used to build values.
-fn decode_json_escapes_lossy(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len());
-    let mut index = 0;
-    while index < body.len() {
-        if body[index] != b'\\' || index + 1 >= body.len() {
-            out.push(body[index]);
-            index += 1;
-            continue;
-        }
-        match body[index + 1] {
-            b'u' if index + 6 <= body.len() => {
-                let hex = std::str::from_utf8(&body[index + 2..index + 6]).ok();
-                let code = hex.and_then(|hex| u16::from_str_radix(hex, 16).ok());
-                if let Some(ch) = code.and_then(|code| char::from_u32(u32::from(code))) {
-                    let mut buffer = [0u8; 4];
-                    out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
-                }
-                index += 6;
-            }
-            b'"' => {
-                out.push(b'"');
-                index += 2;
-            }
-            b'\\' => {
-                out.push(b'\\');
-                index += 2;
-            }
-            b'/' => {
-                out.push(b'/');
-                index += 2;
-            }
-            other => {
-                out.push(b'\\');
-                out.push(other);
-                index += 2;
-            }
-        }
-    }
-    out
-}
-
-/// The strict negotiation decode for a body already known to be invalid:
-/// yields the `NegotiationError` that routes it to retirement.
-fn malformed_negotiation(body: &[u8]) -> ControlAction {
-    ControlAction::TransportNegotiate(crate::transport_negotiation::decode_negotiate_request(body))
-}
-
 /// Validates and classifies one complete channel-0 `Request` body.
 ///
 /// `binary` is the frame's encoding bit: channel 0 accepts JSON only.
 pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> ControlAction {
     if binary {
-        if is_negotiation_family(body) {
-            // Negotiation-family frames require `binary = 0`; the strict
-            // decoder cannot express that, so the error is built directly.
-            return ControlAction::TransportNegotiate(Err(
-                crate::transport_negotiation::NegotiationError {
-                    code: crate::transport_negotiation::NegotiationErrorCode::MalformedJson,
-                    path: "flags".to_owned(),
-                },
-            ));
-        }
         return invalid("control channel accepts JSON only");
     }
     let root = match strict_json::parse(body) {
         Ok(value) => value,
-        Err(err) => {
-            if is_negotiation_family(body) {
-                return malformed_negotiation(body);
-            }
-            return invalid(err.as_str());
-        }
+        Err(err) => return invalid(err.as_str()),
     };
     let serde_json::Value::Object(fields) = root else {
         return invalid("control request must be a JSON object");
@@ -214,9 +113,6 @@ pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> Contro
         .saturating_add(1)
         > MAX_CONTROL_DEPTH
     {
-        if fields.get("op").and_then(serde_json::Value::as_str) == Some(OP_TRANSPORT_NEGOTIATE) {
-            return malformed_negotiation(body);
-        }
         return invalid("control request too deeply nested");
     }
 
@@ -235,9 +131,6 @@ pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> Contro
         OP_ROUTE_OPEN => parse_route_open(&fields, targets),
         OP_HOST_SHUTDOWN => ControlAction::HostShutdown,
         OP_HOST_STATUS => ControlAction::HostStatus,
-        OP_TRANSPORT_NEGOTIATE => ControlAction::TransportNegotiate(
-            crate::transport_negotiation::decode_negotiate_request(body),
-        ),
         _ => ControlAction::Reject {
             code: CODE_UNSUPPORTED_OPERATION,
             message: "operation is not supported by this host".to_owned(),
@@ -398,8 +291,6 @@ fn parse_route_open(
         Some(_) => return invalid("credential_fingerprints must be an object"),
     };
 
-    // Classification runs only after every bound held, so a hostile body
-    // cannot pick its rejection code to probe the catalog cheaply.
     let Some(parsed_kind) = TargetKind::parse(kind) else {
         return ControlAction::Reject {
             code: CODE_TARGET_UNAVAILABLE,
@@ -437,16 +328,12 @@ fn parse_route_open(
     }
 }
 
-/// Validates a startup manifest's module ID against the same constraints
-/// `route.open` applies to the client-supplied target, so startup rejects a
-/// manifest advertising a module that no conforming request could ever bind.
+/// Startup validation applies the `route.open` `target.module_id` constraints to manifest module IDs.
+/// Startup rejects a manifest that advertises a module ID no conforming `route.open` request can bind.
 pub(crate) fn validate_manifest_module_id(module_id: &str) -> Result<(), String> {
     check_string("manifest module_id", module_id, MAX_MODULE_ID_LEN, true)
 }
 
-/// Applies the host's shared bounds to one client-supplied string: nonempty
-/// (when required), a byte ceiling, and no interior NUL. Callers outside the
-/// control plane map the returned message onto their own error code.
 pub(crate) fn check_string(
     field: &str,
     value: &str,
@@ -465,12 +352,8 @@ pub(crate) fn check_string(
     Ok(())
 }
 
-/// Depth of a JSON value: 1 at the subtree root, +1 per nested object/array
-/// level (protocol §7.1). Shared with the negotiation decoder so both read
-/// the same §7.1 counting rule.
-/// Container depth (protocol §7.1): 1 at the subtree root, +1 per nested
-/// object/array. Scalar leaves add no level, so `{"a":1}` is depth 1 and
-/// `{"a":{"b":1}}` is depth 2.
+/// `value_depth` is shared with negotiation decoding to enforce one depth-counting rule.
+/// Each object or array adds 1 to the maximum child depth; scalars contribute 0.
 pub(crate) fn value_depth(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Array(items) => 1 + items.iter().map(value_depth).max().unwrap_or(0),
@@ -479,10 +362,8 @@ pub(crate) fn value_depth(value: &serde_json::Value) -> usize {
     }
 }
 
-/// Immutable `catalog.list` bodies serialized before the host is published.
 ///
-/// Every valid filter resolves to a startup-serialized body: the complete
-/// catalog, one exact per-module entry, or one canonical empty catalog.
+/// An absent filter returns `full`; an unmatched filter returns `empty`.
 pub struct CatalogCache {
     full: Box<[u8]>,
     per_module: Vec<(Box<str>, Box<[u8]>)>,
@@ -490,11 +371,7 @@ pub struct CatalogCache {
 }
 
 impl CatalogCache {
-    /// Serializes every cached body through a capped writer, so a manifest
-    /// set whose catalog exceeds `limit` is rejected while it is being
-    /// written rather than after a full copy exists. Materializing first and
-    /// checking afterwards could OOM the host on the very input startup
-    /// means to refuse.
+    /// The capped writer rejects a catalog that exceeds `limit` before a full body is materialized.
     pub fn new_bounded(manifests: &[ManifestSnapshot], limit: usize) -> Result<Self, ()> {
         let mut per_module = Vec::with_capacity(manifests.len());
         for manifest in manifests {
@@ -510,8 +387,6 @@ impl CatalogCache {
         })
     }
 
-    /// Selects cached bytes without allocating. Unknown filters yield an empty
-    /// list, not an error (protocol §7.3).
     pub fn body(&self, module_id_filter: Option<&str>) -> &[u8] {
         let Some(filter) = module_id_filter else {
             return &self.full;
@@ -523,9 +398,6 @@ impl CatalogCache {
             .unwrap_or(&self.empty)
     }
 
-    /// Bytes this cache permanently keeps resident for the incarnation; the
-    /// runtime subtracts them from the byte budgets so the configured
-    /// `max_resident_bytes` bound stays truthful.
     pub fn resident_len(&self) -> usize {
         self.full.len()
             + self.empty.len()
@@ -537,8 +409,6 @@ impl CatalogCache {
     }
 }
 
-/// Discards nothing but refuses to grow past `limit`, so serialization of an
-/// over-limit value fails instead of allocating it.
 struct CappedWriter {
     buf: Vec<u8>,
     limit: usize,
@@ -565,8 +435,6 @@ fn serialize_catalog_response(
     manifests: &[ManifestSnapshot],
     limit: usize,
 ) -> Result<Box<[u8]>, ()> {
-    // Borrowing `ManifestSnapshot` fields avoids cloning `provides` before
-    // the capped writer can reject an oversized manifest.
     #[derive(serde::Serialize)]
     struct CatalogModule<'a> {
         module_id: &'a str,
@@ -580,7 +448,7 @@ fn serialize_catalog_response(
         op: &'static str,
         generation: u64,
         modules: &'a [CatalogModule<'a>],
-        subc_ops: [&'static str; 5],
+        subc_ops: [&'static str; 4],
     }
 
     let modules: Vec<CatalogModule<'_>> = manifests
@@ -607,7 +475,6 @@ fn serialize_catalog_response(
                 OP_CATALOG_LIST,
                 OP_HOST_SHUTDOWN,
                 OP_HOST_STATUS,
-                OP_TRANSPORT_NEGOTIATE,
             ],
         },
     )
@@ -637,7 +504,10 @@ pub fn host_shutdown_response_json() -> Vec<u8> {
     br#"{"op":"host.shutdown"}"#.to_vec()
 }
 
-pub fn host_status_response_json(report: &crate::handler::HealthReport) -> Vec<u8> {
+pub fn host_status_response_json(
+    report: &crate::handler::HealthReport,
+    shared_memory: serde_json::Value,
+) -> Vec<u8> {
     let health = match report.status {
         crate::handler::HealthStatus::Ok => "ok",
         crate::handler::HealthStatus::Degraded => "degraded",
@@ -733,14 +603,12 @@ pub fn host_status_response_json(report: &crate::handler::HealthReport) -> Vec<u
         "op": OP_HOST_STATUS,
         "health": health,
         "metrics": {"components": components},
+        "shared_memory": shared_memory,
     }))
     .expect("host status serialization cannot fail")
 }
 
-/// Strict JSON parsing: UTF-8 only (serde_json enforces), rejects duplicate
-/// object keys outright. A conforming client never sends duplicates, and
-/// accepting repeated fields would make handling depend on decoder or field
-/// order (protocol §7.1).
+/// `serde_json` accepts only UTF-8; reject duplicate keys to prevent order-dependent field handling.
 pub(crate) mod strict_json {
     use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
     use serde_json::Value;
@@ -975,54 +843,6 @@ mod tests {
         assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
     }
 
-    /// Strict-parse failures inside a negotiation-family body must classify
-    /// as negotiation so they reach the terminal-and-close path (§7.7.1),
-    /// not the generic rejection that commits the generation to TCP.
-    #[test]
-    fn malformed_negotiation_family_bodies_classify_as_negotiation() {
-        // Duplicate key nested inside an offer's opaque parameters.
-        let dup_nested = br#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1,"parameters":{"a":1,"a":2}}]}"#;
-        // Duplicate key at the root.
-        let dup_root = br#"{"op":"transport.negotiate","negotiation_version":1,"negotiation_version":1,"offers":[]}"#;
-        // Syntactically truncated body whose negotiation tag is complete.
-        let truncated = br#"{"op":"transport.negotiate","offers":"#;
-        // Escaped spelling of the tag: legal JSON, still negotiation-family.
-        let escaped = br#"{"op":"transport.\u006eegotiate","offers":"#;
-        // Truncated mid-tag, before the closing quote.
-        let mid_tag = br#"{"op":"transport.negotiate"#;
-        for body in [&dup_nested[..], dup_root, truncated, escaped, mid_tag] {
-            let action = parse_control(body, false, &two_target_index());
-            assert!(
-                matches!(action, ControlAction::TransportNegotiate(Err(_))),
-                "expected TransportNegotiate(Err), got {action:?}"
-            );
-        }
-        // A binary negotiation frame violates the JSON-only encoding rule.
-        let valid = br#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1}]}"#;
-        let action = parse_control(valid, true, &two_target_index());
-        assert!(
-            matches!(action, ControlAction::TransportNegotiate(Err(_))),
-            "expected TransportNegotiate(Err), got {action:?}"
-        );
-        // Deep nesting beyond the control bound stays negotiation-classified.
-        let mut params = String::from("1");
-        for _ in 0..MAX_CONTROL_DEPTH + 2 {
-            params = format!("{{\"k\":{params}}}");
-        }
-        let deep = format!(
-            "{{\"op\":\"transport.negotiate\",\"negotiation_version\":1,\"offers\":[{{\"transport\":\"tcp\",\"capability_version\":1,\"parameters\":{params}}}]}}"
-        );
-        let action = parse_control(deep.as_bytes(), false, &two_target_index());
-        assert!(
-            matches!(action, ControlAction::TransportNegotiate(Err(_))),
-            "expected TransportNegotiate(Err), got {action:?}"
-        );
-        // Non-negotiation bodies with the same defects keep the generic path.
-        let other = br#"{"op":"catalog.list","module_id":"a","module_id":"b"}"#;
-        let action = parse_control(other, false, &two_target_index());
-        assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
-    }
-
     #[test]
     fn unknown_op_is_unsupported_operation_not_invalid() {
         let action = parse(&serde_json::json!({"op": "server.describe"}));
@@ -1036,7 +856,6 @@ mod tests {
             let action = parse(&serde_json::json!({"op": op}));
             assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
         }
-        // Exactly 64 bytes is structurally valid — classified as unsupported.
         let action = parse(&serde_json::json!({"op": "y".repeat(MAX_OP_LEN)}));
         assert_eq!(reject_code(action), CODE_UNSUPPORTED_OPERATION);
     }
@@ -1089,8 +908,6 @@ mod tests {
     #[test]
     fn admission_facts_bounds_are_exact() {
         fn nested(depth: usize) -> serde_json::Value {
-            // `depth` containers around a scalar leaf; the leaf adds no
-            // level (protocol §7.1 counting).
             let mut value = serde_json::json!(1);
             for _ in 0..depth {
                 value = serde_json::json!([value]);
@@ -1105,7 +922,6 @@ mod tests {
         request["admission_facts"] = nested(MAX_ADMISSION_FACTS_DEPTH + 1);
         assert_eq!(reject_code(parse(&request)), CODE_INVALID_CONTROL_REQUEST);
 
-        // Compact size boundary: a string of N bytes serializes to N+2.
         request["admission_facts"] =
             serde_json::Value::String("f".repeat(MAX_ADMISSION_FACTS_BYTES - 2));
         assert!(matches!(parse(&request), ControlAction::RouteOpen { .. }));
@@ -1118,8 +934,6 @@ mod tests {
     #[test]
     fn ignored_field_nesting_is_bounded() {
         fn nested(depth: usize) -> serde_json::Value {
-            // `depth` containers around a scalar leaf; the leaf adds no
-            // level (protocol §7.1 counting).
             let mut value = serde_json::json!(1);
             for _ in 0..depth {
                 value = serde_json::json!([value]);
@@ -1127,9 +941,7 @@ mod tests {
             value
         }
 
-        // Unknown fields count toward nesting limits (protocol §7.1): the
-        // same subtree depth admission_facts allows is accepted, one more is
-        // rejected before dispatching on `op`.
+        // rejected.
         let mut request = minimal_route_open();
         request["forward_compat"] = nested(MAX_ADMISSION_FACTS_DEPTH);
         assert!(matches!(parse(&request), ControlAction::RouteOpen { .. }));
@@ -1211,7 +1023,6 @@ mod tests {
             parse(&serde_json::json!({"op": "host.shutdown"})),
             ControlAction::HostShutdown
         );
-        // Unknown fields are ignored for forward compatibility.
         assert_eq!(
             parse(&serde_json::json!({"op": "host.shutdown", "future": {"a": 1}})),
             ControlAction::HostShutdown
@@ -1250,8 +1061,11 @@ mod tests {
                 }
             })),
         };
-        let response: serde_json::Value =
-            serde_json::from_slice(&host_status_response_json(&report)).expect("status JSON");
+        let response: serde_json::Value = serde_json::from_slice(&host_status_response_json(
+            &report,
+            serde_json::json!({"state": "healthy"}),
+        ))
+        .expect("status JSON");
         assert_eq!(response["op"], "host.status");
         assert_eq!(response["health"], "degraded");
         assert_eq!(
@@ -1269,9 +1083,12 @@ mod tests {
             })
         );
         assert!(
-            !String::from_utf8(host_status_response_json(&report))
-                .expect("UTF-8")
-                .contains("secret detail"),
+            !String::from_utf8(host_status_response_json(
+                &report,
+                serde_json::json!({"state": "healthy"}),
+            ))
+            .expect("UTF-8")
+            .contains("secret detail"),
             "handler detail is tainted and never exposed"
         );
     }
@@ -1349,16 +1166,8 @@ mod tests {
         );
         assert_eq!(
             unfiltered["subc_ops"],
-            serde_json::json!([
-                "route.open",
-                "catalog.list",
-                "host.shutdown",
-                "host.status",
-                "transport.negotiate"
-            ])
+            serde_json::json!(["route.open", "catalog.list", "host.shutdown", "host.status"])
         );
-        assert!(!unfiltered.to_string().contains("transport.activate"));
-        assert!(!unfiltered.to_string().contains("transport.commit"));
         // wake.create must stay absent until implemented (protocol AE10).
         assert!(!unfiltered.to_string().contains("wake.create"));
 

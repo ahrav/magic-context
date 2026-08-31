@@ -61,7 +61,7 @@ function expectDecodeError(bytes: Uint8Array, code: DecodeErrorCode): void {
     expect((caught as DecodeError).code).toBe(code);
 }
 
-/** A valid 21-byte routed StreamData header for mutation-based rejection tests. */
+/** Returns a valid StreamData header. */
 function validHeaderBytes(): Uint8Array {
     return hexToBytes(
         bytesToHex(
@@ -449,9 +449,9 @@ describe("route handles", () => {
 });
 
 describe("committed catalog capability vector", () => {
-    test("subc_ops advertises transport.negotiate but never the candidate-only operations", () => {
+    test("subc_ops contains only application control operations", () => {
         const canonical =
-            '{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","host.status","transport.negotiate"]}';
+            '{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","host.status"]}';
         const parsed = JSON.parse(canonical) as { op: string; subc_ops: string[] };
         expect(parsed.op).toBe("catalog.list");
         expect(parsed.subc_ops).toEqual([
@@ -459,9 +459,6 @@ describe("committed catalog capability vector", () => {
             "catalog.list",
             "host.shutdown",
             "host.status",
-            "transport.negotiate",
         ]);
-        expect(canonical).not.toContain("transport.activate");
-        expect(canonical).not.toContain("transport.commit");
     });
 });

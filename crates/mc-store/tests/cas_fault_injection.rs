@@ -180,6 +180,21 @@ impl SemanticState {
             usage_bytes,
         }
     }
+
+    /// A minted barrier id is unique per run, so two runs of the same operation
+    /// never agree on it. Cross-run convergence rests on every other field.
+    fn without_minted_barrier_ids(mut self) -> Self {
+        const MINTED: &str = "<minted>";
+        for barrier in &mut self.barriers {
+            barrier.0 = MINTED.to_string();
+        }
+        for consumer in &mut self.barrier_consumers {
+            consumer.0 = MINTED.to_string();
+        }
+        self.barriers.sort();
+        self.barrier_consumers.sort();
+        self
+    }
 }
 
 fn rows<T>(
@@ -887,7 +902,10 @@ fn crash_windows_recover_idempotently_and_match_no_crash_execution() {
     let store = KernelStore::open(expected.path()).unwrap();
     seed_domain(&store);
     drop(store);
-    assert_eq!(crashed_state, recover_twice(expected.path()));
+    assert_eq!(
+        crashed_state.without_minted_barrier_ids(),
+        recover_twice(expected.path()).without_minted_barrier_ids()
+    );
 
     let crashed = tempfile::tempdir().unwrap();
     run_crash_child(crashed.path(), "post-purge-commit");
@@ -903,7 +921,10 @@ fn crash_windows_recover_idempotently_and_match_no_crash_execution() {
         .delete_artifact(purge_request("purge-crash", &expected_handle.digest))
         .unwrap();
     drop(store);
-    assert_eq!(crashed_state, recover_twice(expected.path()));
+    assert_eq!(
+        crashed_state.without_minted_barrier_ids(),
+        recover_twice(expected.path()).without_minted_barrier_ids()
+    );
 
     let crashed = tempfile::tempdir().unwrap();
     run_crash_child(crashed.path(), "post-reservation");

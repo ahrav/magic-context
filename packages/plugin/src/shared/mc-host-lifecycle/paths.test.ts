@@ -53,27 +53,20 @@ describe("data-root resolution (U3 scenario 1, Rust parity)", () => {
     });
 
     test("NODE_ENV=test backstops the root instead of reaching the real HOME", () => {
-        // The test preload only runs when bun test's CWD has a bunfig wiring it.
-        // A run from a directory without that wiring has no
-        // MAGIC_CONTEXT_TEST_DATA_DIR, and falling through to the real HOME
-        // would let a lifecycle policy probe, start, stop, or stage inside the
-        // user's live ~/.local/share tree.
+        // Without `MAGIC_CONTEXT_TEST_DATA_DIR`, resolution must not fall through to the real `HOME`.
+        // Lifecycle policies could probe, start, stop, or stage in the user's live `~/.local/share` tree.
         const backstopped = resolveLifecycleDataRoot({ NODE_ENV: "test", HOME: "/home-root" });
         expect(backstopped.ok).toBe(true);
         if (backstopped.ok) {
             expect(backstopped.root).not.toBe(path.join("/home-root", ".local", "share"));
             expect(backstopped.root).toContain("mc-test-db-backstop-");
-            // Memoized: the same process must resolve to the same root, or a
-            // test's daemon state and its database would land in different trees.
+            // Memoization keeps each process on one root so a test's daemon state and database share a tree.
             expect(resolveLifecycleDataRoot({ NODE_ENV: "test" })).toEqual(backstopped);
-            // It is the storage resolver's own backstop root, so when neither
-            // resolver is isolated they agree the way one XDG_DATA_HOME makes
-            // them agree in production. Asserted through the shared accessor
-            // rather than getMagicContextStorageDir(), which honors this
-            // process's own ambient isolation.
+            // `getTestBackstopDataRoot()` returns the storage resolver's backstop root.
+            // The lifecycle and storage resolvers use the same backstop root when neither resolver is isolated.
+            // `getMagicContextStorageDir()` cannot verify the shared backstop because it honors ambient isolation.
             expect(backstopped.root).toBe(getTestBackstopDataRoot());
         }
-        // Explicit isolation still wins over the backstop, in both forms.
         expect(resolveLifecycleDataRoot({ NODE_ENV: "test", XDG_DATA_HOME: "/xdg-root" })).toEqual({
             ok: true,
             root: "/xdg-root",
@@ -81,7 +74,6 @@ describe("data-root resolution (U3 scenario 1, Rust parity)", () => {
         expect(
             resolveLifecycleDataRoot({ NODE_ENV: "test", MAGIC_CONTEXT_TEST_DATA_DIR: "/iso" }),
         ).toEqual({ ok: true, root: "/iso" });
-        // Production, which never sets NODE_ENV=test, is unchanged.
         expect(resolveLifecycleDataRoot({ HOME: "/home-root" })).toEqual({
             ok: true,
             root: path.join("/home-root", ".local", "share"),
@@ -115,9 +107,8 @@ describe("canonical lifecycle paths", () => {
 });
 
 describe("filesystem admission (KTD11)", () => {
-    // The fabricated mount tables below name paths this host does not have, so
-    // the canonicalizer defaults to identity and mount selection stays decided
-    // by the table. Cases that exercise canonicalization pass their own.
+    // These fixtures use nonexistent host paths, so `realpath` defaults to identity.
+    // Identity canonicalization leaves mount selection to the fabricated mount table.
     const mounts = (text: string, realpath: (value: string) => string = (value) => value) => ({
         platform: "linux" as const,
         readMounts: () => text,
@@ -125,8 +116,7 @@ describe("filesystem admission (KTD11)", () => {
     });
 
     /**
-     * A canonicalizer where `existing` resolves to `canonical` and anything
-     * below it reports ENOENT, the way a not-yet-created root does.
+     * The canonicalizer returns `ENOENT` for paths below `existing`, modeling a root that does not yet exist.
      */
     const resolvesOnly =
         (existing: string, canonical: string) =>
@@ -146,11 +136,8 @@ describe("filesystem admission (KTD11)", () => {
     });
 
     test("an unqualified platform is unsupported_platform, not a filesystem verdict", () => {
-        // The mount table this function reads is Linux-specific, so on any other
-        // platform there is no filesystem to judge. Reporting
-        // `unsupported_filesystem`/`set_data_directory` here would tell an
-        // operator to change the data directory on a host where no data
-        // directory can ever be admitted.
+        // On non-Linux platforms, the resolver cannot classify a filesystem because it reads Linux mount tables.
+        // Returning `unsupported_filesystem` or `set_data_directory` on non-Linux platforms would recommend an impossible directory change.
         for (const platform of ["win32", "freebsd", "aix"]) {
             const verdict = admitLifecycleFilesystem("/data", {
                 platform,
@@ -167,8 +154,7 @@ describe("filesystem admission (KTD11)", () => {
     });
 
     test("a relative root is still a filesystem verdict on an unqualified platform", () => {
-        // Absoluteness is a property of the string, not of the host, so it is
-        // decided before the platform can matter.
+        // The resolver validates absoluteness before platform checks because absoluteness depends only on the input string.
         const verdict = admitLifecycleFilesystem("relative/data", {
             platform: "win32",
             readMounts: () => "",
@@ -178,10 +164,7 @@ describe("filesystem admission (KTD11)", () => {
     });
 
     test("distributed and passthrough filesystems are rejected, not treated as local", () => {
-        // The predicate is a deny-list, so anything missing from it is admitted:
-        // the check fails open on exactly the locality axis it exists to
-        // enforce. The classic remote types were listed; the distributed and
-        // object-store families were not.
+        // The locality check fails open for filesystem types absent from the deny-list.
         for (const fsType of [
             "ceph",
             "cephfs",
@@ -208,7 +191,6 @@ describe("filesystem admission (KTD11)", () => {
             expect(verdict.ok).toBe(false);
             if (!verdict.ok) expect(verdict.reason).toBe("unsupported_filesystem");
         }
-        // Genuinely local types still pass, which is the trade the deny-list buys.
         for (const fsType of ["ext4", "xfs", "btrfs", "zfs", "f2fs"]) {
             expect(
                 admitLifecycleFilesystem(
@@ -295,10 +277,8 @@ describe("filesystem admission (KTD11)", () => {
     });
 
     test('darwin mount lines keep mount points containing " on " and need no option list', () => {
-        // The nearest mount decides the verdict, so a mount point whose own
-        // spelling contains " on " must not be truncated into a shorter,
-        // non-matching path, and an entry with no flags after its filesystem
-        // type must still reach the classifier.
+        // The nearest mount determines the verdict.
+        // Entries without flags after their filesystem type must reach the classifier.
         expect(
             admitLifecycleFilesystem("/Volumes/Disk on Server/share", {
                 platform: "darwin",
@@ -323,8 +303,7 @@ describe("filesystem admission (KTD11)", () => {
     });
 
     test("a `..` segment is judged on the mount of the effective path", () => {
-        // `/local/../remote-data` is `/remote-data`: matching the literal string
-        // would admit the ext4 mount the traversal never reaches.
+        // Literal matching would admit the ext4 mount the traversal never reaches.
         const table =
             "/dev/root / ext4 rw 0 0\n/dev/sdb1 /local ext4 rw 0 0\nremote:/x /remote-data nfs4 rw 0 0\n";
         const verdict = admitLifecycleFilesystem("/local/../remote-data/cortexkit", mounts(table));
@@ -367,7 +346,7 @@ describe("filesystem admission (KTD11)", () => {
             mkdirSync(store);
             const link = path.join(base, "via-link");
             symlinkSync(store, link);
-            // Only the canonical directory carries the remote mount; the
+            // Only the canonical directory carries the remote mount.
             // symlinked spelling matches nothing but `/`.
             const table = `/dev/root / ext4 rw 0 0\nremote:/x ${realpathSync.native(store)} nfs4 rw 0 0\n`;
             const verdict = admitLifecycleFilesystem(path.join(link, "cortexkit", "run"), {
@@ -395,8 +374,7 @@ describe("filesystem admission (KTD11)", () => {
     });
 
     test("the latest mount at a shared point governs, shadowing earlier entries", () => {
-        // Stacked mounts share a mount point and the table lists them in
-        // ascending mount order, so the last equal-length entry is on top.
+        // The table lists stacked mounts in ascending mount order, so the last equal-length entry is on top.
         const shadowedByNoexec = admitLifecycleFilesystem(
             "/data/cortexkit",
             mounts(
@@ -435,8 +413,6 @@ describe("path redaction roots (R35)", () => {
         expect(redactLifecyclePath("/xdg-root-backup/secret", ["/xdg-root"])).toBe(
             "/xdg-root-backup/secret",
         );
-        // Under HOME the sibling still redacts, but at the HOME boundary and
-        // with its own directory name intact.
         const roots = sensitiveRootsFor("/home/u/.local/share", { HOME: "/home/u" });
         expect(redactLifecyclePath("/home/u/.local/share-backup/secret", roots)).toBe(
             "<data-root>/.local/share-backup/secret",
@@ -444,8 +420,8 @@ describe("path redaction roots (R35)", () => {
     });
 
     test("an already-redacted value is not measured against a later root", () => {
-        // The placeholder is not a path; resolving it against cwd under a root
-        // that contains cwd would substitute a second placeholder.
+        // The placeholder is not a path.
+        // Resolving the placeholder against cwd when the lifecycle root contains cwd would substitute a second placeholder.
         expect(redactLifecyclePath("/xdg-root/cortexkit", ["/xdg-root", path.resolve(".")])).toBe(
             "<data-root>/cortexkit",
         );
@@ -454,16 +430,15 @@ describe("path redaction roots (R35)", () => {
 
 describe("managed connection-file derivation", () => {
     test("the lifecycle root, not the fallback, names the published file", () => {
-        // The policy launches the daemon with XDG_DATA_HOME set to the
-        // lifecycle root, so readers must resolve the same root.
+        // The daemon receives `XDG_DATA_HOME` set to the lifecycle root.
+        // Readers must resolve the lifecycle root from `XDG_DATA_HOME`.
         expect(defaultConnectionFilePath("/legacy-root", { XDG_DATA_HOME: "/xdg-root" })).toBe(
             path.join("/xdg-root", "cortexkit", "run", CONNECTION_FILE_NAME),
         );
     });
 
     test("a relative XDG_DATA_HOME falls back to HOME, matching the daemon", () => {
-        // `data-path.ts` would join a relative value against cwd; the daemon
-        // ignores it, so this reader must ignore it too.
+        // The daemon ignores relative values, so the mount reader must also ignore relative values.
         expect(
             defaultConnectionFilePath("/legacy-root", {
                 XDG_DATA_HOME: "./relative",

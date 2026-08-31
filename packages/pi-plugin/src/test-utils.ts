@@ -128,16 +128,6 @@ export function fakeContext(
 	cwd = process.cwd(),
 	entryIds: string[] = ["entry-1"],
 	/**
-	 * Optional message references used as `entry.message` on each fake
-	 * SessionEntry. Pi's runtime keeps `entry.message === sourceAgentMessage`
-	 * by reference (session-manager.js:580), and Magic Context's
-	 * `collectMessageEntryIdsByRef` relies on that reference identity to
-	 * map event.messages → entry ids. Tests that want boundary-id
-	 * resolution to work should pass the same message objects they put
-	 * into `event.messages`. Without explicit messages, we fall back to
-	 * synthesized userMessage instances — which intentionally do NOT
-	 * match anything the test passes via `event.messages`, exercising
-	 * the unmapped-slot fallback path.
 	 */
 	messages?: PiMessage[],
 ) {

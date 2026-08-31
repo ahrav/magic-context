@@ -1,13 +1,11 @@
-use std::fs;
-use std::io::Read;
-
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use super::{
-    is_artifact_digest, ArtifactDestination, ArtifactEligibility, ArtifactError, ArtifactErrorKind,
-    ArtifactHandle, EligibilityDeniedReason, ProviderEgress, MAX_PAYLOAD_BYTES,
+    is_artifact_digest, read_capped, ArtifactDestination, ArtifactEligibility, ArtifactError,
+    ArtifactErrorKind, ArtifactHandle, EligibilityDeniedReason, ProviderEgress,
 };
+use crate::kernel::durable_fs::{open_regular_nofollow, open_secure_directory};
 use crate::kernel::{KernelStore, Sensitivity};
 
 impl KernelStore {
@@ -48,36 +46,17 @@ impl KernelStore {
         if tombstoned {
             return Err(ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable));
         }
-        let path = self.artifact_object_path(&handle.digest);
-        let metadata = fs::symlink_metadata(&path).map_err(|_| {
-            ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
-        })?;
-        if !metadata.file_type().is_file() {
+        let missing =
+            || ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest);
+        let objects = self.open_objects_directory().map_err(|_| missing())?;
+        let shard = open_secure_directory(&objects, &handle.digest[..2]).map_err(|_| missing())?;
+        let object = open_regular_nofollow(&shard, &handle.digest[2..]).map_err(|_| missing())?;
+        let Some(bytes) = read_capped(object).map_err(|_| missing())? else {
             return Err(ArtifactError::for_digest(
                 ArtifactErrorKind::CorruptObject,
                 &handle.digest,
             ));
-        }
-        let object = fs::File::open(&path).map_err(|_| {
-            ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
-        })?;
-        let mut bytes = Vec::new();
-        object
-            .take(
-                u64::try_from(MAX_PAYLOAD_BYTES)
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1),
-            )
-            .read_to_end(&mut bytes)
-            .map_err(|_| {
-                ArtifactError::for_digest(ArtifactErrorKind::MissingObject, &handle.digest)
-            })?;
-        if bytes.len() > MAX_PAYLOAD_BYTES {
-            return Err(ArtifactError::for_digest(
-                ArtifactErrorKind::CorruptObject,
-                &handle.digest,
-            ));
-        }
+        };
         if format!("{:x}", Sha256::digest(&bytes)) != handle.digest {
             return Err(ArtifactError::for_digest(
                 ArtifactErrorKind::CorruptObject,

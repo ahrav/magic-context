@@ -98,8 +98,6 @@ describe("window report ledger", () => {
             geometry: "unknown",
             observed_at_ms: 456,
         });
-        // Absent = unknown routing (refuses promotion); this reporter never
-        // asserts false — see the schema pin in the ledger module.
         expect("path_may_forward" in report).toBe(false);
         expect("provider_id" in report).toBe(false);
         expect("model_id" in report).toBe(false);

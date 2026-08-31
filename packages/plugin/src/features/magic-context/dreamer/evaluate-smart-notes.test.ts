@@ -34,8 +34,6 @@ describe("evaluateSmartNotes file-authority phases", () => {
             });
             const { holderId, leaseKey } = heldLeaseArgs(db);
 
-            // A client whose session creation throws makes the no-tool
-            // compiler fail without cancellation.
             const result = await evaluateSmartNotes({
                 db,
                 client: {} as never,
@@ -122,8 +120,6 @@ describe("evaluateSmartNotes file-authority phases", () => {
             const current = getNotes(db, { type: "smart" })[0];
             expect(current.checkStatus).toBe("fallback");
             expect(current.checkFailureCount).toBe(3);
-            // The fallback confirmation also ran (and failed closed), so the
-            // note was checked in the same pass.
             expect(current.lastCheckedAt).not.toBeNull();
         } finally {
             closeQuietly(db);

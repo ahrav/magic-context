@@ -19,10 +19,9 @@ function makeTempRoot(prefix: string): string {
 function withHome(home: string): void {
 	process.env.HOME = home;
 	// The user config base is `(XDG_CONFIG_HOME ?? <HOME>/.config)/cortexkit/...`.
-	// writeUserConfig() writes under `<HOME>/.config`, so pin XDG_CONFIG_HOME to
-	// match — otherwise a CI runner that exports its own XDG_CONFIG_HOME makes the
-	// loader look elsewhere and these tests read schema defaults (the green-on-my-
-	// machine / red-in-CI hermeticity gap this guards against).
+	// withHome() pins XDG_CONFIG_HOME to `<HOME>/.config` because writeUserConfig() writes there.
+	// A preexisting XDG_CONFIG_HOME would make the loader read a different user-config directory.
+	// An XDG_CONFIG_HOME with no user config makes the loader use schema defaults instead of the test config.
 	process.env.XDG_CONFIG_HOME = join(home, ".config");
 }
 
@@ -31,11 +30,6 @@ function writeConfig(path: string, text: string): void {
 	writeFileSync(path, text, "utf-8");
 }
 
-// Hard cutover: both harnesses read config from the shared CortexKit location.
-// Project config: <cwd>/.cortexkit/magic-context.*
-// User config:    <configHome>/cortexkit/magic-context.* where configHome is
-//                 XDG_CONFIG_HOME ?? <HOME>/.config (XDG_CONFIG_HOME is unset in
-//                 the test env, so it resolves under the temp HOME below).
 function writeProjectConfig(
 	cwd: string,
 	text: string,
@@ -95,9 +89,8 @@ describe("loadPiConfig", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
 		withHome(home);
-		// Legacy Pi user config (~/.pi/agent/magic-context.jsonc) with a disabled
-		// setting. The CortexKit base is absent (migration refused/not run), so the
-		// loader must READ this real config — not silently default the setting on.
+		// The disabled legacy setting verifies that the loader reads legacy config instead of using defaults.
+		// The CortexKit base is absent, so the loader must read the legacy config instead of using defaults.
 		writeConfig(
 			join(home, ".pi", "agent", "magic-context.jsonc"),
 			'{"memory":{"enabled":false}}',
@@ -258,7 +251,6 @@ describe("loadPiConfig", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
 		withHome(home);
-		// User config is trusted: {env:} expands and agent prompts are honored.
 		writeUserConfig(
 			home,
 			JSON.stringify({
@@ -279,10 +271,6 @@ describe("loadPiConfig", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
 		withHome(home);
-		// A repo-supplied project config must not read env/files. The token is
-		// left literal and a warning is emitted (parity with OpenCode). Use a
-		// benign field (sidekick.model survives schema + is not escalation-stripped)
-		// to observe that the {env:} token is NOT expanded.
 		writeProjectConfig(
 			cwd,
 			JSON.stringify({
@@ -309,7 +297,6 @@ describe("loadPiConfig", () => {
 
 		const result = loadPiConfig({ cwd });
 
-		// Benign field survives, escalation field stripped + warned.
 		expect(result.config.dreamer?.model).toBe("ok-model");
 		expect(result.config.dreamer?.prompt).toBeUndefined();
 		expect(result.warnings.join("\n")).toContain("dreamer.prompt");

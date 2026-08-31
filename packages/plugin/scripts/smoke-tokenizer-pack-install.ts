@@ -37,8 +37,7 @@ function parsePackedFilename(stdout: string): string {
         const filename = packed[0]?.filename;
         if (typeof filename === "string" && filename.length > 0) return filename;
     } catch {
-        // npm can print warnings around JSON on some versions. Fall back to the
-        // last tarball-looking line so the smoke is not tied to one npm version.
+        // The fallback tolerates npm output variations.
     }
 
     const fallback = stdout
@@ -115,9 +114,8 @@ console.log("packed tokenizer estimates completed");
 `,
     );
 
-    // OpenCode runs as a Bun standalone executable. Re-bundling the installed
-    // plugin into this host reproduces the virtual /$bunfs/root module base that
-    // made createRequire(import.meta.url) unusable in the v0.36.0 Windows report.
+    // The compiled host reproduces Bun's virtual `/$bunfs/root` module base.
+    // Bun's `/$bunfs/root` module base makes `createRequire(import.meta.url)` unusable.
     run("bun", ["build", "--compile", hostSource, "--outfile", hostExecutable], installRoot);
     const resolvedOutput = run(hostExecutable, [projectRoot], projectRoot, {
         ...process.env,

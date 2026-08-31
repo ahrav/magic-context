@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use mc_store::kernel::filesystem_is_unsafe_for_test;
 use mc_store::kernel::schema::apply_kernel_connection_profile;
 use mc_store::kernel::{
-    filesystem_name_is_unsafe_for_test, owner_is_current_for_test,
-    verify_backup_with_deadline_for_test, BackupFault, BackupRequest, CommitIntent, DomainSpec,
-    KernelErrorKind, KernelStore, RestoreFault, Sensitivity,
+    owner_is_current_for_test, sensitivity_bearing_tables_for_test,
+    verify_backup_with_deadline_for_test, BackupRequest, CommitIntent, DomainSpec, KernelError,
+    KernelStore, RestoreFault, Sensitivity,
 };
 use rusqlite::{params, Connection};
 
@@ -236,9 +236,9 @@ fn fresh_store_backup_has_zero_tip_and_no_capture_pin() {
     let destination = private_dir();
     let store = KernelStore::open(root.path()).unwrap();
     let backup = store.backup(request(destination.path())).unwrap();
-    assert_eq!(backup.manifest.captured_commit_seq, 0);
-    assert!(backup.manifest.evidence_refs.is_empty());
-    assert_eq!(backup.manifest.capture_pin_id, None);
+    assert_eq!(backup.captured_commit_seq, 0);
+    assert!(backup.evidence_refs.is_empty());
+    assert_eq!(backup.capture_pin_id, None);
     assert_eq!(destination_entries(destination.path()).len(), 1);
 }
 
@@ -257,16 +257,15 @@ fn backup_restores_exact_snapshot_and_reclaims_writer_fence() {
     let expected = store.known_as_of(2).unwrap();
     let backup = store.backup(request(destination.path())).unwrap();
     let expected_oracle = restore_oracle(root.path());
-    assert_eq!(backup.manifest.captured_commit_seq, 2);
+    assert_eq!(backup.captured_commit_seq, 2);
     assert!(backup
-        .manifest
         .destination_path
         .file_name()
         .unwrap()
         .to_string_lossy()
         .contains("-2-"));
     assert_eq!(
-        fs::metadata(&backup.manifest.destination_path)
+        fs::metadata(&backup.destination_path)
             .unwrap()
             .permissions()
             .mode()
@@ -277,7 +276,7 @@ fn backup_restores_exact_snapshot_and_reclaims_writer_fence() {
     insert_domain(&store, 2, Sensitivity::Normal);
     assert_eq!(
         store
-            .restore_with_hook_for_test(&backup.manifest.destination_path, || {
+            .restore_with_hook_for_test(&backup.destination_path, || {
                 assert!(!root.path().join("core.sqlite").exists());
                 assert_eq!(
                     fs::metadata(root.path().join("core.sqlite.mc-restore"))
@@ -288,8 +287,8 @@ fn backup_restores_exact_snapshot_and_reclaims_writer_fence() {
                     0o600
                 );
                 assert_eq!(
-                    KernelStore::open(root.path()).unwrap_err().kind(),
-                    KernelErrorKind::Held
+                    KernelStore::open(root.path()).unwrap_err(),
+                    KernelError::Held
                 );
             })
             .unwrap(),
@@ -298,14 +297,14 @@ fn backup_restores_exact_snapshot_and_reclaims_writer_fence() {
     assert_eq!(store.known_as_of(2).unwrap(), expected);
     assert_eq!(restore_oracle(root.path()), expected_oracle);
     assert_eq!(
-        store.known_as_of(3).unwrap_err().kind(),
-        KernelErrorKind::FutureSnapshot
+        store.known_as_of(3).unwrap_err(),
+        KernelError::FutureSnapshot
     );
     assert_eq!(insert_domain(&store, 3, Sensitivity::Normal), 3);
     assert!(!root.path().join("core.sqlite.mc-restore").exists());
     assert_eq!(
-        KernelStore::open(root.path()).unwrap_err().kind(),
-        KernelErrorKind::Held
+        KernelStore::open(root.path()).unwrap_err(),
+        KernelError::Held
     );
 }
 
@@ -353,14 +352,18 @@ fn timeout_and_pre_publish_fault_leave_no_artifacts_and_retry_succeeds() {
     let destination = private_dir();
     let store = KernelStore::open(root.path()).unwrap();
     insert_domain(&store, 1, Sensitivity::Normal);
+    // The hook sleeps past the 200 ms deadline, so expiry occurs mid-flight.
+    // `hook_ran` fails the test if `secure_destination` skips the hook.
     let expired = BackupRequest {
         destination_directory: destination.path().to_path_buf(),
-        deadline: Instant::now() + Duration::from_millis(1),
+        deadline: Instant::now() + Duration::from_millis(200),
         capture_pin_expires_at: None,
     };
+    let hook_ran = Cell::new(false);
     assert_eq!(
         store
             .backup_with_hook_for_test(expired, || {
+                hook_ran.set(true);
                 let entries = destination_entries(destination.path());
                 assert_eq!(entries.len(), 1);
                 assert!(entries[0]
@@ -368,19 +371,18 @@ fn timeout_and_pre_publish_fault_leave_no_artifacts_and_retry_succeeds() {
                     .unwrap()
                     .to_string_lossy()
                     .ends_with(".tmp"));
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(Duration::from_millis(250));
             })
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Deadline
+            .unwrap_err(),
+        KernelError::Deadline
     );
+    assert!(hook_ran.get(), "mid-flight assertions never executed");
     assert!(destination_entries(destination.path()).is_empty());
     assert_eq!(
         store
-            .backup_with_fault_for_test(request(destination.path()), BackupFault::BeforeRename)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Fault
+            .backup_with_fault_before_rename_for_test(request(destination.path()))
+            .unwrap_err(),
+        KernelError::Fault
     );
     assert!(destination_entries(destination.path()).is_empty());
     assert!(store.backup(request(destination.path())).is_ok());
@@ -397,13 +399,12 @@ fn backup_deadline_interrupts_verification_sql() {
 
     assert_eq!(
         verify_backup_with_deadline_for_test(
-            &backup.manifest.destination_path,
-            backup.manifest.captured_commit_seq,
+            &backup.destination_path,
+            backup.captured_commit_seq,
             Instant::now() - Duration::from_millis(1),
         )
-        .unwrap_err()
-        .kind(),
-        KernelErrorKind::Deadline
+        .unwrap_err(),
+        KernelError::Deadline
     );
 }
 
@@ -422,9 +423,8 @@ fn backup_name_collision_preserves_preexisting_file() {
     assert_eq!(
         store
             .backup_with_final_name_for_test(request(destination.path()), final_name)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Io
+            .unwrap_err(),
+        KernelError::Io
     );
     assert_eq!(fs::read(&final_path).unwrap(), original);
     assert_eq!(destination_entries(destination.path()), [final_path]);
@@ -437,17 +437,16 @@ fn evidence_manifest_pin_release_and_stale_reap_are_typed() {
     let store = KernelStore::open(root.path()).unwrap();
     insert_domain(&store, 1, Sensitivity::Normal);
     let normal_backup = store.backup(request(destination.path())).unwrap();
-    assert_eq!(normal_backup.manifest.max_sensitivity, Sensitivity::Normal);
+    assert_eq!(normal_backup.max_sensitivity, Sensitivity::Normal);
     drop(store);
     seed_evidence(root.path(), "z-evidence", "sensitive");
     seed_evidence(root.path(), "a-evidence", "normal");
     let store = KernelStore::open(root.path()).unwrap();
     assert_eq!(
         store
-            .backup_with_fault_for_test(request(destination.path()), BackupFault::BeforeRename)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Fault
+            .backup_with_fault_before_rename_for_test(request(destination.path()))
+            .unwrap_err(),
+        KernelError::Fault
     );
     assert_eq!(
         inspect(root.path())
@@ -467,11 +466,11 @@ fn evidence_manifest_pin_release_and_stale_reap_are_typed() {
     );
     let backup = store.backup(request(destination.path())).unwrap();
     assert_eq!(
-        backup.manifest.evidence_refs,
+        backup.evidence_refs,
         ["a-evidence".to_string(), "z-evidence".to_string()]
     );
-    assert_eq!(backup.manifest.max_sensitivity, Sensitivity::Sensitive);
-    let pin = backup.manifest.capture_pin_id.unwrap();
+    assert_eq!(backup.max_sensitivity, Sensitivity::Sensitive);
+    let pin = backup.capture_pin_id.unwrap();
     assert_eq!(
         inspect(root.path())
             .query_row(
@@ -511,9 +510,8 @@ fn evidence_manifest_pin_release_and_stale_reap_are_typed() {
                 capture_pin_expires_at: Some(0),
                 ..request(destination.path())
             })
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::InvalidInput
+            .unwrap_err(),
+        KernelError::InvalidInput
     );
     let now = unix_time_ms();
     let stale = store
@@ -522,7 +520,6 @@ fn evidence_manifest_pin_release_and_stale_reap_are_typed() {
             ..request(destination.path())
         })
         .unwrap()
-        .manifest
         .capture_pin_id
         .unwrap();
     let non_stale = store
@@ -531,7 +528,6 @@ fn evidence_manifest_pin_release_and_stale_reap_are_typed() {
             ..request(destination.path())
         })
         .unwrap()
-        .manifest
         .capture_pin_id
         .unwrap();
     assert_eq!(
@@ -547,7 +543,6 @@ fn evidence_manifest_pin_release_and_stale_reap_are_typed() {
     let defaulted = store
         .backup(request(destination.path()))
         .unwrap()
-        .manifest
         .capture_pin_id
         .unwrap();
     let default_lifetime: i64 = inspect(root.path())
@@ -560,9 +555,7 @@ fn evidence_manifest_pin_release_and_stale_reap_are_typed() {
     assert_eq!(default_lifetime, 24 * 60 * 60 * 1_000);
     drop(store);
     let reopened = KernelStore::open(root.path()).unwrap();
-    reopened
-        .run_capture_pin_maintenance_for_test(now + 90_000)
-        .unwrap();
+    reopened.run_capture_pin_maintenance(now + 90_000).unwrap();
     assert!(inspect(root.path())
         .query_row(
             "SELECT released_at IS NOT NULL FROM capture_pins WHERE capture_pin_id=?1",
@@ -616,7 +609,6 @@ fn staging_sensitivity_marks_backup_sensitive() {
         store
             .backup(request(destination.path()))
             .unwrap()
-            .manifest
             .max_sensitivity,
         Sensitivity::Sensitive
     );
@@ -632,26 +624,20 @@ fn unsafe_destinations_and_restore_sources_are_rejected_before_live_touch() {
     let file_destination = destination.path().join("file");
     fs::write(&file_destination, b"not a directory").unwrap();
     assert_eq!(
-        store.backup(request(&file_destination)).unwrap_err().kind(),
-        KernelErrorKind::UnsafeDestination
+        store.backup(request(&file_destination)).unwrap_err(),
+        KernelError::UnsafeDestination
     );
     let symlink_destination = destination.path().join("link");
     std::os::unix::fs::symlink(root.path(), &symlink_destination).unwrap();
     assert_eq!(
-        store
-            .backup(request(&symlink_destination))
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::UnsafeDestination
+        store.backup(request(&symlink_destination)).unwrap_err(),
+        KernelError::UnsafeDestination
     );
     let broad_destination = private_dir();
     fs::set_permissions(broad_destination.path(), fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
-        store
-            .backup(request(broad_destination.path()))
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::UnsafeDestination
+        store.backup(request(broad_destination.path())).unwrap_err(),
+        KernelError::UnsafeDestination
     );
     #[cfg(target_os = "linux")]
     {
@@ -660,11 +646,14 @@ fn unsafe_destinations_and_restore_sources_are_rejected_before_live_touch() {
         assert!(filesystem_is_unsafe_for_test(0x1234_5678));
         assert!(!filesystem_is_unsafe_for_test(0x794c_7630));
     }
-    for remote in ["nfs", "smbfs", "osxfuse", "macfuse", "webdav"] {
-        assert!(filesystem_name_is_unsafe_for_test(remote));
-    }
-    for local in ["apfs", "hfs", "tmpfs"] {
-        assert!(!filesystem_name_is_unsafe_for_test(local));
+    #[cfg(target_os = "macos")]
+    {
+        for remote in ["nfs", "smbfs", "osxfuse", "macfuse", "webdav"] {
+            assert!(mc_store::kernel::filesystem_name_is_unsafe_for_test(remote));
+        }
+        for local in ["apfs", "hfs", "tmpfs"] {
+            assert!(!mc_store::kernel::filesystem_name_is_unsafe_for_test(local));
+        }
     }
     let current_uid = rustix::process::geteuid().as_raw();
     assert!(owner_is_current_for_test(current_uid));
@@ -672,18 +661,17 @@ fn unsafe_destinations_and_restore_sources_are_rejected_before_live_touch() {
 
     let backup = store.backup(request(destination.path())).unwrap();
     let source_symlink = destination.path().join("source-link.sqlite");
-    std::os::unix::fs::symlink(&backup.manifest.destination_path, &source_symlink).unwrap();
+    std::os::unix::fs::symlink(&backup.destination_path, &source_symlink).unwrap();
     assert_eq!(
-        store.restore(&source_symlink).unwrap_err().kind(),
-        KernelErrorKind::InvalidRestore
+        store.restore(&source_symlink).unwrap_err(),
+        KernelError::InvalidRestore
     );
     assert_eq!(
-        store.restore(destination.path()).unwrap_err().kind(),
-        KernelErrorKind::InvalidRestore
+        store.restore(destination.path()).unwrap_err(),
+        KernelError::InvalidRestore
     );
     let corrupt = destination.path().join(
         backup
-            .manifest
             .destination_path
             .file_name()
             .unwrap()
@@ -697,9 +685,8 @@ fn unsafe_destinations_and_restore_sources_are_rejected_before_live_touch() {
     assert_eq!(
         store
             .restore_with_hook_for_test(&corrupt, || hook_called.set(true))
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::InvalidRestore
+            .unwrap_err(),
+        KernelError::InvalidRestore
     );
     assert!(!hook_called.get());
     assert_eq!(store.known_as_of(1).unwrap().tip, 1);
@@ -716,13 +703,9 @@ fn failed_restore_after_displacement_recovers_live_family() {
     insert_domain(&store, 2, Sensitivity::Normal);
     assert_eq!(
         store
-            .restore_with_fault_for_test(
-                &backup.manifest.destination_path,
-                RestoreFault::AfterDisplace,
-            )
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::Fault
+            .restore_with_fault_for_test(&backup.destination_path, RestoreFault::AfterDisplace,)
+            .unwrap_err(),
+        KernelError::Fault
     );
     assert_eq!(store.known_as_of(2).unwrap().tip, 2);
     assert_eq!(insert_domain(&store, 3, Sensitivity::Normal), 3);
@@ -740,11 +723,8 @@ fn restore_rejects_lost_fence_before_displacement() {
     store.invalidate_writer_fence_for_test().unwrap();
 
     assert_eq!(
-        store
-            .restore(&backup.manifest.destination_path)
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::FenceLost
+        store.restore(&backup.destination_path).unwrap_err(),
+        KernelError::FenceLost
     );
     assert_eq!(restore_oracle(root.path()).commit_tip, 2);
     assert!(!root.path().join("core.sqlite.mc-restore").exists());
@@ -770,7 +750,7 @@ fn restore_into_fresh_store_family_allows_immediate_mutation() {
     drop(initial);
     let fresh = KernelStore::open(fresh_root.path()).unwrap();
     assert_ne!(fresh.lease_epoch(), initial_epoch);
-    let source_epoch: i64 = Connection::open(&backup.manifest.destination_path)
+    let source_epoch: i64 = Connection::open(&backup.destination_path)
         .unwrap()
         .query_row(
             "SELECT writer_epoch FROM writer_fence WHERE id=0",
@@ -780,7 +760,7 @@ fn restore_into_fresh_store_family_allows_immediate_mutation() {
         .unwrap();
     assert_ne!(source_epoch, i64::try_from(fresh.lease_epoch()).unwrap());
     let renamed = destination.path().join("owner-only-renamed.sqlite");
-    fs::rename(&backup.manifest.destination_path, &renamed).unwrap();
+    fs::rename(&backup.destination_path, &renamed).unwrap();
     assert_eq!(fresh.restore(&renamed).unwrap(), 1);
     let restored_epoch: i64 = inspect(fresh_root.path())
         .query_row(
@@ -794,31 +774,28 @@ fn restore_into_fresh_store_family_allows_immediate_mutation() {
 }
 
 #[test]
-fn unrecoverable_restore_poison_preserves_recovery_family() {
+fn unrecoverable_restore_poisons_the_handle_then_reopen_rolls_the_family_back() {
     let root = private_dir();
     let destination = private_dir();
     let store = KernelStore::open(root.path()).unwrap();
     insert_domain(&store, 1, Sensitivity::Normal);
     let backup = store.backup(request(destination.path())).unwrap();
     insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
 
     assert_eq!(
         store
-            .restore_with_fault_for_test(
-                &backup.manifest.destination_path,
-                RestoreFault::RecoveryFailure,
-            )
-            .unwrap_err()
-            .kind(),
-        KernelErrorKind::InvalidRestore
+            .restore_with_fault_for_test(&backup.destination_path, RestoreFault::RecoveryFailure,)
+            .unwrap_err(),
+        KernelError::InvalidRestore
     );
     assert_eq!(
-        store.known_as_of(1).unwrap_err().kind(),
-        KernelErrorKind::InvalidRestore
+        store.known_as_of(1).unwrap_err(),
+        KernelError::InvalidRestore
     );
     assert_eq!(
-        insert_domain_result(&store, 3).unwrap_err().kind(),
-        KernelErrorKind::InvalidRestore
+        insert_domain_result(&store, 3).unwrap_err(),
+        KernelError::InvalidRestore
     );
     assert!(fs::read_dir(root.path()).unwrap().any(|entry| {
         entry
@@ -828,12 +805,22 @@ fn unrecoverable_restore_poison_preserves_recovery_family() {
             .contains(".mc-restore-")
     }));
     assert!(root.path().join("core.sqlite.mc-restore").exists());
-    drop(store);
-    assert_eq!(
-        KernelStore::open(root.path()).unwrap_err().kind(),
-        KernelErrorKind::Inconclusive
-    );
     assert!(!root.path().join("core.sqlite").exists());
+    drop(store);
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert!(root.path().join("core.sqlite").exists());
+    assert!(!root.path().join("core.sqlite.mc-restore").exists());
+    assert!(!fs::read_dir(root.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".mc-restore-")
+    }));
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
 }
 
 fn insert_domain_result(
@@ -849,10 +836,20 @@ fn insert_domain_result(
 }
 
 #[test]
-#[ignore = "generates a one-gibibyte restore fixture for the kernel-rto profile"]
+#[ignore = "writes about 3 GiB; run with: cargo test -p mc-store --features test-support --test kernel_backup threshold_size_restore_rto -- --ignored --nocapture"]
 fn threshold_size_restore_rto() {
     let root = private_dir();
     let destination = private_dir();
+    // The fixture, its backup and the restore copy are each about 1 GiB.
+    for area in [root.path(), destination.path()] {
+        let available = rustix::fs::statvfs(area).unwrap();
+        let free = available.f_bavail * available.f_frsize;
+        assert!(
+            free >= 4 * 1024 * 1024 * 1024,
+            "{} has {free} bytes free; this proof writes about 3 GiB",
+            area.display()
+        );
+    }
     let store = KernelStore::open(root.path()).unwrap();
     insert_domain(&store, 1, Sensitivity::Normal);
     drop(store);
@@ -879,10 +876,529 @@ fn threshold_size_restore_rto() {
     drop(connection);
     assert!(fs::metadata(root.path().join("core.sqlite")).unwrap().len() >= 1024 * 1024 * 1024);
     let store = KernelStore::open(root.path()).unwrap();
-    let backup = store.backup(request(destination.path())).unwrap();
+    // The shared `request` helper allows 30 s, which a 1 GiB copy plus a full
+    // integrity check can exceed on constrained I/O.
+    let rto_request = BackupRequest {
+        destination_directory: destination.path().to_path_buf(),
+        deadline: Instant::now() + Duration::from_secs(300),
+        capture_pin_expires_at: None,
+    };
+    let backup = store.backup(rto_request).unwrap();
     let started = Instant::now();
-    store.restore(&backup.manifest.destination_path).unwrap();
+    store.restore(&backup.destination_path).unwrap();
+    // `restore_elapsed` excludes backup time and the post-restore assertions.
+    let restore_elapsed = started.elapsed();
     assert_eq!(store.known_as_of(1).unwrap().tip, 1);
     assert_eq!(insert_domain(&store, 2, Sensitivity::Normal), 2);
-    assert!(started.elapsed() <= Duration::from_secs(300));
+    assert!(
+        restore_elapsed <= Duration::from_secs(300),
+        "restore took {restore_elapsed:?}"
+    );
+}
+
+fn header_write_read_versions(path: &Path) -> (u8, u8) {
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    fs::File::open(path)
+        .unwrap()
+        .read_exact(&mut header)
+        .unwrap();
+    (header[18], header[19])
+}
+
+#[test]
+fn published_artifact_is_self_contained_and_restores_from_read_only_media() {
+    let root = private_dir();
+    let destination = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    let backup = store.backup(request(destination.path())).unwrap();
+
+    assert_eq!(header_write_read_versions(&backup.destination_path), (1, 1));
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = PathBuf::from(format!(
+            "{}{suffix}",
+            backup.destination_path.to_str().unwrap()
+        ));
+        assert!(!sidecar.exists(), "{suffix} left beside the artifact");
+    }
+    assert_eq!(destination_entries(destination.path()).len(), 1);
+
+    let archive = private_dir();
+    let archived = archive.path().join("archived.sqlite");
+    fs::copy(&backup.destination_path, &archived).unwrap();
+    fs::set_permissions(&archived, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(archive.path(), fs::Permissions::from_mode(0o500)).unwrap();
+
+    let target_root = private_dir();
+    let target = KernelStore::open(target_root.path()).unwrap();
+    assert_eq!(target.restore(&archived).unwrap(), 1);
+    assert_eq!(target.facts(1).unwrap().commit_seq, 1);
+
+    fs::set_permissions(archive.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", archived.to_str().unwrap()));
+        assert!(
+            !sidecar.exists(),
+            "restore created {suffix} beside the source"
+        );
+    }
+}
+
+#[test]
+fn restore_interrupted_before_the_swap_rolls_back_on_the_next_open() {
+    let root = private_dir();
+    let destination = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    let backup = store.backup(request(destination.path())).unwrap();
+    insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // `AfterDisplace` abandons the family in the recovery directory with the
+    // marker still published, matching a process killed mid-replacement.
+    assert_eq!(
+        store
+            .restore_with_fault_for_test(&backup.destination_path, RestoreFault::AfterDisplace)
+            .unwrap_err(),
+        KernelError::Fault
+    );
+    drop(store);
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
+    assert!(!root.path().join("core.sqlite.mc-restore").exists());
+    assert!(!fs::read_dir(root.path()).unwrap().any(|entry| {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        name.contains(".mc-restore-") || name.contains(".restore-")
+    }));
+    assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
+}
+
+#[test]
+fn a_forged_restore_marker_fails_closed_instead_of_moving_the_family() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    drop(store);
+
+    let marker = root.path().join("core.sqlite.mc-restore");
+    fs::write(&marker, b"{\"protocol\":\"mc-kernel-restore-marker-v1\"}").unwrap();
+    assert_eq!(
+        KernelStore::open(root.path()).unwrap_err(),
+        KernelError::Inconclusive
+    );
+    assert!(root.path().join("core.sqlite").exists());
+
+    fs::remove_file(&marker).unwrap();
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 1);
+}
+
+#[test]
+fn sensitivity_classification_scans_every_table_carrying_the_column() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    drop(store);
+
+    let mut connection = inspect(root.path());
+    let scanned = sensitivity_bearing_tables_for_test(&mut connection);
+    let mut expected: Vec<String> = connection
+        .prepare(
+            "SELECT m.name FROM sqlite_schema m, pragma_table_info(m.name) p
+             WHERE m.type='table' AND p.name='sensitivity_class'",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    expected.sort();
+
+    assert!(!scanned.is_empty());
+    assert_eq!(scanned, expected);
+    for required in ["domains", "evidence_meta", "outbox", "candidates"] {
+        assert!(
+            scanned.iter().any(|name| name == required),
+            "{required} missing from the sensitivity scan"
+        );
+    }
+}
+
+#[test]
+fn restore_interrupted_before_displacement_keeps_the_live_family() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // A process killed here leaves the marker published, the recovery directory
+    // empty, and the live family as the only copy of the data.
+    let recovery_dir = store.abandon_restore_marker_for_test().unwrap();
+    assert!(recovery_dir.is_dir());
+    assert_eq!(fs::read_dir(&recovery_dir).unwrap().count(), 0);
+    assert!(root.path().join("core.sqlite").exists());
+    drop(store);
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
+    assert!(!root.path().join("core.sqlite.mc-restore").exists());
+    assert!(!recovery_dir.exists());
+    assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
+}
+
+#[test]
+fn restore_interrupted_after_sidecars_move_keeps_the_live_main_file() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // `displace_family` moves sidecars before the main file, so a kill mid-way
+    // leaves the main file live and its sidecars in the recovery directory.
+    let recovery_dir = store.abandon_restore_marker_for_test().unwrap();
+    drop(store);
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!(
+            "{}{suffix}",
+            root.path().join("core.sqlite").to_str().unwrap()
+        ));
+        if sidecar.exists() {
+            fs::rename(&sidecar, recovery_dir.join(sidecar.file_name().unwrap())).unwrap();
+        }
+    }
+    assert!(root.path().join("core.sqlite").exists());
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
+    assert!(!recovery_dir.exists());
+    assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
+}
+
+#[test]
+fn a_partially_completed_rollback_keeps_the_members_already_restored() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    let recovery_dir = store.abandon_restore_marker_for_test().unwrap();
+    drop(store);
+    // `restore_displaced_family` moves the main file first, so a recovery directory
+    // holding only sidecars is a rollback that already restored the main file. The
+    // live main file must survive the re-run rather than be deleted as residue.
+    let main = root.path().join("core.sqlite");
+    let live_bytes = fs::read(&main).unwrap();
+    fs::write(recovery_dir.join("core.sqlite-wal"), b"").unwrap();
+    assert!(main.exists());
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(fs::read(&main).unwrap(), live_bytes);
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
+    assert!(!recovery_dir.exists());
+    assert!(!root.path().join("core.sqlite.mc-restore").exists());
+    assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
+}
+
+#[test]
+fn backup_reports_deadline_rather_than_blocking_on_a_held_writer() {
+    let root = private_dir();
+    let destination = private_dir();
+    let store = Arc::new(KernelStore::open(root.path()).unwrap());
+    insert_domain(&store, 1, Sensitivity::Normal);
+
+    let (holding_tx, holding_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            store
+                .commit(intent("hold-the-writer"), |_| {
+                    holding_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok("held".to_string())
+                })
+                .unwrap();
+        })
+    };
+    holding_rx.recv().unwrap();
+
+    let started = Instant::now();
+    let outcome = store.backup(BackupRequest {
+        destination_directory: destination.path().to_path_buf(),
+        deadline: Instant::now() + Duration::from_millis(150),
+        capture_pin_expires_at: None,
+    });
+    let elapsed = started.elapsed();
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+
+    assert_eq!(outcome.unwrap_err(), KernelError::Deadline);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "backup blocked on the writer for {elapsed:?}"
+    );
+    assert!(destination_entries(destination.path()).is_empty());
+}
+
+#[test]
+fn a_secret_row_classifies_the_backup_secret_not_merely_sensitive() {
+    let root = private_dir();
+    let destination = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Sensitive);
+    let sensitive = store.backup(request(destination.path())).unwrap();
+    assert_eq!(sensitive.max_sensitivity, Sensitivity::Sensitive);
+
+    insert_domain(&store, 2, Sensitivity::Secret);
+    let secret = store.backup(request(destination.path())).unwrap();
+    assert_eq!(
+        secret.max_sensitivity,
+        Sensitivity::Secret,
+        "a secret row must not be reported as merely sensitive"
+    );
+}
+
+#[test]
+fn an_orphaned_recovery_directory_is_reclaimed_on_the_next_open() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // A crash after the marker is removed but before cleanup leaves the prior
+    // family, which may hold sensitive rows, with nothing to reclaim it.
+    let recovery_dir = store.abandon_restore_marker_for_test().unwrap();
+    fs::write(recovery_dir.join("core.sqlite"), b"prior family bytes").unwrap();
+    fs::remove_file(root.path().join("core.sqlite.mc-restore")).unwrap();
+    drop(store);
+    assert!(recovery_dir.is_dir());
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert!(
+        !recovery_dir.exists(),
+        "recovery directory was not reclaimed"
+    );
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(insert_domain(&reopened, 2, Sensitivity::Normal), 2);
+}
+
+#[test]
+fn an_oversized_or_special_restore_marker_is_refused_before_it_is_read() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    drop(store);
+    let marker = root.path().join("core.sqlite.mc-restore");
+
+    fs::write(&marker, vec![b'{'; 64 * 1024 + 1]).unwrap();
+    assert_eq!(
+        KernelStore::open(root.path()).unwrap_err(),
+        KernelError::Inconclusive
+    );
+    fs::remove_file(&marker).unwrap();
+
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &marker,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        KernelStore::open(root.path()).unwrap_err(),
+        KernelError::Inconclusive
+    );
+    fs::remove_file(&marker).unwrap();
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 1);
+}
+
+#[test]
+fn a_recovery_directory_not_created_by_the_store_is_left_untouched() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    drop(store);
+
+    // `allocate_recovery_dir` appends only digits, so an operator copy sharing the
+    // prefix must survive an open, contents included.
+    let operator_copy = root.path().join("core.sqlite.mc-restore-incident-4821");
+    fs::create_dir(&operator_copy).unwrap();
+    fs::write(operator_copy.join("core.sqlite"), b"operator evidence").unwrap();
+    fs::write(operator_copy.join("notes.txt"), b"do not delete").unwrap();
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert!(operator_copy.is_dir(), "operator directory was reaped");
+    assert_eq!(
+        fs::read(operator_copy.join("core.sqlite")).unwrap(),
+        b"operator evidence"
+    );
+    assert_eq!(
+        fs::read(operator_copy.join("notes.txt")).unwrap(),
+        b"do not delete"
+    );
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 1);
+}
+
+#[test]
+fn restore_verifies_the_staged_copy_so_a_mutated_source_cannot_install() {
+    let root = private_dir();
+    let destination = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    let backup = store.backup(request(destination.path())).unwrap();
+    insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // Rewriting the artifact in place keeps its device and inode, so only verifying
+    // the staged copy can reject it.
+    let mut corrupted = fs::read(&backup.destination_path).unwrap();
+    let tail = corrupted.len() - 512;
+    corrupted[tail..].fill(0x5a);
+    fs::write(&backup.destination_path, &corrupted).unwrap();
+
+    assert_eq!(
+        store.restore(&backup.destination_path).unwrap_err(),
+        KernelError::InvalidRestore
+    );
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(store.facts(1).unwrap().commit_seq, 2);
+    assert!(!fs::read_dir(root.path()).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains(".restore-")));
+    assert_eq!(insert_domain(&store, 3, Sensitivity::Normal), 3);
+}
+
+#[test]
+fn orphan_cleanup_does_not_follow_symlinks_out_of_the_store_root() {
+    let root = private_dir();
+    let outside = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    drop(store);
+
+    // `is_dir` follows symlinks, so a symlinked candidate with a generated-looking
+    // suffix could otherwise redirect the unlinks at another directory.
+    let victim = outside.path().join("core.sqlite");
+    fs::write(&victim, b"someone else's database").unwrap();
+    let victim_wal = outside.path().join("core.sqlite-wal");
+    fs::write(&victim_wal, b"someone else's wal").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path(),
+        root.path().join("core.sqlite.mc-restore-123"),
+    )
+    .unwrap();
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(fs::read(&victim).unwrap(), b"someone else's database");
+    assert_eq!(fs::read(&victim_wal).unwrap(), b"someone else's wal");
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 1);
+}
+
+#[test]
+fn scratch_cleanup_spares_files_the_store_could_not_have_written() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    drop(store);
+
+    // `restore_temp_path` writes only decimal digits between the prefix and suffix.
+    let operator = root.path().join("core.sqlite.restore-incident.tmp");
+    fs::write(&operator, b"operator diagnostic").unwrap();
+    let generated = root.path().join("core.sqlite.restore-4242.tmp");
+    fs::write(&generated, b"leftover staging").unwrap();
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(
+        fs::read(&operator).unwrap(),
+        b"operator diagnostic",
+        "operator file was deleted"
+    );
+    assert!(!generated.exists(), "generated scratch was not reclaimed");
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 1);
+}
+
+#[test]
+fn a_dangling_reference_is_refused_even_when_integrity_check_passes() {
+    let root = private_dir();
+    let destination = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    let backup = store.backup(request(destination.path())).unwrap();
+    insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // `foreign_keys=OFF` lets a dangling row be written that `integrity_check`
+    // still reports as ok, so only a referential check can reject it.
+    let artifact = Connection::open(&backup.destination_path).unwrap();
+    artifact.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    artifact
+        .execute(
+            "INSERT INTO capture_pin_refs(capture_pin_id,evidence_id,expires_at)
+             VALUES ('no-such-pin','no-such-evidence',NULL)",
+            [],
+        )
+        .unwrap();
+    let integrity: String = artifact
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok", "fixture must pass integrity_check");
+    let violations: i64 = artifact
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(violations > 0, "fixture must have a dangling reference");
+    drop(artifact);
+
+    assert_eq!(
+        store.restore(&backup.destination_path).unwrap_err(),
+        KernelError::InvalidRestore
+    );
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(insert_domain(&store, 3, Sensitivity::Normal), 3);
+}
+
+#[test]
+fn a_lone_wal_mode_main_file_is_refused_as_a_restore_source() {
+    let root = private_dir();
+    let source_root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // A byte-copy of a live main file keeps the WAL header while its committed pages
+    // may live only in a `-wal` that was not copied.
+    let other = KernelStore::open(source_root.path()).unwrap();
+    insert_domain(&other, 9, Sensitivity::Normal);
+    let bare = root.path().join("bare-main.sqlite");
+    fs::copy(source_root.path().join("core.sqlite"), &bare).unwrap();
+    fs::set_permissions(&bare, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(header_write_read_versions(&bare), (2, 2));
+
+    assert_eq!(
+        store.restore(&bare).unwrap_err(),
+        KernelError::InvalidRestore
+    );
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+
+    // A sealed artifact from `backup` is accepted, so the check is not rejecting
+    // every source.
+    let destination = private_dir();
+    let sealed = store.backup(request(destination.path())).unwrap();
+    assert_eq!(header_write_read_versions(&sealed.destination_path), (1, 1));
+    assert_eq!(store.restore(&sealed.destination_path).unwrap(), 1);
 }

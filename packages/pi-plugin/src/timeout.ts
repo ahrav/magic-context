@@ -1,4 +1,4 @@
-/** Promise timeout helper that clears and unrefs its timer. */
+/* */
 export function withTimeout<T>(
 	p: Promise<T>,
 	ms: number,

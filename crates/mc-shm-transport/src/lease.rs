@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::descriptor::ReleaseIdentity;
 
-/// Raw, lifetime-bound view of one validated arena span.
+/// `LeaseSpan` provides a raw view of a span whose mapping remains readable for `'lease`.
 #[derive(Clone, Copy)]
 pub struct LeaseSpan<'lease> {
     base: NonNull<u8>,
@@ -15,7 +15,6 @@ pub struct LeaseSpan<'lease> {
 }
 
 impl<'lease> LeaseSpan<'lease> {
-    /// Constructs a span after mapping and descriptor validation.
     ///
     /// # Safety
     /// `base..base.add(len)` must remain mapped and readable for `'lease`.
@@ -34,17 +33,15 @@ impl<'lease> LeaseSpan<'lease> {
         self.len
     }
 
-    /// Raw span address, valid for this span's lifetime. commentlint: allow(JUDGE)
     pub const fn as_mut_ptr(self) -> *mut u8 {
         self.base.as_ptr()
     }
 
-    /// Whether span is empty.
     pub const fn is_empty(self) -> bool {
         self.len == 0
     }
 
-    /// Reads one byte through raw peer-writable mapping access.
+    /// `read_byte` reads one byte through raw access to a peer-writable mapping.
     pub fn read_byte(self, index: usize) -> Option<u8> {
         if index >= self.len {
             return None;
@@ -53,21 +50,19 @@ impl<'lease> LeaseSpan<'lease> {
         Some(unsafe { self.base.as_ptr().add(index).read_volatile() })
     }
 
-    /// Copies this span into exact-size destination compatibility storage.
     pub fn copy_to(self, destination: &mut [u8]) -> Result<(), LeaseError> {
         if destination.len() != self.len {
             return Err(LeaseError::LengthMismatch);
         }
-        // SAFETY: LeaseSpan::new guarantees readable storage for the lease; R19 forbids peer writes before release; destination is distinct and no shared-memory reference escapes. commentlint: allow(JUDGE)
+        // SAFETY: `LeaseSpan::new` guarantees that the source range is readable.
         unsafe {
             std::ptr::copy_nonoverlapping(self.base.as_ptr(), destination.as_mut_ptr(), self.len)
         };
         Ok(())
     }
 
-    /// Touches every byte without materializing a body copy.
     pub fn checksum(self) -> u64 {
-        // SAFETY: LeaseSpan::new guarantees readable storage for the lease; R19 forbids peer writes before release; slice stays inside this call. commentlint: allow(JUDGE)
+        // SAFETY: `LeaseSpan::new` guarantees that the slice range is readable for the lease.
         let bytes = unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) };
         bytes
             .iter()
@@ -83,10 +78,9 @@ impl fmt::Debug for LeaseSpan<'_> {
 
 pub(crate) type ReleaseFn = unsafe fn(*const (), ReleaseIdentity) -> Result<(), LeaseError>;
 
-/// Scoped receive lease over one or two shared spans.
 ///
-/// Raw span access avoids creating a long-lived safe reference to memory a
-/// trusted peer could still address. `Rc` marker makes this type `!Send`.
+/// Raw span access avoids long-lived safe references to mappings a trusted peer can address.
+/// `Rc` marker makes `ReceiveLease` `!Send`.
 pub struct ReceiveLease<'lease> {
     spans: [Option<LeaseSpan<'lease>>; 2],
     span_count: u8,
@@ -101,10 +95,9 @@ pub struct ReceiveLease<'lease> {
 }
 
 impl<'lease> ReceiveLease<'lease> {
-    /// Constructs a lease from a validated descriptor and live mapping.
     ///
     /// # Safety
-    /// Spans and release context must remain valid for `'lease`. Release
+    /// Spans and release context must remain valid for `'lease`.
     /// callback must accept this identity exactly once.
     pub(crate) unsafe fn new(
         spans: [Option<LeaseSpan<'lease>>; 2],
@@ -136,22 +129,18 @@ impl<'lease> ReceiveLease<'lease> {
         })
     }
 
-    /// Exact committed body length.
     pub const fn len(&self) -> usize {
         self.body_len
     }
 
-    /// Whether body is empty.
     pub const fn is_empty(&self) -> bool {
         self.body_len == 0
     }
 
-    /// Number of descriptor spans, including empty-body span.
     pub const fn segment_count(&self) -> usize {
         self.span_count as usize
     }
 
-    /// Returns one scoped segment.
     pub fn segment(&self, index: usize) -> Option<LeaseSpan<'_>> {
         if index >= usize::from(self.span_count) {
             return None;
@@ -164,17 +153,14 @@ impl<'lease> ReceiveLease<'lease> {
         self.wire_header
     }
 
-    /// Returns qualified identity for explicit completion protocols.
     pub const fn identity(&self) -> ReleaseIdentity {
         self.identity
     }
 
-    /// Explicitly completes lease and reports stale or duplicate release.
     pub fn release(mut self) -> Result<(), LeaseError> {
         self.release_once()
     }
 
-    /// Compatibility adapter with one explicit body copy.
     pub fn to_vec(&self) -> Result<Vec<u8>, LeaseError> {
         let mut bytes = vec![0u8; self.body_len];
         let mut cursor = 0usize;
@@ -220,22 +206,16 @@ impl Drop for ReceiveLease<'_> {
     }
 }
 
-/// Receive-span or completion failure.
+/// `LeaseError` reports receive-span or completion failures.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
-    /// Span pointer, count, or length is invalid.
+    /// `LeaseError` reports an invalid span pointer or count.
     InvalidSpan,
-    /// Destination or aggregate body length disagrees.
     LengthMismatch,
-    /// Release identity belongs to another incarnation.
     WrongIncarnation,
-    /// Release identity belongs to another lane.
     WrongLane,
-    /// Release sequence is stale or unexpected.
     InvalidSequence,
-    /// Completion was already recorded.
     DuplicateRelease,
-    /// Candidate is quarantined and cannot recycle storage.
     Quarantined,
 }
 

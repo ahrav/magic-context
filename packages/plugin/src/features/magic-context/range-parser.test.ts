@@ -37,7 +37,6 @@ describe("parseRangeString", () => {
     it("throws on range exceeding 1000 elements", () => {
         //#given
         const input = "1-10000";
-        //#when + #then
         expect(() => parseRangeString(input)).toThrow(
             'Range "1-10000" exceeds maximum size of 1000 elements (got 10000)',
         );

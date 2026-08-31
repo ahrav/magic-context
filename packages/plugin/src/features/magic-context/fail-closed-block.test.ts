@@ -133,14 +133,12 @@ describe("createFailClosedController", () => {
         ).rejects.toBeInstanceOf(Error);
         expect(gate.isArmed()).toBe(true);
 
-        // Second blocked pass hits reprobeEveryN=2 and heals.
         await expect(
             gate.enforce({ blockingEnabled: true, exempt: false, tryReopen }),
         ).resolves.toBeUndefined();
         expect(gate.isArmed()).toBe(false);
         expect(opens).toBe(2);
 
-        // Subsequent passes stay unblocked without another reopen.
         await expect(
             gate.enforce({ blockingEnabled: true, exempt: false, tryReopen }),
         ).resolves.toBeUndefined();

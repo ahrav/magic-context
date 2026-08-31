@@ -4,10 +4,6 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
 
 /**
- * Phase 1 smoke — verifies the harness is wired correctly:
- *   mock server reachable, opencode serve runs with isolated config, plugin loads
- *   from source, a prompt reaches the mock and returns, and the plugin initializes
- *   its SQLite DB.
  */
 
 let h: TestHarness;
@@ -40,23 +36,13 @@ describe("e2e smoke", () => {
         const sessionId = await h.createSession();
         await h.sendPrompt(sessionId, "hi there");
 
-        // The plugin intentionally SKIPS prompt injection for OpenCode's
-        // internal small-model agents (title generator, summary, compaction)
-        // as of v0.16.2 — they don't have our tools and were just paying the
-        // token cost. The first captured request is typically the title
-        // generator firing in parallel with the user's first turn, so we
-        // need to wait for the MAIN agent's request and assert on that one.
         //
-        // Identify the main-agent request: it's the one whose system prompt
-        // does NOT match an OpenCode internal agent signature. We use the
-        // negation of "title generator" / "Generate a summary" / etc. to
         // distinguish.
         await h.waitFor(
             () => {
                 const hits = h.mock.requests().filter((r) => {
                     const body = JSON.stringify(r.body);
                     if (!body.includes("hi there")) return false;
-                    // Skip OpenCode's internal small-model agents.
                     if (body.includes("You are a title generator")) return false;
                     if (body.includes("Generate a title for this conversation:")) return false;
                     if (body.includes("Generate a summary of the conversation")) return false;
@@ -71,12 +57,7 @@ describe("e2e smoke", () => {
         const requests = h.mock.requests();
         expect(requests.length).toBeGreaterThanOrEqual(1);
 
-        // The assertion that matters is that the PLUGIN touched the outgoing
-        // request, not that the harness transported our text. Magic-context
-        // injects a system-prompt block describing its tools and guidance —
-        // this exact phrase comes from
-        // packages/plugin/src/agents/magic-context-prompt.ts and is stable
-        // across the default agent-prompt variants.
+        // The Magic Context assertion distinguishes plugin injection from request transport.
         const mainAgentBody = requests
             .map((r) => JSON.stringify(r.body))
             .find(

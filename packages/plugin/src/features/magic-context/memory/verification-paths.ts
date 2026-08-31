@@ -57,15 +57,14 @@ function toPosixPath(value: string): string {
     return value.split(path.sep).join("/");
 }
 
-/** True when `candidate` stays at or below `root` (no `..` escape). Shared
- * with the enforcement-artifact canonicalizer so the security-sensitive
- * escape predicate has exactly one implementation. */
+/**
+ * */
 export function isWithin(root: string, candidate: string): boolean {
     const rel = path.relative(root, candidate);
     return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
-/** Resolve symlinks, or null when the path does not exist. Shared with the
+/**
  * enforcement-artifact canonicalizer. */
 export function safeRealpath(value: string): string | null {
     try {
@@ -75,17 +74,14 @@ export function safeRealpath(value: string): string | null {
     }
 }
 
-/** SHA-256 hex of a file's bytes, read whole. The single implementation for
- * enforcement-artifact digests: record time and revalidation must hash
- * identically or valid artifacts read as drifted (and vice versa). Use the
- * streaming variant on paths where a large file would pin the event loop. */
+/**
+ * Use `sha256FileStreaming` when synchronous whole-file reads would block the event loop. */
 export function sha256FileSync(absolutePath: string): string {
     return createHash("sha256").update(readFileSync(absolutePath)).digest("hex");
 }
 
-/** Streamed SHA-256: read and hash yield per chunk, so hashing a large
- *  artifact never pins the event loop the way a whole-buffer
- *  createHash().update() would. Digest-identical to `sha256FileSync`. */
+/** Streaming yields between chunks instead of retaining the entire file in one buffer.
+ * `sha256FileStreaming` produces the same digest as `sha256FileSync`. */
 export async function sha256FileStreaming(absolutePath: string): Promise<string> {
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(absolutePath)) {
@@ -119,16 +115,10 @@ export async function readGitChangedFilesSince(
 }
 
 /**
- * Map each repo file changed at/after `sinceMs` to its LATEST commit time (ms).
- * Drives the per-memory verify gate: a memory needs re-verification if any of
- * its mapped files has a change time newer than that memory's `verified_at`.
+ * Maps files in commits newer than `sinceSec` to their newest commit timestamp in milliseconds.
  *
- * Returns null on any git failure → caller falls back to full verification
- * (safe direction: re-check rather than skip). Output excludes the working tree;
- * a file edited but uncommitted is caught separately by `verificationFileExists`
- * (deletion) — verify reads the live file regardless, so uncommitted edits are
- * surfaced when the file is opened. The committed-history map is what lets the
- * gate cheaply SKIP unchanged memories.
+ * Returns `null` when Git resolution or history lookup fails.
+ * Git history excludes working-tree changes.
  */
 export async function readGitFileChangeTimesSince(
     cwd: string,
@@ -137,9 +127,9 @@ export async function readGitFileChangeTimesSince(
     const gitRoot = await resolveGitTopLevel(cwd);
     if (!gitRoot) return null;
     const sinceSec = Math.max(0, Math.floor(sinceMs / 1000));
-    // Block format: "<unix-seconds>\n<file>\n<file>\n...\n\n". %ct = committer
-    // time. --name-only lists each commit's files. We walk newest→oldest (git log
-    // default), keeping the FIRST (= latest) time seen per file.
+    // The git-log output encodes each commit as its committer timestamp followed by its changed files.
+    // `--name-only` lists each commit's changed files.
+    // The map retains the first timestamp seen for each file because git log returns commits newest first.
     const stdout = await runGit(gitRoot, [
         "log",
         `--since=@${sinceSec}`,
@@ -156,7 +146,7 @@ export async function readGitFileChangeTimesSince(
             currentMs = Number.parseInt(line, 10) * 1000;
             continue;
         }
-        // A file path under the current commit. Keep the newest time per file.
+        // Each path belongs to the current commit.
         if (currentMs > 0 && !times.has(line)) {
             times.set(line, currentMs);
         }
@@ -193,8 +183,6 @@ export function verificationFileExists(baseRoot: string, filePath: string): bool
 }
 
 /**
- * Normalize agent-supplied verification paths into repo-root-relative Git paths.
- * Non-git projects fall back to cwd-relative existing files; their gate full-runs.
  */
 export async function normalizeVerificationFiles(args: {
     cwd: string;
@@ -303,9 +291,6 @@ export async function normalizeVerificationFiles(args: {
 export function __setVerificationPathsTestHooks(hooks: {
     execFile?: VerificationPathsExecFile;
 }): void {
-    // Keep the real filesystem shape on disk, but let tests script git output.
-    // Under heavy machine load, launching git can stall while the operating
-    // system assesses the binary, so the seam keeps gate tests deterministic.
     execFileForVerificationPaths = hooks.execFile ?? defaultExecFileForVerificationPaths;
 }
 

@@ -55,13 +55,10 @@ function expectedRelease(root: VerifiedReleaseRoot): FrozenReleaseIdentity {
 }
 
 /**
- * `runProspectiveCase` binds the coordinate to the running host, so roots and
- * inputs are built at this host's platform rather than a fixed literal. A
- * literal would pass only on the machine it names and would otherwise report
- * the binding as broken.
+ * `runProspectiveCase` uses `HOST_PLATFORM` so roots and inputs satisfy the host-platform binding on every host.
  */
 const HOST_PLATFORM = `${process.platform}-${process.arch}`;
-/** Well formed, and never this host, so only the host binding rejects it. */
+/** `FOREIGN_PLATFORM` is well formed and differs from `HOST_PLATFORM`, so only the host binding rejects it. */
 const FOREIGN_PLATFORM = HOST_PLATFORM === "linux-x64" ? "darwin-arm64" : "linux-x64";
 
 async function withRoots(
@@ -72,8 +69,7 @@ async function withRoots(
     const pairedRelease = mkdtempSync(join(tmpdir(), "runner-paired-release-"));
     const active = mkdtempSync(join(tmpdir(), "runner-active-"));
     try {
-        // `releaseRootFixture` declares a fixed `linux-x64`, and `platform` is outside the bytes
-        // `rootFingerprint` covers, so restating it leaves every digest and fingerprint check intact.
+        // `platform` is excluded from `rootFingerprint`, so overriding the fixture's `linux-x64` leaves fingerprint validation intact.
         const manifest = { ...releaseRootFixture(release), platform };
         const pairedManifest = {
             ...releaseRootFixture(pairedRelease, {
@@ -125,7 +121,7 @@ function terminalKey(cell: ProspectiveCellResult): string {
     return `${cell.runHealth}|${cell.productOutcome}|${cell.reasonCode ?? "null"}`;
 }
 
-/** Diagnostics of the single contract error `run` raises, so one code is provable. */
+/** `diagnostics` rethrows non-contract errors so tests cannot treat them as contract failures. */
 function diagnostics(run: () => unknown): readonly string[] {
     try {
         run();
@@ -136,7 +132,7 @@ function diagnostics(run: () => unknown): readonly string[] {
     throw new Error("expected a contract error");
 }
 
-/** The rejecting counterpart of `diagnostics`, for breaches `runProspectiveCase` raises. */
+/* */
 async function rejectionDiagnostics(run: Promise<unknown>): Promise<readonly string[]> {
     try {
         await run;
@@ -148,8 +144,7 @@ async function rejectionDiagnostics(run: Promise<unknown>): Promise<readonly str
 }
 
 /**
- * Drives every terminal path `runProspectiveCase` has so the allowed-triple set
- * is measured against the runner instead of restated as literals.
+ * The test exercises every terminal path in `runProspectiveCase`, so its allowed triples come from the runner rather than duplicated literals.
  */
 async function runnerTerminals(
     root: VerifiedReleaseRoot,
@@ -231,8 +226,7 @@ describe("prospective runner", () => {
     it("rejects a coordinate whose platform is not this host", async () => {
         await withRoots(async (root, paired, active) => {
             const input = baseInput(root, paired, active);
-            // Both manifests and the input agree on the foreign platform, so the agreement checks
-            // pass and only the host binding can be the code that fires.
+            // `pairedManifest` and the input use `FOREIGN_PLATFORM`, so agreement validation passes before host binding rejects it.
             expect([input.platform, root.manifest.platform, paired.manifest.platform]).toEqual([
                 FOREIGN_PLATFORM, FOREIGN_PLATFORM, FOREIGN_PLATFORM,
             ]);
@@ -264,8 +258,7 @@ describe("prospective runner", () => {
             const result = await runProspectiveCase({
                 ...baseInput(root, paired, active),
                 scenario: scenario(async () => ({ state: "stale" }), {
-                    // A non-empty string is truthy, so the failure filter alone reads this check
-                    // as passed and the cell it records claims a pass the verifier never reported.
+                    // `failure` is a non-empty string, so a truthiness filter reports a pass even when the verifier did not.
                     verifier: () => [{ id: "check-current", passed: "false" as unknown as boolean }],
                 }),
             });
@@ -277,10 +270,7 @@ describe("prospective runner", () => {
 
     it("refuses verifier evidence whose container is not an array of objects", async () => {
         await withRoots(async (root, paired, active) => {
-            // A verifier is scenario code, so its declared array type is no evidence about
-            // the container. Each of these throws on `.length`, `.map`, or a member read,
-            // and that throw lands outside the verifier's own `try`: it rejects the call and
-            // can stop the whole cohort instead of recording the malformed-result cell.
+            // `verifier` can return a non-array despite its declared type. These values throw on `.length`, `.map`, or member reads outside `verifier`'s `try`, rejecting the call instead of recording a malformed-result cell.
             const containers: Array<[string, unknown]> = [
                 ["null", null],
                 ["undefined", undefined],
@@ -328,8 +318,7 @@ describe("prospective runner", () => {
     it("refuses a cell when the driver outlives the bounded drain", async () => {
         await withRoots(async (root, paired, active) => {
             let cleaned = false;
-            // Cleanup reports success and still leaves the driver running, which is the case a
-            // returned timeout cell would hand to a retry while the driver can still write.
+            // `cleanup` can report success before the driver exits, so a retry can race writes from the still-running driver.
             const breach = rejectionDiagnostics(runProspectiveCase({
                 ...baseInput(root, paired, active),
                 timeoutMs: 5,
@@ -349,25 +338,21 @@ describe("prospective runner", () => {
                 ...baseInput(root, paired, active),
                 timeoutMs: 5,
                 scenario: scenario(
-                    // The driver ends on the abort, so the drain settles at once and the cleanup
-                    // wait is the only thing that can hold the call open past the deadline.
+                    // `abort` terminates the driver immediately, so only cleanup can extend completion beyond the deadline.
                     (context) => new Promise<{ state: string }>((resolve) => {
                         context.signal.addEventListener("abort", () => resolve({ state: "late" }));
                     }),
                     { cleanup: () => new Promise<void>(() => {}) },
                 ),
             }));
-            // A cleanup still running can keep writing the workspace, and a crash cell leaves
-            // the pair short of "completed", which `buildPairedFacts` reads as grounds for
-            // another attempt against those writes. The breach stops the run instead.
+            // `cleanup` can continue writing the workspace after the driver returns, so retrying an incomplete pair can race those writes.
             expect(await breach).toEqual(["prospective-runner: cleanup-abandoned"]);
         });
     }, 1_000);
 
     it("refuses a cell when cleanup never settles after the driver completes", async () => {
         await withRoots(async (root, paired, active) => {
-            // Cleanup after a driver that returned normally is bounded by the same deadline:
-            // an unbounded wait here wedges the cohort until the outer CI timeout.
+            // Cleanup after a normally returned driver uses the same deadline; an unbounded wait can block the cohort indefinitely.
             const breach = rejectionDiagnostics(runProspectiveCase({
                 ...baseInput(root, paired, active),
                 timeoutMs: 5,

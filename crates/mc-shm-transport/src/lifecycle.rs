@@ -1,9 +1,8 @@
 use std::fmt;
 
-/// Close states in required teardown order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseState {
-    /// Traffic admission and publication are enabled.
+    /// The lifecycle admits and publishes traffic.
     Open,
     /// New admission has stopped.
     Quiescing,
@@ -11,30 +10,27 @@ pub enum CloseState {
     DrainingPublished,
     /// New environment work has stopped.
     StoppingEnvScheduling,
-    /// JavaScript aliases are being detached on environment thread.
+    /// The environment thread detaches JavaScript aliases.
     RevokingJsOnEnv,
     /// N-API asynchronous cleanup is joining native workers.
     AsyncCleanupJoin,
     /// Lexical Rust receive scopes are draining.
     AwaitingRustScopes,
-    /// Backend samples are being released.
+    /// The lifecycle releases backend samples.
     ReleasingSamples,
-    /// Transport mappings and objects are being dropped.
+    /// The lifecycle drops transport mappings and objects.
     DroppingTransport,
-    /// All workers and mappings joined successfully.
     Joined,
-    /// Alias state is uncertain and storage can never be reused.
+    /// Storage can never be reused after `Quarantined`.
     Quarantined,
 }
 
-/// Checked close state machine.
 pub struct Lifecycle {
     state: CloseState,
     prepared: bool,
 }
 
 impl Lifecycle {
-    /// Creates an open lifecycle before provider preparation.
     pub const fn new() -> Self {
         Self {
             state: CloseState::Open,
@@ -42,7 +38,6 @@ impl Lifecycle {
         }
     }
 
-    /// Marks irreversible provider preparation boundary.
     pub fn mark_prepared(&mut self) -> Result<(), LifecycleError> {
         if self.state != CloseState::Open || self.prepared {
             return Err(LifecycleError::InvalidTransition);
@@ -51,7 +46,6 @@ impl Lifecycle {
         Ok(())
     }
 
-    /// Whether failure must remain on selected provider without replay.
     pub const fn must_fail_closed(&self) -> bool {
         self.prepared
     }
@@ -61,7 +55,6 @@ impl Lifecycle {
         self.state
     }
 
-    /// Advances exactly one edge from lifecycle state diagram.
     pub fn advance(&mut self, next: CloseState) -> Result<(), LifecycleError> {
         let valid = matches!(
             (self.state, next),
@@ -95,7 +88,6 @@ impl Lifecycle {
         Ok(())
     }
 
-    /// Whether storage may be reused after close.
     pub fn reusable(&self) -> bool {
         self.state == CloseState::Joined
     }
@@ -117,12 +109,9 @@ impl fmt::Debug for Lifecycle {
     }
 }
 
-/// Invalid lifecycle operation.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleError {
-    /// Requested edge is absent from state diagram.
     InvalidTransition,
-    /// Joined and quarantined states are terminal.
     Terminal,
 }
 

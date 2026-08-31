@@ -73,7 +73,6 @@ describe("buildAutoSearchHint", () => {
         const long = "a".repeat(500);
         const hint = buildAutoSearchHint([memory(long)], { fragmentCharCap: 40 });
         expect(hint).not.toBeNull();
-        // Find the bullet line
         const bullet = (hint ?? "").split("\n").find((l) => l.startsWith("- "));
         expect(bullet).toBeDefined();
         expect((bullet?.length ?? 0) <= 45).toBe(true);
@@ -111,8 +110,7 @@ describe("buildAutoSearchHint", () => {
             [memory(noisy(1), 0.9, 1), memory(noisy(2), 0.9, 2), memory(noisy(3), 0.9, 3)],
             { fragmentCharCap: 220 },
         );
-        // The packer must return a hint when a prefix of cap-truncated
-        // fragments fits the budget, rather than dropping the hint entirely.
+        // buildAutoSearchHint returns a hint when cap-truncated fragment prefixes fit the token budget.
         expect(hint).not.toBeNull();
         expect(estimateTokens(hint ?? "")).toBeLessThanOrEqual(MAX_AUTO_HINT_TOKENS);
         expect(hint?.startsWith("<ctx-search-hint>")).toBe(true);
@@ -122,7 +120,6 @@ describe("buildAutoSearchHint", () => {
         expect(bullets.length).toBeGreaterThanOrEqual(1);
         expect(bullets.length).toBeLessThan(3);
         for (const bullet of bullets) {
-            // A kept fragment carries its full cap-truncated shape.
             expect(bullet.length).toBeGreaterThan(180);
         }
     });
@@ -206,8 +203,6 @@ describe("packAutoSearchHint", () => {
         expect(packed.text).not.toBeNull();
 
         const bullets = (packed.text ?? "").split("\n").filter((line) => line.startsWith("- "));
-        // Delivered results preserve input order and correspond one-to-one
-        // with emitted hint fragments.
         expect(packed.delivered.length).toBe(bullets.length);
         expect(packed.delivered.length).toBeLessThan(results.length);
         expect(packed.delivered).toEqual(results.slice(0, packed.delivered.length));

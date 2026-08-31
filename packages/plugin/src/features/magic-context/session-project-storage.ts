@@ -74,10 +74,6 @@ function getRepairProjectChunkProjectStatement(db: Database): PreparedStatement 
 }
 
 /**
- * Persist the immutable session→project binding resolved from the host session.
- * Chunk backfills use this mapping as the project-scope authority: without it, a
- * project-wide drain cannot safely distinguish same-process sessions from other
- * projects and must not stamp arbitrary compartments with its own identity.
  */
 export function recordSessionProjectIdentity(
     db: Database,
@@ -85,9 +81,6 @@ export function recordSessionProjectIdentity(
     projectPath: string | undefined,
 ): void {
     if (!sessionId || !projectPath) return;
-    // A session started exactly at the user's home directory is not a project.
-    // The guard is repeated here because background backfills can call this
-    // function without passing through the transform resolver.
     if (
         !projectPath.startsWith("git:") &&
         !projectPath.startsWith("dir:") &&
@@ -98,9 +91,6 @@ export function recordSessionProjectIdentity(
     const now = Date.now();
     db.transaction(() => {
         getUpsertSessionProjectStatement(db).run(sessionId, harness, projectPath, now);
-        // Repair a bounded slice of chunks stamped with a project other than the
-        // session's recorded owner. Repeated observations resume the repair
-        // without making transform wait on an unbounded update.
         getRepairSessionChunkProjectStatement(db).run(
             projectPath,
             sessionId,
@@ -112,11 +102,6 @@ export function recordSessionProjectIdentity(
 }
 
 /**
- * Idempotent project-scoped heal for historical chunk rows whose stored project
- * stamp disagrees with the recorded owner. The WHERE clause is scoped to rows
- * that either currently sit under this project or truly belong to it, so normal
- * registration/backfill paths can run it cheaply without scanning unrelated
- * project partitions for every tick.
  */
 export function repairMisScopedCompartmentChunkEmbeddingsForProject(
     db: Database,

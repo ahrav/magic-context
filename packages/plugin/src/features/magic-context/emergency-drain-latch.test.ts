@@ -14,11 +14,8 @@ import {
 } from "./storage-meta-persisted";
 import { createDirectTestDatabase } from "./test-database";
 
-// Reserve args that exhaust the per-window budget in one call, so the SECOND
-// reserve in a window only succeeds if the emergency latch bypass kicks in.
-// usable=100k, perRunCap=20k. At >=80% the window budget is
-// min(750k, max(3*perRunCap=60k, 0.35*usable=35k)) = 60k. Three 20k reserves
-// fill it; the 4th is over budget.
+// The fourth reserve requires the emergency-latch bypass.
+// At >=80%, min(750k, max(3*perRunCap, 0.35*usable)) equals 60k.
 function reserve(
     db: Database,
     sessionId: string,
@@ -40,7 +37,6 @@ function reserve(
 }
 
 function exhaustWindowBudget(db: Database, sessionId: string, usage: number, now: number) {
-    // Fill exactly the window budget for this usage tier with 20k reserves. The
     // budget differs by tier (>=95% is larger than >=80%), so derive the count.
     const budget = protectedTailWindowBudget(usage, 100_000, 20_000);
     const reserves = Math.ceil(budget / 20_000);
@@ -74,7 +70,6 @@ describe("emergency drain catch-up latch", () => {
     it("below the derived force band with an exhausted budget skips (no latch)", () => {
         const t = 1_000_000;
         exhaustWindowBudget(db, SID, 83, t);
-        // 4th reserve in the same window, still 83% → no bypass → skip.
         const r = reserve(db, SID, 83, t + 10);
         expect(r.ok).toBe(false);
         expect(loadProtectedTailMeta(db, SID).emergencyDrainActive).toBe(0);
@@ -85,7 +80,6 @@ describe("emergency drain catch-up latch", () => {
         exhaustWindowBudget(db, SID, 85, t);
         const meta = loadProtectedTailMeta(db, SID);
         expect(meta.emergencyDrainActive).toBeGreaterThan(0); // latch armed on entry
-        // Budget is spent, but the latch bypasses it — repeatedly.
         const r1 = reserve(db, SID, 85, t + 10);
         const r2 = reserve(db, SID, 85, t + 20);
         expect(r1.ok).toBe(true);
@@ -96,11 +90,9 @@ describe("emergency drain catch-up latch", () => {
 
     it("keeps bypassing in the 80-94% band after a spike, until below exit threshold", () => {
         const t = 3_000_000;
-        // Spike to 96% arms the latch.
         exhaustWindowBudget(db, SID, 96, t);
         expect(loadProtectedTailMeta(db, SID).emergencyDrainActive).toBeGreaterThan(0);
-        // Now at 83% (below the force-band entry, above 70 exit for execThreshold=80) the latch
-        // stays armed and keeps draining — this is the band that previously stalled.
+        // At 83%, below the force-band entry but above the 70% exit threshold, the latch stays armed and keeps draining.
         const r = reserve(db, SID, 83, t + 10, { executeThreshold: 80 });
         expect(r.ok).toBe(true);
         expect(r.overQuotaBypass).toBe(true);
@@ -111,8 +103,8 @@ describe("emergency drain catch-up latch", () => {
         const t = 4_000_000;
         exhaustWindowBudget(db, SID, 96, t);
         expect(loadProtectedTailMeta(db, SID).emergencyDrainActive).toBeGreaterThan(0);
-        // 69% < (80-10=70) → exit. A reserve at 69% clears the latch and, with the
-        // budget exhausted, now skips (back to steady-state throttle).
+        // At 69%, below the 70% exit threshold, a reserve clears the latch.
+        // With the budget exhausted, the 69% reserve skips after clearing the latch.
         const r = reserve(db, SID, 69, t + 10, { executeThreshold: 80 });
         expect(loadProtectedTailMeta(db, SID).emergencyDrainActive).toBe(0);
         expect(r.ok).toBe(false);
@@ -122,10 +114,10 @@ describe("emergency drain catch-up latch", () => {
         const t = 5_000_000;
         exhaustWindowBudget(db, SID, 96, t);
         expect(loadProtectedTailMeta(db, SID).emergencyDrainActive).toBeGreaterThan(0);
-        // Still at 84% (above exit but below re-entry) and past the backstop → clear.
-        // (MAX_LATCH 30min > DRAIN_WINDOW 10min, so the per-window budget has also
-        // reset by now; the reserve succeeds within the fresh budget WITHOUT bypass,
-        // and the latch is cleared.)
+        // At 84%, exceeding EMERGENCY_DRAIN_MAX_LATCH_MS clears the latch.
+        // The max-latch duration exceeds the drain-window duration.
+        // The elapsed 10-minute drain window resets the per-window budget.
+        // The reserve succeeds within the fresh budget without bypass, and the max-latch expiry clears the latch.
         const r = reserve(db, SID, 84, t + EMERGENCY_DRAIN_MAX_LATCH_MS + 1, {
             executeThreshold: 80,
         });
@@ -148,7 +140,6 @@ describe("emergency drain catch-up latch", () => {
         const t = 6_000_000;
         exhaustWindowBudget(db, SID, 96, t);
         expect(loadProtectedTailMeta(db, SID).emergencyDrainActive).toBeGreaterThan(0);
-        // A genuine historian failure just happened.
         recordHistorianDrainFailure(db, SID, t + 10);
         // Within the backoff window: latch is armed but bypass is suppressed → skip.
         const blocked = reserve(db, SID, 96, t + 20);
@@ -172,8 +163,8 @@ describe("emergency drain catch-up latch", () => {
         exhaustWindowBudget(db, SID, 96, t);
         const activeAt = loadProtectedTailMeta(db, SID).emergencyDrainActive;
         expect(activeAt).toBeGreaterThan(0);
-        // A reserve after the 10-min window expiry resets the budget but must NOT
-        // clear the latch (still emergency usage).
+        // A reserve after the 10-minute window expires resets the budget without clearing the latch while usage remains in the emergency band.
+        // The reserve must not clear the latch while usage remains in the emergency band.
         const r = reserve(db, SID, 96, t + 11 * 60 * 1000);
         expect(r.ok).toBe(true);
         const meta = loadProtectedTailMeta(db, SID);

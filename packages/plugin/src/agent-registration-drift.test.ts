@@ -34,16 +34,11 @@ import { SIDEKICK_AGENT } from "./agents/sidekick";
 import { SMART_NOTE_COMPILER_AGENT } from "./agents/smart-note-compiler";
 
 /**
- * `buildHiddenAgentRegistrations` deliberately uses INLINE literals for the
- * agent ids / tool allow-lists / step caps instead of the imported module-level
- * consts — because OpenCode Desktop's concurrent per-directory cold boot can
- * leave those `var` consts undefined at config-hook time (the hoisted-function
- * call works, the const args read undefined). See the docs on
- * HiddenAgentRegistration in index.ts.
+ * `buildHiddenAgentRegistrations` inlines agent IDs, tool allow-lists, and step caps because concurrent per-directory cold boots can leave imported constants undefined during config-hook execution.
+ * The hoisted function remains callable, but its imported constant arguments can be undefined.
  *
- * The cost of inlining is drift: someone edits the canonical export but not the
- * inline copy. These tests are the guard — they fail if the two diverge, so the
- * inline literals stay byte-identical to the canonical constants.
+ * Inlining duplicates canonical exports, so edits to either copy can drift.
+ * These tests fail when inline values differ from their canonical exports.
  */
 describe("hidden-agent registration drift guard", () => {
     const regs = buildHiddenAgentRegistrations({
@@ -171,9 +166,8 @@ describe("hidden-agent registration drift guard", () => {
         });
     });
 
-    // Since #285, internal agents register as mode "primary" + hidden (excluded
-    // from describeTask); the Task-permission denies in this suite cover the
-    // explicit subagent_type bypass that mode/hidden metadata cannot.
+    // Internal agents use mode `"primary"` and `hidden`; Task-permission denies prevent explicit `subagent_type` routing.
+    // Mode and hidden metadata do not prevent explicit `subagent_type` routing.
     test("internal direct-prompt agent configuration remains hidden from routing", () => {
         const config = buildHiddenAgentConfig(
             "reviewer prompt",
@@ -210,9 +204,7 @@ describe("hidden-agent registration drift guard", () => {
 
     test("base dreamer (curate) is tool-free and locked", () => {
         expect(byId(DREAMER_AGENT)?.allowedTools).toEqual([...DREAMER_CURATE_ALLOWED_TOOLS]);
-        // Curate's only write path is the XML manifest the host applies inside a
-        // guarded transaction, so it holds no tools at all — ctx_memory would let
-        // a run mutate claims outside that transaction.
+        // Curate has no tools: `ctx_memory` mutates claims outside the host's guarded XML-manifest transaction.
         expect(byId(DREAMER_AGENT)?.allowedTools).toEqual([]);
         expect(byId(DREAMER_AGENT)?.lockPermissions).toBe(true);
         expect(byId(DREAMER_AGENT)?.maxSteps).toBe(150);
@@ -256,7 +248,6 @@ describe("hidden-agent registration drift guard", () => {
         expect(byId(DREAMER_PRIMER_INVESTIGATOR_AGENT)?.allowedTools).toEqual([
             ...DREAMER_PRIMER_INVESTIGATOR_ALLOWED_TOOLS,
         ]);
-        // The whole point: the cache-neutral / source-safety guarantee.
         const tools = byId(DREAMER_PRIMER_INVESTIGATOR_AGENT)?.allowedTools ?? [];
         for (const denied of ["write", "edit", "bash", "ctx_memory", "ctx_note"]) {
             expect(tools).not.toContain(denied);
@@ -273,10 +264,8 @@ describe("hidden-agent registration drift guard", () => {
     });
 
     test("every scoped dreamer task agent locks permissions; historian/sidekick do not", () => {
-        // All dreamer task agents run unsupervised on a per-task tool budget, so a
-        // user `dreamer.tools`/`permission` override must not be able to broaden
-        // them. The historian/sidekick/editor are not locked (they take their
-        // allow-list as-is and have no per-task scoping to protect).
+        // Dreamer task agents run unsupervised with per-task tool budgets, so `dreamer.tools` and `permission` overrides cannot broaden access.
+        // Historian, sidekick, and editor retain their supplied allow-lists because they have no per-task tool scope to protect.
         const lockedDreamerAgents = new Set<string>([
             DREAMER_AGENT,
             DREAMER_DOCS_AGENT,
@@ -293,7 +282,6 @@ describe("hidden-agent registration drift guard", () => {
     });
 
     test("a user dreamer permission override cannot broaden the retrospective agent", () => {
-        // Simulate a user dreamer config that tries to grant bash/ctx_memory.
         const cfg = buildHiddenAgentConfig(
             "prompt",
             DREAMER_RETROSPECTIVE_ALLOWED_TOOLS,
@@ -317,7 +305,6 @@ describe("hidden-agent registration drift guard", () => {
             DREAMER_RETROSPECTIVE_AGENT,
             true,
         ) as { tools?: Record<string, boolean> };
-        // The user `tools` map is dropped entirely under lockPermissions.
         expect(cfg.tools).toBeUndefined();
     });
 
@@ -355,7 +342,7 @@ describe("hidden-agent registration drift guard", () => {
         expect(hist?.allowedTools).toEqual(
             HISTORIAN_ALLOWED_TOOLS.filter((t) => t !== "aft_search"),
         );
-        // "*" removes everything.
+        // `"*"` removes every tool from the allow-list.
         const all = buildHiddenAgentRegistrations({
             dreamerPrompt: "d",
             historianPrompt: "h",
@@ -389,8 +376,7 @@ describe("hidden-agent registration drift guard", () => {
 
     test("each agent carries its passed-through prompt (undefined-safe)", () => {
         expect(byId(DREAMER_AGENT)?.prompt).toBe("dreamer-prompt");
-        // Robustness contract: an undefined prompt is carried through (the config
-        // hook skips that agent), not coerced.
+        // Undefined prompts remain undefined so the config hook skips the agent rather than coercing the prompt.
         const noPrompts = buildHiddenAgentRegistrations({
             dreamerPrompt: undefined,
             historianPrompt: undefined,
@@ -399,8 +385,6 @@ describe("hidden-agent registration drift guard", () => {
             historianDisallowed: [],
         });
         expect(noPrompts.every((r) => r.prompt === undefined)).toBe(true);
-        // ...but the ids and allow-lists are STILL present (the whole point —
-        // they don't depend on module-init timing).
         expect(noPrompts.map((r) => r.id).sort()).toEqual(
             [
                 DREAMER_AGENT,

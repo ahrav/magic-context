@@ -201,19 +201,13 @@ describe("pre-build schema", () => {
             [
                 "kernel floor drift",
                 (c) => {
-                    c.platforms.supported[2].kernel_min = "4.17.0";
-                },
-            ],
-            [
-                "macos floor drift",
-                (c) => {
-                    c.platforms.supported[0].os_min = "13";
+                    c.platforms.supported[0].kernel_min = "4.17.0";
                 },
             ],
             [
                 "dropped procfs capability",
                 (c) => {
-                    c.platforms.supported[2].capabilities.procfs_self_fd_exec = false;
+                    c.platforms.supported[0].capabilities.procfs_self_fd_exec = false;
                 },
             ],
             [
@@ -378,7 +372,7 @@ describe("registry gate", () => {
             [
                 "version already published for one name",
                 (g) => {
-                    g.packages[5].synchronized_version_unpublished = false;
+                    g.packages[4].synchronized_version_unpublished = false;
                 },
                 /is not unpublished/,
             ],
@@ -522,41 +516,6 @@ describe("platform floors", () => {
             target: "linux-x64-gnu",
             synapse: "certified_cpu",
         });
-        for (const arch of ["arm64", "x64"] as const) {
-            const mac = evaluatePlatform(contract, {
-                os: "darwin",
-                arch,
-                osVersion: "13.5",
-                devFdExec: true,
-            });
-            expect(mac.supported).toBe(true);
-            expect(mac.synapse).toBe("unsupported");
-            expect(mac.synapseReason).toBe("synapse_unsupported");
-        }
-    });
-
-    test("a macOS host without descriptor execution is unsupported_platform", () => {
-        // The Darwin counterpart of the Linux procfs_self_fd_exec gate: the
-        // contract requires dev_fd_exec, so a version-passing host that cannot
-        // execute through a descriptor must be refused here rather than at exec
-        // time. An omitted probe field is not evidence of the capability.
-        for (const arch of ["arm64", "x64"] as const) {
-            expect(
-                evaluatePlatform(contract, {
-                    os: "darwin",
-                    arch,
-                    osVersion: "13.5",
-                    devFdExec: false,
-                }),
-            ).toEqual({ supported: false, reason: "unsupported_platform" });
-            expect(
-                evaluatePlatform(contract, {
-                    os: "darwin",
-                    arch,
-                    osVersion: "13.5",
-                }),
-            ).toEqual({ supported: false, reason: "unsupported_platform" });
-        }
     });
 
     test("garbage and prerelease host versions fail the platform gate too", () => {
@@ -606,14 +565,6 @@ describe("platform floors", () => {
                 `glibc=${glibc} must not clear the floor`,
             ).toEqual({ supported: false, reason: "unsupported_platform" });
         }
-        expect(
-            evaluatePlatform(contract, {
-                os: "darwin",
-                arch: "arm64",
-                osVersion: "13.5_rc1",
-                devFdExec: true,
-            }),
-        ).toEqual({ supported: false, reason: "unsupported_platform" });
         // A prerelease genuinely above the floor still clears it.
         expect(
             evaluatePlatform(contract, {
@@ -708,7 +659,7 @@ describe("platform floors", () => {
                 glibc: "2.31",
                 procfsSelfFdExec: true,
             },
-            { os: "darwin", arch: "arm64", osVersion: "13.4" },
+            { os: "darwin", arch: "arm64" },
             { os: "win32", arch: "x64" },
         ] as const;
         for (const probe of probes) {
