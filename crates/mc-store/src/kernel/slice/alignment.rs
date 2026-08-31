@@ -37,7 +37,7 @@ struct AlignmentInput {
     known_as_of: i64,
     tip: i64,
     decisions: HashMap<String, DecisionHistory>,
-    observations: HashMap<String, ObservationInput>,
+    observations: HashMap<String, String>,
     dependencies: Vec<Dependency>,
 }
 
@@ -46,12 +46,6 @@ struct DecisionHistory {
     decision_id: String,
     invalidated_commit_seq: Option<i64>,
     superseded_by: Option<String>,
-}
-
-#[derive(Debug)]
-struct ObservationInput {
-    observation_id: String,
-    alignment_kind: String,
 }
 
 #[derive(Debug)]
@@ -201,13 +195,7 @@ fn load_alignment_input(
                             Box::new(error),
                         )
                     })?;
-                Ok((
-                    observation_id.clone(),
-                    ObservationInput {
-                        observation_id,
-                        alignment_kind: payload.classification,
-                    },
-                ))
+                Ok((observation_id, payload.classification))
             })
             .map_err(|_| KernelError::Io)?
             .collect::<rusqlite::Result<HashMap<_, _>>>()
@@ -258,7 +246,7 @@ fn load_alignment_input(
 fn derive_alignment(input: AlignmentInput) -> Result<AlignmentSnapshot, KernelError> {
     let mut rows = BTreeMap::new();
     for dependency in &input.dependencies {
-        let Some(observation) = input.observations.get(&dependency.observation_id) else {
+        let Some(alignment_kind) = input.observations.get(&dependency.observation_id) else {
             return Err(KernelError::Conflict);
         };
         let Some(decision) = resolve_decision(&input.decisions, &dependency.decision_object_id)?
@@ -267,14 +255,14 @@ fn derive_alignment(input: AlignmentInput) -> Result<AlignmentSnapshot, KernelEr
         };
         let payload = serde_json::to_string(&AlignmentPayload {
             decision_id: &decision.decision_id,
-            observation_id: &observation.observation_id,
-            alignment_kind: &observation.alignment_kind,
+            observation_id: &dependency.observation_id,
+            alignment_kind,
         })
         .map_err(|_| KernelError::InvalidInput)?;
         let row = AlignmentRow {
             decision_id: decision.decision_id.clone(),
-            observation_id: observation.observation_id.clone(),
-            alignment_kind: observation.alignment_kind.clone(),
+            observation_id: dependency.observation_id.clone(),
+            alignment_kind: alignment_kind.clone(),
             alignment_payload: payload,
         };
         let key = (row.decision_id.clone(), row.observation_id.clone());
