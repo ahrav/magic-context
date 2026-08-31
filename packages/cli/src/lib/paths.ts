@@ -297,8 +297,7 @@ export function dirSizeBytes(path: string): number {
                     }
                 }
             }
-        } catch {
-        }
+        } catch {}
     }
     return total;
 }

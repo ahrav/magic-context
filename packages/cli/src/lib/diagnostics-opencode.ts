@@ -177,7 +177,6 @@ export interface HistorianRunSummary {
     lastRunAt: string;
 }
 
-
 function getSelfVersion(): string {
     // createRequire resolves paths relative to this module.
     // The source module is `src/cli/diagnostics.ts`; the bundled module is `dist/cli.js`.
@@ -188,8 +187,7 @@ function getSelfVersion(): string {
             if (typeof pkg.version === "string" && pkg.version.length > 0) {
                 return pkg.version;
             }
-        } catch {
-        }
+        } catch {}
     }
     return "unknown";
 }
@@ -222,7 +220,6 @@ function sanitizeString(value: string): string {
 function sanitizeValue(value: unknown): unknown {
     return sanitizeConfigValue(value);
 }
-
 
 function readConfig(path: string): { value: Record<string, unknown> | null; error?: string } {
     if (!existsSync(path)) return { value: null };
@@ -360,8 +357,7 @@ async function collectRecentSessions(): Promise<RecentSessionSummary[]> {
     } finally {
         try {
             db?.close();
-        } catch {
-        }
+        } catch {}
     }
 }
 
@@ -436,8 +432,7 @@ async function collectHistorianFailures(
     } finally {
         try {
             db?.close();
-        } catch {
-        }
+        } catch {}
     }
 }
 
@@ -539,11 +534,9 @@ async function collectHistorianRuns(storageDirPath: string): Promise<HistorianRu
     } finally {
         try {
             db?.close();
-        } catch {
-        }
+        } catch {}
     }
 }
-
 
 export async function collectDiagnostics(): Promise<DiagnosticReport> {
     const pluginVersion = getSelfVersion();

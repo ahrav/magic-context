@@ -129,8 +129,7 @@ export async function reportAuthorityMarkers(args: {
     let currentIdentity: string | undefined;
     try {
         currentIdentity = resolveProjectIdentity(process.cwd());
-    } catch {
-    }
+    } catch {}
     const transport = new McHostModuleTransport();
     for (const marker of markers) {
         if (marker.project_path !== currentIdentity) {

@@ -220,8 +220,7 @@ export function collectNpmReleaseAgeWarnings(): string[] {
                 );
             }
         }
-    } catch {
-    }
+    } catch {}
     return ageWarnings;
 }
 
@@ -239,7 +238,6 @@ function compareVersions(a: string, b: string): number {
     }
     return 0;
 }
-
 
 function isGhInstalled(): boolean {
     try {
@@ -358,7 +356,6 @@ async function runIssueFlow(): Promise<number> {
         return 1;
     }
 }
-
 
 /**
  *
@@ -546,7 +543,6 @@ async function checkEmbeddingConfig(
             return { issues: localIssues + 1 };
     }
 }
-
 
 function logOpenCodeInstallationTable(installations: OpenCodeInstallationReport[]): void {
     log.info("OpenCode installations:");
@@ -1074,8 +1070,7 @@ export async function runDoctor(
                 log.warn(warning);
                 issues++;
             }
-        } catch {
-        }
+        } catch {}
     }
 
     // Doctor probes the configured endpoint before semantic memory search so configuration errors fail before search.
@@ -1219,7 +1214,6 @@ export async function runDoctor(
             issues++;
         }
     }
-
 
     const logPath = getMagicContextLogPath("opencode");
     if (existsSync(logPath)) {

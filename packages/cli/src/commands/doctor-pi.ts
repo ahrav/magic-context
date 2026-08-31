@@ -157,8 +157,7 @@ function selfVersion(): string {
         try {
             const pkg = req(relPath) as { version?: unknown };
             if (typeof pkg.version === "string") return pkg.version;
-        } catch {
-        }
+        } catch {}
     }
     return "unknown";
 }

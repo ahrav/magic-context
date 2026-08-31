@@ -123,8 +123,7 @@ function selfVersion(): string {
         try {
             const value = req(path) as { version?: unknown };
             if (typeof value.version === "string") return value.version;
-        } catch {
-        }
+        } catch {}
     }
     return "unknown";
 }
