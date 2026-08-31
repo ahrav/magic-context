@@ -1,43 +1,34 @@
-//! Shared measurement rules for the mc-host performance harness.
+//! This module centralizes measurement rules shared by the mc-host performance harness.
 //!
-//! Pure timing, percentile, workload, and outcome-accounting logic used by
-//! `examples/perf_load.rs`, the `ipc_budget` benchmark, and their tests.
-//! Contract: issue-to-validated-terminal is the RTT boundary, scheduled
-//! time exists only for open-loop accounting, and every scheduled slot must
-//! resolve to exactly one terminal outcome.
+//! The performance harness uses this module only for timing, percentiles, workload identity, and outcome accounting.
+//! `examples/perf_load.rs`, the `ipc_budget` benchmark, and their tests use this module.
+//! `RTT` spans issue through validated terminal outcome.
+//! Every scheduled slot resolves to exactly one terminal outcome.
 
 #![allow(dead_code)]
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-/// Version label for the committed compact JSON workload fixture.
 pub const FIXTURE_LABEL: &str = "compact-json-v1";
 
-/// Committed compact JSON request fixture matching the production client's
-/// small-message shape (`JSON.stringify` of a small op object, binary=false;
-/// see packages/plugin/src/shared/mc-host-client/client.ts `encodeBody`).
+/// `FIXTURE_BODY` matches the production client's compact JSON request encoding.
+/// `client.ts::encodeBody` defines the production encoding that `FIXTURE_BODY` matches.
 pub const FIXTURE_BODY: &[u8] =
     br#"{"op":"perf.echo","v":1,"payload":"0123456789abcdef0123456789abcdef"}"#;
 
-/// The fixture is JSON text on the wire, never a binary frame.
 pub const FIXTURE_BINARY: bool = false;
 
-/// Minimum successful post-warmup observations before any tail percentile
-/// (p99.9) may be published for a run.
+/// A run requires at least 30,000 successful post-warmup observations before publishing p99.9.
 pub const TAIL_SAMPLE_FLOOR: u64 = 30_000;
 
-/// Minimum successful post-warmup observations per repetition for a headline
-/// p99.9 row in the published budget.
+/// A published headline p99.9 row requires at least 100,000 successful post-warmup observations per repetition.
 pub const HEADLINE_TAIL_FLOOR: u64 = 100_000;
 
-/// Upper bound accepted for a response body length. The fixture is 69
-/// bytes and error terminals are small JSON; anything larger is a
-/// corrupted or hostile length field that must fail the run before it
-/// drives a multi-gigabyte allocation from an untrusted 32-bit value.
+/// `MAX_BODY_LEN` caps bodies at 1 MiB because valid fixture and error bodies are small, preventing untrusted `u32` lengths from causing multi-gigabyte allocations.
 pub const MAX_BODY_LEN: u32 = 1 << 20;
 
-/// Identity of a workload: enough to prove two runs measured the same bytes.
+/// `WorkloadId` records fixture metadata for comparing runs.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkloadId {
     pub label: String,
@@ -46,7 +37,6 @@ pub struct WorkloadId {
     pub binary: bool,
 }
 
-/// The committed fixture's identity record.
 pub fn fixture_workload() -> WorkloadId {
     WorkloadId {
         label: FIXTURE_LABEL.to_owned(),
@@ -65,8 +55,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Nearest-rank percentile over an ascending-sorted sample vector: the
-/// result is always an actually observed sample (same rule as
+/// `nearest_rank` returns an observed sample rather than an interpolated value.
 /// packages/plugin/scripts/retrieval-benchmark/timing.ts).
 pub fn nearest_rank(sorted: &[u64], percentile: f64) -> Option<u64> {
     if sorted.is_empty() || !(percentile > 0.0 && percentile <= 100.0) {
@@ -90,7 +79,6 @@ pub enum Outcome {
     HistogramOverflow,
 }
 
-/// Terminal-outcome counters with a conservation check.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OutcomeCounts {
     pub success: u64,
@@ -144,16 +132,12 @@ impl OutcomeCounts {
         self.histogram_overflow += other.histogram_overflow;
     }
 
-    /// True when every scheduled slot has exactly one terminal outcome.
     pub fn conserved(&self, scheduled_slots: u64) -> bool {
         self.total() == scheduled_slots
     }
 }
 
-/// Validates an open-loop offered rate. Rejects a zero rate (no arrival
-/// process at all) and rates above 1e9/s, whose per-request spacing
-/// truncates to 0 ns: consecutive slots would share a timestamp and the
-/// arm would silently degrade into unrestricted closed-loop traffic.
+/// `validate_rate` rejects 0 and rates above 1e9/s because zero has no arrivals and higher rates produce 0-ns slot spacing.
 pub fn validate_open_loop_rate(rate_per_sec: u64) -> Result<(), String> {
     if rate_per_sec == 0 {
         return Err("offered rate must be nonzero".to_owned());
@@ -167,32 +151,26 @@ pub fn validate_open_loop_rate(rate_per_sec: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Absolute nanosecond offset of `slot` in an open-loop arrival schedule
-/// at `rate_per_sec`: `floor(slot * 1e9 / rate)` computed in `u128`.
+/// `slot_offset_ns` uses `u128` to prevent overflow when multiplying `slot` by 1e9.
 ///
-/// Each slot is placed independently against the ideal real-valued
-/// schedule, so the floor error is strictly below 1 ns per slot and never
-/// accumulates. In particular `open_loop_offset_ns(rate, rate)` is exactly
-/// 1_000_000_000: the mean offered rate over every whole second is exact
-/// for any rate, not only for divisors of 1e9. A slot's own spacing is the
-/// gap to the next slot, `offset_ns(slot + 1) - offset_ns(slot)`, which
-/// varies by at most 1 ns around the nominal interval.
+/// Each slot is placed independently against the ideal schedule, so floor error never accumulates.
+/// Each offset's floor error is strictly below 1 ns and never accumulates.
+/// For every valid rate, `open_loop_offset_ns(rate, rate)` is exactly `1_000_000_000`.
+/// For every valid rate, the schedule offers exactly `rate_per_sec` slots per whole second.
+/// Consecutive-slot spacing varies by at most 1 ns around the nominal interval.
 ///
-/// Callers must gate the rate through [`validate_open_loop_rate`] first;
-/// a zero rate divides by zero here.
+/// Callers must invoke [`validate_open_loop_rate`] before calling this function.
 pub fn open_loop_offset_ns(slot: u64, rate_per_sec: u64) -> u64 {
     u64::try_from(u128::from(slot) * 1_000_000_000u128 / u128::from(rate_per_sec))
         .expect("scheduled offset exceeds u64 nanoseconds")
 }
 
-/// True when a run has enough successful post-warmup observations to
-/// publish a p99.9 for that run at all.
+/// A run needs at least `TAIL_SAMPLE_FLOOR` successful post-warmup observations to publish p99.9.
 pub fn tail_publishable(successful_observations: u64) -> bool {
     successful_observations >= TAIL_SAMPLE_FLOOR
 }
 
-/// Latency summary computed with nearest-rank semantics. `p999` is `None`
-/// when the sample count is below `TAIL_SAMPLE_FLOOR` (evidence retained,
+/// `LatencySummary` uses nearest-rank percentiles; `p999_ns` is `None` below `TAIL_SAMPLE_FLOOR`.
 /// headline suppressed).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LatencySummary {
@@ -225,7 +203,7 @@ impl LatencySummary {
     }
 }
 
-/// Wire methods exercised by the Synapse benchmark.
+/// The Synapse benchmark exercises these wire methods.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -246,23 +224,20 @@ impl SynapseMethod {
     }
 }
 
-/// Code the harness records when its own deadline fired before any terminal
-/// arrived. It marks an attempt whose admission outcome the wire never
-/// revealed, which is why [`validate_synapse_ledgers`] keeps it out of both
-/// the admitted and the rejected subtotals.
+/// The harness records the timeout outcome when its deadline fires before any terminal outcome arrives.
+/// The unknown-admission outcome marks an attempt whose admission outcome the wire never revealed.
+/// [`validate_synapse_ledgers`] excludes attempts whose wire admission outcome is unknown from admitted and rejected subtotals.
 pub const ATTEMPT_TIMEOUT_CODE: &str = "attempt_timeout";
 
-/// Mutually exclusive attempt-ledger categories from the frozen contract.
+/// Attempt-ledger categories are mutually exclusive.
 ///
-/// The frozen partition is `successes + retryable rejections + timeouts +
-/// polls`. [`Self::Failure`] is the out-of-vocabulary bucket: a non-poll wire
-/// call answered with an error the client policy cannot act on
-/// (`artifact_invalid`, `schema_violation`, `cancelled`, ...). Those terminals
-/// only occur when the run is already invalid, and
-/// [`validate_synapse_ledgers`] reports any nonzero count as a ledger error,
-/// so every retained repetition still satisfies the frozen four-way identity.
-/// Recording them as successes instead would corrupt the raw evidence that
-/// diagnoses the invalid run.
+/// Attempts partition into successes, retryable rejections, timeouts, and polls.
+/// [`Self::Failure`] records a non-poll wire call answered with an error the client policy cannot act on.
+/// Examples include `artifact_invalid`, `schema_violation`, and `cancelled`.
+/// [`Self::Failure`] terminals occur only in an already-invalid run.
+/// [`validate_synapse_ledgers`] reports any nonzero [`Self::Failure`] count as a ledger error.
+/// Every retained repetition satisfies the frozen four-way identity.
+/// Recording [`Self::Failure`] terminals as successes would corrupt the raw evidence used to diagnose an invalid run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptDisposition {
@@ -284,23 +259,16 @@ pub struct AttemptRecord {
     pub actual_send_ns: u64,
     pub terminal_ns: u64,
     pub latency_ns: u64,
-    /// The window class of the owning logical request, so an attempt is
-    /// included or excluded with the request it belongs to rather than by its
-    /// own send instant.
+    /// The owning logical request's window class determines whether an attempt is included or excluded.
+    /// An attempt is included or excluded with its owning logical request, not by its send instant.
     ///
-    /// An attempt is not an independent observation but one wire call of a
-    /// logical request, and [`validate_synapse_ledgers`] rejects a repetition
-    /// whose logical row disagrees with the attempts it owns. Classifying by
-    /// `actual_send_ns` would break that identity for every measured request
-    /// still retrying or polling past the window end, so an ordinary saturated
-    /// repetition would be reported inadmissible. Ownership also keeps
-    /// amplification conservative: attempts per request needs both sides over
-    /// the same requests, and truncating a censored request's attempts at the
-    /// boundary would understate it.
+    /// An attempt is one wire call of its owning logical request, not an independent observation.
+    /// An attempt belongs to its logical request, and [`validate_synapse_ledgers`] rejects repetitions whose logical rows disagree with their owned attempts.
+    /// Classifying attempts by `actual_send_ns` would mark measured requests that retry or poll past the window end inadmissible.
+    /// Counting attempts and requests over the same logical requests keeps amplification conservative.
+    /// Excluding a censored request's post-boundary attempts would understate amplification.
     ///
-    /// Deliberately not `#[serde(default)]`: evidence written without the
-    /// marker is not contract-conformant, so it must fail to parse rather than
-    /// silently read as measured.
+    /// Missing `window` markers must fail parsing rather than default to `Measured`.
     pub window: WindowClass,
 }
 
@@ -324,83 +292,63 @@ pub struct LogicalRecord {
     pub terminal_code: Option<String>,
     pub attempts: u64,
     pub polls: u64,
-    /// Which part of the hold window this request opened in. See
-    /// [`AttemptRecord::window`] for the retention and parsing contract.
+    /// `window` classifies the hold-window segment in which the logical request opened.
     pub window: WindowClass,
 }
 
-/// Code marking a request the hold window closed on. Its wire outcome, if any
-/// arrived, stays in the attempt ledger; the logical row records only that the
-/// request had not settled when measurement ended.
+/// `IN_FLIGHT_AT_WINDOW_END_CODE` marks requests that had not settled when measurement ended.
+/// Any wire outcome remains in the attempt ledger; the logical row records only that the request had not settled when measurement ended.
 pub const IN_FLIGHT_AT_WINDOW_END_CODE: &str = "in_flight_at_window_end";
 
-/// Fraction of the hold window the frozen contract discards as warmup: the
-/// first 10%, matching the `mc-host-baseline.md` convention.
+/// Warmup discards the first 10% of the hold window.
 const WARMUP_WINDOW_DIVISOR: u64 = 10;
 
-/// Where an observation falls relative to the frozen hold window.
+/// `WindowClass` classifies each observation relative to the frozen hold window.
 ///
-/// One field rather than a pair of exclusion booleans: every consumer asks the
-/// same question — is this row part of the measured set — and a single class
-/// cannot encode the contradictory answers two independent flags can. Only
+/// `WindowClass` prevents the contradictory inclusion states that two exclusion booleans could represent.
 /// [`WindowClass::Measured`] rows feed ledgers, rates, percentiles, and gates;
-/// the other two stay in raw evidence so the discard is auditable.
+/// `Warmup` and `AfterWindow` rows remain in raw evidence so their exclusion is auditable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowClass {
-    /// Opened inside the window's warmup prefix.
+    /// `Warmup` classifies requests opened inside the window's warmup prefix.
     Warmup,
-    /// Opened inside the measured span between the warmup boundary and the
+    /// `Measured` classifies requests opened at or after the warmup boundary and before the window end.
     /// window end.
     Measured,
-    /// Opened at or after the window end. Closed-loop workers test the
-    /// boundary before dispatching, so a worker that passes the test can still
-    /// land its first wire send after the window closed; such a request never
-    /// started under measurement and must not be counted as offered.
+    /// `AfterWindow` classifies requests whose first wire send lands at or after the window end.
+    /// A closed-loop worker can pass its pre-dispatch boundary test yet send its first wire call after the window closes.
+    /// Requests whose first wire send lands after the window closes must not count as offered.
     AfterWindow,
 }
 
 impl WindowClass {
-    /// True for the only class that feeds estimates.
     pub fn is_measured(self) -> bool {
         matches!(self, Self::Measured)
     }
 }
 
-/// One engine service-time observation, timestamped so it can be attributed to
-/// a window class.
+/// `ServiceSample` includes a start timestamp so consumers can attribute it to a window class.
 ///
-/// The duration alone is not sufficient evidence: without a start instant a
-/// consumer cannot tell a call made under the warmup prefix, or one drained
-/// after the window closed, from one served inside the measured span.
+/// A duration without a start instant cannot distinguish warmup, measured, and after-window calls.
 ///
-/// Classified by `started_ns` alone, deliberately. A call that begins inside the
-/// measured span is work that span generated, and its duration is a complete
-/// observation of service time even when it finishes after the boundary.
-/// Excluding boundary-spanning calls instead — `started_ns + service_ns` beyond
-/// the window end — would drop the longest calls from `S`, truncating its right
-/// tail and biasing the mean and coefficient of variation downward and the
-/// derived capacity upward. That is the same right-censoring error that keeps
-/// unsettled requests out of the latency percentiles, applied in the direction
-/// that silently flatters the system, so start-based classification is the
-/// conservative rule here.
+/// `started_ns` alone determines `ServiceSample` classification.
+/// A call that finishes after the boundary remains a complete service-time observation.
+/// Excluding calls that finish after the window end biases service-time observations toward shorter calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ServiceSample {
-    /// When the engine call began, on the harness wire clock. The completion
-    /// instant is `started_ns + service_ns`, so a consumer that wants a
-    /// different boundary rule can derive it without a second field.
+    /// `started_ns` is the engine-call start on the harness wire clock; completion is `started_ns + service_ns`.
     pub started_ns: u64,
-    /// Wall time the engine call occupied.
+    /// `service_ns` measures the engine call's wall-clock duration.
     pub service_ns: u64,
     pub window: WindowClass,
 }
 
-/// One repetition's scheduled hold window on the harness wire clock.
+/// `HoldWindow` represents one repetition's scheduled wire-clock hold window.
 ///
-/// The contract measures a fixed window, so both frozen boundaries are derived
-/// from the *scheduled* span rather than from observed completions: the warmup
-/// prefix that stays out of estimates, and the end past which an unsettled
-/// request is censored instead of being awaited into a completion.
+/// `HoldWindow` derives both boundaries from the scheduled span, not observed completions.
+/// `warmup_end_ns` excludes the warmup prefix from estimates.
+/// `end_ns` censors unsettled requests instead of awaiting completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HoldWindow {
     pub start_ns: u64,
@@ -409,8 +357,7 @@ pub struct HoldWindow {
 }
 
 impl HoldWindow {
-    /// `start_ns` is the first scheduled slot on the wire clock and `seconds`
-    /// the frozen hold duration.
+    /// `start_ns` is the first scheduled wire-clock slot; `seconds` is the fixed hold duration.
     pub fn new(start_ns: u64, seconds: u64) -> Self {
         let span_ns = seconds.saturating_mul(1_000_000_000);
         Self {
@@ -420,8 +367,6 @@ impl HoldWindow {
         }
     }
 
-    /// Classifies an opening instant. Both boundaries are half-open: the
-    /// warmup boundary itself is already measured, and the window end itself is
     /// already outside.
     pub fn classify(&self, opened_ns: u64) -> WindowClass {
         if opened_ns < self.warmup_end_ns {
@@ -433,28 +378,21 @@ impl HoldWindow {
         }
     }
 
-    /// The instant a logical request opened: its scheduled start for open-loop
-    /// work, or its first wire send for closed-loop work, matching the frozen
-    /// definition of a logical request.
+    /// `opened_ns` uses scheduled start for open-loop work and first wire send for closed-loop work.
     pub fn opened_ns(record: &LogicalRecord) -> u64 {
         record
             .scheduled_start_ns
             .unwrap_or(record.actual_first_send_ns)
     }
 
-    /// Stamps the frozen window boundaries onto one repetition's ledgers.
     ///
-    /// A request that settled after the window closed was, at the window's
-    /// end, still in flight; recording its later outcome as a completion or
-    /// timeout would understate censoring and let post-window work inflate the
-    /// completed rate over the configured window. Its attempt rows keep the
-    /// wire outcome that did arrive, so nothing is lost from raw evidence.
+    /// A measured request that settles after `end_ns` was in flight when the window closed.
+    /// Recording a post-window outcome as a completion or timeout understates censoring and inflates the completed rate.
+    /// Attempt rows retain the observed wire outcome.
     ///
-    /// The censoring rewrite applies only to measured rows. A warmup or
-    /// after-window request is excluded from estimates outright, so rewriting
-    /// its disposition would discard a true outcome from raw evidence and buy
-    /// nothing; it also keeps the in-flight-at-window-end code meaning exactly
-    /// "the measured window closed on this request".
+    /// Warmup and after-window requests are excluded from estimates.
+    /// Rewriting an excluded request's disposition would discard its true outcome from raw evidence.
+    /// `IN_FLIGHT_AT_WINDOW_END_CODE` applies only when the measured window closes while the request is in flight.
     pub fn stamp(&self, logical: &mut [LogicalRecord], attempts: &mut [AttemptRecord]) {
         let mut classes = std::collections::BTreeMap::new();
         for record in logical.iter_mut() {
@@ -469,11 +407,8 @@ impl HoldWindow {
             }
         }
         for attempt in attempts.iter_mut() {
-            // Ownership, not the attempt's own send instant: see
-            // `AttemptRecord::window` for why the per-request ledger identity
-            // requires it. An attempt whose logical row is missing cannot be
-            // attributed to the measured set at all; the ledger validator
-            // reports the orphan.
+            // An `AttemptRecord` inherits its `window` from its `logical_id`'s `LogicalRecord`, not from its own send time.
+            // An attempt without a matching logical row cannot be attributed to the measured set.
             attempt.window = classes
                 .get(&attempt.logical_id)
                 .copied()
@@ -482,9 +417,7 @@ impl HoldWindow {
     }
 }
 
-/// Splits one repetition's ledgers into the measured set and everything the
-/// frozen window excludes. Only the measured set feeds rates, percentiles, and
-/// gates; the caller retains both in raw evidence.
+/// Only measured records feed rates, percentiles, and gates; raw evidence retains measured and excluded records.
 pub fn partition_measured<T: Clone>(
     records: &[T],
     class: impl Fn(&T) -> WindowClass,
@@ -501,8 +434,6 @@ pub fn partition_measured<T: Clone>(
     (measured, excluded)
 }
 
-/// Counts excluded rows of one class, so the summary can report the warmup
-/// discard and the after-window discard as the distinct quantities they are.
 pub fn count_class<T>(records: &[T], want: WindowClass, class: impl Fn(&T) -> WindowClass) -> u64 {
     records.iter().filter(|row| class(row) == want).count() as u64
 }
@@ -514,10 +445,9 @@ pub struct SynapseLedgerSummary {
     pub offered: u64,
     pub offered_by_method: BTreeMap<String, u64>,
     pub admitted_by_method: BTreeMap<String, u64>,
-    /// Attempts whose admission cannot be decided from the wire: the client
-    /// deadline fired before any terminal arrived, so the harness has no
-    /// evidence the host took an admission permit or job slot. Kept out of
-    /// `admitted_by_method` because that subtotal is the measured λ_adm.
+    /// An attempt is outcome-unknown when the client deadline fires before any terminal arrives.
+    /// The harness cannot determine whether the host consumed an admission permit or job slot.
+    /// `outcome_unknown_by_method` is excluded from `admitted_by_method` because that subtotal is the measured λ_adm.
     pub outcome_unknown_by_method: BTreeMap<String, u64>,
     pub completed: u64,
     pub completed_by_method: BTreeMap<String, u64>,
@@ -530,13 +460,12 @@ pub struct SynapseLedgerSummary {
     pub retryable_rejections: u64,
     pub attempt_timeouts: u64,
     pub polls: u64,
-    /// Non-poll wire calls answered with an error outside the client policy's
-    /// vocabulary. Always zero in an admissible repetition.
+    /// An admissible repetition has no non-poll wire calls answered with an error outside the client policy vocabulary.
     pub failures: u64,
     pub amplification: f64,
 }
 
-/// Validates both frozen count ledgers before any rate or percentile is used.
+/// The ledger validator checks both frozen count ledgers before rates or percentiles are used.
 pub fn validate_synapse_ledgers(
     logical: &[LogicalRecord],
     attempts: &[AttemptRecord],
@@ -584,9 +513,6 @@ pub fn validate_synapse_ledgers(
     let mut outcome_unknown_by_method = BTreeMap::new();
     let mut rejected_by_method_code = BTreeMap::new();
     let mut timed_out_by_method_code = BTreeMap::new();
-    // One pass over attempts also builds the per-logical aggregates the
-    // ownership and method subtotals need, so validation stays linear in
-    // (logical + attempts) instead of rescanning every attempt per request.
     let mut first_method_by_logical: BTreeMap<u64, &'static str> = BTreeMap::new();
     let mut attempts_by_logical: BTreeMap<u64, u64> = BTreeMap::new();
     let mut polls_by_logical: BTreeMap<u64, u64> = BTreeMap::new();
@@ -600,9 +526,8 @@ pub fn validate_synapse_ledgers(
         }
 
         let queue_full = attempt.code.as_deref() == Some("queue_full");
-        // A client-side attempt timeout produced no terminal, so the wire
-        // carries no evidence either way: it can neither be counted as
-        // admitted nor as rejected.
+        // A client-side timeout without a terminal provides no wire evidence of admission or rejection.
+        // The attempt counts as neither admitted nor rejected.
         let outcome_unknown = attempt.code.as_deref() == Some(ATTEMPT_TIMEOUT_CODE);
         if outcome_unknown {
             *outcome_unknown_by_method
@@ -650,11 +575,7 @@ pub fn validate_synapse_ledgers(
     }
 
     let mut errors = Vec::new();
-    // The two conservation equations below cannot fail on their own —
-    // the dispositions partition each ledger — so the falsifiable
-    // identity checks come first: duplicate logical rows, duplicate
-    // attempt rows, and attempts owned by no logical request are the
-    // corruption shapes a recording bug actually produces.
+    // The validator checks duplicate IDs and orphaned attempts before ledger totals; disposition counts partition each ledger.
     let mut logical_ids = std::collections::BTreeSet::new();
     for request in logical {
         if !logical_ids.insert(request.logical_id) {
@@ -666,12 +587,7 @@ pub fn validate_synapse_ledgers(
         if !attempt_ids.insert(attempt.attempt_id) {
             errors.push(format!("duplicate attempt_id {}", attempt.attempt_id));
         }
-        // `Poll` and `embed.result` must imply each other. The count checks
-        // above cannot catch a violation on their own: an `embed.result` row
-        // recorded as `Success` moves into `successes` instead of `polls`, and a
-        // logical row claiming zero polls then reconciles, so the repetition
-        // reports valid while publishing an understated poll distribution — the
-        // exact quantity the poll ceiling gates on.
+        // `SynapseMethod::Result` must have `AttemptDisposition::Poll`, and only that method may have it; ledger totals do not enforce this invariant.
         let is_poll = attempt.disposition == AttemptDisposition::Poll;
         if (attempt.method == SynapseMethod::Result) != is_poll {
             errors.push(format!(
@@ -699,9 +615,7 @@ pub fn validate_synapse_ledgers(
             "attempt ledger: {attempt_total} != {successes} + {retryable_rejections} + {attempt_timeouts} + {polls} + {failures}"
         ));
     }
-    // The frozen attempt vocabulary has four categories. A recorded failure
-    // is a wire error the client policy cannot act on, so the repetition
-    // carries an instrumentation or host fault and is inadmissible.
+    // A valid attempt ledger contains no `failures`.
     if failures != 0 {
         errors.push(format!(
             "attempt ledger: {failures} non-poll attempts ended in an error outside the frozen vocabulary"
@@ -718,10 +632,7 @@ pub fn validate_synapse_ledgers(
                 request.logical_id, request.attempts
             ));
         }
-        // The attempt total alone cannot catch a misattributed poll count: a
-        // row claiming zero polls while owning a Poll attempt still balances
-        // whenever its total matches, and the poll distribution it feeds is
-        // then wrong while the ledger reports valid.
+        // The validator verifies per-logical poll counts because total attempts can balance despite a misattributed `Poll`.
         let owned_polls = polls_by_logical
             .get(&request.logical_id)
             .copied()
@@ -761,15 +672,8 @@ pub fn validate_synapse_ledgers(
     }
 }
 
-/// Deterministic generator used only by the benchmark's jitter policy.
 ///
-/// SplitMix64: the state advances by the golden-ratio increment and each
-/// draw runs the full avalanche finalizer, so the first draw from any
-/// seed — including adjacent small seeds such as `seed ^ logical_id` —
-/// is already well mixed. (A raw xorshift here would make every small
-/// seed's first draw nearly zero, synchronizing all callers' first retry
-/// delays at the base value and defeating the jitter.) Every distinct
-/// seed, including 0, yields a distinct sequence.
+/// SplitMix64 avalanches each draw so adjacent `seed ^ logical_id` values do not synchronize first retry delays.
 #[derive(Debug, Clone)]
 pub struct DeterministicRng(u64);
 
@@ -788,38 +692,28 @@ impl DeterministicRng {
         (value >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    /// Mirrors plugin retry jitter: `[base, 3 * base)`.
+    /// Retry jitter matches the plugin range: `[base, 3 * base)`.
     pub fn retry_delay_ms(&mut self, base_ms: u64) -> f64 {
         base_ms as f64 * (1.0 + 2.0 * self.unit())
     }
 
-    /// Mirrors plugin fast-first poll jitter: `[1ms, 2ms)`.
     pub fn first_poll_delay_ms(&mut self) -> f64 {
         1.0 + self.unit()
     }
 }
 
-/// Plugin poll-policy constants mirrored here so the benchmark's variant
-/// arms schedule exactly the shipped cadence. Single source on the Rust
-/// side; must equal `SYNAPSE_POLL_DELAY_MULTIPLIER` and
+/// `POLL_DELAY_MULTIPLIER` must match `SYNAPSE_POLL_DELAY_MULTIPLIER`.
 /// `SYNAPSE_POLL_MIN_DELAY_MS` in
 /// `packages/plugin/src/features/magic-context/memory/embedding-synapse.ts`,
-/// and `retry_and_poll_schedule_matches_plugin_policy` pins the unsaturated
-/// escalation step so a drifted copy fails a gate instead of silently
 /// invalidating client-faithfulness.
 pub const POLL_DELAY_MULTIPLIER: f64 = 1.6;
 pub const POLL_MIN_DELAY_MS: u64 = 10;
 
-/// Mirrors the plugin's `SYNAPSE_QUEUE_FULL_MAX_ATTEMPTS`: `queue_full` is a
-/// deadline-bounded wait for an admission slot, and this cap only bounds
-/// amplification when a served hint is pathologically small.
 pub const QUEUE_FULL_MAX_ATTEMPTS: u32 = 64;
 
-/// Consumes the current pending-poll delay and escalates the stored next
-/// one, mirroring the plugin's `pendingPollDelay`: the first pending reply
-/// waits the jittered fast-first seed, later pendings wait the escalated
-/// value, and the served `retry_after_ms` (floored at the busy-poll
-/// minimum) caps every returned delay while the stored state escalates
+/// `next_delay_ms` escalates after each call.
+/// The first pending reply waits the jittered fast-first seed.
+/// Later pending replies use the escalated delay, capped by `served_cap_ms`.
 /// uncapped.
 pub fn pending_poll_delay_ms(next_delay_ms: &mut f64, served_cap_ms: u64) -> f64 {
     let current = *next_delay_ms;
@@ -827,8 +721,6 @@ pub fn pending_poll_delay_ms(next_delay_ms: &mut f64, served_cap_ms: u64) -> f64
     current.min(served_cap_ms.max(POLL_MIN_DELAY_MS) as f64)
 }
 
-/// Frozen treatment arm. Policy methods keep the benchmark's client behavior
-/// in one place so a host hint cannot accidentally leak into control arms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SynapseVariant {
     #[serde(rename = "baseline")]
@@ -858,7 +750,7 @@ impl SynapseVariant {
         }
     }
 
-    /// CLI spelling of the variant; the inverse of `parse`.
+    /// `as_str` returns a value that `parse` maps back to the same variant.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
@@ -874,18 +766,11 @@ impl SynapseVariant {
         matches!(self, Self::A | Self::APlusC)
     }
 
-    /// `None` is the historical query-only admission loop: retry until the
-    /// single absolute deadline with no attempt cap. Treatment/hygiene arms
-    /// mirror the plugin's `queue_full` budget: deadline-bounded with the
-    /// [`QUEUE_FULL_MAX_ATTEMPTS`] safety cap.
+    /// `None` imposes no query-admission attempt cap.
     pub fn query_attempt_limit(self) -> Option<u32> {
         (!matches!(self, Self::Baseline)).then_some(QUEUE_FULL_MAX_ATTEMPTS)
     }
 
-    /// Only candidate B reads the host's served `query_retry_after_ms`. The
-    /// frozen matrix declares `a+c` as A's bounded server waiting plus C's
-    /// fast polling, so letting it read the hint too would make its query
-    /// results unattributable between A+C and an unlabelled B.
     pub fn uses_served_query_hint(self) -> bool {
         matches!(self, Self::B)
     }
@@ -894,16 +779,12 @@ impl SynapseVariant {
         matches!(self, Self::C | Self::APlusC)
     }
 
-    /// Seed of the pending-poll ladder for fast-poll arms: the jittered
-    /// fast-first delay, consumed by the first pending reply. The first
-    /// `embed.result` itself is issued immediately in every arm, mirroring
+    /// Fast-poll arms use the jittered fast-first delay for their first pending reply.
     /// the plugin.
     pub fn initial_pending_delay_ms(self, rng: &mut DeterministicRng) -> Option<f64> {
         self.fast_polls().then(|| rng.first_poll_delay_ms())
     }
 
-    /// One pending wait. Fast arms consume-then-escalate the ladder state;
-    /// other arms reproduce the historical fixed served-delay poll.
     pub fn pending_poll_delay_ms(self, state: &mut f64, served_ms: u64) -> f64 {
         if self.fast_polls() {
             pending_poll_delay_ms(state, served_ms)
@@ -912,9 +793,6 @@ impl SynapseVariant {
         }
     }
 
-    /// Query admission delay in milliseconds. Baseline reproduces the fixed,
-    /// unjittered 100 ms loop. Other arms jitter either the fallback or the
-    /// served hint over `[base, 3base)`.
     pub fn query_retry_delay_ms(
         self,
         served_hint_ms: Option<u64>,

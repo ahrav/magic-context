@@ -1,46 +1,23 @@
-//! Resource-observer self-tests and the crash/recovery resource soak for
-//! the provisional ring-backed shared-memory tuple (plan U5).
 //!
-//! # Provisional tuple
-//! The frozen retained-tuple manifest from Beads task `magic-context-ymc.12`
-//! (`crates/mc-shm-transport/benches/manifests/v1.json`) still contains
-//! unresolved fields, so the soak runs against the in-repo ring-backed
-//! `ShmProvider` tuple on Linux as the provisional tuple, exactly like
-//! `shm_failure_modes.rs`. The observer backends themselves are
-//! cross-platform: macOS `libproc` support compiles and self-tests on macOS
 //! CI.
 //!
-//! # Conservation mechanism (R12)
-//! The ring provider has no dead-peer reclamation: a candidate whose peer
-//! dies mid-flight keeps its active charges until the endpoint closes (the
-//! U4 idle-kill note). Each clean soak cycle therefore drives the victim
-//! through a full roundtrip and a `Goodbye` frame before the `SIGKILL`: the
-//! Goodbye-driven clean endpoint close — not the kill or the reap — is the
-//! event that returns the candidate's exact admission charges. The
-//! subsequent `SIGKILL` still terminates a live process holding both ring
-//! mappings, and the parent then proves exact logical conservation, zero
-//! quarantined charges, and no surviving descendants before the next cycle.
+//! The ring provider never reclaims active charges after a peer dies.
+//! A candidate whose peer dies mid-flight retains active charges until its endpoint closes.
+//! A `Goodbye`-driven clean endpoint closure, not killing or reaping, returns the candidate's exact admission charges.
+//! The parent proves exact logical conservation, zero quarantined charges, and no surviving descendants before the next cycle.
 //!
-//! Clean cycles therefore prove clean-close charge conservation plus crash-side OS hygiene — NOT dead-peer charge reclamation, which remains a provider gap pending the frozen `.12` manifest and is pinned exactly by `killed_victim_holding_active_charges_is_never_reclaimed` in `shm_failure_modes.rs`.
+//! Clean cycles prove clean-close charge conservation and crash-side OS hygiene, not dead-peer charge reclamation; `killed_victim_holding_active_charges_is_never_reclaimed` verifies that active charges are never reclaimed after a victim is killed.
 //!
-//! # Envelope (KTD10)
-//! Twenty unmeasured warmup cycles run first. After logical quiescence,
-//! three equal consecutive OS snapshots per long-lived role (daemon and
-//! harness parent, which also holds the observer route) freeze the
-//! envelope. Measurement checks logical counters every cycle and OS
-//! counters every ten cycles plus the final cycle, and never updates the
+//! # Envelope
+//! Twenty unmeasured warmup cycles run first.
+//! Three equal consecutive OS snapshots freeze the envelope for each long-lived role.
+//! The daemon and harness parent each provide the snapshots that freeze the envelope.
+//! Measurement checks logical counters every cycle and OS counters every ten cycles and on the final cycle.
+//! The measurement phase never updates the envelope.
 //! envelope.
 //!
-//! # Full soak
-//! `full_soak_cycles_conserve_resources` is `#[ignore]`d and opt-in. Run it
-//! through the dedicated nextest profile,
-//! `cargo nextest run -P shm-soak --run-ignored ignored-only`, or directly:
-//! `cargo test -p mc-host --test shm_soak -- --ignored --exact
-//! full_soak_cycles_conserve_resources`. The `MC_SHM_SOAK_CYCLES`
-//! environment variable overrides the measured cycle count (default 1000).
 //!
-//! # Redaction (R17)
-//! Failure output names only role, cycle number, counter kind, and
+//! Failure output names only the role, cycle number, counter kind, and expected and actual counts.
 //! expected/actual counts.
 
 mod support;
@@ -51,9 +28,9 @@ use std::time::{Duration, Instant};
 
 use support::process_resources::{observe, ResourceCounts};
 
-/// Serializes every test in this binary under plain `cargo test`, where
-/// tests share one process and would otherwise race the fd, mapping, and
-/// thread counters. Taken before any runtime is built.
+/// `serial_soak_lock` serializes all tests in this binary because plain `cargo test` runs them in one process.
+/// Tests would otherwise race fd, mapping, and thread counters in the shared process.
+/// Callers acquire `serial_soak_lock` before building any runtime.
 fn serial_soak_lock() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -62,7 +39,6 @@ fn serial_soak_lock() -> MutexGuard<'static, ()> {
 const STABLE_DEADLINE: Duration = Duration::from_secs(15);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Bounded poll until `predicate` holds for the observed counters.
 fn wait_counts(pid: u32, what: &str, predicate: impl Fn(ResourceCounts) -> bool) {
     let deadline = Instant::now() + STABLE_DEADLINE;
     loop {
@@ -78,7 +54,6 @@ fn wait_counts(pid: u32, what: &str, predicate: impl Fn(ResourceCounts) -> bool)
     }
 }
 
-/// Three equal consecutive snapshots within a bounded wait (KTD10).
 fn stable_counts(pid: u32) -> ResourceCounts {
     let deadline = Instant::now() + STABLE_DEADLINE;
     let mut streak: Option<(ResourceCounts, u32)> = None;
@@ -102,7 +77,6 @@ fn stable_counts(pid: u32) -> ResourceCounts {
 }
 
 // ---------------------------------------------------------------------------
-// Observer self-tests: one known fd, mapping, and thread (KTD9).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -117,8 +91,6 @@ fn observer_reports_fd_delta_and_return_to_baseline() {
     wait_counts(pid, "the fd baseline", |counts| counts.fds == baseline.fds);
 }
 
-/// One shared file-backed (Linux memfd) or shared anonymous (macOS)
-/// mapping: both kinds occupy exactly one region that never merges into a
 /// neighbor.
 struct TestMapping {
     address: *mut libc::c_void,
@@ -128,7 +100,6 @@ struct TestMapping {
 }
 
 impl TestMapping {
-    /// Extra fds the mapping holds while alive.
     #[cfg(target_os = "linux")]
     const FD_DELTA: u64 = 1;
     #[cfg(not(target_os = "linux"))]
@@ -219,7 +190,6 @@ fn observer_reports_thread_delta_and_return_to_baseline() {
     });
 }
 
-/// An unobservable pid must FAIL the observation, never report zeros (R13).
 #[test]
 fn observer_fails_on_an_unobservable_pid() {
     let _serial = serial_soak_lock();
@@ -241,11 +211,8 @@ fn observer_fails_on_an_unobservable_pid() {
 }
 
 // ---------------------------------------------------------------------------
-// Soak harness (Linux provisional tuple).
 // ---------------------------------------------------------------------------
 
-// Role tests live at the crate top level so `spawn_role`'s `--exact`
-// libtest filter matches their names.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "daemon role for the shm soak harness"]
@@ -260,7 +227,6 @@ fn shm_role_victim() {
     support::shm_process::victim_role();
 }
 
-/// Fixture role that deliberately leaks one descendant process.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "leaky fixture role for the descendant check"]
@@ -272,8 +238,6 @@ fn shm_soak_role_leaky() {
         .arg("3600")
         .spawn()
         .expect("spawn the leaked descendant");
-    // The child handle is dropped without wait: the descendant outlives
-    // this role's own lifetime checks.
     drop(child);
     support::shm_process::emit_record("child_leaked");
     loop {
@@ -299,10 +263,8 @@ mod soak {
     pub const ENV_LEAKY_ROLE: &str = "MC_SHM_SOAK_LEAKY_ROLE";
 
     // -----------------------------------------------------------------------
-    // Violations and checks.
     // -----------------------------------------------------------------------
 
-    /// One redacted soak failure: role, cycle, counter kind, and counts
     /// only (R17).
     #[derive(Debug, PartialEq, Eq)]
     pub struct SoakViolation {
@@ -323,7 +285,6 @@ mod soak {
         }
     }
 
-    /// Every live descendant of `pid` outside `allowed` is a violation.
     pub fn check_descendants(
         role: &'static str,
         cycle: u64,
@@ -346,8 +307,6 @@ mod soak {
         })
     }
 
-    /// Bounded poll until every OS counter for `pid` is inside the frozen
-    /// envelope; a persistent excess is a violation naming the counter.
     fn check_envelope(
         role: &'static str,
         cycle: u64,
@@ -378,7 +337,6 @@ mod soak {
         }
     }
 
-    /// Bounded poll until `predicate` accepts the daemon's counters.
     pub fn wait_soak_stats(
         daemon: &mut RoleProcess,
         what: &str,
@@ -398,9 +356,6 @@ mod soak {
         }
     }
 
-    /// Exact logical conservation after one cycle: zero active and zero
-    /// quarantined charges, exactly one preparation per completed cycle,
-    /// and readiness `Ready` (R12).
     fn wait_logical_baseline(daemon: &mut RoleProcess, cycle: u64) {
         let deadline = Instant::now() + STABLE_DEADLINE;
         loop {
@@ -425,19 +380,14 @@ mod soak {
     }
 
     // -----------------------------------------------------------------------
-    // Cycle and soak runners.
     // -----------------------------------------------------------------------
 
     pub struct SoakConfig {
         pub measured_cycles: u64,
         pub os_check_interval: u64,
-        /// Test fault: the daemon leaks one duplicated fd every N measured
-        /// cycles (the seeded-defect detector fixture).
         pub leak_fd_every: Option<u64>,
     }
 
-    /// One connect/crash/reap/recover/quiesce cycle. `completed` is the
-    /// total cycle ordinal (warmup plus measured).
     async fn run_cycle(
         daemon: &mut RoleProcess,
         observer: &mut Observer,
@@ -465,7 +415,6 @@ mod soak {
         }
     }
 
-    /// Warmup, envelope freeze, then the measured soak (KTD10).
     pub async fn run_soak(config: SoakConfig) -> Result<(), SoakViolation> {
         let data_root = tempfile::tempdir().expect("data root");
         let mut daemon = start_daemon(data_root.path());
@@ -487,7 +436,6 @@ mod soak {
             )
             .await;
         }
-        // Freeze the envelope after warmup quiescence; measurement never
         // updates it.
         let daemon_envelope = stable_counts(daemon_pid);
         let parent_envelope = stable_counts(parent_pid);
@@ -530,8 +478,6 @@ mod soak {
     // Scenarios.
     // -----------------------------------------------------------------------
 
-    /// A fixture process that leaks one descendant must FAIL the role and
-    /// descendant check, instead of a daemon-only snapshot passing.
     #[test]
     fn role_liveness_check_detects_a_leaked_descendant() {
         let _serial = serial_soak_lock();
@@ -546,7 +492,6 @@ mod soak {
         assert_eq!(violation.role, "leaky");
         assert_eq!(violation.counter, "descendants");
         assert_eq!(violation.actual, 1);
-        // Reclaim the deliberate leak so bounded teardown can verify.
         for descendant in live_descendants(leaky.pid()) {
             unsafe {
                 libc::kill(descendant as libc::pid_t, libc::SIGKILL);
@@ -555,8 +500,6 @@ mod soak {
         leaky.teardown();
     }
 
-    /// Short soak smoke: warmup plus five measured cycles with one final
-    /// envelope check, exercised on every PR run.
     #[test]
     fn soak_smoke_conserves_charges_and_stays_inside_the_envelope() {
         let _serial = serial_soak_lock();
@@ -571,8 +514,6 @@ mod soak {
         });
     }
 
-    /// Seeded-defect detector: one duplicated fd leaked per measured cycle
-    /// must breach the frozen daemon fd envelope within ten cycles.
     #[test]
     fn injected_fd_leak_breaches_the_frozen_envelope() {
         let _serial = serial_soak_lock();
@@ -590,15 +531,10 @@ mod soak {
         });
     }
 
-    /// Full opt-in soak (R12): 1,000 measured cycles by default;
-    /// `MC_SHM_SOAK_CYCLES` overrides the count.
     #[test]
     #[ignore = "opt-in full resource soak; run via the shm-soak nextest profile"]
     fn full_soak_cycles_conserve_resources() {
         let _serial = serial_soak_lock();
-        // A present-but-malformed or zero override must fail loudly: a
-        // silent fallback or an empty `1..=0` measured loop would run the
-        // warmup and report success without the requested measurement.
         let measured: u64 = match std::env::var("MC_SHM_SOAK_CYCLES") {
             Ok(raw) => raw
                 .parse()
@@ -620,16 +556,12 @@ mod soak {
         });
     }
 
-    /// Quarantine as a separate experiment (KTD11): exact retained charges
-    /// through the frozen cap, readiness `Quarantined`, one rejected excess
-    /// attempt with no new fd, mapping, worker, or logical object, and
-    /// healthy observer TCP traffic throughout.
     #[test]
     fn quarantine_exhaustion_retains_exact_charges_and_creates_no_resources() {
         let _serial = serial_soak_lock();
         soak_runtime().block_on(async {
             let data_root = tempfile::tempdir().expect("data root");
-            // Frozen cap: admission limits fit exactly two candidates.
+            // The frozen cap admits exactly two candidates.
             let mut daemon = start_daemon_with(data_root.path(), 2);
             let info = daemon_info(data_root.path());
             let mut observer = Observer::connect(&info, "observer-quarantine").await;
@@ -656,13 +588,13 @@ mod soak {
                     peer.send(goodbye_header(), &[]).expect("publish goodbye");
                 });
                 drop(peer);
-                // Each accepted quarantine is charged exactly once (R8).
+                // Each accepted quarantine consumes one charge.
                 wait_soak_stats(&mut daemon, "exact retained charges", |stats| {
                     stats.quarantined == retained(count) && stats.active == [0; 4]
                 });
                 observer.roundtrip(256, 9, BUDGET).await;
             }
-            // Cap exhaustion is terminal for new offers.
+            // After two quarantines, the next offer is rejected with `unavailable`.
             let exhausted = wait_soak_stats(&mut daemon, "readiness Quarantined", |stats| {
                 stats.readiness == "Quarantined"
             });
@@ -670,8 +602,6 @@ mod soak {
             let preparations_before = exhausted.preparations;
             let os_before = stable_counts(daemon.pid());
 
-            // One excess attempt is rejected onto TCP with exact
-            // `unavailable` and creates no provider resources.
             let (probe, selection) = negotiate_grant(&info).await;
             assert_eq!(selection["selected"]["transport"], "tcp");
             assert_eq!(selection["reason"], "unavailable");

@@ -17,10 +17,7 @@ function useTempDataHome(prefix: string): string {
     const dir = mkdtempSync(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
-    // Match the getDataDir() layout the plugin expects. opencode.db lives
-    // under opencode/, while magic-context's own DB now lives at the shared
-    // cortexkit path. Create both parent directories so the OpenCode-side DB
-    // file write succeeds and openDatabase() finds a clean target.
+    // Create both parent directories: OpenCode writes opencode/opencode.db, and openDatabase() uses cortexkit/magic-context.
     mkdirSync(join(dir, "opencode"), { recursive: true });
     mkdirSync(join(dir, "cortexkit", "magic-context"), { recursive: true });
     return dir;
@@ -63,7 +60,6 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            // Ignore EBUSY on Windows
         }
     }
     tempDirs.length = 0;
@@ -76,7 +72,6 @@ describe("checkCompactionMarkerConsistency", () => {
         closeQuietly(opencodeDb);
 
         const db = openDatabase();
-        // Should not throw on the happy path even when there are no markers.
         expect(() => checkCompactionMarkerConsistency(db)).not.toThrow();
     });
 
@@ -84,10 +79,9 @@ describe("checkCompactionMarkerConsistency", () => {
         const dataHome = useTempDataHome("consistency-orphan-");
         const opencodeDb = createOpenCodeDb(dataHome);
 
-        // Insert only 2 of the 4 referenced rows, simulating a half-written marker
         insertMessage(opencodeDb, "msg-boundary");
         insertPart(opencodeDb, "prt-compaction");
-        // msg-summary and prt-summary-text are intentionally MISSING
+        // msg-summary and prt-summary-text are absent.
         closeQuietly(opencodeDb);
 
         const db = openDatabase();
@@ -102,7 +96,6 @@ describe("checkCompactionMarkerConsistency", () => {
 
         checkCompactionMarkerConsistency(db);
 
-        // Persisted state should now be cleared
         const row = db
             .prepare("SELECT compaction_marker_state FROM session_meta WHERE session_id = ?")
             .get("ses-1") as { compaction_marker_state?: string } | null;
@@ -113,7 +106,6 @@ describe("checkCompactionMarkerConsistency", () => {
         const dataHome = useTempDataHome("consistency-healthy-");
         const opencodeDb = createOpenCodeDb(dataHome);
 
-        // All 4 referenced rows exist
         insertMessage(opencodeDb, "msg-boundary");
         insertMessage(opencodeDb, "msg-summary");
         insertPart(opencodeDb, "prt-compaction");
@@ -132,7 +124,6 @@ describe("checkCompactionMarkerConsistency", () => {
 
         checkCompactionMarkerConsistency(db);
 
-        // Persisted state should still be intact
         const row = db
             .prepare("SELECT compaction_marker_state FROM session_meta WHERE session_id = ?")
             .get("ses-1") as { compaction_marker_state?: string } | null;
@@ -145,13 +136,12 @@ describe("checkCompactionMarkerConsistency", () => {
         const dataHome = useTempDataHome("consistency-multi-");
         const opencodeDb = createOpenCodeDb(dataHome);
 
-        // Session 1: healthy, keep
+        // ses-1 has all referenced rows and must retain its marker state.
         insertMessage(opencodeDb, "msg-boundary-1");
         insertMessage(opencodeDb, "msg-summary-1");
         insertPart(opencodeDb, "prt-compaction-1");
         insertPart(opencodeDb, "prt-summary-text-1");
-        // Session 2: orphaned, clear
-        // (no rows inserted for ses-2)
+        // ses-2 has a missing referenced row and must have its marker state cleared.
         closeQuietly(opencodeDb);
 
         const db = openDatabase();
@@ -181,10 +171,8 @@ describe("checkCompactionMarkerConsistency", () => {
             .prepare("SELECT compaction_marker_state FROM session_meta WHERE session_id = ?")
             .get("ses-2") as { compaction_marker_state?: string } | null;
 
-        // ses-1 healthy → preserved
         const parsed1 = JSON.parse(row1?.compaction_marker_state ?? "{}");
         expect(parsed1.boundaryMessageId).toBe("msg-boundary-1");
-        // ses-2 orphaned → cleared
         expect(row2?.compaction_marker_state ?? "").toBe("");
     });
 
@@ -192,7 +180,7 @@ describe("checkCompactionMarkerConsistency", () => {
         const dataHome = useTempDataHome("consistency-idempotent-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertMessage(opencodeDb, "msg-boundary");
-        // Missing rows → marker is orphaned
+        // Any missing referenced row clears the marker state.
         closeQuietly(opencodeDb);
 
         const db = openDatabase();

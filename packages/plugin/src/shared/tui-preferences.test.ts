@@ -132,7 +132,6 @@ describe("watchTuiPreferences", () => {
 describe("resolveMagicContextPrefs (per-key validation)", () => {
     test("missing key → full defaults clone", () => {
         expect(resolveMagicContextPrefs({})).toEqual(DEFAULT_PREFS);
-        // clone, not the shared object
         expect(resolveMagicContextPrefs({})).not.toBe(DEFAULT_PREFS);
     });
 
@@ -208,16 +207,16 @@ describe("write path — comment-json full round-trip", () => {
     });
 
     test("INTEROP: a sibling plugin's values AND comments survive MC writing only its key", async () => {
-        // A shared file owned partly by anthropic-auth, with comments and an
-        // appearance block MC knows nothing about. MC must touch ONLY its key.
+        // Magic Context must preserve anthropic-auth's comments and unknown appearance block.
+        // Magic Context modifies only its own key.
         await writeFile(
             file,
             `{
-  // anthropic-auth section — DO NOT lose this BLOCK comment
+  // Magic Context must preserve anthropic-auth's leading comment.
   "anthropic-auth": {
     "order": 160,
     "header": { "label": "CLAUDE" },
-    // bar appearance knobs MC has no schema for
+    // Magic Context must preserve anthropic-auth.appearance, which has no schema.
     "appearance": { "barWidth": 10, "barFilledChar": "#" },
     "pollMs": 2000 // INLINE trailing comment — must survive too
   },
@@ -230,13 +229,10 @@ describe("write path — comment-json full round-trip", () => {
         await queueTuiPreferenceUpdate(PLUGIN_KEY, ["collapsed"], true);
 
         const text = await readFile(file, "utf8");
-        // sibling comments preserved — BOTH block and inline trailing
-        // (comment-json round-trips both faithfully; enforce the guarantee).
         expect(text).toContain("anthropic-auth section — DO NOT lose this BLOCK comment");
         expect(text).toContain("bar appearance knobs MC has no schema for");
         expect(text).toContain("INLINE trailing comment — must survive too");
 
-        // sibling VALUES intact (incl. nested keys MC has no schema for)
         const root = parse(text) as Record<string, Record<string, unknown>>;
         const aa = root["anthropic-auth"] as Record<string, unknown>;
         expect(aa.order).toBe(160);
@@ -245,7 +241,6 @@ describe("write path — comment-json full round-trip", () => {
         expect(appearance.barWidth).toBe(10);
         expect(appearance.barFilledChar).toBe("#");
 
-        // MC's own change landed
         expect(resolveMagicContextPrefs(root).collapsed).toBe(true);
         expect(resolveMagicContextPrefs(root).order).toBe(200);
     });
@@ -254,7 +249,7 @@ describe("write path — comment-json full round-trip", () => {
         const broken = `{ "anthropic-auth": { "order": 160 } broken `;
         await writeFile(file, broken, "utf8");
         await queueTuiPreferenceUpdate(PLUGIN_KEY, ["collapsed"], true);
-        // unchanged — we never clobber a file we can't safely parse
+        // The writer never clobbers a file it cannot safely parse.
         expect(await readFile(file, "utf8")).toBe(broken);
     });
 });

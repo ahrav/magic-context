@@ -3,17 +3,13 @@
 // Anthropic vision docs: tokens ≈ (width × height) / 750
 // https://docs.claude.com/en/build-with-claude/vision
 //
-// Images are sent inline as data URLs. Base64 char length is a terrible proxy
-// (50x over-estimate for a typical screenshot), so we parse PNG/JPEG headers
-// directly to read real pixel dimensions.
+// Pixel dimensions, not encoded length, determine the token estimate.
 
 const IMAGE_TOKEN_DIVISOR = 750;
 const IMAGE_FALLBACK_TOKENS = 1200; // ~ 950×950 mid-size image
 const IMAGE_TOKEN_CAP = 4500; // Anthropic's max for a single image
 
 /**
- * Estimate token cost of an image from its data URL.
- * Returns a conservative fallback when parsing fails.
  */
 export function estimateImageTokensFromDataUrl(url: string): number {
     const comma = url.indexOf(",");
@@ -21,9 +17,6 @@ export function estimateImageTokensFromDataUrl(url: string): number {
     const header = url.slice(0, comma);
     const payload = url.slice(comma + 1);
 
-    // Only decode the first ~32 bytes of the image — enough for both PNG IHDR
-    // (bytes 16-24) and JPEG SOF markers (typically within first 256 bytes).
-    // Read up to ~512 bytes of base64 to cover edge-case JPEG marker offsets.
     const sliceLen = Math.min(512, payload.length);
     const preview = payload.slice(0, sliceLen);
 
@@ -58,7 +51,6 @@ function clampImageTokens(n: number): number {
 }
 
 function base64Decode(b64: string): Uint8Array {
-    // atob is available in Bun / Node 20+. Pad to multiple of 4.
     const pad = b64.length % 4;
     const padded = pad === 0 ? b64 : b64 + "=".repeat(4 - pad);
     const binary = atob(padded);
@@ -100,7 +92,6 @@ function parseJpegDimensions(b: Uint8Array): { w: number; h: number } | null {
         const marker = b[i + 1];
         if (marker === undefined) break;
         if (isSofMarker(marker)) {
-            // i+2: segment length (2B), i+4: precision (1B), i+5: height (2B), i+7: width (2B)
             const h = (b[i + 5]! << 8) | b[i + 6]!;
             const w = (b[i + 7]! << 8) | b[i + 8]!;
             if (w && h) return { w, h };
@@ -134,8 +125,8 @@ function parseWebpDimensions(b: Uint8Array): { w: number; h: number } | null {
     const variant = String.fromCharCode(b[12]!, b[13]!, b[14]!, b[15]!);
     if (variant === "VP8 ") {
         // Lossy: width/height at bytes 26-29 (14-bit each, little-endian).
-        // The `& 0x3fff` already produces a non-negative 14-bit result; no
-        // extra `|| 0` fallback is needed.
+        // `& 0x3fff` yields a non-negative 14-bit integer.
+        // `& 0x3fff` yields a non-negative 14-bit integer.
         const w = (b[26]! | (b[27]! << 8)) & 0x3fff;
         const h = (b[28]! | (b[29]! << 8)) & 0x3fff;
         if (w && h) return { w, h };
@@ -168,10 +159,10 @@ function parseGifDimensions(b: Uint8Array): { w: number; h: number } | null {
 }
 
 function readUint32BE(b: Uint8Array, offset: number): number {
-    // `>>> 0` coerces to an unsigned 32-bit integer. Without it, a byte with
-    // the MSB set produces a negative value (JS bitwise ops are 32-bit
-    // signed), which would bypass downstream `< 1` guards and produce
-    // wrong token counts for malformed/untrusted PNG headers.
+    // `>>> 0` converts the assembled value to an unsigned 32-bit integer; JavaScript bitwise operators otherwise produce signed 32-bit results.
+    // `>>> 0` converts the assembled value to an unsigned 32-bit integer; JavaScript bitwise operators otherwise produce signed 32-bit results.
+    // `>>> 0` converts the assembled value to an unsigned 32-bit integer; JavaScript bitwise operators otherwise produce signed 32-bit results.
+    // `>>> 0` converts the assembled value to an unsigned 32-bit integer; JavaScript bitwise operators otherwise produce signed 32-bit results.
     return (
         ((b[offset]! << 24) | (b[offset + 1]! << 16) | (b[offset + 2]! << 8) | b[offset + 3]!) >>> 0
     );

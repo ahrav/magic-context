@@ -1,6 +1,3 @@
-//! Native lifecycle evidence and control: the schema-1 lifecycle record, the
-//! stable coordination fences (`transaction.lock` and `lifetime.lock`), the
-//! observational state probe, and the `host.shutdown` commit latch (plan
 //! KTD2-KTD4).
 //!
 //! State is derived from lock ownership plus incarnation-fenced evidence.
@@ -22,38 +19,27 @@ use crate::instance::{
     InstanceGuard, CONNECTION_FILE_NAME, S_IFDIR, S_IFMT, S_IFREG,
 };
 
-/// Canonical lifecycle-record name inside the runtime directory.
+/// `LIFECYCLE_RECORD_NAME` identifies the lifecycle record in the runtime directory.
 pub const LIFECYCLE_RECORD_NAME: &str = "mc-host-lifecycle.json";
 
-/// The probe reason for a quarantined persisted record: the bytes decode to
-/// an unknown schema, so they are preserved untouched rather than repaired.
+/// Persisted records that decode to an unknown schema are quarantined.
+/// Unknown-schema records are preserved without repair.
 ///
-/// Exported because it is a load-bearing classification, not a diagnostic
-/// string: `InstanceGuard::acquire` refuses to start over a quarantined
-/// record, so every caller that acts on a probe must recognize this reason in
-/// both its `Stopped` (both fences free) and `Wedged` (fence held) shapes.
+/// `InstanceGuard::acquire` refuses records quarantined for `UNSUPPORTED_STATE_SCHEMA_REASON`.
+/// Probe consumers must recognize `UNSUPPORTED_STATE_SCHEMA_REASON` in `Stopped` when both fences are free and in `Wedged` when a fence is held.
 pub const UNSUPPORTED_STATE_SCHEMA_REASON: &str = "unsupported_state_schema";
 
-/// Version-neutral coordination directory name directly under the data root.
-/// Every release resolves this same owner-only directory; supported code
-/// never renames, replaces, or unlinks it.
+/// `COORDINATION_DIR_NAME` names the version-neutral coordination directory under the data root.
 pub const COORDINATION_DIR_NAME: &str = ".mc-host-coordination";
 
-/// Never-renamed regular file carrying the cross-process lifecycle
-/// transaction flock inside the coordination directory.
+/// `TRANSACTION_LOCK_NAME` names the coordination file used for the cross-process transaction flock.
 pub const TRANSACTION_LOCK_NAME: &str = "transaction.lock";
 
-/// Never-renamed regular file carrying the daemon's whole-incarnation
-/// lifetime flock inside the coordination directory.
+/// `LIFETIME_LOCK_NAME` names the coordination file used for the daemon's lifetime flock.
 pub const LIFETIME_LOCK_NAME: &str = "lifetime.lock";
 
-/// Byte length of the canonical payload-manifest digest: the lowercase hex
-/// SHA-256 of the staged payload manifest.
 pub const PAYLOAD_MANIFEST_DIGEST_LEN: usize = 64;
 
-/// Accepts exactly the canonical release digest shape: 64 lowercase hex
-/// characters, nothing else. Empty, oversized, uppercase, or otherwise
-/// noncanonical digests are rejected (plan R36).
 pub fn is_canonical_payload_digest(digest: &str) -> bool {
     digest.len() == PAYLOAD_MANIFEST_DIGEST_LEN
         && digest
@@ -61,23 +47,15 @@ pub fn is_canonical_payload_digest(digest: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Snapshot cap shared with the publication reader.
 const MAX_EVIDENCE_BYTES: usize = 65_536;
 
-/// Resolves `${dataDir}/.mc-host-coordination`: the fixed owner-only
-/// directory whose never-renamed `transaction.lock` and `lifetime.lock`
-/// regular files serialize lifecycle mutation and fence incarnation lifetime
-/// across every release (plan KTD2). It sits outside the replaceable managed
-/// `cortexkit` subtree, so replacing `lifecycle`, `run`, or the whole subtree
-/// cannot split either lock.
+/// The coordination lock files serialize lifecycle mutation and fence each daemon incarnation's lifetime.
+/// Keeping coordination outside `cortexkit` prevents replacement of that subtree from splitting the locks.
 pub fn coordination_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
     Ok(data_dir_path(data_dir_override)?.join(COORDINATION_DIR_NAME))
 }
 
-/// Resolves `${dataDir}/cortexkit/lifecycle`: the managed lifecycle
-/// namespace (staged generations and profiles land here in later units). It
-/// is replaceable and therefore carries no lock; serialization lives on the
-/// stable coordination files instead.
+/// The replaceable lifecycle namespace carries no locks.
 pub fn lifecycle_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
     let run = runtime_dir_path(data_dir_override)?;
     let base = run
@@ -87,11 +65,8 @@ pub fn lifecycle_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, I
     Ok(base.join("lifecycle"))
 }
 
-/// Opens (creating if absent) the named coordination lock file inside the
-/// secured coordination directory and validates it is an owner-only,
-/// single-link regular file. `O_NONBLOCK` keeps a planted FIFO from hanging
-/// the open; the fstat check still rejects it. The mode is normalized to
-/// 0600 through the descriptor we validated as our own — never through an
+/// The function accepts only owner-only, single-link regular files.
+/// The function normalizes the validated descriptor's mode to 0600 instead of chmodding the path.
 /// attacker-selected path.
 fn open_coordination_lock_create(
     data_dir_override: Option<&Path>,
@@ -110,9 +85,7 @@ fn open_coordination_lock_create(
     Ok((fd, dir_path.join(name)))
 }
 
-/// `O_NONBLOCK` keeps a planted FIFO from hanging the open; the fstat check
-/// still rejects it. The mode is normalized to 0600 through the descriptor
-/// we validated as our own — never through an attacker-selected path.
+/// `O_NONBLOCK` prevents a planted FIFO from blocking open; `fstat` then rejects the FIFO.
 fn create_validated_lock_file(
     dir: &OwnedFd,
     dir_path: &Path,
@@ -149,10 +122,8 @@ fn create_validated_lock_file(
     Ok(fd)
 }
 
-/// No-create opener for observational probes: `Ok(None)` when the
-/// coordination directory or the named lock file does not exist. A hostile
-/// shape — symlink, FIFO, wrong owner, loose mode, extra links — fails
-/// closed instead of reading as absence.
+/// The function returns `Ok(None)` when the coordination directory or named lock file is absent.
+/// Symlinks, FIFOs, wrong owners, loose modes, and extra links fail closed.
 fn open_coordination_lock_probe(
     data_dir_override: Option<&Path>,
     name: &'static str,
@@ -188,31 +159,25 @@ fn open_coordination_lock_probe(
     Ok(Some((fd, path)))
 }
 
-/// The daemon's whole-incarnation lifetime fence: an exclusive flock on the
-/// stable `lifetime.lock` coordination file, taken before the runtime
-/// directory is secured and held through publication cleanup, component
-/// shutdown, and callback reaping (it is dropped with [`InstanceGuard`],
-/// after the runtime-directory lock). Because the file is never renamed and
-/// sits outside `cortexkit`, replacing the managed subtree cannot free it,
-/// so a successor cannot overlap a displaced incarnation.
+/// An exclusive flock on `lifetime.lock` fences each daemon incarnation.
+/// The daemon acquires `lifetime.lock` before securing the runtime directory.
+/// The daemon holds `lifetime.lock` through publication cleanup, component shutdown, and callback reaping.
+/// `InstanceGuard` drops `lifetime.lock` after the runtime-directory lock.
+/// `lifetime.lock` is never renamed and resides outside `cortexkit`.
+/// Replacing `cortexkit` cannot release `lifetime.lock`.
+/// A successor that opens `lifetime.lock` cannot overlap a displaced incarnation.
 ///
-/// The refusal holds only among coordination-aware incarnations: a release
-/// that predates this fence never opens `lifetime.lock`, so a rollback to
-/// such a release reinstates the replacement-overlap hazard unless the
-/// daemon is fully stopped first. Likewise, the fence binds by name: an
-/// actor that renames or removes `.mc-host-coordination` itself (an
-/// unsupported mutation of the data root) splits it the same way renaming
-/// the runtime directory splits the runtime lock.
+/// Only incarnations that open `lifetime.lock` participate in the fence.
+/// Operators must stop the daemon before running a release that does not open `lifetime.lock`.
+/// Renaming or removing `.mc-host-coordination` splits the lifetime fence.
+/// Renaming the runtime directory also splits the runtime lock.
 pub(crate) struct LifetimeLock {
     _file: OwnedFd,
 }
 
 impl LifetimeLock {
-    /// One nonblocking attempt: contention is reported as `AlreadyRunning`
-    /// so the caller decides how to wait. `run` retries on its own async
-    /// timer; parking an executor thread here (as the bounded blocking
-    /// retry would) could stall a same-process predecessor drain whose
-    /// completion releases this very lock.
+    /// `acquire` must not block because parking an executor thread can stall a same-process predecessor drain that releases `lifetime.lock`.
+    /// The predecessor drain releases `lifetime.lock` when it completes.
     pub(crate) fn acquire(data_dir_override: Option<&Path>) -> Result<Self, InstanceError> {
         let (file, path) = open_coordination_lock_create(data_dir_override, LIFETIME_LOCK_NAME)?;
         match flock(&file, FlockOperation::NonBlockingLockExclusive) {
@@ -223,12 +188,10 @@ impl LifetimeLock {
     }
 }
 
-/// Nonblocking observational test of the lifetime fence. `Ok(true)` means no
-/// incarnation holds it. An absent coordination root or lock file also
-/// reports free: absence has no possible holder for a supported deployment,
-/// where the coordination names are never renamed or unlinked — an external
-/// rename of `.mc-host-coordination` under a live daemon is out of contract
-/// and reads as free here. The momentary shared hold is released when the
+/// Tests `lifetime.lock` without blocking; `Ok(true)` means no incarnation holds it.
+/// An absent coordination root or lock file reports free because supported deployments never rename or unlink the coordination names.
+/// Supported deployments must not rename `.mc-host-coordination` while a daemon is live.
+/// Renaming `.mc-host-coordination` under a live daemon makes the probe report free.
 /// descriptor drops.
 fn lifetime_lock_free(data_dir_override: Option<&Path>) -> Result<bool, InstanceError> {
     let Some((fd, path)) = open_coordination_lock_probe(data_dir_override, LIFETIME_LOCK_NAME)?
@@ -242,18 +205,13 @@ fn lifetime_lock_free(data_dir_override: Option<&Path>) -> Result<bool, Instance
     }
 }
 
-/// Returns whether the lifecycle-record name holds quarantined bytes: a
-/// readable regular file whose JSON carries an unknown schema. Such bytes
-/// are preserved byte-for-byte — supported code must not interpret,
-/// migrate, overwrite, or remove them (plan R22).
+/// Returns `true` when a regular lifecycle record has an unknown schema or cannot be read.
+/// Supported code must not interpret, migrate, overwrite, or remove quarantined bytes.
 ///
-/// The gate fails closed where record bytes could exist but cannot be
-/// proven to carry a known schema: an open, stat, or read failure —
-/// including a record larger than [`MAX_EVIDENCE_BYTES`], which a future
-/// schema may legitimately be — refuses the start rather than admit an
-/// overwrite. Non-regular shapes (a planted symlink or FIFO) are not
-/// records: startup's atomic rename replaces the name without following
-/// it, per `a_planted_symlink_at_the_record_name_is_replaced_not_followed`.
+/// Startup refuses when record bytes could exist but cannot be proven to carry a known schema.
+/// Open failures other than `NOENT`, `LOOP`, and `NOTDIR`, plus `fstat` failures and read failures, refuse startup because the record schema cannot be proven known.
+/// A record larger than [`MAX_EVIDENCE_BYTES`] refuses startup rather than permit an overwrite.
+/// Startup's atomic rename replaces a non-regular lifecycle-record name without following it.
 pub(crate) fn quarantined_record_present(
     dir: &OwnedFd,
     dir_path: &Path,
@@ -276,14 +234,11 @@ pub(crate) fn quarantined_record_present(
         return Ok(false);
     }
     let Ok(bytes) = read_all_fd(&fd, MAX_EVIDENCE_BYTES) else {
-        // Unreadable or oversized: cannot prove a known schema, so treat as
-        // quarantined rather than admit an overwrite.
         return Ok(true);
     };
     Ok(matches!(decode_record(&bytes), RecordDecode::UnknownSchema))
 }
 
-/// Where in an incarnation the daemon reported itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecyclePhase {
     Starting,
@@ -310,8 +265,8 @@ impl LifecyclePhase {
     }
 }
 
-/// Strict schema-1 lifecycle record. PID is optional display metadata only:
-/// no decision may be made from it (plan KTD3).
+/// A schema-1 lifecycle record uses PID only as optional display metadata.
+/// The daemon must not make decisions from PID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleRecord {
     pub phase: LifecyclePhase,
@@ -337,14 +292,9 @@ struct WireRecord {
 const HEX_LAUNCH_LEN: usize = 32;
 const HEX_DAEMON_LEN: usize = 32;
 
-/// Outcome of strictly decoding lifecycle-record bytes. Unknown schemas are
-/// distinguished from corruption because they are quarantined, not repaired:
-/// the bytes stay untouched and classification reports
-/// `unsupported_state_schema` instead of a corrupt record. `Legacy` is the
-/// one pre-coordination shape — schema 1, valid in every field except an
-/// empty payload digest, exactly what releases before the digest fence
-/// persisted — kept distinct so a live pre-coordination incumbent can be
-/// classified instead of read as corruption.
+/// Unknown schemas are classified separately from corruption because they are quarantined rather than repaired.
+/// `Legacy` records have schema 1 and an empty `payload_manifest_digest`; all other validated fields are valid.
+/// `Legacy` records are not `Malformed` when only `payload_manifest_digest` is empty.
 #[derive(Debug, PartialEq, Eq)]
 enum RecordDecode {
     Valid(LifecycleRecord),
@@ -373,8 +323,7 @@ fn decode_record(bytes: &[u8]) -> RecordDecode {
             && s.bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     };
-    // Exactly empty is the legacy pre-digest shape; any other noncanonical
-    // digest is corruption.
+    // `payload_manifest_digest` is legacy only when empty; other noncanonical values are malformed.
     let legacy_digest = wire.payload_manifest_digest.is_empty();
     if !is_hex(&wire.launch_id, HEX_LAUNCH_LEN)
         || !is_hex(&wire.daemon_id, HEX_DAEMON_LEN)
@@ -405,23 +354,15 @@ fn now_ms() -> u64 {
 }
 
 impl InstanceGuard {
-    /// A path or symlink swap cannot redirect the write outside the locked
     /// directory inode.
     ///
-    /// Blocking-synchronous: one small-file open/write/fsync/rename, the same
-    /// exposure `publish` and `remove_publication` already have. Callers run
-    /// it directly on startup and teardown paths — once per incarnation, not
-    /// per request — accepting a single fsync's latency there rather than
-    /// restructuring guard ownership around `spawn_blocking`.
     pub fn write_lifecycle_record(&self, phase: LifecyclePhase) -> Result<(), InstanceError> {
         let record = WireRecord {
             schema: 1,
             phase: phase.as_str().to_owned(),
             launch_id: hex(self.launch_id()),
             daemon_id: hex(self.daemon_id()),
-            // The same validated digest is written for every phase of one
-            // incarnation, so `starting`, `running`, and `stopping` carry a
-            // byte-identical nonempty payload identity (plan R36).
+            // `payload_manifest_digest` is the same for every lifecycle phase of one `InstanceGuard`.
             payload_manifest_digest: self.payload_manifest_digest().to_owned(),
             pid: std::process::id(),
             written_at_ms: now_ms(),
@@ -436,34 +377,20 @@ impl InstanceGuard {
         .map(|_stat| ())
     }
 
-    /// Marks this incarnation `stopping` and then retires its publication.
     ///
-    /// The order matters: `classify` maps a held lock plus a `running` record
-    /// with no publication to `wedged`, so unpublishing without first
-    /// demoting the phase reports an operator-visible fault for an orderly
-    /// stop. Every teardown path — graceful shutdown and the abandoned-`run`
-    /// guard — goes through here so the two cannot report different states
-    /// for the same situation.
     ///
-    /// The phase write is best effort: teardown proceeds regardless, and a
-    /// stale phase ages to `wedged` honestly.
     pub fn begin_stopping(&mut self) {
         let _ = self.write_lifecycle_record(LifecyclePhase::Stopping);
         self.remove_publication();
     }
 
-    /// Best-effort fenced removal of this incarnation's lifecycle record:
-    /// no-follow open, secure regular file, matching launch and daemon
-    /// identity. A mismatch leaves the file alone — an old incarnation must
-    /// never delete a successor's evidence.
+    /// A launch ID or daemon ID mismatch leaves the record unchanged.
+    /// The guard never deletes a successor's evidence.
     ///
-    /// `O_NONBLOCK` is load-bearing, not an optimization: `O_NOFOLLOW`
-    /// rejects a symlink but not a FIFO, and opening a FIFO for reading
-    /// blocks until a writer arrives. Without it a planted FIFO at this name
-    /// would hang this call forever — and this runs from `Drop` while the
-    /// instance lock is still held, so the lock would never be released and
-    /// every later start would fail `AlreadyRunning`. The flag is a no-op on
-    /// regular files, and `is_secure_regular` below still rejects the FIFO.
+    /// `O_NONBLOCK` prevents a planted FIFO from blocking the read open.
+    /// `O_NOFOLLOW` rejects symlinks but not FIFOs.
+    /// Opening a FIFO for reading blocks until a writer arrives.
+    /// `is_secure_regular` rejects FIFOs after `openat` succeeds.
     pub fn remove_lifecycle_record(&self) {
         let Ok(fd) = openat(
             self.dir(),
@@ -492,30 +419,22 @@ impl InstanceGuard {
     }
 }
 
-/// Exclusive cross-process lifecycle transaction lock, held as a flock on
-/// the never-renamed `${dataDir}/.mc-host-coordination/transaction.lock`
-/// regular file (plan KTD2).
+/// The transaction lock is an exclusive cross-process `flock` on `${dataDir}/.mc-host-coordination/transaction.lock`.
+/// The transaction lock is never renamed.
 ///
-/// The lock file is a mutual-exclusion token, not an evidence anchor: the
-/// runtime evidence lives in the managed `cortexkit/run` directory. Because
-/// the token sits outside the replaceable managed subtree and is never
-/// renamed or unlinked by supported code, renaming or replacing `lifecycle`,
-/// `run`, or the whole `cortexkit` tree cannot mint a second transaction
-/// owner. A holder that mutates named entries must still anchor those
-/// mutations to retained descriptors and abort on identity drift
-/// ([`NamespaceAnchor`]); the lock alone serializes mutators, it does not prove
-/// the names still resolve to the tree the holder opened.
+/// The lock file serializes mutators but does not anchor runtime evidence.
+/// Runtime evidence lives in the managed `cortexkit/run` directory.
+/// Supported code never renames or unlinks `transaction.lock`.
+/// Replacing `lifecycle`, `run`, or `cortexkit` cannot mint a second transaction owner.
+/// A holder that mutates named entries must anchor mutations to retained descriptors.
+/// `NamespaceAnchor` requires holders to abort mutations on identity drift.
+/// The lock serializes mutators but does not prove that names still resolve to the opened tree.
 ///
-/// Like the lifetime fence, the exclusion holds only among coordination-aware
-/// releases. A release that predates this token serializes transactions on the
-/// `${dataDir}/cortexkit/lifecycle` directory inode instead; that inode and
-/// this file are unrelated, so the two never contend and a pre-coordination
-/// launcher's transaction can overlap one taken here. Mixed-release lifecycle
-/// mutation therefore requires stopping the daemon across the transition
-/// rather than relying on this lock; restoring exclusion against a
-/// pre-coordination peer would mean also acquiring the legacy directory lock in
-/// a fixed order, which no supported deployment needs while adjacent-release
-/// interop stays stop-only.
+/// The exclusion holds only among coordination-aware releases.
+/// A release that predates `transaction.lock` serializes transactions on the `${dataDir}/cortexkit/lifecycle` directory inode instead.
+/// `transaction.lock` and the legacy `lifecycle` directory inode are unrelated, so their flocks never contend.
+/// A pre-coordination launcher's transaction can overlap one taken here.
+/// Stop the daemon before mutating if a pre-coordination launcher may run.
 pub struct LifecycleTransactionLock {
     _file: OwnedFd,
     path: PathBuf,
@@ -530,31 +449,24 @@ impl std::fmt::Debug for LifecycleTransactionLock {
 }
 
 impl LifecycleTransactionLock {
-    /// Securely creates or opens the coordination root and takes the
-    /// exclusive nonblocking transaction flock on `transaction.lock`.
-    /// `AlreadyRunning` means another lifecycle transaction holds it.
+    /// `AlreadyRunning` means another lifecycle transaction holds `transaction.lock`.
     ///
-    /// Uses the same bounded retry as the instance lock: a probe's shared
-    /// hold is transient, and reporting `AlreadyRunning` for it would name a
-    /// mutator that does not exist.
+    /// `acquire_exclusive` retries because a probe's shared lock is transient; otherwise `AlreadyRunning` could identify no mutator.
     pub fn acquire_exclusive(data_dir_override: Option<&Path>) -> Result<Self, InstanceError> {
         let (file, path) = open_coordination_lock_create(data_dir_override, TRANSACTION_LOCK_NAME)?;
         flock_exclusive_bounded(&file, &path, "flock_transaction")?;
         Ok(Self { _file: file, path })
     }
 
-    /// Validation-only shared lock for observational probes: never creates
-    /// the coordination root or the lock file. `Ok(None)` means no
-    /// coordination root exists or a mutator outlasted the bounded wait
-    /// below; the probe proceeds on evidence alone and relies on its bounded
+    /// `acquire_shared` never creates the coordination root or lock file.
+    /// `Ok(None)` means no coordination root exists or a mutator outlasted the bounded wait.
+    /// The probe proceeds on evidence alone and relies on its bounded reread loop.
     /// reread loop.
     ///
-    /// The wait mirrors the bounded retry mutators use against a probe's
-    /// transient shared hold: a mutator's transaction is a few file writes,
-    /// so retrying covers it and the probe samples with the transaction
-    /// excluded instead of reading a stable-looking intermediate state the
-    /// reread loop cannot detect. Blocking: the retry sleeps the calling
-    /// thread, matching `probe_lifecycle`'s documented contract.
+    /// The wait uses the same bounded retry that mutators use against a probe's shared lock.
+    /// Retrying lets the probe acquire the shared lock after a mutator releases it.
+    /// Acquiring the shared lock prevents the probe from reading intermediate mutator state that its reread loop cannot detect.
+    /// The bounded retry blocks the calling thread.
     pub fn acquire_shared(data_dir_override: Option<&Path>) -> Result<Option<Self>, InstanceError> {
         let Some((file, path)) =
             open_coordination_lock_probe(data_dir_override, TRANSACTION_LOCK_NAME)?
@@ -574,17 +486,12 @@ impl LifecycleTransactionLock {
     }
 }
 
-/// Retained managed-namespace descriptors for a lifecycle mutator:
-/// `cortexkit` plus whichever of its `lifecycle` and `run` children exist at
-/// capture. A holder of the transaction lock captures the anchor, performs
-/// mutations relative to the retained descriptors, and calls [`verify`]
-/// before reporting any named-namespace result: if a captured name no longer
-/// resolves to the same identity — the tree was renamed or replaced — the
-/// holder must abort rather than claim a commit under the canonical names.
+/// `NamespaceAnchor` retains managed-namespace descriptors for lifecycle mutators.
+/// `NamespaceAnchor` retains `cortexkit` and its existing `lifecycle` and `run` children.
+/// Transaction-lock holders capture the anchor and mutate through its retained descriptors.
+/// Transaction-lock holders must call [`verify`] before reporting a named-namespace result.
+/// A holder must abort if a captured name resolves to a different identity.
 ///
-/// Published because the lifecycle CLI holds the transaction lock from outside
-/// this crate and runs the check before reporting any named-namespace result,
-/// so the drift check has a production caller rather than only tests.
 ///
 /// [`verify`]: NamespaceAnchor::verify
 pub struct NamespaceAnchor {
@@ -593,8 +500,8 @@ pub struct NamespaceAnchor {
 
 struct AnchorEntry {
     path: PathBuf,
-    /// Retained so mutations stay descriptor-relative for the anchor's
-    /// lifetime; identity comparison uses the recorded (dev, ino).
+    /// The anchor retains each descriptor so mutations remain descriptor-relative for its lifetime.
+    /// The anchor compares identities using each entry's recorded `(dev, ino)`.
     _fd: OwnedFd,
     dev: u64,
     ino: u64,
@@ -615,18 +522,17 @@ impl std::fmt::Debug for NamespaceAnchor {
     }
 }
 
-// `Stat` field types vary by platform (macOS `st_dev` is `i32`); the casts
-// are no-ops on Linux but load-bearing elsewhere.
+// `Stat::st_dev` is `i32` on macOS, so `stat_identity` casts it to `u64`.
+// The cast is required on platforms where `st_dev` is not `u64`.
 #[allow(clippy::unnecessary_cast)]
 fn stat_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
     (stat.st_dev as u64, stat.st_ino as u64)
 }
 
 impl NamespaceAnchor {
-    /// Opens `cortexkit` and its existing `lifecycle` and `run` children
-    /// through validated no-follow descriptors and records their identities.
-    /// Absent entries are simply not captured: creating them later is the
-    /// mutator's own work, not drift.
+    /// `NamespaceAnchor::capture` uses validated no-follow descriptors and records each directory's identity.
+    /// `NamespaceAnchor::capture` does not capture absent entries.
+    /// Creating an uncaptured entry later does not constitute namespace drift.
     pub fn capture(data_dir_override: Option<&Path>) -> Result<Self, InstanceError> {
         let base = crate::instance::managed_dir_path(data_dir_override)?;
         let mut entries = Vec::new();
@@ -646,10 +552,7 @@ impl NamespaceAnchor {
         Ok(Self { entries })
     }
 
-    /// Re-resolves every captured name and fails with
-    /// [`InstanceError::NamespaceDrift`] when a name is gone or resolves to a
-    /// different identity. Callers abort their named-namespace result on
-    /// error; the retained descriptors and stable locks are unaffected.
+    /// `NamespaceAnchor::verify` returns [`InstanceError::NamespaceDrift`] when a captured name is absent or resolves to a different identity.
     pub fn verify(&self) -> Result<(), InstanceError> {
         for entry in &self.entries {
             let drift = || InstanceError::NamespaceDrift {
@@ -668,10 +571,9 @@ impl NamespaceAnchor {
     }
 }
 
-/// Opens an existing directory by walking each component with `O_NOFOLLOW`
-/// — so no intermediate or final symlink is followed — without creating or
-/// chmodding anything; validates replacement-proof intermediates and
-/// owner-only final metadata. `None` means some component does not exist.
+/// `open_validated_dir` does not follow intermediate or final symlinks.
+/// `open_validated_dir` neither creates nor changes permissions on filesystem entries.
+/// `None` indicates that at least one path component does not exist.
 fn open_validated_dir(
     dir_path: &Path,
     what: &'static str,
@@ -713,9 +615,9 @@ fn open_validated_dir(
         let next = match openat(&current, name, flags, Mode::empty()) {
             Ok(fd) => fd,
             Err(rustix::io::Errno::NOENT) => return Ok(None),
-            // O_NOFOLLOW on a symlink component reports ELOOP; a directory
-            // opener hitting a non-directory reports ENOTDIR. Both are
-            // hostile shapes, not absence.
+            // Opening a symlink component with `O_NOFOLLOW` fails with `ELOOP`.
+            // Opening a non-directory component fails with `ENOTDIR`.
+            // `ELOOP` and `ENOTDIR` are hostile shapes, not absence.
             Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::NOTDIR) => {
                 return Err(insecure());
             }
@@ -739,8 +641,7 @@ fn open_validated_dir(
     Ok(Some(current))
 }
 
-/// Observed lifecycle state (plan R6). `Wedged` is observational only:
-/// nothing in this crate kills processes or breaks locks.
+/// `LifecycleState::Wedged` records an observation; this crate neither kills processes nor breaks locks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleState {
     Stopped,
@@ -750,8 +651,8 @@ pub enum LifecycleState {
     Wedged,
 }
 
-/// Untrusted diagnostic summary of a publication. Never carries key bytes
-/// and never authorizes anything (plan R16).
+/// `PublicationSummary` is untrusted diagnostic data and never carries key bytes.
+/// `PublicationSummary` never authorizes anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationSummary {
     pub daemon_id: String,
@@ -760,8 +661,8 @@ pub struct PublicationSummary {
     pub port: u16,
 }
 
-/// How long `starting` and `stopping` evidence stays credible before a held
-/// lock with that evidence classifies `wedged`.
+/// `ProbeFreshness::window` limits how long `Starting` and `Stopping` evidence remains credible.
+/// A held lock with expired `Starting` or `Stopping` evidence classifies as `Wedged`.
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeFreshness {
     pub window: Duration,
@@ -775,16 +676,15 @@ impl Default for ProbeFreshness {
     }
 }
 
-/// One coherent lifecycle observation.
 #[derive(Debug)]
 pub struct LifecycleProbe {
     pub state: LifecycleState,
-    /// Bounded static classification detail; never tainted file content.
+    /// `reason` contains bounded static classification detail, never file content.
     pub reason: &'static str,
     pub record: Option<LifecycleRecord>,
     pub publication: Option<PublicationSummary>,
     pub instance_lock_free: bool,
-    /// Whether the stable `lifetime.lock` fence had no holder at sample time.
+    /// `lifetime_lock_free` is true when `lifetime.lock` had no holder at sample time.
     pub lifetime_lock_free: bool,
 }
 
@@ -794,12 +694,12 @@ struct EvidenceSample {
     publication: EvidenceFile,
 }
 
-/// Reads one evidence file, distinguishing genuine absence from a hostile
-/// shape. `O_NONBLOCK` is required for correctness: `O_NOFOLLOW` rejects a
-/// symlink but not a FIFO, and a FIFO opened for reading blocks until a
-/// writer arrives, which would hang every probe uncancellably (a blocking
-/// syscall outruns any `spawn_blocking` timeout). The flag is a no-op on
-/// regular files and `is_secure_regular` still rejects the FIFO.
+/// Treat only `NOENT` as absence; fail closed on every other open error.
+/// `O_NONBLOCK` prevents FIFO opens from blocking; `O_NOFOLLOW` does not reject FIFOs.
+/// Without `O_NONBLOCK`, opening a FIFO for reading blocks until a writer arrives.
+/// A blocking syscall can outlive any `spawn_blocking` timeout.
+/// `O_NONBLOCK` does not change regular-file reads.
+/// `is_secure_regular` rejects FIFOs after the nonblocking open.
 fn read_evidence_file(dir: &OwnedFd, name: &str) -> EvidenceFile {
     let fd = match openat(
         dir,
@@ -808,12 +708,9 @@ fn read_evidence_file(dir: &OwnedFd, name: &str) -> EvidenceFile {
         Mode::empty(),
     ) {
         Ok(fd) => fd,
-        // Only "the name is not there" is absence. Every other failure is a
-        // shape this probe must fail closed on: `ELOOP` from a planted
-        // symlink, `ENOTDIR`/`ENXIO` from a hostile type, `EACCES` from a
-        // mode we cannot vouch for, `EMFILE`/`ENFILE` from exhaustion.
-        // Collapsing those to `Absent` would let a symlink downgrade a
-        // `wedged` verdict to `starting`/`stopping` (protocol §4.3).
+        // Treat `ELOOP`, `ENOTDIR`, and `ENXIO` as insecure.
+        // A symlink-open failure must not produce `Absent`.
+        // Treating a symlink as absent could downgrade `Wedged` to `Starting` or `Stopping`.
         Err(rustix::io::Errno::NOENT) => return EvidenceFile::Absent,
         Err(_) => return EvidenceFile::Insecure,
     };
@@ -833,7 +730,7 @@ fn read_evidence_file(dir: &OwnedFd, name: &str) -> EvidenceFile {
 enum EvidenceFile {
     Absent,
     Present(Vec<u8>),
-    /// Wrong type, owner, mode, link count, or oversize: hostile shape.
+    /// `is_secure_regular` rejects files with the wrong type, owner, mode, link count, or size.
     Insecure,
 }
 
@@ -853,20 +750,18 @@ fn sample_evidence(dir: &OwnedFd) -> EvidenceSample {
     }
 }
 
-/// Nonblocking probe of instance-lock ownership on the same open file
-/// description the evidence was sampled through, so a directory swapped
-/// between opens cannot pair one inode's evidence with another's lock.
-/// flock ownership is per open file description, so this works even when the
-/// holding daemon lives in the same process.
+/// The probe checks instance-lock ownership nonblockingly on the evidence file's open file description.
+/// The probe cannot pair one inode's evidence with another inode's lock after a directory swap.
+/// `flock` ownership is per open file description.
+/// Per-open-file-description ownership also detects a daemon holding the lock in the same process.
 ///
-/// The test takes a *shared* lock, not an exclusive one. A daemon holds this
-/// inode exclusively for its whole incarnation, and shared conflicts with
-/// exclusive, so a live host is still detected. Testing with an exclusive
-/// lock would instead make probes conflict with each other: the loser would
-/// read `WOULDBLOCK`, report the lock held, and misclassify a stopped host as
-/// `wedged` (or resurrect a crashed daemon's stale evidence as `running`),
-/// inverting the protocol §4.3 rule that a free lock always means `stopped`.
-/// The probe unlocks immediately either way.
+/// The test takes a shared lock because shared locks conflict with the daemon's exclusive lifetime lock.
+/// A daemon holds the lifetime-lock inode exclusively for its entire incarnation.
+/// Shared locking detects a daemon's exclusive lock without making concurrent probes conflict.
+/// Exclusive probes conflict with each other.
+/// An exclusive-lock loser reads `WOULDBLOCK` and reports the lock held.
+/// An exclusive probe can misclassify a stopped host as `LifecycleState::Wedged` or stale evidence as `LifecycleState::Running`.
+/// A free lock means no holder held the sampled lock at probe time.
 fn instance_lock_free(dir: &OwnedFd, dir_path: &Path) -> Result<bool, InstanceError> {
     match flock(dir, FlockOperation::NonBlockingLockShared) {
         Ok(()) => {
@@ -878,11 +773,9 @@ fn instance_lock_free(dir: &OwnedFd, dir_path: &Path) -> Result<bool, InstanceEr
     }
 }
 
-/// Decodes a publication and enforces the same contract discovery applies
-/// (protocol §4.1): schema, key length, declared wire version, loopback
-/// host, nonzero port, nonempty daemon version. A publication no conforming
-/// client would accept must not count as evidence of a running host, so
-/// `None` here sends a held lock with a `running` record to `wedged` rather
+/// A valid publication must satisfy the contract discovery accepts.
+/// A publication no conforming client accepts cannot establish a running host.
+/// `None` classifies a held lock with a `LifecycleState::Running` record as `LifecycleState::Wedged`.
 /// than `running`.
 fn publication_summary(bytes: &[u8]) -> Option<PublicationSummary> {
     let info: ConnectionInfo = serde_json::from_slice(bytes).ok()?;
@@ -904,37 +797,36 @@ fn publication_summary(bytes: &[u8]) -> Option<PublicationSummary> {
     })
 }
 
-/// Classifies host lifecycle state from lock ownership plus fenced evidence
-/// (plan KTD3). Blocking-synchronous and observational: it creates nothing,
-/// chmods nothing, unlinks nothing, and never signals a PID. It may sleep its
-/// thread briefly while re-sampling, so async callers must wrap it in
+/// `probe_lifecycle` classifies host lifecycle state from lock ownership and fenced evidence.
+/// The probe blocks synchronously and creates nothing.
+/// The probe does not change permissions, unlink files, or signal PIDs.
+/// Async callers must use `spawn_blocking` because re-sampling may sleep the thread.
 /// `spawn_blocking`.
 pub fn probe_lifecycle(
     data_dir_override: Option<&Path>,
     freshness: &ProbeFreshness,
 ) -> Result<LifecycleProbe, InstanceError> {
     const MAX_REREADS: usize = 3;
-    // A daemon must hold the instance lock before it can write its `starting`
-    // record, so a probe landing in that window sees a held lock with no
-    // evidence — by shape alone indistinguishable from a wedged host. The
-    // record write includes an fsync, so the window is short but not
-    // instantaneous; re-sample a bounded number of times before believing it.
-    // A genuinely record-less holder still classifies `wedged` after the last
+    // A daemon acquires the instance lock before writing its `starting` record.
+    // A probe that runs between lock acquisition and record creation sees a held lock with no evidence.
+    // A held lock with no evidence is indistinguishable from a wedged host.
+    // The record write fsyncs, but the window is not instantaneous.
+    // The probe re-samples `ABSENT_RECORD_GRACE` times before classifying the holder as `wedged`.
+    // A genuinely record-less holder classifies as `wedged` after the last attempt.
     // attempt.
     const ABSENT_RECORD_GRACE: usize = 2;
-    // The lifetime fence is taken before the runtime lock at start and
-    // released after it at teardown, so a probe can land in a window where
-    // exactly one is held. The window is a few syscalls wide; re-sample a
-    // bounded number of times before treating disagreement as a fault.
+    // The daemon acquires the lifetime fence before the runtime lock and releases it afterward.
+    // A probe can observe exactly one lock held while a daemon acquires or releases the fences.
+    // The probe re-samples `LOCK_DISAGREEMENT_GRACE` times before treating a lifetime-fence/runtime-lock disagreement as a fault.
     const LOCK_DISAGREEMENT_GRACE: usize = 2;
     const GRACE_DELAY: Duration = Duration::from_millis(25);
 
     let dir_path = runtime_dir_path(data_dir_override)?;
-    // A missing runtime directory is `stopped` only when the stable lifetime
-    // fence is also free. A held fence names a live incarnation whose
-    // namespace was replaced (or one still creating its runtime directory:
-    // the same bounded grace covers that startup window). A free replacement
-    // runtime lock is never proof that the first daemon ended.
+    // A missing runtime directory means `stopped` only if the stable lifetime fence is free.
+    // A held lifetime fence can identify a live incarnation whose namespace was replaced.
+    // A held lifetime fence can also identify an incarnation still creating its runtime directory.
+    // The probe re-samples `LOCK_DISAGREEMENT_GRACE` times while a live incarnation creates its runtime directory.
+    // A free runtime lock does not prove that the lifetime-fence holder ended.
     let mut runtime_dir = None;
     for attempt in 0..=LOCK_DISAGREEMENT_GRACE {
         match open_validated_dir(&dir_path, "lifecycle evidence directory")? {
@@ -974,14 +866,9 @@ pub fn probe_lifecycle(
     let mut grace_rereads = 0;
     let mut disagreement_rereads = 0;
     loop {
-        // Shared transaction lock per sample, when the coordination root
-        // exists: an in-flight mutator is excluded for the duration of one
-        // sample. Absence (or a held exclusive lock) degrades to
-        // evidence-only probing, made coherent by the bounded reread loop.
-        // The hold is released before any grace sleep below: mutators only
-        // tolerate LOCK_RETRY_ATTEMPTS x LOCK_RETRY_DELAY of contention, so
-        // sleeping under a shared hold would make an innocent probe report a
-        // mutator that does not exist as `AlreadyRunning`.
+        // A shared transaction lock excludes in-flight mutators for each sample.
+        // If the transaction lock is absent or exclusively held, the probe uses evidence-only sampling.
+        // The bounded reread loop keeps evidence-only samples coherent.
         let sample = {
             let _root = LifecycleTransactionLock::acquire_shared(data_dir_override)?;
             let lifetime_before = lifetime_lock_free(data_dir_override)?;
@@ -1001,10 +888,7 @@ pub fn probe_lifecycle(
             std::thread::sleep(GRACE_DELAY);
             continue;
         }
-        // A coordination-aware daemon that just acquired both fences may not
-        // have replaced a predecessor's record yet: an absent record and a
-        // stale legacy (empty-digest) leftover are both expected in that
-        // startup window, so re-sample before believing either.
+        // The probe retries absent or stale legacy records while both fences are held, up to `ABSENT_RECORD_GRACE` times.
         let stale_legacy = !lock_free
             && !lifetime_free
             && matches!(
@@ -1024,8 +908,6 @@ pub fn probe_lifecycle(
 }
 
 /// A credible timestamp lies within `window` of now, in either direction:
-/// older has expired, and further in the future than the window exceeds any
-/// plausible clock skew.
 fn timestamp_fresh(written_at_ms: u64, window: Duration) -> bool {
     let now = now_ms();
     let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
@@ -1048,11 +930,6 @@ fn classify(
     let publication = sample.publication.bytes().and_then(publication_summary);
 
     if lock_free && lifetime_free {
-        // No holder of either fence means no incarnation, whatever evidence
-        // remains: a crashed daemon's leftovers are diagnostics, not
-        // liveness. Nothing is unlinked (plan R5). Quarantined unknown-schema
-        // bytes are still surfaced so callers report them instead of
-        // treating the root as cleanly reusable.
         let reason = if unknown_schema {
             UNSUPPORTED_STATE_SCHEMA_REASON
         } else if sample.record != EvidenceFile::Absent
@@ -1081,13 +958,6 @@ fn classify(
         lifetime_lock_free: lifetime_free,
     };
 
-    // Exactly one fence held after the bounded rereads. A held runtime lock
-    // with a free lifetime fence and a legacy record is the one coherent
-    // shape: a live pre-coordination incumbent (a release that predates the
-    // lifetime fence), which classifies by its record below so the launcher
-    // can stop it instead of alarming. Every other single-fence combination
-    // — a replaced runtime directory, a squatter, or a genuinely stuck
-    // teardown — is a fault.
     let incumbent = !lock_free && lifetime_free && legacy_record.is_some();
     if lock_free != lifetime_free && !incumbent {
         return wedged("lifetime and runtime locks disagree", record);
@@ -1102,11 +972,6 @@ fn classify(
     if sample.publication == EvidenceFile::Insecure {
         return wedged("publication failed security checks", record);
     }
-    // A legacy (empty-digest) record under a coordination-aware holder is a
-    // fault: every release with the lifetime fence writes a canonical
-    // digest, so the holder cannot have written this record. Under a
-    // pre-coordination incumbent the legacy record is its ordinary output
-    // and classifies like a valid one.
     let record = if incumbent {
         legacy_record
     } else if legacy_record.is_some() {
@@ -1130,11 +995,6 @@ fn classify(
     }
     let (state, reason) = match record.phase {
         LifecyclePhase::Starting => {
-            // A publication under a foreign daemon ID is expected crash
-            // residue here: a SIGKILLed predecessor leaves its publication
-            // behind, and the successor writes its `starting` record before
-            // its own `publish` overwrites the file. Only a `running` claim
-            // requires the publication to match.
             if timestamp_fresh(record.written_at_ms, freshness.window) {
                 (LifecycleState::Starting, "starting record is fresh")
             } else {
@@ -1156,9 +1016,6 @@ fn classify(
             ),
         },
         LifecyclePhase::Stopping => {
-            // Same crash-residue rule as `starting`: an incarnation that
-            // failed before publishing tears down past a predecessor's
-            // fenced-off publication without ever owning it.
             if timestamp_fresh(record.written_at_ms, freshness.window) {
                 (LifecycleState::Stopping, "stopping record is fresh")
             } else {
@@ -1176,10 +1033,6 @@ fn classify(
     }
 }
 
-/// Host-owned `host.shutdown` commit latch: `open -> response_in_flight ->
-/// committed` (plan KTD4). Full-frame write acknowledgement of the winning
-/// correlated success response is the stop linearization point; every
-/// pre-acknowledgement failure reopens ownership for a later authenticated
 /// requester.
 pub struct ShutdownLatch {
     phase: Mutex<LatchPhase>,
@@ -1193,15 +1046,11 @@ enum LatchPhase {
     Committed,
 }
 
-/// What a shutdown requester holds after asking the latch for ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LatchDecision {
-    /// This requester owns the attempt and must enqueue the committing
     /// response.
     Owner,
-    /// Another attempt is in flight; wait for `changed` and ask again.
     Wait,
-    /// A prior attempt committed; respond success without a second commit.
     Committed,
 }
 
@@ -1225,9 +1074,6 @@ impl ShutdownLatch {
         }
     }
 
-    /// A pre-acknowledgement failure returns ownership to `open` so a later
-    /// requester can commit. Idempotent against an already-committed latch:
-    /// commit is final.
     pub fn reopen(&self) {
         let mut phase = self.phase.lock().expect("latch lock");
         if *phase == LatchPhase::ResponseInFlight {
@@ -1237,17 +1083,11 @@ impl ShutdownLatch {
         self.changed.notify_waiters();
     }
 
-    /// Full-frame acknowledgement observed: the latch is committed forever.
     pub fn commit(&self) {
         *self.phase.lock().expect("latch lock") = LatchPhase::Committed;
         self.changed.notify_waiters();
     }
 
-    /// Registers interest in the next phase change. Callers must pin the
-    /// returned future and call `enable()` on it BEFORE re-checking
-    /// `try_own`: `notify_waiters` only wakes futures that are already
-    /// enabled or polled, so a change between check and first poll would
-    /// otherwise be missed forever.
     pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
         self.changed.notified()
     }
@@ -1259,11 +1099,6 @@ impl Default for ShutdownLatch {
     }
 }
 
-/// Commits the latch and cancels host admission when the winning response's
-/// bytes fully reach the socket; reopens ownership when dropped unrun (the
-/// writer retired, the write failed or timed out, or the frame was never
-/// enqueued). Runs inside retained host work — the connection writer task —
-/// so requester-task cancellation after enqueue cannot lose the shutdown.
 pub struct CommitOnAck {
     latch: std::sync::Arc<ShutdownLatch>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -1354,8 +1189,6 @@ mod tests {
                 .write_lifecycle_record(LifecyclePhase::Running)
                 .expect("write running");
 
-            // An old incarnation must not delete a successor's record when
-            // either fence member differs.
             let bytes = std::fs::read(record_path(&guard)).expect("read record");
             let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
             json[field] = serde_json::Value::String("ab".repeat(16));
@@ -1435,7 +1268,6 @@ mod tests {
                 "digest {digest:?} must be rejected"
             );
         }
-        // Exactly empty is the one legacy pre-coordination shape.
         assert!(matches!(
             mutate(&|v| v["payload_manifest_digest"] = "".into()),
             RecordDecode::Legacy(_)
@@ -1465,8 +1297,6 @@ mod tests {
         );
     }
 
-    /// One incarnation writes a byte-identical nonempty digest into
-    /// `starting`, `running`, and `stopping`.
     #[test]
     fn the_same_digest_is_recorded_across_every_phase() {
         let root = temp_root();
@@ -1542,8 +1372,6 @@ mod tests {
             let zero = ProbeFreshness {
                 window: Duration::ZERO,
             };
-            // The record was written milliseconds ago; a zero window has
-            // already expired it.
             std::thread::sleep(Duration::from_millis(5));
             let observed = probe_lifecycle(Some(root.path()), &zero).expect("probe");
             assert_eq!(observed.state, LifecycleState::Wedged, "{phase:?}");
@@ -1572,7 +1400,6 @@ mod tests {
         let root = temp_root();
         let mut guard = acquire(root.path());
 
-        // Held lock, no record at all.
         let observed = probe(root.path());
         assert_eq!(observed.state, LifecycleState::Wedged);
         assert!(!observed.instance_lock_free);
@@ -1583,7 +1410,6 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
         assert_eq!(probe(root.path()).state, LifecycleState::Wedged);
 
-        // Running record whose publication names a different daemon.
         guard
             .write_lifecycle_record(LifecyclePhase::Running)
             .expect("running");
@@ -1610,11 +1436,9 @@ mod tests {
         std::fs::set_permissions(&publication, std::fs::Permissions::from_mode(0o600))
             .expect("restore mode");
 
-        // Running record with no publication.
         std::fs::remove_file(&publication).expect("remove publication");
         assert_eq!(probe(root.path()).state, LifecycleState::Wedged);
 
-        // Insecure record mode.
         guard
             .write_lifecycle_record(LifecyclePhase::Starting)
             .expect("rewrite starting");
@@ -1633,13 +1457,11 @@ mod tests {
                 .expect("running");
             guard.publish(43123, "mc-host/test").expect("publish");
             publication = guard.dir_path().join(CONNECTION_FILE_NAME);
-            // Simulate a crash: prevent the fenced Drop cleanup by rewriting
-            // the publication under a foreign daemon ID first.
+            // The test rewrites the publication under a foreign daemon ID so fenced `Drop` cleanup leaves it behind, simulating a crash.
             let bytes = std::fs::read(&publication).expect("read");
             let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
             json["daemon_id"] = serde_json::json!(vec![7u8; 16]);
-            // The stale PID belongs to this very-much-alive test process: a
-            // live PID must not change classification (plan R5).
+            // The stale PID is this live test process; PID liveness does not affect classification.
             json["pid"] = serde_json::Value::from(std::process::id());
             std::fs::write(&publication, serde_json::to_vec(&json).expect("encode"))
                 .expect("rewrite");
@@ -1663,9 +1485,7 @@ mod tests {
         guard
             .write_lifecycle_record(LifecyclePhase::Starting)
             .expect("starting");
-        // Plant a crashed predecessor's leftover: a well-formed publication
-        // under a foreign daemon ID, exactly what a SIGKILLed incarnation
-        // leaves behind for its successor to overwrite at `publish`.
+        // A crashed predecessor can leave a well-formed foreign-daemon publication for its successor to overwrite at `publish`.
         guard.publish(43123, "mc-host/test").expect("publish");
         let publication = guard.dir_path().join(CONNECTION_FILE_NAME);
         let bytes = std::fs::read(&publication).expect("read");
@@ -1683,7 +1503,6 @@ mod tests {
             observed.reason
         );
 
-        // The same residue under a `running` claim is a real fault.
         guard
             .write_lifecycle_record(LifecyclePhase::Running)
             .expect("running");
@@ -1709,9 +1528,7 @@ mod tests {
         drop(second);
     }
 
-    /// Scenario 1 (plan U1): a transaction holder whose managed namespace is
-    /// replaced or renamed fails closed at `verify` instead of reporting a
-    /// named-namespace commit against a tree it no longer owns.
+    /// A transaction holder fails closed at `verify` when its managed namespace is replaced or renamed rather than reporting a commit against a tree it no longer owns.
     #[test]
     fn namespace_drift_fails_the_holder_before_a_named_commit() {
         for victim in ["lifecycle", "run", ""] {
@@ -1734,7 +1551,6 @@ mod tests {
             let anchor = NamespaceAnchor::capture(Some(root.path())).expect("anchor");
             anchor.verify().expect("identity holds before replacement");
 
-            // Replace a child, or the whole managed subtree.
             let target = if victim.is_empty() {
                 cortexkit.clone()
             } else {
@@ -1781,8 +1597,7 @@ mod tests {
             .is_some());
     }
 
-    /// Scenario 3 (plan U1): hostile shapes at the coordination names fail
-    /// closed without creating or chmodding attacker-selected paths.
+    /// Hostile shapes at coordination names fail closed without creating or chmodding attacker-selected paths.
     #[test]
     fn symlinked_coordination_root_fails_closed_for_probes() {
         let root = temp_root();
@@ -1805,7 +1620,6 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         for name in [TRANSACTION_LOCK_NAME, LIFETIME_LOCK_NAME] {
-            // A symlink at the lock name.
             let root = temp_root();
             let coordination = coordination_dir_path(Some(root.path())).expect("path");
             std::fs::create_dir_all(&coordination).expect("coordination root");
@@ -1829,15 +1643,8 @@ mod tests {
                 "the symlink target must be untouched"
             );
 
-            // A FIFO at the lock name must classify, not hang. Linux-gated
-            // like the other two fifo cases in this module: rustix gates
-            // `mkfifoat` away from Apple targets and this crate is
-            // `deny(unsafe_code)`, so the plant has no portable in-process
-            // form. Shelling out to `mkfifo(1)` is not the answer either —
-            // forking from this test binary hands the child duplicates of the
-            // `flock`ed descriptors sibling tests hold in parallel threads,
-            // and the lock outlives its guard until the child execs and exits,
-            // which makes those siblings fail with EWOULDBLOCK.
+            // A FIFO at the lock name must classify without hanging. Linux-only: `rustix` exposes `mkfifoat` only off Apple, and `deny(unsafe_code)` prevents a portable in-process fixture.
+            // Tests must not invoke `mkfifo(1)`: forked children inherit sibling tests' `flock` descriptors, delaying lock release and causing `EWOULDBLOCK`.
             #[cfg(target_os = "linux")]
             {
                 let root = temp_root();
@@ -1860,7 +1667,7 @@ mod tests {
                 );
             }
 
-            // A hard-linked lock file has an owner besides us.
+            // The lock-file validator rejects a hard-linked lock file because another directory entry can retain it after cleanup.
             let root = temp_root();
             let coordination = coordination_dir_path(Some(root.path())).expect("path");
             std::fs::create_dir_all(&coordination).expect("coordination root");
@@ -1902,7 +1709,7 @@ mod tests {
             "a reopened attempt must not cancel"
         );
 
-        // Acknowledged: committed forever, host cancellation fired.
+        // Acknowledgement commits ownership permanently and fires host cancellation.
         CommitOnAck::new(std::sync::Arc::clone(&latch), shutdown.clone()).acknowledge();
         assert!(shutdown.is_cancelled());
         assert_eq!(latch.try_own(), LatchDecision::Committed);
@@ -1937,8 +1744,7 @@ mod tests {
             })
             .await
             .expect("queued");
-        // Discarding the writer before it writes a queued frame drops that
-        // frame's hook unrun.
+        // Discarding the writer before it writes a queued frame drops the frame's hook without running it.
         handle.discard();
         drop(handle);
         task.await.expect("writer task");
@@ -1986,8 +1792,7 @@ mod tests {
         }
     }
 
-    /// `notify_waiters` wakes only enabled futures: a notification landing
-    /// between `try_own` and the first poll must still be observed.
+    /// `notify_waiters` wakes only enabled futures, so a notification between `try_own` and the first poll must remain observable.
     #[tokio::test]
     async fn an_enabled_change_future_survives_a_pre_poll_notification() {
         let latch = ShutdownLatch::new();
@@ -2002,16 +1807,10 @@ mod tests {
             .expect("the pre-poll notification must not be lost");
     }
 
-    // --- hostile evidence shapes and probe non-interference ---
-
-    /// Runs `work` on a scratch thread and refuses to wait past `budget`.
     ///
-    /// A thread parked in a blocking `openat` on a writer-less FIFO cannot be
-    /// cancelled or joined, so a regression here would hang the whole test
-    /// binary instead of failing it. Exiting the process on timeout keeps the
-    /// signal unambiguous and bounded: the harness reports a failure, and no
-    /// wedged thread outlives it. The fixed build returns in microseconds and
-    /// never reaches the deadline.
+    /// A thread blocked in `openat` on a writer-less FIFO cannot be cancelled or joined.
+    /// A timeout must terminate the process because a blocked FIFO-open thread cannot be joined.
+    /// The timeout handler exits the process because a blocked FIFO-open thread cannot be joined.
     #[cfg(target_os = "linux")]
     fn within<T: Send + 'static>(
         budget: Duration,
@@ -2035,9 +1834,8 @@ mod tests {
         }
     }
 
-    /// `O_NOFOLLOW` rejects a symlink but not a FIFO, and a FIFO opened for
-    /// reading blocks until a writer arrives. Without `O_NONBLOCK` both
-    /// evidence readers hang forever; the probe must instead classify the
+    /// `O_NOFOLLOW` rejects symlinks but not FIFOs; opening a FIFO for reading blocks until a writer arrives.
+    /// Without `O_NONBLOCK`, both evidence readers block forever on a writer-less FIFO.
     /// hostile shape.
     #[cfg(target_os = "linux")]
     #[test]
@@ -2048,8 +1846,7 @@ mod tests {
             guard
                 .write_lifecycle_record(LifecyclePhase::Running)
                 .expect("running");
-            // Replace the named evidence with a FIFO the test never opens for
-            // writing, so a blocking open can never complete.
+            // The fixture never opens a FIFO writer, so a blocking open cannot complete.
             let path = guard.dir_path().join(name);
             let _ = std::fs::remove_file(&path);
             rustix::fs::mkfifoat(rustix::fs::CWD, path.as_path(), Mode::from_raw_mode(0o600))
@@ -2077,9 +1874,9 @@ mod tests {
         }
     }
 
-    /// A FIFO at the record name must not hang fenced removal either: that
-    /// runs from `Drop` while the instance lock is held, so a hang would
-    /// retain the lock and fail every later start.
+    /// Fenced removal must not block on a FIFO at the record name.
+    /// Fenced removal runs from `Drop` while the instance lock is held.
+    /// Blocking fenced removal retains the instance lock and prevents later starts.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_fifo_at_the_record_name_cannot_hang_fenced_removal() {
@@ -2097,8 +1894,7 @@ mod tests {
         assert!(path.exists(), "a foreign shape must survive fenced removal");
     }
 
-    /// A symlink is a hostile shape, not absence. Collapsing its `ELOOP` to
-    /// `Absent` would let it downgrade a `wedged` verdict to `stopping`.
+    /// A symlink is a hostile shape; mapping its `ELOOP` to `Absent` would downgrade a `wedged` verdict to `stopping`.
     #[test]
     fn a_symlinked_publication_is_insecure_not_absent() {
         let root = temp_root();
@@ -2126,20 +1922,16 @@ mod tests {
         );
     }
 
-    /// The probe tests lock freedom with a shared lock, so concurrent probes
-    /// do not alias each other into a false "lock held" reading. An exclusive
-    /// test made the loser read `WOULDBLOCK` and resurrect a crashed daemon's
-    /// leftover evidence as `Running` — a false liveness claim that inverts
-    /// the protocol §4.3 rule that a free lock always means `stopped`
-    /// (plan R5). Leftover evidence is deliberate: it is the shape the
-    /// absent-record grace re-read cannot mask.
+    /// Shared locks prevent concurrent probes from reporting each other as holding the lock.
+    /// An exclusive probe makes a concurrent probe read `WOULDBLOCK` and falsely report `Running`.
+    /// The protocol defines a free lock as `stopped`.
+    /// The fixture retains leftover evidence so the absent-record grace re-read cannot mask it.
     #[test]
     fn concurrent_probes_never_resurrect_stale_evidence_as_live() {
         let root = temp_root();
         let root_path = root.path().to_path_buf();
 
-        // Produce genuinely valid publication bytes, then strand them with no
-        // holder — exactly what a crashed daemon leaves behind.
+        // The fixture creates valid publication bytes, then strands them without a lock holder to simulate a crashed daemon.
         let (publication_bytes, daemon_hex) = {
             let mut guard = acquire(&root_path);
             guard.publish(43123, "mc-host/test").expect("publish");
@@ -2167,7 +1959,6 @@ mod tests {
         std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600))
             .expect("mode");
 
-        // A single, uncontended probe must already call this stopped.
         assert_eq!(probe(root.path()).state, LifecycleState::Stopped);
 
         let workers: Vec<_> = (0..6)
@@ -2194,7 +1985,6 @@ mod tests {
         }
     }
 
-    /// A probe still detects a real incarnation's exclusive hold.
     #[test]
     fn a_shared_freedom_test_still_sees_a_live_holder() {
         let root = temp_root();
@@ -2210,12 +2000,7 @@ mod tests {
         assert_eq!(observed.state, LifecycleState::Starting);
     }
 
-    // --- U1: stable coordination fences and payload identity ---
-
-    /// Scenario 1 (plan U1): replacing or renaming the managed `lifecycle`
-    /// directory after transaction-lock acquisition must not create a second
-    /// transaction owner. The lock lives on the stable coordination file, not
-    /// on the replaceable managed subtree.
+    /// Replacing or renaming the managed `lifecycle` directory after transaction-lock acquisition must not create a second transaction owner.
     #[test]
     fn a_replaced_lifecycle_child_cannot_mint_a_second_transaction_owner() {
         let root = temp_root();
@@ -2235,9 +2020,7 @@ mod tests {
         );
     }
 
-    /// Scenario 1 (plan U1): independent openers — a stand-in for N and N-1
-    /// releases — must resolve the same coordination inode identities, and
-    /// replacing the whole managed subtree must not move them.
+    /// Independent openers must resolve the same coordination inode identities after the managed subtree is replaced.
     #[test]
     fn independent_openers_see_one_stable_coordination_identity() {
         use std::os::unix::fs::MetadataExt;
@@ -2254,7 +2037,6 @@ mod tests {
         let identity = (meta.dev(), meta.ino());
         drop(first);
 
-        // Replace the entire managed subtree between openers.
         let cortexkit = root.path().join("cortexkit");
         std::fs::create_dir_all(cortexkit.join("run")).expect("managed subtree");
         std::fs::rename(&cortexkit, root.path().join("cortexkit-old")).expect("replace subtree");
@@ -2269,10 +2051,7 @@ mod tests {
         );
     }
 
-    /// Scenario 2 (plan U1): replacing the whole `cortexkit` subtree after
-    /// publication isolates the old descriptor-owned evidence, but the stable
-    /// lifetime fence still names a live incarnation — a probe must not call
-    /// that `stopped`, and a successor must not acquire.
+    /// Replacing the whole `cortexkit` subtree after publication isolates old descriptor-owned evidence, but the stable lifetime fence still names a live incarnation.
     #[test]
     fn a_replaced_cortexkit_subtree_is_not_reported_stopped_while_the_daemon_lives() {
         let root = temp_root();
@@ -2295,8 +2074,7 @@ mod tests {
         );
         assert_eq!(observed.state, LifecycleState::Wedged);
 
-        // The successor cannot start a second incarnation while the first
-        // holds the stable lifetime fence.
+        // The successor cannot start a second incarnation while the first holds the stable lifetime fence.
         assert!(
             matches!(
                 InstanceGuard::acquire(Some(root.path()), TEST_DIGEST),
@@ -2314,8 +2092,7 @@ mod tests {
         );
     }
 
-    /// Scenario 4 (plan U1): a persisted record carrying an empty digest must
-    /// never be reported as a coherent running incarnation.
+    /// A persisted record carrying an empty digest is never reported as a coherent running incarnation.
     #[test]
     fn an_empty_payload_digest_is_never_a_coherent_running_incarnation() {
         let root = temp_root();
@@ -2326,8 +2103,6 @@ mod tests {
         guard.publish(43123, "mc-host/test").expect("publish");
         assert_eq!(probe(root.path()).state, LifecycleState::Running);
 
-        // Rewrite the record with an empty digest, keeping everything else
-        // valid — the shape the pre-U1 baseline persisted.
         let path = record_path(&guard);
         let bytes = std::fs::read(&path).expect("read record");
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
@@ -2344,10 +2119,7 @@ mod tests {
         );
     }
 
-    /// Scenario 5 (plan U1): an unknown lifecycle schema is preserved
-    /// byte-for-byte and classified `unsupported_state_schema` — under a held
-    /// fence and under free fences — and a start against it refuses rather
-    /// than overwriting the quarantined bytes.
+    /// An unknown lifecycle schema is preserved byte-for-byte and classified `unsupported_state_schema` under held and free fences.
     #[test]
     fn an_unknown_lifecycle_schema_is_quarantined_not_interpreted() {
         let root = temp_root();
@@ -2364,21 +2136,20 @@ mod tests {
             std::fs::write(&path, &future_record).expect("plant future record");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
 
-            // Held fences + unknown schema: never a coherent incarnation.
+            // The classifier never treats an unknown schema under a held fence as a coherent incarnation.
             let observed = probe(root.path());
             assert_eq!(observed.state, LifecycleState::Wedged);
             assert_eq!(observed.reason, "unsupported_state_schema");
             path
         };
 
-        // Free fences + unknown schema: stopped, but the classification still
-        // names the quarantined bytes and fenced removal spared them.
+        // With both fences free, an unknown schema yields `Stopped` and preserves the record.
         assert!(record_path.exists(), "drop must not remove foreign bytes");
         let observed = probe(root.path());
         assert_eq!(observed.state, LifecycleState::Stopped);
         assert_eq!(observed.reason, "unsupported_state_schema");
 
-        // A start must refuse rather than overwrite.
+        // A start against an unknown-schema record must refuse rather than overwrite the record.
         assert!(
             matches!(
                 InstanceGuard::acquire(Some(root.path()), TEST_DIGEST),
@@ -2393,15 +2164,11 @@ mod tests {
         );
     }
 
-    /// A runtime-lock holder without the lifetime fence whose record carries
-    /// a canonical digest (a replaced-directory squatter, or a stuck
-    /// teardown) is a fault, never a coherent running incarnation: a
-    /// coordination-era record proves the writer knew the lifetime fence, so
-    /// its absence is incoherent.
+    /// A canonical-digest record with a held runtime lock and no lifetime fence yields `Wedged`.
+    /// A held runtime lock without a lifetime fence makes a canonical-digest record incoherent.
     #[test]
     fn lifetime_and_runtime_lock_disagreement_is_wedged() {
         let root = temp_root();
-        // Create the namespace and evidence, then release both fences.
         {
             let mut guard = acquire(root.path());
             guard
@@ -2409,7 +2176,6 @@ mod tests {
                 .expect("running");
             guard.publish(43123, "mc-host/test").expect("publish");
         }
-        // Hold only the runtime-directory lock, the way a pre-coordination
         // release would.
         let dir_path = runtime_dir_path(Some(root.path())).expect("path");
         let dir = openat(
@@ -2428,16 +2194,11 @@ mod tests {
         assert!(observed.lifetime_lock_free);
     }
 
-    /// A pre-coordination incumbent — the runtime lock held with a legacy
-    /// (empty-digest) schema-1 record and no lifetime fence, exactly what a
-    /// release before this one looks like while serving — classifies by its
-    /// record so an upgrade's launcher can stop it, instead of alarming as
-    /// `wedged` on every routine rollout.
+    /// The probe classifies a held runtime lock with a schema-1 empty-digest record and no lifetime fence as `Wedged`.
     #[test]
     fn a_pre_coordination_incumbent_classifies_by_its_record() {
         let root = temp_root();
-        // Capture genuinely valid record and publication bytes, then let the
-        // guard tear down (its fenced cleanup removes both files and frees
+        // Dropping `guard` removes both files and releases both fences.
         // both fences).
         let (record_file, record_bytes, publication_file, publication_bytes) = {
             let mut guard = acquire(root.path());
@@ -2456,8 +2217,6 @@ mod tests {
                 publication_bytes,
             )
         };
-        // Replant the evidence in the pre-U1 shape: schema 1 with an empty
-        // digest, everything else untouched. Timestamp stays fresh.
         let mut json: serde_json::Value = serde_json::from_slice(&record_bytes).expect("parse");
         json["payload_manifest_digest"] = serde_json::Value::String(String::new());
         for (path, bytes) in [
@@ -2468,7 +2227,6 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("mode");
         }
 
-        // Hold only the runtime-directory lock, the way a pre-coordination
         // release does.
         let dir_path = runtime_dir_path(Some(root.path())).expect("path");
         let dir = openat(
@@ -2494,9 +2252,6 @@ mod tests {
         );
     }
 
-    /// Lifecycle temps must be reclaimable: they share the publication's temp
-    /// shape, so the acquire-time stale sweep has to cover both canonical
-    /// names — including for an incarnation that never reaches publish.
     #[test]
     fn stale_lifecycle_temps_are_swept() {
         let root = temp_root();

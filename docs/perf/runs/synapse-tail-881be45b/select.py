@@ -88,7 +88,6 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(out_rows)
 
-    # Queue objective at the 1.0x derivation point, query arm.
     objective: dict[str, object] = {
         "rule": "contract: smallest K whose M/M/1/K model-guided blocking improves on the "
                 "measured baseline and whose model-guided p95 waiting delay is below 100 ms; "
@@ -111,8 +110,6 @@ def main() -> None:
             offered = block_mean(group, "offered")
             amp = block_mean(group, "amplification")
             rej_terminal = block_mean(group, "terminal_rejected")
-            # attempt-level rejection per logical request = A - successes(1) - timeouts,
-            # approximated for the query arm as A - completed_fraction.
             entry[f"{variant}-k{k}"] = {
                 "blocks": len(group),
                 "offered_per_block": offered,

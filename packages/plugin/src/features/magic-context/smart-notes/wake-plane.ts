@@ -3,14 +3,14 @@ import { getDataDir } from "../../../shared/data-path";
 import { McHostClient } from "../../../shared/mc-host-client";
 import { defaultConnectionFilePath } from "../../../shared/mc-host-lifecycle/paths";
 
-/** The sole wire-level coupling between standalone smart notes and scheduled wakes. */
+/** `wake.create` indicates that scheduled wakes own condition evaluation. */
 export const WAKE_PLANE_CAPABILITY = "wake.create";
 
 export type WakePlaneStatus = "present" | "absent" | "unknown";
 
 const WAKE_PLANE_STATUS_TTL_MS = 5 * 60 * 1_000;
 const WAKE_PLANE_HANDSHAKE_TIMEOUT_MS = 2_000;
-/** Bounds the catalog request directly; the client default is 30 seconds. */
+/* */
 const WAKE_PLANE_CATALOG_TIMEOUT_MS = 2_000;
 
 type CatalogEntry = { control_ops?: unknown };
@@ -20,7 +20,7 @@ type PublicationReader = () => string | null;
 interface WakePlaneStatusCache {
     status: WakePlaneStatus;
     expiresAt: number;
-    /** Publication the answer was proved against; null when none was readable. */
+    /** The cache records the publication against which the answer was proved; `null` means none was readable. */
     publication: string | null;
 }
 
@@ -31,19 +31,11 @@ let readPublication: PublicationReader = readDaemonPublication;
 let now = () => Date.now();
 
 function connectionFile(): string {
-    // The managed lifecycle owner publishes the daemon under the lifecycle data
-    // root, and this file is both what the catalog probe dials and what binds a
-    // retained answer to its daemon. Both must agree with that resolver, or a
-    // managed start publishes somewhere this never reads. The application
-    // storage resolver only backstops environments where no lifecycle root
-    // resolves at all.
     return defaultConnectionFilePath(getDataDir());
 }
 
 /**
- * Identity of the daemon publication an answer was proved against. A daemon
- * replacement republishes this file with a new socket, pid, and auth key, so a
- * change here retires every capability the previous daemon proved.
+ * The publication fingerprint identifies the daemon publication against which the answer was proved.
  */
 function readDaemonPublication(): string | null {
     try {
@@ -78,34 +70,24 @@ async function probeStatus(): Promise<WakePlaneStatus> {
     try {
         return catalogHasWakePlane(await catalogProbe()) ? "present" : "absent";
     } catch {
-        // A reachable catalog is the only proof that scheduled wakes own this
-        // capability. Connection and catalog failures must leave smart notes on.
+        // Connection and catalog failures return `unknown` so standalone smart notes remain on.
         return "unknown";
     }
 }
 
 /**
- * Every retained answer is bound to the daemon publication it was proved
- * against, and the probe closes its connection. An affirmative answer may only
- * be reused while that daemon still owns the publication, so a replacement can
- * never inherit the capability. A negative or unknown answer is bound the same
- * way: under lazy demand-start the common case is a passive probe that runs
- * BEFORE the first Rust or Synapse demand, and the managed start that follows
- * publishes a new connection file. Without this binding that answer would keep
- * standalone evaluation on for the rest of its TTL while the daemon already
- * owns scheduled wakes, so both planes would evaluate the same conditions.
+ * An affirmative answer is reusable only while its daemon retains the publication.
  */
 function isRetainedAnswerUsable(cache: WakePlaneStatusCache): boolean {
-    // An affirmative answer with no readable publication has nothing that can
-    // retire it, so it is never retained in the first place.
+    // `present` with no readable publication is never reusable.
     if (cache.status === "present" && cache.publication === null) return false;
     return cache.publication === readPublication();
 }
 
 /**
- * Discover whether the fleet's scheduled-wake plane owns condition evaluation.
- * Only an affirmative catalog capability disables standalone smart notes; an
- * unreachable daemon and a catalog without the capability remain fail-open.
+ * The status probe determines whether scheduled wakes own condition evaluation.
+ * Only an affirmative catalog capability disables standalone smart notes.
+ * An unreachable daemon or a catalog without `wake.create` leaves standalone smart notes enabled.
  */
 export async function wakePlaneStatus(): Promise<WakePlaneStatus> {
     const cached = cachedStatus;
@@ -113,28 +95,21 @@ export async function wakePlaneStatus(): Promise<WakePlaneStatus> {
     if (inFlightProbe) return await inFlightProbe;
 
     const startedAt = now();
-    // Captured before the probe so the answer can be bound to the daemon that
+    // The pre-probe publication binds the result to the daemon observed before probing.
     // produced it.
     const publication = readPublication();
     const probe = probeStatus().then((status) => {
-        // Re-read on settle. Rejecting a stale identity only on the NEXT call
-        // protected the cache but not this result: the initiating caller and
-        // every caller coalesced on `inFlightProbe` still received an answer
-        // describing a daemon that is no longer serving. Across a restart that
-        // could report `present` from the old incarnation and suppress
-        // standalone evaluation even though the replacement may not offer
-        // `wake.create` at all.
+        // Stale publications must be rejected before the probe settles so coalesced callers cannot receive stale results.
+        // A stale result can describe a daemon that no longer serves requests.
+        // After a restart, a stale result can report `present` for the old daemon.
+        // A replacement daemon without `wake.create` makes an old `present` result stale.
         //
-        // A changed publication discards the answer rather than retrying: the
-        // result is unbound, `unknown` is this module's fail-open value, and the
-        // next call re-probes against the new owner. Nothing is cached, so that
-        // next call cannot inherit this one's uncertainty.
+        // The function returns `unknown` because the result cannot be bound to a publication.
         if (readPublication() !== publication) {
             cachedStatus = null;
             return "unknown" as WakePlaneStatus;
         }
-        // With no readable publication there is nothing to bind an affirmative
-        // answer to, so it is not retained at all.
+        // The cache does not retain `present` when `publication` is `null` because no daemon identity is available.
         cachedStatus =
             status === "present" && publication === null
                 ? null

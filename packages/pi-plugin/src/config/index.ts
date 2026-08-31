@@ -36,7 +36,7 @@ export interface LoadPiConfigOptions {
 
 export interface LoadPiConfigResult {
 	config: MagicContextConfig;
-	/** USER-tier default/overrides captured before project routing is merged. */
+	/** registrationPromptSurface contains USER-tier defaults and overrides before project routing merges. */
 	registrationPromptSurface: PromptSurfaceConfig;
 	warnings: string[];
 	loadedFromPaths: string[];
@@ -72,11 +72,6 @@ interface LoadedConfigFile {
 	loadOutcome: LoadOutcome;
 }
 
-// Shared CortexKit paths are the primary config location. When that base is
-// absent because migration refused/not-yet-ran, Pi may still READ its own legacy
-// paths as a non-destructive fallback (see resolvePiLegacyFallback) rather than
-// silently using schema defaults. The CortexKit target normalizes to .jsonc; we
-// still detect a pre-existing .json at the target for resilience.
 function getProjectConfigPaths(cwd: string): string[] {
 	const basePath = cortexKitProjectConfigBasePath(cwd);
 	return [`${basePath}.jsonc`, `${basePath}.json`];
@@ -91,11 +86,8 @@ function resolveFirstExisting(paths: string[]): string | undefined {
 	return paths.find((path) => existsSync(path));
 }
 
-// When the shared CortexKit base is absent (migration refused on a differing
-// OpenCode/Pi pair, or not yet run), read Pi's OWN legacy file as a
-// non-destructive fallback rather than silently using schema defaults — which
-// would re-enable features the user's real config disabled. Pi reads only Pi
-// legacy paths so a differing pair stays correct per-harness.
+// Pi falls back to its legacy config so schema defaults do not re-enable user-disabled features.
+// Pi reads only its legacy paths so another harness's legacy config cannot affect Pi.
 function resolvePiLegacyFallback(
 	sources: readonly LegacyConfigSource[],
 ): LegacyConfigSource | null {
@@ -111,8 +103,8 @@ function loadConfigFile(
 		const substituted = substituteConfigVariables({
 			text: rawText,
 			configPath: path,
-			// Repo-supplied project configs are untrusted: do not expand
-			// {env:}/{file:} secret-bearing tokens (parity with OpenCode).
+			// Project configs cannot expand `{env:}` or `{file:}` tokens because they may expose secrets.
+			// Project configs cannot expand `{env:}` or `{file:}` tokens because they may expose secrets.
 			isProjectConfig: scope === "project",
 		});
 		const rejectedKeyPaths: string[] = [];
@@ -225,10 +217,7 @@ function parsePiConfig(
 		rawConfig,
 		preMigrationWarnings,
 	);
-	// Relocate graduated experimental.* keys (temporal_awareness, caveman →
-	// top-level; auto_search, git_commit_indexing → memory.*; user_memories,
-	// pin_key_files → dreamer.*). Shared with OpenCode so both harnesses preserve
-	// a user's opt-in/opt-out across the upgrade.
+	// Migration preserves each relocated key's opt-in or opt-out.
 	const migrated = migrateDreamerV2(
 		migrateLegacyExperimental(agentMigrated, preMigrationWarnings),
 		preMigrationWarnings,
@@ -240,8 +229,8 @@ function parsePiConfig(
 
 	const defaults = MagicContextConfigSchema.parse({});
 	const errorPaths = new Set<string>();
-	// Per top-level key, the FULL error paths — so we can prune only the invalid
-	// nested leaf instead of the whole block (mirrors OpenCode config recovery).
+	// Validation retains full error paths for each top-level key.
+	// Full error paths let recovery remove invalid nested leaves without deleting their containing block.
 	const issuePathsByKey = new Map<string, PropertyKey[][]>();
 	for (const issue of parsed.error.issues) {
 		const topKey = issue.path[0];
@@ -270,10 +259,9 @@ function parsePiConfig(
 			continue;
 		}
 
-		// Object-valued key: prune ONLY invalid nested leaves, keep valid siblings
-		// (e.g. don't wipe the whole `memory` block — incl. migrated auto_search /
-		// git_commit_indexing — for one bad nested field). Falls back to whole-key
-		// deletion when the issue is at the key itself or the value isn't an object.
+		// For object-valued keys, recovery prunes only invalid nested leaves and keeps valid siblings.
+		// Recovery keeps valid `memory` siblings when one nested field is invalid.
+		// Recovery deletes the entire key only when the error is at that key or its value is not an object.
 		const issuePaths = issuePathsByKey.get(key) ?? [];
 		const rawValue = migrated[key];
 		const allNested =
@@ -288,9 +276,8 @@ function parsePiConfig(
 			};
 			const prunedLeaves: string[] = [];
 			for (const p of issuePaths) {
-				// Prune the DEEPEST invalid leaf (parity with OpenCode), so a
-				// 3-level path like memory.git_commit_indexing.since_days drops
-				// only `since_days` and keeps a sibling `enabled: false`.
+				// Recovery prunes the deepest invalid leaf so valid siblings remain.
+				// Recovery preserves a sibling `enabled: false`.
 				const relative = p.slice(1);
 				const result = pruneNestedConfigLeaf(prunedBlock, relative);
 				if (result) {
@@ -383,12 +370,9 @@ export function loadPiConfig(
 		if (a.scope === b.scope) return 0;
 		return a.scope === "user" ? -1 : 1;
 	});
-	// The trusted user config (sorted first) — passed to the embedding-redirect
-	// guard so a project repeating the user's own endpoint is not a redirect.
+	// The guard treats a project endpoint matching the user's endpoint as a non-redirect.
 	const userRaw = mergeFiles.find((f) => f.scope === "user")?.config;
-	// Threshold trust boundary is relative to the USER/default effective config:
-	// a cloned repo may delay compaction, but it may not lower thresholds in a
-	// way that forces extra historian work on the user's account.
+	// The threshold trust boundary uses the effective USER/default config as its baseline.
 	const trustedBaseConfig = parsePiConfig(userRaw ?? {}).config;
 
 	for (const loaded of mergeFiles) {
@@ -397,8 +381,7 @@ export function loadPiConfig(
 		warnings.push(...loaded.warnings.map((warning) => `${prefix} ${warning}`));
 
 		if (loaded.scope === "project") {
-			// Harden the repo-supplied (untrusted) project config before merging
-			// it over the trusted user config (parity with OpenCode).
+			// The loader sanitizes the untrusted project config before merging it.
 			const projectRaw = { ...loaded.config };
 			for (const warning of stripUnsafeProjectConfigFields(projectRaw)) {
 				warnings.push(`${prefix} ${warning}`);
@@ -560,9 +543,7 @@ export function loadPiConfigDetailed(
 		return a.scope === "user" ? -1 : 1;
 	});
 	const userRaw = mergeFiles.find((f) => f.scope === "user")?.config;
-	// Threshold trust boundary is relative to the USER/default effective config:
-	// a cloned repo may delay compaction, but it may not lower thresholds in a
-	// way that forces extra historian work on the user's account.
+	// A cloned repository may delay compaction but must not lower thresholds enough to increase historian work for the user's account.
 	const trustedBaseConfig = parsePiConfig(userRaw ?? {}).config;
 
 	for (const loaded of mergeFiles) {

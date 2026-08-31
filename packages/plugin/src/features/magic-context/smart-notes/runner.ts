@@ -115,7 +115,6 @@ export async function runDueCompiledSmartNoteChecks(
             if (!evaluated.ok) {
                 continue;
             }
-            // Cron search is bounded and completed before the write lock so
             // schedule evaluation cannot extend the state transaction.
             const reduction = reduceSmartNoteEvaluation(
                 lifecycleStateFromNote(note),

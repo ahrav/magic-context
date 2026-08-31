@@ -27,12 +27,8 @@ export type WindowOverlayUnknownWhy =
     | "placeholder_output_equals_context"
     | "placeholder_zero"
     | "never_measured"
-    // Asserts the KEY cannot hold one fact (e.g. a router samples heterogeneous
-    // backends per request), so measurement cannot settle it and measured
-    // reports must not be promoted into stated/bracket cells at this key.
-    // Ratified terminal at fusiform 080e70208aad713d, added without a schema bump: an
-    // additive vocabulary value degrades per-cell for ignorant consumers,
-    // whereas a version bump would trigger the file-level refusal rule.
+    // The not_single_valued_at_key value denotes keys that cannot hold one fact.
+    // The not_single_valued_at_key value prevents measured reports from being promoted to stated or bracket values.
     | "not_single_valued_at_key"
     | "retracted";
 
@@ -140,7 +136,7 @@ function isFinitePositive(value: unknown): value is number {
     return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
-/** Convert the ratified tagged numeric union into the conservative scalar used by derivation. */
+/** scalarizeFact converts tagged numeric facts to the conservative scalar used by derivation. */
 export function scalarizeFact(value: WindowOverlayFactValue): number | undefined {
     if (value.kind === "stated") return isFinitePositive(value.value) ? value.value : undefined;
     if (value.kind === "bracket") {
@@ -324,7 +320,7 @@ export function readWindowOverlayFile(
     return parsed.overlay;
 }
 
-/** Set the user-tier overlay path. Undefined restores the Fusiform data-dir default. */
+/** Undefined restores the Fusiform data-dir default. */
 export function setWindowOverlayPath(path: string | undefined): void {
     configuredOverlayPath = path;
     loadedOverlayPath = undefined;
@@ -382,13 +378,11 @@ function numericOverlayFact(
 }
 
 /**
- * Three-state geometry resolution from the overlay. The absent-vs-unknown
- * distinction is ratified contract semantics: a fact ABSENT from the cell was
- * never considered (our static provider table still applies), while a fact
- * present with kind "unknown" was considered and has no answer — the dataset
- * owner checked the primary source and found the usual inference unsupported
- * (e.g. Google's own docs contradict the separate-quota reading), so the
- * static assumption built on that same inference must NOT apply either.
+ * An absent fact uses static geometry; an unknown fact disables static fallback.
+ * An absent fact uses static geometry; an unknown fact disables static fallback.
+ * An absent fact allows the static provider table to apply.
+ * A fact with kind "unknown" disables the static provider-table fallback.
+ * An unknown fact disables the static geometry fallback.
  */
 function overlayGeometry(
     overlay: ResolvedWindowOverlayFacts | undefined,
@@ -403,7 +397,7 @@ function overlayGeometry(
         : undefined;
 }
 
-/** Placeholder filtering is deliberately per output field, never a row-level rejection. */
+/** Placeholder filtering applies per output field, not per row. */
 export function placeholderFilteredOutput(
     output: number | undefined,
     context: number | undefined,
@@ -473,9 +467,8 @@ export function deriveWindowGeometry(
     const providerOutput = placeholderFilteredOutput(providerLimit?.output, softContext);
     const output = providerOutput ?? overlayOutput ?? catalogOutput;
     const geometryFact = overlayGeometry(options.overlay);
-    // Considered-unknown demotes to shared_upfront — the conservative geometry
-    // in both directions (largest soft reserve, lowest hard wall) — until a
-    // measurement settles the cell. Absence falls through to the static table.
+    // A considered-unknown fact selects shared_upfront.
+    // shared_upfront uses the largest soft reserve and the lowest hard wall.
     const geometry =
         geometryFact?.kind === "stated"
             ? geometryFact.value
@@ -497,9 +490,7 @@ export function deriveWindowGeometry(
     let softReserve = 0;
     let reserveSource: WindowReserveSource = "none";
     if (outputReserveOverride !== undefined) {
-        // An explicit user reserve owns the usable-window carve. When the
-        // provider also publishes a smaller input cap, use that cap as the
-        // window; treating the cap as final would silently ignore the config.
+        // An explicit user reserve determines the usable-window carve.
         const reserveWindow = preCarvedInput ? input : (softContext ?? input);
         if (!isFinitePositive(reserveWindow)) return undefined;
         derivationWindow = reserveWindow;
@@ -545,11 +536,8 @@ export function deriveWindowGeometry(
         const floor = Math.max(MIN_PLAUSIBLE_CONTEXT_LIMIT, softContext * 0.5);
         const flooredReserve = Math.min(softReserve, Math.max(0, softContext - floor));
         if (flooredReserve < softReserve) {
-            // A reserve large enough to hit the half-window floor means the
-            // catalog's context/output pair contradicts itself (93 live rows
-            // publish output > context — fusiform's negative-window detector).
-            // The floor keeps the window functional; the log keeps the
-            // degradation visible instead of silently halving the window.
+            // An output value above context contradicts the catalog pair.
+            // The floor preserves a usable window.
             logGeometryClampOnce(
                 `soft-floor|${providerID}/${modelID}|${softReserve}|${flooredReserve}`,
                 `output reserve clamped by the half-window floor for ${providerID}/${modelID}: reserve ${softReserve} → ${flooredReserve} (catalog context/output pair is contradictory)`,

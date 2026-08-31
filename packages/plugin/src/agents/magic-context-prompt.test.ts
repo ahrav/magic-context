@@ -38,14 +38,12 @@ describe("buildMagicContextSection — generic guidance", () => {
         const noReduce = buildMagicContextSection(null, 20, false, false, false, false);
 
         for (const out of [reduce, noReduce]) {
-            // Identity frame + the durability + no-scarcity + no-wind-down beats.
             expect(out).toContain("long-term partner on this project");
             expect(out).toContain("weeks, months, or even years");
             expect(out).toContain("effectively unbounded");
             expect(out).toContain("never a reason to wrap up, cut scope, rush, or defer");
             expect(out).toContain("Finishing a task does not end the session");
             expect(out).toContain("no compaction pauses");
-            // Frame is at the TOP — before the tool mechanics.
             expect(out.indexOf("long-term partner")).toBeLessThan(out.indexOf("ctx_note"));
         }
     });
@@ -54,13 +52,10 @@ describe("buildMagicContextSection — generic guidance", () => {
         const reduce = buildMagicContextSection(null, 20, true, false, false, false);
         const noReduce = buildMagicContextSection(null, 20, false, false, false, false);
 
-        // reduce mode: agent participates in housekeeping
         expect(reduce).toContain("Reduction prompts are routine housekeeping");
         expect(reduce).not.toContain("there's nothing to prune");
-        // no-reduce mode: fully automatic, nothing to prune
         expect(noReduce).toContain("there's nothing to prune and no warnings to act on");
         expect(noReduce).not.toContain("Reduction prompts are routine housekeeping");
-        // Both keep the task-scope caveat.
         for (const out of [reduce, noReduce]) {
             expect(out).toContain("never let context size change");
         }
@@ -77,7 +72,6 @@ describe("buildMagicContextSection — subagent mode", () => {
 
     it("emits ONLY the minimal §N§ + ctx_reduce mechanics", () => {
         const out = subagent();
-        // Has the marker (injection idempotency) + the tag/ctx_reduce mechanics.
         expect(out).toContain("## Magic Context");
         expect(out).toContain("§N§ identifiers");
         expect(out).toContain("ctx_reduce");
@@ -114,8 +108,7 @@ describe("buildMagicContextSection — subagent mode", () => {
 });
 
 describe("buildMagicContextSection: memory gating", () => {
-    // buildMagicContextSection's 9th positional parameter is memoryEnabled
-    // (defaults to true). The 7-arg legacy call below relies on that default.
+    // memoryEnabled defaults to true; 7-argument legacy calls rely on that default.
     it("memory ON (default) keeps claim-native ctx_memory guidance", () => {
         const legacy = buildMagicContextSection(null, 20, true, false, false, false, false);
         const memOn = buildMagicContextSection(
@@ -150,7 +143,6 @@ describe("buildMagicContextSection: memory gating", () => {
         expect(off).not.toContain("ctx_memory");
         expect(off).not.toContain("Save durable knowledge proactively");
         expect(off).toContain("Use `ctx_search`");
-        // no dangling blank line where the block was removed
         expect(off).not.toContain("\n\nUse `ctx_search`");
     });
 
@@ -200,8 +192,7 @@ describe("buildMagicContextSection — caveman compression warning", () => {
     });
 
     it("emits the warning when ctx_reduce is callable and caveman is enabled", () => {
-        // Caveman compression is independent from ctx_reduce availability, so
-        // reduce-enabled primary guidance must still warn about rewritten prose.
+        // Primary guidance warns that caveman compression can rewrite prose even when ctx_reduce is available.
         const out = buildMagicContextSection(
             null,
             20,
@@ -215,28 +206,14 @@ describe("buildMagicContextSection — caveman compression warning", () => {
     });
 
     it("omits the warning by default (parameter optional)", () => {
-        // Old callers that didn't pass the new parameter must continue to
-        // produce identical output (no warning leaked into legacy paths).
         const out = buildMagicContextSection(null, 20, false, false, false);
         expect(out).not.toContain(CAVEMAN_MARKER);
     });
 });
 
 describe("buildMagicContextSection — compaction-off guidance variant (#266 S4)", () => {
-    // Spec #266 decision #3: compaction-off mode reuses the EXISTING no-reduce
-    // guidance variant machinery — no third template. The variant is reached
-    // by passing ctxReduceCallable=false (which the process-global registration
-    // override in ctx-reduce-availability.ts forces when ctx_reduce is not
-    // registered). This suite pins the spec's guidance acceptance:
-    //   - no ctx_reduce mention, no §N§ prefix advertising, no tag-recovery
-    //   - memory/search/note/expand guidance present
-    //   - byte-identical to the existing reduce-unavailable variant (no third
-    //     template constant was introduced)
 
     it("the compaction-off variant is byte-identical to the existing no-reduce variant", () => {
-        // The existing no-reduce variant is buildMagicContextSection(..., false, ...).
-        // Compaction-off reaches the SAME code path via the availability override,
-        // so the rendered text must be byte-identical — no third template.
         const existingNoReduce = buildMagicContextSection(null, 20, false, false, false, false);
         const compactionOff = buildMagicContextSection(null, 20, false, false, false, false);
         expect(compactionOff).toBe(existingNoReduce);
@@ -244,22 +221,9 @@ describe("buildMagicContextSection — compaction-off guidance variant (#266 S4)
 
     it("does not advertise ctx_reduce, §N§ prefixes, or tag-based recovery", () => {
         const out = buildMagicContextSection(null, 20, false, false, false, false);
-        // No ctx_reduce tool mention.
         expect(out).not.toContain("ctx_reduce");
-        // No §N§ prefix SYSTEM DESCRIPTION / advertising. The reduce variant
-        // opens with "Messages and tool outputs are tagged with §N§
-        // identifiers" — that advertising line is absent here. (The
-        // `[dropped §N§]` sentinel appears only inside TOOL_HISTORY_GUIDANCE's
-        // "never reproduce these markers" prohibition list, which is shared
-        // by both variants and is not advertising; the spec pins reuse of the
-        // existing variant byte-identical, so that prohibition mention stays.)
         expect(out).not.toContain("tagged with §N§ identifiers");
         expect(out).not.toContain("Use `ctx_reduce`");
-        // No tag-based-recovery WORKFLOW wording. The expand line frames
-        // recovery around <session-history> summary headings and ctx_search
-        // message ordinals, not §N§ tags. "tag" appears only inside the
-        // shared TOOL_HISTORY_GUIDANCE prohibition ("never reproduce ..."),
-        // not as a recovery instruction.
         expect(out).not.toMatch(/recover.*tag|tag.*recover/i);
         expect(out).not.toContain("§N§ identifiers (e.g.");
     });
@@ -274,18 +238,13 @@ describe("buildMagicContextSection — compaction-off guidance variant (#266 S4)
 
     it("frames ctx_expand as recovery for summaries / ctx_search hits, not tag-based recovery", () => {
         const out = buildMagicContextSection(null, 20, false, false, false, false);
-        // The expand line in the no-reduce variant references <session-history>
-        // summary headings and ctx_search message ordinals — not §N§ tags.
         expect(out).toContain("ctx_expand");
         expect(out).toContain("session-history");
         expect(out).toContain("message ordinals");
     });
 
     it("the reduce variant DOES advertise §N§ and ctx_reduce (contrast for the off-mode assertion)", () => {
-        // This is the mutation-direction anchor: the reduce-on variant carries
-        // the §N§ + ctx_reduce advertising that the off-mode variant omits.
-        // If the off-mode variant ever leaked these, this contrast would
-        // still pass but the off-mode assertion above would go red.
+        // `compactionEnabled=false` omits `ctx_reduce` guidance.
         const reduce = buildMagicContextSection(null, 20, true, false, false, false);
         expect(reduce).toContain("ctx_reduce");
         expect(reduce).toContain("tagged with §N§ identifiers");

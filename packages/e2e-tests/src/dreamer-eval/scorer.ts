@@ -27,8 +27,6 @@ export interface ManifestScore {
     reason: ErrorReason | FailReason | null;
     runFatal: boolean;
     /**
-     * Evidence in the shape the report contract accepts, so a score can be
-     * carried into a run report without a wrapper transformation.
      */
     parsedManifest: ParsedManifestEvidence | null;
 }
@@ -96,23 +94,9 @@ function invalidOutput(manifestText: string, evidence?: ManifestInfraEvidence): 
 }
 
 /**
- * Collapses `.` and `..` in a path the provider emitted, the way production's
- * `path.resolve` does before `normalizeVerificationFiles` matches it against a
- * tracked path. Gold is already canonical — the scenario contract admits only
- * declared fixture paths — so without this a manifest naming a tracked file
- * through an alias such as `src/./file.ts` scores `wrong-mapping` even though
- * production canonicalizes it and applies exactly the gold path.
+ * Preserve whether the path has a leading separator and unresolved leading `..` segments.
  *
- * Separator handling follows the running platform, because production's does: on
- * Windows `path.resolve` treats a backslash as a separator, so `src\file.ts`
- * resolves to the tracked file and is applied, while on a POSIX host the
- * backslash is an ordinary filename character and the path is untracked and
- * dropped. Mirroring that keeps the score equal to what the host would do rather
- * than to what one platform would do.
  *
- * An escaping prefix and a leading separator survive on purpose: production drops
- * a path that leaves the project rather than resolving it inward, so neither may
- * quietly turn into a tracked path here.
  */
 function canonicalObservedPath(value: string): string {
     const separators = sep === "\\" ? /[\\/]/ : "/";
@@ -169,9 +153,6 @@ export function scoreVerifyManifest(
         return publicClaimId === undefined ? undefined : actual.get(publicClaimId);
     };
 
-    // Each archival class gets its own full pass so the reported reason does not
-    // depend on the order of gold.claims: an irreversible wrong archival
-    // outranks a retained false memory, which outranks any other verdict error.
     for (const expected of gold.claims) {
         const observed = observedFor(expected.claimId);
         if (observed?.verdict === "archive" && expected.verdict !== "archive") {
@@ -189,16 +170,10 @@ export function scoreVerifyManifest(
         if (observed?.verdict !== expected.verdict) {
             return score("FAIL", "wrong-verdict", "scored", parsed);
         }
-        // Verification applies this attribute as the claim's new exact mapping,
-        // so a narrowed set silently shrinks future incremental verify scope.
         if (expected.verdict !== "archive" && !sameSet(canonicalObservedPaths(observed.files), expected.expectedFiles)) {
             return score("FAIL", "wrong-mapping", "scored", parsed);
         }
         if (expected.verdict === "update") {
-            // Production refuses to apply an empty or over-long replacement
-            // body, so a manifest carrying one is not a passing run whatever its
-            // anchors say: the experiment would report success for output the
-            // host would have rejected.
             const trimmed = observed.content?.trim() ?? "";
             if (trimmed.length === 0 || trimmed.length > VERIFY_UPDATE_CONTENT_MAX_LENGTH) {
                 return score("FAIL", "wrong-update-content", "scored", parsed);
@@ -215,23 +190,18 @@ export function scoreVerifyManifest(
             }
         }
     }
-    // Appliability is a property of the batch, not of one entry, so it runs once
-    // over the parsed updates in the order production stages them.
     if (firstUnappliableUpdate(pool, parsed.updated)) {
         return score("FAIL", "wrong-update-content", "scored", parsed);
     }
     return score("PASS", null, "scored", parsed);
 }
 
-/** A claim's dedup identity: its category plus its normalized content. */
+/* */
 export function claimIdentity(category: string, content: string): string {
     return `${category}\u0000${normalizeMemoryContent(content)}`;
 }
 
 /**
- * Identities the active pool already owns, keyed to their holder. Shared with the
- * mutation battery so the rule for "this content is already taken" has one
- * definition: the battery plans a manifest against it while the scorer judges
  * one.
  */
 export function liveIdentities(pool: PoolDescriptor): Map<string, string> {
@@ -245,17 +215,7 @@ export function liveIdentities(pool: PoolDescriptor): Map<string, string> {
 }
 
 /**
- * Whether any update in the batch is one the host could not apply, judged in the
- * order production stages them.
  *
- * `applyVerifyManifest` stages verified entries, then updates, then archives, and
- * each revision asserts its `(category, normalized content)` identity is free
- * among active claims, exempting only the claim being revised. Two consequences
- * a snapshot-only comparison gets wrong in both directions: an update takes its
- * new identity for the rest of the batch, so two updates converging on one
- * identity fail on the second; and an update may legitimately take an identity an
- * earlier update in the same batch vacated. Archives are staged last, so one
- * cannot free an identity for an update.
  */
 function firstUnappliableUpdate(
     pool: PoolDescriptor,
@@ -266,9 +226,6 @@ function firstUnappliableUpdate(
     for (const entry of updates) {
         const claim = byPublicId.get(entry.publicClaimId);
         if (claim === undefined) continue;
-        // The revision vacates whatever the claim held before taking its new
-        // identity, which is what exempting the claim from its own assertion
-        // amounts to across a batch.
         owner.delete(claimIdentity(claim.category, claim.content));
         const next = claimIdentity(claim.category, (entry.content ?? "").trim());
         const held = owner.get(next);
@@ -338,21 +295,10 @@ export function scoreClassifyManifest(
         if (observed === undefined || current === undefined) {
             return score("FAIL", "wrong-classification", "scored", parsed);
         }
-        // A manifest entry may report any subset of the three fields — the parser
-        // requires at least one and coverage is enforced per claim — and
-        // production preserves whatever the entry omits. The applied value is
-        // therefore the reported one where present and the claim's current value
-        // otherwise, so scoring the reported field alone fails a run whose
-        // resulting pool matches gold.
         const importance = observed.importance ?? current.importance;
         const scope = observed.scope ?? current.memoryScope;
         const reportedShareable = observed.shareable;
         const preservedShareable = reportedShareable ?? current.sharing === "shareable";
-        // `applyClassifications` forces a reported `true` to false when the claim
-        // content trips the same predicate, so that is the value the pool ends up
-        // with. Scoring the raw `true` would fail a run whose applied pool
-        // matches gold. The override fires only on a reported `true`, so an
-        // omitted field still resolves to the preserved value.
         const shareable =
             reportedShareable === true && hasShareabilitySensitiveText(current.content)
                 ? false

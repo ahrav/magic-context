@@ -1,39 +1,15 @@
-/// <reference types="bun-types" />
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 
 /**
- * Pi short-context overflow survival guard.
  *
- * # Why this test is structured the way it is
  *
- * OpenCode's equivalent test (short-context-overflow.test.ts) verifies that
- * heuristic cleanup drops tags under 85% force-materialization. The drops it
- * counts are message-type tags created when OpenCode strips
- * `<system-reminder>`-wrapped user prompts that OpenCode injects on every
- * turn. Pi RPC mode does NOT wrap user prompts in system-reminders, so a
- * pure-text Pi session simply has no message tags to drop — Pi's heuristic
- * cleanup correctly drops only `type='tool'` tags, and tool tags only exist
- * when the agent actually invokes tools.
  *
- * Building a Pi e2e that exercises tool drops requires the agent loop to
- * actually run a tool, await its result, and continue — which Pi's RPC
- * `prompt` command serializes per session (a follow-up `prompt` while the
- * agent is mid-tool-execution returns "Agent is already processing").
+ * Pi rejects concurrent `prompt` commands with `Agent is already processing`, so this test cannot drive a tool call and its continuation with back-to-back prompts.
  *
- * What this test verifies:
- *   - Pi survives 30 back-to-back 20KB-reply turns with a slow historian
- *   - No turns error out (proves the pipeline stays responsive)
  *
- * Pi tool-drop materialization is covered by `pi-drops.test.ts` (queue +
- * apply path), Pi historian compartment publication is covered by
- * `pi-historian-success.test.ts`, and Pi compaction-marker writing (the
- * X1 fix) is covered by `pi-deferred-compaction-marker.test.ts`. The
- * production wire dump from the user's stuck Anthropic Auth session
- * confirmed the X1/X2 fix in `55ebb14` resolves the actual tool-tag
- * accumulation symptom that prevented JSONL trimming.
  */
 
 const HISTORIAN_MARKER = "the hippocampus of a long-running coding agent";
@@ -95,8 +71,6 @@ describe("pi short context accumulating overflow", () => {
             };
         });
 
-        // Plain text matcher. See header comment for why this test
-        // doesn't try to exercise tool drops in Pi RPC mode.
         let mainCalls = 0;
         h.mock.addMatcher((body) => {
             if (isHistorian(body)) return null;
@@ -119,10 +93,8 @@ describe("pi short context accumulating overflow", () => {
         const turnErrors: Array<{ turn: number; error: string }> = [];
         const turns = 30;
 
-        // Background passes (historian publish, deferred compaction) can hold
-        // the agent busy briefly after agent_end; a prompt sent in that window
-        // fails with "Agent is already processing". Slow CI runners widen the
-        // window, so wait for idle state between back-to-back turns.
+        // Background work can keep the agent busy after `agent_end`.
+        // A prompt sent while the agent is busy fails with "Agent is already processing".
         const waitForIdle = async (): Promise<void> => {
             const deadline = Date.now() + 30_000;
             while (Date.now() < deadline) {
@@ -169,10 +141,6 @@ describe("pi short context accumulating overflow", () => {
         expect(sessionId).toBeTruthy();
         expect(turnErrors).toEqual([]);
 
-        // Diagnostic visibility only — see header comment for why we don't
-        // assert specific drop/compartment counts in a pure-text Pi RPC
-        // session. The real survival contract is "no turn errors over 30
-        // back-to-back high-pressure turns", asserted above.
         const compartmentCount = h
             .contextDb()
             .prepare("SELECT COUNT(*) AS c FROM compartments WHERE session_id = ?")

@@ -1,7 +1,7 @@
 import type { ParsedCompartment } from "./compartment-parser";
 import type { CandidateCompartment } from "./compartment-runner-types";
 
-/** Tier/metadata fields a parsed compartment may carry, threaded to storage. */
+/* */
 type ParsedTierFields = Pick<
     ParsedCompartment,
     "p1" | "p2" | "p3" | "p4" | "importance" | "episodeType"

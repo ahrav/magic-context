@@ -1,62 +1,39 @@
 /**
- * Cross-harness subagent runner abstraction.
  *
- * Magic Context spawns three kinds of subagents — historian, dreamer, sidekick —
- * each as a child "session" with its own model/prompt/tools. OpenCode and Pi
- * have very different APIs for this:
+ * Magic Context spawns historian, dreamer, and sidekick subagents.
+ * OpenCode and Pi expose different child-agent APIs.
  *
- *   - OpenCode: `client.session.create({parentID}) → client.session.prompt() →
- *     client.session.messages() → client.session.delete()`. The plugin runs
- *     in-process with the OpenCode server and uses its SDK client directly.
+ * OpenCode creates, prompts, reads, and deletes child sessions through its SDK.
+ * OpenCode runs child sessions in process through its SDK client.
  *
- *   - Pi: no in-process child-session API. Instead `pi --print --mode=json`
- *     spawns a non-interactive subprocess that emits structured JSON events
- *     and exits when the agent loop finishes. Sessions are JSONL files on
- *     disk, optionally addressed via `--session <path>`.
+ * Pi runs child agents in non-interactive `pi --print --mode=json` subprocesses.
+ * Pi emits structured JSON events from the subprocess.
+ * Pi stores sessions as JSONL files, optionally selected with `--session <path>`.
  *
- * The runner interface below normalizes both into the same shape so the
- * actual subagent business logic (historian XML parsing, dreamer task loop,
- * sidekick augmentation) can stay harness-agnostic. Each harness ships its
- * own runner implementation; agents take a `SubagentRunner` as a dep instead
- * of reaching for `client.session.*` directly.
+ * `SubagentRunner` isolates harness-specific session APIs from subagent business logic.
+ * Each harness implements `SubagentRunner`.
+ * Agents receive `SubagentRunner` instead of calling `client.session.*`.
  *
- * Step 5a (this commit) defines the contract and ships `PiSubagentRunner`.
- * Step 5b will refactor the OpenCode-side spawn paths in
- * `compartment-runner-historian.ts`, `dreamer/runner.ts`, and
- * `sidekick/agent.ts` onto an `OpenCodeSubagentRunner` so both harnesses
- * share the agent business logic instead of duplicating it. Until 5b lands,
- * OpenCode keeps its existing direct `client.session.*` calls untouched —
- * the runner contract is purely additive on the OpenCode side.
  */
 
 /**
- * Configuration for one subagent invocation.
  *
- * Mirrors the union of OpenCode's `session.create` + `session.prompt` body
- * fields and Pi's `--print` CLI flags, picking the shared subset that all
- * three subagent kinds (historian, dreamer, sidekick) actually use today.
+ * The configuration contains fields shared by OpenCode session calls and Pi print flags.
  *
  * Fields:
- * - `agent`: harness-specific agent name. OpenCode looks this up in its
- *   agent registry (`HISTORIAN_AGENT`, `DREAMER_AGENT`, `SIDEKICK_AGENT`).
- *   Pi has no concept of "agent name" beyond config, so this is ignored
- *   on the Pi side and used only by `OpenCodeSubagentRunner`.
- * - `systemPrompt`: full system prompt for this child run. Replaces (not
- *   appends to) any harness-default system prompt.
- * - `userMessage`: the single user-turn prompt. Subagent runs are always
- *   one-shot — no multi-turn conversation in the child.
- * - `model`: provider/model identifier in the canonical "provider/model"
- *   shape (e.g. "anthropic/claude-sonnet-4-7"). Each runner is responsible
- *   for translating to its harness's native model selection.
- * - `fallbackModels`: ordered list of models to try if `model` fails. Both
- *   harnesses retry on transient model failures.
- * - `timeoutMs`: hard cap on the child run. The runner aborts the child on
- *   exceeding this and returns `{ ok: false, reason: "timeout" }`.
- * - `cwd`: working directory for the child. OpenCode uses this for
- *   `query.directory`; Pi uses it as the spawn cwd so that `--cwd`-aware
- *   tools see the right project root.
- * - `signal`: optional AbortSignal so callers can cancel an in-flight run
- *   (used by dreamer's lease-renewal-aborts-on-loss path).
+ * `agent` selects an OpenCode agent registry entry.
+ * Pi ignores `agent`; only `OpenCodeSubagentRunner` uses it.
+ * `systemPrompt` replaces the harness-default system prompt.
+ * `userMessage` is the child run's only user-turn prompt.
+ * Child runs do not support multi-turn conversations.
+ * `model` uses the canonical `provider/model` form.
+ * Each runner translates `model` to its harness's native model selection.
+ * `fallbackModels` lists models to retry after transient failures of `model`.
+ * `timeoutMs` expiry aborts the child and returns `{ ok: false, reason: "timeout" }`.
+ * OpenCode passes `cwd` as `query.directory`.
+ * Pi uses `cwd` as the spawn cwd.
+ * `signal` lets callers cancel an in-flight run.
+ * Dreamer uses `signal` to abort lease renewal when it loses the lease.
  */
 export interface SubagentRunOptions {
     agent: string;
@@ -68,30 +45,26 @@ export interface SubagentRunOptions {
     cwd?: string | undefined;
     signal?: AbortSignal | undefined;
     /**
-     * Pi only: explicit thinking level, passed as `--thinking <level>` to the
-     * Pi subprocess. OpenCode ignores this field — thinking/reasoning is
-     * controlled via `variant` in the OpenCode agent config instead.
+     * Pi passes `thinkingLevel` as `--thinking <level>`.
+     * Pi uses `thinkingLevel`; OpenCode uses the agent config's `variant` for thinking and reasoning.
      *
-     * Required when the configured historian/dreamer model supports reasoning
-     * (e.g. github-copilot/gpt-5.4) because Pi's own default resolution may
-     * pick a value the provider rejects. Set to "off" to disable thinking for
-     * speed (local models), or "medium"/"high" for better quality.
+     * `thinkingLevel` is required when the configured historian or dreamer model supports reasoning.
+     * Pi's default thinking-level resolution can select a value the provider rejects.
+     * Set `thinkingLevel` to `"off"` to disable thinking.
      */
     thinkingLevel?: string | undefined;
 
     /**
-     * Optional progress callback. The runner invokes it for milestone events
-     * during the run: spawn, first event received, terminal stop reason
-     * detected, child exit. Used by historian/dreamer/sidekick to write
-     * lifecycle entries to the magic-context.log without polluting the
-     * normal stdout stream.
+     * The runner invokes `onProgress` for run milestones.
+     * Historian, dreamer, and sidekick use `onProgress` to write lifecycle entries.
+     * They write lifecycle entries to `magic-context.log` without writing them to stdout.
      *
-     * Implementations must be non-throwing and fast — they're called on the
-     * runner's hot path. Errors are swallowed.
+     * Progress callbacks must return promptly and must not throw.
+     * The runner swallows progress-callback errors.
      */
     onProgress?: (event: SubagentProgressEvent) => void;
 
-    /** Optional token accounting metadata. When present, harness runners persist subagent_invocations. */
+    /** Harness runners persist `subagent_invocations` when accounting metadata is present. */
     accountingSessionId?: string | undefined;
     accountingSubagent?:
         | "historian"
@@ -107,22 +80,16 @@ export interface SubagentRunOptions {
 }
 
 /**
- * Progress events emitted by a runner during a run. Distinct from the final
- * `SubagentRunResult` — these are mid-run milestones plus (optionally) every
- * raw event the underlying harness emits, so callers can write a complete
- * trace to the log when diagnosing hangs.
+ * Progress events are emitted before the final `SubagentRunResult`.
+ * Raw events let callers write a complete trace to the log when diagnosing hangs.
  *
  * Categories:
- * - `spawned` / `child_exit` / `stderr` — process lifecycle.
- * - `first_event` — convenience: first event received from the child, useful
- *   for measuring auth/network warmup time.
- * - `terminal` — runner detected the final assistant turn (Pi: assistant
- *   message_end with terminal stopReason and no toolCall; OpenCode: SDK
+ * `first_event` is the first event received from the child and can measure auth and network warmup time.
+ * `terminal` identifies the final assistant turn: Pi requires an assistant `message_end` with a terminal `stopReason` and no tool call; OpenCode uses the SDK `agent_end` equivalent.
  *   `agent_end` equivalent).
- * - `raw_event` — every parsed event from the harness's structured output
- *   stream (Pi NDJSON / OpenCode SDK events). Emitted unconditionally so
- *   debug logs can capture the full timeline. The `event` payload is
- *   harness-shaped — callers should treat it as `unknown` and log it raw.
+ * `raw_event` contains every parsed Pi NDJSON or OpenCode SDK event.
+ * `raw_event` is emitted unconditionally so debug logs capture the full timeline.
+ * `raw_event.event` is harness-shaped; callers must treat it as `unknown` and log it raw.
  */
 export type SubagentProgressEvent =
     | { type: "spawned"; argv: readonly string[]; pid: number | undefined }
@@ -144,37 +111,24 @@ export type SubagentProgressEvent =
     | { type: "child_exit"; code: number | null; signal: string | null; ms: number };
 
 /**
- * Result of one subagent invocation.
  *
- * The runner contract is "fail soft": transient errors, timeouts, model
- * failures, and aborts all surface as `{ ok: false, reason }` with a
- * machine-readable reason and a human-readable message. Throwing is
- * reserved for programmer errors (bad arguments, missing dependencies)
- * that the agent code couldn't have caused.
+ * Transient errors, timeouts, model failures, and aborts return `{ ok: false, reason }` with machine-readable reasons and human-readable messages.
+ * Only programmer errors, such as bad arguments or missing dependencies, throw because agent code cannot cause them.
  *
  * Fields:
  * - `ok`: true iff the child produced a final assistant message.
- * - `assistantText`: concatenated text content from the final assistant
- *   message, with leading/trailing whitespace trimmed. Empty assistant text is
- *   reported as `ok: false, reason: "no_assistant"` so callers can try fallback
- *   models instead of accepting an unusable success.
- * - `reason`: failure category, one of:
+ * `assistantText` contains trimmed, concatenated text from the final assistant message; empty text returns `ok: false` with reason `"no_assistant"` so callers can try fallback models.
  *     - `"invalid_prompt"`: a known zero-tool child was given no system prompt
  *     - `"timeout"`: hit `timeoutMs` before the child finished
  *     - `"abort"`: caller's `signal` was triggered
  *     - `"model_failed"`: every configured model + fallback returned an error
  *     - `"truncated"`: child stopped because model output hit length limits
- *     - `"spawn_failed"`: subprocess couldn't start (Pi only — binary missing,
- *       permission denied, etc.)
+ * `"spawn_failed"`: subprocess could not start because the Pi binary is missing or permission was denied.
  *     - `"non_zero_exit"`: child exited unsuccessfully before a final answer
  *     - `"no_assistant"`: child completed without a final assistant message
- *     - `"parse_failed"`: child emitted output we couldn't parse (Pi only —
- *       JSON malformed or unexpected event ordering)
- * - `error`: human-readable detail; safe to log, may include stack info.
- * - `durationMs`: wall-clock time from runner-call to runner-return.
- * - `meta`: optional harness-specific debug payload. Unused; kept
- *   here so the OpenCode runner can surface the child session ID for log
- *   correlation when Step 5b lands.
+ * `"parse_failed"`: Pi emitted malformed JSON or events in an unexpected order.
+ * `error` contains human-readable failure detail.
+ * `durationMs` measures wall-clock time from runner call to return.
  */
 export type SubagentRunResult =
     | {
@@ -182,12 +136,6 @@ export type SubagentRunResult =
           assistantText: string;
           durationMs: number;
           /**
-           * Number of tool invocations the agent made during the run. Pi reports
-           * this so callers that gate on "did the agent actually investigate vs
-           * just paraphrase" (refresh-primers' grounding gate) work on Pi, whose
-           * facade otherwise surfaces only the final assistant text. OpenCode
-           * leaves it undefined — its callers read tool-call parts straight off
-           * the real session messages.
            */
           toolCallCount?: number;
           meta?: Record<string, unknown>;
@@ -206,30 +154,22 @@ export type SubagentRunResult =
               | "parse_failed";
           error: string;
           durationMs: number;
-          /** True when the caller should retry the task rather than advance its schedule. */
+          /** `retryable` is true when callers should retry the task instead of advancing its schedule. */
           transient?: boolean;
           meta?: Record<string, unknown>;
       };
 
 /**
- * Abstract runner contract.
  *
- * Each harness ships a single instance — the OpenCode plugin wires
- * `OpenCodeSubagentRunner` and the Pi plugin wires `PiSubagentRunner` in
- * its `extension` boot path. Agent code (historian, dreamer, sidekick)
- * receives the runner as a dep and never reaches for harness-specific
- * client APIs directly.
  */
 export interface SubagentRunner {
-    /** Human-readable harness name, for logging (`"opencode"` or `"pi"`). */
+    /** `harness` identifies the harness in logs (`"opencode"` or `"pi"`). */
     readonly harness: string;
 
     /**
-     * Run one subagent invocation to completion.
      *
-     * Always resolves with a `SubagentRunResult` — never throws for
-     * runtime/transport/model failures. Throwing is reserved for caller
-     * misuse (e.g. missing required option fields).
+     * `run` resolves with `SubagentRunResult` for runtime, transport, and model failures.
+     * `run` throws when required option fields are missing.
      */
     run(options: SubagentRunOptions): Promise<SubagentRunResult>;
 }

@@ -8,11 +8,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ck_wire::{CkIngressMessage, CkWireBlock};
 
-/// A decoded compaction marker from a harness transcript.
+/// ExtractedBoundary records a decoded compaction marker from a harness transcript.
 ///
-/// This is an input fact extracted from the harness's own compaction marker. It
-/// is not a caller-supplied cache anchor: the module still decides whether the
-/// boundary is present and how cache-core state should consume it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedBoundary {
     pub harness: String,
@@ -182,9 +179,7 @@ fn stamped_block_identity(block: &CkWireBlock) -> Option<(usize, usize, &str)> {
     Some((block_index, native_index, fingerprint))
 }
 
-/// True when a decoded block still carries its exact native-part origin. Frozen rewrites retain
-/// this stamp, allowing the encoder to update the original part instead of using compatibility
-/// coalescing for an unmatched call/result shell.
+/// True when a decoded block retains its exact native-part origin.
 pub(crate) fn has_stamped_block_identity(block: &CkWireBlock) -> bool {
     stamped_block_identity(block).is_some()
 }
@@ -219,9 +214,7 @@ fn alignment_candidate(
         return Some(false);
     }
 
-    // For sidecars written before fingerprints existed, match by position only when the block
-    // index is unchanged. This keeps old sessions readable without re-enabling the old fallback
-    // that inferred matches by scanning nearby blocks of the same kind after deletions.
+    // Position-only matching for fingerprintless sidecars requires an unchanged block index and does not scan nearby same-kind blocks.
     (meta.content_fingerprint.is_none() && block_index == meta.block_index && kind_matches)
         .then_some(false)
 }
@@ -240,11 +233,9 @@ pub(crate) fn match_block_metas<'a>(
         }
     }
 
-    // Origin indexes are stamped onto decoded blocks and survive reductions, overlays, and
-    // deletion compaction through CkWireBlock::provider_extras. The fingerprint stored beside
-    // that index is always the pre-mutation decoded fingerprint, so a mutated survivor aligns
-    // with its own native meta rather than being compared by its current bytes. The LCS-style
-    // walk preserves native order and refuses the former same-kind adjacency fallback.
+    // Origin indexes are stamped onto decoded blocks and survive reductions, overlays, and deletion compaction in CkWireBlock::provider_extras.
+    // Each origin index stores the pre-mutation decoded fingerprint.
+    // Pre-mutation fingerprints align mutated survivors with their native metadata; the LCS-style walk preserves native order and avoids same-kind adjacency matching.
     let mut scores = vec![vec![AlignmentScore::default(); metas.len() + 1]; blocks.len() + 1];
     for block_index in (0..blocks.len()).rev() {
         for meta_index in (0..metas.len()).rev() {

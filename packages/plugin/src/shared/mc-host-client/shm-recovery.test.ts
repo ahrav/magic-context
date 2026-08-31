@@ -1,11 +1,5 @@
 /**
- * Fresh-generation TCP-to-shared-memory re-upgrade suite (U3, R9-R11).
  *
- * The runtime-neutral key scenarios in
- * `test-support/shm-recovery-scenarios.ts` run here under bun AND under
- * Node 24 through `scripts/run-mc-host-client-adversarial.ts`. The cases
- * below are bun-only detail coverage: promotion fencing, predecessor drain
- * ordering, permit accounting, and probe-stop classification.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -120,8 +114,7 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
             const stopServing = serveTcpRoutes(conn1, 7);
             const rawHandle = await client.routeOpen(TOOL_TARGET, IDENTITY);
 
-            // A withheld raw response keeps the predecessor pending set
-            // nonempty across promotion.
+            // A withheld raw response keeps the predecessor pending set nonempty across promotion.
             stopServing();
             const pendingRaw = client.request(rawHandle, { hold: true }, { timeoutMs: 8_000 });
             pendingRaw.catch(() => {});
@@ -131,7 +124,7 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
             allowGrant = true;
             await waitUntil(() => connectedTransports(events).includes("fake.shm"), 10_000);
 
-            // Route closed but request still pending: no retirement.
+            // A pending request prevents predecessor retirement after its route closes.
             await client.closeRoute(rawHandle);
             await delay(100);
             expect(conn1.socket.destroyed).toBe(false);
@@ -139,8 +132,8 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
                 conn1.frames.some((f) => f.ty === PeerFrameType.Goodbye && f.channel === 0),
             ).toBe(false);
 
-            // The old pending request completes on its own generation
-            // with exactly one terminal; pending-zero then retires the
+            // The epoch-1 response settles the old request on the predecessor.
+            // The predecessor retires when its pending count reaches zero.
             // predecessor.
             const requestFrame = conn1.frames.find(
                 (f) => f.channel === 7 && f.ty === PeerFrameType.Request,
@@ -185,7 +178,6 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
         try {
             const { peer, client, events } = harness;
             const conn1 = peer.connections[0] as FakePeerConnection;
-            // Serve route.open manually, withhold the managed response.
             const openFramePromise = conn1.waitFor(() =>
                 conn1.frames.some((f) => {
                     if (f.ty !== PeerFrameType.Request || f.channel !== 0) return false;
@@ -226,7 +218,7 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
             );
             allowGrant = true;
             await waitUntil(() => connectedTransports(events).includes("fake.shm"), 10_000);
-            // Predecessor still open: managed terminal not yet observed.
+            // The predecessor remains open until it observes the managed terminal.
             expect(conn1.socket.destroyed).toBe(false);
             const body = conn1.frames.find(
                 (f) => f.channel === 9 && f.ty === PeerFrameType.Request,
@@ -241,8 +233,7 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
                 }),
             );
             expect(await managedCall).toEqual({ served: "tcp" });
-            // Pending-zero closes the orphaned managed route (route
-            // Goodbye on channel 9) and then the whole predecessor.
+            // The predecessor closes its orphaned managed route when its pending count reaches zero.
             await waitUntil(
                 () =>
                     conn1.frames.some((f) => f.ty === PeerFrameType.Goodbye && f.channel === 9) &&
@@ -275,9 +266,6 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
             const rawHandle = await client.routeOpen(TOOL_TARGET, IDENTITY);
             await waitUntil(() => connectedTransports(events).includes("fake.shm"), 10_000);
 
-            // Retire the shm primary while the raw handle keeps the
-            // predecessor occupied; the reconnect commits unavailable
-            // TCP and starts a second episode that must wait.
             grantEnabled = false;
             const acceptedBefore = peer.connections.length;
             provider.host.close();
@@ -290,8 +278,7 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
             serveTcpRoutes(conn2, 11);
             expect(await call).toEqual({ served: "tcp" });
 
-            // While the predecessor slot is occupied no shadow dial
-            // happens (permits stay at primary+predecessor), and the
+            // An occupied predecessor slot prevents shadow dialing.
             // raw handle is never forced closed.
             await delay(300);
             expect(peer.connections.length).toBe(acceptedBefore + 1);
@@ -300,8 +287,6 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
                 served: "tcp",
             });
 
-            // Freeing the slot lets the deferred episode dial and
-            // promote a fresh generation.
             grantEnabled = true;
             await client.closeRoute(rawHandle);
             await waitUntil(
@@ -311,8 +296,7 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
             expect(await client.call("magic-context", "after-episode-2")).toEqual({
                 served: "shm",
             });
-            // Permit bound across the whole flow: primary, predecessor,
-            // and one shadow at most.
+            // At most three permits are active: one primary, one predecessor, and one shadow.
             expect(liveTcpConnections(peer)).toBeLessThanOrEqual(3);
         } finally {
             await harness.cleanup();
@@ -321,9 +305,6 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
 
     test("a stale shadow success racing primary retirement cannot publish and returns its permits", async () => {
         const provider = createFakePairedProvider();
-        // The shadow attaches and activates, but its commit response is
-        // withheld until the test has retired the primary — the held
-        // commit is the stale success.
         let heldCommit: bigint | undefined;
         const auto = candidateAutoResponder(RECOVERY_GRANT_TOKEN);
         provider.host.onFrame = (frame, host) => {
@@ -351,8 +332,6 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
             const { peer, client, events } = harness;
             const conn1 = peer.connections[0] as FakePeerConnection;
             await waitUntil(() => heldCommit !== undefined, 10_000);
-            // The shadow candidate attached before the race: the permit
-            // and channel-close assertions below always apply.
             expect(provider.connectCount).toBeGreaterThan(0);
             conn1.destroy();
             await waitUntil(() => events.some((e) => e.type === "retired"), 5_000);
@@ -411,9 +390,7 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
     }, 20_000);
 
     test("a post-grant failure during a shadow attempt stops the episode permanently", async () => {
-        // The provider host rejects activation (token mismatch): grant
-        // attachment succeeded but activation fails, which must stop
-        // recovery for the episode without extending any deadline.
+        // A token mismatch rejects activation after grant attachment succeeds and stops episode recovery without extending any deadline.
         const provider = createFakePairedProvider();
         provider.host.onFrame = candidateAutoResponder("ffffffffffffffffffffffffffffffff");
         const harness = await connectHarness(
@@ -427,9 +404,9 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
         try {
             const { peer, events } = harness;
             await waitUntil(() => provider.connectCount >= 1, 10_000);
-            // The activation error retires the candidate; the closed
-            // channel marks the failure processed, and the settle turns
-            // let the episode's stop decision run to completion.
+            // The activation error retires the candidate.
+            // The closed channel marks the failure processed.
+            // A settle turn lets the episode's stop decision complete.
             await waitUntil(() => provider.host.channelClosed, 10_000);
             await settle();
             const settled = peer.connections.length;
@@ -457,10 +434,9 @@ describe("shm re-upgrade drain and fencing (bun)", () => {
         try {
             const { peer, events } = harness;
             await waitUntil(() => connectedTransports(events).includes("fake.shm"), 15_000);
-            // One primary plus at most one shadow before any
-            // predecessor exists; never more than three overall.
+            // Before a predecessor exists, one primary and at most one shadow are active; no more than three are active overall.
             expect(Math.max(...maxLive)).toBeLessThanOrEqual(3);
-            // Every failed shadow's connection permit was returned.
+            // Each failed shadow returns its connection permit.
             await waitUntil(() => liveTcpConnections(peer) <= 1, 5_000);
         } finally {
             await harness.cleanup();

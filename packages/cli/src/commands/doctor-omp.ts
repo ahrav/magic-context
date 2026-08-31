@@ -124,7 +124,6 @@ function selfVersion(): string {
             const value = req(path) as { version?: unknown };
             if (typeof value.version === "string") return value.version;
         } catch {
-            // Try the source/published alternate layout.
         }
     }
     return "unknown";

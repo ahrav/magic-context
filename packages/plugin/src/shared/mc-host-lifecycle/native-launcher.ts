@@ -1,18 +1,6 @@
 /**
- * Bounded native lifecycle subprocess invocation.
  *
- * Production launch maps the retained verified launcher descriptor to one
- * fixed child fd through Node/Bun stdio numeric mapping and spawns the
- * platform's descriptor exec path (`/proc/self/fd/<n>` on linux,
- * `/dev/fd/<n>` on darwin) with `shell:false`, a minimal environment, and the
- * startup envelope on stdin only. A dev/test injection point spawns an
- * explicit binary path instead (this repo's cargo-built `ck-mc-host`);
- * production callers never take that branch with untrusted input because the
- * target is constructed by policy, not configuration.
  *
- * Output handling is fail-closed: stdout must be exactly one v1 JSON object,
- * the exit code must agree with `ok`, and stderr is tainted — drained and
- * discarded, so it never reaches an error or result.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -24,15 +12,13 @@ import {
     parseDaemonResult,
 } from "./contract";
 
-/** The fixed collision-free child descriptor for the retained launcher. */
+/* */
 export const LAUNCHER_CHILD_FD = 3;
 
 export type NativeLaunchTarget =
     | { kind: "retained-fd"; fd: number }
     /**
-     * Dev/test injection point. `path` MUST be absolute: the child is spawned
-     * with `cwd: "/"`, so a relative path is resolved against the filesystem
-     * root rather than the caller's directory.
+     * `path` MUST be absolute because the child resolves it from `cwd: "/"`.
      */
     | { kind: "test-binary"; path: string };
 
@@ -48,7 +34,7 @@ export type NativeLaunchFailureCode =
     | "exit_disagreement"
     | "usage_error";
 
-/** Typed launch failure. Never carries stdout/stderr bytes or raw paths. */
+/* */
 export class NativeLaunchError extends Error {
     constructor(
         readonly code: NativeLaunchFailureCode,
@@ -62,19 +48,18 @@ export class NativeLaunchError extends Error {
 export interface NativeLaunchOptions {
     command: NativeLifecycleCommand;
     /**
-     * Dev/test staging source forwarded as `--payload-dir`. MUST be absolute:
-     * the child runs with `cwd: "/"` and resolves it there.
+     * `payloadDir` MUST be absolute because the child resolves it from `cwd: "/"`.
      */
     payloadDir?: string;
-    /** Parent-trusted canonical manifest digest for a production payload directory. */
+    /** The parent trusts `payloadManifestDigest` as the canonical manifest digest for a production payload directory. */
     payloadManifestDigest?: string;
-    /** JSON-serializable startup envelope written to stdin, or null. */
+    /** `envelope` supplies a JSON-serializable startup envelope on stdin, or `null`. */
     envelope?: unknown;
-    /** Absolute wall-clock budget; the child is killed at expiry. */
+    /** `deadlineMs` sets an absolute wall-clock budget; expiry kills the child. */
     deadlineMs: number;
-    /** Explicit environment for the child; defaults to a minimal set. */
+    /** `env` sets the child environment; omitting it uses a minimal set. */
     env?: Record<string, string>;
-    /** Host platform override for the retained-descriptor exec path; tests only. */
+    /** `platform` overrides the host platform for the retained-descriptor exec path; only tests set it. */
     platform?: NodeJS.Platform;
 }
 
@@ -103,13 +88,8 @@ interface CollectedExit {
 }
 
 /**
- * Resolve the exec path that re-opens the retained launcher descriptor.
  *
- * Linux reaches it through procfs and darwin through `/dev/fd`; the release
- * contract records exactly this split as the `procfs_self_fd_exec` and
- * `dev_fd_exec` platform capabilities. Any other platform has neither, so it
- * gets no path and the caller fails with a real platform reason rather than a
- * spawn error against a path that cannot exist.
+ * Unsupported platforms return `null` so callers can report an unsupported-platform error before spawning.
  */
 function retainedFdExecPath(platform: NodeJS.Platform): string | null {
     if (platform === "linux") return `/proc/self/fd/${LAUNCHER_CHILD_FD}`;
@@ -132,21 +112,14 @@ function collectChild(child: ChildProcess, deadlineMs: number): Promise<Collecte
         child.stdout?.on("data", (chunk: Buffer) => {
             stdoutLen += chunk.length;
             if (stdoutLen > MAX_STDOUT_BYTES) {
-                // Its own flag, never `timedOut = false`: buffered stdout can
-                // still arrive after the deadline timer's SIGKILL, and clearing
-                // `timedOut` there would report a real deadline expiry as a
-                // bare signal exit.
                 outputCapExceeded = true;
                 child.kill("SIGKILL");
                 return;
             }
             stdoutChunks.push(chunk);
         });
-        // Stderr is tainted diagnostics: drain it so a child writing more than
-        // one pipe buffer cannot block, and discard every byte — it never
-        // reaches an error or result. Draining keeps the read end open for the
-        // child's whole run; closing it early would make the next child-side
-        // write take EPIPE/SIGPIPE and turn a healthy run into a signal exit.
+        // The parent drains stderr so a child writing beyond a pipe buffer cannot block.
+        // Keep the stderr read end open for the child's whole run; closing it early makes the next child-side write fail with EPIPE or SIGPIPE.
         child.stderr?.resume();
         child.on("error", (error) => {
             if (settled) return;
@@ -155,8 +128,7 @@ function collectChild(child: ChildProcess, deadlineMs: number): Promise<Collecte
             if (stdioGrace !== null) clearTimeout(stdioGrace);
             reject(new NativeLaunchError("spawn_failed", `native spawn failed: ${error.name}`));
         });
-        // The `exit` handler waits STDIO_FLUSH_GRACE_MS before destroying the
-        // pipes so inherited descriptors cannot delay `close` indefinitely.
+        // The parent destroys the pipes after `STDIO_FLUSH_GRACE_MS` because inherited descriptors can otherwise delay `close` indefinitely.
         child.on("exit", () => {
             stdioGrace = setTimeout(() => {
                 child.stdout?.destroy();
@@ -180,11 +152,6 @@ function collectChild(child: ChildProcess, deadlineMs: number): Promise<Collecte
 }
 
 /**
- * Run one native lifecycle command and return its validated v1 result.
- * Every non-conforming outcome — spawn failure, deadline kill, signal exit,
- * extra stdout bytes, unknown fields, exit/JSON disagreement, usage exit —
- * is a typed {@link NativeLaunchError}; secrets, stderr text, and raw paths
- * never ride on it.
  */
 export async function runNativeLifecycle(
     target: NativeLaunchTarget,
@@ -198,37 +165,25 @@ export async function runNativeLifecycle(
         args.push("--payload-manifest-digest", options.payloadManifestDigest);
     }
     const env = options.env ?? {};
-    // Validated before anything is spawned, for the same reason the envelope is:
-    // an exhausted or malformed budget must produce a typed error with no child
-    // in flight. `setTimeout` coerces a nonpositive or non-finite delay to 1ms,
-    // so without this a mutating lifecycle transaction would start and then be
-    // SIGKILLed a millisecond later — filesystem and daemon effects from a call
-    // that had no execution budget at all.
+    // The launcher rejects nonpositive or non-finite `deadlineMs` before spawning because `setTimeout` coerces either to 1 ms.
     if (!Number.isFinite(options.deadlineMs) || options.deadlineMs <= 0) {
         throw new NativeLaunchError(
             "usage_error",
             "native lifecycle deadline is not a positive finite duration",
         );
     }
-    // Path inputs are checked here for the same reason, because the child is
-    // spawned with `cwd: "/"`: a relative value silently changes meaning rather
-    // than failing. `target/debug/ck-mc-host` becomes `/target/debug/...` and
-    // fails as a missing payload, and a first segment that collides with a real
-    // root entry is worse — `bin/foo` resolves to `/bin/foo` and *executes the
-    // wrong binary*, surfacing later as malformed output. `--payload-dir` has
-    // the same hazard, staging from a directory the caller never named.
+    // The launcher requires absolute path inputs because `cwd: "/"` resolves relative values against `/`.
+    // Relative executable paths can resolve to unintended binaries under `/`.
+    // A relative `--payload-dir` stages from a directory the caller did not name.
     if (target.kind === "test-binary" && !path.isAbsolute(target.path)) {
         throw new NativeLaunchError("usage_error", "native launch target path is not absolute");
     }
     if (options.payloadDir !== undefined && !path.isAbsolute(options.payloadDir)) {
         throw new NativeLaunchError("usage_error", "native payload directory is not absolute");
     }
-    // The envelope is serialized before anything is spawned: a value with no
-    // JSON form must fail as a typed error with no child in flight, and the
-    // stdin `error` listener below only sees stream errors, never a synchronous
-    // throw from this call. `JSON.stringify` also answers `undefined` rather
-    // than throwing for values that have no JSON form at all, such as a bare
-    // function, so both outcomes are rejected the same way.
+    // The launcher serializes `envelope` before spawning so values without a JSON form fail without starting a child.
+    // `JSON.stringify` returns `undefined` rather than throwing for a bare function.
+    // `JSON.stringify` exceptions and `undefined` results cause `NativeLaunchError` with code `usage_error`.
     let serializedEnvelope: string | undefined;
     if (options.envelope !== undefined && options.envelope !== null) {
         try {
@@ -272,10 +227,9 @@ export async function runNativeLifecycle(
     } catch {
         throw new NativeLaunchError("spawn_failed", "native spawn threw synchronously");
     }
-    // A child that already exited or failed to exec makes this write raise
-    // EPIPE/ERR_STREAM_DESTROYED on stdin. Without a listener that stream
-    // `error` is an uncaught exception in the host, so an ordinary child-side
-    // failure would crash the process instead of surfacing as NativeLaunchError.
+    // Calling `child.stdin?.end()` after the child exits or fails to exec can raise `EPIPE` or `ERR_STREAM_DESTROYED`.
+    // Without a `child.stdin` `error` listener, emitted stream errors are uncaught host exceptions.
+    // Without a `child.stdin` `error` listener, child-side stdin failures crash the host instead of surfacing as `NativeLaunchError`.
     child.stdin?.on("error", () => {});
     if (serializedEnvelope === undefined) {
         child.stdin?.end();
@@ -304,11 +258,10 @@ export async function runNativeLifecycle(
             "native lifecycle command rejected its invocation",
         );
     }
-    // Decoded strictly. `Buffer.toString("utf8")` substitutes U+FFFD for an
-    // invalid byte, so a corrupt byte inside an otherwise well-formed JSON
-    // string would parse, validate, and be accepted as a conforming result
-    // carrying a silently mangled value — a truncated or corrupted stream must
-    // fail closed instead.
+    // `TextDecoder` rejects invalid UTF-8; `Buffer.toString("utf8")` replaces invalid bytes with U+FFFD.
+    // A JSON string containing U+FFFD can parse and pass result validation after replacement.
+    // Replacing invalid bytes can silently mangle a result value.
+    // The launcher rejects truncated or corrupted stdout rather than accepting a mangled result.
     let stdoutText: string;
     try {
         stdoutText = new TextDecoder("utf-8", { fatal: true }).decode(collected.stdout);

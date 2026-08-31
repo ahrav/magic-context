@@ -1,7 +1,5 @@
 /**
- * Keep TCP fragmentation, authentication leftovers, and FIN/RST cases
- * separate from provider-neutral contract scenarios: only the socket
- * transport has byte-split or EOF variants.
+ * Byte-split and EOF variants are TCP-specific; provider-neutral contract scenarios exclude them.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
@@ -119,9 +117,7 @@ describe("TCP adapter specifics", () => {
     }, 30_000);
 
     test("auth and first frames arriving in one socket chunk transfer without loss", async () => {
-        // Two coalesced frames ride the same write as the ServerHello, so
-        // every leftover byte must move from the auth buffer to the frame
-        // reader when delivery begins.
+        // The channel moves all unread authentication bytes to the frame reader when frame delivery begins because a ServerHello write can contain two frames.
         const h = await createHarness({
             helloTrailer: Buffer.concat([
                 responseFrame(41n, Buffer.from("first")),
@@ -187,11 +183,8 @@ describe("TCP adapter specifics", () => {
     });
 
     test("an abrupt peer reset reports one close with a terminal classification", async () => {
-        // The load-bearing invariant is exactly-once close reporting. The
-        // classification depends on the runtime: `resetAndDestroy()` sends
-        // an RST where supported (`socket_error`), but Bun on Linux can
-        // still deliver an orderly EOF for the same peer action, so the
-        // observed close reason is any terminal classification.
+        // The channel reports closure exactly once.
+        // The channel treats `socket_error` and EOF after `resetAndDestroy()` as terminal because Bun on Linux can deliver EOF instead of an RST.
         const h = await createHarness();
         h.connection.reset();
         await waitUntil(() => h.closes.length >= 1);
@@ -270,8 +263,7 @@ describe("TCP adapter specifics", () => {
         );
         producer.write(Buffer.alloc(capacity, 7));
         producer.commit(capacity);
-        // Spans (capacity) and the queued copy (capacity) are both charged at
-        // the commit boundary, so peak reflects the true double residency.
+        // `ByteBudget` charges span and queued-copy capacity at commit so peak usage includes both resident copies.
         expect(h.budget.peak).toBeGreaterThanOrEqual(2 * capacity);
     });
 
@@ -290,9 +282,7 @@ describe("TCP adapter specifics", () => {
             capacity,
         );
         producer.write(Buffer.alloc(capacity, 7));
-        // Committed spans detach through structuredClone transfer; refusing
-        // the transfer fails commit after the compatibility copy is charged,
-        // exercising the abort path between prepareCommit and publish.
+        // If `structuredClone` refuses to transfer a committed span, commit fails after charging the compatibility copy and before publish.
         const originalClone = globalThis.structuredClone;
         globalThis.structuredClone = (() => {
             throw new Error("alias detachment refused");

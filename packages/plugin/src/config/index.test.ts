@@ -7,15 +7,10 @@ import { loadPluginConfig, loadPluginConfigDetailed } from "./index";
 import { RUST_COMPACTION_OFF_WARNING } from "./transform-mode";
 
 /**
- * Writes a magic-context.jsonc file inside a fresh temp XDG_CONFIG_HOME tree
- * and runs loadPluginConfig against it. Returns warnings + parsed config.
  *
- * Scope directory is NOT set — we pass a unique directory that does not
- * contain a project config so only the user config is loaded.
  */
 function loadWithUserConfig(configText: string, extraEnv: Record<string, string> = {}) {
     const xdg = mkdtempSync(join(tmpdir(), "mc-config-test-"));
-    // Hard cutover: the loader reads user config from <XDG>/cortexkit/.
     const configDir = join(xdg, "cortexkit");
     const fs = require("node:fs") as typeof import("node:fs");
     fs.mkdirSync(configDir, { recursive: true });
@@ -29,8 +24,6 @@ function loadWithUserConfig(configText: string, extraEnv: Record<string, string>
     }
     process.env.XDG_CONFIG_HOME = xdg;
 
-    // Use a directory that definitely has no project config so only the
-    // user config feeds the loader. We use a sibling temp directory.
     const projectDir = mkdtempSync(join(tmpdir(), "mc-config-proj-"));
     try {
         return loadPluginConfig(projectDir);
@@ -47,12 +40,12 @@ function loadWithUserConfig(configText: string, extraEnv: Record<string, string>
         try {
             rmSync(xdg, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
         try {
             rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     }
 }
@@ -65,7 +58,6 @@ function loadWithUserAndProjectConfig(
     const xdg = mkdtempSync(join(tmpdir(), "mc-config-test-"));
     const projectDir = mkdtempSync(join(tmpdir(), "mc-config-proj-"));
     const fs = require("node:fs") as typeof import("node:fs");
-    // Hard cutover: user config at <XDG>/cortexkit/, project at <root>/.cortexkit/.
     const configDir = join(xdg, "cortexkit");
     fs.mkdirSync(configDir, { recursive: true });
     fs.mkdirSync(join(projectDir, ".cortexkit"), { recursive: true });
@@ -99,12 +91,12 @@ function loadWithUserAndProjectConfig(
         try {
             rmSync(xdg, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
         try {
             rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     }
 }
@@ -182,8 +174,8 @@ describe("loadPluginConfig — secret redaction", () => {
         const origHome = process.env.HOME;
         process.env.XDG_CONFIG_HOME = xdg;
         process.env.HOME = home;
-        // A real setting the user disabled: it MUST survive the unmigrated window,
-        // not be silently re-enabled by schema defaults (memory defaults to on).
+        // The legacy configuration must preserve explicitly disabled settings.
+        // `memory` defaults to enabled, so schema defaults must not re-enable an explicitly disabled setting.
         writeFileSync(
             join(projectDir, "magic-context.jsonc"),
             '{"embedding":{"provider":"off"},"memory":{"enabled":false}}',
@@ -191,11 +183,7 @@ describe("loadPluginConfig — secret redaction", () => {
         try {
             const result = loadPluginConfigDetailed(projectDir);
 
-            // Read-legacy-on-conflict: the legacy file is the source of truth
-            // until migration completes, so the load is trusted ("ok") and the
-            // real (disabled) setting is honored, not silently defaulted on.
-            // (embedding.* is intentionally stripped from project-scope config for
-            // security, so we assert a non-embedding setting survives.)
+            // Project-scope config strips `embedding.*`; this test uses a non-embedding setting.
             expect(result.sources.projectConfig).toBe("ok");
             expect(result.loadOutcome).toBe("ok");
             expect(result.config.memory.enabled).toBe(false);
@@ -214,8 +202,8 @@ describe("loadPluginConfig — secret redaction", () => {
     });
 
     it("loadPluginConfig (the runtime init path) honors read-legacy, not schema defaults", () => {
-        // The runtime registers via loadPluginConfig (index.ts), NOT the detailed
-        // variant. This locks that the read-legacy fallback applies there too — a
+        // Runtime registration calls `loadPluginConfig` from `index.ts`, not `loadPluginConfigDetailed`.
+        // Runtime initialization must apply the read-legacy fallback through loadPluginConfig.
         // migration refusal must not silently re-enable disabled features at init.
         const xdg = mkdtempSync(join(tmpdir(), "mc-config-test-"));
         const home = mkdtempSync(join(tmpdir(), "mc-config-home-"));
@@ -243,16 +231,14 @@ describe("loadPluginConfig — secret redaction", () => {
     it("does NOT leak resolved env values through Zod validation warnings", () => {
         const secret = "sk-live-CARDINAL-SIN-IF-THIS-APPEARS-IN-LOGS";
         const config = JSON.stringify({
-            // `historian_timeout_ms` has a minimum of 60_000. Feeding the
-            // substituted secret string here causes Zod to reject the field
-            // and route through the warning path we care about.
+            // `historian_timeout_ms` requires at least `60_000`; substituting the secret must fail Zod validation.
             historian_timeout_ms: "{env:MC_TEST_SECRET}",
         });
 
         const result = loadWithUserConfig(config, { MC_TEST_SECRET: secret });
         const warnings = result.configWarnings ?? [];
 
-        // The plugin should still load (enabled: true kept by recovery path).
+        // Config recovery preserves `enabled: true`.
         expect(result.enabled).toBe(true);
 
         // No warning or config field may contain the resolved secret.
@@ -260,19 +246,17 @@ describe("loadPluginConfig — secret redaction", () => {
         expect(allText).not.toContain(secret);
         expect(allText).not.toContain("CARDINAL-SIN");
 
-        // But the warnings should still describe what failed. We expect a
-        // warning mentioning historian_timeout_ms and the safe type summary.
+        // Warnings must name `historian_timeout_ms` and include a safe type summary.
         const relevantWarning = warnings.find((w) => w.includes("historian_timeout_ms"));
         expect(relevantWarning).toBeDefined();
         expect(relevantWarning).toContain("invalid value");
-        // Must show type + length, not the value itself.
+        // Warnings must show the value's type and length, not its value.
         expect(relevantWarning).toMatch(/string, \d+ chars?/);
     });
 
     it("redacts long string values of any source (not just env-substituted)", () => {
-        // Verifies the redaction applies to plain invalid values too — we
-        // don't want to special-case env vs non-env because we can't tell
-        // them apart at the Zod layer.
+        // The redactor must redact invalid literal values and environment-resolved values.
+        // The redactor cannot distinguish environment-resolved strings from literal strings.
         const config = JSON.stringify({
             historian_timeout_ms: "super-secret-plain-literal-that-should-not-leak",
         });
@@ -314,11 +298,9 @@ describe("loadPluginConfig — secret redaction", () => {
     });
 
     it("recovers an invalid NESTED field without wiping valid siblings in the same block", () => {
-        // Regression: one bad nested field (memory.injection_budget_tokens as a
-        // string) must NOT delete the whole `memory` block — which would silently
-        // drop valid siblings like memory.auto_search.enabled (and, on the
-        // migration path, the just-graduated memory.git_commit_indexing). Recovery
-        // should prune only the invalid leaf and keep the rest.
+        // An invalid `memory.injection_budget_tokens` value must not discard valid fields in `memory`.
+        // Deleting `memory` would drop valid siblings such as `memory.auto_search.enabled`.
+        // Recovery must prune only the invalid leaf and preserve valid siblings.
         const config = JSON.stringify({
             memory: {
                 injection_budget_tokens: "not-a-number", // invalid nested leaf
@@ -330,12 +312,11 @@ describe("loadPluginConfig — secret redaction", () => {
         const warnings = result.configWarnings ?? [];
 
         expect(result.enabled).toBe(true);
-        // The valid sibling the user explicitly set must be preserved, not reset
-        // to the schema default (true).
+        // `memory.auto_search.enabled` must remain disabled rather than reset to its default (`true`).
+        // Valid siblings must not reset to the schema default (`true`).
         expect(result.memory.auto_search.enabled).toBe(false);
         // The invalid leaf falls back to its schema default.
         expect(typeof result.memory.injection_budget_tokens).toBe("number");
-        // A warning should name the pruned nested field.
         const w = warnings.find(
             (x) => x.includes("memory") && x.includes("injection_budget_tokens"),
         );
@@ -343,9 +324,7 @@ describe("loadPluginConfig — secret redaction", () => {
     });
 
     it("still shows numeric and boolean invalid values (not secrets by nature)", () => {
-        // Numbers/booleans in config fields are never secrets — they're
-        // plain validation mistakes — so we surface them fully to help
-        // the user diagnose.
+        // Numbers and booleans are rendered verbatim.
         const config = JSON.stringify({
             execute_threshold_percentage: 5, // below min (20)
         });
@@ -355,7 +334,6 @@ describe("loadPluginConfig — secret redaction", () => {
         const combined = warnings.join("\n");
 
         expect(combined).toContain("execute_threshold_percentage");
-        // `number 5` is the human-friendly safe render.
         expect(combined).toMatch(/number 5/);
     });
 
@@ -369,7 +347,7 @@ describe("loadPluginConfig — secret redaction", () => {
         const combined = warnings.join("\n");
 
         expect(combined).toContain("execute_threshold_percentage");
-        // The custom message explains WHY, not just "too big".
+        // The custom message must state the violated constraint, not only that the value is too large.
         expect(combined).toContain("capped at 90% for cache safety");
     });
     it("keeps embedding destination fields from trusted user config", () => {
@@ -446,9 +424,8 @@ describe("loadPluginConfig — secret redaction", () => {
 });
 
 describe("loadPluginConfig — experimental graduation migration", () => {
-    // These cover the FULL chain: experimental.* → (migrate-experimental) →
-    // legacy dreamer.user_memories/pin_key_files → (migrate-dreamer-v2) → the v2
-    // per-task `dreamer.tasks` record. review-user-memories enabled ⇔ schedule != "";
+    // `dreamer.user_memories` and `dreamer.pin_key_files` migrate to `dreamer.tasks`.
+    // A `review-user-memories` task is enabled only when its `schedule` is nonempty.
     // key-files likewise.
     it("migrates experimental.user_memories object block to a scheduled review-user-memories task", () => {
         const config = JSON.stringify({
@@ -464,13 +441,13 @@ describe("loadPluginConfig — experimental graduation migration", () => {
         const rum = result.dreamer?.tasks["review-user-memories"];
         expect(rum?.schedule).not.toBe("");
         expect(rum?.promotion_threshold).toBe(5);
-        // Warning so users know to run doctor.
+        // The warning identifies `experimental.user_memories`.
         expect(result.configWarnings?.join("\n")).toContain("experimental.user_memories");
     });
 
     it("coerces primitive experimental.user_memories: false to a disabled review task", () => {
-        // Without the chain, the user's opt-out would silently flip to the new
-        // default (enabled). The disabled opt-out must survive as schedule "".
+        // `enabled: false` migrates to `schedule: ""`.
+        // `enabled: false` migrates to `schedule: ""`.
         const config = JSON.stringify({
             experimental: {
                 user_memories: false,
@@ -482,8 +459,7 @@ describe("loadPluginConfig — experimental graduation migration", () => {
     });
 
     it("drops legacy experimental.pin_key_files — no key-files task is emitted", () => {
-        // key-files was removed (feature moved to AFT's dreamer). A legacy
-        // experimental.pin_key_files block migrates forward but produces no task.
+        // `experimental.pin_key_files` migration produces no `dreamer.tasks` entry.
         const config = JSON.stringify({
             experimental: {
                 pin_key_files: { enabled: true, token_budget: 9000, min_reads: 5 },
@@ -506,7 +482,7 @@ describe("loadPluginConfig — experimental graduation migration", () => {
 
         const result = loadWithUserConfig(config);
         const rum = result.dreamer?.tasks["review-user-memories"];
-        // enabled:false → disabled task, but the threshold is carried.
+        // `enabled: false` creates a disabled task and preserves its threshold.
         expect(rum?.schedule).toBe("");
         expect(rum?.promotion_threshold).toBe(10);
     });
@@ -514,7 +490,7 @@ describe("loadPluginConfig — experimental graduation migration", () => {
     it("is a no-op when no experimental block exists", () => {
         const config = JSON.stringify({ enabled: true });
         const result = loadWithUserConfig(config);
-        // No warning, no disruption.
+        // The migration emits no warning.
         expect(result.configWarnings).toBeUndefined();
     });
 
@@ -536,11 +512,11 @@ describe("loadPluginConfig — experimental graduation migration", () => {
             },
         });
         const result = loadWithUserConfig(config);
-        // Explicit user values survive the relocation (opt-outs/opt-ins preserved).
+        // The migration preserves explicit user opt-outs and opt-ins.
         expect(result.temporal_awareness).toBe(false);
         expect(result.caveman_text_compression.enabled).toBe(true);
         expect(result.caveman_text_compression.min_chars).toBe(800);
-        // auto_search + git_commit_indexing land under memory.*
+        // The migration moves `auto_search` and `git_commit_indexing` to `memory.*`.
         expect(result.memory.auto_search.enabled).toBe(false);
         expect(result.memory.git_commit_indexing.enabled).toBe(true);
         expect(result.memory.git_commit_indexing.since_days).toBe(30);
@@ -558,7 +534,7 @@ describe("loadPluginConfig — experimental graduation migration", () => {
             memory: { git_commit_indexing: { enabled: true } },
         });
         const result = loadWithUserConfig(config);
-        // memory.* (graduated) enabled wins; missing sub-fields fill from old block.
+        // `memory.*.enabled` overrides the legacy block, and missing `memory.*` fields inherit from it.
         expect(result.memory.git_commit_indexing.enabled).toBe(true);
         expect(result.memory.git_commit_indexing.since_days).toBe(99);
         expect(result.memory.git_commit_indexing.max_commits).toBe(500);
@@ -580,7 +556,7 @@ describe("loadPluginConfig — legacy agent enabled migration", () => {
 
         expect(result.dreamer?.disable).toBeUndefined();
         expect("enabled" in (result.dreamer as Record<string, unknown>)).toBe(false);
-        // enabled=true is a no-op alias for the new default; no warning should be emitted.
+        // enabled=true is a no-op alias; no warning should be emitted.
         const warnings = result.configWarnings?.join("\n") ?? "";
         expect(warnings).not.toContain("dreamer.enabled=true");
         expect(warnings).not.toContain("dreamer.enabled");
@@ -810,11 +786,6 @@ describe("loadPluginConfig — project compaction trust boundary", () => {
 });
 
 describe("loadPluginConfig — raw merge preserves user fields not set in project", () => {
-    // Regression for the embedding-wipe bug. Project configs that
-    // don't mention `embedding` (or any other defaulted field) must inherit
-    // the user's explicit value instead of getting clobbered by the Zod
-    // default. Previously each source was parsed separately and Zod-filled
-    // defaults appeared as if they were explicit project overrides.
 
     it("user embedding survives when project config omits embedding", () => {
         const userConfig = JSON.stringify({
@@ -861,14 +832,11 @@ describe("loadPluginConfig — raw merge preserves user fields not set in projec
     });
 
     it("user scalar field survives when project omits it", () => {
-        // execute_threshold_percentage default is { default: 65, ... }. User
-        // sets a value, project doesn't mention it — user must win.
         const result = loadWithUserAndProjectConfig(
             JSON.stringify({ execute_threshold_percentage: 30, enabled: true }),
             JSON.stringify({ smart_drops: false }),
         );
 
-        // execute_threshold_percentage min is 20, so 30 is valid
         expect(result.execute_threshold_percentage).toBe(30);
     });
 
@@ -895,7 +863,6 @@ describe("loadPluginConfig — raw merge preserves user fields not set in projec
     });
 
     it("project boolean override beats user default", () => {
-        // User omits smart_drops (default false). Project turns it on.
         const result = loadWithUserAndProjectConfig(
             JSON.stringify({ enabled: true }),
             JSON.stringify({ smart_drops: true }),

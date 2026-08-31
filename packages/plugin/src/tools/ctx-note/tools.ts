@@ -35,19 +35,16 @@ export interface CtxNoteToolDeps {
     db: Database;
     dreamerEnabled?: boolean;
     /**
-     * Resolve the project identity for the session's directory at call time.
-     * See CtxMemoryToolDeps.resolveProjectPath for why this is a function.
-     * Optional — when undefined, smart-note creation is rejected with an
+     * The tool resolves the session directory's project identity at call time.
+     * The tool rejects smart-note creation when resolveProjectPath is undefined.
      * explanatory error.
      */
     resolveProjectPath?: (directory: string) => string | undefined;
     rustToolBackends?: RustToolBackends;
 }
 
-/** Capture the live-tail message ordinal so a note can be traced back to the
- *  conversation that produced it. Best-effort: returns null when there are no
- *  indexed messages yet (ordinal 0) or the lookup fails, in which case the note
- *  is stored without an anchor. */
+/**
+ * */
 function captureAnchorOrdinal(db: Database, sessionId: string): number | null {
     try {
         const ordinal = getLastIndexedOrdinal(db, sessionId);
@@ -79,9 +76,8 @@ function formatNoteLine(note: Note): string {
 
 const DISMISS_FOOTER = '\n\nTo dismiss a stale note: ctx_note(action="dismiss", note_id=N)';
 
-/** Default page size for read. Long-running sessions accumulate hundreds of
- *  notes; dumping all of them burns output tokens and buries the recent ones,
- *  so read pages newest-first and tells the caller how to reach older pages. */
+/** Read returns 25 notes per page to avoid burying recent notes in output.
+ * */
 const DEFAULT_READ_LIMIT = 25;
 
 function paginateNewestFirst(
@@ -261,8 +257,7 @@ const ctxNoteArgsShape = {
         .describe("Note ID (required for 'dismiss' and 'update' actions)."),
 };
 // The tool definition exposes only the documented argument shape to the model
-// provider, but older callers may still send extra arguments. Parse with
-// passthrough so execute() can receive those fields without advertising them.
+// The parser preserves extra arguments so execute() receives fields not exposed to the model provider.
 const ctxNoteArgsSchema = tool.schema.object(ctxNoteArgsShape).passthrough();
 
 function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
@@ -285,9 +280,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 note_id: "number",
             });
             const sessionId = toolContext.sessionID;
-            // Infer write only on NON-EMPTY content. GPT-family models fill every
-            // optional param (content:"" for a read), so a bare `typeof === "string"`
-            // check would mis-infer `write` and then reject the empty content.
+            // A string-only check would classify empty content as write and reject it.
             const action = args.action ?? (args.content?.trim() ? "write" : "read");
             const wakePlaneActive =
                 action === "write" &&
@@ -295,10 +288,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 (await wakePlaneStatus()) === "present";
             const surfaceCondition = wakePlaneActive ? undefined : args.surface_condition?.trim();
 
-            // Resolve the session's actual project from `toolContext.directory`
-            // each call. OpenCode's top-level `ctx.directory` (the launch dir)
-            // can differ from the session's working directory when the user
-            // runs `opencode -s <id>` from outside the project.
+            // The tool resolves toolContext.directory on every call.
             const projectIdentity = deps.resolveProjectPath?.(toolContext.directory);
 
             const marker = projectIdentity
@@ -335,11 +325,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     } else if (!commandId) {
                         return "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.";
                     }
-                    // An identified request goes through without compilation:
-                    // the module replays a committed command's recorded
-                    // response from its ledger and refuses a first-time
-                    // mutation with this same message. Failing here would make
-                    // a lost-response retry report the note as unwritten.
+                    // The idempotency ledger replays recorded responses and rejects first-time mutations that reuse a recorded message.
                 }
                 const request: RustNoteToolRequest = {
                     ...(commandId ? { commandId } : {}),
@@ -384,14 +370,8 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     return "Error: 'content' is required when action is 'write'.";
                 }
 
-                // Anchor the note to the live conversation tail so it can be
-                // traced back later. The agent reads this as the upper bound and
-                // expands `anchorOrdinal - x .. anchorOrdinal` via ctx_expand at
-                // its own discretion. Best-effort: 0 (no indexed messages yet)
-                // stores null and the note simply renders without an anchor.
                 const anchorOrdinal = captureAnchorOrdinal(deps.db, sessionId);
 
-                // Smart note — project-scoped with condition evaluation by dreamer
                 if (args.surface_condition?.trim()) {
                     if (wakePlaneActive) {
                         const note = addNote(deps.db, "session", {
@@ -422,7 +402,6 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     return `Created smart note #${note.id}. Dreamer will evaluate the condition during nightly runs:\n- Content: ${content}\n- Condition: ${smartSurfaceCondition}${conditionCompileReplySuffix(compilation)}`;
                 }
 
-                // Simple session note
                 const note = addNote(deps.db, "session", { sessionId, content, anchorOrdinal });
                 return `Saved session note #${note.id}.`;
             }
@@ -495,13 +474,10 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 offset,
             });
 
-            // Record read watermark so note-nudger can suppress reminders
-            // when the agent has already seen notes in recent context and no
-            // new notes have been written since.
+            // The note-nudger uses the read watermark to suppress reminders after the agent reads notes and until a new note is written.
             try {
                 setNoteLastReadAt(deps.db, sessionId);
             } catch {
-                // Best-effort — the watermark is a suppression hint, not correctness.
             }
 
             if (sections.length === 0) {
@@ -509,9 +485,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
             }
 
             const body = sections.join("\n\n");
-            // Only surface the anchor hint when at least one note carries one,
-            // so notes written before anchoring (or with no indexed tail) don't
-            // advertise a capability their output doesn't show.
+            // The response must not describe `ctx_expand` when `body` contains no `↳ @msg ` anchor.
             const anchorHint = body.includes("↳ @msg ")
                 ? "\n\n↳ @msg N marks the conversation tail when a note was written. To see what led to it: ctx_expand(start=N-x, end=N) (pick x for how far back to look)."
                 : "";

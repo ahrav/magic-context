@@ -9,8 +9,7 @@ function parsed(expr: string) {
     return r.cron;
 }
 
-// All tests use the LOCAL Date constructor + local getters so they are
-// timezone-independent (construction and assertion share the machine's tz).
+// Tests construct and inspect dates in the same local timezone, so their civil-time assertions are timezone-independent.
 function local(y: number, mo1: number, d: number, h = 0, mi = 0): Date {
     return new Date(y, mo1 - 1, d, h, mi, 0, 0);
 }
@@ -89,14 +88,12 @@ describe("matchesCron — dom/dow OR semantics", () => {
         expect(matchesCron(c, local(2026, 6, 16, 0, 0))).toBe(false);
     });
     it("only dow restricted → only that weekday", () => {
-        // The first fixture date is a Sunday.
         const c = parsed("0 0 * * 0");
         expect(local(2026, 6, 7).getDay()).toBe(0);
         expect(matchesCron(c, local(2026, 6, 7, 0, 0))).toBe(true);
         expect(matchesCron(c, local(2026, 6, 8, 0, 0))).toBe(false);
     });
     it("both restricted → OR (either matches)", () => {
-        // dom=15 OR dow=0(Sun). The day-15 fixture is a Monday (dom hit, dow miss).
         const c = parsed("0 0 15 * 0");
         expect(local(2026, 6, 15).getDay()).toBe(1); // Monday
         expect(matchesCron(c, local(2026, 6, 15, 0, 0))).toBe(true); // dom matches
@@ -110,7 +107,6 @@ describe("nextOccurrence", () => {
         const c = parsed("0 3 * * *");
         const next = nextOccurrence(c, local(2026, 1, 1, 3, 0));
         expect(next).not.toBeNull();
-        // not the same instant — must advance to the next day's 03:00
         expect(next?.getTime()).toBe(local(2026, 1, 2, 3, 0).getTime());
     });
     it("nightly from midday → same-or-next day 03:00", () => {
@@ -125,7 +121,6 @@ describe("nextOccurrence", () => {
     });
     it("weekly Sunday 03:00", () => {
         const c = parsed("0 3 * * 0");
-        // From the Monday fixture, the next match is the following Sunday.
         const next = nextOccurrence(c, local(2026, 6, 8, 12, 0));
         expect(next?.getDay()).toBe(0);
         expect(next?.getTime()).toBe(local(2026, 6, 14, 3, 0).getTime());
@@ -143,9 +138,7 @@ describe("nextOccurrence", () => {
     it("excludeCivilMinute skips a matching candidate (DST double-fire guard)", () => {
         const c = parsed("30 1 * * *"); // 01:30 daily
         const day1 = local(2026, 1, 1, 1, 30);
-        // Without exclusion, from 01:00 we'd get 01:30 same day.
         expect(nextOccurrence(c, local(2026, 1, 1, 1, 0))?.getTime()).toBe(day1.getTime());
-        // Excluding that exact civil minute pushes to the next day's 01:30.
         const key = "2026-01-01 01:30";
         const next = nextOccurrence(c, local(2026, 1, 1, 1, 0), key);
         expect(next?.getTime()).toBe(local(2026, 1, 2, 1, 30).getTime());
@@ -172,8 +165,7 @@ describe("nextDueAtMs", () => {
     it("excludes the consumed scheduled minute", () => {
         const c = "30 1 * * *";
         const consumed = local(2026, 1, 1, 1, 30).getTime();
-        // Finishing at 01:31 the same civil minute would otherwise still be 'after';
-        // exclusion guarantees we jump to the next day.
+        // Excluding the repeated 01:30 civil minute returns the next day's occurrence.
         const next = nextDueAtMs(c, local(2026, 1, 1, 1, 31).getTime(), consumed);
         expect(next).toBe(local(2026, 1, 2, 1, 30).getTime());
     });

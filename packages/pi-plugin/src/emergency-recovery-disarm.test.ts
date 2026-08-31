@@ -3,24 +3,11 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * Regression guard for the emergency-recovery disarm predicate.
  *
- * Regression: a session whose overflow armed `needs_emergency_recovery=1`, then was
- * rescued by `/ctx-recomp` (covering all but a tiny in-progress tail), looped
- * forever — every transform pass force-bumped pressure to 95% because the flag
- * never cleared. Two clearing paths exist:
- *   1. historian publish → onPublished → clearEmergencyRecovery (never fires:
- *      the trigger needs a RUNNABLE window, which a tiny tail isn't), and
- *   2. the early `isEmergency` disarm, which used the LOOSE
- *      `hasEligiblePiCompartmentHistory(db, sessionId)` (no snapshot) — that
- *      returns true for "any raw message past the boundary", so it never
  *      disarmed.
  *
- * FIX: disarm inside `maybeFireHistorian`'s no-fire (`!trigger.shouldFire`)
- * branch, where the AUTHORITATIVE runnable-window snapshot is in hand — clear
- * the flag when recovery is armed AND there is no runnable compartment window.
- * This guard pins that predicate so a future refactor can't silently revert to
- * the loose check.
+ * `maybeFireHistorian` disarms emergency recovery only in its no-fire branch.
+ * `maybeFireHistorian` clears `needsEmergencyRecovery` only when recovery is armed, no historian is in flight, no runnable compartment window exists, and `usage.percentage < historianForceMaterializationPercentage`.
  */
 const SRC = readFileSync(join(import.meta.dir, "context-handler.ts"), "utf8");
 const codeOnly = SRC.split("\n")
@@ -33,8 +20,6 @@ describe("emergency-recovery disarm predicate", () => {
 			"shouldFire=false (no trigger condition met)",
 		);
 		expect(noFire).toBeGreaterThan(-1);
-		// The disarm clears the flag right after the no-fire log, gated on the
-		// authoritative runnable-window check (not the loose raw-beyond-boundary one).
 		const disarm = codeOnly.indexOf(
 			"clearEmergencyRecovery(db, sessionId)",
 			noFire,
@@ -62,10 +47,6 @@ describe("emergency-recovery disarm predicate", () => {
 	});
 
 	test("disarm is gated on LOW real pressure (keep armed during a genuine overflow arc)", () => {
-		// A non-runnable window at HIGH pressure is a real overflow whose tail is
-		// one in-progress arc — keep the flag armed (OpenCode does too) so
-		// drop-all-tools keeps shrinking until the arc closes. Only a STALE flag
-		// (low real pressure, e.g. post-/ctx-recomp ~20%) disarms.
 		const noFire = codeOnly.indexOf(
 			"shouldFire=false (no trigger condition met)",
 		);

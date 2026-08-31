@@ -225,10 +225,7 @@ describe("dreamer manifest scorers", () => {
     });
 
     test("an update body production would refuse never scores PASS", () => {
-        // With no required anchor to miss, only the production content bound
-        // separates a scoreable update from one applyVerifyManifest rejects
-        // outright, which would report a successful experiment for output the
-        // host would have thrown away.
+        // When requiredUpdateAnchors is empty, scoreVerifyManifest must enforce applyVerifyManifest's update-content bounds to avoid PASS for output applyVerifyManifest rejects.
         const gold = {
             kind: "verify" as const,
             claims: verifyGold.claims.map((claim) =>
@@ -273,16 +270,13 @@ describe("dreamer manifest scorers", () => {
         expect(scoreClassifyManifest(correctClassify.replace('importance="70"', 'importance="64"'), pool, classifyGold)).toMatchObject({ status: "FAIL", reason: "wrong-classification" });
         expect(scoreClassifyManifest(correctClassify.replace('scope="project"', 'scope="ecosystem"'), pool, classifyGold)).toMatchObject({ status: "FAIL", reason: "wrong-classification" });
         expect(scoreClassifyManifest(correctClassify.replace('shareable="true"', 'shareable="false"'), pool, classifyGold)).toMatchObject({ status: "FAIL", reason: "wrong-classification" });
-        // Production preserves a field the entry omits, so the applied
-        // importance stays the claim's current 70 — inside the 65-75 band, which
-        // is a pass rather than a wrong classification.
+        // When a classification entry omits importance, applyClassifications preserves the claim's existing importance.
         expect(scoreClassifyManifest(correctClassify.replace(' importance="70"', ""), pool, classifyGold)).toMatchObject({
             stage: "scored",
             status: "PASS",
             reason: null,
         });
-        // The omission only passes because the preserved value satisfies gold. A
-        // band that excludes it still fails, on the preserved value.
+        // Omitting importance passes only when the claim's preserved importance is within gold's allowed band.
         const narrowGold = {
             kind: "classify" as const,
             claims: classifyGold.claims.map((claim) =>
@@ -298,9 +292,7 @@ describe("dreamer manifest scorers", () => {
     });
 
     test("the applied shareability override decides a sensitive claim's score", () => {
-        // applyClassifications forces a reported `true` to false for sensitive
-        // content, so the pool ends up matching `shareable: false` gold and the
-        // run passes on the applied value rather than the raw report.
+        // For sensitive content, applyClassifications changes reported shareable=true to false; scoring uses the applied value.
         const sensitivePool = {
             ...pool,
             claims: pool.claims.map((claim) =>
@@ -319,8 +311,7 @@ describe("dreamer manifest scorers", () => {
             status: "PASS",
             reason: null,
         });
-        // The override fires only for sensitive content: the same manifest and
-        // gold against non-sensitive content is a genuine wrong classification.
+        // The shareable override applies only to sensitive content; against non-sensitive content, the same manifest and gold produce wrong-classification.
         expect(scoreClassifyManifest(correctClassify, pool, privateGold)).toMatchObject({
             status: "FAIL",
             reason: "wrong-classification",
@@ -328,9 +319,7 @@ describe("dreamer manifest scorers", () => {
     });
 
     test("update appliability is judged across the batch, not against the snapshot", () => {
-        // Production stages updates in order, each taking its new identity for the
-        // rest of the batch, so two converging on one identity fail on the second
-        // even though neither collides with the unchanged pool.
+        // Production applies updates sequentially and uses each update's new identity for later updates in the batch.
         const twoUpdates = {
             kind: "verify" as const,
             claims: [
@@ -348,14 +337,13 @@ describe("dreamer manifest scorers", () => {
             status: "FAIL",
             reason: "wrong-update-content",
         });
-        // Distinct bodies satisfying the same anchor stay appliable.
+        // Distinct update bodies can both apply when they satisfy the same required anchor.
         const distinct = converging.replace(
             '<update claim="mcm_update" files="src/cache.ts">one shared body</update>',
             '<update claim="mcm_update" files="src/cache.ts">another shared body</update>',
         );
         expect(scoreVerifyManifest(distinct, pool, twoUpdates)).toMatchObject({ status: "PASS", reason: null });
-        // An update may take an identity an earlier update in the same batch
-        // vacated, which a snapshot-only check would have refused.
+        // A later update may use an identity that an earlier update in the same batch vacated.
         const handoff = `<verify>
 <update claim="mcm_true" files="src/cache.ts,src/config.ts">shared moved along</update>
 <update claim="mcm_update" files="src/cache.ts">The cache limit is 4096 entries.  shared</update>
@@ -365,9 +353,7 @@ describe("dreamer manifest scorers", () => {
     });
 
     test("an update colliding with another live claim is not appliable", () => {
-        // Revision asserts the (category, normalized content) identity is free,
-        // exempting only the claim being revised, so content equal to a sibling's
-        // throws rather than applying.
+        // Revision requires the (category, normalized content) identity to be unused except by the revised claim.
         const collidingGold = {
             kind: "verify" as const,
             claims: verifyGold.claims.map((claim) =>
@@ -376,7 +362,6 @@ describe("dreamer manifest scorers", () => {
                     : claim,
             ),
         };
-        // claim-false is active, same category, content "The removed queue still exists."
         const collision = correctVerify.replace(
             "Uses a BOUNDED CACHE with 4096 ENTRIES.",
             "  the REMOVED QUEUE still exists.  ",
@@ -385,8 +370,7 @@ describe("dreamer manifest scorers", () => {
             status: "FAIL",
             reason: "wrong-update-content",
         });
-        // The same content is appliable once that sibling is no longer live, so
-        // the identity is free and the run passes.
+        // The update for claim-false applies after claim-false is no longer live because the identity is free.
         const archivedSibling = {
             ...pool,
             claims: pool.claims.map((claim) =>
@@ -400,28 +384,22 @@ describe("dreamer manifest scorers", () => {
     });
 
     test("a canonicalizable alias of a gold path scores as that path", () => {
-        // Production resolves the path before matching it against a tracked file,
-        // so a manifest naming a gold file through an alias applies exactly the
-        // gold path and must not read as a wrong mapping.
+        // Production resolves a manifest path before matching it to a tracked file.
         expect(
             scoreVerifyManifest(correctVerify.replace("src/cache.ts,src/config.ts", "src/./cache.ts,src/sub/../config.ts"), pool, verifyGold),
         ).toMatchObject({ status: "PASS", reason: null });
         expect(
             scoreMapManifest(correctMap.replace("src/cache.ts,src/config.ts", "src/./cache.ts,src/sub/../config.ts"), pool, mapGold),
         ).toMatchObject({ status: "PASS", reason: null });
-        // A path that leaves the project is dropped by production rather than
-        // resolved inward, so it must not collapse onto a tracked path here.
+        // Production drops paths that leave the project instead of resolving them to tracked paths.
         expect(
             scoreMapManifest(correctMap.replace("src/cache.ts", "../src/cache.ts"), pool, mapGold),
         ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
         expect(
             scoreMapManifest(correctMap.replace("src/cache.ts", "/src/cache.ts"), pool, mapGold),
         ).toMatchObject({ status: "FAIL", reason: "wrong-mapping" });
-        // Separator handling follows the platform, because production's does. On
-        // a POSIX host a backslash is an ordinary filename character, so this
-        // path is untracked and production drops it — folding it here would
-        // credit output the host would not apply. The win32 branch cannot be
-        // exercised from this runner.
+        // Production uses platform-specific path separators.
+        // On POSIX, backslashes are ordinary filename characters; production drops the resulting untracked path.
         if (sep === "/") {
             expect(
                 scoreMapManifest(correctMap.replace("src/cache.ts", "src\\cache.ts"), pool, mapGold),

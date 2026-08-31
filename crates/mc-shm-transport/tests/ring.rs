@@ -276,7 +276,6 @@ fn probe_reads_shared_state_without_consuming_a_frame() {
     let ring = Ring::create(&profile(), 27).unwrap();
     publish(&ring, &[7]);
     ring.probe().unwrap();
-    // The published frame is still receivable after the probe.
     let lease = ring.try_receive().unwrap().unwrap();
     assert_eq!(lease.segment(0).unwrap().read_byte(0), Some(7));
     lease.release().unwrap();
@@ -393,7 +392,6 @@ fn attach_rejects_unsealed_objects_and_tampered_grants() {
     let ring = Ring::create(&profile(), 21).unwrap();
     let base = ring.grant().encode();
 
-    // Geometry tampering fails closed inside the pure grant decoder.
     let mut version = base;
     version[0..2].copy_from_slice(&1u16.to_le_bytes());
     let mut zero_depth = base;
@@ -426,7 +424,6 @@ fn attach_rejects_unsealed_objects_and_tampered_grants() {
         assert_eq!(RingGrant::decode(bytes), Err(RingError::InvalidGrant));
     }
 
-    // Identity tampering passes `RingGrant::decode` but `Ring::attach` rejects it.
     let mut incarnation = base;
     incarnation[2] ^= 1;
     let mut lane = base;
@@ -496,8 +493,6 @@ fn grant_slice_rejects_every_truncation_point_and_one_byte_suffix() {
     );
 }
 
-/// The fuzz corpus seed `provider_grant/valid` doubles as the golden grant
-/// fixture: one exact `RingGrant::encode` output carrying the frozen
 /// ring-profile geometry.
 #[test]
 fn golden_grant_fixture_matches_the_frozen_ring_profile_encoding() {

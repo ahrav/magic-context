@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -34,10 +33,7 @@ describe("sanitizeLogContent — secret token redaction (council finding #9)", (
         it("redacts sk-proj-* project keys", () => {
             const log = "OPENAI_API_KEY=sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
             const sanitized = sanitizeLogContent(log);
-            // The env-var assignment redactor wins first (more specific
-            // semantics — keeps the variable name visible). The specific
-            // sk-proj- pattern won't trigger because the value is already
-            // replaced with a key-typed redaction marker.
+            // The environment-variable redactor runs before token redactors.
             expect(sanitized).toBe("OPENAI_API_KEY=<REDACTED:openai_api_key>");
         });
 
@@ -83,7 +79,6 @@ describe("sanitizeLogContent — secret token redaction (council finding #9)", (
         it("redacts hf_* tokens", () => {
             const log = "HF_TOKEN=hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
             const sanitized = sanitizeLogContent(log);
-            // env-var redactor wins (more semantic context preserved)
             expect(sanitized).toBe("HF_TOKEN=<REDACTED:hf_token>");
         });
 
@@ -121,7 +116,6 @@ describe("sanitizeLogContent — secret token redaction (council finding #9)", (
             const sanitized = sanitizeLogContent(log);
             expect(sanitized).toContain("<REDACTED:aws_secret_access_key>");
             expect(sanitized).not.toContain("wJalrXUtnFEMI");
-            // key name preserved
             expect(sanitized).toContain("aws_secret_access_key");
         });
     });
@@ -146,8 +140,6 @@ describe("sanitizeLogContent — secret token redaction (council finding #9)", (
 
     describe("Google API keys", () => {
         it("redacts AIza* keys", () => {
-            // Real Google API keys are 39 chars total (AIza + 35 char body).
-            // Body counts: SyD-aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456 = 35 chars.
             const log = "Calling Maps API with AIzaSyD-aBcDeFgHiJkLmNoPqRsTuVwXyZ01234 then done";
             const sanitized = sanitizeLogContent(log);
             expect(sanitized).toContain("<GOOGLE_API_KEY_REDACTED>");
@@ -254,7 +246,6 @@ describe("sanitizeLogContent — secret token redaction (council finding #9)", (
         it("does not redact arbitrary base64 strings without JWT prefix", () => {
             const log = "computed digest: abcdefgh.ijklmnop.qrstuvwx";
             const sanitized = sanitizeLogContent(log);
-            // No `eyJ` prefix → should not match JWT pattern
             expect(sanitized).toContain("abcdefgh.ijklmnop.qrstuvwx");
             expect(sanitized).not.toContain("<JWT_REDACTED>");
         });
@@ -315,7 +306,6 @@ describe("sanitizeLogContent — secret token redaction (council finding #9)", (
         });
 
         it("does not over-redact a legitimate model name", () => {
-            // Model identifiers like `anthropic/claude-haiku-4-5` should pass through
             const log = "Using model anthropic/claude-haiku-4-5 for historian";
             const sanitized = sanitizeLogContent(log);
             expect(sanitized).toContain("anthropic/claude-haiku-4-5");

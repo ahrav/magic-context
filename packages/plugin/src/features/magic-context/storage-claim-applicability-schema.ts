@@ -1,27 +1,18 @@
 /**
- * v85 bitemporal claim applicability, Git anchor, and source-trust DDL
- * (U6c: KTD2-KTD7, KTD9).
+ * Migration v85 creates bitemporal claim-applicability, Git-anchor, and source-trust DDL.
  *
- * Dependency-light on purpose: runtime imports here must carry explicit `.ts`
- * extensions so the Node SQLite smoke
- * (`packages/plugin/scripts/smoke-node-sqlite.ts`) can import this module
- * directly under Node's type-stripping loader.
+ * Runtime imports must use explicit `.ts` extensions because the Node SQLite smoke test imports this module under Node's type-stripping loader.
+ * The SQLite smoke test at `packages/plugin/scripts/smoke-node-sqlite.ts` imports this module directly.
  *
- * Every object here is migration-owned (created by migration v85, never by
- * `initializeDatabase()`), following the v80/v82/v84 precedent.
+ * Migration v85 creates every object here; `initializeDatabase()` creates none.
  *
- * Physical model (KTD2): bitemporal state is an append-only assertion ledger,
- * never mutable columns on `claims` or `claim_revisions`. Each assertion
- * belongs to exactly one immutable stream; a gapless sequence plus unique
- * predecessor consumption forms one chain per stream. `recorded_until` and
- * `known_until` are derived read-time by the interval view — no stored end
- * column is ever updated. Missing assertion means `unknown` (R13); a stored
- * baseline assertion also uses `unknown` (KTD3).
+ * Bitemporal state is an append-only assertion ledger, not mutable columns on `claims` or `claim_revisions`.
+ * Each assertion belongs to exactly one immutable stream; a gapless sequence plus unique predecessor consumption forms one chain per stream.
+ * `recorded_until` and `known_until` are derived at read time by the interval view; no end values are stored.
+ * A missing assertion means `unknown`.
+ * A stored baseline assertion also uses `unknown`.
  *
- * Version lane: Synapse owns v83 and the memories-to-claims compatibility
- * contract owns v84, so this contract lands at v85. Pre-v85 revisions receive
- * seeded `unknown` baselines here; the still-pending lazy backfill and live
- * claim writers populate real trust and path state for later revisions.
+ * Pre-v85 revisions receive seeded `unknown` baselines.
  */
 
 import type { Database } from "../../shared/sqlite";
@@ -35,7 +26,7 @@ export const CLAIM_APPLICABILITY_TABLES = [
     "claim_revision_applicability_symbols",
 ] as const;
 
-/** Coarse immutable origin classification on observations (R9, KTD7). */
+/** `SOURCE_TRUST_CLASSES` classifies immutable observation origins. */
 export const SOURCE_TRUST_CLASSES = [
     "explicit_user",
     "trusted_local_code",
@@ -46,8 +37,8 @@ export const SOURCE_TRUST_CLASSES = [
 ] as const;
 export type SourceTrustClass = (typeof SOURCE_TRUST_CLASSES)[number];
 
-/** Constrained applicability states (R4). `historical` is the persisted state
- * for an invalidated interval; there is no `invalidated` value by contract. */
+/** `historical` persists invalidated intervals; `invalidated` is not a state.
+ * */
 export const APPLICABILITY_STATES = [
     "current",
     "historical",
@@ -59,7 +50,7 @@ export const APPLICABILITY_STATES = [
 ] as const;
 export type ApplicabilityState = (typeof APPLICABILITY_STATES)[number];
 
-/** Typed multi-representation anchor evidence forms (R7, KTD5). */
+/* */
 export const GIT_ANCHOR_REPRESENTATION_KINDS = [
     "commit_oid",
     "tree_oid",
@@ -71,11 +62,9 @@ export const GIT_ANCHOR_REPRESENTATION_KINDS = [
 export type GitAnchorRepresentationKind = (typeof GIT_ANCHOR_REPRESENTATION_KINDS)[number];
 
 /**
- * Identity tuple of one anchor representation row. Single source for the DDL
- * UNIQUE constraint, the append-only collision trigger, and the
- * application-side idempotency pre-check in `storage-git-anchors.ts`: a
- * divergent spelling would make the pre-check skip an insert the trigger
- * ABORTs (or vice versa).
+ * `GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS` defines the tuple used by the DDL UNIQUE constraint, collision trigger, and application pre-check.
+ * `storage-git-anchors.ts` must use the same tuple as the DDL constraint and collision trigger.
+ * Divergent tuple spellings can make the `storage-git-anchors.ts` pre-check skip an insert that the trigger aborts.
  */
 export const GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS = [
     "anchor_id",
@@ -86,15 +75,15 @@ export const GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS = [
     "value",
 ] as const;
 
-/** Stream owner kinds: source lineage vs evaluation lineage (KTD3, R5). */
+/** `APPLICABILITY_OWNER_KINDS` distinguishes source lineage from evaluation lineage. */
 export const APPLICABILITY_OWNER_KINDS = ["source", "evaluation"] as const;
 export type ApplicabilityOwnerKind = (typeof APPLICABILITY_OWNER_KINDS)[number];
 
-/** Path knowledge dispositions on an assertion (R6, KTD4). */
+/* */
 export const APPLICABILITY_PATHS_STATES = ["unknown", "known"] as const;
 export type ApplicabilityPathsState = (typeof APPLICABILITY_PATHS_STATES)[number];
 
-/** Path selector kinds (R6). */
+/* */
 export const APPLICABILITY_PATH_KINDS = ["exact", "glob"] as const;
 export type ApplicabilityPathKind = (typeof APPLICABILITY_PATH_KINDS)[number];
 
@@ -106,13 +95,11 @@ const representationIdentityMatch = GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS.m
 ).join(" AND ");
 
 /**
- * Add the constrained observation trust column (KTD7). ALTER TABLE ADD COLUMN
- * keeps the append-only v82 rows byte-identical while giving every existing
- * observation the conservative `model_inference` default. Fresh and upgraded
- * databases converge because both run v82's CREATE TABLE then this ALTER.
+ * The ALTER TABLE operation preserves existing v82 row bytes.
+ * The column gives existing observations the `model_inference` default.
+ * Fresh and upgraded databases run v82's CREATE TABLE before this ALTER, so both receive the same default.
  */
 export function addObservationSourceTrustClassColumn(db: Database): void {
-    // Interpolation is a compile-time const allowlist, not caller input.
     // pi-lens-ignore: sql-injection
     db.exec(`
         ALTER TABLE observations ADD COLUMN source_trust_class TEXT NOT NULL
@@ -126,10 +113,9 @@ export function observationSourceTrustClassColumnExists(db: Database): boolean {
     return columns.some((column) => column.name === "source_trust_class");
 }
 
-/** Full v85 object graph: tables from the dependency roots outward, indexes,
- * the interval view, then guards. */
+/**
+ * */
 export function createClaimApplicabilitySchema(db: Database): void {
-    // Interpolation is a compile-time const allowlist, not caller input.
     // pi-lens-ignore: sql-injection
     db.exec(`
     -- One logical project-scoped anchor identity (KTD5). Deliberately no FK
@@ -490,17 +476,16 @@ export function createClaimApplicabilitySchema(db: Database): void {
     `);
 }
 
-/** Versioned deterministic stream-key protocol for supported writers (KTD3). */
+/** Supported writers use a versioned, deterministic stream-key protocol. */
 export const APPLICABILITY_STREAM_KEY_PROTOCOL = "mc-applicability-stream-key-v1";
 
-/** Stream key for the migration-seeded / writer-default baseline stream. */
+/** The migration seeds this stream key as the writer-default baseline. */
 export const APPLICABILITY_BASELINE_STREAM_KEY = "baseline:v1";
 
 /**
- * Seed one `unknown` baseline assertion for every claim revision that has no
- * applicability stream yet (U1, AE1). Revision bytes are untouched; knowledge
- * time uses the revision's creation time only when it is a plausible retained
- * timestamp (a positive integer).
+ * The migration seeds an `unknown` baseline assertion for each claim revision without an applicability stream.
+ * The migration leaves revision bytes unchanged.
+ * Knowledge time uses the revision creation time only when it is a positive integer.
  */
 export function seedApplicabilityBaselines(db: Database, nowMs: number): void {
     db.prepare(
@@ -538,9 +523,7 @@ export function seedApplicabilityBaselines(db: Database, nowMs: number): void {
 }
 
 /**
- * Targeted per-new-table foreign-key validation, mirroring
- * `assertClaimsSchemaForeignKeys` so unrelated legacy corruption cannot turn
- * this migration into a whole-database repair gate.
+ * The migration validates foreign keys only for newly created tables.
  */
 export function assertClaimApplicabilitySchemaForeignKeys(db: Database): void {
     const violations: string[] = [];
@@ -554,12 +537,7 @@ export function assertClaimApplicabilitySchemaForeignKeys(db: Database): void {
 }
 
 /**
- * Non-table objects `createClaimApplicabilitySchema` creates, absent from
- * `sqlite_master`. The v85 replay guard uses this so a database whose tables
- * survived but whose view, indexes, or guard triggers did not (for example
- * one created by an earlier draft of the schema) is refused instead of being
- * accepted as complete. migrations-v85.test.ts asserts the name list below
- * stays in sync with the DDL.
+ * The v85 replay guard checks the required non-table objects.
  */
 export function missingClaimApplicabilitySchemaObjects(db: Database): string[] {
     const required: Array<[type: string, name: string]> = [
@@ -612,10 +590,6 @@ export function missingClaimApplicabilitySchemaObjects(db: Database): string[] {
 }
 
 export function dropClaimApplicabilityObjectsForTests(db: Database): void {
-    // The observations.source_trust_class column cannot be dropped here, so
-    // callers must also drop and recreate `observations` (the
-    // migrations-v82.test.ts fixture path) before rerunning migrations;
-    // otherwise the v85 replay guard refuses the half-dropped shape.
     db.exec(`
         DROP VIEW IF EXISTS claim_revision_applicability_intervals;
         DROP TABLE IF EXISTS claim_revision_applicability_symbols;

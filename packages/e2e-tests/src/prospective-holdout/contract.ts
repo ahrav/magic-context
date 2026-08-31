@@ -14,10 +14,7 @@ export const FAMILY_ID_RE = /^fam-[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const STATIC_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const RELEASE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._+-]*$/;
 /**
- * The two spellings an instant may take: seconds precision, or seconds plus exactly three
- * fractional digits. The `Z` designator is the only offset admitted, so every accepted
- * instant is already stated in UTC. The groups carry the calendar text and the optional
- * fraction so `instant` can restate the supplied instant in the one form `toISOString`
+ * The `Z` designator makes every accepted instant UTC.
  * renders.
  */
 const ISO_INSTANT_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d{3})?Z$/;
@@ -57,16 +54,12 @@ export function instant(value: unknown, label: string): string {
     if (parts === null || !Number.isFinite(parsed)) {
         fail(`${label}: instant-invalid`);
     }
-    // A shape that passes the pattern can still name a day its month does not have, and the
-    // parser answers such a date by carrying the overflow into the following month rather
-    // than refusing it, so the instant is finite. Every ordering comparison downstream reads
-    // that carried instant rather than the calendar date the artifact states, so the parsed
-    // value is re-rendered and required to spell the instant it came from.
+    // `Date.parse` normalizes impossible calendar days instead of rejecting them.
+    // The equality check rejects dates that `Date.parse` normalizes.
     //
-    // `toISOString` always renders milliseconds and always uses `Z`, and the pattern admits
-    // no offset other than `Z`, so the two sides differ only in whether the fraction is
-    // written. Restoring the absent fraction normalises both sides to one spelling, which
-    // compares the whole instant in a single step instead of reading six fields back out.
+    // `toISOString` always renders milliseconds, and `ISO_INSTANT_RE` admits only `Z`.
+    // For valid calendar fields, formatting differs only when the input omits milliseconds.
+    // Appending `.000` to a fractionless input makes the comparison use identical spellings.
     if (new Date(parsed).toISOString() !== `${parts[1]}${parts[2] ?? ".000"}Z`) {
         fail(`${label}: instant-invalid`);
     }

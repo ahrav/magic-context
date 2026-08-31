@@ -1,6 +1,3 @@
-//! Control-plane validation and host-global route lifecycle, driven end to end
-//! by the independent raw client.
-
 mod support;
 
 use std::collections::HashSet;
@@ -14,7 +11,7 @@ use support::{BindPolicy, Event, TestHost, LINKED_MODULE_ID, MODULE_VERSION};
 const BUDGET: Duration = Duration::from_secs(5);
 const ROOT: &str = "/workspace/project";
 
-/// Sends a control request and returns its single terminal frame.
+/// A control request produces exactly one terminal frame.
 async fn control_once(
     client: &mut raw_client::RawClient,
     body: serde_json::Value,
@@ -45,8 +42,7 @@ async fn catalog_is_truthful_and_filters_exactly() {
     assert_eq!(modules.len(), 1);
     assert_eq!(modules[0]["module_id"], LINKED_MODULE_ID);
     assert_eq!(modules[0]["module_version"], MODULE_VERSION);
-    // The manifest must survive without lossy rewriting, including fields the
-    // host does not understand.
+    // The host preserves manifest fields it does not understand.
     assert_eq!(
         modules[0]["roles"][0]["tools"][0]["name"], "ctx_reduce",
         "tool schemas must reach the client intact"
@@ -73,8 +69,7 @@ async fn catalog_is_truthful_and_filters_exactly() {
         .body
         .windows(16)
         .any(|w| w == b"transport.commit"));
-    // The direct host implements only `health.check`; `wake.create` stays
-    // excluded so TypeScript wake-plane probing stays fail-open (AE10).
+    // The direct host exposes only `health.check`.
     support::assert_control_ops(&json["modules"], &["health.check"]);
 
     let exact = control_once(
@@ -146,7 +141,7 @@ async fn bounded_metadata_accepts_its_maximum_and_rejects_one_past_it() {
         })
     };
 
-    // Session caps at 256 bytes.
+    // The session rejects payloads larger than 256 bytes.
     let at_max = control_once(&mut client, base(serde_json::json!("s".repeat(256)))).await;
     assert_eq!(at_max.ty, TY_RESPONSE, "the exact maximum must be accepted");
 
@@ -156,7 +151,7 @@ async fn bounded_metadata_accepts_its_maximum_and_rejects_one_past_it() {
     let with_nul = control_once(&mut client, base(serde_json::json!("ses\0sion"))).await;
     assert_eq!(with_nul.error_code(), "invalid_control_request");
 
-    // Relative project roots are refused before any handler work.
+    // Validation rejects relative project roots before any handler work.
     let relative = control_once(
         &mut client,
         serde_json::json!({
@@ -168,7 +163,7 @@ async fn bounded_metadata_accepts_its_maximum_and_rejects_one_past_it() {
     .await;
     assert_eq!(relative.error_code(), "invalid_control_request");
 
-    // admission_facts: 8,192 compact bytes and depth 32 are the boundaries.
+    // `admission_facts` limits compact input to 8,192 bytes and nesting to depth 32.
     let facts_at_max = serde_json::Value::String("f".repeat(8_190));
     let ok = control_once(
         &mut client,
@@ -195,7 +190,7 @@ async fn bounded_metadata_accepts_its_maximum_and_rejects_one_past_it() {
     .await;
     assert_eq!(rejected.error_code(), "invalid_control_request");
 
-    // 33 capabilities exceeds the cap.
+    // `admission_facts` caps capabilities at 32.
     let too_many: Vec<serde_json::Value> = (0..33)
         .map(|index| serde_json::json!(format!("cap-{index}")))
         .collect();
@@ -219,7 +214,7 @@ async fn malformed_control_bodies_are_refused_before_handler_work() {
     let host = TestHost::start().await;
     let mut client = host.client().await;
 
-    // Duplicate recognized field.
+    // Validation rejects duplicate recognized fields.
     let corr = client.next_corr();
     client
         .send_frame(
@@ -373,7 +368,7 @@ async fn concurrent_generations_receive_distinct_live_channels() {
     let mut second = host.client().await;
 
     let mut channels = HashSet::new();
-    // Two roots for one session, and two sessions, must never alias.
+    // Each distinct (root, session) pair uses distinct session state.
     let (channel, epoch) = first
         .route_open(LINKED_MODULE_ID, "/workspace/a", "opencode", "shared")
         .await
@@ -427,7 +422,7 @@ async fn rejected_bind_never_publishes_and_still_reports_route_gone() {
         "the handler observed the handle, so route-gone is owed exactly once"
     );
 
-    // The generation still works, and a permitted session binds normally.
+    // Rejected roots do not prevent a permitted session from binding.
     let ok = client
         .route_open(LINKED_MODULE_ID, ROOT, "opencode", "allowed")
         .await
@@ -447,13 +442,13 @@ async fn closed_route_requests_are_unknown_and_cleanup_is_idempotent() {
         .await
         .expect("route");
 
-    // Close the route, then confirm the old epoch is inert.
+    // Closing a route makes its previous epoch inert.
     client
         .send_frame(TY_GOODBYE, FLAGS_PURE_HEADER, channel, epoch, 0, &[])
         .await
         .expect("route goodbye");
 
-    // A request on the closed epoch proves no dispatch.
+    // Requests on a closed epoch are never dispatched.
     let before = host.handler.dispatch_count();
     let corr = client.next_corr();
     client
@@ -486,7 +481,7 @@ async fn closed_route_requests_are_unknown_and_cleanup_is_idempotent() {
         .await
         .expect("duplicate goodbye");
 
-    // The connection is still usable, which proves neither was treated as
+    // `Cancel` and duplicate `Goodbye` leave the connection usable.
     // corruption.
     let frame = control_once(&mut client, serde_json::json!({"op": "catalog.list"})).await;
     assert_eq!(frame.ty, TY_RESPONSE);

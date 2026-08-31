@@ -79,18 +79,15 @@ function freshRoot(): string {
         RELEASE_CONTRACT,
         "bun.lock",
         "crates/mc-host/Cargo.toml",
-        // Required input: the qualifier fails closed without it so a missing
-        // manifest cannot silently empty the tiny-fixture hash blacklist.
+        // The qualifier fails closed without TINY_MANIFEST, preventing a missing manifest from emptying the tiny-fixture hash blacklist.
         TINY_MANIFEST,
-        // Present in the real repo, so production qualification must reject its
-        // artifact digests wherever those bytes are relocated to.
+        // Production qualification must reject FIXTURE_MANIFEST_RELATIVE artifact digests after relocation.
         FIXTURE_MANIFEST_RELATIVE,
-        // The U2/U6 gate re-derives every U8 output, so the registry gate its
-        // generation requires and the generated consumer artifacts it compares
-        // against must both exist in a staged root.
+        // The U2/U6 gate re-derives every U8 output.
+        // A staged root must include the registry gate required for generation and the generated consumer artifacts compared against U8 outputs.
         "release/mc-host-registry-gate.json",
-        // Cargo resolves `[patch]`/`[replace]` from the workspace root, so ruling out
-        // an override of the qualified crates needs the root manifest too.
+        // Cargo resolves `[patch]` and `[replace]` from the workspace root.
+        // Ruling out `[patch]` or `[replace]` overrides of qualified crates requires the root Cargo.toml.
         "Cargo.toml",
         "release/generated/mc-host-release-contract.rs",
         "packages/plugin/src/shared/mc-host-lifecycle/generated-contract.ts",
@@ -98,9 +95,9 @@ function freshRoot(): string {
         mkdirSync(join(root, dirname(relative)), { recursive: true });
         cpSync(join(repoRoot, relative), join(root, relative));
     }
-    // The committed gate is fail-closed by design, and generation refuses to run
-    // against it, so every case here would fail on the gate instead of the rule
-    // it means to exercise. Stage a synthetic complete gate instead.
+    // The committed gate fails closed, and generation refuses to run against it.
+    // Without a synthetic complete gate, every test case fails at the gate instead of its target rule.
+    // freshRoot stages a synthetic complete gate so each test reaches its target rule.
     const gatePath = join(root, "release/mc-host-registry-gate.json");
     writeFileSync(
         gatePath,
@@ -120,13 +117,11 @@ function fixtureManifest(): any {
 
 // biome-ignore lint/suspicious/noExplicitAny: tests install mutated manifests
 /**
- * Restate the copied smoke report over the manifest a test is about to install.
  *
- * The oracle's report is a separate file bound by digest, so a test that rewrote
- * input digests or host capabilities would otherwise trip the report/manifest
- * identity check for its own setup's reason instead of the rule under test.
- * Tests that mean to forge a report call {@link checkOracleEvidence} with one
- * directly and do not go through here.
+ * The oracle report is a separate file bound by digest.
+ * Changing input digests or host capabilities without rebinding the report triggers the report/manifest identity check.
+ * rebindSmokeReport prevents setup failures from hiding the rule under test.
+ * Tests that forge a report call {@link checkOracleEvidence} directly instead of rebindSmokeReport.
  */
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
 function rebindSmokeReport(root: string, manifest: any): void {
@@ -139,11 +134,9 @@ function rebindSmokeReport(root: string, manifest: any): void {
     report.table_epoch = manifest.oracle.table_epoch;
     report.execution_provider = manifest.oracle.execution_provider;
     report.host = manifest.oracle.host;
-    // The report names the semantic corpus `semantic_corpus`; the manifest keys it
     // `corpus`.
-    // An unqualified input carries no digest. The report's required keys are fixed,
-    // so keep what it already named instead of dropping the key and failing the
-    // setup on a shape error.
+    // rebindSmokeReport preserves the report value when an input lacks `sha256` because required report input keys cannot be omitted.
+    // Dropping a required report input key causes a setup shape error.
     const digest = (key: string, reportKey: string): string =>
         (manifest.inputs[key] as { sha256?: string }).sha256 ??
         report.inputs[reportKey];
@@ -172,8 +165,8 @@ function installManifest(root: string, manifest: any): void {
     );
 }
 
-/** Mirrors the qualifier's JSON-shaped input set, so a staged production artifact
- *  is loadable rather than merely digest-correct. */
+/** The fixture mirrors the qualifier's JSON-shaped input set so staged production artifacts are loadable, not merely digest-correct.
+ * */
 const JSON_SHAPED_INPUTS: ReadonlySet<string> = new Set([
     "config",
     "corpus",
@@ -183,18 +176,14 @@ const JSON_SHAPED_INPUTS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Where production-mode tests stage artifact bytes. Production qualification
- * denies any verify path under `scripts/__fixtures__`, so a production manifest
- * must name a location outside it — as a real qualifying host would.
+ * Production qualification rejects verify paths under `scripts/__fixtures__`.
  */
 const STAGED_PRODUCTION_INPUT_DIR = "opt/mc-host-inputs";
 
 /**
- * Rebind the oracle transcript to whatever digests the inputs now carry.
  *
- * Any helper that restages bytes has to do this, which is the binding working as
- * intended: a transcript naming digests the lock no longer holds is exactly the
- * stale-oracle case the check exists to reject.
+ * Every helper that restages input bytes must rebind the oracle transcript to the new digests.
+ * The oracle check rejects transcripts whose bound digests no longer match the lock.
  */
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
 function rebindOracle(manifest: any): void {
@@ -208,10 +197,7 @@ function rebindOracle(manifest: any): void {
 }
 
 /**
- * Point every source at a resolvable host. The committed fixtures name RFC 2606
- * `.invalid` hosts, which production mode rejects because they can never serve an
- * artifact, so a production-mode test aimed at any other rule has to clear that one
- * first — as a real production manifest would.
+ * Production mode rejects fixture `.invalid` hosts before unrelated rules run.
  */
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
 function useResolvableSources(manifest: any): void {
@@ -228,9 +214,8 @@ function useResolvableSources(manifest: any): void {
 }
 
 /**
- * Replace every declared digest with a distinct non-blacklisted value. Production
- * mode denies the committed fixture digests outright, which fires before the path
- * rules, so a test targeting a path rule must not carry those digests.
+ * Production mode rejects fixture digests before path rules run.
+ * A path-rule test must replace fixture digests because production mode rejects them first.
  */
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
 function unblacklistDigests(manifest: any): void {
@@ -246,11 +231,8 @@ function unblacklistDigests(manifest: any): void {
 }
 
 /**
- * Give every input a production-policy license approver.
+ * Production mode rejects the fixture's `test-fixture` approver before other rules run.
  *
- * The fixture is approved by `test-fixture`, which production mode rejects, so a
- * test that promotes the fixture must restate the approval or fail on the
- * approver before reaching the rule it is exercising.
  */
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
 function useProductionApprovers(manifest: any): void {
@@ -264,11 +246,8 @@ function useProductionApprovers(manifest: any): void {
 }
 
 /**
- * Every fixture-provenance adjustment production mode requires.
  *
- * The fixture names `.invalid` hosts and is approved by `test-fixture`; both are
- * rejected in production mode, and a test that fixes one but not the other fails
- * on the provenance it forgot rather than on the rule it is exercising.
+ * Production mode rejects fixture `.invalid` hosts and the `test-fixture` approver before unrelated rules run.
  */
 // biome-ignore lint/suspicious/noExplicitAny: tests mutate deep copies of the manifest
 function useProductionProvenance(manifest: any): void {
@@ -285,9 +264,7 @@ function installProductionManifest(
     manifest.mode = "production";
     const stagedDir = join(root, STAGED_PRODUCTION_INPUT_DIR);
     mkdirSync(stagedDir, { recursive: true });
-    // Deliberately NOT the committed fixture bytes: their digests are denied in
-    // production mode, so a production manifest must carry distinct bytes and
-    // the digests computed from them, exactly as a real qualifying host would.
+    // Production mode denies the committed fixture bytes.
     for (const [key, artifact] of Object.entries(manifest.inputs) as [
         string,
         {
@@ -298,9 +275,8 @@ function installProductionManifest(
         },
     ][]) {
         const target = join(stagedDir, basename(artifact.verify_local_path));
-        // The JSON inputs must parse: a correct digest over plain text still cannot
-        // be loaded by the runtime, so byte verification rejects it. Distinct
-        // contents per key keep the digests distinct, as real artifacts would be.
+        // Inputs in `JSON_SHAPED_INPUTS` must contain valid JSON; a correct digest alone does not satisfy runtime parsing.
+        // Each key requires distinct contents to produce distinct test digests.
         const bytes = Buffer.from(
             JSON_SHAPED_INPUTS.has(key)
                 ? `${JSON.stringify({ staged_production_stand_in: key })}\n`
@@ -310,9 +286,7 @@ function installProductionManifest(
         artifact.verify_local_path = target;
         artifact.sha256 = createHash("sha256").update(bytes).digest("hex");
         artifact.size_bytes = bytes.length;
-        // The fixtures name RFC 2606 `.invalid` hosts, which production mode
-        // rejects because they can never serve an artifact. A production manifest
-        // must name a resolvable host, exactly as a real one would.
+        // Production mode rejects fixture RFC 2606 `.invalid` hosts because they cannot serve artifacts.
         artifact.source = artifact.source.replace(
             /\.example\.invalid\b/,
             ".mchost-release.io",
@@ -389,10 +363,7 @@ function openCodeClosureFixture(): HarnessClosureManifest {
 }
 
 /**
- * Overwrite a cited qualification artifact and re-point every evidence citation
- * at the bytes now on disk, so no digest check can fire. A test using this is
- * aiming at what the gate believes about an artifact's *contents*, not at
- * whether it noticed a digest mismatch.
+ * `recite` updates evidence digests so tests can validate artifact contents without digest-mismatch failures.
  */
 function recite(root: string, artifactPath: string, bytes: string): void {
     writeFileSync(artifactPath, bytes);
@@ -542,8 +513,7 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("a mutable ref as the final path segment is rejected", () => {
-        // No trailing slash follows the ref, so a substring match on `/main/`
-        // misses it while the URL still names a moving branch.
+        // The URL names the moving `main` branch without a trailing slash, bypassing a `/main/` substring check.
         for (const ref of ["main", "master", "latest", "HEAD", "nightly"]) {
             const root = freshRoot();
             const manifest = fixtureManifest();
@@ -557,8 +527,8 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("a percent-encoded mutable ref is rejected", () => {
-        // `URL.pathname` preserves the encoding, so a literal comparison would
-        // miss `ma%69n` even though the server resolves it as `main`.
+        // `URL.pathname` must be decoded before immutable-ref comparison; `%69` resolves to `i`.
+        // `ma%69n` resolves to `main` on the server.
         for (const encoded of ["ma%69n", "MAIN", "%4cATEST"]) {
             const root = freshRoot();
             const manifest = fixtureManifest();
@@ -572,10 +542,8 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("a source whose normalized path is a directory is rejected", () => {
-        // A dot segment moves the trailing slash out of the spelling: the raw string
-        // ends in `..`, while `new URL()` normalizes the path to the parent
-        // directory. The content-address check still passes because the digest
-        // survives as a segment, so the URL qualified as one artifact while naming
+        // `new URL()` normalizes a trailing `..` path segment to the parent directory.
+        // The digest remains a path segment, so digest validation passes although the URL names the parent directory.
         // a directory.
         for (const suffix of ["/..", "/.", "/%2e%2e", "/"]) {
             const root = freshRoot();
@@ -594,8 +562,7 @@ describe("immutable input fail-closed rules", () => {
         // `TypeError: Invalid URL` would lose the consistent failure prefix.
         const root = freshRoot();
         const manifest = fixtureManifest();
-        // An unterminated IPv6 bracket is unparseable; a space in the path is
-        // only percent-encoded, so it would not exercise the catch.
+        // A space in the path is percent-encoded instead of causing URL parsing to throw.
         manifest.inputs.model_onnx.source = "https://[invalid/model.onnx";
         installManifest(root, manifest);
         expect(() => generate(root, { check: false })).toThrow(
@@ -604,8 +571,7 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("a mutable ref in the query string is rejected", () => {
-        // An endpoint can name its revision outside the path, and such a URL
-        // keeps resolving a moving target however immutable its path looks.
+        // A revision in a non-path URL component can still name a moving target.
         for (const source of [
             "https://artifacts.example.invalid/download?ref=main",
             "https://artifacts.example.invalid/download?rev=v1&branch=LATEST",
@@ -622,9 +588,8 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("a mutable ref behind encoded separators is rejected", () => {
-        // One raw path segment, but a server that decodes escaped separators
-        // resolves it through the moving ref. Comparing the decoded value
-        // wholesale against the ref set misses it.
+        // Servers that decode escaped separators can resolve the path through a moving ref.
+        // Escaped separators prevent wholesale raw-path comparison against the ref set.
         const root = freshRoot();
         const manifest = fixtureManifest();
         manifest.inputs.model_onnx.source =
@@ -636,9 +601,8 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("a source URL fragment is rejected outright", () => {
-        // A fragment never reaches the server, so it cannot select artifact
-        // bytes; what it can do is carry an OAuth-style token that `buildLock`
-        // would copy into the committed lock.
+        // A fragment never reaches the server, so it cannot select an artifact.
+        // `buildLock` copies URL fragments into the committed lock.
         for (const source of [
             "https://artifacts.example.invalid/rev/abc123/model.onnx#access_token=secret",
             "https://artifacts.example.invalid/rev/abc123/model.onnx#HEAD",
@@ -655,8 +619,7 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("a source URL carrying credentials is rejected", () => {
-        // `buildLock` copies `source` verbatim into a committed artifact, so
-        // accepting either shape would publish the secret in Git permanently.
+        // Accepting credential-bearing source URLs would commit the secret to Git permanently.
         const withUserinfo = freshRoot();
         const userinfoManifest = fixtureManifest();
         userinfoManifest.inputs.model_onnx.source =
@@ -684,8 +647,7 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("digest-correct bytes the runtime cannot load are rejected", () => {
-        // Byte identity is not loadability: a plain-text stand-in with a matching
-        // digest would qualify and then fail at bundle load.
+        // A matching digest does not prove that the artifact can load as a bundle.
         const root = freshRoot();
         installProductionManifest(root, (manifest) => {
             const target = manifest.inputs.tokenizer.verify_local_path;
@@ -702,9 +664,8 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("a production source carries no query string", () => {
-        // A credential hides in a query value as readily as in its name — a nested
-        // URL with its own userinfo, and one level down from that. The component is
-        // rejected outright in production rather than proven clean at every depth.
+        // Nested URLs can contain userinfo at multiple depths.
+        // Production validation rejects the query component instead of recursively proving nested URLs clean.
         for (const query of [
             "?redirect=https%3A%2F%2Fuser%3Asecret%40storage.example%2Fx",
             "?harmless=1",
@@ -723,8 +684,7 @@ describe("immutable input fail-closed rules", () => {
 
     test("a production source must name its content", () => {
         // A denylist of ref names can never be complete, so immutability is required
-        // positively: an unlisted branch reads as immutable only because nobody
-        // thought of it.
+        // An unlisted branch appears immutable only because no denylist entry names it.
         for (const path of [
             "/gte-modernbert/resolve/develop/model.onnx",
             "/gte-modernbert/resolve/v1.2.3/model.onnx",
@@ -739,8 +699,7 @@ describe("immutable input fail-closed rules", () => {
             );
         }
 
-        // The artifact's own digest satisfies it, and so does any
-        // content-addressed revision of git-SHA-1 length or longer.
+        // A content-addressed Git revision must contain at least 40 characters.
         for (const segment of ["${sha256}", "a".repeat(40)]) {
             const root = freshRoot();
             installProductionManifest(root, (manifest) => {
@@ -757,22 +716,18 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("reserved source hosts cannot qualify for production", () => {
-        // The committed fixtures name RFC 2606 `.invalid` hosts. Leaving one in a
-        // production manifest records provenance nobody can retrieve, so the lock
-        // would claim an artifact origin that cannot exist.
+        // An `.invalid` host in a production manifest records an artifact origin that cannot exist.
         for (const host of [
             "models.example.invalid",
             "artifacts.example.test",
             "cdn.localhost",
             "files.example.com",
-            // `URL.hostname` brackets an IPv6 literal, so the bare `::1` entry in
-            // the list would never match without normalizing first.
+            // `URL.hostname` returns `[::1]` for an IPv6 loopback literal, so host matching requires brackets.
             "[::1]",
             "127.0.0.1",
             // The whole 127.0.0.0/8 block is loopback, not only `.1`.
             "127.0.0.2",
-            // `URL` canonicalizes an IPv4-mapped literal to `[::ffff:7f00:1]`,
-            // which equals neither entry in the list it is meant to match.
+            // `URL` canonicalizes `[::ffff:127.0.0.1]` to `[::ffff:7f00:1]`, so both forms must be rejected.
             "[::ffff:127.0.0.1]",
         ]) {
             const root = freshRoot();
@@ -785,7 +740,7 @@ describe("immutable input fail-closed rules", () => {
             );
         }
 
-        // Test-fixture mode keeps using them, which is what the fixtures are.
+        // Test-fixture mode permits reserved hosts.
         const fixture = freshRoot();
         installManifest(fixture, fixtureManifest());
         expect(() => generate(fixture, { check: false })).not.toThrow();
@@ -802,11 +757,10 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("production mode rejects the committed qualification fixtures", () => {
-        // The fixture artifacts are tiny text stand-ins named `model.onnx` and
-        // `ort-runtime.so` with `example.invalid` provenance. Two independent
-        // mechanisms must keep them out of a production lock.
+        // Fixture artifacts use tiny text stand-ins with `example.invalid` provenance.
+        // Production qualification must reject fixture artifacts.
 
-        // 1. By digest, which survives relocating the bytes anywhere.
+        // Digest checks reject fixture bytes after relocation.
         const relocated = freshRoot();
         const byHash = fixtureManifest();
         byHash.mode = "production";
@@ -829,7 +783,7 @@ describe("immutable input fail-closed rules", () => {
             /committed tiny fixture bytes can never qualify/,
         );
 
-        // 2. By path, for bytes carrying digests the blacklist does not know.
+        // Path checks reject fixture bytes whose digests are unknown.
         const inPlace = freshRoot();
         const byPath = fixtureManifest();
         byPath.mode = "production";
@@ -927,8 +881,6 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("whitespace-only attestations are rejected", () => {
-        // A blank string reads as an approver or a provenance record in the
-        // committed lock while asserting nothing, so a length check is not enough.
         const cases: [(manifest: any) => void, RegExp][] = [
             [
                 (m) => {
@@ -1033,13 +985,8 @@ describe("immutable input fail-closed rules", () => {
         };
         installManifest(root, manifest);
         expect(() => generate(root, { check: true })).not.toThrow();
-        // `verifyBytes` is the one gate, and it is the flag `--verify-bytes` and
-        // `requireQualificationEvidence` actually pass. It previously read a
-        // `verifyExternalBytes` option that was not in `generate`'s signature, so
-        // no caller could set it and closure source bytes went unverified while
-        // the command reported that every production byte had been checked.
-        // Asserting the closure message specifically is what keeps that gate
-        // wired: a generic /missing/ passes on the artifact paths alone.
+        // `verifyBytes` controls both `--verify-bytes` and `requireQualificationEvidence`.
+        // The closure-specific matcher prevents artifact-path failures from satisfying this assertion.
         expect(() => generate(root, { check: true, verifyBytes: true })).toThrow(
             /closure verify root is missing/,
         );
@@ -1050,7 +997,6 @@ describe("immutable input fail-closed rules", () => {
         const pkg = "@earendil-works/pi-coding-agent";
 
         // A transitive copy at an unrelated version satisfies a substring search
-        // for `"<pkg>@<version>"` while the workspace resolves to something else.
         const decoy = freshRoot();
         const lockPath = join(decoy, "bun.lock");
         const lock = readFileSync(lockPath, "utf8");
@@ -1068,8 +1014,7 @@ describe("immutable input fail-closed rules", () => {
             /does not match the resolved bun\.lock pin \(0\.80\.2\)/,
         );
 
-        // A nested resolution outranks the hoisted one. Bun keys it by the
-        // consumer's package name, never by its directory.
+        // A nested resolution overrides a hoisted resolution. Bun keys resolutions by the consumer package name, not its directory.
         const nested = freshRoot();
         const nestedLockPath = join(nested, "bun.lock");
         writeFileSync(
@@ -1084,8 +1029,7 @@ describe("immutable input fail-closed rules", () => {
         installManifest(nested, citesNested);
         expect(() => generate(nested, { check: false })).not.toThrow();
 
-        // A directory-keyed entry is not a Bun resolution and must not be read
-        // as one, or the check silently falls back to the hoisted version.
+        // The resolver ignores directory-keyed entries because treating them as Bun resolutions falls back to the hoisted version.
         const pathKeyed = freshRoot();
         const pathKeyedLock = join(pathKeyed, "bun.lock");
         writeFileSync(
@@ -1102,9 +1046,7 @@ describe("immutable input fail-closed rules", () => {
             /does not match the resolved bun\.lock pin \(0\.80\.2\)/,
         );
 
-        // A hoisted entry is only the workspace's resolution if the workspace
-        // still depends on the package. Otherwise the lock would record a version
-        // nothing in the released workspace binds to.
+        // A hoisted entry resolves the workspace dependency only when the workspace declares the package.
         const undeclared = freshRoot();
         const undeclaredLock = join(undeclared, "bun.lock");
         writeFileSync(
@@ -1128,8 +1070,7 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("a workspace override of a qualified crate fails production closed", () => {
-        // Cargo resolves `[patch]` from the workspace root, so the leaf manifest can
-        // name the exact pin while the build compiles a replacement source.
+        // Cargo resolves `[patch]` entries from the workspace root, so a leaf manifest's pin can differ from the source Cargo builds.
         const cases: [string, RegExp][] = [
             [
                 '[patch.crates-io]\nort = { path = "../vendored-ort" }\n',
@@ -1140,22 +1081,17 @@ describe("immutable input fail-closed rules", () => {
                 /overrides fastembed, so the build would not resolve/,
             ],
             [
-                // No trailing blank line: the subtable runs to EOF. Deciding from
-                // assignment lines read `path` as the crate and only reached the
-                // header's crate on a non-assignment line, so this form was never
-                // checked — and the case above passed only because its trailing
-                // newline produced one.
+                // The parser detects `[patch.crates-io.<crate>]` subtables that end at EOF.
                 '[patch.crates-io.fastembed]\npath = "../vendored-fastembed"',
                 /overrides fastembed, so the build would not resolve/,
             ],
             [
-                // A patch entry renames the same way a dependency does, so the key is
-                // not the crate.
+                // Renamed patch entries identify the overridden crate through `package`, not the dependency key.
                 '[patch.crates-io]\nort_fork = { package = "ort", path = "../vendored-ort" }\n',
                 /overrides ort, so the build would not resolve/,
             ],
             [
-                // The same rename in subtable form.
+                // The parser applies renamed-patch detection to subtable entries.
                 '[patch.crates-io.ort_fork]\npackage = "ort"\npath = "../vendored-ort"\n',
                 /overrides ort, so the build would not resolve/,
             ],
@@ -1164,9 +1100,7 @@ describe("immutable input fail-closed rules", () => {
                 /dotted override assignment this qualifier cannot attribute/,
             ],
             [
-                // A dotted key's components are TOML keys too, so `"patch"` names the
-                // same table as `patch`. Testing the still-quoted component against a
-                // bare-name pattern matched nothing and the override went unnoticed.
+                // The parser treats quoted components in dotted TOML keys as equivalent to bare components.
                 '"patch"."crates-io"."ort" = { path = "fake-ort" }\n',
                 /dotted override assignment this qualifier cannot attribute/,
             ],
@@ -1179,23 +1113,19 @@ describe("immutable input fail-closed rules", () => {
                 /overrides ort, so the build would not resolve/,
             ],
             [
-                // The same replacement in subtable form. Cargo deserializes the
-                // header's package-ID spec and applies the replacement; a scan that
-                // opens subtables only under `patch` reads this body as an override
-                // of a crate named `path`.
+                // A replacement subtable overrides the package identified by its package-ID header.
+                // A replacement subtable overrides the package identified by its package-ID header.
                 '[replace."ort:2.0.0-rc.13"]\npath = "../vendored-ort"\n',
                 /overrides ort, so the build would not resolve/,
             ],
             [
-                // Subtable form running to EOF, for the same reason the `patch` case
-                // above carries one: the verdict must not depend on a trailing line.
+                // The parser detects replacement subtables that end at EOF.
                 '[replace."ort:2.0.0-rc.13"]\npath = "../vendored-ort"',
                 /overrides ort, so the build would not resolve/,
             ],
             [
-                // `name@version` is the modern package-ID spelling and Cargo accepts
-                // it here. Cutting the spec at its first `:` leaves the version
-                // attached, so the override reads as one of an unrelated crate.
+                // The parser accepts `name@version` as a valid Cargo package-ID spec.
+                // The parser excludes the version from the crate name in `name@version` package-ID specs.
                 '[replace]\n"ort@2.0.0-rc.13" = { path = "../vendored-ort" }\n',
                 /overrides ort, so the build would not resolve/,
             ],
@@ -1204,26 +1134,22 @@ describe("immutable input fail-closed rules", () => {
                 /overrides ort, so the build would not resolve/,
             ],
             [
-                // A spec may name its source as a URL and the package in the
-                // fragment. Cutting at the first `:` reduces this one to `https`.
+                // The parser reads the package name from a URL package-ID spec's fragment.
                 '[replace]\n"https://github.com/pykeio/ort#ort:2.0.0-rc.13" = { path = "../vendored-ort" }\n',
                 /overrides ort, so the build would not resolve/,
             ],
             [
-                // Literal-string spellings of the same key.
+                // The parser treats literal TOML strings as equivalent key spellings.
                 "[replace.'ort:2.0.0-rc.13']\npath = \"../vendored-ort\"\n",
                 /overrides ort, so the build would not resolve/,
             ],
             [
-                // A URL spec whose fragment holds only a version leaves Cargo to
-                // derive the package from the source, which this scan cannot follow.
+                // The scanner cannot derive the package name from a source URL without a package fragment.
                 '[replace."https://github.com/pykeio/ort#2.0.0-rc.13"]\npath = "../vendored-ort"\n',
                 /declares an override this qualifier cannot read/,
             ],
             [
-                // Table names are TOML keys, so they may be quoted. Comparing the
-                // header text left every quoted spelling unattributed and therefore
-                // unexamined, for `replace` and `patch` alike.
+                // The parser parses quoted TOML table keys to attribute `replace` and `patch` overrides.
                 '["replace"."ort:2.0.0-rc.13"]\npath = "../vendored-ort"\n',
                 /overrides ort, so the build would not resolve/,
             ],
@@ -1251,9 +1177,7 @@ describe("immutable input fail-closed rules", () => {
             expect(() => generate(root, { check: false })).toThrow(error);
         }
 
-        // An override of an unrelated crate is not this check's business, in the
-        // subtable spellings as much as the inline ones — the point of resolving the
-        // header is to attribute the override, not to reject every one on sight.
+        // The parser rejects only target-crate overrides and resolves headers to identify the overridden crate.
         for (const override of [
             '[patch.crates-io]\nserde = { path = "../vendored-serde" }\n',
             '[replace."serde:1.0.0"]\npath = "../vendored-serde"\n',
@@ -1273,9 +1197,7 @@ describe("immutable input fail-closed rules", () => {
     });
 
     test("a forbidden ORT capability in Cargo.toml fails production closed", () => {
-        // The declared array is not the effective feature closure, but adding a
-        // download, TLS, or accelerator feature while leaving the version pin
-        // untouched is exactly the edit the version-only check missed.
+        // Declared features are not the effective closure; a version pin cannot detect forbidden declared features.
         const cargoPath = "crates/mc-host/Cargo.toml";
         const cases: [(cargo: string) => string, RegExp][] = [
             [
@@ -1303,8 +1225,7 @@ describe("immutable input fail-closed rules", () => {
                 /ort .* must set default-features = false/,
             ],
             [
-                // The same declaration reformatted across lines. A one-line scan
-                // sees no closing bracket, finds no features array, and would
+                // The parser parses multiline feature arrays because a one-line scan misses the closing bracket.
                 // pass vacuously.
                 (cargo) =>
                     cargo.replace(
@@ -1314,8 +1235,7 @@ describe("immutable input fail-closed rules", () => {
                 /ort feature download-binaries .* outside the qualified closure/,
             ],
             [
-                // A features key whose array cannot be read must fail, not be
-                // treated as an empty list.
+                // An unreadable `features` array must fail rather than be treated as empty.
                 (cargo) =>
                     cargo.replace(
                         'features = ["load-dynamic", "ndarray", "std"] }',
@@ -1324,33 +1244,25 @@ describe("immutable input fail-closed rules", () => {
                 /declares a features list this qualifier cannot read/,
             ],
             [
-                // The subtable form is a valid Cargo spelling, so it must be
-                // checked rather than refused: its keys are the same ones the
-                // inline table carries, just under a header.
+                // The scanner must check dependency subtables because Cargo accepts them as an alternative to inline dependency tables.
                 (cargo) =>
                     `${cargo.replace(/^ort = .*$/m, "")}\n[dependencies.ort]\nversion = "=2.0.0-rc.13"\ndefault-features = false\nfeatures = ["load-dynamic", "download-binaries"]\n`,
                 /ort feature download-binaries .* outside the qualified closure/,
             ],
             [
-                // A multiline array inside a subtable. Its lines sit below top
-                // level, so skipping them truncates `features = [` and the feature
-                // check reports a valid manifest as unreadable instead of reading
-                // the forbidden entry.
+                // The scanner must read multiline `features` arrays in dependency subtables; skipping subtable lines reports forbidden features as unreadable.
                 (cargo) =>
                     `${cargo.replace(/^ort = .*$/m, "")}\n[dependencies.ort]\nversion = "=2.0.0-rc.13"\ndefault-features = false\nfeatures = [\n    "load-dynamic",\n    "tensorrt",\n]\n`,
                 /ort feature tensorrt .* outside the qualified closure/,
             ],
             [
-                // A target-specific subtable, which Cargo unifies into the Linux
-                // build's feature set while the base entry stays clean.
+                // Cargo unifies target-specific dependency features into the Linux build.
                 (cargo) =>
                     `${cargo}\n[target.'cfg(target_os = "linux")'.dependencies.ort]\nversion = "=2.0.0-rc.13"\nfeatures = ["cuda"]\n`,
                 /ort must be declared exactly once/,
             ],
             [
-                // A decoy assignment under an unrelated table. A scan that
-                // ignores section headers validates the decoy and never reaches
-                // the real dependency's forbidden feature.
+                // The scanner must respect section headers; otherwise an unrelated `ort` assignment can hide the dependency's forbidden feature.
                 (cargo) =>
                     cargo
                         .replace(
@@ -1364,9 +1276,7 @@ describe("immutable input fail-closed rules", () => {
                 /ort must be declared exactly once/,
             ],
             [
-                // A comment is the one place Cargo.toml can hold text that reads
-                // exactly like a declaration and means nothing. The real pin here
-                // is rc.12; the commented rc.13 must not satisfy the check.
+                // The qualifier must ignore commented declarations: the manifest pins rc.12, and commented rc.13 does not satisfy the check.
                 (cargo) =>
                     cargo.replace(
                         'ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "std"] }',
@@ -1375,7 +1285,7 @@ describe("immutable input fail-closed rules", () => {
                 /pinned ort identity does not match/,
             ],
             [
-                // Same shape, faking the default-features opt-out instead.
+                // A comment must not satisfy `default-features = false`.
                 (cargo) =>
                     cargo.replace(
                         'ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "std"] }',
@@ -1384,8 +1294,7 @@ describe("immutable input fail-closed rules", () => {
                 /ort .* must set default-features = false/,
             ],
             [
-                // A `#` inside a quoted value is not a comment, so the entry must
-                // survive intact rather than be truncated into a rejection.
+                // A `#` inside a quoted value is string content, so the parser must not truncate the entry.
                 (cargo) =>
                     cargo.replace(
                         '"load-dynamic", "ndarray", "std"',
@@ -1394,51 +1303,45 @@ describe("immutable input fail-closed rules", () => {
                 /ort feature cuda#notacomment .* outside the qualified closure/,
             ],
             [
-                // TOML allows any whitespace around `=`, so a target-specific
-                // duplicate spelled `ort={ ... }` must still be counted. Missing it
-                // leaves its accelerator feature unchecked while the base entry
-                // validates cleanly — and Cargo unifies both into the resolved set.
+                // The qualifier must count `ort={ ... }` in target-specific dependency tables because TOML permits whitespace around `=`.
+                // Cargo unifies the target-specific and base `ort` entries' features.
                 (cargo) =>
                     `${cargo}\n[target.'cfg(target_os = "linux")'.dependencies]\nort={ version = "=2.0.0-rc.13", default-features = false, features = ["cuda"] }\n`,
                 /ort must be declared exactly once/,
             ],
             [
-                // A quoted key can carry escapes: Cargo reads `"o\u0072t"` as
-                // `ort` and unifies its features. A scan that cannot decode the
-                // spelling must refuse the file, not treat it as a different key
-                // and validate only the safe base entry.
+                // Cargo reads the quoted key `"o\u0072t"` as `ort`.
+                // The qualifier must reject dependency tables whose quoted keys cannot be decoded.
                 (cargo) =>
                     `${cargo}\n[target.'cfg(target_os = "linux")'.dependencies]\n"o\\u0072t" = { version = "=2.0.0-rc.13", default-features = false, features = ["cuda"] }\n`,
-                // Crate-agnostic: an unreadable dependency table means no crate's
-                // closure can be checked, so whichever is validated first reports.
+                // An unreadable dependency table prevents validation of every crate's closure.
+                // The qualifier must reject an unreadable dependency table before validating any crate closure.
                 /must be declared exactly once/,
             ],
             [
-                // A dependency key is not a crate name. Cargo resolves this to the
-                // same `ort` and unifies its features with the ordinary entry, so
-                // comparing keys leaves it unexamined.
+                // A dependency key can rename a crate.
+                // Cargo resolves `ort_cuda` to `ort` and unifies its features with the `ort` entry.
+                // Matching dependency keys instead of `package` names misses renamed `ort` dependencies.
                 (cargo) =>
                     `${cargo}\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", default-features = false, features = ["cuda"] }\n`,
                 /ort must be declared exactly once/,
             ],
             [
-                // A rename whose `package` value cannot be read must refuse the
-                // file rather than be attributed to its key.
+                // The qualifier must reject a renamed dependency whose `package` value cannot be decoded.
                 (cargo) =>
                     `${cargo}\nort_alias = { package = "o\\u0072t", version = "=2.0.0-rc.13" }\n`,
                 /must be declared exactly once/,
             ],
             [
-                // The other side of the closure. Cargo's feature table forwards to a
-                // dependency with `dep/feature`, and `default` is on for every build
-                // that does not pass --no-default-features, which `build:rust` does
+                // Cargo feature entries forward dependency features with `dep/feature`.
+                // `default` is enabled unless Cargo receives `--no-default-features`.
                 // not.
                 (cargo) => `${cargo}\n[features]\ndefault = ["ort/cuda"]\n`,
                 /\[features\] table .* forwards ort\/cuda, which is outside the qualified closure/,
             ],
             [
-                // Scanned whether or not the entry is reachable from `default`, and
-                // under a renamed key, since forwarding names the key.
+                // The qualifier must scan every feature forwarding, including forwardings unreachable from `default`.
+                // Feature forwarding uses the dependency key, including renamed keys.
                 (cargo) =>
                     `${cargo.replace(
                         /^ort = /m,
@@ -1447,46 +1350,37 @@ describe("immutable input fail-closed rules", () => {
                 /forwards ort_dep\/tensorrt, which is outside the qualified closure/,
             ],
             [
-                // A TOML literal string is a valid spelling of the same forwarding.
+                // TOML literal strings can spell `ort/cuda` feature forwarding.
                 (cargo) => `${cargo}\n[features]\nbypass = ['ort/cuda']\n`,
                 /forwards ort\/cuda, which is outside the qualified closure/,
             ],
             [
-                // And so is a quoted table name: `["features"]` is the same table, so
-                // comparing the raw header left the whole forwarding table unexamined
-                // while Cargo still reported `default = ["ort/cuda"]`.
+                // A quoted table header `["features"]` denotes the `[features]` table.
+                // Raw-header comparison misses quoted `[features]` table headers.
                 (cargo) => `${cargo}\n["features"]\ndefault = ["ort/cuda"]\n`,
                 /forwards ort\/cuda, which is outside the qualified closure/,
             ],
             [
-                // Header eligibility from bracket depth alone let a line inside a
-                // multi-line string read as a real header, moving the section away
-                // from `features` so every forwarding after it went unread.
+                // Header detection must ignore lines inside multi-line strings.
                 (cargo) =>
                     `${cargo}\n[features]\npoison = ["""\n[package.metadata.decoy]\n"""]\ndefault = ["ort/cuda"]\n`,
                 /forwards ort\/cuda, which is outside the qualified closure/,
             ],
             [
-                // A multi-line string's closing delimiter may sit behind a `#`, which
-                // is content there. Stripping comments per line deleted that close, so
-                // the string state stayed open and every table after it was read as
-                // string body — including this Linux-only entry Cargo resolves with
-                // the `cuda` feature.
+                // A `#` inside a multi-line string is string content, including before its closing delimiter.
+                // Per-line comment stripping must preserve multi-line string delimiters.
                 (cargo) =>
                     `[package.metadata.decoy]\nvalue = """\n# """\n\n${cargo}\n[target.'cfg(target_os = "linux")'.dependencies]\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
                 /ort must be declared exactly once/,
             ],
             [
-                // An escaped basic string decodes to the same value, so a scan that
-                // cannot decode it must refuse rather than skip it.
+                // The qualifier must decode escaped basic strings before scanning or reject the manifest.
                 (cargo) =>
                     `${cargo}\n[features]\nbypass = ["ort/c\\u0075da"]\n`,
                 /\[features\] table .* holds a string this qualifier cannot read/,
             ],
             [
-                // Every key in a dependency entry is a suffix of some decoy Cargo
-                // tolerates as an unused key. The opt-out must come from the real
-                // key, or default features — accelerators included — enter the build.
+                // The qualifier must require exact dependency keys because Cargo ignores unknown keys such as `fakedefault-features`.
                 (cargo) =>
                     cargo.replace(
                         'ort = { version = "=2.0.0-rc.13", default-features = false,',
@@ -1495,8 +1389,7 @@ describe("immutable input fail-closed rules", () => {
                 /ort .* must set default-features = false/,
             ],
             [
-                // Same shape on the version pin, which a substring test also read
-                // out of a decoy.
+                // The qualifier must require the real `version` key; `fakeversion` can contain the required pin.
                 (cargo) =>
                     cargo.replace(
                         'ort = { version = "=2.0.0-rc.13",',
@@ -1506,9 +1399,7 @@ describe("immutable input fail-closed rules", () => {
             ],
             [
                 // A key inside an inline table is a TOML key, so it may be quoted.
-                // Cargo reports the `cuda` feature from `"features"` exactly as it
-                // does from the bare spelling, while a pattern over the bare key
-                // missed both the presence test and the extraction.
+                // The parser treats quoted `features` keys as `features` when reading `ort` features.
                 (cargo) =>
                     cargo.replace(
                         /^ort = \{ version = "=2\.0\.0-rc\.13", default-features = false,.*$/m,
@@ -1517,7 +1408,6 @@ describe("immutable input fail-closed rules", () => {
                 /ort feature cuda .* is outside the qualified closure/,
             ],
             [
-                // The literal-string spelling of the same key.
                 (cargo) =>
                     cargo.replace(
                         /^ort = \{ version = "=2\.0\.0-rc\.13", default-features = false,.*$/m,
@@ -1526,9 +1416,7 @@ describe("immutable input fail-closed rules", () => {
                 /ort feature tensorrt .* is outside the qualified closure/,
             ],
             [
-                // An escaped quoted key decodes to the same name and no pattern over
-                // literal spellings can represent it, so the entry is refused rather
-                // than examined with the key read as absent.
+                // The parser rejects escaped quoted keys instead of treating them as absent.
                 (cargo) =>
                     cargo.replace(
                         /^ort = \{ version = "=2\.0\.0-rc\.13", default-features = false,.*$/m,
@@ -1537,47 +1425,36 @@ describe("immutable input fail-closed rules", () => {
                 /must be declared exactly once/,
             ],
             [
-                // A quoted `package` conceals a rename the same way, so the renamed
-                // declaration would be filed under its key and leave the base entry
-                // as the only match.
+                // The parser treats quoted `package` keys as `package` when resolving renamed dependencies.
                 (cargo) =>
                     `${cargo}\n[target.'cfg(target_os = "linux")'.dependencies]\nort_cuda = { "package" = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
                 /ort must be declared exactly once/,
             ],
             [
-                // Same form with the whitespace TOML permits around the dots.
+                // TOML permits whitespace around dots in dotted keys.
                 (cargo) =>
                     `target . 'cfg(target_os = "linux")' . dependencies . ort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n${cargo}`,
                 /must be declared exactly once/,
             ],
             [
-                // `features.default` declares the feature table without a header, so
-                // a header-only scan never reaches the forwarding.
+                // `features.default` creates the feature table without a `[features]` header.
                 (cargo) => `features.default = ["ort/cuda"]\n${cargo}`,
                 /dotted features assignment this qualifier cannot attribute/,
             ],
             [
-                // A dotted assignment creates its own table, so this declares a
-                // Linux `ort` dependency before the first header — where the section
-                // is still empty and the key is unreadable to a text scan.
+                // The parser recognizes dotted assignments before any table header as dependency declarations.
                 (cargo) =>
                     `target.'cfg(target_os = "linux")'.dependencies.ort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n${cargo}`,
                 /must be declared exactly once/,
             ],
             [
-                // TOML permits whitespace around the dots in a table header, and it
-                // is the same table either way. A raw suffix test classifies it as
-                // something else and everything inside goes unexamined.
+                // TOML treats table-header dots with surrounding whitespace as equivalent.
                 (cargo) =>
                     `${cargo}\n[target . 'cfg(target_os = "linux")' . dependencies]\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
                 /ort must be declared exactly once/,
             ],
             [
-                // A header component is a TOML key, so `"dependencies"` names the
-                // ordinary dependency table. Cargo reports the target entry's `cuda`
-                // feature either way; classifying the section from the raw suffix
-                // recorded the rename as an unrelated crate, leaving the safe base
-                // entry as the only `ort` declaration.
+                // A header component is a TOML key, so quoted `"dependencies"` names the `dependencies` table.
                 (cargo) =>
                     `${cargo}\n[target.'cfg(target_os = "linux")'."dependencies"]\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
                 /ort must be declared exactly once/,
@@ -1588,28 +1465,21 @@ describe("immutable input fail-closed rules", () => {
                 /ort must be declared exactly once/,
             ],
             [
-                // Header eligibility was decided from bracket depth alone, so a line
-                // inside a multi-line string read as a real header and closed the
-                // dependency subtable early. Cargo keeps every key below it in the
-                // entry — `features` included — so the forbidden capability was
-                // simply absent from what the scan examined.
+                // The parser must ignore headers inside multiline strings.
                 (cargo) =>
                     `${cargo.replace(/^ort = .*$/m, "")}\n[dependencies.ort]\nversion = "=2.0.0-rc.13"\ndefault-features = false\npoison = """\n[package.metadata.decoy]\n"""\nfeatures = ["cuda"]\n`,
                 /ort feature cuda .* is outside the qualified closure/,
             ],
             [
-                // A multi-line string spans lines, so quote state cannot reset per
-                // line: a bracket inside one would otherwise drive the shared depth
-                // wrong for everything after it.
+                // Quote state must persist across lines in multiline strings.
+                // A bracket in a multiline string must not change bracket depth.
                 (cargo) =>
                     `${cargo}\npoison = """\n]\n"""\n\n[target.'cfg(target_os = "linux")'.dependencies]\nort_cuda = { package = "ort", version = "=2.0.0-rc.13", features = ["cuda"] }\n`,
                 /ort must be declared exactly once/,
             ],
             [
-                // A bracket inside a quoted value is not structure. Counting it
-                // leaves the depth permanently positive, so every later line is
-                // read as nested content and a target-specific dependency after it
-                // is never seen.
+                // A bracket inside a quoted value must not change bracket depth.
+                // A positive depth prevents detection of later target-specific dependencies.
                 (cargo) =>
                     `${cargo}\npoison = "["\n\n[target.'cfg(target_os = "linux")'.dependencies]\nort = { version = "=2.0.0-rc.13", default-features = false, features = ["cuda"] }\n`,
                 /ort must be declared exactly once/,
@@ -1652,9 +1522,8 @@ describe("oracle evidence hook", () => {
     });
 
     test("real host version strings agree with the platform gate", () => {
-        // `compareDotted` exists to read these spellings; a format pre-filter
-        // here would reject hosts that `evaluatePlatform` accepts on the same
-        // floors, which is the disagreement the shared comparator prevents.
+        // The shared comparator prevents format filtering from rejecting hosts that `evaluatePlatform` accepts.
+        // `compareDotted` and `evaluatePlatform` must use the same version-floor semantics.
         const root = freshRoot();
         const manifest = fixtureManifest();
         manifest.oracle.host.kernel = "4.18.0-513.el8.x86_64";
@@ -1662,7 +1531,7 @@ describe("oracle evidence hook", () => {
         installManifest(root, manifest);
         expect(() => generate(root, { check: false })).not.toThrow();
 
-        // Below the floor still fails closed.
+        // Versions below the floor fail closed.
         const low = freshRoot();
         const lowManifest = fixtureManifest();
         lowManifest.oracle.host.kernel = "2.6.32-696.el6.x86_64";
@@ -1673,9 +1542,9 @@ describe("oracle evidence hook", () => {
     });
 
     test("a truncated host version cannot clear a floor on one component", () => {
-        // `compareDotted` scores a missing component as 0, so a value shorter
-        // than the floor is compared as if its absent components were zeros and
-        // one high segment decides the result alone.
+        // `compareDotted` treats missing components as 0.
+        // A shorter version is compared with zero for every missing component.
+        // After equal preceding segments, a higher segment makes the version pass.
         for (const [field, value] of [
             ["kernel", "999garbage"],
             ["glibc", "999garbage"],
@@ -1692,8 +1561,7 @@ describe("oracle evidence hook", () => {
     });
 
     test("a prerelease host version does not satisfy the stable floor", () => {
-        // `compareDotted` reads leading digits only, so a release candidate
-        // scores exactly equal to the floor it actually precedes.
+        // `compareDotted` treats a numeric suffix as patch components above the floor.
         for (const [field, value] of [
             ["kernel", "4.18-rc1"],
             ["kernel", "4.18.0-rc2"],
@@ -1709,9 +1577,6 @@ describe("oracle evidence hook", () => {
             );
         }
 
-        // A numeric release suffix means the opposite — the floor plus patches —
-        // and a prerelease is only disqualifying while the version sits exactly
-        // at the floor.
         for (const [field, value] of [
             ["kernel", "4.18.0-513.el8.x86_64"],
             ["glibc", "2.28-236.el8"],
@@ -1721,10 +1586,7 @@ describe("oracle evidence hook", () => {
             const root = freshRoot();
             const manifest = fixtureManifest();
             manifest.oracle.host[field] = value;
-            // The fixture records the floor exactly. These cases deliberately move
-            // the host, so the exact-floor claim stops describing it; leaving it
-            // set would fail on that claim rather than on the floor comparison
-            // this case is about.
+            // A host-version fixture must clear exact-floor evidence after changing the host version.
             manifest.oracle.host.exact_floor = false;
             installManifest(root, manifest);
             expect(() => generate(root, { check: false })).not.toThrow();
@@ -1732,16 +1594,15 @@ describe("oracle evidence hook", () => {
     });
 
     test("an oracle transcript cannot outlive the bytes it names", () => {
-        // The scenario the binding exists for: artifacts are requalified with new
-        // digests and the oracle object is retained. A recorded pass then covers
-        // bytes that are no longer in the lock.
+        // Requalification must replace the oracle binding when artifact digests change.
+        // A retained oracle pass can cover bytes absent from the lock.
         const root = freshRoot();
         installProductionManifest(root, (manifest) => {
             manifest.inputs.model_onnx.sha256 = createHash("sha256")
                 .update("requalified model bytes")
                 .digest("hex");
         });
-        // `installProductionManifest` rebinds, so undo that to model the stale case.
+        // The stale case retains the prior oracle binding.
         const manifestPath = join(root, SOURCE_MANIFEST_PATH);
         const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
         manifest.oracle.bound_inputs.model_onnx = createHash("sha256")
@@ -1755,9 +1616,9 @@ describe("oracle evidence hook", () => {
     });
 
     test("an oracle host without procfs fd exec cannot qualify", () => {
-        // The certified Linux lane executes the sealed ORT object through
-        // /proc/self/fd. An oracle that loaded it some other way did not exercise
-        // the production path, so its evidence cannot stand in for one that did.
+        // The certified Linux lane executes the sealed ORT object through `/proc/self/fd`.
+        // An oracle that loads the sealed ORT object without `/proc/self/fd` does not exercise the production path.
+        // Evidence from an oracle that does not use `/proc/self/fd` cannot qualify for the production path.
         for (const value of [false, undefined]) {
             const root = freshRoot();
             const manifest = fixtureManifest();
@@ -1776,9 +1637,9 @@ describe("oracle evidence hook", () => {
     });
 
     test("an oracle without a recorded pass cannot qualify", () => {
-        // Every other oracle field describes how the run was configured. A run
-        // that failed, or never happened, produces the same parameters, so
-        // presence must not read as success.
+        // `oracle.result` distinguishes a successful run from a failed or absent run.
+        // A failed or absent run can have the same configuration as a successful run.
+        // `oracle.result` must equal `"pass"`; its presence alone does not establish success.
         const cases: [(o: any) => void, RegExp][] = [
             [
                 (o) => {
@@ -1822,8 +1683,7 @@ describe("oracle evidence hook", () => {
 
     test("mismatched oracle evidence is rejected", () => {
         const contract = buildContract();
-        // The oracle binds itself to the artifact digests, so the check needs the
-        // input table it is being validated against.
+        // The oracle binds to artifact digests, so validation needs the input table being checked.
         const inputs = fixtureManifest().inputs;
         const base = fixtureManifest().oracle;
         const report = JSON.parse(
@@ -1834,8 +1694,7 @@ describe("oracle evidence hook", () => {
         );
         const cases: [(o: typeof base) => void, RegExp][] = [
             [
-                // A mis-cased nested key must be reported as an unknown key,
-                // not fall through as an absent version.
+                // A mis-cased nested key must be reported as unknown instead of as an absent version.
                 (o) => {
                     o.host = {
                         target: o.host.target,
@@ -1949,9 +1808,6 @@ describe("provider-credential matrix", () => {
     });
 
     test("a repeated template placeholder fails the one-to-one check", () => {
-        // Keyed by name, a Map collapses the duplicate and reports size 1 for a
-        // 1-field variant. `renderArgumentVariant` substitutes only
-        // `field.position`, so the other `{model}` would survive into argv.
         const bad = credentialsCopy();
         const [harness] = Object.keys(bad.harnesses);
         const variants = bad.harnesses[harness].argument_variants.variants;
@@ -2017,7 +1873,6 @@ describe("provider-credential matrix", () => {
                 ).toEqual({ ok: false, reason: "provider_unsupported" });
             }
         }
-        // Pi subscription aliases are not OpenCode providers.
         expect(
             evaluateBrocaRun(doc, {
                 harness: "opencode",
@@ -2039,7 +1894,6 @@ describe("provider-credential matrix", () => {
             variables: ["OPENAI_API_KEY"],
             viaAlias: "openai-codex",
         });
-        // The alias's own subscription mechanism is unsupported.
         expect(
             evaluateBrocaRun(doc, {
                 harness: "pi",
@@ -2112,7 +1966,6 @@ describe("provider-credential matrix", () => {
                 credentials: { ...exactly, K4: "d".repeat(last + 1) },
             }),
         ).toEqual({ ok: false, reason: "credential_row_too_large" });
-        // A row failing both caps reports the individual value first.
         expect(
             evaluateBrocaRun(doc4, {
                 harness: "opencode",
@@ -2166,7 +2019,6 @@ describe("credential-row fingerprint canonicalization", () => {
         expect(
             canonicalCredentialRowEncoding("opencode", "openai", rowA),
         ).not.toBe(same);
-        // Length prefixes remove delimiter ambiguity across name/value splits.
         expect(
             canonicalCredentialRowEncoding("pi", "openai", [["AB", "C"]]),
         ).not.toBe(
@@ -2281,10 +2133,6 @@ describe("typed argument variants", () => {
         }
     });
 
-    // The matrix is a second declaration of an argv contract the Rust broca
-    // backends already implement. Without this cross-check the two drift and
-    // the collision oracle stops covering flags the daemon actually emits, so
-    // a prompt equal to a host-owned flag would render as a real control.
     test("control_tokens cover every flag the Rust broca backends emit", () => {
         for (const [harness, source] of [
             ["opencode", "crates/mc-host/src/broca/opencode.rs"],
@@ -2713,9 +2561,6 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
     });
 
     test("the gate re-hashes real artifacts when asked", () => {
-        // The lock records each artifact's sha256 but deliberately not its
-        // host-specific verify path, so the gate cannot hash bytes on its own.
-        // A build running on the qualifying host can demand it.
         const root = freshRoot();
         installProductionManifest(root);
         generate(root, { check: false });
@@ -2730,8 +2575,6 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
         );
         writeFileSync(bytesPath, "swapped after qualification\n");
 
-        // Every digest in the committed description still agrees; only the
-        // artifact bytes changed, which the default portable gate cannot see.
         expect(() => requireQualificationEvidence(root)).not.toThrow();
         expect(() =>
             requireQualificationEvidence(root, { verifyBytes: true }),
@@ -2739,10 +2582,6 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
     });
 
     test("stripped lock rows cannot pass the gate", () => {
-        // Every marker check reads only a `qualified` flag or a version's type,
-        // so a lock whose rows keep nothing but those markers satisfies all of
-        // them while carrying no artifact hash, size, license, oracle result, or
-        // harness identity at all.
         const root = freshRoot();
         installProductionManifest(root);
         generate(root, { check: false });
@@ -2764,9 +2603,6 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
     });
 
     test("a replaced credential matrix cannot pass the gate", () => {
-        // The citation loop compares a self-reported digest and never parses the
-        // matrix, so updating both together would otherwise let a production
-        // build embed an empty or foreign credential policy.
         const root = freshRoot();
         installProductionManifest(root);
         generate(root, { check: false });
@@ -2779,8 +2615,6 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
     });
 
     test("an edited generated U8 contract cannot pass the gate", () => {
-        // The runtime compiles the generated Rust contract, not the in-source
-        // literal the cited U8 digest is derived from.
         const root = freshRoot();
         installProductionManifest(root);
         generate(root, { check: false });
@@ -2801,7 +2635,6 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
 
     test("summary-only lock edits cannot fake a verdict", () => {
         const root = freshRoot();
-        // One input left unqualified, so the lock carries a false row.
         const manifest = fixtureManifest();
         manifest.inputs.model_onnx = {
             qualified: false,
@@ -2810,9 +2643,6 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
         installManifest(root, manifest);
         generate(root, { check: false });
 
-        // Edit the lock's summary fields AND re-point the evidence citation at
-        // the edited bytes, so every digest check still passes. The per-row
-        // truth is what must be believed.
         const lockPath = join(root, OUTPUT_PATHS.lock);
         const lock = JSON.parse(readFileSync(lockPath, "utf8"));
         lock.mode = "production";
@@ -2839,13 +2669,9 @@ describe("build-entrypoint evidence consumption (U2/U6 gate)", () => {
 
     test("evidence claiming qualification over an unqualified lock is rejected", () => {
         const root = freshRoot();
-        // Test-mode manifest => the lock records unqualified inputs.
         installManifest(root, fixtureManifest());
         generate(root, { check: false });
 
-        // Forge evidence that asserts a production verdict while citing the
-        // real, unmodified lock and credentials digests. The gate must derive
-        // the verdict from the lock bytes, not from these self-reported bits.
         const evidencePath = join(root, OUTPUT_PATHS.evidence);
         const evidence = JSON.parse(readFileSync(evidencePath, "utf8"));
         evidence.production_qualified = true;
@@ -2867,8 +2693,6 @@ describe("verify-path resolution", () => {
         useProductionProvenance(manifest);
         unblacklistDigests(manifest);
 
-        // Real bytes live in a developer cache; the manifest names an
-        // innocuous absolute path that is a symlink to them.
         const cache = join(root, "home/.cache/huggingface");
         mkdirSync(cache, { recursive: true });
         const realModel = join(cache, "model.onnx");
@@ -2904,8 +2728,6 @@ describe("verify-path resolution", () => {
     });
 
     test("the fixture deny-list matches path segments, not substrings", () => {
-        // A real artifact store whose name merely contains a denied word names
-        // nothing that is actually a fixture or a cache.
         const allowed = freshRoot();
         installProductionManifest(allowed, (manifest) => {
             const dir = join(allowed, "mnt/release/hf-tests/fixtures-store");
@@ -2923,7 +2745,6 @@ describe("verify-path resolution", () => {
             true,
         );
 
-        // The real segment run is still denied wherever it appears.
         const denied = freshRoot();
         installProductionManifest(denied, (manifest) => {
             manifest.inputs.model_onnx.verify_local_path = join(
@@ -2950,15 +2771,12 @@ describe("verify-path resolution", () => {
         installProductionManifest(root);
         generate(root, { check: false });
 
-        // Drop the artifacts a foreign host (CI) would never hold. Drift
-        // checking of the committed lock must still work.
         rmSync(join(root, STAGED_PRODUCTION_INPUT_DIR), {
             recursive: true,
             force: true,
         });
         expect(generate(root, { check: true }).drift).toEqual([]);
 
-        // Byte verification remains available on the qualifying host.
         expect(() =>
             generate(root, { check: true, verifyBytes: true }),
         ).toThrow(/verify bytes missing/);
@@ -2967,27 +2785,17 @@ describe("verify-path resolution", () => {
 
 describe("release prerequisite (CLI)", () => {
     test("the consumption gate is reachable outside the tests", () => {
-        // `--check` reports drift and exits 0 over unqualified inputs on purpose, so
-        // without a separate entry point nothing in the repo would reject an
-        // unqualified release. `--require-qualified` is that entry point: it runs the
-        // same gate a production build runs, ready for a release job to invoke.
+        // Without `--verify-bytes`, the gate must reach a qualification verdict without reading artifacts.
         const script = join(
             repoRoot,
             "scripts/qualify-mc-host-production-inputs.ts",
         );
-        // No `--verify-bytes`, so the gate regenerates in check mode and reads no
-        // artifact: it must reach the verdict rather than stop on the runtime binding,
-        // which only governs runs that will actually hash bytes.
         const required = spawnSync("bun", [script, "--require-qualified"], {
             cwd: repoRoot,
             encoding: "utf8",
         });
         expect(required.status).toBe(1);
-        // The refusal is the claim; its reason depends on the checkout. Evidence
-        // lives at an ignored `tmp/` path, so a clean tree rejects it as absent
-        // while a tree that has already generated it rejects the recorded
-        // verdict. Both are the gate refusing on qualification grounds, so
-        // accepting either keeps this independent of ambient files.
+        // Missing evidence and an unqualified recorded verdict both reject qualification.
         expect(required.stderr).toContain("qualification evidence rejected");
         const refusals = [
             "not production-qualified",
@@ -2997,8 +2805,7 @@ describe("release prerequisite (CLI)", () => {
             refusals.filter((reason) => required.stderr.includes(reason)),
         ).not.toEqual([]);
 
-        // The drift check over the same tree stays green, which is what keeps CI
-        // usable while the real production bytes are still unqualified.
+        // The drift check must pass while production bytes remain unqualified.
         const drift = spawnSync("bun", [script, "--check"], {
             cwd: repoRoot,
             encoding: "utf8",
@@ -3010,10 +2817,7 @@ describe("release prerequisite (CLI)", () => {
 
 describe("qualifying-runtime binding", () => {
     test("only the pinned Bun may verify bytes", () => {
-        // Checked as a predicate over an explicit value, not against whatever Bun
-        // happens to run the suite: an assertion about the host belongs at the CLI
-        // boundary, and putting it inside `generate` made every production-mode test
-        // and CI's portable drift check depend on the runner's version.
+        // `assertPinnedQualifyingRuntime` receives an explicit runtime value so tests do not depend on the Bun that runs them.
         const pinned = QUALIFICATION_PINS.harness_runtimes.bun;
         expect(() => assertPinnedQualifyingRuntime(pinned)).not.toThrow();
         for (const running of ["1.2.14", "1.4.0", undefined]) {
@@ -3026,15 +2830,7 @@ describe("qualifying-runtime binding", () => {
 
 describe("resolved runtime feature closure", () => {
     test("the graph Cargo resolves carries no forbidden capability", () => {
-        // The manifest scans bound what `crates/mc-host/Cargo.toml` declares. They
-        // cannot bound what Cargo *selects*: features are unified per package across
-        // the whole normal dependency graph, so any node — another workspace member,
-        // a path dependency, or a registry crate whose manifest is not in this
-        // repository — can turn on an accelerator on the same ORT node while the leaf
-        // manifest still reads as CPU-only. Only the resolver knows, which is why
-        // this assertion lives here rather than in the portable drift check: it needs
-        // a resolvable workspace and a toolchain, exactly as the `cargo tree`
-        // dependency-boundary test does.
+        // Cargo unifies features across the resolved graph; `cargo metadata` detects features manifest scans miss but requires a resolvable workspace and toolchain.
         const metadata = spawnSync(
             "cargo",
             ["metadata", "--format-version", "1"],
@@ -3046,15 +2842,12 @@ describe("resolved runtime feature closure", () => {
             id: string;
             features: string[];
         }[]) {
-            // Ids are `<source>#<name>@<version>`, or `<source>#<version>` when the
-            // path segment already names the package.
+            // IDs are `<source>#<name>@<version>`, or `<source>#<version>` when the path segment already names the package.
             const tail = node.id.split("#").pop() ?? "";
             const name = tail.includes("@") ? tail.split("@")[0] : tail;
             if (name !== undefined) resolved.set(name, node.features);
         }
-        // Not "no forbidden feature appears" alone: the published closure is an exact
-        // claim, so anything the resolver adds to it — forbidden or merely undeclared
-        // — contradicts the lock and has to fail.
+        // Exact equality rejects undeclared resolved features as well as forbidden ones.
         expect(resolved.get("ort")).toEqual([
             ...RUNTIME_IDENTITY.rust_crates.ort_features,
         ]);
@@ -3068,16 +2861,9 @@ describe("resolved runtime feature closure", () => {
                 ).toBeNull();
             }
         }
-        // `ort-sys` is the crate that would link or download a runtime, so the
-        // opt-out the lock publishes has to be active in the resolved set too.
+        // `ort-sys` features that disable runtime linking or downloads must be active in the resolved set.
         for (const feature of RUNTIME_IDENTITY.rust_crates.ort_sys_features) {
             expect(resolved.get("ort-sys")).toContain(feature);
         }
-        // The default per-test timeout is not a meaningful bound for this one:
-        // `cargo metadata` is the first toolchain invocation in its CI job, so on
-        // a cold runner it has to populate the registry index before it can
-        // resolve, which routinely outruns a few seconds. Being killed mid-fetch
-        // surfaces as `status: null` rather than a resolver disagreement, which
-        // reads as a contract failure this test never actually observed.
     }, 120_000);
 });

@@ -250,7 +250,7 @@ impl Mapping {
         validate_object(&fd, len)?;
         #[cfg(target_os = "linux")]
         validate_seals(&fd)?;
-        // SAFETY: authenticated fd was size-validated before mapping.
+        // SAFETY: validate_object confirmed that fd has the exact nonzero length.
         let mapped = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -305,7 +305,7 @@ impl Drop for Mapping {
     }
 }
 
-/// Fd-validated owner-only setup directory.
+/// RuntimeDir retains an fd-validated, owner-only setup directory.
 pub struct RuntimeDir {
     path: PathBuf,
     fd: File,
@@ -393,7 +393,7 @@ impl Drop for RuntimeDir {
     }
 }
 
-/// Authenticated fixed-layout attachment grant.
+/// AttachmentGrant carries authenticated fixed-layout attachment data.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RingGrant {
     layout_version: u16,
@@ -422,10 +422,7 @@ impl RingGrant {
 
     /// Decodes grant received through authenticated bootstrap transport.
     ///
-    /// Rejects reserved-byte tampering and any geometry that cannot map a
-    /// valid ring: wrong layout version, zero depth, an arena below one
-    /// legal maximum frame, lease bounds outside `1..=depth`, or a total
-    /// size that disagrees with the computed layout.
+    /// Rejects reserved-byte tampering and geometry that cannot map a valid ring: wrong layout version, zero depth, an arena below one legal maximum frame, lease bounds outside `1..=depth`, or a total size that disagrees with the computed layout.
     pub fn decode(bytes: [u8; GRANT_BYTES]) -> Result<Self, RingError> {
         if bytes[54..58] != [0; 4] {
             return Err(RingError::InvalidGrant);
@@ -481,7 +478,6 @@ impl RingGrant {
         Ok(layout)
     }
 
-    /// Fixed encoded grant length.
     pub const fn encoded_len() -> usize {
         GRANT_BYTES
     }
@@ -493,7 +489,6 @@ impl fmt::Debug for RingGrant {
     }
 }
 
-/// Ring attachment handle.
 #[cfg(target_os = "linux")]
 pub struct RingAttachment {
     fd: OwnedFd,
@@ -521,7 +516,7 @@ impl fmt::Debug for RingAttachment {
     }
 }
 
-/// Cacheline-isolated SPSC descriptor ring with FIFO payload arena.
+/// Ring uses cacheline-isolated SPSC descriptors and a FIFO payload arena.
 pub struct Ring {
     mapping: Mapping,
     layout: Layout,
@@ -547,8 +542,7 @@ impl Ring {
         runtime: &RuntimeDir,
     ) -> Result<Self, RingError> {
         runtime.validate()?;
-        // Reservations crossing the arena end wrap into two spans, so a
-        // profile advertising fewer spans per frame cannot be honored.
+        // Reservations crossing the arena end wrap into two spans, so a profile advertising fewer spans per frame cannot be honored.
         if profile.descriptor().backend() != BackendId::Ring
             || profile.descriptor().memory_layout() != MemoryLayout::TwoSpanWrap
             || profile.max_spans() < MAX_SPANS
@@ -610,18 +604,17 @@ impl Ring {
         })
     }
 
-    /// Attachment grant for authenticated bootstrap.
+    /// AttachmentGrant carries data for authenticated bootstrap attachment.
     pub const fn grant(&self) -> RingGrant {
         self.grant
     }
 
-    /// Shared object descriptor for authenticated transfer.
+    /// SharedObjectDescriptor transfers a shared object through authenticated transport.
     #[cfg(target_os = "linux")]
     pub fn raw_fd(&self) -> RawFd {
         self.mapping.fd.as_raw_fd()
     }
 
-    /// Duplicates attachment handle.
     #[cfg(target_os = "linux")]
     pub fn attachment(&self) -> Result<RingAttachment, RingError> {
         // SAFETY: F_DUPFD_CLOEXEC duplicates owned valid descriptor.
@@ -658,7 +651,7 @@ impl Ring {
         Ok(())
     }
 
-    /// Attempts immediate descriptor and arena reservation.
+    /// Returns without blocking when descriptor or arena capacity is unavailable.
     pub fn try_reserve(
         &self,
         bound: usize,
@@ -675,7 +668,7 @@ impl Ring {
         let reclaim = self.reclaim_ptr().map_err(ProducerError::Ring)?;
         // SAFETY: producer and reclaim pages were initialized before activation.
         let published = unsafe { (*producer).published.load(Ordering::Relaxed) };
-        // SAFETY: same as above.
+        // SAFETY: producer and reclaim pages were initialized before activation.
         let completed = unsafe { (*reclaim).completed.load(Ordering::Acquire) };
         let outstanding = published
             .checked_sub(completed)
@@ -711,7 +704,7 @@ impl Ring {
                 return Err(ProducerError::Exhausted);
             }
             Err(error) => {
-                // SAFETY: same rollback as exhaustion.
+                // SAFETY: producer owns the reserved slot and no descriptor was published.
                 unsafe { (*slot).state.store(SLOT_FREE, Ordering::Release) };
                 return Err(ProducerError::Arena(error));
             }
@@ -733,7 +726,6 @@ impl Ring {
         })
     }
 
-    /// Applies profile scheduling until capacity or deadline.
     pub fn reserve_until(
         &self,
         bound: usize,
@@ -758,9 +750,7 @@ impl Ring {
 
     /// Acquires next complete frame after release/acquire publication.
     ///
-    /// Returns `Ok(None)` when no frame is deliverable right now: the ring
-    /// is empty or every `max_leases` receive lease is outstanding. Errors
-    /// are reserved for faults that end the channel.
+    /// Returns `Ok(None)` when no frame is deliverable because the ring is empty or all `max_leases` receive leases are outstanding.
     pub fn try_receive(&self) -> Result<Option<ReceiveLease<'_>>, RingError> {
         if self.is_quarantined() {
             return Err(RingError::Quarantined);
@@ -770,8 +760,7 @@ impl Ring {
         // SAFETY: consumer page remains mapped.
         let active = unsafe { (*consumer).active_leases.load(Ordering::Relaxed) };
         if active >= self.grant.max_leases {
-            // A full lease set is backpressure, not a fault: published
-            // frames stay queued until a lease is released and the caller
+            // A full lease set leaves published frames queued until a lease is released.
             // polls again.
             return Ok(None);
         }
@@ -843,7 +832,6 @@ impl Ring {
         Ok(Some(lease))
     }
 
-    /// Validates and records one explicit completion.
     pub fn release(&self, identity: ReleaseIdentity) -> Result<(), LeaseError> {
         if self.is_quarantined() {
             return Err(LeaseError::Quarantined);
@@ -908,7 +896,6 @@ impl Ring {
         Ok(())
     }
 
-    /// Returns descriptor and byte conservation snapshot.
     pub fn conservation(&self) -> Result<(DescriptorCounts, ArenaCounts), RingError> {
         if self.is_quarantined() {
             return Ok((
@@ -929,7 +916,7 @@ impl Ring {
             let slot = self.slot_ptr(index + 1)?;
             // SAFETY: slot atomics remain mapped.
             let state = unsafe { (*slot).state.load(Ordering::Acquire) };
-            // SAFETY: reservation length is atomic and assigned before non-free state is observed.
+            // SAFETY: reservation length is assigned before `SLOT_PUBLISHED` is observed.
             let len = unsafe { (*slot).reservation_len.load(Ordering::Relaxed) };
             match state {
                 SLOT_FREE => descriptors.free += 1,
@@ -1019,12 +1006,10 @@ impl Ring {
         Ok(residency.into_iter().all(|entry| entry & 1 == 1))
     }
 
-    /// Number of mappings held by this direction.
     pub const fn mapping_count(&self) -> usize {
         1
     }
 
-    /// Fixed object size.
     pub const fn object_size(&self) -> usize {
         self.mapping.len
     }
@@ -1037,7 +1022,6 @@ impl Ring {
         }
     }
 
-    /// Whether lifecycle is terminally quarantined.
     pub fn is_quarantined(&self) -> bool {
         self.lifecycle_ptr()
             .map(|page| {
@@ -1097,7 +1081,7 @@ impl Ring {
         if end > self.arena_bytes() {
             return Err(RingError::InvalidLayout);
         }
-        // SAFETY: descriptor validation bounded span within mapped arena.
+        // SAFETY: descriptor validation bounds the span within the mapped arena.
         let ptr = unsafe { self.mapping.base.as_ptr().add(self.layout.arena + offset) };
         // SAFETY: pointer and length remain valid while self is borrowed.
         unsafe { LeaseSpan::new(ptr, len) }.map_err(RingError::Lease)
@@ -1259,7 +1243,7 @@ unsafe fn ring_release_callback(
     ring.release(identity)
 }
 
-/// Direct bounded producer over one or two arena spans.
+/// The producer writes directly to one or two bounded arena spans.
 #[must_use = "producer reservation must be committed or aborted"]
 pub struct ProducerReservation<'ring> {
     ring: &'ring Ring,
@@ -1272,27 +1256,22 @@ pub struct ProducerReservation<'ring> {
 }
 
 impl ProducerReservation<'_> {
-    /// Reserved capacity bound.
     pub const fn capacity(&self) -> usize {
         self.plan.allocation_len() as usize
     }
 
-    /// Bytes written so far.
     pub const fn written(&self) -> usize {
         self.cursor
     }
 
-    /// Remaining reserved bytes.
     pub const fn remaining(&self) -> usize {
         self.capacity() - self.cursor
     }
 
-    /// Number of reserved spans.
     pub const fn segment_count(&self) -> usize {
         self.plan.span_count() as usize
     }
 
-    /// Returns one reserved span.
     pub fn segment(&self, index: usize) -> Result<Option<LeaseSpan<'_>>, ProducerError> {
         let Some(span) = self.plan.span(index) else {
             return Ok(None);
@@ -1303,7 +1282,6 @@ impl ProducerReservation<'_> {
             .map_err(ProducerError::Ring)
     }
 
-    /// Advances cursor after writes into reserved spans.
     pub fn advance(&mut self, bytes: usize) -> Result<(), ProducerError> {
         if self.finished {
             return Err(ProducerError::Aborted);
@@ -1322,7 +1300,7 @@ impl ProducerReservation<'_> {
         Ok(())
     }
 
-    /// Sets the wire header that commit validates against exact body length.
+    /// The producer sets a wire header that declares `exact_len`; `commit_reservation` validates it.
     pub fn set_wire_header(
         &mut self,
         wire_header: [u8; WIRE_V2_HEADER_BYTES],
@@ -1334,7 +1312,7 @@ impl ProducerReservation<'_> {
         Ok(())
     }
 
-    /// Writes all bytes or aborts reservation on overflow.
+    /// The method aborts the reservation if a write fails.
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), ProducerError> {
         if self.finished {
             return Err(ProducerError::Aborted);
@@ -1348,7 +1326,6 @@ impl ProducerReservation<'_> {
         Ok(())
     }
 
-    /// Publishes exact committed length after cursor equality check.
     pub fn commit(mut self, body_len: usize) -> Result<ReleaseIdentity, ProducerError> {
         if self.finished {
             return Err(ProducerError::Aborted);
@@ -1379,7 +1356,7 @@ impl ProducerReservation<'_> {
         }
     }
 
-    /// Returns descriptor and arena reservation without publication.
+    /// The producer returns the descriptor and arena reservation without publishing either.
     pub fn abort(mut self) {
         if !self.finished {
             self.ring.abort_reservation(self.sequence);
@@ -1403,7 +1380,7 @@ impl Drop for ProducerReservation<'_> {
     }
 }
 
-/// Pair of exclusive ordered logical directions under one runtime root.
+/// The runtime root contains two exclusive, ordered logical directions.
 pub struct DuplexRing {
     /// Caller-to-peer direction.
     pub first: Ring,
@@ -1413,7 +1390,7 @@ pub struct DuplexRing {
 }
 
 impl DuplexRing {
-    /// Creates two independently cache-isolated directions.
+    /// The runtime creates two independently cache-isolated directions.
     pub fn create(profile: &TargetProfile) -> Result<Self, RingError> {
         let runtime = RuntimeDir::create_in(&std::env::temp_dir())?;
         let first = Ring::create_in(profile, 0, &runtime)?;
@@ -1432,7 +1409,7 @@ impl fmt::Debug for DuplexRing {
     }
 }
 
-/// Builds minimal structurally valid wire-v2 header for body length.
+/// The returned wire-v2 header declares the body length and is structurally valid.
 pub fn wire_v2_header(body_len: usize) -> Result<[u8; WIRE_V2_HEADER_BYTES], ProducerError> {
     let body_len = u32::try_from(body_len).map_err(|_| ProducerError::BoundExceedsSpans)?;
     if body_len as usize > MAX_FRAME_BYTES {
@@ -1444,32 +1421,28 @@ pub fn wire_v2_header(body_len: usize) -> Result<[u8; WIRE_V2_HEADER_BYTES], Pro
     Ok(header)
 }
 
-/// Producer reservation or commit failure.
+/// The producer failed to reserve or commit.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProducerError {
-    /// Reserved spans cannot cover requested bound.
+    /// The reserved spans do not cover the requested bound.
     BoundExceedsSpans,
-    /// A write crossed checked capacity.
+    /// Cursor arithmetic overflowed or exceeded reservation capacity.
     Overflow,
-    /// Commit length exceeds reservation.
     CommitOutsideReservation,
-    /// Cursor differs from exact commit length.
+    /// The cursor does not equal the commit length.
     Underfill,
-    /// Reservation was already aborted.
     Aborted,
-    /// No descriptor or arena capacity is available.
+    /// Descriptor or arena capacity is unavailable.
     Exhausted,
-    /// Backpressure deadline elapsed before publication.
+    /// The backpressure deadline elapsed before publication.
     Deadline,
-    /// Sequence would wrap within incarnation.
+    /// The sequence would wrap within the incarnation.
     SequenceExhausted,
-    /// Wire header version or length disagrees with body.
+    /// The wire header's version or length disagrees with the body.
     WireHeaderMismatch,
-    /// Candidate is terminally quarantined.
+    /// The candidate is terminally quarantined.
     Quarantined,
-    /// Arena planning failure.
     Arena(ArenaError),
-    /// Ring state failure.
     Ring(RingError),
 }
 
@@ -1508,7 +1481,7 @@ impl std::error::Error for ProducerError {
     }
 }
 
-/// Ring setup, validation, or receive failure.
+/// Ring setup, validation, or receiving failed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RingError {
     /// Offset or size arithmetic overflowed.
@@ -1521,7 +1494,6 @@ pub enum RingError {
     ObjectValidationFailed,
     /// Attachment grant is malformed or mismatched.
     InvalidGrant,
-    /// Shared layout fields are invalid.
     InvalidLayout,
     /// Shared state transition is impossible.
     InvalidSharedState,
@@ -1531,9 +1503,7 @@ pub enum RingError {
     SequenceExhausted,
     /// Candidate is terminally quarantined.
     Quarantined,
-    /// Descriptor validation failed.
     Descriptor(DescriptorError),
-    /// Lease construction failed.
     Lease(LeaseError),
 }
 
@@ -1683,9 +1653,8 @@ fn validate_object(fd: &OwnedFd, expected_len: usize) -> Result<(), RingError> {
     }
     // SAFETY: geteuid has no preconditions.
     let current_uid = unsafe { libc::geteuid() };
-    // Darwin populates st_mode for shm_open descriptors from the creation
-    // mode alone, without file-type bits, so the regular-file check applies
-    // only to Linux memfd objects.
+    // Darwin sets `st_mode` for `shm_open` descriptors from the creation mode without file-type bits; apply the regular-file check only to Linux `memfd` objects.
+    // Darwin sets `st_mode` for `shm_open` descriptors from the creation mode without file-type bits; apply the regular-file check only to Linux `memfd` objects.
     let type_valid = if cfg!(target_os = "linux") {
         stat.st_mode & libc::S_IFMT == libc::S_IFREG
     } else {
@@ -1762,7 +1731,7 @@ fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
             text
         });
     let name = CString::new(name).map_err(|_| RingError::ObjectSetupFailed)?;
-    // SAFETY: unique NUL-terminated name and owner-only flags.
+    // SAFETY: `name` is unique and NUL-terminated; `mode` is 0o600.
     let raw = unsafe {
         libc::shm_open(
             name.as_ptr(),

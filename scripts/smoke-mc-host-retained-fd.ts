@@ -18,13 +18,11 @@ function required(name: string): string {
 
 async function main(): Promise<void> {
     const dataRoot = required("MC_HOST_CANARY_DATA_ROOT");
-    // `stageBootstrap` resolves this relative to the script's working directory,
-    // but the daemon resolves its data root through `data_dir_path`, which ignores
-    // a relative `XDG_DATA_HOME` and falls back to `$HOME/.local/share` — and
-    // `HOME` here is derived from the Node install below. A relative value would
-    // therefore stage into one tree and exercise lifecycle state in another,
-    // failing qualification for a reason that has nothing to do with the payload
-    // while polluting an unintended location.
+    // `stageBootstrap` resolves relative destination paths from the script's working directory.
+    // `data_dir_path` ignores relative `XDG_DATA_HOME` values.
+    // For a relative `XDG_DATA_HOME`, `data_dir_path` falls back to `$HOME/.local/share`.
+    // Relative roots make staging and lifecycle state use different trees.
+    // A relative data root can pollute `$HOME/.local/share`.
     if (!isAbsolute(dataRoot)) {
         throw new Error("MC_HOST_CANARY_DATA_ROOT must be absolute");
     }
@@ -32,19 +30,15 @@ async function main(): Promise<void> {
     const opencode = required("MC_HOST_CANARY_OPENCODE");
     const node = required("MC_HOST_CANARY_NODE");
     const piEntrypoint = required("MC_HOST_CANARY_PI_ENTRYPOINT");
-    // Native `start` without `--payload-dir` accepts only an already-promoted
-    // current generation from the generation store. `stageBootstrap` populates
-    // the separate bootstrap store, so on a clean canary root nothing has ever
-    // promoted a generation and `start` answers `native_payload_missing`. The
-    // payload root is what lets this run stage and promote one, which is also
-    // the path a real install takes.
+    // `start` without `--payload-dir` requires an already-promoted current generation.
+    // `stageBootstrap` writes to the bootstrap store, not the generation store.
+    // On a clean canary root, no generation has been promoted.
+    // `--payload-dir` lets `start` stage and promote a payload.
     const payloadDir = required("MC_HOST_CANARY_PAYLOAD_DIR");
     if (!isAbsolute(payloadDir)) {
         throw new Error("MC_HOST_CANARY_PAYLOAD_DIR must be absolute");
     }
-    // Optional: when supplied, the daemon rejects a promoted generation whose
-    // recorded source manifest disagrees, so a canary can pin which payload the
-    // generation must come from instead of accepting whatever staged.
+    // `MC_HOST_CANARY_PAYLOAD_MANIFEST_SHA256` rejects promoted generations whose recorded source manifest differs.
     const payloadManifestDigest =
         process.env.MC_HOST_CANARY_PAYLOAD_MANIFEST_SHA256;
     const digest = createHash("sha256").update(readFileSync(launcher)).digest("hex");
@@ -83,13 +77,13 @@ async function main(): Promise<void> {
         XDG_DATA_HOME: dataRoot,
         HOME: dirname(dirname(node)),
     };
-    // A started daemon holds the lifecycle locks under `dataRoot`, so leaving one
-    // behind makes every later canary run on the same data root fail for the
-    // previous run's residue. The flag therefore records that a start was
-    // *attempted*, and is set before the await: `runNativeLifecycle` can reject
-    // on a response timeout, an output cap, or a malformed reply after the
-    // daemon is already up, and any assignment after the await is unreachable on
-    // exactly that path. Stopping a daemon that never launched is harmless.
+    // A started daemon holds lifecycle locks under `dataRoot`.
+    // A daemon left running makes later canaries sharing `dataRoot` fail.
+    // `startAttempted` requires cleanup after every attempted start.
+    // `startAttempted` must be set before awaiting `runNativeLifecycle`.
+    // `runNativeLifecycle` can reject after starting the daemon because of a response timeout, output cap, or malformed reply.
+    // An assignment after the await cannot run when `runNativeLifecycle` rejects after starting the daemon.
+    // Stopping a daemon that never launched is harmless.
     let startAttempted = false;
     try {
         startAttempted = true;
@@ -122,8 +116,7 @@ async function main(): Promise<void> {
         );
         assert.equal(stop.ok, true);
         assert.equal(stop.state, "stopped");
-        // Only a stop that returned and asserted clean retires the obligation; a
-        // wrong reported state still gets the teardown retry below.
+        // Clear `startAttempted` only after `stop` completes without assertion failures; otherwise leave it set for teardown retry.
         startAttempted = false;
         console.log("mc-host retained-fd smoke: PASS");
     } finally {
@@ -134,8 +127,7 @@ async function main(): Promise<void> {
                     { command: "stop", deadlineMs: 30_000, env },
                 );
             } catch {
-                // Teardown is best-effort: the original failure is what the
-                // operator needs to see, so it must not be masked here.
+                // Teardown failures must not mask the original failure.
             }
         }
         closeSync(retained.fd);

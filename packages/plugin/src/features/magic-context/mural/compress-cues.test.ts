@@ -57,9 +57,8 @@ function successfulCueClient(onPrompt?: () => void) {
     };
 }
 
-/** A client whose prompt always fails with the exact timeout error that
- *  promptWithTimeout throws, so the chunk is classified as a timeout-class
- *  failure (the kind that trips the consecutive-timeout circuit breaker). */
+/** The client throws the timeout error that `promptWithTimeout` throws, so the chunk counts as a timeout-class failure.
+ * Timeout-class failures trip the consecutive-timeout circuit breaker. */
 function timeoutCueClient(onPrompt?: () => void) {
     return {
         session: {
@@ -74,7 +73,7 @@ function timeoutCueClient(onPrompt?: () => void) {
     };
 }
 
-/** A client that repeats one candidate cue for every claim in the pool. */
+/* */
 function repeatingCueClient(cue: string) {
     let manifest = "";
     return {
@@ -92,9 +91,8 @@ function repeatingCueClient(cue: string) {
     };
 }
 
-/** A client whose prompt succeeds but returns output with no <cues> manifest,
- *  so output validation fails. This is a VALIDATION-class failure (bad manifest),
- *  which must NOT trip the timeout breaker — every chunk is still attempted. */
+/** The client returns no `<cues>` manifest after a successful prompt, producing a validation-class failure.
+ * Validation-class failures do not trip the timeout breaker; the loop attempts every chunk. */
 function invalidOutputCueClient(onPrompt?: () => void) {
     return {
         session: {
@@ -148,9 +146,6 @@ function cueArgs(db: Database, projectIdentity: string): CompressCuesArgs {
         sessionDirectory: process.cwd(),
         holderId,
         leaseKey,
-        // Comfortably above CHUNK_TIMEOUT_FLOOR_MS so the run loop actually
-        // attempts chunks instead of stopping at the floor guard. Tests that
-        // exercise the floor/deadline stops mutate this per case.
         deadline: Date.now() + 600_000,
     };
 }
@@ -290,10 +285,8 @@ describe("runCompressCues disposition", () => {
             const projectIdentity = "git:cues-floor-stop";
             seedClaims(db, projectIdentity, 41);
             const args = cueArgs(db, projectIdentity);
-            // First chunk succeeds and banks its 40 cues; the callback then drops
-            // the deadline to a value that is still > 0 but below the chunk floor,
-            // so the loop must stop at the floor guard (not the <= 0 guard) before
-            // attempting chunk 2.
+            // After chunk 1 stores 40 cues, the callback leaves a positive deadline below `CHUNK_TIMEOUT_FLOOR_MS`, so the loop stops before chunk 2.
+            // The loop stops at the floor guard before attempting chunk 2, rather than at the nonpositive-deadline guard.
             args.client = successfulCueClient(() => {
                 args.deadline = Date.now() + 60_000; // > 0, < CHUNK_TIMEOUT_FLOOR_MS
             }) as never;
@@ -313,7 +306,6 @@ describe("runCompressCues disposition", () => {
         const db = createClaimReaderTestDatabase();
         try {
             const projectIdentity = "git:cues-breaker";
-            // 120 claims = exactly 3 chunks of 40.
             seedClaims(db, projectIdentity, 120);
             const args = cueArgs(db, projectIdentity);
             let promptCalls = 0;
@@ -323,8 +315,8 @@ describe("runCompressCues disposition", () => {
 
             const result = await runCompressCues(args);
 
-            // The breaker trips after the 2nd consecutive timeout, so chunk 3 is
-            // never attempted: exactly 2 prompt calls, not 3.
+            // The breaker trips after the second consecutive timeout, so the loop does not attempt chunk 3.
+            // The loop makes exactly two prompt calls and does not attempt chunk 3.
             expect(promptCalls).toBe(2);
             expect(result.chunks).toBe(2);
             expect(result.compressed).toBe(0);
@@ -379,8 +371,8 @@ describe("runCompressCues disposition", () => {
 
             const result = await runCompressCues(args);
 
-            // Bad-manifest (validation) failures keep the per-chunk retry-next-run
-            // behavior: all 3 chunks are attempted, the run is not stopped early.
+            // A validation failure leaves the chunk eligible for retry on the next run.
+            // The run attempts all three chunks and does not stop early.
             expect(promptCalls).toBe(3);
             expect(result.chunks).toBe(3);
             expect(result.compressed).toBe(0);
@@ -508,9 +500,9 @@ describe("cue rejection latch", () => {
             );
             expect(revised.outcome).toBe("applied");
 
-            // The stored latch row is keyed to the old revision locator, so
-            // the revised claim reads as needing a fresh cue and a new
-            // rejection restarts at 1.
+            // The latch row uses the pre-revision locator.
+            // The revised claim needs a fresh cue.
+            // A new rejection count starts at 1.
             const current = claimSnapshot(db, claim.publicClaimId);
             const state = cueStateOf(db, claim.publicClaimId);
             expect(claimNeedsCue(state, current.revisionLocator)).toBe(true);
@@ -522,8 +514,7 @@ describe("cue rejection latch", () => {
 
 describe("computeChunkSliceMs (chunk time floor)", () => {
     test("applies the floor when the even split would be below it", () => {
-        // 12 chunks of a 1_200s budget → even split 100s < 240s floor → floor wins.
-        // This is the live failure shape: a 470-memory pool split into 12 chunks.
+        // The 1,200-second budget gives each of 12 chunks 100 seconds, so the 240-second floor applies.
         expect(computeChunkSliceMs(1_200_000, 12)).toBe(CHUNK_TIMEOUT_FLOOR_MS);
     });
 
@@ -554,12 +545,12 @@ describe("applyCues (per-cue validation, skip-not-reject, locator-race)", () => 
                 { item: claimSnapshot(db, good.publicClaimId) },
                 { item: claimSnapshot(db, bad.publicClaimId) },
             ];
-            // The bad cue is an unbalanced-parens violation → skipped, not fatal.
+            // The unbalanced-parentheses violation skips the bad cue without failing the chunk.
             const manifest = `<cues><cue id="${good.publicClaimId}">good anchor</cue><cue id="${bad.publicClaimId}">oops (unbalanced</cue></cues>`;
             const result = applyCues(cueArgs(db, "git:p"), chunk, manifest);
             expect(result.compressed).toBe(1);
             expect(result.skipped).toBe(1);
-            // good got its cue; bad stayed NULL (retried next run).
+            // The parser stores `good`'s cue and leaves `bad` NULL so `bad` is retried on the next run.
             expect(cueStateOf(db, good.publicClaimId)?.cue).toBe("good anchor");
             expect(cueStateOf(db, bad.publicClaimId)?.cue ?? null).toBeNull();
         } finally {
@@ -575,11 +566,10 @@ describe("applyCues (per-cue validation, skip-not-reject, locator-race)", () => 
                 content: "original content",
                 category: "ARCHITECTURE",
             });
-            // Candidate captured at selection time (locator of the ORIGINAL
+            // The candidate stores the original revision's locator at selection time.
             // revision).
             const chunk = [{ item: claimSnapshot(db, claim.publicClaimId) }];
 
-            // The claim is revised AFTER selection but BEFORE the cue is applied.
             const revised = reviseProjectMemoryClaim(
                 db,
                 { producer: "test", operationKey: "revise-mid-run" },
@@ -603,9 +593,9 @@ describe("applyCues (per-cue validation, skip-not-reject, locator-race)", () => 
             const manifest = `<cues><cue id="${claim.publicClaimId}">anchor from original</cue></cues>`;
             applyCues(cueArgs(db, "git:p"), chunk, manifest);
 
-            // The stored locator is the ORIGINAL revision's, which no longer
-            // matches the current revision — so the cue is stale and
-            // claimNeedsCue re-selects the claim next run.
+            // The candidate stores the original revision's locator at selection time.
+            // The cue is stale and must not be applied.
+            // claimNeedsCue returns true for the revised claim on the next run.
             const current = claimSnapshot(db, claim.publicClaimId);
             const state = cueStateOf(db, claim.publicClaimId);
             expect(state?.revisionLocator).toBe(claim.revisionLocator);

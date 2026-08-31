@@ -1,15 +1,15 @@
 import type { Database } from "../../../shared/sqlite";
 
 export const GIT_SWEEP_COOLDOWN_MS = 10 * 60 * 1000;
-// Commit indexing can include two embedding drains (the indexer drain plus the
-// timer follow-up drain). The lease is renewed every minute while the sweep is
-// running, so this TTL is crash-recovery latency rather than the expected full
+// Commit indexing can require two embedding drains: the indexer drain and the timer follow-up drain.
+// The sweep renews its lease every minute.
+// Minute-by-minute renewal makes the TTL bound crash-recovery latency rather than sweep duration.
 // wall-clock budget.
 export const GIT_SWEEP_LEASE_TTL_MS = 5 * 60 * 1000;
 /**
- * Re-probe horizon for structurally non-indexable directories (not a repo /
- * empty repo). Long enough to stop per-tick log flooding, short enough that a
- * directory that becomes a real repo starts indexing within a day.
+ * The 24-hour horizon delays re-probing structurally non-indexable directories.
+ * The 24-hour delay limits repeated failure logs from non-indexable directories.
+ * A directory that becomes a Git repository is re-probed within 24 hours.
  */
 export const GIT_SWEEP_NON_INDEXABLE_REPROBE_MS = 24 * 60 * 60 * 1000;
 export const GIT_SWEEP_LEASE_RENEWAL_MS = 60 * 1000;
@@ -54,13 +54,13 @@ export interface AcquireGitSweepLeaseOptions {
     cooldownMs?: number;
     leaseTtlMs?: number;
     /**
-     * Skip the recently-swept cooldown gate, acquiring on mutual-exclusion
-     * (lease) alone. Used by the backlog-drain path: draining unembedded rows
-     * has no git-log cost and must run every tick until the backlog clears, so
-     * it must not be starved by a cooldown the dream-timer sweep advanced.
-     * Cross-process duplication is still prevented by the lease itself, and the
-     * caller releases with releaseGitSweepLease (which does NOT advance the
-     * cooldown), keeping the dream-timer's cooldown tracking independent.
+     * ignoreCooldown skips the cooldown gate but still requires lease acquisition.
+     * The backlog-drain path ignores cooldown because unembedded rows must drain on every tick.
+     * Draining unembedded rows has no git-log cost and continues until the backlog clears.
+     * The backlog drain ignores cooldown so the dream-timer sweep cannot starve it.
+     * The lease prevents duplicate sweeps across processes.
+     * releaseGitSweepLease does not advance the cooldown.
+     * The backlog-drain path leaves dream-timer cooldown tracking unchanged.
      */
     ignoreCooldown?: boolean;
 }
@@ -78,7 +78,7 @@ function runImmediate<T>(db: Database, body: () => T): T {
             try {
                 db.exec("ROLLBACK");
             } catch {
-                // already rolled back / no active transaction
+                // SQLite may reject ROLLBACK when no transaction remains active.
             }
         }
     }
@@ -218,14 +218,13 @@ export function markGitSweepSuccessAndRelease(
 }
 
 /**
- * Park a structurally non-indexable project (not a git repo, or a repo with
- * no commits) and release the lease. Re-probes are still allowed after
- * `reprobeMs` — a plain directory can be `git init`-ed and an empty repo gets
- * its first commit — but until then every sweep tick would fail identically,
- * so the cooldown gate absorbs them. Implemented by future-dating
- * `last_swept_at` so the existing cooldown arithmetic
- * (`last_swept_at + cooldownMs`) yields the long re-probe horizon without a
- * schema change; `last_swept_at` is only ever read by that arithmetic.
+ * Non-indexable projects release their leases and are not retried until reprobeMs.
+ * Non-indexable projects can be re-probed after reprobeMs.
+ * A plain directory can become a Git repository, and an empty repository can receive its first commit before reprobeMs.
+ * Suppressing sweep ticks before reprobeMs avoids identical failures.
+ * The function future-dates last_swept_at so the cooldown gate suppresses sweeps until reprobeMs.
+ * The function future-dates `last_swept_at` so the cooldown expires at the reprobe deadline.
+ * Future-dating last_swept_at encodes the reprobe deadline without another field.
  */
 export function parkGitSweepNonIndexable(
     db: Database,

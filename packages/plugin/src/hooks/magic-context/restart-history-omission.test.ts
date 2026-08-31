@@ -1,23 +1,9 @@
 /// <reference types="bun-types" />
 
-// Repro + regression guard for the "restart history omission" failure mode:
 //
-// A historian publish sets only IN-MEMORY deferred-refresh signals. If the
-// process restarts before the next transform consumes them, and the first
-// post-restart pass is a defer pass (below the execute threshold, within TTL),
 // then:
-//   - prepareCompartmentInjection rebuilds from DB with a COLD in-memory cache
-//     and trims the live tail through the LATEST compartment boundary (incl. the
-//     freshly published compartment B).
-//   - injectM0M1, with isCacheBustingPass=false and no HARD trigger, replays the
-//     STALE persisted cached_m1_bytes (which predates B).
-// Net: B's raw messages are trimmed out AND B's summary is in neither m[0] nor
-// m[1] → that slice of history silently disappears from what the model sees.
 //
-// The fix makes prepareCompartmentInjection cap its tail-trim at the compartment
-// boundary the persisted m[1] actually covers when the m0/m1 path owns rendering
-// and this is NOT a cache-busting pass — so a compartment newer than the cached
-// m[1] keeps its raw messages in the tail until an exec pass folds it into m[1].
+// When the m0/m1 path owns rendering and isCacheBustingPass is false, prepareCompartmentInjection preserves raw messages beyond persisted m[1]'s boundary until an exec pass updates m[1].
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -70,7 +56,6 @@ function compartment(seq: number, title: string, body: string): CompartmentInput
     };
 }
 
-// Raw conversation messages with ids m0..mN matching the compartment boundaries.
 function makeMessages(count: number): MessageLike[] {
     const out: MessageLike[] = [];
     for (let i = 0; i < count; i++) {
@@ -94,8 +79,6 @@ function runProductionFlow(opts: {
     isCacheBustingPass: boolean;
     messages: MessageLike[];
 }): { m0: string; m1: string; tailIds: string[] } {
-    // Mirror the transform→postprocess order: prepareCompartmentInjection first
-    // (trims the live tail), then injectM0M1 (prepends m[0]/m[1]).
     prepareCompartmentInjection(
         db,
         SESSION_ID,
@@ -142,7 +125,6 @@ describe("restart history omission", () => {
     it("does NOT drop a compartment published just before a restart on the first defer pass", () => {
         const projectDirectory = makeProjectDir();
 
-        // Baseline: compartment A covers m0; materialize m[0]/m[1] with A only.
         appendCompartments(db, SESSION_ID, [compartment(0, "A", "Alpha baseline")]);
         runProductionFlow({
             projectDirectory,
@@ -150,17 +132,14 @@ describe("restart history omission", () => {
             messages: makeMessages(6),
         });
 
-        // Historian publishes compartment B covering m1 (raw messages m2+ remain
-        // the live tail). In production this also sets in-memory deferred signals.
+        // Historian publishes B for m1; messages m2+ remain in the live tail.
         appendCompartments(db, SESSION_ID, [compartment(1, "B", "Bravo just-published")]);
 
-        // RESTART: the in-memory injection cache is lost. The persisted
-        // cached_m1_bytes still predates B (m[1] only updates on cache-busting
-        // passes, which haven't run since B was published).
+        // clearInjectionCache(SESSION_ID) simulates a restart by discarding the in-memory injection cache.
+        // cached_m1_bytes predates B because no cache-busting pass has run since B was published.
         clearInjectionCache(SESSION_ID);
 
-        // First post-restart pass is a DEFER pass (below execute threshold): the
-        // rehydrated deferred-history signal is NOT consumable here, so
+        // A deferred pass below the execute threshold cannot consume the rehydrated deferred-history signal.
         // isCacheBustingPass=false.
         const post = runProductionFlow({
             projectDirectory,
@@ -168,23 +147,21 @@ describe("restart history omission", () => {
             messages: makeMessages(6),
         });
 
-        // The invariant: B must NOT silently vanish. Either its summary is present
-        // (in m[1] or m[0]) OR its raw messages are still in the live tail. The
+        // B must be represented by its summary in m[0] or m[1], or by raw messages in the live tail.
         const bInSummary =
             post.m1.includes("Bravo just-published") || post.m0.includes("Bravo just-published");
-        // B's boundary is m1, so its raw slice is messages with id m1 (and the
-        // tail m2+). If trimmed through B's boundary, m1 is gone from the tail.
+        // B covers m1; trimming through B's boundary removes m1 from the tail.
         const bRawStillPresent = post.tailIds.includes("m1");
 
         expect(bInSummary || bRawStillPresent).toBe(true);
 
-        // Specifically: on the cold defer pass, B is NOT yet in the summary
-        // (m[1] replays stale), so its raw messages MUST be retained in the tail.
+        // On the cold defer pass, B is absent from the summary.
+        // The defer pass retains B's raw messages because stale m[1] does not summarize B.
         expect(bInSummary).toBe(false);
         expect(bRawStillPresent).toBe(true);
 
-        // And the NEXT exec (cache-busting) pass folds B into m[1] and the tail
-        // trims forward — no permanent duplication.
+        // The next cache-busting pass folds B into m[1] and advances the tail.
+        // The cache-busting pass advances the tail after folding B into m[1], preventing permanent duplication.
         const exec = runProductionFlow({
             projectDirectory,
             isCacheBustingPass: true,
@@ -195,30 +172,22 @@ describe("restart history omission", () => {
     });
 
     it("does NOT drop the first compartment when m[0] was materialized before any compartment existed (null persisted boundary)", () => {
-        // Regression for the null-boundary hole in the restart-omission fix: the
-        // cold-rebuild trim must distinguish "cached m[0] exists but boundary is
-        // null" (m[0] materialized before any compartment → its m[1] covers NOTHING
-        // → must NOT trim) from "no cached m[0] / legacy v1" (fall back to latest
-        // boundary). Falling back to the latest boundary in the null case
-        // reintroduces exactly the history loss the fix exists to prevent.
+        // Falling back to the latest boundary when the cached m[0] boundary is null drops uncompacted messages.
         const projectDirectory = makeProjectDir();
 
-        // Materialize m[0]/m[1] with ZERO compartments → persisted baseline
-        // boundary is null (lastCompartmentBoundaryId([]) === null).
+        // With no compartments, lastCompartmentBoundaryId([]) persists a null baseline boundary.
         runProductionFlow({
             projectDirectory,
             isCacheBustingPass: true,
             messages: makeMessages(6),
         });
 
-        // First compartment C publishes (covers m1). Persisted cached_m1_bytes
-        // still predates C and the baseline boundary is still null.
+        // Persisted cached_m1_bytes predates C, and the baseline boundary remains null.
         appendCompartments(db, SESSION_ID, [compartment(1, "C", "Charlie first-ever")]);
 
-        // RESTART: cold in-memory cache.
+        // clearInjectionCache(SESSION_ID) simulates a cold in-memory cache.
         clearInjectionCache(SESSION_ID);
 
-        // First post-restart DEFER pass.
         const post = runProductionFlow({
             projectDirectory,
             isCacheBustingPass: false,
@@ -229,25 +198,17 @@ describe("restart history omission", () => {
             post.m1.includes("Charlie first-ever") || post.m0.includes("Charlie first-ever");
         const cRawStillPresent = post.tailIds.includes("m1");
 
-        // Must not vanish: C's summary isn't in the stale m[1] yet, so its raw
-        // messages MUST remain in the tail (the null-boundary no-trim path).
+        // C's raw messages must remain in the tail because stale m[1] does not summarize C.
         expect(cInSummary).toBe(false);
         expect(cRawStillPresent).toBe(true);
     });
 
     it("clearing the injection cache after an m[0]/m[1] failure routes the next defer pass to cold-rebuild (no history loss)", () => {
-        // Regression for the failure-path drain bug: a cache-busting pass trims
-        // the tail to the LATEST compartment and caches that NEW boundary, but if
-        // injectM0M1 then throws, the persisted m[1] still predates that
-        // compartment. WITHOUT clearing the in-memory injection cache, a later
-        // same-process DEFER pass reuses the cached new boundary and trims the
-        // compartment's raw messages while replaying the stale m[1] → silent loss.
-        // The fix clears the injection cache in the failure catch so the next
-        // defer pass cold-rebuilds and trims only to the persisted baseline.
+        // If injectM0M1 throws after caching the latest boundary, persisted m[1] can predate that boundary.
+        // A same-process DEFER pass can trim the new compartment's raw messages while replaying stale m[1], losing history.
+        // The failure catch clears the injection cache so the next defer pass cold-rebuilds and trims only to the persisted baseline.
         const projectDirectory = makeProjectDir();
 
-        // Baseline: compartment A; materialize m[0]/m[1] with A → persisted
-        // baseline boundary = A's (m0), persisted m[1] = A.
         appendCompartments(db, SESSION_ID, [compartment(0, "A", "Alpha baseline")]);
         runProductionFlow({
             projectDirectory,
@@ -255,18 +216,14 @@ describe("restart history omission", () => {
             messages: makeMessages(6),
         });
 
-        // Compartment B publishes (covers m1).
         appendCompartments(db, SESSION_ID, [compartment(1, "B", "Bravo just-published")]);
 
-        // Simulate the failing cache-busting pass: prepareCompartmentInjection runs
-        // (trims to latest = B, caches boundary m1 IN MEMORY) but injectM0M1 throws
-        // — so persisted m[1] stays = A and the in-memory cache now holds boundary
-        // m1. We reproduce that by calling prepare directly without injectM0M1.
+        // prepareCompartmentInjection trims to B and caches m1 in memory before injectM0M1 throws.
         const failMsgs = makeMessages(6);
         prepareCompartmentInjection(db, SESSION_ID, failMsgs, true, PROJECT_PATH);
 
-        // HAZARD (no clear): a defer pass reuses the cached m1 boundary → B's raw
-        // messages (m1) are trimmed out, and the stale m[1] (A) doesn't summarize B.
+        // Without clearInjectionCache(SESSION_ID), a defer pass reuses the cached m1 boundary.
+        // The defer pass trims B's raw m1 messages, and stale m[1] (A) does not summarize B.
         const hazard = runProductionFlow({
             projectDirectory,
             isCacheBustingPass: false,
@@ -275,9 +232,8 @@ describe("restart history omission", () => {
         expect(hazard.m1.includes("Bravo just-published")).toBe(false);
         expect(hazard.tailIds.includes("m1")).toBe(false); // B lost without the fix
 
-        // FIX: clear the injection cache (what the failure catch now does), then
-        // the next defer pass cold-rebuilds and trims only to the persisted
-        // baseline (A's boundary) → B's raw messages are retained.
+        // clearInjectionCache(SESSION_ID) forces the next defer pass to rebuild from the persisted boundary.
+        // The rebuilt defer pass retains B's raw messages.
         clearInjectionCache(SESSION_ID);
         const fixed = runProductionFlow({
             projectDirectory,

@@ -43,7 +43,7 @@ describe("native mechanism gate", () => {
             "../mc_shm_native.node",
         );
         // The first test tolerates an unbuilt addon via probeCapabilities();
-        // this one requires the artifact, so skip rather than fail without it.
+        // The cleanup-hook test requires the addon artifact, so skip when it is absent.
         if (!existsSync(addon)) return;
         writeFileSync(
             script,
@@ -77,31 +77,24 @@ function loadRawAddon(): RawAttachAddon | null {
     return createRequire(import.meta.url)(path) as RawAttachAddon;
 }
 
-/** Geometry of the `mc-host-test-ring-v1` profile (`ring_profile`). */
+/** The grant constants define the `mc-host-test-ring-v1` `ring_profile` geometry. */
 const GRANT_DESCRIPTOR_DEPTH = 32n;
-/** `MIN_ARENA_BYTES` == `MAX_FRAME_BYTES` == 64 MiB. */
+/** `MIN_ARENA_BYTES` and `MAX_FRAME_BYTES` are both 64 MiB. */
 const GRANT_ARENA_BYTES = 67_108_864n;
 const GRANT_MAX_LEASES = 32n;
 /**
- * Bytes the ring layout adds around a page-aligned arena: the control
- * region that precedes it (producer, consumer, and reclaim cache lines
- * plus `descriptor_depth` slots, rounded up to a page) and the trailing
+ * The ring layout adds a control region before the page-aligned arena and a lifecycle page after it.
+ * The control region contains producer, consumer, and reclaim cache lines.
+ * The control region includes page-rounded `descriptor_depth` slots.
  * lifecycle page.
  *
- * `RingGrant::decode` recomputes the layout and rejects any grant whose
- * `total_bytes` disagrees, so this value is not decoration: it must track
- * `Layout::new(GRANT_DESCRIPTOR_DEPTH, GRANT_ARENA_BYTES).total`. Growing
- * a control-region struct past a page boundary changes it, and a stale
- * value surfaces as `invalid shared-memory descriptor` from whichever
- * test needs the grant to be *valid* — see the unresolvable-descriptor
- * test below, which is the only case that gets past decoding.
+ * `GRANT_LAYOUT_OVERHEAD_BYTES` must equal `Layout::new(GRANT_DESCRIPTOR_DEPTH, GRANT_ARENA_BYTES).total - GRANT_ARENA_BYTES` because `RingGrant::decode` rejects mismatched `total_bytes`.
+ * Growing a control-region struct past a page boundary changes `GRANT_LAYOUT_OVERHEAD_BYTES`; a stale value causes `invalid shared-memory descriptor`.
+ * An unresolvable descriptor must pass decoding before resolution fails.
  */
 const GRANT_LAYOUT_OVERHEAD_BYTES = 16_384n;
 
 /**
- * Encodes one RingGrant wire image (layout version 2) as lowercase hex:
- * layout_version u16, incarnation [16], lane u32, descriptor_depth u64,
- * arena_bytes u64, max_leases u64, total_bytes u64, reserved u32 zero —
  * all little-endian.
  */
 function testGrantHex(lane: number, incarnation: number): string {
@@ -288,8 +281,8 @@ describe("raw N-API descriptor boundary", () => {
     test("a well-formed but unresolvable descriptor fails without registry effects", () => {
         const addon = loadRawAddon();
         if (!addon || process.platform !== "linux") return;
-        // pid 4294967295 is above the Linux pid_max ceiling: validation
-        // passes, the /proc open fails, and no channel is registered.
+        // PID 4294967295 exceeds Linux `pid_max`, but validation accepts it.
+        // The `/proc` open fails after validation accepts PID 4294967295, so no channel is registered.
         expectRejectedWithoutEffects(
             addon,
             { ...validRawDescriptor(), pid: 4_294_967_295 },

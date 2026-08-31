@@ -1,20 +1,12 @@
 /**
- * U1 direct-cutover groundwork (KTD1): the composable current-schema snapshot
- * source. The converged non-memory schema (claims/evidence v82, applicability
- * v85, policy v86) is registered here as explicit components so the direct
- * bootstrap (U8) and the direct test factory can create the exact current
- * schema without running the legacy migration chain.
+ * Direct bootstrap and the direct test factory create the current schema without legacy migrations.
  *
  * Registered-component contract:
  *   - every component declares the top-level tables it OWNS (`provides`);
- *     indexes/triggers/views attribute to their owning table through
- *     `sqlite_schema.tbl_name`, so they never need separate declarations.
- *   - composition validates duplicate ownership, unknown/cyclic dependencies,
- *     and undeclared schema objects, then fails closed.
+ * Composition validates duplicate ownership, unknown dependencies, and dependency cycles.
+ * Composition fails closed when it finds undeclared schema objects.
  *
- * Dependency-light on purpose: runtime imports use explicit `.ts` extensions
- * so the Node smoke scripts can load this module under Node's type-stripping
- * loader (which cannot resolve extensionless runtime imports).
+ * Runtime imports use explicit `.ts` extensions because Node's type-stripping loader cannot resolve extensionless imports.
  */
 
 import { createHash } from "node:crypto";
@@ -45,28 +37,24 @@ import {
     SESSION_RUNTIME_TABLES,
 } from "./storage-session-runtime-schema.ts";
 
-/** Canonical protocol tag for the registered-component manifest digest. */
+/** SCHEMA_MANIFEST_PROTOCOL is the canonical protocol tag in the registered-component manifest digest. */
 export const SCHEMA_MANIFEST_PROTOCOL = "mc-schema-manifest-v1";
 
 export interface RegisteredSchemaComponent {
-    /** Stable component name; part of the manifest digest. */
+    /** name is stable and contributes to the manifest digest. */
     readonly name: string;
-    /** Names of components that must be created first. */
+    /** Each dependency must be created before its component. */
     readonly dependsOn: readonly string[];
     /**
-     * Top-level tables and views this component owns (exactly, no overlap).
-     * Indexes and triggers attribute to their owning table through
-     * `sqlite_schema.tbl_name` and are not declared separately.
+     * provides lists the top-level tables and views owned by the component; component lists cannot overlap.
+     * Indexes and triggers use `sqlite_schema.tbl_name` to attribute ownership to their owning table, so they need no separate declarations.
      */
     readonly provides: readonly string[];
-    /** Creates every owned object. Runs inside the caller's transaction. */
+    /** `create` creates every owned object inside the caller's transaction. */
     readonly create: (db: Database) => void;
 }
 
 /**
- * The converged non-memory current schema, in registration order. U2 appends
- * the claim-memory component and `magic-context-3q5.9` appends the retrieval
- * projection to this same list; there is no direct-format data migration.
  */
 export const CURRENT_SCHEMA_COMPONENTS: readonly RegisteredSchemaComponent[] = [
     {
@@ -80,8 +68,7 @@ export const CURRENT_SCHEMA_COMPONENTS: readonly RegisteredSchemaComponent[] = [
         dependsOn: ["claims-evidence"],
         provides: [...CLAIM_APPLICABILITY_TABLES, "claim_revision_applicability_intervals"],
         create: (db) => {
-            // v85 order: the observations trust-class column lands before the
-            // applicability objects that classify against it.
+            // The observations trust-class column is added before applicability objects classify against it.
             addObservationSourceTrustClassColumn(db);
             createClaimApplicabilitySchema(db);
         },
@@ -126,9 +113,9 @@ export interface SchemaComponentManifest {
 }
 
 /**
- * Validate the registered-component set. Returns every violation (empty =
- * valid): duplicate component names, duplicate table ownership, unknown
- * dependency names, and dependency cycles.
+ * The validator returns every violation; an empty result is valid.
+ * The validator reports duplicate component names and duplicate table ownership.
+ * The validator reports unknown dependency names and dependency cycles.
  */
 export function validateSchemaComponents(
     components: readonly RegisteredSchemaComponent[],
@@ -161,7 +148,6 @@ export function validateSchemaComponents(
             }
         }
     }
-    // Cycle detection: iterative DFS with tri-color marking.
     const state = new Map<string, "visiting" | "done">();
     const visit = (name: string, path: string[]): void => {
         const mark = state.get(name);
@@ -180,7 +166,7 @@ export function validateSchemaComponents(
     return problems;
 }
 
-/** Topological creation order. Throws on any validation failure. */
+/** The composer creates components in topological order and throws when validation fails. */
 export function orderSchemaComponents(
     components: readonly RegisteredSchemaComponent[],
 ): RegisteredSchemaComponent[] {
@@ -204,7 +190,7 @@ export function orderSchemaComponents(
     return ordered;
 }
 
-/** Build the declared manifest (registration order, exact declared lists). */
+/** The manifest preserves registration order and each component's exact declared lists. */
 export function buildSchemaComponentManifest(
     components: readonly RegisteredSchemaComponent[] = CURRENT_SCHEMA_COMPONENTS,
 ): SchemaComponentManifest {
@@ -219,9 +205,8 @@ export function buildSchemaComponentManifest(
 }
 
 /**
- * Canonical line encoding shared with the Rust runtimes: one protocol line,
- * then one `component ...` line per component in manifest order. The digest is
- * SHA-256 over these lines joined with '\n' (no trailing newline).
+ * The canonical encoding begins with one protocol line.
+ * The encoding emits one `component ...` line for each component in manifest order.
  */
 export function canonicalSchemaManifestLines(manifest: SchemaComponentManifest): string[] {
     return [
@@ -240,9 +225,7 @@ export function computeSchemaManifestDigest(manifest: SchemaComponentManifest): 
 }
 
 /**
- * Every non-internal object name in `main.sqlite_schema`. SQLite-internal
- * objects (`sqlite_sequence`, `sqlite_autoindex_*`, `sqlite_stat*`) are engine
- * bookkeeping, not registered schema.
+ * SQLite treats `sqlite_sequence`, `sqlite_autoindex_*`, and `sqlite_stat*` as internal bookkeeping rather than registered schema.
  */
 export function listSchemaObjectNames(db: Database): string[] {
     const rows = db
@@ -252,9 +235,8 @@ export function listSchemaObjectNames(db: Database): string[] {
 }
 
 /**
- * Create every registered component in dependency order, then fail closed if
- * any resulting schema object is not attributable to a declared owner. Runs
- * against an empty `main` schema; callers own transaction scope and PRAGMAs.
+ * `composeRegisteredSchema` creates components in dependency order and rejects undeclared non-internal schema objects.
+ * `composeRegisteredSchema` rejects non-internal schema objects whose `tbl_name` is absent from every component's `provides` list.
  */
 export function composeRegisteredSchema(
     db: Database,
@@ -292,9 +274,6 @@ export function composeRegisteredSchema(
 }
 
 /**
- * Compute the expected direct format (registered inventory plus marker
- * objects) by composing the components into a scratch in-memory database so
- * the expectation can never drift from what composition actually creates.
  */
 export function computeExpectedDirectFormat(
     components: readonly RegisteredSchemaComponent[] = CURRENT_SCHEMA_COMPONENTS,

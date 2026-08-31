@@ -1,11 +1,9 @@
 /**
- * Private client-side transport provider registry (U5, KTD2).
+ * Only the client uses this registry for transport providers.
  *
- * The production registry is empty: TCP needs no provider object because
- * the authenticated bootstrap channel IS the selected channel on a TCP
- * selection. Non-TCP providers exist only as injected test seams through
- * the internal `McHostClientOptions.transportProviders` option. Deliberately
- * not exported from `index.ts` (R15: no supported consumer provider hooks).
+ * TCP selections use the authenticated bootstrap channel directly and need no provider object.
+ * Non-TCP providers are injected only through internal `McHostClientOptions.transportProviders`.
+ * This module is not exported from `index.ts`; consumers cannot register providers.
  */
 
 import { McHostCallError } from "./errors";
@@ -37,41 +35,38 @@ import {
     type TransportOffer,
 } from "./transport-negotiation";
 
-/** The TCP capability version this client offers and accepts. */
+/* */
 export const TCP_CAPABILITY_VERSION = 1;
 
-/** Construction arguments for one non-routable candidate channel. */
+/** Providers receive these arguments when constructing non-routable candidate channels. */
 export interface CandidateChannelArgs {
-    /** Shared aggregate byte budget (KTD7). */
+    /** This budget is shared across candidate channels. */
     budget: ByteBudget;
     maxBodyLen: number;
     handlers: FrameChannelHandlers;
     /**
-     * Authenticated per-incarnation daemon identity, copied from the
-     * generation whose handshake proved it and which negotiated this grant.
-     * Providers scoping replay state (candidate watermarks) key on it, never
-     * on the reusable PID.
+     * The handshake-authenticated generation supplies this per-incarnation `daemonId`.
+     * Providers key candidate watermarks by `daemonId`, not reusable PIDs.
+     * Providers key replay state by `daemonId`, not reusable PIDs.
      */
     daemonId: Uint8Array;
 }
 
 export interface ClientTransportProvider {
-    /** Bounded lowercase transport name (wire doc 7.7.1), offered before TCP. */
+    /** The client offers this bounded lowercase transport name before TCP. */
     readonly transport: string;
     readonly capabilityVersion: number;
-    /** Optional opaque offer parameters forwarded verbatim in the offer. */
+    /** The client forwards supplied opaque parameters verbatim in the offer. */
     readonly parameters?: OpaqueObject;
     /**
-     * Synchronously construct one non-routable candidate channel for a
-     * validated grant `descriptor`; attachment I/O belongs in the returned
-     * channel's `start()`. KTD9: implementations must enforce owner-only
-     * endpoint access, exclusive peer attachment, incarnation fencing, and
-     * stale-descriptor rejection before the channel yields frames.
+     * Providers synchronously construct non-routable candidate channels for validated grants.
+     * Providers perform attachment I/O in the returned channel's `start()`.
+     * Providers must enforce owner-only endpoint access, exclusive peer attachment, incarnation fencing, and stale-descriptor rejection before yielding frames.
      */
     connect(descriptor: OpaqueObject, args: CandidateChannelArgs): SetupFrameChannel;
 }
 
-/** Ordered provider set consulted once per connection setup (KTD5: selection is sticky). */
+/** The registry consults providers once per connection setup; the selected provider remains fixed for that connection. */
 export class ClientTransportRegistry {
     private readonly offerSnapshot: readonly TransportOffer[];
     private readonly entries: readonly {
@@ -81,13 +76,9 @@ export class ClientTransportRegistry {
     }[];
 
     constructor(providers: readonly ClientTransportProvider[]) {
-        // Provider-authored getters and `toJSON` run once, here — never on
-        // an authenticated connection's setup path, where synchronous
-        // provider code could hold the socket and shared flight
-        // indefinitely and a throwing getter would escape unsanitized.
-        // Phase 1 runs every provider call (getters plus serialization)
-        // inside one containment: any throw — including a provider-forged
-        // `NegotiationError` — becomes the bounded registration error.
+        // The constructor snapshots provider getters and `toJSON` so authenticated setup never runs provider code.
+        // Synchronous provider code can hold the socket and shared flight indefinitely.
+        // The constructor converts every provider exception, including `NegotiationError`, into a bounded registration error.
         let raw: {
             transport: string;
             capabilityVersion: number;
@@ -99,9 +90,7 @@ export class ClientTransportRegistry {
             raw = providers.map((provider) => {
                 const transport = provider.transport;
                 const capabilityVersion = provider.capabilityVersion;
-                // Primitive snapshots only: a non-string transport would
-                // defer a provider-owned toString() into the validation
-                // phase, outside this containment.
+                // The constructor snapshots primitive values before validation to prevent provider-owned `toString()` from running outside containment.
                 if (typeof transport !== "string" || typeof capabilityVersion !== "number") {
                     throw new Error("non-primitive provider identity");
                 }
@@ -110,13 +99,10 @@ export class ClientTransportRegistry {
                 return {
                     transport,
                     capabilityVersion,
-                    // Presence is tracked separately: a supplied value whose
-                    // serialization yields `undefined` (a `toJSON` returning
-                    // undefined) is an invalid opaque object, never an
+                    // A `toJSON` result of `undefined` makes a present opaque parameter invalid, not absent.
                     // absent one.
                     hasParameters,
-                    // Bounded serialization: an oversized provider value is
-                    // rejected during traversal, never materialized in full.
+                    // Bounded serialization rejects oversized provider values during traversal before full materialization.
                     serializedParameters: hasParameters
                         ? serializeOpaqueBounded(parameters, "parameters")
                         : undefined,
@@ -126,14 +112,9 @@ export class ClientTransportRegistry {
         } catch {
             throw new Error("transport provider registration failed");
         }
-        // Phase 2 validates pure data: a NegotiationError raised here is
-        // ours and carries only bounded codes and structural paths.
+        // Phase 2 raises only library-owned `NegotiationError`s with bounded codes and structural paths.
         for (const entry of raw) {
-            // "tcp" is reserved for the implicit bootstrap entry: a
-            // provider advertising tcp at another capability version could
-            // be validly selected by a host, and the client would then
-            // continue on the v1 bootstrap channel under a version lie
-            // while the provider is never activated.
+            // `tcp` is reserved for the implicit bootstrap entry because another capability version could be selected while the client continues on the v1 bootstrap channel and never activates the provider.
             if (entry.transport === TRANSPORT_TCP) {
                 throw new NegotiationError("invalid_transport_name", "transport");
             }
@@ -156,16 +137,12 @@ export class ClientTransportRegistry {
                   },
         );
         offers.push({ transport: TRANSPORT_TCP, capabilityVersion: TCP_CAPABILITY_VERSION });
-        // Static configuration errors (invalid or duplicate identities, a
-        // provider named "tcp", too many offers) surface here, before any
-        // dial: the encoder's closed-vocabulary rules run against the
-        // snapshot so a bad registry cannot consume a connection setup
-        // budget or retire a healthy authenticated generation.
+        // The constructor encodes the offer snapshot before dialing so invalid or duplicate identities, a provider named `tcp`, and excess offers cannot consume a connection setup budget or retire an authenticated generation.
         encodeNegotiateRequest({ negotiationVersion: NEGOTIATION_VERSION, offers });
         this.offerSnapshot = offers;
     }
 
-    /** Ordered offers: installed non-TCP providers first, then the required TCP entry. */
+    /* */
     offers(): TransportOffer[] {
         return [...this.offerSnapshot];
     }
@@ -179,10 +156,7 @@ export class ClientTransportRegistry {
 }
 
 /**
- * The closed channel close-reason vocabulary. A provider channel's runtime
- * `reason` outside this set is provider-controlled text and is replaced:
- * it would otherwise become `RetirementInfo.reason`, pending-request error
- * messages, and the `retired` diagnostics event.
+ * Provider `reason` values outside this closed vocabulary are replaced before they reach `RetirementInfo.reason`, pending-request errors, or `retired` diagnostics.
  */
 const CHANNEL_CLOSE_REASONS: ReadonlySet<FrameChannelCloseReason> = new Set([
     "socket_error",
@@ -198,7 +172,7 @@ const CHANNEL_CLOSE_REASONS: ReadonlySet<FrameChannelCloseReason> = new Set([
     "quarantined",
 ]);
 
-/** The closed diagnostic-type vocabulary a provider channel may emit. */
+/** A provider channel may emit only these diagnostic types. */
 const CHANNEL_DIAGNOSTIC_TYPES: ReadonlySet<FrameChannelDiagnosticType> = new Set([
     "write_start",
     "write_complete",
@@ -206,10 +180,8 @@ const CHANNEL_DIAGNOSTIC_TYPES: ReadonlySet<FrameChannelDiagnosticType> = new Se
 ]);
 
 /**
- * R14 provider boundary: replace a provider-owned failure with a bounded
- * error carrying only the already-validated transport name and a fixed
- * phase word. The original message, cause chain, and stack are dropped
- * because provider code may reference descriptors, tokens, or endpoints.
+ * Provider failures expose only `transport` and `phase`.
+ * Provider failures do not retain the original message, cause, or stack.
  */
 function sanitizedProviderError(
     transport: string,
@@ -219,8 +191,7 @@ function sanitizedProviderError(
 }
 
 /**
- * Channel-operation codes the generation engine classifies by. Anything
- * outside this set is provider-authored and dropped with the message.
+ * The generation engine classifies only codes in this set and drops provider-authored codes with their messages.
  */
 const BOUNDED_CHANNEL_CODES = new Set([
     "channel_closed",
@@ -231,19 +202,15 @@ const BOUNDED_CHANNEL_CODES = new Set([
 ]);
 
 /**
- * Upper bound on segments one provider frame may carry. The ring transport
- * delivers at most two spans (wrap), so this is generous headroom; its job
- * is to cap the array allocation a provider-controlled count drives.
+ * This segment limit caps allocation driven by a provider-controlled count; the ring transport emits at most two wrapped spans.
  */
 const MAX_PROVIDER_SEGMENTS = 64;
 
 /**
- * Wrap a provider's candidate construction so every provider-originated
- * error surface — constructor throw, `start()` rejection, channel-detected
- * close errors — is sanitized per R14 before it can enter generation error
- * graphs, retirement info, or diagnostics. `transport` is the cached
- * registry name, never a live provider getter: failure paths must not
- * re-enter provider code to describe a provider failure.
+ * The wrapper sanitizes constructor throws, `start()` rejections, and channel-detected close errors.
+ * The wrapper sanitizes provider errors before they enter generation error graphs, retirement info, or diagnostics.
+ * `transport` stores the registry name rather than a live provider getter.
+ * Failure paths must not call provider code while reporting provider failures.
  */
 export function sanitizedCandidateFactory(
     transport: string,
@@ -252,25 +219,19 @@ export function sanitizedCandidateFactory(
     daemonId: Uint8Array,
 ): (args: Omit<CandidateChannelArgs, "daemonId">) => SetupFrameChannel {
     return (args) => {
-        // Wrapped flush() calls settle here on channel close, matching the
-        // FrameChannel contract, instead of waiting out their deadlines.
+        // Closing the channel settles pending wrapped `flush()` calls immediately.
         const flushWaiters = new Set<() => void>();
         const receiveLeases = new Set<ReceiveLease>();
-        // Source-lease identity: a provider delivering the same still-active
-        // lease twice would get two wrappers over the same segments, where
-        // releasing either detaches the shared lease and silently invalidates
-        // the other caller's body.
+        // The wrapper rejects a duplicate active source lease because releasing either wrapper invalidates the other body.
+        // A duplicate active lease would create two wrappers over the same segments.
         const activeSourceLeases = new Set<ReceiveLease>();
         const copyCounter = new CopyCounter();
         let quarantinedBytes = 0;
-        // Set before the provider learns about any close, so a provider that
-        // synchronously delivers a final frame from close(), or replays a
-        // queued callback after retirement, is fenced out of charging the
-        // frozen budget or dispatching past the owner.
+        // The wrapper sets `wrapperClosed` before notifying the provider so close-triggered frames cannot consume budget or dispatch.
+        // The provider can synchronously deliver a final frame from `close()`.
+        // Provider callbacks queued before retirement cannot consume the frozen budget or dispatch past the owner.
         let wrapperClosed = false;
-        // Single close path: EVERY channel close — provider-reported or
-        // wrapper-detected — drains the flush waiters first, so no pending
-        // flush outlives the close that should have settled it.
+        // Every channel close drains `flushWaiters` before notifying the owner.
         const closeUpstream = (
             reason: FrameChannelCloseReason,
             phase: "channel" | "send",
@@ -296,10 +257,9 @@ export function sanitizedCandidateFactory(
         const upstreamDiagnostic = args.handlers.onDiagnostic;
         const handlers: FrameChannelHandlers = {
             onFrame: (frame) => {
-                // A frame arriving after close — a provider close() delivering
-                // synchronously, or a queued callback running after owner
-                // retirement — must not charge the frozen budget or dispatch:
-                // its lease is released and the delivery dropped.
+                // A queued provider callback can run after owner retirement.
+                // Late frames cannot consume the frozen budget or dispatch.
+                // Release late `ReceiveLease` bodies because they cannot reach the owner.
                 if (wrapperClosed) {
                     try {
                         const lateBody = frame.body;
@@ -307,15 +267,14 @@ export function sanitizedCandidateFactory(
                             lateBody.release();
                         }
                     } catch {
-                        // Best-effort: the channel is already closed either way.
+                        // The wrapper ignores release failures because `wrapperClosed` already prevents further dispatch.
                     }
                     return;
                 }
-                // Snapshot and structurally validate the provider frame: a
-                // throwing getter or malformed shape becomes one bounded
-                // channel close, never an exception unwinding through the
-                // provider's reader callback with provider-owned text —
-                // and never a stalled published generation.
+                // The wrapper converts throwing getters and malformed provider frames into a bounded channel close.
+                // Provider frame validation closes the channel instead of unwinding through the reader callback.
+                // The close error omits provider-owned text.
+                // Frame validation prevents malformed provider frames from stalling a published generation.
                 let snapshot: InboundFrame;
                 let sourceLease: ReceiveLease | null = null;
                 let charged = 0;
@@ -327,10 +286,9 @@ export function sanitizedCandidateFactory(
                     const flags = Number(header.flags);
                     const channelId = Number(header.channel);
                     const epoch = Number(header.epoch);
-                    // Correlation identity must be exact: coercing an
-                    // already-rounded number above MAX_SAFE_INTEGER would
-                    // key this frame to a DIFFERENT pending request once a
-                    // generation's allocator reaches that range.
+                    // The wrapper rejects correlation IDs that are not exact safe integers.
+                    // Numbers above `MAX_SAFE_INTEGER` can already be rounded before correlation.
+                    // Rounding above `MAX_SAFE_INTEGER` can associate a frame with a different pending request.
                     const rawCorr = header.corr;
                     if (
                         typeof rawCorr !== "bigint" &&
@@ -348,20 +306,11 @@ export function sanitizedCandidateFactory(
                     ) {
                         throw new Error("malformed provider frame");
                     }
-                    // A lease already wrapped by an earlier delivery stays
-                    // owned by its wrapper: releasing it here would detach the
-                    // segments under that wrapper's caller. sourceLease stays
-                    // null so the catch below cannot touch it.
                     if (activeSourceLeases.has(providerLease)) {
                         throw new Error("duplicate provider lease");
                     }
                     sourceLease = providerLease;
                     activeSourceLeases.add(providerLease);
-                    // Wire widths: `validateHeader` checks flag semantics and
-                    // identity rules but NOT field ranges (those live in
-                    // `encodeHeader`, which an inbound frame never reaches),
-                    // so an out-of-range value like `flags: 256` would pass
-                    // semantic validation and dispatch.
                     if (
                         len < 0 ||
                         len > 0xffff_ffff ||
@@ -384,10 +333,6 @@ export function sanitizedCandidateFactory(
                     if (!Number.isSafeInteger(reported) || reported > args.maxBodyLen) {
                         throw new Error("oversize provider frame");
                     }
-                    // The segment count is provider-controlled and drives an
-                    // allocation, so it is read once and bounded BEFORE the
-                    // array exists: a lying getter could otherwise allocate
-                    // gigabytes ahead of every byte-level validation and the
                     // budget charge.
                     const segmentCount = Number(providerLease.segmentCount);
                     if (
@@ -449,12 +394,6 @@ export function sanitizedCandidateFactory(
                     let retained = false;
                     if (sourceLease) {
                         activeSourceLeases.delete(sourceLease);
-                        // isReleased() and release() are provider-overridable
-                        // and may throw; both share one containment so the
-                        // rejection always reaches the sanitized close below.
-                        // A lease whose state cannot even be read counts as
-                        // retained: its storage may still be aliased, so the
-                        // charge is quarantined rather than released.
                         try {
                             if (!sourceLease.isReleased()) sourceLease.release();
                         } catch {
@@ -480,18 +419,11 @@ export function sanitizedCandidateFactory(
             },
             onClosed: (reason, _error) =>
                 closeUpstream(
-                    // A runtime reason outside the typed vocabulary is
-                    // provider-controlled text; the bounded replacement
-                    // keeps it out of retirement info and diagnostics.
                     CHANNEL_CLOSE_REASONS.has(reason) ? reason : "protocol_violation",
                     "channel",
                 ),
             onDiagnostic: upstreamDiagnostic
                 ? (type, meta) => {
-                      // Snapshot to bounded primitives: provider-controlled
-                      // strings or throwing getters must not reach the
-                      // public diagnostics observer, which the wire doc
-                      // requires to stay free of descriptor and token data.
                       if (!CHANNEL_DIAGNOSTIC_TYPES.has(type)) return;
                       let snapshot: FrameMeta;
                       try {
@@ -503,8 +435,6 @@ export function sanitizedCandidateFactory(
                               len: Number(meta.len),
                           };
                       } catch {
-                          // Diagnostics are best-effort; a malformed event
-                          // is dropped, never surfaced raw.
                           return;
                       }
                       upstreamDiagnostic(type, snapshot);
@@ -517,9 +447,6 @@ export function sanitizedCandidateFactory(
         } catch {
             throw sanitizedProviderError(transport, "connect");
         }
-        // Every provider-reachable failure surface is sanitized: send,
-        // sendControl, and flush forward through the same bounded-error
-        // policy as connect and start.
         return {
             start: async (deadline) => {
                 try {
@@ -689,9 +616,9 @@ export function sanitizedCandidateFactory(
                 });
             },
             send: (frame, hooks) => {
-                // Publication is tracked HERE, not trusted from the error:
-                // a provider-supplied kind could claim any classification,
-                // and an ordinary Error would otherwise read as `terminal`.
+                // The wrapper tracks publication locally rather than trusting state carried by the error.
+                // Provider-supplied kinds can claim any classification.
+                // Without local classification, an ordinary `Error` reads as `terminal`.
                 let published = false;
                 const trackedHooks: FrameSendHooks = {
                     onPublish: () => {
@@ -711,17 +638,16 @@ export function sanitizedCandidateFactory(
                             ? error.code
                             : undefined;
                     if (!published) {
-                        // Proven refusal: nothing was published, so the
-                        // bounded failure is replay-safe `not_sent`.
+                        // The wrapper returns replay-safe `not_sent` only when nothing was published.
                         throw new McHostCallError(
                             "not_sent",
                             `transport provider ${transport} failed during send`,
                             code,
                         );
                     }
-                    // Publication may have begun: ambiguous. Fail the
-                    // channel — retirement settles pending work exactly
-                    // once — and classify the throw as never replayable.
+                    // The wrapper closes the channel when publication may have begun.
+                    // Retirement settles pending generation requests.
+                    // The adapter throws `outcome_unknown`, which is never replayable.
                     closeUpstream("write_failed", "send");
                     throw new McHostCallError(
                         "outcome_unknown",
@@ -729,27 +655,17 @@ export function sanitizedCandidateFactory(
                         code,
                     );
                 }
-                // Built explicitly — never spread from the provider object,
-                // whose enumerable getters could throw mid-construction
-                // after the frame was already admitted.
+                // The adapter does not spread `ticket` because its enumerable getters can throw after frame admission.
                 return {
                     cancel: () => {
                         try {
-                            // Exactly `true` is proof of non-publication; a
-                            // truthy non-boolean is not, and treating it as
-                            // proof would let the generation settle
-                            // `not_sent` (replay-eligible) for a frame the
-                            // provider may still publish. Our own publish
-                            // observation overrides the provider's answer:
-                            // once publication began, no later `true` can
+                            // Only `ticket.cancel() === true` proves non-publication.
+                            // A truthy non-boolean result does not prove non-publication.
+                            // A non-boolean truthy result could mark a still-publishable frame `not_sent` and replay-eligible.
+                            // A prior publication prevents any later cancel result from proving non-publication.
                             // unsay it.
                             return !published && ticket.cancel() === true;
                         } catch {
-                            // A throwing provider ticket must not disrupt
-                            // pending-entry settlement; `false` is the
-                            // "possible send" answer, which the generation
-                            // now honors by settling `outcome_unknown`
-                            // (never replay-eligible `not_sent`).
                             return false;
                         }
                     },
@@ -759,21 +675,15 @@ export function sanitizedCandidateFactory(
                 try {
                     channel.sendControl(header);
                 } catch {
-                    // Generation control paths (a Pong answered inside frame
-                    // dispatch) do not catch here, so a throw would unwind
-                    // through the provider's own onFrame callback. Control
-                    // emission failure IS channel failure: surface it as one
-                    // close — retirement is idempotent — never an exception
-                    // across the frame-delivery callback.
+                    // The adapter closes the channel and never throws across the frame-delivery callback.
                     closeUpstream("write_failed", "send");
                 }
             },
             flush: (deadline) =>
-                // Best-effort by contract and bounded locally: a provider
-                // that ignores its deadline must not stall teardown, a
-                // synchronous throw or rejection must not abort the close
-                // path that still has to retire the generation, and channel
-                // close settles the wait immediately.
+                // Teardown enforces the provider deadline locally.
+                // A provider that ignores its deadline must not stall teardown.
+                // A synchronous throw or rejection must not abort close.
+                // The wrapper settles pending flush waiters before `channel.close()`.
                 new Promise<void>((resolve) => {
                     const timer = setTimeout(settle, deadline.remainingMs());
                     function settle(): void {
@@ -789,9 +699,7 @@ export function sanitizedCandidateFactory(
                     }
                 }),
             close: (error) => {
-                // Fenced before the provider observes the close: a final
-                // frame delivered synchronously from channel.close() must not
-                // charge the frozen budget or dispatch past retirement.
+                // The adapter sets `wrapperClosed` before `channel.close()` so synchronous final frames are ignored.
                 wrapperClosed = true;
                 for (const lease of [...receiveLeases]) {
                     try {
@@ -800,19 +708,11 @@ export function sanitizedCandidateFactory(
                         void error;
                     }
                 }
-                // Owner close never fires onClosed (FrameChannel contract),
-                // so wrapper-owned flush waiters settle here too: a
-                // retiring generation must not leave them pending until
-                // the shutdown deadline.
                 for (const settle of [...flushWaiters]) settle();
                 try {
                     channel.close(error);
                 } catch {
-                    // Swallowed: close runs inside generation retirement,
-                    // after retirement state is set but before its promise
-                    // resolves — a provider throw here would leave the
-                    // retirement unresolved and the facade's active slot
-                    // stuck. The channel is being abandoned either way.
+                    // Prevent `channel.close()` exceptions from escaping.
                 }
             },
             isClosed: () => channel.isClosed(),
@@ -830,10 +730,8 @@ export function sanitizedCandidateFactory(
                 };
                 let stats = zero;
                 try {
-                    // Every provider getter is read exactly once into a plain
-                    // snapshot: keeping (or spreading) the live report object
-                    // would re-run throwing getters outside this containment
-                    // and copy arbitrary extra properties past the boundary.
+                    // The snapshot reads each `reported` getter once.
+                    // The snapshot reads only `FrameChannelStats` fields to avoid rerunning getters or copying extra properties.
                     const reported = channel.stats();
                     const snapshot: FrameChannelStats = {
                         readerHeldBytes: reported.readerHeldBytes,

@@ -1,14 +1,12 @@
 /**
- * Generate the decay-curve golden fixture for the Rust port's differential test.
+ * This script generates the decay-curve fixture for the Rust differential test.
  *
- * Uses the production `decay-curve.ts` as the oracle: emits a grid of tier /
- * archive / rendered-tier cases plus budget-pressure cases, which the Rust
- * `decay_golden_matches_reference` test asserts against. Run after any change to
- * `decay-curve.ts` (or the Rust port) to re-baseline:
+ * Production `decay-curve.ts` is the oracle for the Rust differential test.
+ * The Rust `decay_golden_matches_reference` test asserts the generated tier, archive, rendered-tier, and budget-pressure cases.
  *
  *   bun crates/mc-core/testdata/gen-golden.ts
  *
- * Writes decay-golden.json beside this file (committed as the Rust test fixture).
+ * Rust tests consume the committed `decay-golden.json` fixture.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -49,7 +47,6 @@ for (const index of indices) {
     }
 }
 
-// Budget-pressure cases: a few compartment-pool shapes × budgets, incl. tight ones.
 const pools = [
     Array.from({ length: 50 }, () => 50),
     Array.from({ length: 200 }, (_, i) => (i % 100) + 1),
@@ -74,14 +71,13 @@ mkdirSync(dirname(out), { recursive: true });
 writeFileSync(out, `${JSON.stringify({ tier_cases: tierCases, pressure_cases: pressureCases }, null, 2)}\n`);
 console.log(`wrote ${tierCases.length} tier cases + ${pressureCases.length} pressure cases → ${out}`);
 
-// --- decay RENDERER golden (fixture for the Rust mc-module port of decay-render.ts) ---
-// All cases use a deliberately huge budget so the TS token-estimate demotion guard
-// never fires; the Rust port (which injects that guard as a no-op) then produces the
-// same output driven purely by the decay curve. Legacy/flat bodies are ASCII-only so
-// the TS UTF-16 string slice and the Rust char slice truncate identically. The cases
-// exercise: the P1..P4 paraphrase bodies across a set old enough to demote and archive
-// some rows, XML-safe single-line headings, escaped bodies, empty-P4 title-only headings,
-// legacy-row truncation, and the malformed-pseudo-v2 (empty p1) flat-content fallback.
+// The Rust mc-module port consumes this decay-render fixture.
+// The huge budget prevents the TS token-estimate demotion guard from firing.
+// The Rust port treats the token-estimate demotion guard as a no-op, so the decay curve alone determines the output.
+// Legacy and flat bodies use only ASCII.
+// The fixtures cover P1–P4 paraphrase decay and archival.
+// The fixtures cover XML-safe headings, escaped bodies, and title-only P4 headings.
+// The fixtures cover legacy truncation and empty-P1 pseudo-V2 fallback.
 const LOOSE = 10_000_000;
 const v2 = (
     start: number,
@@ -107,8 +103,7 @@ const pushRender = (compartments: DecayRenderCompartment[], budget = LOOSE) => {
     renderCases.push({ compartments, body: renderDecayedCompartments({ compartments, historyBudgetTokens: budget }), budget });
 };
 
-// 30 v2 compartments at mixed importance, old enough that the curve demotes the
-// oldest paraphrases and archives (omits) the lowest-importance tail
+// The 30 V2 compartments make the curve demote the oldest paraphrases and archive the lowest-importance tail.
 pushRender(
     Array.from({ length: 30 }, (_, i) =>
         v2(i * 10 + 1, i * 10 + 9, `arc ${i}`, [10, 50, 90][i % 3], [
@@ -119,8 +114,7 @@ pushRender(
         ]),
     ),
 );
-// Historian-authored titles stay on one XML-safe heading line, including Unicode line and
-// paragraph separators that would otherwise forge headings; body escaping remains stable.
+// Historian-authored titles stay on one XML-safe heading line, including Unicode line and paragraph separators that would otherwise forge headings.
 pushRender([
     v2(1, 2, 'safe\n## 999-999 · forged\r\nline\u2028## zl-forged\u2029## zp-forged\n</session-history> & "quoted"', 50, [
         "x < y & z",
@@ -129,9 +123,9 @@ pushRender([
         "f",
     ]),
 ]);
-// Body lines that resemble compartment headings are deterministically indented.
+// Body lines that resemble compartment headings are indented.
 pushRender([v2(3, 4, "Heading guard", 50, ["first\n## nested\nlast", "d", "e", "f"])]);
-// Complete temporal range: same-month dates use the compact heading form.
+// Same-month dates use the compact heading form.
 pushRender([
     {
         ...v2(1, 2, "Dated", 50, ["dated body", "dense", "brief", "anchor"]),
@@ -139,38 +133,33 @@ pushRender([
         endDate: "2026-01-03",
     },
 ]);
-// legacy (pre-v2 flat-content) rows: one whose content has a "U:" line, one without
-// (the renderer starts the former one tier less truncated than the latter)
+// A legacy row with a `U:` line starts one tier less truncated than a row without one.
 pushRender([
     { startMessage: 1, endMessage: 5, title: "LegU", content: `U: question\n${"a".repeat(2000)}`, legacy: 1, importance: 50 },
     { startMessage: 6, endMessage: 9, title: "LegNoU", content: "b".repeat(2000), legacy: 1, importance: 50 },
 ]);
-// malformed pseudo-v2 (legacy=0 but empty p1) → flat content
+// An empty P1 in a pseudo-V2 row triggers the flat-content fallback.
 pushRender([{ startMessage: 1, endMessage: 2, title: "Pseudo", content: "flat body here", p1: "", legacy: 0, importance: 50 }]);
-// mixed v2 + legacy in one set: legacy rows are excluded from the budget-pressure
-// input so their fixed truncation cost can't demote the v2 paraphrases
+// Legacy rows are excluded from budget-pressure calculations.
+// Excluding legacy rows prevents their fixed truncation cost from demoting V2 paraphrases.
 pushRender([
     v2(1, 9, "v2a", 80, ["P1 first", "P2 first", "P3 first", "P4first"]),
     { startMessage: 10, endMessage: 14, title: "leg", content: `U: x\n${"c".repeat(600)}`, legacy: 1, importance: 50 },
     v2(15, 20, "v2b", 30, ["P1 second", "P2 second", "P3 second", ""]),
 ]);
 
-// the render golden is consumed by the mc-module port → write it to that crate's testdata
+// The mc-module port consumes this fixture from its testdata directory.
 const renderOut = join(import.meta.dir, "../../mc-module/testdata/render-golden.json");
 mkdirSync(dirname(renderOut), { recursive: true });
 writeFileSync(renderOut, `${JSON.stringify({ cases: renderCases }, null, 2)}\n`);
 console.log(`wrote ${renderCases.length} render cases → ${renderOut}`);
 
-// --- TIGHT-budget render golden: the cases where the token-estimate budget GUARD FIRES ---
-// The loose-budget golden above validates the pure curve; this set validates the guard
-// demotion loop end-to-end. The bodies are produced by the SAME TS renderDecayedCompartments
-// with the REAL estimateTokens (Claude BPE), at budgets tight enough to overshoot the
-// curve's tier selection and force oldest-first demotion. The Rust mc-module test runs the
-// SAME cases with the REAL mc_tokenizer::estimate_tokens — so both sides measure with a
-// bit-identical tokenizer (proven by the mc-tokenizer differential golden) and MUST agree.
-// v2-only (whole-tier selection, no legacy char-slicing) so the only cross-language input
-// is the token count. UTF-8 content (CJK/code) is included on purpose: a char/N proxy would
-// mis-demote it, which is exactly the drift the real estimator prevents.
+// The loose-budget fixture validates curve-only output; the tight-budget fixture validates budget-guard demotions.
+// At these budgets, the real Claude-BPE token estimate forces oldest-first demotion after curve selection.
+// The Rust test runs these cases with mc_tokenizer::estimate_tokens.
+// The TS and Rust tests must produce identical token counts for every case.
+// V2 whole-tier selection leaves token count as the only cross-language input.
+// UTF-8 CJK and code content expose character-count proxy drift; estimateTokens avoids that drift.
 const tightBody = (compartments: DecayRenderCompartment[], budget: number) =>
     renderDecayedCompartments({ compartments, historyBudgetTokens: budget });
 
@@ -209,15 +198,13 @@ const tightRenderCases: Array<{
 const pushTight = (compartments: DecayRenderCompartment[], budget: number) =>
     tightRenderCases.push({ compartments, budget, body: tightBody(compartments, budget) });
 
-// A pool that fits loosely but overshoots progressively tighter budgets → forces 1, then
-// several, then near-total demotion. Each budget exercises a different depth of the guard.
+// The budgets force progressively deeper oldest-first demotion, from one compartment to near-total demotion.
 pushTight(tightPool(20), 1500);
 pushTight(tightPool(20), 800);
 pushTight(tightPool(20), 300);
 pushTight(tightPool(12), 120);
-// a budget so tight even all-P4 overshoots → guard runs to its cap, best-effort floor
+// Budget 20 leaves even all-P4 output over budget, so the guard reaches its best-effort cap.
 pushTight(tightPool(12), 20);
-// UTF-8/CJK pool: the char/N-proxy drift case the real estimator fixes
 pushTight(cjkPool(15), 600);
 pushTight(cjkPool(15), 150);
 
@@ -225,12 +212,8 @@ const tightOut = join(import.meta.dir, "../../mc-module/testdata/render-tight-go
 writeFileSync(tightOut, `${JSON.stringify({ cases: tightRenderCases }, null, 2)}\n`);
 console.log(`wrote ${tightRenderCases.length} tight-budget render cases → ${tightOut}`);
 
-// --- project-docs golden (canonical hash + rendered <project-docs> block) ---
-// Each case writes the given files into a temp dir, runs the TS reference
-// implementation, and records the rendered block + canonical hash. Symlink/oversize
-// cases are NOT in the golden (they're filesystem-shape tests, covered directly in the
-// Rust unit tests). ASCII + the canonicalization edge cases (BOM/CRLF/trailing) so the
-// Rust char port and the TS UTF-16 port agree.
+// Each project-docs golden case records a canonical hash and rendered <project-docs> block.
+// The golden excludes symlink and oversize cases.
 const docCaseInputs: Array<Array<[string, string]>> = [
     [],
     [["ARCHITECTURE.md", "# Arch\nbody line"]],
@@ -238,11 +221,10 @@ const docCaseInputs: Array<Array<[string, string]>> = [
         ["ARCHITECTURE.md", "# Arch\nalpha"],
         ["STRUCTURE.md", "# Struct\nbeta"],
     ],
-    // canonicalization: BOM + CRLF + trailing spaces/tabs + trailing blank lines
+    // Canonicalization removes BOMs, normalizes CRLF, and trims trailing spaces, tabs, and blank lines.
     [["ARCHITECTURE.md", "\uFEFFline1  \r\nline2\t\n\n\n"]],
     // XML-escaped content
     [["STRUCTURE.md", "a < b & c > d"]],
-    // only STRUCTURE present (ARCHITECTURE absent)
     [["STRUCTURE.md", "solo struct"]],
 ];
 const docsCases = docCaseInputs.map((files) => {
@@ -259,11 +241,7 @@ const docsOut = join(import.meta.dir, "../../mc-module/testdata/project-docs-gol
 writeFileSync(docsOut, `${JSON.stringify({ cases: docsCases }, null, 2)}\n`);
 console.log(`wrote ${docsCases.length} project-docs cases → ${docsOut}`);
 
-// --- memory-render golden (the <project-memory> block + <memory-updates> corrections) ---
-// The block render uses the exported renderMemoryBlockV2 (real reference). The updates
-// render is a private DB-backed function; its branch logic (update/superseded/removed)
-// is mirrored here byte-for-byte (the Rust unit tests assert the same three branches
-// directly), so the golden still pins the Rust render to the TS shape.
+// Each golden records the rendered <project-memory> block and <memory-updates> corrections.
 const xmlContent = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const mkMem = (id: number, category: string, content: string, importance: number | null): Memory =>
     ({ id, category, content, importance }) as unknown as Memory;

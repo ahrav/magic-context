@@ -59,28 +59,24 @@ describe("parseRangeString", () => {
     it("throws on empty string", () => {
         //#given
         const input = "";
-        //#when + #then
         expect(() => parseRangeString(input)).toThrow();
     });
 
     it("throws on non-numeric input", () => {
         //#given
         const input = "abc";
-        //#when + #then
         expect(() => parseRangeString(input)).toThrow();
     });
 
     it("throws on reversed range", () => {
         //#given
         const input = "5-3";
-        //#when + #then
         expect(() => parseRangeString(input)).toThrow();
     });
 
     it("throws on range exceeding 1000 elements", () => {
         //#given
         const input = "1-10000";
-        //#when + #then
         expect(() => parseRangeString(input)).toThrow(
             'Range "1-10000" exceeds maximum size of 1000 elements (got 10000)',
         );
@@ -89,7 +85,6 @@ describe("parseRangeString", () => {
     it("throws on range of 1001 elements", () => {
         //#given
         const input = "1-1001";
-        //#when + #then
         expect(() => parseRangeString(input)).toThrow();
     });
 
@@ -105,18 +100,15 @@ describe("parseRangeString", () => {
     });
 
     it("tolerates §N§ tag markers in a range (the agent often pastes them verbatim)", () => {
-        //#given the agent copied the transcript markers into the range
         const input = "§302§-§305§";
         //#when
         const result = parseRangeString(input);
-        //#then it parses as 302-305 instead of erroring
         expect(result).toEqual([302, 303, 304, 305]);
     });
 
     it("tolerates §N§ markers in a single id and a comma list", () => {
         expect(parseRangeString("§5§")).toEqual([5]);
         expect(parseRangeString("§1§,§2§,§9§")).toEqual([1, 2, 9]);
-        // Mixed bare + marked is fine too.
         expect(parseRangeString("1-3,§8§")).toEqual([1, 2, 3, 8]);
     });
 });

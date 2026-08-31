@@ -1,7 +1,6 @@
 /**
- * Shared runtime-neutral test helpers for the mc-host-client suites.
- * `node:assert/strict` only — no bun:test — so runtime-neutral callers
- * (like the adversarial scenario runner) can import everything here.
+ * These helpers support runtime-neutral mc-host-client test suites.
+ * `node:assert/strict` keeps this module free of `bun:test`.
  */
 
 import assert from "node:assert/strict";
@@ -29,7 +28,7 @@ import type { OpaqueObject } from "../transport-negotiation";
 import type { CandidateChannelArgs, ClientTransportProvider } from "../transport-provider";
 import { FakePeer, type FakePeerOptions } from "./fake-peer";
 
-/** Await a promise that MUST reject and return its rejection value. */
+/* */
 export async function rejection(promise: Promise<unknown>): Promise<unknown> {
     return promise.then(
         () => {
@@ -73,16 +72,16 @@ export async function writeConnectionFile(filePath: string, peer: FakePeer): Pro
     await writeFile(filePath, json, { mode: 0o600 });
 }
 
-/** Peer/generation factory whose creations are tracked for cleanup. */
+/** This factory tracks every peer and generation it creates for cleanup. */
 export interface ScenarioContext {
-    /** Start a tracked fake peer; closed by `cleanup()`. */
+    /** The harness closes each peer started by `startPeer` when `cleanup()` runs. */
     startPeer(options?: FakePeerOptions): Promise<FakePeer>;
-    /** Construct a tracked, unstarted generation dialing `peer`. */
+    /** `createGeneration` tracks an unstarted generation that dials `peer`. */
     createGeneration(
         peer: FakePeer,
         overrides?: Partial<ConnectionGenerationOptions>,
     ): ConnectionGeneration;
-    /** Construct AND start a tracked generation under `deadlineMs`. */
+    /** `dial` tracks and starts a generation under `deadlineMs`. */
     dial(
         peer: FakePeer,
         overrides?: Partial<ConnectionGenerationOptions>,
@@ -91,7 +90,7 @@ export interface ScenarioContext {
 }
 
 export interface TrackedHarness extends ScenarioContext {
-    /** Retire every tracked generation, then close every tracked peer. */
+    /** `cleanup()` retires every tracked generation before closing every tracked peer. */
     cleanup(): Promise<void>;
 }
 
@@ -143,10 +142,10 @@ export function createTrackedHarness(): TrackedHarness {
 }
 
 // ----------------------------------------------------------------------
-// In-process paired candidate transport for injected-provider tests.
+// This transport pairs an injected provider with an in-process candidate channel.
 // ----------------------------------------------------------------------
 
-/** One complete frame observed by the host half of the paired channel. */
+/* */
 export interface CandidateHostFrame {
     header: EnvelopeHeader;
     body: Uint8Array;
@@ -160,7 +159,6 @@ interface CandidateWaiter {
 }
 
 /**
- * Scriptable host half of one in-process paired candidate channel. Tests
  * set `onFrame` to script activation, commit, and application responses;
  * `close` fails the client half like a lost channel.
  */
@@ -170,7 +168,7 @@ export class FakeCandidateHost {
     private channel: FakeCandidateChannel | null = null;
     private readonly waiters: CandidateWaiter[] = [];
 
-    /** True once the client half was closed or failed. */
+    /** The client half's closed state is true after it closes or fails. */
     get channelClosed(): boolean {
         return this.channel?.isClosed() ?? false;
     }
@@ -192,7 +190,7 @@ export class FakeCandidateHost {
         this.onFrame?.(frame, this);
     }
 
-    /** Deliver one frame to the client half. */
+    /* */
     send(header: Omit<EnvelopeHeader, "len" | "ver">, body: Uint8Array = new Uint8Array(0)): void {
         this.channel?.deliver(
             { ...header, len: body.length, ver: PROTOCOL_VERSION },
@@ -243,8 +241,7 @@ interface FakeCandidateChannelOptions {
 }
 
 /**
- * Client half of the paired candidate channel. Frames transfer in-process
- * as complete `{header, body}` objects; publication and completion hooks
+ * The client half transfers frames in-process as complete `{header, body}` objects.
  * fire synchronously at `send`, so a queued-cancel is never possible and
  * `cancel()` reports a possible send.
  */
@@ -417,7 +414,7 @@ export interface FakeProviderOptions {
     parameters?: OpaqueObject;
     /** Thrown from `connect` to exercise the sanitized provider boundary. */
     connectError?: Error;
-    /** Rejected from the channel's `start` for the same boundary. */
+    /** Rejected from the channel's `start` to exercise the sanitized provider boundary. */
     startError?: Error;
     /** The channel's `start` never settles, exercising the retirement race. */
     startHang?: boolean;
@@ -429,7 +426,7 @@ export interface FakePairedProvider extends ClientTransportProvider {
     lastDescriptor: OpaqueObject | null;
 }
 
-/** One injected provider paired with a scriptable in-process host half. */
+/** This provider is paired with a scriptable in-process host half. */
 export function createFakePairedProvider(options: FakeProviderOptions = {}): FakePairedProvider {
     const host = new FakeCandidateHost();
     const provider: FakePairedProvider = {
@@ -463,8 +460,7 @@ function candidateBodyJson(frame: CandidateHostFrame): { op?: unknown } | undefi
 }
 
 /**
- * Default host-half script: acknowledge `transport.activate` when the token
- * matches, acknowledge `transport.commit`, and hand every other Request to
+ * The default host script acknowledges `transport.activate` only when the token matches and acknowledges `transport.commit`.
  * `onRequest`.
  */
 export function candidateAutoResponder(

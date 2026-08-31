@@ -1,10 +1,5 @@
 /**
- * Runtime-neutral adversarial scenario harness.
  *
- * Each scenario drives a real `ConnectionGeneration` against the
- * independent `FakePeer` using `node:assert/strict` only — no bun:test —
- * so the same scenarios also execute under Node 24. `connection.test.ts`
- * wraps every scenario in a bun test and adds bun-specific cases on top.
  */
 
 import assert from "node:assert/strict";
@@ -24,7 +19,7 @@ export interface AdversarialScenario {
     run(ctx: ScenarioContext): Promise<void>;
 }
 
-/** Run one scenario with automatic peer/generation cleanup. */
+/* */
 export async function runAdversarialScenario(scenario: AdversarialScenario): Promise<void> {
     const harness = createTrackedHarness();
     try {
@@ -39,8 +34,6 @@ const EPOCH = 9;
 
 export const adversarialScenarios: readonly AdversarialScenario[] = [
     {
-        // Malformed auth: typed failure, no ClientAuth after the failed
-        // check, exactly one retirement notification, no leaked timers.
         name: "auth rejection retires once without emitting ClientAuth",
         async run(ctx) {
             const peer = await ctx.startPeer({ authMode: "wrong-proof" });
@@ -54,15 +47,12 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
             assert.deepEqual(retirements, ["auth_failed"]);
             assert.equal(generation.stats().activeTimers, 0);
             const connection = await peer.waitForConnection();
-            // ClientHello only: a ClientAuth after a failed server proof
-            // would be a second auth message.
+            // The client must not send a second authentication message.
             await connection.closed;
             assert.equal(connection.authMessages.length, 1);
         },
     },
     {
-        // Auth deadline: the peer stalls after ClientHello; setup fails
-        // under its deadline with one retirement and no ClientAuth.
         name: "stalled auth fails under the setup deadline with one retirement",
         async run(ctx) {
             const peer = await ctx.startPeer({ authMode: "stall" });
@@ -80,8 +70,6 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
         },
     },
     {
-        // Fragmentation: one response frame delivered at EVERY split point
-        // of its header+body must decode identically.
         name: "every split point of a header and body decodes",
         async run(ctx) {
             const peer = await ctx.startPeer();
@@ -120,7 +108,6 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
                     body,
                 );
             }
-            // Three-way split across header and body boundaries.
             const request = generation.request({
                 channel: CHANNEL,
                 epoch: EPOCH,
@@ -142,8 +129,6 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
         },
     },
     {
-        // Coalescing: multiple frames (terminals plus a Ping) delivered in
-        // ONE data event all dispatch; the Ping still gets its Pong.
         name: "coalesced frames in one data event all dispatch",
         async run(ctx) {
             const peer = await ctx.startPeer();
@@ -203,9 +188,9 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
         },
     },
     {
-        // Backpressure: many concurrent requests through a non-reading
-        // peer; the peer's independent decoder proves complete frames in
-        // enqueue order with strictly monotonic correlations.
+        // The non-reading peer applies backpressure while concurrent requests enqueue.
+        // The peer's independent decoder verifies complete frames in enqueue order.
+        // Correlations increase strictly monotonically in enqueue order.
         name: "backpressure preserves frame ordering and monotonic correlations",
         async run(ctx) {
             const peer = await ctx.startPeer();
@@ -262,13 +247,12 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
         },
     },
     {
-        // KTD4 send-outcome classification: queued-then-removed is
-        // not_sent; reset after write invocation is outcome_unknown; a
-        // matching Error after invocation is the known terminal.
+        // A request removed before `socket.write()` is `not_sent`.
+        // A reset after `socket.write()` and before a terminal is `outcome_unknown`.
+        // A matching Error after `socket.write()` is the known terminal.
         name: "send outcomes classify not_sent, outcome_unknown, and terminal",
         async run(ctx) {
-            // not_sent: wedge the writer behind a non-reading peer, then
-            // abort a request that never reached socket.write().
+            // A request aborted before `socket.write()` is `not_sent`.
             const peerA = await ctx.startPeer();
             const generationA = await ctx.dial(peerA);
             const connectionA = await peerA.waitForConnection();
@@ -291,8 +275,7 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
             wedge.abort();
             generationA.retire("owner_close");
 
-            // outcome_unknown: peer resets immediately after the request's
-            // bytes were handed to socket.write() and before any terminal.
+            // A reset after `socket.write()` and before a terminal is `outcome_unknown`.
             const peerB = await ctx.startPeer();
             const generationB = await ctx.dial(peerB);
             const connectionB = await peerB.waitForConnection();
@@ -306,8 +289,8 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
             expectMcHostCallError(await rejection(reset.result), "outcome_unknown");
             assert.ok(generationB.isRetired());
 
-            // terminal: a matching Error frame after invocation is the
-            // authoritative known outcome, not outcome_unknown.
+            // A matching Error frame after `socket.write()` is the authoritative known outcome, not `outcome_unknown`.
+            // A matching Error frame after `socket.write()` is the authoritative known outcome, not `outcome_unknown`.
             const peerC = await ctx.startPeer();
             const generationC = await ctx.dial(peerC);
             const connectionC = await peerC.waitForConnection();
@@ -338,9 +321,9 @@ export const adversarialScenarios: readonly AdversarialScenario[] = [
         },
     },
     {
-        // KTD10 cleanup race: a post-write abort settles the caller
-        // promptly while the cleanup ticket stays pending until the
-        // original terminal arrives, then completes exactly once.
+        // A post-write abort settles the caller before the original terminal.
+        // A post-write abort leaves the cleanup ticket pending until the original terminal arrives.
+        // The cleanup ticket completes exactly once when the original terminal arrives.
         name: "post-write abort settles the caller and the cleanup ticket independently",
         async run(ctx) {
             const peer = await ctx.startPeer();

@@ -139,8 +139,7 @@ describe("OpenCodeRetrospectiveRawProvider", () => {
             openOpenCodeDb: () => null,
         });
 
-        // sub1 is filtered out despite being newest; roots are returned oldest-first
-        // so the bounded scan drains historical backlog before newer sessions.
+        // The scan processes oldest sessions first so a bounded scan drains historical backlog before newer sessions.
         expect(provider.listProjectSessions("project-a")).toEqual([
             { sessionId: "root2", updatedAt: 40 },
             { sessionId: "root1", updatedAt: 50 },
@@ -180,10 +179,7 @@ describe("OpenCodeRetrospectiveRawProvider", () => {
 
         const provider = new OpenCodeRetrospectiveRawProvider({ contextDb, opencodeDb });
 
-        // PRIVACY: only genuine typed USER text carries content. Assistant text
-        // is dropped entirely; a tool row carries metadata (name + error flag)
-        // with NO raw output text — so no cross-session secret/file content can
-        // reach the friction prompt.
+        // Only USER text parts reach the friction prompt.
         expect(provider.readUserMessagesSince("s1", 150, 10)).toEqual({
             messages: [
                 {
@@ -220,13 +216,11 @@ describe("OpenCodeRetrospectiveRawProvider", () => {
         }
         const provider = new OpenCodeRetrospectiveRawProvider({ contextDb, opencodeDb });
 
-        // cap 5 ≥ 3 rows → not truncated.
         expect(provider.readUserMessagesSince("s1", 0, 5).truncated).toBe(false);
-        // cap 2 < 3 rows → truncated (the SQL saw a 3rd row past the limit).
+        // The query marks the result truncated after reading a third row beyond the cap of 2.
         const capped = provider.readUserMessagesSince("s1", 0, 2);
         expect(capped.truncated).toBe(true);
         expect(capped.messages).toHaveLength(2);
-        // oldest-first: kept the 2 OLDEST.
         expect(capped.messages.map((m) => m.text)).toEqual(["msg 0", "msg 1"]);
     });
 

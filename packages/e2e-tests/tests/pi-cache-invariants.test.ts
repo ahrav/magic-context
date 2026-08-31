@@ -1,14 +1,7 @@
 /// <reference types="bun-types" />
 
 /**
- * Pi cache-invariant suite — the Pi-harness mirror of tests/cache-invariants.ts.
  *
- * Pi's m[0]/m[1] renderer (inject-compartments-pi.ts) is a SEPARATE
- * implementation from OpenCode's, and the Pi parity audit repeatedly found
- * cache divergences there. This suite asserts the portable replay and
- * m[0]/m[1] taxonomy invariants using the SAME harness-agnostic bust oracle
- * (src/cache-analysis.ts) the OpenCode suite uses, so both harnesses are held
- * to one definition of a cache bust.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -40,7 +33,7 @@ const HIGH_USAGE: MockUsage = {
     cache_read_input_tokens: 0,
 };
 
-// High enough to trip the historian trigger while still below the model limit.
+// 90,000 input tokens trigger the historian while remaining below the 100,000-token model limit.
 const HISTORIAN_TRIGGER_USAGE: MockUsage = {
     input_tokens: 90_000,
     output_tokens: 20,
@@ -63,7 +56,7 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
     return false;
 }
 
-/** Line-anchored [N] U:/A: ordinal range, scoped to the <new_messages> block. */
+/* */
 function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
     const messages = (body.messages as Array<{ content: unknown }> | undefined) ?? [];
     for (const m of messages) {
@@ -146,7 +139,7 @@ function readOldestActiveTag(h: PiTestHarness, sessionId: string): number {
     return row?.tag ?? 0;
 }
 
-/** Emit a single ctx_reduce tool call on the first main-agent request that exposes it. */
+/* */
 function emitCtxReduceOnce(h: PiTestHarness, drop: string): void {
     let emitted = false;
     h.mock.addMatcher((body) => {
@@ -315,7 +308,7 @@ describe("pi cache invariants — m[0]/m[1] taxonomy", () => {
         try {
             installHistorianMatcher(h);
 
-            // Force an early execute so the baseline session-history block materializes empty before any compartment exists.
+            // The test forces an early execute so the baseline session-history block materializes empty before any compartment exists.
             await sendTurn(h, "pi B9 turn 1: warmup.", "pi B9 warm");
             const sessionId = h.lastTurn?.sessionId ?? "";
             expect(sessionId).toBeTruthy();
@@ -325,7 +318,6 @@ describe("pi cache invariants — m[0]/m[1] taxonomy", () => {
             const m0BaselineEmpty = extractM0(mainRequests(h).at(-1)!.body);
             expect(m0BaselineEmpty).toContain("<session-history></session-history>");
 
-            // Build enough raw conversation text for historian compaction, then trigger and publish it.
             for (let i = 4; i <= 11; i++) {
                 await sendTurn(
                     h,
@@ -341,8 +333,7 @@ describe("pi cache invariants — m[0]/m[1] taxonomy", () => {
                 label: "pi B9 compartment publishes",
             });
 
-            // Keep sending execute-eligible turns until the new compartment appears in the second
-            // request body. If historian still holds the lease, Pi defers mutations, so retry under pressure.
+            // If the historian holds the lease, Pi defers mutations, so the test continues execute-eligible turns until the lease releases.
             let surfaceReq = mainRequests(h).find((r) => extractM1(r.body)?.includes("<new-compartments>"));
             for (let attempt = 0; attempt < 4 && !surfaceReq; attempt++) {
                 await waitForLeaseFree(h, sessionId, "historian lease free before B9 surface execute");

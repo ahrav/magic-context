@@ -1,10 +1,7 @@
-//! Host-owned handler contract.
 //!
-//! `magic-context-c50.4` will adapt `McHandler` onto this boundary. It is
-//! deliberately independent of the private subc SDK: no `subc-*` type appears
-//! here, the handler never sees socket frames, credentials, correlations, or
-//! route allocation, and the host owns lifecycle transitions, terminal
-//! arbitration, and wire emission (plan KTD2).
+//! The boundary excludes private `subc-*` SDK types.
+//! Handlers do not receive socket frames, credentials, correlations, or route allocation.
+//! The host owns lifecycle transitions, terminal arbitration, and wire emission.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -15,23 +12,20 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::HostInit;
 
-/// Catalog-visible snapshot of the linked module's manifest.
 ///
-/// `provides` is carried as raw JSON so `catalog.list` can return it without
-/// lossy rewriting (protocol §7.3). The host reads each entry's top-level
-/// `role` for admission and preserves the remaining role data unchanged.
+/// The host retains `provides` as raw JSON so `catalog.list` returns it without lossy rewriting.
+/// The host reads each entry's top-level `role` for admission.
 #[derive(Debug, Clone)]
 pub struct ManifestSnapshot {
     pub module_id: String,
     pub module_version: String,
-    /// The manifest's complete `provides` array, including tool schemas.
+    /// `provides` retains the complete manifest array, including tool schemas.
     pub provides: Vec<serde_json::Value>,
-    /// Implemented module control operations only; truthfulness here is what
-    /// keeps wake-plane probing fail-open (protocol §7.3).
+    /// `control_ops` lists only implemented module control operations.
     pub control_ops: Vec<String>,
 }
 
-/// One live route: `(channel, epoch)` allocated by the host before bind.
+/// The host allocates each `(channel, epoch)` route before binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RouteHandle {
     pub channel: u16,
@@ -54,56 +48,44 @@ impl TargetKind {
     }
 }
 
-/// Which pending-request and handler-task permit class a module's routes
-/// draw on (plan KTD2).
+/// Each route uses its module's pending-request and handler-task permit class.
 ///
-/// The class is fixed per module by its [`ResourceDeclaration`], stored on
-/// each installed route at bind time, and read back by dispatch — the host
-/// never parses application bodies to pick a class, so long-settling
-/// reserved work (Broca subscriptions) and general Magic Context/Synapse
-/// traffic cannot consume each other's admission capacity (protocol §8.3).
+/// `ResourceDeclaration` fixes the route class for every module.
+/// The host stores the class on each route at bind time and dispatch reads that stored value.
+/// The host never parses application bodies to select a permit class.
+/// Reserved work and general traffic use separate admission capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RouteClass {
-    /// Draws on the shared pools left after every reservation. The default,
-    /// and the only class a zero-reservation handler ever uses.
+    /// `General` draws on capacity remaining after every reservation.
+    /// A zero-reservation handler uses only `General`.
     #[default]
     General,
-    /// Draws only on permits the module reserved at startup.
+    /// `Reserved` draws only on permits reserved for its module at startup.
     Reserved,
 }
 
-/// One immutable, host-neutral, pre-initialization declaration of the
-/// runtime resources a module reserves (plan KTD2).
+/// Modules declare reserved runtime resources before initialization.
 ///
-/// The runtime checked-sums declarations across all modules before handler
-/// initialization: reserved pending/task slots are carved out of the
-/// configured limits into a separate permit class, and retained resident
-/// bytes are subtracted from the frame-admission (ingress) pool alongside
-/// the resident catalog. Startup refuses any configuration that leaves
-/// fewer than one general pending slot, one general task slot, or one
-/// maximum-size ingress body. The all-zero default preserves the original
-/// single-pool behavior exactly.
+/// Before handler initialization, the runtime sums declarations across all modules.
+/// The runtime removes reserved pending and task slots from the configured general limits.
+/// The runtime assigns reserved pending and task slots to a separate permit class.
+/// The runtime subtracts retained resident bytes from the ingress pool alongside the resident catalog.
+/// Startup rejects configurations that leave fewer than one general pending slot, one general task slot, or one maximum-size ingress body.
+/// The all-zero declaration preserves single-pool behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResourceDeclaration {
-    /// Handler-task permits carved out of `max_handler_tasks` for this
-    /// module's reserved class.
+    /// `reserved_handler_tasks` is deducted from `max_handler_tasks` for the module's reserved permit class.
     pub reserved_handler_tasks: usize,
-    /// Pending-request permits carved out of `max_pending_requests` for
-    /// this module's reserved class.
+    /// `reserved_pending_requests` is deducted from `max_pending_requests` for the module's reserved permit class.
     pub reserved_pending_requests: usize,
-    /// Resident bytes this module retains for its own bounded state (for
-    /// example Broca's 64 MiB replay budget). An accounting reservation
-    /// subtracted from ingress; the module enforces its own internal budget.
+    /// `retained_resident_bytes` is deducted from ingress capacity; the module enforces its internal memory budget.
     pub retained_resident_bytes: u64,
-    /// Upper bound on general-class handler tasks this module can hold
-    /// concurrently parked on internal admission (for example Synapse's
-    /// one running query plus its FIFO waiters, each awaiting a lane permit
-    /// inside its handler task until the request deadline). Not a carve-out:
-    /// the tasks still draw on the general pool. Startup checked-sums these
-    /// bounds and refuses a configuration whose parked tasks could consume
-    /// every general slot, which would let one module's waiting traffic
-    /// starve every other route of dispatch capacity. Zero declares no
-    /// long-parked general tasks.
+    /// `general_task_hold_bound` limits general-pool handler tasks parked on internal admission.
+    /// Parked tasks use the general pool.
+    /// Startup sums `general_task_hold_bound` across modules.
+    /// Startup rejects configurations whose parked tasks could consume every general slot.
+    /// Consuming every general slot would let one module's waiting traffic starve other routes of dispatch capacity.
+    /// `general_task_hold_bound = 0` declares no long-parked general tasks.
     pub general_task_hold_bound: usize,
     /// The permit class every route bound to this module dispatches under.
     pub route_class: RouteClass,
@@ -115,8 +97,7 @@ pub struct RouteTarget {
     pub kind: TargetKind,
 }
 
-/// Caller-supplied route scope. Every field is an unverified claim: it scopes
-/// handler state and never grants authority (protocol §2, §7.1).
+/// `RouteIdentity` fields are unverified claims that scope handler state but never grant authority.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RouteIdentity {
     pub project_root: PathBuf,
@@ -131,8 +112,7 @@ pub struct RouteIdentity {
 
 impl std::fmt::Debug for RouteIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Identity claims are sensitive diagnostics (protocol V24): report
-        // bounded structural metadata only, never the values.
+        // `Debug` exposes only structural metadata because identity claims may contain sensitive data.
         f.debug_struct("RouteIdentity")
             .field("project_root_len", &self.project_root.as_os_str().len())
             .field("harness_len", &self.harness.len())
@@ -155,8 +135,7 @@ impl std::fmt::Debug for RouteIdentity {
 #[derive(Clone, PartialEq, Eq)]
 pub enum BindOutcome {
     Accept,
-    /// The route is never published; the client receives this as the terminal
-    /// error for its `route.open` correlation.
+    /// `Reject` prevents route publication and terminates the `route.open` correlation with an error.
     Reject {
         code: String,
         message: String,
@@ -165,8 +144,7 @@ pub enum BindOutcome {
 
 impl std::fmt::Debug for BindOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Rejection code and message are handler-controlled and can carry
-        // identity data; diagnostics get lengths only (protocol V24).
+        // Handler-controlled rejection codes and messages may contain identity data, so diagnostics expose only lengths.
         match self {
             Self::Accept => f.write_str("Accept"),
             Self::Reject { code, message } => f
@@ -185,7 +163,7 @@ pub enum HealthStatus {
     Failing,
 }
 
-/// Internal health snapshot. Never exposed as a client JSON operation
+/// Client JSON operations do not expose the health snapshot.
 /// (protocol §9.3).
 #[derive(Debug, Clone)]
 pub struct HealthReport {
@@ -204,10 +182,8 @@ impl HealthReport {
     }
 }
 
-/// How one routed request settles from the handler's side.
 ///
-/// Output storage must be reserved through [`RequestCtx::reserve_output`]
-/// before allocation; an already allocated `Vec` cannot bypass the host's
+/// `RequestCtx::reserve_output` must reserve output storage before allocation; preallocated `Vec`s cannot bypass host limits.
 /// resident-byte budget:
 ///
 /// ```compile_fail
@@ -218,24 +194,22 @@ impl HealthReport {
 /// };
 /// ```
 pub enum RequestOutcome {
-    /// Unary success; the host emits one `Response` terminal whose wire
-    /// `binary` flag mirrors `binary`, exactly like [`RequestCtx::stream`]
+    /// The `binary` flag has the same semantics as `RequestCtx::stream`.
     /// items.
     Response { body: OutputBuffer, binary: bool },
-    /// Application failure; the host emits one canonical `Error` terminal.
+    /// An application failure causes the host to emit one canonical `Error` terminal.
     Error {
         code: String,
         message: String,
-        /// Advisory delay before retrying this operation.
+        /// The delay is advisory; callers may retry sooner.
         retry_after_ms: Option<u64>,
     },
-    /// Stream items were emitted through [`RequestCtx::stream`]; the host
-    /// emits the `StreamEnd` terminal.
+    /// The host emits `StreamEnd` after items emitted through `RequestCtx::stream`.
+    /// The host emits the `StreamEnd` terminal.
     Streamed,
 }
 
 impl RequestOutcome {
-    /// Constructs an error without retry timing metadata.
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Error {
             code: code.into(),
@@ -244,7 +218,6 @@ impl RequestOutcome {
         }
     }
 
-    /// Constructs an error with an advisory retry delay.
     pub fn error_retry_after(
         code: impl Into<String>,
         message: impl Into<String>,
@@ -260,9 +233,9 @@ impl RequestOutcome {
 
 impl std::fmt::Debug for RequestOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Error code and message are handler-controlled and can carry
-        // request or identity data; diagnostics get lengths only (protocol
-        // V24), matching OutputBuffer and RequestCtx.
+        // Handler-controlled error codes and messages can contain request or identity data; diagnostics expose only their lengths.
+        // Handler-controlled error codes and messages can contain request or identity data; diagnostics expose only their lengths.
+        // Protocol V24 diagnostics expose only error-code and message lengths, matching `OutputBuffer` and `RequestCtx`.
         match self {
             Self::Response { body, binary } => f
                 .debug_struct("Response")
@@ -284,9 +257,9 @@ impl std::fmt::Debug for RequestOutcome {
     }
 }
 
-/// Owned semantic request body with its resident-byte charge attached.
-/// Transport bytes are decoded or copied synchronously before construction,
-/// so asynchronous handler work never retains a receive lease.
+/// The semantic request body owns its resident-byte charge.
+/// The host decodes or copies transport bytes before construction, so asynchronous handler work never retains a receive lease.
+/// Asynchronous handler work never retains a receive lease.
 pub struct InputBuffer {
     pub(crate) body: Vec<u8>,
     pub(crate) _charge: crate::wire::ByteCharge,
@@ -323,10 +296,9 @@ impl std::fmt::Debug for InputBuffer {
     }
 }
 
-/// Host-reserved output storage.
 ///
 /// The host acquires the resident-byte charge before allocating this buffer.
-/// Its fixed maximum keeps later writes from growing beyond that reservation;
+/// The buffer's fixed maximum prevents writes from exceeding its reservation.
 /// the charge moves with the body into the connection writer.
 pub struct OutputBuffer {
     pub(crate) body: Vec<u8>,
@@ -347,8 +319,8 @@ pub(crate) enum OutputParts {
 
 impl std::fmt::Debug for OutputBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Reserved output holds application data, which stays out of
-        // diagnostics (protocol V24) — mirror RequestCtx's body_len-only
+        // Diagnostics expose only the reserved output length, not application data.
+        // Diagnostics mirror `RequestCtx` by exposing only the body length.
         // policy.
         f.debug_struct("OutputBuffer")
             .field("len", &self.len())
@@ -377,7 +349,7 @@ impl OutputBuffer {
         &self.body
     }
 
-    /// Appends bytes without permitting allocation beyond the host reservation.
+    /// `OutputBuffer::append` appends bytes without allocating beyond the host reservation.
     pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), StreamClosed> {
         if self.direct.is_some() || bytes.len() > self.max_len.saturating_sub(self.body.len()) {
             return Err(StreamClosed);
@@ -386,7 +358,7 @@ impl OutputBuffer {
         Ok(())
     }
 
-    /// Resizes within the fixed reservation without permitting further growth.
+    /// `OutputBuffer::resize` resizes within the fixed reservation without permitting further growth.
     pub fn resize(&mut self, new_len: usize, value: u8) -> Result<(), StreamClosed> {
         if self.direct.is_some() || new_len > self.max_len {
             return Err(StreamClosed);
@@ -416,10 +388,10 @@ impl io::Write for OutputBuffer {
     }
 }
 
-/// Context for one dispatched request. Dropping it without returning an
-/// outcome leaves settlement to the host (cancellation or teardown).
+/// Dropping `RequestCtx` without returning an outcome leaves settlement to the host through cancellation or teardown.
+/// Dropping `RequestCtx` without returning an outcome leaves settlement to the host through cancellation or teardown.
 ///
-/// `RequestCtx` specifically hides transport correlations, sockets, and
+/// `RequestCtx` hides transport correlations and sockets.
 /// credentials:
 ///
 /// ```compile_fail
@@ -435,22 +407,21 @@ impl io::Write for OutputBuffer {
 /// ```
 pub struct RequestCtx {
     pub route: RouteHandle,
-    /// Opaque owned semantic body. Binary or JSON per `binary`.
+    /// `RequestBody` owns an opaque semantic body; `binary` selects binary or JSON encoding.
     /// Retaining the body retains its ingress byte charge.
     pub body: InputBuffer,
     pub binary: bool,
     pub(crate) cancel: CancellationToken,
     pub(crate) stream: crate::dispatch::StreamSink,
-    /// Pool funding request scratch and request-derived ownership. Separate
-    /// from the pool that charged `body`, so holding these bytes can never
-    /// stall another connection's frame admission.
+    /// `scratch` funds request scratch and request-derived ownership.
+    /// `scratch` is separate from the pool that charged `body`.
+    /// `scratch` charges cannot stall another connection's frame admission.
     pub(crate) scratch: crate::wire::ByteBudget,
 }
 
 impl RequestCtx {
-    /// Resolves when the host has requested cancellation of this request
-    /// (client `Cancel`, route close, or shutdown). Best effort: the handler
-    /// may still complete, and the host's first-terminal-wins arbiter decides.
+    /// The future resolves when the host requests cancellation.
+    /// The request may still complete because the host's first-terminal-wins arbiter selects the outcome.
     pub fn cancelled(&self) -> impl Future<Output = ()> + Send + '_ {
         self.cancel.cancelled()
     }
@@ -461,8 +432,7 @@ impl RequestCtx {
 
     /// Reserves capacity and its resident-byte charge before allocating output.
     ///
-    /// The returned buffer can hold at most `max_len` body bytes. Its charge
-    /// transfers into either a unary response or a stream item.
+    /// The returned buffer holds at most `max_len` body bytes and transfers its charge into a unary response or stream item.
     pub async fn reserve_output(&self, max_len: usize) -> Result<OutputBuffer, StreamClosed> {
         self.stream.reserve(max_len).await
     }
@@ -476,29 +446,28 @@ impl RequestCtx {
         self.stream.reserve_direct(exact_len, serializer).await
     }
 
-    /// Reserves resident bytes for request-derived state the handler is about to
-    /// allocate — parse scratch, an owned tree decoded from `body`, anything whose
-    /// lifetime is the request rather than the response.
+    /// The reservation covers request-derived allocations, including parse scratch and owned trees decoded from `body`.
+    /// The reservation covers state whose lifetime is the request rather than the response.
     ///
-    /// `None` means the pool cannot cover it right now. Charge BEFORE allocating:
-    /// a reservation taken afterwards has already let the allocation escape the
-    /// envelope, and concurrent requests each escape by their own full amount.
-    /// The returned charge releases on drop, so hold it for as long as the bytes
+    /// `None` means the pool cannot cover the request now; reserve before allocating.
+    /// Reserving after allocation lets the allocation escape the resident envelope.
+    /// Concurrent requests can each exceed the envelope by their full allocation.
+    /// The returned charge releases on drop; retain it while the charged bytes are resident.
     /// are live.
     pub fn try_reserve_resident(&self, bytes: usize) -> Option<crate::wire::ByteCharge> {
         self.scratch.try_charge(bytes)
     }
 
-    /// The resident ceiling `try_reserve_resident` is measured against. A
-    /// reservation above this can never be acquired, so callers report it
-    /// as a permanent rejection instead of retryable backpressure.
+    /// The resident ceiling bounds `try_reserve_resident`.
+    /// Reservations above the resident ceiling cannot be acquired.
+    /// Callers treat requests above the resident ceiling as permanent rejection, not retryable backpressure.
     pub fn resident_capacity(&self) -> usize {
         self.scratch.capacity()
     }
 
-    /// Queues one nonterminal `StreamData` item, in order. Returns `Err` once
-    /// the request is cancelled, a terminal is selected, or the connection is
-    /// gone; the handler should stop streaming then.
+    /// The stream queues one nonterminal `StreamData` item in order.
+    /// The method returns `Err` after cancellation, terminal selection, or connection loss.
+    /// After `Err`, `stream` cannot queue another item.
     pub async fn stream(&self, item: OutputBuffer, binary: bool) -> Result<(), StreamClosed> {
         self.stream.send(item, binary).await
     }
@@ -516,9 +485,7 @@ impl std::fmt::Debug for RequestCtx {
     }
 }
 
-/// Output reservation or streaming can no longer proceed because admission
-/// was rejected, cancellation or terminal selection occurred, or the
-/// connection was lost.
+/// Output reservation or streaming cannot proceed after admission rejection, cancellation, terminal selection, or connection loss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamClosed;
 
@@ -530,7 +497,6 @@ impl std::fmt::Display for StreamClosed {
 
 impl std::error::Error for StreamClosed {}
 
-/// Handler initialization failure; prevents publication and fails startup.
 #[derive(Debug)]
 pub struct InitError(pub String);
 
@@ -542,37 +508,26 @@ impl std::fmt::Display for InitError {
 
 impl std::error::Error for InitError {}
 
-/// The linked module's lifecycle surface, called only by the host.
 ///
-/// Concurrency: `handle` runs on independent tasks and may overlap itself,
-/// `health`, and lifecycle callbacks for other routes. `initialize` is called
-/// exactly once before the listener binds. `bind` precedes any request for its
-/// route. `route_gone` follows completion or forced abort of that route's
-/// request tasks and runs exactly once per handle the handler observed,
-/// including rejected binds. `health` runs on a dedicated host task.
 ///
-/// Failure policy (plan KTD9): a panic or deadline overrun in `initialize`,
-/// `bind`, `route_gone`, or `health` is host-fatal. A panic in `handle` maps
-/// to one `internal_error` terminal for that correlation only (when the
-/// runtime unwinds; under `panic=abort` any panic kills the process).
 pub trait McHostHandler: Send + Sync + 'static {
     fn manifests(&self) -> Vec<ManifestSnapshot>;
 
-    /// One immutable resource declaration per [`McHostHandler::manifests`]
-    /// entry, in the same order, read exactly once before initialization
-    /// (plan KTD2). The default declares zero reservations for every
-    /// module, which preserves single-pool admission unchanged.
+    /// Implementations return one immutable `ResourceDeclaration` for each `manifests` entry.
+    /// The host reads declarations once before initialization, in manifest order.
+    /// The default returns zero-reservation declarations for every module.
+    /// Zero reservations preserve existing single-pool admission.
     fn resource_declarations(&self) -> Vec<ResourceDeclaration> {
         vec![ResourceDeclaration::default(); self.manifests().len()]
     }
 
-    /// Installs the incarnation bearer for protocol-internal credential-row
-    /// fingerprints before any component initialization or route bind.
+    /// `install_connection_key` installs the incarnation bearer used for protocol-internal credential-row fingerprints.
+    /// The host calls `install_connection_key` before component initialization or route binding.
     fn install_connection_key(&self, _key: [u8; 32]) {}
 
     fn initialize(&self, init: HostInit) -> impl Future<Output = Result<(), InitError>> + Send;
 
-    /// Runs once after transport publication, before the accept loop, and is never awaited for readiness: storage opening and model construction belong here rather than in `initialize`, so transport never waits behind them. An expected artifact fault resolves to `Ok(())` with that lane internally degraded; `Err`, panic, and task loss are invariant failures that reach the host-fatal channel. Shutdown abandons an unfinished activation future, so long-running work must live in component-owned trackers that `shutdown` drains.
+    /// `activate` runs after transport publication and before request acceptance without gating readiness. For expected artifact faults, `activate` degrades the affected lane and returns `Ok(())`; `Err`, panic, and task loss are host-fatal. Because `shutdown` abandons unfinished activation, long-running work must use component-owned trackers drained by `shutdown`.
     fn activate(&self) -> impl Future<Output = Result<(), InitError>> + Send {
         async { Ok(()) }
     }
@@ -590,15 +545,15 @@ pub trait McHostHandler: Send + Sync + 'static {
 
     fn health(&self) -> impl Future<Output = HealthReport> + Send;
 
-    /// Drains handler-owned work and releases handler-owned resources. The
-    /// host awaits this before it releases the single-instance fence, so a
-    /// successor cannot start against work this call has not stopped.
+    /// `shutdown` drains handler-owned work and releases handler-owned resources.
+    /// The host awaits `shutdown` before releasing the single-instance fence.
+    /// Awaiting `shutdown` prevents a successor from starting while handler-owned work remains.
     ///
-    /// Runs at most once per incarnation, and it can run against a handler
-    /// whose `initialize` was interrupted rather than completed: an aborted
-    /// initialization can already have handed work to handler-owned trackers,
-    /// and only this call stops it. Implementations must therefore tolerate
-    /// partially initialized state — cancel, close, and drain whatever exists
-    /// instead of asserting that setup finished.
+    /// `shutdown` runs at most once per incarnation and may run against a partially initialized handler.
+    /// `shutdown` may run after `initialize` is interrupted.
+    /// An interrupted `initialize` may already have handed work to handler-owned trackers.
+    /// Only `shutdown` stops work held by handler-owned trackers.
+    /// Implementations must tolerate partially initialized state by cancelling, closing, and draining existing resources.
+    /// Implementations must not assert that initialization finished.
     fn shutdown(&self) -> impl Future<Output = ()> + Send;
 }

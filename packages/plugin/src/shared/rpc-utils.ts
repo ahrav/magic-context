@@ -11,7 +11,7 @@ export interface RpcPortFileRecord {
     started_at: number;
     /** Optional producer-provided kind; older records omit it. */
     kind?: string;
-    /** Compatibility with discovery records that used the harness name. */
+    /** Older discovery records use `harness`. */
     harness?: string;
     /**
      * Per-process bearer token. The server requires it on all non-health RPC
@@ -22,25 +22,25 @@ export interface RpcPortFileRecord {
      * auth required" only when the server itself didn't set one).
      */
     token?: string;
-    /** Per-server filename nonce; prevents same-process instances from sharing one file. */
+    /** When present, `instance_id` distinguishes port-file names for same-PID instances. */
     instance_id?: string;
 }
 
 /**
  * Stable hash for a project directory — scopes RPC port files per-project
- * so multiple OpenCode instances don't collide.
+ * so different project directories use separate RPC port-file directories unless their 64-bit hashes collide.
  */
 export function projectHash(directory: string): string {
     const normalized = directory.replace(/\/+$/, "");
     return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
 }
 
-/** Directory containing per-process RPC discovery files for a project. */
+/* */
 export function rpcPortDir(storageDir: string, directory: string): string {
     return join(storageDir, "rpc", projectHash(directory));
 }
 
-/** Per-process RPC port file path. */
+/* */
 export function rpcPortFilePath(
     storageDir: string,
     directory: string,
@@ -51,7 +51,7 @@ export function rpcPortFilePath(
     return join(rpcPortDir(storageDir, directory), `port-${pid}${suffix}.json`);
 }
 
-/** Legacy single-port file used by v0.18.0 and earlier. */
+/* */
 export function legacyRpcPortFilePath(storageDir: string, directory: string): string {
     return join(rpcPortDir(storageDir, directory), "port");
 }
@@ -230,7 +230,7 @@ function readPsProcessCommand(pid: number): string | null {
     }
 }
 
-/** Reuse the platform-gated command probes used by PID identity checks. */
+/* */
 export function readProcessCommand(pid: number): string | null {
     if (!Number.isInteger(pid) || pid <= 0) return null;
     return rpcIdentityPlatform === "linux"
@@ -397,10 +397,9 @@ export interface PiProcessDiscovery {
 }
 
 /**
- * Inspect Pi/OMP processes without converting a failed process-list probe into
- * false evidence that no harness is running. Callers choose their own policy
- * for the unreadable state: destructive maintenance can fail closed, while a
- * migration guard can proceed after reporting that no live Pi process was confirmed.
+ * A failed process-list probe leaves database ownership inconclusive.
+ * Failed probes return `unreadable` rather than indicating that no harness is running.
+ * Destructive maintenance can fail closed when `state` is `"unreadable"`.
  */
 export function inspectLivePiProcesses(): PiProcessDiscovery {
     if (process.env.NODE_ENV === "test" && !rpcProcessListTestOverride) {
@@ -452,7 +451,7 @@ export function inspectLivePiProcesses(): PiProcessDiscovery {
     }
 }
 
-/** Enumerate live Pi/OMP harness processes before deciding whether migration can proceed. */
+/* */
 export function discoverLivePiProcessIds(): number[] {
     return inspectLivePiProcesses().processIds;
 }

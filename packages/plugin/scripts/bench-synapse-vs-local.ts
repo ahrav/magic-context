@@ -1,9 +1,8 @@
 #!/usr/bin/env bun
 /**
- * Speed benchmark: the default local embedding lane vs Synapse over the subc
- * daemon, embedding real compartment texts pulled read-only from context.db.
+ * This script benchmarks the default local embedding lane against Synapse over the subc daemon.
  *
- * Usage: bun packages/plugin/scripts/bench-synapse-vs-local.ts [--n 100]
+ * Users invoke this script with `bun packages/plugin/scripts/bench-synapse-vs-local.ts [--n 100]`.
  */
 
 import { homedir } from "node:os";
@@ -15,8 +14,6 @@ import { LocalEmbeddingProvider } from "../src/features/magic-context/memory/emb
 const nIdx = process.argv.indexOf("--n");
 const N = nIdx >= 0 ? Number(process.argv[nIdx + 1]) : 100;
 
-// Real corpus: compartment P1 paraphrases (the same content class the chunk
-// embedder feeds), read-only.
 const { Database } = await import("bun:sqlite");
 const db = new Database(join(homedir(), ".local/share/cortexkit/magic-context/context.db"), {
     readonly: true,
@@ -34,7 +31,6 @@ const items = rows.map((r) => ({
     contentSha256: new Bun.CryptoHasher("sha256").update(r.p1).digest("hex"),
 }));
 
-// Lane 1: Synapse over subc (gte-modernbert-base f16, Metal).
 {
     const connectionFile = join(homedir(), ".local/share/cortexkit/run/subc-connection.json");
     const metadata = await SynapseEmbeddingProvider.discover({
@@ -50,8 +46,7 @@ const items = rows.map((r) => ({
         fingerprint: metadata.fingerprint,
         tableEpoch: metadata.table_epoch,
     });
-    // Warm call outside the timed window so route open + model residency are
-    // not billed to the throughput number.
+    // The timed interval excludes the warmup embed.
     await provider.embed("warmup");
     const t = Date.now();
     const result = await provider.embedItems(items);
@@ -61,7 +56,6 @@ const items = rows.map((r) => ({
     );
 }
 
-// Lane 2: the default local embedding model (ONNX, 512-token truncation).
 {
     const provider = new LocalEmbeddingProvider();
     const warm = await provider.embed("warmup");

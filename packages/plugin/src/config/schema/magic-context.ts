@@ -11,44 +11,30 @@ import { isValidPromptSurfaceModelKey } from "../../shared/prompt-surface";
 import { AgentOverrideConfigSchema } from "./agent-overrides";
 
 export const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
-// Output reservation now removes generation capacity from the usable window.
-// The 90% cap leaves roughly 10% of that safe input budget for mid-turn growth;
-// escalation derives above the effective threshold and the 95% wall stays fixed.
+// The 95% emergency wall remains above the 90% execute-threshold cap.
 export const EXECUTE_THRESHOLD_CAP_MESSAGE =
     "execute_threshold is capped at 90% for cache safety: output capacity is reserved from the usable context window, and the remaining 10% absorbs mid-turn growth before the absolute 95% emergency wall. Use a value between 20 and 90.";
 export const DEFAULT_HISTORIAN_TIMEOUT_MS = 300_000;
 export const DEFAULT_HISTORY_BUDGET_PERCENTAGE = 0.15;
 
-// bge-small beat MiniLM and four other candidates on the judged in-domain
-// retrieval benchmark (development and sealed holdout both), at the same
-// 384-dim vector size. Its CLS pooling and query-side instruction are bound to
-// the model id in embedding-local.ts, so the default stays correct end to end.
 export const DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/bge-small-en-v1.5";
 
-/** The previous local default. Setup wizards used to write it as an explicit
- *  pin, so configs carrying this exact value are almost always echoing the
- *  then-default rather than expressing a preference. Doctor surfaces those pins
- *  with the remedy; nothing rewrites a user's config automatically, because the
- *  file carries no provenance and a deliberate pin must keep working. */
+/** Configs with this value may be deliberate pins and must not be rewritten automatically.
+ * */
 export const RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 
-// Re-exported from the (DB-free) task registry so the schema and the runtime
-// scheduler share ONE source of truth for task names. DreamingTask remains the
-// agentic tasks (those driven by buildDreamTaskPrompt); CANONICAL_DREAM_TASKS
-// is the full task set used for per-task scheduling config.
 export type DreamingTask = (typeof AGENTIC_DREAM_TASKS)[number];
 
-/** Valid thinking levels for Pi subagents. Maps to Pi's --thinking CLI flag.
- *  Off: disable reasoning. Minimal/low/medium/high/xhigh/max: increasing reasoning depth.
- *  `max` was added in Pi 0.83.0.
+/** PiThinkingLevelSchema maps to Pi's `--thinking` CLI flag.
+ * `off` disables reasoning; `minimal` through `max` increase reasoning depth.
  *  Pi-only — OpenCode uses `variant` in agent config instead. */
 export const PiThinkingLevelSchema = z
     .enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
     .optional();
 export type PiThinkingLevel = z.infer<typeof PiThinkingLevelSchema>;
 
-/** Pi-only child-process controls. This block is intentionally optional so an
- * absent allowlist preserves Pi's normal extension discovery behavior. */
+/** An absent allowlist preserves Pi's normal extension discovery behavior.
+ * */
 export const PiConfigSchema = z
     .object({
         subagent_extensions: z
@@ -62,7 +48,7 @@ export const PiConfigSchema = z
 export type PiConfig = NonNullable<z.infer<typeof PiConfigSchema>>;
 
 /**
- * Route the built-in prompt surface without changing guidance or tool registration.
+ * PromptSurfacePresetSchema routes the built-in prompt surface without changing guidance or tool registration.
  * Project config can choose preset routing; only user config can provide override text.
  */
 export const PromptSurfacePresetSchema = z.enum(["full", "light"]);
@@ -72,8 +58,7 @@ const PromptSurfaceModelKeySchema = z.string().refine(isValidPromptSurfaceModelK
     message:
         "Use a non-empty bare model key, provider/model key, or the literal provider/* wildcard; model IDs may contain additional slashes and matching is case-sensitive.",
 });
-// Tool-description keys must be non-empty IDs; harness-specific known-tool
-// validation can run when a user override is applied.
+// Harness-specific known-tool validation runs when a user override is applied.
 const PromptSurfaceToolKeySchema = z.string().refine((value) => value.trim().length > 0, {
     message: "tool description keys must not be empty or whitespace-only",
 });
@@ -115,7 +100,7 @@ export const PromptSurfaceConfigSchema = z
     );
 export type PromptSurfaceConfig = z.infer<typeof PromptSurfaceConfigSchema>;
 
-/** A 5-field cron expression, or "" to disable the task. */
+/** An empty string disables the task; otherwise the value must be a five-field cron expression. */
 const CronScheduleSchema = z
     .string()
     .refine((s) => s.trim() === "" || isValidCron(s), {
@@ -124,9 +109,8 @@ const CronScheduleSchema = z
     })
     .describe('5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task.');
 
-/** Per-task scheduling + model config. Model/fallback/thinking inherit the
- *  dreamer-level defaults when omitted. Task-specific params (promotion_threshold)
- *  are optional and only meaningful for their owning task. */
+/** When omitted, model, fallback, and thinking inherit dreamer-level defaults.
+ * */
 const DreamTaskBaseConfigSchema = z.object({
     schedule: CronScheduleSchema.default(""),
     model: z.string().optional().describe("Per-task model override (inherits dreamer.model)"),
@@ -169,19 +153,16 @@ const PromotePrimersTaskConfigSchema = DreamTaskBaseConfigSchema.extend({
 });
 export type DreamTaskConfig = z.infer<typeof DreamTaskConfigSchema>;
 
-/** Default schedule per task. Preserves v1 behavior: verify runs nightly;
- *  curate runs weekly; classify runs daily after curation; maintain-docs
- *  defaults OFF (it was not in the v1 default list); the two promoted
- *  post-phases run nightly and are gated. */
+/** Default schedules: verify runs nightly; curate runs weekly; classify runs daily after curation.
+ * `maintain-docs` defaults to disabled.
+ * */
 const DEFAULT_TASK_SCHEDULES: Record<DreamTaskName, string> = {
-    // map-memories is a one-time-style backfill (gate: unmapped memories exist).
-    // Default nightly so it drains the pool then no-ops once everything is mapped.
+    // `map-memories` runs nightly until all memories are mapped, then no-ops.
     "map-memories": "0 2 * * *",
     verify: "0 3 * * *",
     "verify-broad": "0 4 * * 0",
     curate: "0 4 * * 0",
-    // Daily trickle: chunks are small (~40 memories), so after the initial
-    // backfill the per-memory cue compression is cheap to run every night.
+    // Each `compress-cues` run processes up to 40 memories.
     "compress-cues": "0 4 * * *",
     "classify-memories": "0 6 * * *",
     retrospective: "0 5 * * *",
@@ -199,11 +180,11 @@ function defaultTaskConfig(task: DreamTaskName): z.input<typeof DreamTaskConfigS
     return base;
 }
 
-// `.default()` in Zod 4 wants the OUTPUT shape; the function form lets us derive
-// it by parsing the (partial) input default so timeout_minutes etc. fill in.
-/** The `tasks` record: one entry per canonical task, each defaulting to its
- *  v1-behavior-preserving schedule. Written explicitly (not via fromEntries) so
- *  the inferred type stays a precise per-key object. */
+// In Zod 4, `.default()` requires an output-shaped default.
+// `parse()` converts the partial input default to the output shape and fills defaults such as `timeout_minutes`.
+/**
+ * `DreamTasksSchema` lists keys explicitly so TypeScript infers a precise per-key object.
+ * */
 export const DreamTasksSchema = z
     .object({
         "map-memories": DreamTaskBaseConfigSchema.default(() =>
@@ -247,7 +228,7 @@ export const DreamTasksSchema = z
         "Per-task scheduling + model config. Each task has its own cron schedule and may override the dreamer-level model.",
     );
 
-/** Combined dreamer agent + per-task scheduling configuration (Dreamer v2). */
+/* */
 export const DreamerConfigSchema = AgentOverrideConfigSchema.merge(
     z.object({
         tasks: DreamTasksSchema.default(() => DreamTasksSchema.parse({})),
@@ -273,11 +254,10 @@ export const SidekickConfigSchema = AgentOverrideConfigSchema.extend({
 }).optional();
 export type SidekickConfig = NonNullable<z.infer<typeof SidekickConfigSchema>>;
 
-/** Historian agent configuration — includes all agent overrides plus two_pass mode.
- *  Two-pass mode runs a second editor pass after the initial historian pass to clean
- *  up low-signal U: lines and cross-compartment duplicates. Recommended for models
- *  without extended thinking; not needed for Claude Sonnet/Opus when reasoning is
- *  enabled via OpenCode variant config. */
+/**
+ * Two-pass mode runs a second editor pass after the initial historian pass.
+ * `two_pass` removes low-signal `U:` lines and cross-compartment duplicates during the second editor pass.
+ * */
 export const HistorianConfigSchema = AgentOverrideConfigSchema.extend({
     two_pass: z
         .boolean()
@@ -421,12 +401,7 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
             provider: "local" as const,
             model: data.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
             ...(data.max_input_tokens ? { max_input_tokens: data.max_input_tokens } : {}),
-            // local_dtype is spread CONDITIONALLY: omitting it when unset keeps
-            // the identity byte-identical for the common no-dtype config, so
-            // adding this field does not force a global re-embed — only configs
-            // that actually set a dtype get a new identity (and under per-model
-            // coexistence even that just coexists + lazily GCs, never a
-            // destructive wipe). Mirrors the truncate fold pattern.
+            // Omit `local_dtype` when unset to preserve the existing identity; a set dtype creates a distinct identity.
             ...(data.local_dtype ? { local_dtype: data.local_dtype } : {}),
         };
     }
@@ -464,8 +439,8 @@ export interface ShadowEmbeddingConfig {
 
 export interface MuralConfig {
     enabled: boolean;
-    /** The CUE COMPRESSOR model for the compress-cues dreamer task (the mural is
-     *  now rendered deterministically, so this no longer names an author model). */
+    /**
+     * */
     model?: string;
 }
 
@@ -476,30 +451,30 @@ export interface MagicContextConfig {
     mural: MuralConfig;
     /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
     transform_mode: "ts" | "rust";
-    /** Auto-update the cached OpenCode plugin wrapper when a newer npm version is available.
+    /** The cached OpenCode plugin wrapper auto-updates when a newer npm version is available.
      *  USER config only; project configs cannot disable it. Default: true. */
     auto_update?: boolean;
-    /** Output language for generated Magic Context prose. USER config only. */
+    /** Only user config can set the output language for generated Magic Context prose. */
     language?: string;
     historian?: HistorianConfig;
     dreamer?: DreamerConfig;
     smart_notes: {
-        /** Flip ownership of authoring-compiled conditions from dreamer to retina. */
+        /** The setting assigns ownership of authoring-compiled conditions to `retina` instead of `dreamer`. */
         retina_handoff: boolean;
     };
     cache_ttl: string | { default: string; [modelKey: string]: string };
-    /** Preset routing for guidance and provider-visible prompt surfaces. */
+    /** The preset routes guidance and provider-visible prompt surfaces. */
     prompt_surface: PromptSurfaceConfig;
-    /** User-only output-token reservation override. Zero disables reservation. */
+    /** Only user config can override output-token reservation; 0 disables reservation. */
     output_reserve?: number | { default: number; [modelKey: string]: number };
-    /** User-only model metadata inputs. */
+    /** Only user config can provide model metadata. */
     models?: { window_overlay_path?: string };
-    /** TUI toast lifetime in milliseconds for Magic Context notifications. Default: 5000. */
+    /* */
     toast_duration_ms?: number;
     execute_threshold_percentage: number | { default: number; [modelKey: string]: number };
-    /** Absolute token thresholds per model. When set for a given model (or via `default`),
-     *  this overrides `execute_threshold_percentage` for that model. Useful for hard caps
-     *  matching provider input limits. Values above 90% × context_limit are clamped with a warning. */
+    /**
+     * `execute_threshold_tokens` overrides `execute_threshold_percentage` for models with a model-specific or default token threshold.
+     * These thresholds support hard caps matching provider input limits; Magic Context clamps values above 90% × `context_limit` and warns. */
     execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
     protected_tags: number;
     clear_reasoning_age: number;
@@ -509,135 +484,121 @@ export interface MagicContextConfig {
         enabled: boolean;
         min_clusters: number;
     };
-    /** Per-connection SQLite tuning for Magic Context's own context.db. */
+    /** Magic Context applies these SQLite settings per connection to its own `context.db`. */
     sqlite: {
         cache_size_mb: number;
         mmap_size_mb: number;
     };
     /**
-     * Keep shared-storage permissions under an external operator's control.
-     * USER config only; project configs cannot weaken local data privacy.
+     * An external operator retains control of shared-storage permissions.
+     * Only user config can set `storage.enforce_private_permissions`; project configs cannot weaken local data privacy.
      */
     storage: {
         enforce_private_permissions: boolean;
     };
     /**
-     * Controls whether and where Magic Context augments the system prompt
-     * (`## Magic Context` guidance, `<project-docs>`, `<user-profile>`,
-     * sticky date) inside `experimental.chat.system.transform`.
+     * Magic Context can inject `## Magic Context` guidance, `<project-docs>`, `<user-profile>`, and a sticky date.
+     * Magic Context injects this content through `experimental.chat.system.transform`.
      *
-     * Internal OpenCode hidden agents (title, summary, compaction) are
-     * always skipped automatically — that's a separate code path.
+     * Magic Context skips hidden OpenCode title, summary, and compaction agents through a separate code path.
      */
     system_prompt_injection: {
-        /** When false, NO injection happens for ANY agent — global escape hatch. */
+        /** When false, Magic Context injects no system-prompt content. */
         enabled: boolean;
         /**
-         * If the agent's system prompt contains any of these substrings,
-         * skip ALL Magic Context injection for that call. Lets users opt
-         * specific agents out (e.g. read-only QA agents that deny our
-         * `ctx_*` tools and don't need the guidance). The default marker
-         * `<!-- magic-context: skip -->` is meant to be added inside the
-         * user's custom agent prompt.
+         * Magic Context skips all system-prompt injection when an agent system prompt contains a configured signature.
          */
         skip_signatures: string[];
     };
-    /** Inject elapsed-time markers between user messages and date ranges on
-     *  compartments so the agent has a wall-clock sense of the session.
-     *  Graduated from `experimental.temporal_awareness`; default: true. */
+    /** Magic Context injects elapsed-time markers between user messages and date ranges on compartments.
+     * Default: true. */
     temporal_awareness: boolean;
-    /** Debug: when true, keep the child sessions Magic Context spawns for its
-     *  own subagents (historian, dreamer, sidekick, memory-migration) instead
-     *  of deleting them on success. For short-term inspection/data collection;
-     *  kept sessions accumulate until manually cleared. Default false. */
+    /** When true, Magic Context retains child sessions spawned for historian, dreamer, sidekick, and memory migration; retained sessions accumulate until manually cleared. Default: false.
+     * */
     keep_subagents: boolean;
     /**
-     * When true (default), deterministic inoperability (schema fence, storage
-     * open/migration failure) blocks the primary-session transform with a loud
-     * recovery error instead of silently falling through to native compaction.
-     * USER config only — project tier cannot set this. Not recommended to disable.
+     * `fail_closed_blocking` blocks primary-session transforms when a schema fence or storage open/migration failure makes Magic Context inoperable.
+     * A storage open or migration failure blocks the primary-session transform with a recovery error.
+     * Deterministic inoperability raises a recovery error instead of falling through to native compaction.
+     * Only user configuration can set `fail_closed_blocking`; the project tier cannot set it.
      */
     fail_closed_blocking: boolean;
     /**
-     * Compaction-off mode gate. When `enabled` is false Magic Context stops
-     * managing the context window and keeps only its knowledge layer, letting
-     * the harness's native compaction (or nothing) own the window. USER config
-     * only — project tier `compaction.enabled` is stripped for security.
-     * Boot-resolved: changing it requires a process restart.
+     * When `compaction.enabled` is false, Magic Context stops managing the context window.
+     * When `compaction.enabled` is false, Magic Context retains only its knowledge layer.
+     * When `compaction.enabled` is false, the harness's native compaction, or no compaction, manages the context window.
+     * Only user configuration can set `compaction.enabled`; Magic Context strips project-tier values.
+     * `compaction.enabled` resolves at boot; changing it requires a process restart.
      */
     compaction: {
         enabled: boolean;
     };
-    /** Pi-only controls for Magic Context's OpenCode-parity todowrite surface. */
+    /** Magic Context exposes its OpenCode-parity `todowrite` surface only on Pi. */
     todowrite: {
         enabled: boolean;
         overlay: boolean;
     };
-    /** Pi-only child-process extension controls. */
+    /** Only Pi exposes child-process extension controls. */
     pi?: PiConfig;
-    /** Content-aware reclaim of tool output that a later call supersedes, added
-     *  to the normal age-based auto-drop: superseded todowrite/ctx_reduce/meta
-     *  outputs are dropped, and older edits to a file are compressed to a marker
-     *  that keeps only the filePath. Only runs on a transform pass that is
-     *  already rewriting the messages, so it never triggers a prompt-cache miss
-     *  on its own; when off, the messages sent to the model are byte-identical to
-     *  the age-based-only behavior. Experimental, opt-in, default off until cache
-     *  stability is proven. */
+    /** `smart_drops` reclaims tool output that later calls supersede in addition to normal age-based auto-drop.
+     * `smart_drops` drops superseded `todowrite`, `ctx_reduce`, and `meta` outputs.
+     * `smart_drops` replaces older edits to the same file with a marker.
+     * The replacement marker retains only `filePath`; `smart_drops` runs only during a message-rewriting transform pass.
+     * Because `smart_drops` runs only during a message-rewriting transform pass, it never independently causes a prompt-cache miss.
+     * When `smart_drops` is false, the messages sent to the model are byte-identical.
+     * `smart_drops` is disabled by default.
+     * */
     smart_drops: boolean;
     /**
-     * Age-tier caveman compression for long user/assistant text parts.
-     * Graduated from `experimental.caveman_text_compression`; opt-in, default off.
+     * `caveman_text_compression` applies age-tier compression to long user and assistant text parts.
+     * `caveman_text_compression` is opt-in and disabled by default.
      *
-     * Active only for primary sessions when enabled; never for subagents.
-     * Buckets eligible (outside-protected-tail) messages into four age
-     * tiers by tag position — oldest 20% → ultra, next 20% → full,
-     * next 20% → lite, newest 40% → untouched — and rewrites the text
-     * part in place.
-     * Always compresses from the original source (source_contents), so
-     * tier shifts produce the same result as if the target depth were
-     * applied directly to the original text.
+     * `caveman_text_compression` runs only for primary sessions and never for subagents.
+     * `caveman_text_compression` groups eligible messages outside the protected tail into four age tiers by tag position.
+     * The oldest eligible 20% uses `ultra` compression, and the next 20% uses `full` compression.
+     * The next eligible 20% uses `lite` compression; the newest 40% remains untouched.
+     * `caveman_text_compression` rewrites the eligible text part in place.
+     * `caveman_text_compression` always compresses from `source_contents`.
+     * Tier shifts produce the same output as applying the target depth directly to the original text.
      *
-     * Disabled by default because it rewrites agent-visible history.
      */
     caveman_text_compression: {
         enabled: boolean;
-        /** Text parts shorter than this (characters) are left untouched. */
+        /** Text parts shorter than `min_chars` are left untouched. */
         min_chars: number;
     };
     embedding: EmbeddingConfig;
-    /** User-only connection settings for the Synapse daemon. */
+    /** `subc` provides user-only connection settings for the Synapse daemon. */
     subc?: SubcConfig;
-    /** Developer-only Synapse shadow lane switch. */
+    /** Only developers can enable `shadow_embedding`. */
     shadow_embedding?: ShadowEmbeddingConfig;
     memory: {
         enabled: boolean;
         injection_budget_tokens: number;
         auto_promote: boolean;
         retrieval_count_promotion_threshold: number;
-        /** Appends a compact hint to new user messages when ctx_search finds
-         *  highly-related memories, conversation, or git commits. Does NOT
-         *  inject full content — just vague fragments that nudge the agent to
-         *  run ctx_search for full context if relevant. Graduated from
-         *  `experimental.auto_search`; enabled by default. Independent of
-         *  `memory.enabled` — it can still surface conversation/git hints when
-         *  the memory store is off. */
+        /** `auto_search` appends a compact hint to new user messages when `ctx_search` finds related results.
+         * `auto_search` injects fragments rather than full content.
+         * Hints direct agents to run `ctx_search` for full context when relevant.
+         * `auto_search` is enabled by default and operates independently of `memory.enabled`.
+         * `auto_search` can surface conversation and Git hints when `memory.enabled` is false.
+         * */
         auto_search: {
             enabled: boolean;
             /** Top hit score must exceed this threshold for the hint to fire. */
             score_threshold: number;
-            /** Minimum user message length in characters (skip short prompts). */
+            /** `auto_search` skips user messages shorter than `min_prompt_chars`. */
             min_prompt_chars: number;
         };
-        /** Index git commit messages from HEAD into a new ctx_search source so
-         *  agents can recall recent regressions, fixes, and decisions from
-         *  commit history without running git log manually. Graduated from
-         *  `experimental.git_commit_indexing`; opt-in, default off. Independent
+        /** `git_commit_indexing` indexes commit messages reachable from HEAD in a `ctx_search` source.
+         * `git_commit_indexing` lets agents recall recent regressions, fixes, and decisions from indexed commit messages.
+         * `git_commit_indexing` is opt-in, defaults to off, and operates independently of `memory.enabled`.
          *  of `memory.enabled`. */
         git_commit_indexing: {
             enabled: boolean;
-            /** Days of history to index (default: 365) */
+            /** `git_commit_indexing` indexes `since_days` days of history (default: 365). */
             since_days: number;
-            /** Max commits kept per project; oldest evicted (default: 2000) */
+            /** `git_commit_indexing` retains at most `max_commits` commits per project, evicting the oldest (default: 2000). */
             max_commits: number;
         };
     };
@@ -838,10 +799,6 @@ export const MagicContextConfigSchema = z
             .describe(
                 "Controls whether and where Magic Context augments the system prompt. Lets users opt specific agents out of the Magic Context guidance and the surrounding project-docs / user-profile blocks. OpenCode's internal hidden agents — title, summary, and compaction — are always skipped automatically.",
             ),
-        // v2: the LLM compressor was removed — deterministic decay-tier rendering
-        // (decay-render.ts) replaces it, so there are no compressor knobs. A
-        // leftover `compressor` block in an existing config is silently ignored
-        // (the schema strips unknown keys).
         sqlite: z
             .object({
                 cache_size_mb: z

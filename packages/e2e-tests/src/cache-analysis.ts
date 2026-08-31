@@ -1,29 +1,22 @@
 /**
- * cache-analysis.ts — the cache-bust oracle for e2e tests.
+ * E2E tests use this module to classify cache busts.
  *
- * This is the in-test port of the production diagnostic
- * `packages/plugin/scripts/analyze-cache-busts.ts`. It encodes the SAME
- * definition of "what is a cache bust" so the suite asserts against the exact
- * notion the real wire-diff tool uses — not an ad-hoc per-test prefix loop.
  *
- * The core idea: Anthropic serves a cache hit only up to the longest matching
- * prefix that ends at a `cache_control` breakpoint. So for two consecutive
- * requests in a session, find the FIRST wire-order segment whose content
- * changed. If that divergence lands at/after the final breakpoint, it's the
- * growing tail (a new turn was appended) → STABLE. If it lands BEFORE the final
- * breakpoint, the request rewrote bytes that were supposed to stay cached →
+ * Anthropic cache hits end at the longest matching prefix with a `cache_control` breakpoint.
+ * The oracle compares consecutive requests in a session.
+ * The oracle finds the first changed wire-order segment.
+ * A divergence in the appended tail yields `STABLE`.
  * BUST.
  *
- * Normalization (measure REAL content drift, not provider/marker noise):
- *   - `cache_control` markers move every turn (OpenCode walks the breakpoint
- *     forward to extend the cached boundary) → stripped before hashing.
- *   - The `cch=<nonce>` billing nonce in the system block is per-request and
- *     Anthropic ignores it for cache-keying → normalized out.
- *   - `§N§` tag prefixes ARE on-wire content the model sees → KEPT. A changed
- *     tag number is a genuine bust we want to catch.
+ * Normalization removes `cache_control` and `cch=<nonce>` before comparing content.
+ * OpenCode moves `cache_control` markers each turn to extend the cached boundary.
+ * The system block contains a per-request `cch=<nonce>` billing nonce.
+ * The oracle removes `cch=<nonce>` because Anthropic ignores it for cache keys.
+ * The oracle retains `§N§` prefixes because they are on-wire model content.
+ * A changed `§N§` tag number is a cache bust.
  *
- * Works on the `CapturedRequest` shape both TestHarness and PiTestHarness
- * expose via `mock.requests()`, so OpenCode and Pi suites share one oracle.
+ * The OpenCode and Pi harnesses expose `CapturedRequest` values through `mock.requests()`.
+ * OpenCode and Pi suites use the same cache-bust oracle.
  */
 
 import { createHash } from "node:crypto";
@@ -42,7 +35,7 @@ export interface WireSegment {
 }
 
 export interface WireSnapshot {
-    /** Index of this request within the filtered request list. */
+    /** `index` is this request's position in the filtered request list. */
     index: number;
     segments: WireSegment[];
 }
@@ -50,18 +43,18 @@ export interface WireSnapshot {
 export type BustVerdict = "BASE" | "SAME" | "STABLE" | "BUST";
 
 export interface PassComparison {
-    /** Index of the later request in the pair. */
+    /** `index` is the later request's position in the pair. */
     index: number;
     verdict: BustVerdict;
-    /** Wire-order index of the first diverging segment (-1 if none). */
+    /** `divergeIndex` is the first diverging wire-order index, or `-1` when no segment diverges. */
     divergeIndex: number;
-    /** Human-readable id of the first diverging segment. */
+    /** `divergeSegmentId` identifies the first diverging segment for diagnostics. */
     divergeSegmentId: string | null;
-    /** Effective cached-prefix bytes (up to the last breakpoint before divergence). */
+    /* */
     cachedPrefixBytes: number;
-    /** Segment id of that last breakpoint. */
+    /** `cachedPrefixAt` identifies the last breakpoint before divergence. */
     cachedPrefixAt: string;
-    /** prev/cur snippet of the diverging segment, for failure diagnostics. */
+    /** `diff` stores previous and current snippets of the diverging segment for failure diagnostics. */
     diff: { prev: string | null; cur: string | null } | null;
 }
 
@@ -75,11 +68,7 @@ const HIDDEN_AGENT_SIGNATURES: readonly string[] = [
 ];
 
 /**
- * Detect internal (non-main-agent) requests by their system-prompt openers:
- * OpenCode's native title/summary/compaction agents plus Magic Context's own
- * hidden children (historian/dreamer/sidekick/memory-migration). The signature
- * literals are imported from the plugin's production classifier so the oracle
- * cannot drift from what production actually skips.
+ * Shared signature literals keep the oracle aligned with plugin-defined signatures.
  */
 export function isInternalAgentRequest(request: MinimalRequest): boolean {
     const system = request.body.system;
@@ -92,7 +81,7 @@ function sha(s: string): string {
     return createHash("sha256").update(s).digest("hex").slice(0, 12);
 }
 
-/** Recursively strip `cache_control` fields — marker movement is not content. */
+/** `cache_control` movement does not change content. */
 function stripCacheControl(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(stripCacheControl);
     if (value && typeof value === "object") {
@@ -116,7 +105,7 @@ function messageHasBreakpoint(msg: Json): boolean {
     return hasCacheControl(msg);
 }
 
-/** Normalize the per-request billing nonce so it isn't seen as a content change. */
+/** The normalization step removes the per-request billing nonce so cache classification ignores it. */
 function normalizeSystemText(text: string): string {
     return text.replace(/cch=[^;]*;/g, "cch=<NONCE>;");
 }
@@ -128,7 +117,7 @@ function blockText(block: unknown): string {
     return JSON.stringify(stripCacheControl(block));
 }
 
-/** Build the wire-order segment list: system blocks first, then every message. */
+/** The segment list orders system blocks before every message. */
 export function buildSegments(body: MinimalRequest["body"]): WireSegment[] {
     const segs: WireSegment[] = [];
     const system = body.system;
@@ -155,7 +144,7 @@ export function buildSegments(body: MinimalRequest["body"]): WireSegment[] {
     return segs;
 }
 
-/** First wire-order segment index where prev/cur diverge (added/removed/changed). */
+/** `divergeIndex` is the first wire-order index where `prev` and `cur` differ, including added or removed segments. */
 function firstDivergence(prev: WireSegment[], cur: WireSegment[]): number {
     const n = Math.min(prev.length, cur.length);
     for (let i = 0; i < n; i += 1) {
@@ -164,7 +153,7 @@ function firstDivergence(prev: WireSegment[], cur: WireSegment[]): number {
     return prev.length === cur.length ? -1 : n;
 }
 
-/** Effective cached prefix = bytes up to the last breakpoint strictly before divergence. */
+/** `cachedPrefixBytes` counts bytes through the last breakpoint before divergence. */
 function cachedPrefixBytes(segs: WireSegment[], divergeIdx: number): { bytes: number; at: string } {
     let bytes = 0;
     let lastBreakpointBytes = 0;
@@ -198,8 +187,7 @@ function rawSegmentText(body: MinimalRequest["body"], idx: number): string | nul
 }
 
 /**
- * Compare each consecutive pair of requests and verdict every transition.
- * `requests` should already be filtered to the main-agent requests in order.
+ * `requests` is in wire order.
  */
 export function analyzePasses(requests: MinimalRequest[]): PassComparison[] {
     const out: PassComparison[] = [];
@@ -232,18 +220,10 @@ export function analyzePasses(requests: MinimalRequest[]): PassComparison[] {
             });
             continue;
         }
-        // The cache was WRITTEN during the previous request, at the previous
-        // request's cache_control breakpoints. So the reusable cached prefix for
-        // this transition is bounded by PREV's last breakpoint — not cur's.
-        // OpenCode walks the breakpoint forward to the last 1-2 messages every
-        // turn, so cur's last breakpoint sits AHEAD of freshly-appended tail
-        // content; comparing against it would mis-flag benign tail growth as a
-        // bust. The correct invariant: everything up to and including prev's
-        // last breakpoint must stay byte-identical in cur.
-        //   STABLE: first divergence is strictly AFTER prev's last breakpoint
-        //           (only uncached tail changed, or pure append).
-        //   BUST:   first divergence is at/before prev's last breakpoint
-        //           (content that was cached got rewritten).
+        // Classify the transition using `PREV`'s last breakpoint, not `CUR`'s.
+        // The oracle returns `STABLE` when the first divergence is strictly after `prev`'s last breakpoint.
+        // `STABLE` permits changes only after the previous request's last breakpoint, including a pure append.
+        // `BUST` applies when the first divergence is at or before the previous request's last breakpoint.
         // prevLastBreakpoint === -1 means prev cached nothing → no bust possible.
         const prevLastBreakpoint = lastBreakpointIndex(prev);
         const verdict: BustVerdict = idx > prevLastBreakpoint ? "STABLE" : "BUST";
@@ -268,12 +248,12 @@ export function analyzePasses(requests: MinimalRequest[]): PassComparison[] {
     return out;
 }
 
-/** All comparisons that the oracle classifies as a real cache bust. */
+/* */
 export function findBusts(requests: MinimalRequest[]): PassComparison[] {
     return analyzePasses(requests).filter((c) => c.verdict === "BUST");
 }
 
-/** Filter to main-agent requests (those carrying the Magic Context system block). */
+/* */
 export function mainAgentRequests<T extends MinimalRequest>(requests: T[]): T[] {
     return requests.filter((r) => {
         const sys = r.body.system;
@@ -284,26 +264,14 @@ export function mainAgentRequests<T extends MinimalRequest>(requests: T[]): T[] 
 }
 
 /**
- * Extract the text of the first wire message whose content contains `marker`.
  *
- * v2 prepends two synthetic user messages to every request: m[0] carrying
- * `<session-history>…</session-history>` (the frozen cumulative baseline) and
- * m[1] carrying `<session-history-since>…</session-history-since>` (the volatile
- * delta: new compartments, new memories, memory-update deltas, new user-profile
- * additions). The m[0]/m[1] cache taxonomy is asserted DIRECTLY off these two
- * messages — m[0] must stay byte-identical across a routine (SOFT) publish; the
- * new content must surface in m[1] — rather than inferred from breakpoints.
  */
 export function extractMessageText(body: MinimalRequest["body"], marker: string): string | null {
     const messages = Array.isArray(body.messages) ? (body.messages as Json[]) : [];
     for (const m of messages) {
         const content = m.content;
-        // Extract per TEXT BLOCK, not per message. OpenCode merges the two
-        // prepended same-role user messages (m[0] and m[1]) into ONE user
-        // message with two text blocks, so a whole-message scan would conflate
-        // them. `<session-history-since>` does not contain `<session-history>`
-        // as a substring (the `-since>` differs), so block-level matching keeps
-        // m[0] and m[1] cleanly separated.
+        // Whole-message scans can conflate text blocks that contain different session-history markers.
+        // The `-since>` suffix prevents `<session-history-since>` from matching `<session-history>`.
         if (typeof content === "string") {
             if (content.includes(marker)) return content;
         } else if (Array.isArray(content)) {
@@ -318,17 +286,17 @@ export function extractMessageText(body: MinimalRequest["body"], marker: string)
     return null;
 }
 
-/** The m[0] baseline text (`<session-history>` block) for a request, or null. */
+/* */
 export function extractM0(body: MinimalRequest["body"]): string | null {
     return extractMessageText(body, "<session-history>");
 }
 
-/** The m[1] delta text (`<session-history-since>` block) for a request, or null. */
+/* */
 export function extractM1(body: MinimalRequest["body"]): string | null {
     return extractMessageText(body, "<session-history-since>");
 }
 
-/** Compact, human-readable bust report for test failure messages. */
+/* */
 export function formatBustReport(comparisons: PassComparison[]): string {
     const lines: string[] = [];
     for (const c of comparisons) {

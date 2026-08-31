@@ -15,18 +15,18 @@ import type { ConnectionOrigin } from "../shared/mc-host-lifecycle";
 export interface ResolvedSynapseEmbeddingConfig {
     provider: "synapse";
     model: string;
-    /** Advertised per-input token window; SYNAPSE_MAX_INPUT_TOKENS when the
-     *  catalog omits it. */
+    /** `max_input_tokens` defaults to `SYNAPSE_MAX_INPUT_TOKENS` when the catalog omits the advertised window.
+     * */
     max_input_tokens: number;
-    /** Advertised UTF-8 byte ceiling for one input. */
+    /** `synapse_max_input_bytes` is the advertised UTF-8 byte ceiling for one input. */
     synapse_max_input_bytes: number;
     synapse_connection_file?: string;
     synapse_connection_origin: ConnectionOrigin;
     synapse_fallback?: EmbeddingConfig;
     synapse_fingerprint?: string;
     synapse_table_epoch?: number;
-    // Dims are absent until the first embed response pins them; the registry
-    // treats a missing value as adopt-on-first-write.
+    // `synapse_dims` remains absent until the first embed response pins its value.
+    // The registry adopts `synapse_dims` on the first write when it is missing.
     synapse_dims?: number;
     synapse_recommended_batch?: number;
     synapse_recommended_token_budget?: number;
@@ -34,11 +34,11 @@ export interface ResolvedSynapseEmbeddingConfig {
 }
 
 export interface ResolvedEmbeddingRouting {
-    /** Provider config for the authoritative lane. */
+    /** `primary` supplies the authoritative lane's provider config. */
     primary: EmbeddingConfig | ResolvedSynapseEmbeddingConfig;
-    /** Separate Synapse config for the developer mirror, when armed. */
+    /** `shadow` supplies a separate Synapse config for the armed developer mirror. */
     shadow: ResolvedSynapseEmbeddingConfig | null;
-    /** Human-readable warnings produced while selecting a lane. */
+    /** `warnings` contains human-readable warnings from lane selection. */
     warnings: string[];
 }
 
@@ -46,7 +46,6 @@ function fallbackConfig(
     config: EmbeddingConfig,
     provider: EmbeddingFallbackProvider | undefined,
 ): EmbeddingConfig {
-    // SAFETY: each fallback field is narrowed before use.
     const raw = config as unknown as Record<string, unknown>;
     const model = typeof raw.model === "string" ? raw.model.trim() : "";
     const endpoint = typeof raw.endpoint === "string" ? raw.endpoint.trim() : "";
@@ -99,11 +98,10 @@ function deferredSynapseConfig(
 }
 
 /**
- * Translate the configured embedding block into lane intents. Synapse lanes
- * are deferred (no daemon probe here): the registry resolves them on first
- * use and only then persists an identity, so a fallback vector can never be
- * written under a Synapse identity. The registry receives only the selected
- * lane's provider fields, not the raw routing controls.
+ * Synapse identities are deferred without probing the daemon.
+ * The registry persists a Synapse identity only on first use.
+ * The registry never writes fallback vectors under Synapse identities.
+ * The registry uses the lane's provider fields, not the raw routing controls.
  */
 export async function resolveEmbeddingRouting(args: {
     config: MagicContextConfig;

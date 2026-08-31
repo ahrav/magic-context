@@ -20,13 +20,13 @@ export interface CloneSessionStateFilter {
     resolveBoundaryOrdinal(messageId: string): number | undefined;
     includeTag(tag: CloneTagRow): boolean;
     includeMessageId(messageId: string): boolean;
-    /** Map a source message/content id into the destination session. */
+    /** mapMessageId maps a source message/content ID into the destination session. */
     mapMessageId?: (messageId: string) => string;
-    /** Opt into remapping globally keyed tag ids; leave undefined for Pi compatibility. */
+    /** Defining mapTagId remaps globally keyed tag IDs; leaving it undefined preserves Pi compatibility. */
     mapTagId?: (sourceTagId: number, destinationTagId: number) => number;
     /** Pi forks inherit session notes/facts in the same atomic prefix copy. */
     copySessionNotesAndFacts?: boolean;
-    /** Return the destination ordinal for an inherited source anchor. */
+    /** mapOrdinal returns the destination ordinal for an inherited source anchor. */
     mapOrdinal?: (sourceOrdinal: number) => number | undefined;
     selectPendingPiMarker(
         rawState: string | null,
@@ -226,9 +226,8 @@ function clampWatermark(value: number | null, maxCopiedTag: number): number {
 }
 
 /**
- * Copy durable session content into a clone under one immediate transaction.
- * The destination guard runs after the write lock is acquired so two plugin
- * processes cannot both observe an empty clone and duplicate its state.
+ * copySessionStateForClone copies durable session content under one immediate transaction.
+ * Acquiring the write lock before the destination guard prevents concurrent clone operations from both observing an empty destination.
  */
 export function copySessionStateForClone(
     db: Database,

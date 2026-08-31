@@ -22,8 +22,6 @@ interface Tuple {
 }
 
 const CAPS = {
-    // Covers one duplex candidate of the default geometry below: both
-    // directions double the per-direction arena bytes and descriptors.
     arena_bytes: 2097152,
     descriptors: 64,
     leases: 64,
@@ -144,9 +142,6 @@ describe("shm hardening matrix validator", () => {
         const entry = tuple({
             host_limits: {
                 active: {
-                    // One duplex candidate of the default geometry needs
-                    // 2 x 1048576 arena bytes, 2 x 32 descriptors, and at
-                    // least one lease and one mapping per direction.
                     arena_bytes: 1048576,
                     descriptors: 63,
                     leases: 1,
@@ -176,11 +171,8 @@ describe("shm hardening matrix validator", () => {
                     descriptors: 64,
                     leases: 2,
                     mappings: 2,
-                    // Cold-park profiles pin zero workers; no floor applies.
                     pinned_workers: 0,
                 },
-                // Quarantine caps have no admission floor: zero declares
-                // quarantine retention disabled.
                 quarantine: {
                     arena_bytes: 0,
                     descriptors: 0,

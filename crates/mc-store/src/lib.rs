@@ -1,15 +1,14 @@
-//! Magic Context durable cache-state store.
 //!
-//! Persists the per-session `cortexkit-cache-core` [`CoreState`] plus a small
-//! `module_meta` blob (`initialized`, `last_render_config`, `coverage_ordinal`).
+//! This module persists each session's `cortexkit-cache-core` [`CoreState`] and `module_meta`.
+//! `module_meta` stores `initialized`, `last_render_config`, and `coverage_ordinal`.
 //!
 //! Concurrency: writes go through `cortexkit-store`'s epoch-fenced transaction
-//! (rejects a superseded lease handover) AND an app-level `row_version` CAS inside
-//! that same transaction. The epoch fence only rejects a STRICTLY-NEWER writer
-//! (lease handover) — an equal-epoch writer is NOT fenced — so the row_version CAS
-//! is what catches a same-epoch second writer. It is conditional: a pass writes
-//! ONLY when durable state actually changed (a pure SoftPlus replay mutates
-//! nothing and writes nothing), so the no-write-on-defer guarantee holds.
+//! The `row_version` CAS runs inside the epoch-fenced transaction.
+//! The epoch fence rejects only strictly newer writers.
+//! Equal-epoch writers are not fenced; `row_version` CAS detects same-epoch conflicts.
+//! The persistence pass uses `row_version` CAS to catch a second same-epoch writer and writes conditionally.
+//! A pass writes only when durable state changed; a pure SoftPlus replay writes nothing.
+//! A deferred pass performs no write.
 
 #![forbid(unsafe_code)]
 
@@ -43,13 +42,11 @@ pub type ProviderExtras = BTreeMap<String, BTreeMap<String, Value>>;
 
 static NEXT_TAG_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
-/// Canonicalize a filesystem route root before using it as lineage state.
 ///
 /// Transform and facade lanes can observe the same directory through different spellings when
 /// a project is reached through a symlink. Comparing those spellings as strings would make a
 /// valid session look unresolved, so filesystem roots share this boundary normalization. A root
-/// may have been removed by the time a request arrives; retain the input spelling in that case
-/// instead of turning canonicalization into a request failure.
+/// `canonical_root` retains the input spelling when canonicalization fails so requests do not fail for removed roots.
 pub fn canonical_root(path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref();
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -69,8 +66,7 @@ pub struct HarnessMeta {
     pub errored: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish: Option<String>,
-    /// Native message creation time, when the harness provides it. Used for temporal
-    /// compartment heading dates without making dates part of message identity.
+    /// `created_at_ms` stores the harness-provided creation time for temporal compartment headings without affecting message identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_ms: Option<i64>,
 }
@@ -89,7 +85,7 @@ pub struct CkWireMessage {
     pub origin: Option<MessageOrigin>,
     pub provider_extras: ProviderExtras,
     pub meta: HarnessMeta,
-    /// Original parsed JSON for pass-through messages. Pass-through MUST stay
+    /// `original` retains parsed JSON for pass-through messages and must remain a `Value` rather than a typed-struct round-trip.
     /// Value-level: serializing this retained value, never a typed-struct round-trip,
     /// preserves harmless unknown fields and keeps replay lossless as the CK wire evolves.
     original: Option<Value>,
@@ -192,8 +188,7 @@ impl CkWireMessage {
 pub struct CkWireBlock {
     pub kind: CkKind,
     pub provider_extras: ProviderExtras,
-    /// Original parsed JSON for pass-through blocks. Keep this Value-level for the same
-    /// lossless-pass-through reason as CkWireMessage::original.
+    /// Serializing retained block JSON directly preserves unknown fields.
     original: Option<Value>,
 }
 
@@ -253,9 +248,9 @@ impl CkWireBlock {
         }
     }
 
-    /// Drop the retained ingress bytes so serialization reflects an in-place
-    /// mutation of the typed content. Every mutator that edits `kind` through a
-    /// live block MUST call this: `Serialize` prefers `original` for lossless
+    /// Mutators must clear `original` after editing typed content so serialization emits the edit.
+    /// Every mutator that edits `kind` through a live block must clear `original`.
+    /// `Serialize` prefers `original` for lossless pass-through.
     /// pass-through, so an uncleared block silently serializes its pre-mutation
     /// bytes and the edit never reaches the wire.
     pub fn mark_modified(&mut self) {
@@ -396,14 +391,13 @@ pub enum MediaKind {
     Document,
 }
 
-/// Migration namespace for the cache-state domain (one DB can host several
-/// independent namespaces; this is ours).
+/// This namespace isolates cache-state migrations from other namespaces in the same database.
 const NS: &str = "mc_cache";
 
-/// Sentinel row_version meaning "no row present" (COALESCE default inside the txn).
+/// The transaction's `COALESCE` default for `row_version` denotes an absent row.
 const NO_ROW: i64 = -1;
 const MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES: usize = 256 * 1024;
-/// Cap decompression so a small compressed row cannot allocate an unbounded transcript.
+/// Decompression limits prevent a small compressed row from allocating an unbounded transcript.
 const MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES: usize = 512 * 1024;
 const CHUNK_TRANSCRIPT_TRUNCATION_MARKER: &str =
     "\n[truncated: transcript exceeded the inflated-byte limit]";
@@ -411,11 +405,11 @@ const MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES: i64 = 8 * 1024 * 1024;
 const PASS_SCHEDULER_HISTORY_CAP: usize = 256;
 const PASS_SCHEDULER_INTERESTING_HISTORY_CAP: usize = 256;
 const MAX_FULL_ARRAY_FINGERPRINT_BYTES: usize = 256;
-/// The recency entry is at most 99 bytes. An interesting entry is at most 1,906 bytes with
-/// sender identity and arc counters; JSON's worst case expands fingerprint bytes to `\u00xx`.
+/// The recency entry is at most 99 bytes.
+/// An interesting entry is at most 1,906 bytes; JSON escapes fingerprint bytes as `\u00xx`.
 const MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 99;
 const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_906;
-/// Maximum combined UTF-8 bytes for both scheduler JSON arrays on one session row.
+/// `PASS_SCHEDULER_TELEMETRY_MAX_BYTES` caps the combined UTF-8 bytes for both scheduler JSON arrays on one session row.
 pub const PASS_SCHEDULER_TELEMETRY_MAX_BYTES: usize = 1
     + PASS_SCHEDULER_HISTORY_CAP * (MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1)
     + 1
@@ -1311,12 +1305,8 @@ CREATE TABLE mc_claim_mirror_receipts (
     "#,
 }];
 
-/// The highest `mc_cache` schema migration this binary ships.
 ///
-/// The store has no separate fence constant: `McStore::open` applies every bundled
-/// migration on open, so the newest bundled migration IS the binary's supported
-/// ceiling. Status surfaces report this value to answer "which schema does this
-/// binary support" without a second source of truth that could drift from the
+/// `McStore::open` applies all bundled migrations, so this value is the highest schema version the binary supports.
 /// migration list.
 pub const LATEST_MIGRATION_VERSION: u32 = {
     let mut latest = 0;
@@ -1330,19 +1320,12 @@ pub const LATEST_MIGRATION_VERSION: u32 = {
     latest
 };
 
-/// Lowest `mc_cache` version this binary can adopt without reinterpreting an
 /// older schema.
 ///
-/// [`MIGRATIONS`] is a single consolidated bootstrap, not an incremental chain:
-/// its statements compose the whole schema from an empty `main`. The runner in
-/// `cortexkit-store` applies any bundled version above the highest recorded one,
-/// so a store carrying pre-cutover history would run that bootstrap against a
-/// populated schema and fail on the first `CREATE TABLE`. Such a store is
-/// classified and refused before the runner sees it.
 const OLDEST_ADOPTABLE_MIGRATION_VERSION: u32 = LATEST_MIGRATION_VERSION;
 
-/// Highest `mc_cache` migration recorded in `store.db`, or `None` when the
-/// namespace has no history: a fresh file, or one predating the version table.
+/// The version lookup returns the highest `mc_cache` migration in `store.db`, or `None` when the namespace has no history.
+/// The version lookup returns `None` for a fresh `store.db` or one predating the version table.
 fn recorded_mc_cache_version(inner: &SqliteStore) -> Result<Option<u32>, McStoreError> {
     Ok(inner.with_conn(|conn| {
         let tracked: bool = conn.query_row(
@@ -1365,13 +1348,8 @@ fn recorded_mc_cache_version(inner: &SqliteStore) -> Result<Option<u32>, McStore
     })?)
 }
 
-/// Refuse a `store.db` whose `mc_cache` history predates the consolidated
-/// bootstrap, before the migration runner can apply that bootstrap over it.
+/// Migration validation refuses `store.db` histories predating the consolidated bootstrap before applying migrations.
 ///
-/// The alternative is the runner's raw `table mc_cache_state already exists`,
-/// which names a symptom rather than the family, and leaves an operator with no
-/// stated action. Old version ranges are not supported inputs
-/// (`docs/migration-version-lanes.md`), so this refuses rather than migrating.
 fn refuse_pre_cutover_store(inner: &SqliteStore) -> Result<(), McStoreError> {
     match recorded_mc_cache_version(inner)? {
         Some(recorded) if recorded < OLDEST_ADOPTABLE_MIGRATION_VERSION => {
@@ -1384,10 +1362,7 @@ fn refuse_pre_cutover_store(inner: &SqliteStore) -> Result<(), McStoreError> {
     }
 }
 
-/// Apply the route-to-identity vocabulary law inside the caller's fenced transaction.
-/// Deletes only content twins, then rekeys remaining route rows and their mutation/note
-/// companions. The authority predicate is repeated on every statement so a binding is
-/// harmless until its domain is actually MODULE-owned.
+/// Every statement requires the authority predicate so bindings outside MODULE-owned domains cannot modify rows.
 fn normalize_authority_note_route_tx(
     tx: &rusqlite::Transaction<'_>,
     context_store_uuid: &str,
@@ -1410,11 +1385,8 @@ fn normalize_authority_note_route_tx(
     Ok(())
 }
 
-/// A project's workspace membership: the union of member identities it reads, which of
-/// them are its OWN (full visibility) vs FOREIGN (visible only in `share_categories`),
-/// The durable historian single-flight phase. The phase lives in [`ModuleMeta`] so
-/// the same row-version CAS that guards cache-state commits also guards writer
-/// orchestration: a stale producer can never publish against a newer module state.
+/// A project's workspace membership is the union of identities it reads: OWN has full visibility; FOREIGN is visible only in `share_categories`.
+/// The row-version CAS that guards cache-state commits also guards writer orchestration, preventing stale producers from publishing against newer module state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistorianPhase {
@@ -1438,25 +1410,24 @@ impl HistorianPhase {
     }
 }
 
-/// Inclusive ordinal range pinned for one historian run.
+/// The historian run pins an inclusive ordinal range.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianChunkRange {
     pub from_ordinal: u64,
     pub to_ordinal: u64,
 }
 
-/// Content-sensitive identity for one message selected into a historian firing.
-/// The outer firing vector preserves message order; each block vector preserves
-/// the canonical block order already tracked by [`ModuleMeta::block_identity_by_mid`].
+/// The historian firing uses a content-sensitive identity for each selected message.
+/// The outer firing vector preserves message order; each block vector preserves the canonical block order in [`ModuleMeta::block_identity_by_mid`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianSelectedMessageIdentity {
     pub mid: String,
     pub block_identities: Vec<BlockIdentity>,
 }
 
-/// The durable historian state stored inside [`ModuleMeta`]. Idle keeps
-/// `firing_seq` as the monotonic last-issued sequence and clears the in-flight
-/// identifiers; abandon paths additionally set `failure_backoff_at_ms`.
+/// `ModuleMeta` stores durable historian state.
+/// When idle, `firing_seq` remains the monotonic last-issued sequence and the state clears in-flight identifiers.
+/// Abandon paths clear in-flight identifiers and set `failure_backoff_at_ms`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianDurableState {
     #[serde(default)]
@@ -1467,52 +1438,44 @@ pub struct HistorianDurableState {
     pub chunk_range: Option<HistorianChunkRange>,
     #[serde(default)]
     pub chunk_fingerprint: String,
-    /// Durable content identities for exactly the message range sent to the producer.
-    /// Publication compares these with the current store metadata inside the write
-    /// transaction, allowing later tail extension while rejecting selected-byte drift.
+    /// The producer receives durable content identities for exactly the message range.
+    /// The write transaction permits later tail extension but rejects drift in selected bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
     #[serde(default)]
     pub producer_session_id: Option<String>,
     #[serde(default)]
     pub producer_run_id: Option<String>,
-    /// The harness the producer run was started under. Broca scopes a run's
-    /// identity by `(project_root, harness, session)`, so recovery must
-    /// reattach with THIS harness rather than whatever the resuming route is
-    /// bound to: after a cross-harness handoff the current binding would
-    /// resolve to `missing` and abandon-then-refire a run the original
-    /// harness may still be executing. `None` is a state written before this
-    /// field existed; recovery falls back to the resuming binding there.
+    /// Broca identifies a run by `(project_root, harness, session)`.
+    /// Recovery reattaches with the recorded harness rather than the resuming binding.
+    /// After a cross-harness handoff, the resuming binding resolves the original run as `missing`.
+    /// The resuming binding abandons and refires a run resolved as `missing`.
+    /// An absent recorded harness makes recovery fall back to the resuming binding.
     #[serde(default)]
     pub producer_harness: Option<String>,
     #[serde(default)]
     pub fired_at_ms: Option<i64>,
-    /// Session-level revert epoch observed when the chunk was assembled. It is copied
-    /// into the firing state so a producer reattached after restart publishes against the
-    /// same epoch it originally saw, not the session's current epoch.
+    /// `expected_revert_epoch` records the session-level revert epoch observed when the chunk was assembled.
+    /// A reattached producer publishes against `expected_revert_epoch` rather than the session's current epoch.
     #[serde(default)]
     pub expected_revert_epoch: u64,
-    /// The compartment-set generation observed with the firing snapshot. Publication
-    /// rechecks it inside its transaction so an overlapping external sync cannot slip
-    /// between the producer's snapshot and the append.
+    /// `compartment_set_generation` records the generation observed with the firing snapshot.
+    /// Publication rechecks `compartment_set_generation` inside its transaction.
+    /// The transactional recheck detects compartment-set changes after the snapshot before append.
     #[serde(default)]
     pub compartment_set_generation: CompartmentSetGeneration,
     #[serde(default)]
     pub failure_backoff_at_ms: Option<i64>,
-    /// Human-readable detail of the most recent failed firing. The producer runs in a
-    /// spawned task whose stderr a supervised deployment never captures, so the error
-    /// must live in durable state to be diagnosable from a state dump. Cleared when a
-    /// later firing establishes its producer run.
+    /// `last_failure` records human-readable detail of the most recent failed firing.
+    /// A later firing clears `last_failure` after establishing its producer run.
     #[serde(default)]
     pub last_failure: Option<String>,
-    /// Why the most recent pass declined to fire (reason discriminant only, no numbers,
-    /// so steady-state passes rewrite nothing). The twin of `last_failure` for the
-    /// pre-fire half: a supervised rig cannot read the transform response's diagnostics
-    /// block, so the skip branch must be readable from the state dump. Cleared on fire.
+    /// `last_no_fire` records why the most recent pass declined to fire without numeric details.
+    /// A firing clears `last_no_fire`.
     #[serde(default)]
     pub last_no_fire: Option<String>,
-    /// Consecutive failures on the historian publication path. This is diagnostic-only
-    /// state: it makes repeated fence/outbox failures visible without affecting bytes.
+    /// `consecutive_publish_failures` is diagnostic only.
+    /// Historian publication failures do not affect emitted bytes.
     #[serde(default)]
     pub consecutive_publish_failures: u32,
 }
@@ -1539,7 +1502,7 @@ impl Default for HistorianDurableState {
     }
 }
 
-/// One accepted pass in the bounded scheduler history attached to [`PassTrace`].
+/// `PassSchedulerObservation` records one accepted pass in the bounded scheduler history attached to [`PassTrace`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassSchedulerObservation {
     pub timestamp_ms: i64,
@@ -1547,31 +1510,31 @@ pub struct PassSchedulerObservation {
     pub drain_latch_active: bool,
 }
 
-/// Incident-worthy scheduler evidence retained independently of the recency ring.
+/// `InterestingPassSchedulerObservation` retains incident-worthy scheduler evidence independently of the recency ring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterestingPassSchedulerObservation {
     pub timestamp_ms: i64,
     pub scheduler_decision: String,
     pub drain_latch_active: bool,
-    /// Sender-stamped request instant. Missing remains missing; it is never backfilled from the
-    /// module clock because the two clocks are not interchangeable correlation keys.
+    /// `request_observed_at_ms` must not use the module clock as a fallback.
+    /// The module clock and sender clock are not interchangeable correlation keys.
     pub request_observed_at_ms: Option<u64>,
-    /// Caller-owned full-array fingerprint echoed by the transform response. This is omitted
-    /// only when the caller supplied no identity or exceeded the diagnostic byte bound.
+    /// The transform response echoes the caller-owned full-array fingerprint.
+    /// `full_array_fingerprint` is omitted only when the caller supplied no identity or exceeded the diagnostic byte bound.
     pub full_array_fingerprint: Option<String>,
-    /// Live superseded tool arcs observed when the ride gate opened, before downstream filters.
-    /// Missing means the gate stayed shut and selection did not run; zero is an observed empty set.
+    /// The field contains live superseded tool arcs observed when the ride gate opened, before downstream filters.
+    /// A missing value means the gate stayed shut and selection did not run; zero means selection observed an empty set.
     #[serde(default)]
     pub eligible_supersession_count: Option<u64>,
-    /// Eligible supersession arcs whose final decisions were entirely removed by the newest-tag
-    /// block window. Unit: tool arcs.
+    /// The newest-tag block window can remove all final decisions for eligible supersession arcs.
+    /// `withheld_by_tag_window` counts tool arcs.
     #[serde(default)]
     pub withheld_by_tag_window: Option<u64>,
-    /// Eligible supersession arcs whose final decisions were entirely removed by mutation-exempt
-    /// or lineage-anchor messages. Unit: tool arcs.
+    /// Mutation-exempt or lineage-anchor messages can remove all final decisions for eligible supersession arcs.
+    /// `withheld_by_exempt_message` counts tool arcs.
     #[serde(default)]
     pub withheld_by_exempt_message: Option<u64>,
-    /// Eligible supersession tool arcs represented in the final reduction decision list.
+    /// The final reduction decision list contains eligible supersession tool arcs.
     #[serde(default)]
     pub applied_supersession_count: Option<u64>,
 }
@@ -1645,9 +1608,8 @@ fn serialize_interesting_scheduler_observation(
     .map_err(|error| McStoreError::Serde(error.to_string()))
 }
 
-/// Durable receive/complete/reject breadcrumbs for one session's transform passes.
-/// Stored separately from `mc_cache_state` so a rejected pass can still leave a readable
-/// trail without advancing the cache row_version.
+/// The breadcrumb record retains durable receive, complete, and reject events for one session's transform passes.
+/// `PassTrace` records the breadcrumb trail without advancing the cache `row_version`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassTrace {
     pub last_received_at_ms: i64,
@@ -1656,17 +1618,12 @@ pub struct PassTrace {
     pub last_reject_at_ms: Option<i64>,
     pub reject_count: u64,
     pub receive_count: u64,
-    /// JSON for the current pass's first-divergence attribution, when one was observed.
     pub first_divergence: Option<String>,
-    /// JSON for the most recent diverging pass, including its accepted pass id and timestamp.
     pub last_divergence: Option<String>,
-    /// Oldest-to-newest bounded history of accepted scheduler decisions and latch state.
+    /// The bounded history stores accepted scheduler decisions and latch state from oldest to newest.
     pub scheduler_history: Vec<PassSchedulerObservation>,
 }
 
-/// A validated historian fact that may become a project memory. Validation owns
-/// A historian event retained for a future module-to-TS mirror. `at_compartment` keeps the
-/// producer's one-based anchor even when the module-side compartment surrogate is unavailable.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianEventCandidate {
     pub kind: String,
@@ -1677,9 +1634,7 @@ pub struct HistorianEventCandidate {
     pub harness: String,
 }
 
-/// A primer candidate records a question that should remain available across sessions, along with
-/// the project, session, and source-compartment information needed to trace where it came from.
-/// Its fields match the corresponding TypeScript primer record.
+/// A primer candidate remains available across sessions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianPrimerCandidate {
     pub project_path: String,
@@ -1693,8 +1648,7 @@ pub struct HistorianPrimerCandidate {
     pub created_at: i64,
 }
 
-/// A privacy-gated user observation candidate. It is intentionally not a project memory:
-/// the TS review task owns promotion after the user opts into collection.
+/// `Project memory` must not receive privacy-gated user observations until the user opts into collection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistorianUserMemoryCandidate {
     pub content: String,
@@ -1704,17 +1658,15 @@ pub struct HistorianUserMemoryCandidate {
     pub created_at: i64,
 }
 
-/// A newly promoted project-memory row, returned so post-commit embedding can target
-/// The stale-producer predicate checked inside the publish transaction before any
-/// additive writes occur. Every field must match the durable state row.
+/// The predicate must match every durable state field before additive writes occur.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorianPublishPredicate {
     pub firing_seq: u64,
     pub producer_run_id: String,
     pub chunk_fingerprint: String,
     pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
-    /// Cheap generation of the complete compartment set captured when this firing
-    /// assembled its raw chunk. Count closes the sequence-reuse case that max alone
+    /// The generation captures the complete compartment set used to assemble the raw chunk.
+    /// `count` distinguishes sequence reuse that `max_sequence` alone cannot.
     /// cannot distinguish.
     pub compartment_set_generation: CompartmentSetGeneration,
 }
@@ -1737,15 +1689,14 @@ pub struct HistorianSideChannelStatus {
     pub last_failure: Option<String>,
 }
 
-/// A cheap, snapshot-consistent identifier for the complete compartment set.
+/// `CompartmentSetGeneration` provides a snapshot-consistent generation for the compartment set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompartmentSetGeneration {
     pub max_sequence: i64,
     pub count: i64,
 }
 
-/// Session data read atomically for historian assembly. The epoch and compartment
-/// generation must be snapped with the set that determines the chunk.
+/// `HistorianAssemblySnapshot` stores the epoch and compartment generation with the compartments that determine the chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorianAssemblySnapshot {
     pub compartments: Vec<StoredCompartment>,
@@ -1753,9 +1704,8 @@ pub struct HistorianAssemblySnapshot {
     pub compartment_set_generation: CompartmentSetGeneration,
 }
 
-/// Result of a deterministic revert re-cut. The caller must use the returned
-/// row_version for the subsequent pass commit and patch the returned metadata fields
-/// into the whole-blob ModuleMeta it commits.
+/// The caller must use the returned `row_version` for the subsequent pass commit.
+/// The caller must patch the returned metadata fields into the whole-blob `ModuleMeta`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncateOutcome {
     pub revert_epoch: u64,
@@ -1775,12 +1725,11 @@ pub struct HistorianPublishRequest<'a> {
     pub user_memory_candidates: &'a [HistorianUserMemoryCandidate],
     pub publication_floor_ordinal: u64,
     pub chunk_transcript: Option<&'a str>,
-    /// JSON-encoded original CK messages for the compacted range. Unlike the condensed
-    /// transcript, this preserves full tool output for durable ctx_expand recovery.
+    /// `raw_chunk_messages` preserves original CK messages, including full tool output, for `ctx_expand` recovery.
     pub raw_chunk_messages: Option<&'a str>,
 }
 
-/// Typed publish failures. CAS and state mismatches are deliberately separate so a
+/// `HistorianPublishError` distinguishes CAS conflicts from stale-producer state mismatches.
 /// caller can tell "another writer already committed" from "this producer is stale."
 #[derive(Debug)]
 pub enum HistorianPublishError {
@@ -1791,15 +1740,14 @@ pub enum HistorianPublishError {
         reason: Option<String>,
     },
     /// A caller-supplied publication fence refused the publish before any write.
-    /// Distinct from CasConflict so callers can abandon the run WITHOUT arming a
-    /// model-failure cooldown: a fence rejection is a fast local race, not a
-    /// producer failure, and an immediate retry with a fresh snapshot is valid.
+    /// A fence rejection does not indicate producer failure.
+    /// A fresh snapshot may retry immediately after a fence rejection.
     FenceRejected {
         reason: String,
     },
-    /// An appended historian compartment intersects an already durable range. This
-    /// is a publish rejection rather than a SQLite failure so callers can abandon the
-    /// stale firing and leave the session immediately reusable.
+    /// An overlap with a durable range rejects the publish.
+    /// The rejection lets callers abandon a stale firing without treating it as a SQLite failure.
+    /// The rejection leaves the session immediately reusable.
     CompartmentOverlap {
         existing_sequence: i64,
         incoming_start_message: i64,
@@ -1871,16 +1819,16 @@ impl From<StoreError> for HistorianPublishError {
     }
 }
 
-/// Persisted provider-usage ground truth used to keep pressure bands stable across
-/// retries and restarts. A request-supplied non-zero value replaces this value; an
-/// absent or all-zero request falls back to it.
+/// Persisted provider usage keeps pressure bands stable across retries and restarts.
+/// A non-zero request-supplied value replaces the persisted value.
+/// An absent or all-zero request uses the persisted value.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleUsage {
     #[serde(default)]
     pub current_total_input_tokens: u64,
     #[serde(default)]
     pub context_limit_tokens: u64,
-    /// Host final-wire estimate used only to clear an already armed emergency latch.
+    /// The host uses the final-wire estimate only to clear an armed emergency latch.
     #[serde(default)]
     pub final_wire_input_tokens: u64,
     #[serde(default)]
@@ -1898,8 +1846,7 @@ pub struct DeferredExecuteState {
     pub reason: String,
 }
 
-/// Durable counters for fake-compaction lineage handling. Keeping them in the cache meta
-/// blob makes status reads consistent with the terminal disposition they describe.
+/// Cache metadata stores fake-compaction lineage counters so status reads match their terminal disposition.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageDescentCounters {
     #[serde(default)]
@@ -1926,8 +1873,8 @@ pub struct LineageDescentCounters {
     pub pending_no_responses: u64,
 }
 
-/// One hop in a composed lineage edge. `epoch` is the epoch of `new_key`; the prior
-/// node's epoch is the edge's `prior_epoch` for the first hop and the preceding hop's
+/// Each edge stores the epoch of `new_key`.
+/// For the first hop, `prior_epoch` is the prior node's epoch.
 /// epoch thereafter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineageConstituent {
@@ -1944,9 +1891,8 @@ pub struct LineageAnchor {
     pub ordinal: u64,
 }
 
-/// Input to the single fenced lineage operation. Recognition is performed by mc-module
-/// over canonical pre-overlay blocks; the store owns source selection, validation, copy,
-/// terminal recording, and the prior-lineage publish fence.
+/// `mc-module` recognizes canonical pre-overlay blocks.
+/// The store owns source selection, validation, copying, terminal recording, and the prior-lineage publish fence.
 pub struct LineageDescentRequest<'a> {
     pub target_key: &'a str,
     pub expected_target_row_version: Option<u64>,
@@ -1993,11 +1939,8 @@ pub struct LineageDescentOutcome {
     pub disposition: LineageDescentDisposition,
     pub source_key: Option<String>,
     pub prior_last_ordinal: Option<u64>,
-    /// True only while the copied state still requires the hard, state-committing pass that
-    /// consumes this lineage edge.
     pub materialization_required: bool,
-    /// A terminal record was observed durably for this target and may be acknowledged
-    /// after the transform returns successfully.
+    /// The store may acknowledge a terminal record for this target only after the transform returns successfully.
     pub acknowledge: bool,
 }
 
@@ -2066,9 +2009,8 @@ fn record_lineage_disposition(
     }
 }
 
-/// A TypeScript-owned compaction marker waiting for the consuming transform pass.
-/// The module retains the marker during a TS-to-Rust transition so a restart cannot
-/// silently lose the pending boundary reconciliation.
+/// The module retains this TypeScript-owned compaction marker until the consuming transform pass handles it.
+/// The module retains the marker so a restart cannot silently lose the pending boundary reconciliation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCompactionMarkerState {
     pub ordinal: u64,
@@ -2076,10 +2018,7 @@ pub struct PendingCompactionMarkerState {
     pub published_at: i64,
 }
 
-/// Durable alarm state for a boundary-absent request that shares no prefix with the
-/// session's held lineage. The transform arms this once and then serves matching
-/// absent-shape traffic raw without more writes; only boundary-present recovery or a
-/// later re-arm advances the diagnostic counters.
+/// The transform arms this durable alarm for a boundary-absent request that shares no prefix with the session's held lineage.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRewriteState {
     pub armed_at_ms: i64,
@@ -2090,31 +2029,28 @@ pub struct PendingRewriteState {
     pub last_present_at_ms: Option<i64>,
 }
 
-/// The durable identity fingerprint for one block of a message. The transform records
-/// the ordered vector per `mid` and rejects later drift instead of silently applying
-/// frozen reductions to a different block list.
+/// The transform records the ordered block-identity vector per `mid` and rejects later drift to avoid applying frozen reductions to a different block list.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockIdentity {
     pub kind_tag: String,
     pub byte_fingerprint: String,
 }
 
-/// Frozen CK-native synthetic todowrite pair persisted in module metadata.
+/// Module metadata persists the frozen CK-native synthetic `todowrite` pair.
 ///
-/// The pair is replayed exactly at its stored anchor until the task-list content changes.
-/// Rebuilding or moving it would alter the exact prompt bytes seen by the provider,
-/// so both CK messages are stored byte-complete.
+/// The transform replays the pair exactly at its stored anchor until the task-list content changes.
+/// Rebuilding or moving the pair changes the exact prompt bytes seen by the provider.
+/// Store both CK messages byte-complete to preserve the exact prompt bytes seen by the provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FrozenSyntheticTodoPair {
-    /// Shared synthetic tool-call id used by both the assistant ToolCall and tool result.
+    /// The assistant `ToolCall` and tool result use the same synthetic tool-call ID.
     pub call_id: String,
-    /// Real tail message id the pair is inserted after. None means no real tail existed
-    /// when the pair was frozen, so it is appended at the output end.
+    /// The stored ID identifies the real tail message after which the pair is inserted; `None` means no real tail exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_mid: Option<String>,
-    /// Frozen assistant-role CK message carrying the synthetic todowrite ToolCall.
+    /// The stored assistant-role CK message carries the synthetic `todowrite` `ToolCall`.
     pub assistant_msg: CkWireMessage,
-    /// Frozen tool-role CK message carrying the matching synthetic todowrite ToolResult.
+    /// The stored tool-role CK message carries the matching synthetic `todowrite` `ToolResult`.
     pub tool_msg: CkWireMessage,
 }
 
@@ -2135,9 +2071,8 @@ impl<'de> Deserialize<'de> for FrozenSyntheticTodoPair {
         let data = FrozenSyntheticTodoPairData::deserialize(deserializer)?;
         let mut assistant_msg = data.assistant_msg;
         let mut tool_msg = data.tool_msg;
-        // Frozen synthetic task list messages are generated by this crate, not inbound
-        // pass-through messages. Clear the retained Value after loading metadata so
-        // replay uses the same canonical typed serialization as the original freeze.
+        // Frozen synthetic task-list messages are generated by this crate, not passed through from inbound messages.
+        // Clear the retained `Value` after loading metadata so replay uses canonical typed serialization.
         assistant_msg.mark_fully_typed();
         tool_msg.mark_fully_typed();
         Ok(Self {
@@ -2170,7 +2105,7 @@ fn u8_is_zero(value: &u8) -> bool {
     *value == 0
 }
 
-/// A response-side Channel-2 directive awaiting a gateway delivery acknowledgement.
+/// The state retains a response-side Channel-2 directive until gateway delivery acknowledges it.
 /// The text is stored verbatim because Claude Code does not retain the injected prompt block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingChannel2Directive {
@@ -2180,7 +2115,6 @@ pub struct PendingChannel2Directive {
     pub arming_watermark: u64,
 }
 
-/// Content class recorded by the rendered-tail hygiene walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TailHygienePartKind {
@@ -2191,9 +2125,8 @@ pub enum TailHygienePartKind {
     Excluded,
 }
 
-/// One typed part from the rendered-tail hygiene walk. Persisting its measurements lets later
-/// passes record newly appended content and update which content is considered recent without
-/// tokenizing the historical prefix again.
+/// Persist measurements so later passes can record appended content without tokenizing the historical prefix again.
+/// Later passes record appended content and update recency from persisted measurements.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailHygienePartMeasurement {
     pub key: String,
@@ -2206,8 +2139,7 @@ pub struct TailHygienePartMeasurement {
     pub protected: bool,
 }
 
-/// Durable hygiene metrics used by both reminder channels, measured relative to the currently
-/// live tail rather than the full history.
+/// `TailHygieneBaseline` measures hygiene metrics against the live tail, not the full history.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailHygieneBaseline {
     pub baseline_u: i64,
@@ -2222,21 +2154,17 @@ pub struct TailHygieneBaseline {
     pub content_signature: String,
 }
 
-/// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
-    /// Durable bootstrap has completed. A seeded session may still await its first module fold
-    /// while `bootstrap_seed_fold_pending` is true.
+    /// `bootstrap_complete` is true after durable bootstrap completes; a seeded session can still await its first module fold.
+    /// `bootstrap_seed_fold_pending` keeps a seeded session pending until its first module fold.
     pub initialized: bool,
-    /// A bootstrap state-sync adopted its boundary, but the module has not yet rendered the
-    /// initial frozen prefix regions (`m0` and `m1`).
+    /// `bootstrap_seed_fold_pending` means a bootstrap state-sync adopted its boundary before the module rendered frozen prefix regions `m0` and `m1`.
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub bootstrap_seed_fold_pending: bool,
-    /// The render-config fingerprint as of the last Hard fold; an incoming pass whose
-    /// fingerprint differs is an epoch change → Hard.
+    /// `last_render_config` stores the render-config fingerprint from the last Hard fold; a differing incoming fingerprint starts a new Hard epoch.
     pub last_render_config: String,
-    /// Provider/model/system/upgrade identity observations used to adopt legacy rows without
-    /// treating the first non-empty observation as a cache eviction.
+    /// The module uses provider, model, system-prompt, and upgrade observations to adopt legacy rows without treating the first non-empty observation as a cache eviction.
     #[serde(default)]
     pub last_provider_id: String,
     #[serde(default)]
@@ -2245,125 +2173,111 @@ pub struct ModuleMeta {
     pub last_system_prompt_hash: String,
     #[serde(default)]
     pub last_upgrade_state: String,
-    /// The terminal covered ordinal as of the last baseline. Monotonic-absolute,
-    /// never positional; can DECREASE on a revert-Hard.
+    /// `coverage_ordinal` stores the terminal ordinal covered by the last baseline; it is monotonic-absolute, not positional, and may decrease on revert-Hard.
     pub coverage_ordinal: Option<u64>,
-    /// Last normalized `todowrite` view captured on a bust pass. This is deliberately
-    /// session-scoped: a task list is the working state of one conversation, not a
-    /// project-shared memory or preference.
+    /// `last_todo_state` stores the normalized `todowrite` view captured on a bust pass; task lists are session-scoped working state, not project-shared memory or preferences.
     #[serde(default)]
     pub last_todo_state: Option<String>,
-    /// Message id that owns the last captured task-list state. Host-side task-list forwarding uses
-    /// this to make retries of one tool result harmless without suppressing newer states.
+    /// Host-side task-list forwarding uses `last_todo_state_owner_message_id` to make retries of one tool result harmless without suppressing newer states.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_todo_state_owner_message_id: Option<String>,
-    /// SHA-256 of the normalized task-list state, used with the owner id for replay detection.
+    /// `last_todo_state_hash` stores the SHA-256 of normalized task-list state and combines with the owner id to detect replays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_todo_state_hash: Option<String>,
-    /// Set by session.flush and consumed by the next eligible transform as a SOFT refresh.
+    /// `soft_refresh_pending` causes the next eligible transform to perform a SOFT refresh after `session.flush` sets it.
     #[serde(default)]
     pub soft_refresh_pending: bool,
-    /// This session's `Today's date: ...` guidance line. Because it changes with the
-    /// wall clock, we update it only during a pass that already rewrites cached content.
+    /// `guidance_date` stores this session's `Today's date: ...` guidance line.
+    /// Passes update `guidance_date` only when they already rewrite cached content because the guidance line changes with the wall clock.
     #[serde(default)]
     pub guidance_date: String,
-    /// Monotonic session-level epoch bumped atomically with a revert re-cut. Historian
-    /// firings carry the epoch observed at assembly so stale publishers cannot append
-    /// rows after the covered prefix has been truncated.
+    /// `revert_epoch` increments atomically with each revert re-cut.
+    /// `firings` carry the epoch observed at assembly, preventing stale publishers from appending output.
     #[serde(default)]
     pub revert_epoch: u64,
-    /// Diagnostic for the most recent deterministic re-cut. It is stored with the epoch
-    /// bump so state dumps explain which suffix was dropped without retaining history.
+    /// `last_recut` records the suffix dropped by the most recent deterministic re-cut.
     #[serde(default)]
     pub last_recut: Option<String>,
-    /// A boundary-absent, share-nothing request on a key that already has lineage. This
-    /// is an alarmed raw-pass-through state, not a predicate for a future truncate.
+    /// The module marks a boundary-absent, share-nothing request on a key with lineage as an alarmed raw-pass-through state.
+    /// The alarmed raw-pass-through state does not permit a future truncate.
     #[serde(default)]
     pub pending_rewrite: Option<PendingRewriteState>,
-    /// Interleave edges between pending raw traffic and boundary-present traffic. The
-    /// counter is diagnostic and drives the durable ambiguous alarm.
+    /// The module counts interleave edges between pending raw traffic and boundary-present traffic.
+    /// The interleave-edge counter is diagnostic and triggers the durable ambiguous alarm.
     #[serde(default)]
     pub pending_rewrite_trip_count: u32,
-    /// True after repeated arm/clear interleaving proves two conversations are sharing
-    /// one session key. Serving continues, but absent-shape traffic remains raw.
+    /// Repeated arm/clear interleaving sets the ambiguous alarm.
+    /// When the ambiguous alarm is true, serving continues but boundary-absent traffic remains raw.
     #[serde(default)]
     pub pending_rewrite_ambiguous: bool,
-    /// Durable loud detail for the pending/ambiguous rewrite alarm. It is separate from
-    /// historian failures because no historian run owns this state.
+    /// pending_rewrite_last_failure is independent of historian failures because no historian run owns the alarm state.
     #[serde(default)]
     pub pending_rewrite_last_failure: Option<String>,
-    /// Frozen CK-native synthetic task-list pair plus the real tail message id it follows.
-    /// Replays keep this exact position; only changed task-list content moves it to a new
+    /// synthetic_todo stores a CK-native task-list pair and the real tail message ID preceding it.
+    /// Replays preserve the synthetic pair's position; changed task-list content moves it to a new tail end.
     /// tail end.
     #[serde(default)]
     pub synthetic_todo: Option<FrozenSyntheticTodoPair>,
-    /// Sticky note-nudge decisions copied from TypeScript during bootstrap. The host
-    /// replays these anchors after native serving so a mode transition keeps them visible.
+    /// The host replays bootstrap-copied note-nudge anchors after native serving so mode transitions retain them.
     #[serde(default)]
     pub note_nudge_anchors: Vec<NoteNudgeAnchorSeed>,
-    /// The applied in-session revision the frozen m1 block was last rendered from.
-    /// A signal mismatch is pending work; it is not itself permission to bust the provider
-    /// cache. 0 is retained for pre-materialization metadata.
+    /// m1_revision records the in-session revision used to render the frozen m1 block.
+    /// An `m1` signal mismatch marks pending work but does not permit a provider-cache bust.
+    /// m1_revision == 0 denotes pre-materialization metadata.
     #[serde(default)]
     pub m1_revision: u64,
-    /// Highest compartment sequence represented by the applied m1 revision. Unlike the combined
-    /// revision digest, this component is unaffected by project memories, notes, or profile churn.
+    /// m1_compartment_seq stores the highest compartment sequence represented by m1_revision.
+    /// m1_compartment_seq is unaffected by project memories, notes, or profile churn.
     /// `None` identifies metadata written before the component watermark was persisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub m1_compartment_seq: Option<i64>,
-    /// Counted coherent divergence observations suppressed by a pending compartment revision.
-    /// Active historian and wrapup publication windows retain this value without incrementing or
-    /// resetting it; legacy or damaged rows resume escalation after those bounded windows close.
+    /// boundary_divergence_pending_count records coherent divergence observations suppressed by a pending compartment revision.
+    /// Active historian and wrapup publication windows neither increment nor reset boundary_divergence_pending_count.
+    /// After active historian and wrapup publication windows close, legacy or damaged rows resume escalation.
     #[serde(default, skip_serializing_if = "u8_is_zero")]
     pub boundary_divergence_pending_count: u8,
-    /// The last materializing pass had cross-session memory disabled. The negative form keeps
-    /// pre-field metadata and fresh default state compatible with the historical enabled mode.
+    /// memory_disabled records whether the last materializing pass disabled cross-session memory.
+    /// `false` keeps pre-field metadata and fresh default state compatible with the historical enabled mode.
     #[serde(default)]
     pub memory_disabled: bool,
-    /// External render lane fingerprint applied by the last HARD fold. Workspace changes
-    /// remain eager-HARD and are kept separate from the deferred in-session lane.
+    /// m1_external_revision records the external render-lane fingerprint applied by the last HARD fold.
+    /// Workspace changes trigger eager HARD folds and remain separate from deferred in-session changes.
     #[serde(default)]
     pub m1_external_revision: u64,
-    /// Latest project memory epoch received from TypeScript state-sync. A changed epoch
-    /// arms an eager HARD on the next transform instead of silently becoming an m1 delta.
+    /// project_memory_epoch stores the latest project-memory epoch received from TypeScript state-sync.
+    /// A project-memory epoch update arms an eager HARD fold on the next transform instead of becoming an m1 delta.
     #[serde(default)]
     pub project_memory_epoch: u64,
     #[serde(default)]
     pub project_memory_epoch_pending: bool,
-    /// Latest global user-profile version received from state-sync. It participates in the
-    /// in-session m1 signal and therefore defers until a genuine bust opportunity.
+    /// user_profile_version participates in the in-session m1 signal.
+    /// `user_profile_version` defers until a provider-cache bust opportunity.
     #[serde(default)]
     pub user_profile_version: u64,
-    /// The profile version whose rows were actually rendered into m0 or m1. Keeping this
-    /// separate from the current state-sync version prevents an empty/budget-trimmed profile
-    /// delta from being acknowledged before its body reaches the provider.
+    /// m1_user_profile_version records the profile version whose rows were rendered into m0 or m1.
+    /// Separating rendered and current profile versions prevents acknowledgment of empty or budget-trimmed profile deltas before their bodies reach the provider.
     #[serde(default)]
     pub m1_user_profile_version: u64,
-    /// Best-effort durable start of the currently pending in-session delta. It is populated
-    /// by state-sync watermark edges, not by a pure defer transform, so defer remains a
-    /// zero-write replay path.
+    /// State-sync watermark edges populate the durable start of a pending in-session delta.
+    /// Pure defer transforms do not write the pending in-session delta start.
+    /// A defer transform performs no writes, preserving replay behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub m1_pending_since_ms: Option<i64>,
 
-    // --- slice 4d-m0: the two-watermark coverage model + memory manifest ---
-    // (all serde(default) so pre-4d meta JSON loads cleanly)
-    /// The highest compartment `sequence` folded INTO m0. The "in-m0 vs riding-m1"
-    /// divider — advances ONLY on a HARD fold. The m1 renderer treats compartments with
-    /// `sequence > folded_compartment_seq` as new (renders them at P1); the HARD folds
-    /// them and advances this. Distinct from `coverage_ordinal` (the m0+m1 coverage end /
-    /// tail-trim point, which advances on a coverage-extending SOFT too).
+    // m0 uses separate coverage watermarks and a memory manifest.
+    /// folded_compartment_seq stores the highest compartment sequence folded into m0.
+    /// folded_compartment_seq advances only on a HARD fold.
+    /// `m0` renders compartments with `sequence > folded_compartment_seq` at P1 as new.
     #[serde(default)]
     pub folded_compartment_seq: i64,
-    /// The first ordinal covered by the compartment span reflected in `coverage_ordinal`.
-    /// Leading system messages below this start are not summarized by compartments and
-    /// must remain pass-through on full-array profiles.
+    /// `coverage_start_ordinal` is the first ordinal covered by the compartment span reflected in `coverage_ordinal`.
+    /// Leading system messages below coverage_start_ordinal are not summarized by compartments.
+    /// Leading system messages below `coverage_start_ordinal` remain pass-through on full-array profiles.
     #[serde(default)]
     pub coverage_start_ordinal: Option<u64>,
-    /// The highest compartment `sequence` reflected in `coverage_ordinal` after either a
-    /// HARD fold or a coverage-extending SOFT. The transform compares the live scalar max
-    /// against this before loading full rows for covered-system absorption, keeping steady
-    /// defer passes off the compartment-row hot path. `None` means legacy metadata; callers
-    /// fall back to `folded_compartment_seq`.
+    /// `coverage_compartment_seq` is the highest compartment `sequence` reflected in `coverage_ordinal` after a HARD fold or coverage-extending SOFT.
+    /// `coverage_compartment_seq` avoids loading full rows for covered-system absorption on steady defer passes.
+    /// Callers fall back to `folded_compartment_seq` when `coverage_compartment_seq` is `None`.
     #[serde(default)]
     pub coverage_compartment_seq: Option<i64>,
     /// The frozen m0 contains these claim revisions.
@@ -2372,120 +2286,93 @@ pub struct ModuleMeta {
     /// The frozen m0/m1 pair represents this claim generation vector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_snapshot_vector: Option<SnapshotVector>,
-    /// The expiry cutoff FROZEN at the last HARD (the module clock at materialization). A
-    /// memory's expiry is judged against THIS, not a live clock, so every later SOFT/defer
-    /// compose sees the SAME memory set the m0 baseline was built against — a memory
-    /// expiring between the HARD and a later pass must not change the rendered bytes.
-    /// 0 before the first HARD.
+    /// `expiry_cutoff_ms` freezes the module clock at the last HARD materialization.
+    /// Memory expiry is judged against expiry_cutoff_ms, not a live clock.
+    /// `compose` uses the memory set that built the `m0` baseline.
+    /// Memory that expires between a HARD fold and a later pass must not change the rendered bytes.
+    /// `expiry_cutoff_ms` is 0 before the first HARD fold.
     #[serde(default)]
     pub expiry_cutoff_ms: i64,
 
-    // --- historian writer orchestration ---
-    /// Durable single-flight state for the background historian. It is intentionally
-    /// colocated with the cache meta blob: publish can CAS the state row and append
-    /// rows in one SQLite transaction without introducing a second concurrency token.
-    /// These fields never feed render bytes; they only decide whether a producer may
-    /// publish or be reattached after restart.
+    /// `historian` and `publication_floor_ordinal` never affect rendered bytes.
     #[serde(default)]
     pub historian: HistorianDurableState,
-    /// The trigger-only protected-tail floor advanced by a successful publication.
-    /// This is distinct from `coverage_ordinal`: coverage drives render/splice output,
-    /// while this floor only anchors future historian trigger selection.
+    /// A successful publication advances `publication_floor_ordinal`, the trigger-only protected-tail floor.
+    /// `publication_floor_ordinal` only anchors future historian trigger selection; `coverage_ordinal` drives render and splice output.
     #[serde(default)]
     pub publication_floor_ordinal: Option<u64>,
 
-    /// Ordered block identity vectors keyed by producer message id. Each vector stores
-    /// the block kind and a fingerprint of the canonical reduction-accounting bytes, so
-    /// a later request that changes a live message's block layout fails closed.
+    /// `mid` identifies the producer message.
+    /// Each `BlockIdentity` stores its block kind and a fingerprint of canonical reduction-accounting bytes.
     #[serde(default)]
     pub block_identity_by_mid: BTreeMap<String, Vec<BlockIdentity>>,
-    /// Number of accepted live-tail identity changes. Covered and frozen identities still
-    /// reject, but OpenCode may legitimately rewrite an uncovered queued message in place.
+    /// Covered and frozen identities reject changes, but OpenCode may rewrite an uncovered queued message in place.
     #[serde(default)]
     pub tail_identity_re_adopt_count: u64,
-    /// Record the newest non-synthetic flat block id seen in a successful live pass.
-    /// When a note is created, this value is used as a best-effort pointer to the end
-    /// of the conversation that the note refers to.
+    /// `newest_live_block_id` is the newest non-synthetic flat block ID seen in a successful live pass.
+    /// A created note uses `newest_live_block_id` as a best-effort pointer to the conversation end it refers to.
     #[serde(default)]
     pub newest_live_block_id: Option<String>,
-    /// Last non-zero provider usage reported by the caller. Used when a retry or restart
-    /// sends absent/zero usage, but overwritten by any later non-zero usage even when it
-    /// decreases after reclaim.
+    /// Absent or zero usage retains the prior value; any later non-zero usage replaces it, even after reclaim.
     #[serde(default)]
     pub last_usage: Option<ModuleUsage>,
-    /// The most recent serializer profile observed on this durable conversation key.
     #[serde(default)]
     pub last_serializer_profile: String,
-    /// Durable compatibility copy of the OpenCode reasoning cutoff captured on the last bust.
+    /// `reasoning_cleared_through_ordinal` stores the OpenCode reasoning cutoff captured on the last bust for pre-tag compatibility.
     /// A defer pass replays the same cutoff after OpenCode rebuilds the native message array.
     #[serde(default)]
     pub reasoning_cleared_through_ordinal: u64,
-    /// Tag-number cutoff captured on the last independently busting pass. This is the cycle
-    /// basis, not merely the highest message changed on that pass: preserving it across restart
-    /// prevents later tag mints from trickling reasoning strips into the cached prefix.
-    /// Keep the older ordinal field populated so pre-tag readers remain compatible.
+    /// `reasoning_cleared_through_tag` stores the tag-number cutoff from the last independently busting pass.
+    /// `reasoning_cleared_through_tag` is the cycle basis, not the highest changed message; retaining it across restart prevents later tag mints from adding reasoning strips to the cached prefix.
+    /// Writers keep the older ordinal field populated so pre-tag readers remain compatible.
     #[serde(default)]
     pub reasoning_cleared_through_tag: u64,
-    /// Highest tag number used as the immutable caveman age basis by the last
-    /// caveman-enabled genuine bust. Defer passes and restarts retain this value while
-    /// newly tagged text waits for the next independently busting pass. Zero means no
-    /// caveman-enabled bust has captured an age basis yet.
+    /// `caveman_age_basis_tag` stores the highest tag number used as the immutable caveman age basis by the last caveman-enabled bust.
+    /// `caveman_age_basis_tag` persists across defer passes and restarts; newly tagged text waits for the next independently busting pass.
+    /// Zero means no caveman-enabled bust has captured an age basis yet.
     #[serde(default)]
     pub caveman_age_basis_tag: u64,
-    /// The request-local Claude Code mechanics state committed with the rendered identity.
-    /// Missing legacy metadata is false, which preserves the dormant render path.
+    /// `cc_u1_active` stores the request-local Claude Code mechanics state committed with the rendered identity.
     #[serde(default)]
     pub cc_u1_active: bool,
-    /// The request-local tagging surface latch committed with the rendered identity.
-    /// Both the current request and this durable latch must be active before overlay bytes
-    /// render, so a transition pass can coordinate one cache-breaking HARD first.
+    /// `tagging_surface_active` stores the request-local tagging-surface latch committed with the rendered identity.
+    /// The dual latch lets a transition pass issue one cache-breaking HARD first.
     #[serde(default)]
     pub tagging_surface_active: bool,
-    /// Reclaimable-token amount at the last Channel-1 append or suppression reset.
+    /// `channel1_last_nudge_undropped` stores the reclaimable-token amount at the last Channel-1 append or suppression reset.
     #[serde(default)]
     pub channel1_last_nudge_undropped: i64,
-    /// Last Channel-1 severity band that appended a reminder. Empty means no active band.
+    /// An empty `channel1_last_nudge_level` means no active band.
     #[serde(default)]
     pub channel1_last_nudge_level: String,
-    /// Baseline calculated by one shared tail walk so both nudge channels use the same measurements.
+    /// `tail_hygiene_baseline` stores measurements from one shared tail walk so both nudge channels use the same baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_hygiene_baseline: Option<TailHygieneBaseline>,
-    /// Auto-search decisions targeting a previously served block remain hidden until an
-    /// independent cache-busting pass. A genuinely new physical tail renders immediately and
-    /// never enters this set.
+    /// Auto-search decisions for served blocks remain hidden until an independent cache-busting pass; a new physical tail renders immediately and is never added.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub pending_user_hint_block_ids: BTreeSet<String>,
-    /// Set by ctx_reduce after the agent has acted on a reminder. The next transform
-    /// suppresses new Channel-1 appends while still replaying every stored append row.
+    /// After `ctx_reduce` records that the agent acted on a reminder, the next transform suppresses new Channel-1 appends but replays every stored append row.
     #[serde(default)]
     pub channel1_reduce_suppressed: bool,
 
-    /// Highest tail ordinal observed on an execute pass that actually froze reductions.
+    /// `last_execute_ordinal` stores the highest tail ordinal observed on an execute pass that froze reductions.
     #[serde(default)]
     pub last_execute_ordinal: u64,
-    /// Provider input-token sample from the prior emergency drop-producing pass.
     #[serde(default)]
     pub last_emergency_input_sample: f64,
-    /// Whether the emergency idempotence sample is valid.
     #[serde(default)]
     pub has_prior_emergency_drop: bool,
-    /// Execute intent recorded when mid-turn tool-use defers a scheduler execute.
     #[serde(default)]
     pub deferred_execute_state: Option<DeferredExecuteState>,
-    /// Pending TypeScript compaction marker retained across authority transitions.
     #[serde(default)]
     pub pending_compaction_marker: Option<PendingCompactionMarkerState>,
 
-    // --- fake-compaction lineage descent ---
-    /// Highest real live ordinal observed on this lineage. Descent uses this durable tail,
-    /// rather than compacted coverage, as the provisional base for the replacement array.
+    /// Descent uses newest_live_ordinal, rather than compacted coverage, as the provisional base for the replacement array.
     #[serde(default)]
     pub newest_live_ordinal: u64,
-    /// A successful cross-lineage copy wrote the real boundary row for this key. Terminal
-    /// refusal records deliberately leave this false so they are never selected as copy sources.
+    /// A successful cross-lineage copy sets descent_completed after writing the real boundary row; terminal refusal records leave it false so they cannot be selected as copy sources.
     #[serde(default)]
     pub descent_completed: bool,
-    /// Target key and edge whose durable terminal record makes response-loss retries ackable.
     #[serde(default)]
     pub lineage_descent_target_key: String,
     #[serde(default)]
@@ -2494,7 +2381,7 @@ pub struct ModuleMeta {
     pub lineage_descent_disposition: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage_descent_source_key: Option<String>,
-    /// Prior lineage's final ordinal. New-array ordinals start immediately after this base.
+    /// New-array ordinals start immediately after the prior lineage's final ordinal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ordinal_continuation_base: Option<u64>,
     /// The summary block is the durable mutation/trim anchor, not the mutable whole message.
@@ -2502,59 +2389,50 @@ pub struct ModuleMeta {
     pub anchor_block_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_content_hash: Option<String>,
-    /// The fenced copy commits before transform composition. The materialized flag is set only
-    /// by the hard pass that consumes the copy; if the process crashes between those steps,
-    /// replay must materialize the copied state again.
+    /// The fenced copy commits before transform composition; lineage_descent_materialized is set only by the hard pass that consumes the copy.
+    /// If the process crashes after the fenced copy commits but before a hard pass consumes it, replay materializes the copied state again.
     #[serde(default)]
     pub lineage_descent_materialized: bool,
     #[serde(default)]
     pub lineage_descent_counters: LineageDescentCounters,
 
-    /// Channel-2 host lease state copied from the TypeScript session metadata.
     #[serde(default)]
     pub channel2_nudge_state: String,
-    /// Claude Code directive bytes awaiting an idempotent delivery echo from the gateway.
+    /// Claude Code directive bytes await an idempotent gateway delivery echo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_channel2_directive: Option<PendingChannel2Directive>,
-    /// True from a pressure crossing until a later below-threshold observation rearms the cycle.
+    /// The pressure-cycle latch remains true from a pressure crossing until a later below-threshold observation rearms the cycle.
     #[serde(default, skip_serializing_if = "bool_is_false")]
     pub channel2_pressure_latched: bool,
-    /// Monotonic cycle identity used to make directive IDs deterministic across retries.
+    /// The monotonic cycle identity makes directive IDs deterministic across retries.
     #[serde(default)]
     pub channel2_arming_watermark: u64,
-    /// Emergency drain latch active bit.
     #[serde(default)]
     pub emergency_drain_active: bool,
-    /// Unix milliseconds when the drain latch was entered; 0 when inactive.
+    /// The drain-latch timestamp is 0 when inactive; otherwise, it is the Unix-millisecond entry time.
     #[serde(default)]
     pub emergency_drain_entered_at_ms: i64,
-    /// Sparse response-recency anchor, piggybacked only on passes already committing.
+    /// The system persists the response-recency anchor only on passes that already commit.
     #[serde(default)]
     pub last_committed_pass_at_ms: i64,
-    /// Fingerprints of the blocks most recently served to the provider. The vector is exactly
-    /// the served block set for that pass, so it stays bounded by the output size.
+    /// The fingerprint vector contains exactly the blocks served to the provider on that pass, so it is bounded by the output size.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub served_output_fingerprint: Vec<ServedBlockFingerprint>,
 
-    /// Tracks which shadow reset generation this record belongs to. Operations created
-    /// before the most recent reset are rejected so they cannot write rows from an older
+    /// The record tracks its shadow reset generation; the system rejects operations created before the most recent reset so they cannot write rows from an older generation.
     /// session state.
     #[serde(default)]
     pub shadow_generation: u64,
-    /// Monotonic sequence number for accepted shadow state-sync transactions. Zero is a
-    /// valid first value, so callers must compare it directly instead of treating it as
+    /// The sequence number can be zero; callers must compare it directly rather than treating zero as missing.
     /// missing.
     #[serde(default)]
     pub shadow_seq: u64,
-    /// Set when the shadow session first diverges from the source state. Quarantine is
-    /// terminal for that generation: later passes increment the counter without adding
-    /// duplicate divergence rows until a reset clears both fields.
+    /// The record enters quarantine when the shadow session first diverges from the source state; quarantine remains terminal for that generation until a reset clears the quarantine state and counter.
+    /// After quarantine, later passes increment the divergence counter without adding duplicate divergence rows until a reset clears the counter and quarantine state.
     #[serde(default)]
     pub shadow_quarantined: bool,
     #[serde(default)]
     pub shadow_quarantined_pass_count: u64,
-    /// Stores the last watermarks acknowledged from the sender, using the same
-    /// compare-and-swap update as the mirror rows so restarts and retries see one
     /// consistent state.
     #[serde(default)]
     pub shadow_acked_watermarks: Value,
@@ -2573,8 +2451,8 @@ pub struct PendingAgentDrop {
 pub struct AppendOutcome {
     pub queued: u64,
     pub duplicate: bool,
-    /// Terminal disposition for the ledger row, set when the command resolved zero targets.
-    /// NULL means the command produced pending drops (normal path).
+    /// The ledger row's disposition becomes terminal when the command resolves zero targets.
+    /// NULL indicates that the command produced pending drops.
     pub disposition: Option<String>,
 }
 
@@ -2602,9 +2480,9 @@ pub struct TagNumberRow {
     pub tag_number: i64,
 }
 
-/// A cheap tag-table identity used to validate the module's in-process baseline.
+/// The tag identity validates the module's in-process baseline.
 ///
-/// `generation` is advanced by SQLite triggers for every insert, update, and delete. The
+/// SQLite triggers advance `generation` on every insert, update, and delete.
 /// count/max fields make normal append deltas recognizable without rehydrating old payloads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TagCacheSummary {
@@ -2648,8 +2526,8 @@ pub struct UserHintDecisionInput {
     pub hint_text: String,
 }
 
-/// Overlay writes staged by a transform and committed only after every local validation
-/// has accepted the pass. The cache-state CAS serializes competing speculative renders.
+/// A transform commits staged overlay writes only after every local validation accepts the pass.
+/// The cache-state CAS serializes competing speculative renders.
 #[derive(Debug, Default)]
 pub struct TransformOverlayBatch<'a> {
     pub max_seen_ordinal: Option<u64>,
@@ -2676,29 +2554,26 @@ pub struct TransformCommit<'a> {
     pub meta: &'a ModuleMeta,
     pub consumed_drop_ids: &'a [i64],
     pub first_applied_command_ids: &'a [String],
-    /// Snapshot vector fenced by this cache commit.
+    /// The cache commit fences the snapshot vector.
     pub claim_snapshot_vector: Option<&'a SnapshotVector>,
-    /// Highest compartment sequence observed while composing a bust. The fenced commit
-    /// re-reads this scalar so a publication interleaved between signal read and commit
-    /// cannot be hidden behind the older rendered m1 bytes.
+    /// The fenced commit re-reads the highest observed compartment sequence before publishing rendered m1 bytes.
+    /// Re-reading the compartment sequence prevents an interleaved publication from being hidden by stale rendered m1 bytes.
     pub compartment_max_seq: Option<i64>,
-    /// Authenticated filesystem root observed by the transform that owns this cache commit.
+    /// The transform records the authenticated filesystem root for this cache commit.
     pub project_root: Option<&'a str>,
-    /// Serialized first-divergence attribution to store with the accepted pass.
+    /// The transaction stores first-divergence attribution with the accepted pass.
     pub first_divergence: Option<&'a str>,
-    /// Scheduler arm and updated drain-latch state for a real accepted transform pass.
-    /// Maintenance callers that reuse this transaction leave it absent.
+    /// The transaction stores the scheduler arm and drain-latch state only for accepted transform passes.
     pub scheduler_observation: Option<&'a PassSchedulerObservation>,
-    /// Sender clock and exact full-array identity already carried on the transform request.
+    /// The transform request carries the sender clock and exact full-array identity.
     pub scheduler_request_observed_at_ms: Option<u64>,
     pub scheduler_full_array_fingerprint: Option<&'a str>,
-    /// Eligible supersession tool arcs counted when an open ride gate runs selection. Missing
-    /// means selection did not run; zero means it ran and found none.
+    /// An absent eligible-supersession-tool-arc count means selection did not run; zero means it ran and found none.
     pub scheduler_eligible_supersession_count: Option<u64>,
     pub scheduler_withheld_by_tag_window: Option<u64>,
     pub scheduler_withheld_by_exempt_message: Option<u64>,
     pub scheduler_applied_supersession_count: Option<u64>,
-    /// Whether this pass added a previously-unfrozen reduction to the served output.
+    /// A true value means the pass added a previously unfrozen reduction to the served output.
     pub scheduler_applied_reductions: bool,
     pub overlays: TransformOverlayBatch<'a>,
 }
@@ -2713,7 +2588,7 @@ pub struct SessionStatusSnapshot {
     pub compartment_page: Option<CompartmentPage>,
 }
 
-/// A bounded chronological page of module-owned compartments.
+/// `CompartmentPage` contains a bounded chronological page of module-owned compartments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompartmentPage {
     pub compartments: Vec<StoredCompartment>,
@@ -2740,8 +2615,8 @@ pub enum TodoStateSetOutcome {
     Noop,
 }
 
-/// A stored compartment row (the m0/m1 history source). `sequence` is the
-/// chronological order (1 = oldest).
+/// A stored compartment row supplies the m0/m1 history source.
+/// A value of 1 denotes the oldest row.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoredCompartment {
     pub sequence: i64,
@@ -2752,17 +2627,17 @@ pub struct StoredCompartment {
     pub start_date: Option<String>,
     pub end_date: Option<String>,
     pub title: String,
-    /// v2 P1 text, or the flat legacy body. Always present.
+    /// The field contains v2 P1 text or the flat legacy body and is always present.
     pub content: String,
-    /// v2 paraphrase tiers; None for legacy rows.
+    /// The field contains v2 paraphrase tiers and is `None` for legacy rows.
     pub p1: Option<String>,
     pub p2: Option<String>,
     pub p3: Option<String>,
     pub p4: Option<String>,
-    /// Decay rate (1..100), defaults to 50.
+    /// The decay rate ranges from 1 through 100 and defaults to 50.
     pub importance: i32,
     pub episode_type: Option<String>,
-    /// 1 = pre-v2 flat compartment, 0 = v2 tiered.
+    /// A value of 1 denotes a pre-v2 flat compartment; 0 denotes a v2 tiered compartment.
     pub legacy: i32,
     pub created_at: i64,
 }
@@ -2799,8 +2674,8 @@ pub struct StoredChunkTranscript {
     pub start_ordinal: i64,
     pub end_ordinal: i64,
     pub transcript: Option<String>,
-    /// JSON-encoded original CK messages for this compacted range. Old transcript rows do not
-    /// have this migration-era payload, so callers retain the condensed transcript fallback.
+    /// The field stores JSON-encoded original CK messages for this compacted range.
+    /// Old transcript rows lack this payload, so callers retain the condensed transcript fallback.
     pub raw_messages_json: Option<String>,
     pub created_at_ms: i64,
 }
@@ -2808,7 +2683,6 @@ pub struct StoredChunkTranscript {
 #[derive(Debug, Clone, Copy)]
 pub struct NoteInput<'a> {
     pub project_path: &'a str,
-    /// Bound route root for facade writes. The note remains keyed by `project_path`.
     pub route_project_root: Option<&'a str>,
     pub session_id: &'a str,
     pub content: &'a str,
@@ -2817,13 +2691,13 @@ pub struct NoteInput<'a> {
     pub now_ms: i64,
 }
 
-/// Full module-side note write input. `surface_condition` selects the pending smart-note
-/// state; an absent condition creates an ordinary active note for legacy callers, while the
+/// `surface_condition` selects the pending smart-note path.
+/// An absent `surface_condition` creates an ordinary active note for legacy callers.
 /// Rust-mode adapter keeps session-only notes on the TypeScript-owned path.
 #[derive(Debug, Clone, Copy)]
 pub struct NoteWriteInput<'a> {
     pub project_path: &'a str,
-    /// Bound route root for facade writes. The note remains keyed by `project_path`.
+    /// Facade writes use the bound route root, while the note remains keyed by `project_path`.
     pub route_project_root: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub content: &'a str,
@@ -2930,21 +2804,20 @@ pub struct NoteEvaluationInput<'a> {
     pub now_ms: i64,
 }
 
-/// Lease length for one durable smart-note evaluation claim.
+/// A durable smart-note evaluation claim expires after this lease length.
 pub const NOTE_EVAL_CLAIM_LEASE_MS: i64 = 2 * 60_000;
-/// Replay retention for a `no_work` acquisition decision.
+/// `no_work` acquisition decisions remain replayable for this retention period.
 pub const NOTE_EVAL_NO_WORK_RETENTION_MS: i64 = 10 * 60_000;
-/// Replay retention for a terminal claim result.
+/// Terminal claim results remain replayable for this retention period.
 pub const NOTE_EVAL_TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60_000;
-/// How long a terminal claim keeps its `terminal_response` before redaction.
-/// The response exists only so a worker that lost the completion reply can
-/// replay it; that window is minutes, not days. Nulling it well before the
-/// row itself ages out keeps evaluator-supplied response text from being
-/// retained for the full terminal-retention window.
+/// Terminal claims redact `terminal_response` after 24 hours.
+/// Redact `terminal_response` before terminal-row expiry.
+/// The system retains `terminal_response` for 24 hours, then redacts it before terminal-row expiry.
+/// Redacting `terminal_response` prevents evaluator-supplied response text from surviving for the terminal-retention window.
 pub const NOTE_EVAL_RESPONSE_REDACT_MS: i64 = 24 * 60 * 60_000;
-/// Per-project row cap for each evaluation ledger.
+/// Each project retains at most 10,000 rows in each evaluation ledger.
 pub const NOTE_EVAL_LEDGER_CAP: i64 = 10_000;
-/// Rows repaired per committed batch by the v51 compiled-artifact repair.
+/// Each committed compiled-artifact repair batch repairs 500 rows.
 const NOTE_ARTIFACT_REPAIR_BATCH: i64 = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2965,11 +2838,10 @@ pub struct NoteEvalClaim {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// One selection decision produced by the caller's closure inside the
-/// acquisition transaction. `NoWork` carries its cause so the durable
-/// ledger can replay the full decision after response loss: a spent
-/// cursor (`cycle_exhausted`) tells the client to poll again, while a
-/// plain empty answer ends the drain.
+/// The acquisition transaction stores the caller closure's selection decision.
+/// `NoWork` records its cause so the acquisition ledger can replay the decision after response loss.
+/// `cycle_exhausted` tells the client to poll again after the selection cursor is spent.
+/// An empty selection result ends the drain.
 pub enum NoteEvalSelection {
     Claim { note_id: i64, phase: String },
     NoWork { cycle_exhausted: bool },
@@ -2985,8 +2857,7 @@ pub enum NoteEvalAcquireOutcome {
     },
     NoWork {
         replayed: bool,
-        /// The selection cursor, not the queue, ended this pass. Durable in
-        /// the acquisition ledger so response-loss replays re-announce it.
+        /// The acquisition ledger records cursor exhaustion so response-loss replay re-announces it.
         cycle_exhausted: bool,
     },
     /// The acquisition identity replays an expired decision.
@@ -3066,7 +2937,7 @@ pub struct StoredNoteSearchRow {
     pub updated_at_ms: i64,
 }
 
-/// Persists one claim command intent and its committed result JSON.
+/// The ledger persists one claim command intent and its committed result JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimIntentRecord {
     pub binding: ClaimIntentBinding,
@@ -3084,7 +2955,7 @@ pub struct ClaimIntentMutationOutcome {
     pub replayed: bool,
 }
 
-/// Durable authority state for one context store, project, and owned domain.
+/// The authority state covers one context store, project, and owned domain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorityRow {
     pub context_store_uuid: String,
@@ -3104,7 +2975,7 @@ pub struct AuthorityRow {
     pub step_flip: bool,
     pub coordinator_lease: Option<String>,
     pub lease_expires_at: Option<i64>,
-    /// Attempt-unique token minted at drain begin/takeover. Step and finish require it.
+    /// Drain begin or takeover mints an attempt-unique token; step and finish require that token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_token: Option<String>,
     pub checksum_expected: Option<String>,
@@ -3112,7 +2983,7 @@ pub struct AuthorityRow {
     pub checksum_ok: Option<bool>,
 }
 
-/// One append-only row returned by `mirror.pull`. The snapshot is the complete row
+/// Each `mirror.pull` call returns one append-only row; its snapshot contains the complete row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChangefeedRow {
     pub feed_seq: i64,
@@ -3138,29 +3009,26 @@ pub struct DreamTaskCommandRow {
     pub created_at: i64,
 }
 
-/// A context row used by the crash-idempotent authority seed. The JSON payload is
-/// intentionally opaque here; the module persists the fields it owns and verifies
-/// the host-provided content hash separately.
+/// The crash-idempotent authority seed uses the persisted context-store row.
+/// The module persists owned fields and separately verifies the host-provided content hash without interpreting the JSON payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthoritySeedRow {
     pub source_row_id: i64,
     pub snapshot: Value,
 }
 
-/// A loaded per-session row: the core state, the meta blob, and the CAS token.
 #[derive(Debug, Clone)]
 pub struct LoadedState {
     pub core: CoreState,
     pub meta: ModuleMeta,
-    /// The row_version read from disk; pass it back to [`McStore::commit`] as the CAS
-    /// expectation. `None` when no row existed yet (first bootstrap → INSERT path).
+    /// Callers pass `row_version` to [`McStore::commit`] as the CAS expectation.
+    /// `None` selects [`McStore::commit`]'s INSERT path when no row exists.
     pub row_version: Option<u64>,
 }
 
-/// Query-family timings collected while loading a transform snapshot.
+/// The module collects these query-family timings while loading a transform snapshot.
 ///
-/// These fields are not durable state. They expose the read-transaction breakdown to the
-/// module's per-pass diagnostic line without changing snapshot contents or transaction scope.
+/// These fields expose the read-transaction breakdown in the module's per-pass diagnostic line without changing snapshot contents or transaction scope.
 #[derive(Debug, Clone, Default)]
 pub struct TransformSnapshotTimings {
     pub cache_state_ms: f64,
@@ -3170,9 +3038,9 @@ pub struct TransformSnapshotTimings {
     pub overlay_frontier_ms: f64,
 }
 
-/// Cache state and every non-tag byte-affecting transform overlay from one SQLite snapshot.
+/// The module reads cache state and every non-tag byte-affecting transform overlay from one SQLite snapshot.
 ///
-/// Tag rows are immutable payloads cached module-side and validated with [`TagCacheSummary`].
+/// The module caches tag rows as immutable payloads and validates them with [`TagCacheSummary`].
 #[derive(Debug, Clone)]
 pub struct TransformSnapshot {
     pub loaded: LoadedState,
@@ -3238,9 +3106,8 @@ pub struct UserHintSeedRow {
     pub hint_text: String,
 }
 
-/// A TypeScript-owned strip decision that must be replayed by the module before its
-/// first transform. Message-level strips intentionally carry the message id rather
-/// than a block id because the source operation may have covered several CK blocks.
+/// The module replays the TypeScript-owned strip decision before its first transform.
+/// Message-level strips carry the message ID because one source operation can cover several CK blocks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleStripSeedRow {
     pub message_id: String,
@@ -3252,7 +3119,7 @@ pub struct ModuleStateSyncRequest<'a> {
     pub project_path: &'a str,
     pub shadow_generation: u64,
     pub expected_shadow_seq: u64,
-    /// The producer's current flat compaction boundary. Present only on a full seed.
+    /// A full seed includes the producer's current flat compaction boundary.
     pub seed_boundary_id: Option<&'a str>,
     pub drop_seeds: &'a [ModuleDropSeedRow],
     pub drop_seed_skipped: usize,
@@ -3260,11 +3127,11 @@ pub struct ModuleStateSyncRequest<'a> {
     pub pending_agent_drops_skipped: usize,
     pub user_hint_seeds: &'a [UserHintSeedRow],
     pub auto_search_hint_skipped: usize,
-    /// When true, the seed batch is the host's COMPLETE hint-decision list
-    /// for this session: any stored hint block absent from the batch has no
-    /// backing decision the host can still validate (a pre-policy hint whose
-    /// raw message is gone), and keeping it would replay unvalidated overlay
-    /// bytes forever. Rows in the batch are upserted; absent rows deleted.
+    /// When user_hints_replace_session is true, the seed batch is the host's complete hint-decision list for the session.
+    /// When user_hints_replace_session is true, an absent stored hint block has no backing decision the host can validate.
+    /// A pre-policy hint whose raw message is gone has no backing decision the host can validate.
+    /// Keeping a hint without a validatable backing decision replays unvalidated overlay bytes forever.
+    /// When user_hints_replace_session is true, seed rows are upserted and absent stored rows are deleted.
     pub user_hints_replace_session: bool,
     pub note_nudge_anchors: Option<&'a [NoteNudgeAnchorSeed]>,
     pub todo_synthetic_anchor: Option<&'a FrozenSyntheticTodoPair>,
@@ -3360,13 +3227,13 @@ pub enum ModuleStateSyncError {
 #[derive(Debug)]
 pub enum McStoreError {
     Store(StoreError),
-    /// `store.db` carries `mc_cache` history older than the consolidated
-    /// bootstrap, so this binary cannot adopt it and does not migrate it.
+    /// `store.db` contains pre-consolidation `mc_cache` history that this binary cannot adopt or migrate.
+    /// `store.db` contains pre-consolidation `mc_cache` history that this binary cannot adopt or migrate.
     PreCutoverModuleStore {
         recorded_version: u32,
         bootstrap_version: u32,
     },
-    /// The on-disk row_version moved under us (a concurrent writer committed first).
+    /// A concurrent writer committed first, changing the on-disk row_version.
     /// The caller re-loads and re-steps.
     CasConflict {
         expected: Option<u64>,
@@ -3408,8 +3275,8 @@ pub enum McStoreError {
         incoming_start_message: i64,
         incoming_end_message: i64,
     },
-    /// A facade route bound to an authority-managed identity attempted to write
-    /// using filesystem-path transport vocabulary instead of the domain identity.
+    /// A facade route bound to an authority-managed identity must use the domain identity, not filesystem-path transport vocabulary, to write.
+    /// A facade route bound to an authority-managed identity must use the domain identity, not filesystem-path transport vocabulary, to write.
     FacadeProjectVocabularyMismatch {
         route_project_root: String,
         authority_project: String,
@@ -3648,9 +3515,8 @@ impl From<StoreError> for ModuleStateSyncError {
     }
 }
 
-/// Outcome of the fenced commit txn: either the new row_version, or a CAS conflict
-/// carrying the version observed on disk. Modeled as a return value (not an error)
-/// so a conflicting pass commits an empty txn and the caller re-loads cleanly.
+/// The fenced commit transaction returns either the new row_version or a CAS conflict containing the on-disk version.
+/// CAS conflicts are return values so the transaction can commit no changes and the caller can reload cleanly.
 enum CommitOutcome {
     Committed(u64),
     CasConflict(u64),
@@ -3670,9 +3536,9 @@ enum ClaimIntentTxnOutcome {
         found: String,
     },
     Frozen(String),
-    /// No `mc_authority` row is reachable from the bound daemon route, so this route
-    /// has no proven memories ownership. Distinct from `Frozen` so callers can tell
-    /// "never managed here" from "managed but transitioning".
+    /// No `mc_authority` row is reachable from the bound daemon route.
+    /// `RouteNotManaged` indicates that no `mc_authority` row is reachable from the bound daemon route.
+    /// `RouteNotManaged` means "never managed here"; `Frozen` means "managed but transitioning".
     RouteNotManaged,
     NotFound,
     Transition {
@@ -4004,9 +3870,8 @@ fn mint_coordinator_token(lease: &str, lease_expires_at: i64, generation: u64) -
 impl std::error::Error for AuthorityTransitionError {}
 
 fn map_authority_sql_error(error: StoreError) -> McStoreError {
-    // cortexkit-store intentionally erases driver-specific errors at its connection
-    // boundary. Keep the durable operation error rather than pretending it was a
-    // successful transition when a generation or state check failed.
+    // cortexkit-store erases driver-specific errors at its connection boundary.
+    // Do not report a successful transition when a generation or state check fails.
     McStoreError::Store(error)
 }
 
@@ -4020,30 +3885,14 @@ fn validate_authority_domain(domain: &str) -> Result<(), McStoreError> {
     }
 }
 
-/// Resolve the memories/notes authority bound to a daemon route, inside an open
 /// transaction.
 ///
-/// This is the transaction-scoped twin of `authority_project_state_for_route`.
-/// Callers that hold caller-supplied identity fields must not key `mc_authority`
-/// by those fields: the authority row is keyed by `context_store_uuid`, which the
-/// host mints separately from the format marker's `database_incarnation_id`, so
-/// keying by the marker identity matches no row and silently fails open. Route
-/// bindings are installed server-side by `bind_authority_route`, which makes the
-/// bound route the only trustworthy authority identity on a facade request.
+/// Callers must not key `mc_authority` by caller-supplied identity fields.
+/// The bound route is the only trustworthy authority identity on a facade request.
 ///
-/// Both legs are index seeks: `mc_authority_route_bindings.route_project_root` is
-/// the primary key, and `mc_authority` is keyed by
-/// `(context_store_uuid, project, domain)`.
 ///
-/// Unlike the non-transactional helpers, this does not filter on state; the caller
-/// decides which states it accepts so it can distinguish "not managed" from
-/// "managed but draining".
-/// The live fence a claim intent must clear before its context mutation may run.
+/// A caller can distinguish an unmanaged route from a non-`MODULE` route.
 ///
-/// `Ok(None)` means staging may proceed; `Ok(Some(outcome))` is the rejection to
-/// return. Both the fresh insert and a `staged` replay call this, because a replay
-/// executes the same mutation and the stored binding only proves what was true
-/// when the row was written.
 fn claim_intent_stage_fence(
     tx: &rusqlite::Transaction<'_>,
     route_project_root: &str,
@@ -4059,10 +3908,7 @@ fn claim_intent_stage_fence(
     if let Some(state) = transition.filter(|state| state != "accepting") {
         return Ok(Some(ClaimIntentTxnOutcome::Frozen(state)));
     }
-    // Resolve the authority from the bound route, never from the caller-supplied
-    // binding. `mc_authority` is keyed by `context_store_uuid`, which the host mints
-    // independently of the format marker's `database_incarnation_id`, so keying this
-    // lookup by the binding identity matches no row and fails open.
+    // The lookup resolves the authority from the bound route, never from the caller-supplied binding.
     let Some((authority_project, state, generation)) =
         authority_for_route_tx(tx, route_project_root, "memories")?
     else {
@@ -4071,8 +3917,6 @@ fn claim_intent_stage_fence(
     if state != "MODULE" {
         return Ok(Some(ClaimIntentTxnOutcome::Frozen(state)));
     }
-    // The route owns the project vocabulary; a binding naming another project must
-    // not be able to stage against this route's authority.
     if authority_project != binding.authority_project {
         return Ok(Some(ClaimIntentTxnOutcome::BindingMismatch {
             field: "authority project",
@@ -4316,8 +4160,6 @@ fn validated_seed_boundary(
     }
 
     Ok(ValidatedSeedBoundary {
-        // The compartment publisher's end-block form is canonical even if a future
-        // sender derives the same identity through a different marker representation.
         boundary_id: tail.end_message_id.clone(),
         coverage_start_ordinal: ordered[0].start_message as u64,
         coverage_end_ordinal: tail.end_message as u64,
@@ -4340,7 +4182,6 @@ type AbandonHistorianHook = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut
 type BeforeMaxCompartmentEndReadHook =
     std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut(&McStore) + Send>>>>;
 
-/// The Magic Context cache-state store: one single-writer SQLite handle for the
 /// module's lifetime.
 struct FacadeAuthorityScope {
     owner: std::thread::ThreadId,
@@ -4375,16 +4216,12 @@ impl Drop for FacadeNoteScopeGuard<'_> {
     }
 }
 
-/// The result of one command-aware facade mutation. `Duplicate` contains the exact response bytes
-/// committed by the original command; it is returned without entering the mutation operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FacadeMutationOutcome {
     Applied(Vec<u8>),
     Duplicate(Vec<u8>),
 }
 
-/// Transaction-scoped ports used by the module facade. Every method operates on the transaction
-/// owned by `with_facade_command`, so the mutation and its response ledger row commit together.
 pub struct FacadeMutationTxn<'a> {
     tx: &'a rusqlite::Transaction<'a>,
 }
@@ -4609,15 +4446,8 @@ impl<'a> FacadeMutationTxn<'a> {
 
 pub struct McStore {
     inner: SqliteStore,
-    // Distinguishes independent stores in the process-local tag baseline cache. Production
-    // opens one store for the module lifetime; tests and embedded callers may open several.
     tag_cache_namespace: u64,
-    /// The connection-local caller identity used by note ownership triggers. It is
-    /// installed only while a fenced note mutation is executing, so an unwrapped SQL
-    /// writer fails closed instead of inheriting a previous operation's project.
     note_caller_project: Arc<Mutex<Option<String>>>,
-    /// Facade scope is visible to SQLite triggers for the duration of a mutation. A separate
-    /// lock serializes scopes so one request cannot lend its authority identity to another.
     facade_authority_scope: Arc<Mutex<Option<FacadeAuthorityScope>>>,
     facade_mutation_lock: Mutex<()>,
     #[cfg(any(test, feature = "test-support"))]
@@ -4667,9 +4497,6 @@ fn seeded_drop_unit(
     })
 }
 
-/// Materialize the TypeScript drop snapshot before the first transform. A tag
-/// may name a tool arc, so its paired result receives the module's normal drop
-/// unit while the call block keeps the requested skeleton or edit marker kind.
 fn materialize_drop_seed_units(
     core: &mut CoreState,
     session_id: &str,
@@ -4757,9 +4584,6 @@ fn valid_strip_seed_kind(kind: &str) -> bool {
     )
 }
 
-/// Materialize frozen message-level strips from the TypeScript authority. The unit
-/// payload is only a compatibility marker; the transform chooses the provider-aware
-/// sentinel at egress, while the unit key keeps detection/replay id-keyed.
 fn materialize_strip_seed_units(
     core: &mut CoreState,
     session_id: &str,
@@ -4808,7 +4632,6 @@ fn materialize_strip_seed_units(
 }
 
 impl McStore {
-    /// Process-local identity for cache entries that otherwise use a session id as their key.
     pub fn tag_cache_namespace(&self) -> u64 {
         self.tag_cache_namespace
     }
@@ -4820,8 +4643,6 @@ impl McStore {
         let note_udf_scope = Arc::clone(&note_caller_project);
         let facade_domain_scope = Arc::clone(&facade_authority_scope);
         let facade_route_scope = Arc::clone(&facade_authority_scope);
-        // Register before migrations: migrations create triggers that call these functions,
-        // and the same connection must expose them before the first guarded write is possible.
         inner.with_conn(move |conn| {
             conn.create_scalar_function(
                 "mc_note_caller_project",
@@ -4872,9 +4693,6 @@ impl McStore {
         })?;
         refuse_pre_cutover_store(&inner)?;
         inner.migrate(NS, MIGRATIONS)?;
-        // Per-pass statements run through prepare_cached; the rusqlite default cache
-        // holds 16 statements, which the hot set alone exceeds. 128 keeps every hot
-        // shape resident without meaningful memory cost.
         inner.with_conn(|conn| {
             conn.set_prepared_statement_cache_capacity(128);
             Ok(())
@@ -4909,10 +4727,7 @@ impl McStore {
         let now_ms = current_time_ms();
         self.inner
             .with_conn(|conn| {
-                // Cache rows are retained across session teardown, so row existence is not
-                // activity. Prune lineage only when both the root observation and its cache
-                // activity watermark are older than the inactivity window. This keeps active
-                // sessions alive without depending on a deletion path that does not exist.
+                // The pruner removes lineage only when both the root observation and cache activity watermark predate the inactivity window.
                 conn.execute(
                     "DELETE FROM mc_transform_session_roots AS roots
                       WHERE roots.observed_at < ?1
@@ -4928,8 +4743,6 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Recover the authenticated transform lineage after a module process restart. Cache state
-    /// alone is insufficient: the exact project root must have been committed with that session.
     pub fn knows_transform_session_root(
         &self,
         session_id: &str,
@@ -4938,9 +4751,6 @@ impl McStore {
         let candidate = canonical_root(project_root);
         self.inner
             .with_conn(|conn| {
-                // Older stores may contain symlink spellings. Load the tiny per-session set and
-                // canonicalize both sides in Rust rather than relying on SQL string equality;
-                // this keeps migration compatibility without changing the durable schema.
                 let mut statement = conn.prepare_cached(
                     "SELECT project_root
                        FROM mc_transform_session_roots
@@ -4958,10 +4768,6 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Execute a command-aware facade mutation in one fenced transaction. The operation callback
-    /// must return the exact response bytes that the caller would receive; those bytes are stored
-    /// before the transaction commits. A duplicate command returns the stored bytes without
-    /// invoking the callback.
     #[allow(clippy::too_many_arguments)]
     pub fn with_facade_command(
         &self,
@@ -5039,9 +4845,7 @@ impl McStore {
                             created_at_ms
                         ],
                     )?;
-                    // Keep only the newest 512 commands for each session identity. The command
-                    // key remains unique while it is retained; old outcomes are intentionally
-                    // forgettable because the host session has a bounded replay horizon.
+                    // Old outcomes are forgettable because the host session has a bounded replay horizon.
                     tx.execute(
                         "DELETE FROM mc_facade_mutation_ledger
                           WHERE identity_scope = ?1
@@ -5060,11 +4864,8 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Complete route normalization after schema upgrades using the same caller-identity
-    /// check as runtime note writes. Because the SQL migration cannot safely rekey several
-    /// note owners under one caller identity, replay this idempotent repair on every store
-    /// open, including stores that already recorded the upgraded schema version.
-    /// Verify pre-v51 compiled artifacts once, then record completion in mc_cache_state.
+    /// Replay this idempotent repair on every store open because SQL migration cannot safely rekey several note owners under one caller identity.
+    /// The repair records completion in mc_cache_state after verifying pre-v51 compiled artifacts.
     /// This repair does not advance any note revision.
     fn repair_note_artifacts_v51(&self) -> Result<(), McStoreError> {
         const FLAG_KEY: &str = "note_artifact_repair_v51_done";
@@ -5090,10 +4891,7 @@ impl McStore {
             Ok(rows)
         })?;
         for project in projects {
-            // Commit in bounded batches so a kill mid-repair keeps the work
-            // already done instead of rolling back a whole project and redoing it
-            // on every subsequent boot. The query re-selects unrepaired rows each
-            // pass, so this is naturally resumable.
+            // The repair commits bounded batches so a mid-repair kill preserves completed work; each pass reselects unrepaired rows to resume later.
             loop {
                 let processed = self
                     .with_note_conn_fenced(&project, |tx| repair_note_artifacts_tx(tx, &project))?;
@@ -5113,8 +4911,7 @@ impl McStore {
         Ok(())
     }
 
-    /// Associate a daemon-bound route root with an authority identity. The route path
-    /// is transport vocabulary; the identity remains the key used by domain rows.
+    /// Domain rows use the authority identity as their key; route paths are transport-only.
     pub fn bind_authority_route(
         &self,
         context_store_uuid: &str,
@@ -5130,18 +4927,13 @@ impl McStore {
                     project = excluded.project",
                 params![route_project_root, context_store_uuid, project],
             )?;
-            // The trigger remains the direct-SQL safety net, but cleanup also belongs to
-            // this operation: a bind can happen before twins exist and never be retried
-            // by the cached authority-status path. Running it after every upsert makes
-            // the vocabulary law independent of write ordering.
+            // Cleanup runs after every upsert because binds can precede twin creation and cached authority-status checks may not retry.
             normalize_authority_note_route_tx(tx, context_store_uuid, project, route_project_root)?;
             Ok(())
         })
     }
 
-    /// Resolve a requested facade identity to the MODULE authority that owns it. The
-    /// context UUID is returned with the identity so a write can establish the route
-    /// binding even when the transform's authority-status result was cached.
+    /// The lookup returns the MODULE authority identity and context UUID so writes can bind routes even when authority-status results are cached.
     pub fn module_authority_for_project(
         &self,
         project: &str,
@@ -5164,8 +4956,7 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Resolve a facade-supplied identity while it is module-owned or draining. DRAINING remains
-    /// visible so callers can return a retryable transition error instead of falling back to a
+    /// Exposing DRAINING lets callers return a retryable transition error.
     /// filesystem route.
     pub fn facade_authority_for_project(
         &self,
@@ -5190,8 +4981,7 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Return the authority identity and state bound to this daemon route while ownership is
-    /// active or draining. Mutation callers use the state; transforms and reads keep continuity.
+    /// The route lookup returns the authority identity and state for an ACTIVE or DRAINING route; mutations use the state while transforms and reads preserve continuity.
     pub fn authority_project_state_for_route(
         &self,
         route_project_root: &str,
@@ -5217,9 +5007,7 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Return the authority identity bound to this daemon route only while ownership is active
-    /// or draining. PREPARING remains route-keyed so transforms cannot observe a partial seed;
-    /// the verified MODULE acknowledgement publishes the identity-key flip.
+    /// The route lookup returns the authority identity only for ACTIVE routes; PREPARING remains route-keyed until verified MODULE acknowledgement publishes the identity-key flip.
     pub fn authority_project_for_route(
         &self,
         route_project_root: &str,
@@ -5257,7 +5045,7 @@ impl McStore {
             .insert(kind.to_string());
     }
 
-    /// Reject a facade write that crosses the route's active authority identity.
+    /// The facade write path rejects writes that cross the route's active authority identity.
     pub fn enforce_facade_project_vocabulary(
         &self,
         route_project_root: &str,
@@ -5276,9 +5064,7 @@ impl McStore {
         Ok(())
     }
 
-    /// Install a one-shot callback immediately before the max-compartment-end query. It lets
-    /// detector tests place a publication after an earlier revision read without adding a
-    /// production scheduling seam.
+    /// The hook runs once immediately before the max-compartment-end query so detector tests can publish after an earlier revision read without a production scheduling seam.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_before_max_compartment_end_read_hook(&self, hook: Box<dyn FnMut(&McStore) + Send>) {
         *self
@@ -5287,9 +5073,7 @@ impl McStore {
             .expect("max compartment-end read hook mutex") = Some(hook);
     }
 
-    /// Install a test callback while cleanup of a matching pending historian run holds
-    /// SQLite's writer lock. The callback checks that a competing write cannot slip
-    /// between reading the match and storing the idle state.
+    /// The callback runs while cleanup holds SQLite's writer lock to verify that a competing write cannot occur between reading the match and storing the idle state.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_abandon_historian_hook(&self, hook: Box<dyn FnMut() + Send>) {
         *self
@@ -5342,9 +5126,7 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// The applied schema version of this store's `mc_cache` migration chain:
-    /// MAX(version) recorded in the shared `cortexkit_schema_version` table for this
-    /// namespace. Read-only probe for status surfaces; it never writes.
+    /// The applied `mc_cache` schema version is the maximum version recorded for this namespace in `cortexkit_schema_version`.
     pub fn module_store_schema_version(&self) -> Result<u32, McStoreError> {
         self.inner
             .with_conn(|conn| {
@@ -5357,8 +5139,8 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Whether a session has committed module cache state. Facade identity shortcuts use
-    /// this as a provenance check; a client-supplied harness label cannot create this row.
+    /// Facade identity shortcuts use committed module cache state as a provenance check.
+    /// A client-supplied harness label cannot create a committed module cache-state row.
     pub fn has_cache_state(&self, session_id: &str) -> Result<bool, McStoreError> {
         self.inner
             .with_conn(|conn| {
@@ -5371,7 +5153,6 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Return the last OC-host-rendered mural for a resolved project identity.
     pub fn load_project_mural_artifact(
         &self,
         project_path: &str,
@@ -5397,10 +5178,8 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Store a host-rendered mural only when its content identity changes.
     ///
-    /// A transform can carry the same host artifact on every pass. Updating `updated_at` in that
-    /// case would turn ordinary defer traffic into a write stream, so the hash is the sole gate.
+    /// Updating `updated_at` when the host artifact is unchanged would turn ordinary defer traffic into a write stream, so the hash is the sole gate.
     pub fn upsert_project_mural_artifact(
         &self,
         project_path: &str,
@@ -5426,9 +5205,8 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Delete every row whose ownership is expressed by an exact `session_id` column.
-    /// Project memories and smart notes survive because their ownership is project-scoped;
-    /// session notes and every cache/overlay/producer ledger row are removed atomically.
+    /// Project memories and smart notes survive because their ownership is project-scoped.
+    /// The cleanup atomically removes session notes and cache, overlay, and producer ledger rows.
     pub fn delete_session(
         &self,
         session_id: &str,
@@ -5448,8 +5226,7 @@ impl McStore {
             for table in tables {
                 let quoted = format!("\"{}\"", table.replace('"', "\"\""));
                 let has_session_id = {
-                    // Not prepare_cached: the SQL text embeds the table name, so
-                    // each entry is one-shot and would only churn the LRU cache.
+                    // The query uses `prepare` because its SQL text embeds the table name, so one-shot entries would only churn the LRU cache.
                     let mut stmt = tx.prepare(&format!("PRAGMA table_info({quoted})"))?;
                     let columns = stmt
                         .query_map([], |row| row.get::<_, String>(1))?
@@ -5476,8 +5253,7 @@ impl McStore {
         })
     }
 
-    /// Load a session's persisted state. Returns defaults (uninitialized, no row)
-    /// when the session has never been seen — the classifier then bootstraps.
+    /// The loader returns uninitialized defaults when no session row exists; the classifier then bootstraps.
     pub fn load(&self, session_id: &str) -> Result<LoadedState, McStoreError> {
         let row = self.inner.with_conn(|conn| {
             Ok(conn
@@ -5513,9 +5289,8 @@ impl McStore {
         }
     }
 
-    /// Load cache state and non-tag render overlays from one SQLite read transaction.
-    /// No-write passes use this snapshot as their read linearization point; tag payloads use the
-    /// separately validated module baseline so a stable pass does not stream every source blob.
+    /// The loader reads cache state and non-tag render overlays in one SQLite read transaction.
+    /// No-write passes linearize reads at this snapshot; tag payloads use a separately validated module baseline to avoid streaming every source blob on stable passes.
     pub fn load_transform_snapshot(
         &self,
         session_id: &str,
@@ -5654,7 +5429,7 @@ impl McStore {
         Ok(snapshot)
     }
 
-    /// Load all durable fields used by session.status from one SQLite read transaction.
+    /// The loader reads all durable fields used by `session.status` in one SQLite read transaction.
     pub fn load_session_status_snapshot(
         &self,
         session_id: &str,
@@ -5781,9 +5556,7 @@ impl McStore {
         Ok(snapshot)
     }
 
-    /// Record that the module accepted a transform request for this session. This is a
-    /// plain one-statement UPSERT outside the fenced cache-state transaction so the
-    /// observability write never contends with or extends the pass commit.
+    /// The acceptance recorder uses a one-statement UPSERT outside the fenced cache-state transaction so the observability write does not contend with or extend the pass commit.
     pub fn trace_pass_received(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
         self.inner.with_conn(|conn| {
             conn.prepare_cached(
@@ -5808,9 +5581,7 @@ impl McStore {
         Ok(())
     }
 
-    /// Clear the current-pass divergence for a successful stable transform. This is separate
-    /// from `trace_pass_received` because direct module callers do not use the daemon receive
-    /// hook, while daemon callers must not count the same pass twice.
+    /// The transform clears current-pass divergence after a successful stable transform. Current-pass divergence remains separate from `trace_pass_received` because direct module callers skip the daemon receive hook and daemon callers must not count a pass twice.
     pub fn trace_pass_stable(
         &self,
         session_id: &str,
@@ -5880,9 +5651,7 @@ impl McStore {
         Ok(())
     }
 
-    /// Record that a transform request finished successfully. This remains outside the
-    /// fenced cache-state transaction so a pass completion breadcrumb cannot alter CAS
-    /// semantics or hold the commit transaction open longer than the cache write itself.
+    /// The completion recorder runs outside the fenced cache-state transaction so the breadcrumb cannot alter CAS semantics or extend the transaction beyond the cache write.
     pub fn trace_pass_completed(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
         self.inner.with_conn(|conn| {
             conn.execute(
@@ -5905,10 +5674,7 @@ impl McStore {
         Ok(())
     }
 
-    /// Record the last rejected transform for a session. The error string is capped so
-    /// the durable diagnostic stays readable even if an upstream failure produces a huge
-    /// message. Like the other trace writes, this is a single plain UPSERT outside the
-    /// fenced cache-state transaction.
+    /// The store caps rejection errors to prevent unbounded diagnostic rows.
     pub fn trace_pass_rejected(
         &self,
         session_id: &str,
@@ -5939,7 +5705,6 @@ impl McStore {
         Ok(())
     }
 
-    /// Load the durable pass breadcrumbs for one session, if any have been written.
     pub fn load_pass_trace(&self, session_id: &str) -> Result<Option<PassTrace>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             conn.query_row(
@@ -5982,9 +5747,7 @@ impl McStore {
         })?)
     }
 
-    /// Load accepted scheduler observations whose request timestamps fall in an inclusive range.
-    /// The JSON ring stays on the session row so appends reuse existing pass writes; `json_each`
-    /// makes the bounded records directly filterable during an incident.
+    /// The session row stores the JSON ring so appends reuse pass writes; `json_each` makes bounded records directly filterable during an incident.
     pub fn load_pass_scheduler_history(
         &self,
         session_id: &str,
@@ -6020,9 +5783,7 @@ impl McStore {
         })?)
     }
 
-    /// Load incident-worthy scheduler observations from the independently bounded retention set.
-    /// The inclusive module-clock range narrows candidates; sender time and fingerprint remain
-    /// available on each result for exact cross-system correlation.
+    /// The loader reads incident-worthy scheduler observations from the independently bounded retention set.
     pub fn load_interesting_pass_scheduler_history(
         &self,
         session_id: &str,
@@ -6058,7 +5819,6 @@ impl McStore {
         })?)
     }
 
-    /// Find retained passes by the sender-stamped instant shared by both sides of an exchange.
     pub fn load_interesting_pass_scheduler_history_by_request_time(
         &self,
         session_id: &str,
@@ -6092,7 +5852,6 @@ impl McStore {
         })?)
     }
 
-    /// Find retained passes by the caller-owned full-array fingerprint.
     pub fn load_interesting_pass_scheduler_history_by_fingerprint(
         &self,
         session_id: &str,
@@ -6123,8 +5882,8 @@ impl McStore {
         })?)
     }
 
-    /// Append flat block ids requested by ctx_reduce to the durable per-session queue.
-    /// Duplicate pending ids are ignored so repeated command delivery is harmless.
+    /// The store appends block IDs requested by `ctx_reduce` to the durable per-session queue.
+    /// Repeated delivery does not add duplicate pending IDs.
     pub fn append_pending_agent_drops(
         &self,
         session_id: &str,
@@ -6141,12 +5900,11 @@ impl McStore {
         Ok(outcome.queued as usize)
     }
 
-    /// Append ctx_reduce drops and, when supplied, durably record the command that requested
-    /// them. A repeated command is acknowledged without touching pending queue rows.
+    /// The store appends `ctx_reduce` drops and records the requesting command when supplied.
+    /// A repeated command is acknowledged without modifying pending queue rows.
     ///
-    /// When `zero_targets` is true the ledger row is still recorded (idempotency correctness
-    /// requires it — a retry of the same command_id must still dedupe), but the disposition
-    /// is set to "no_targets" so the row is not counted as pending.
+    /// When `zero_targets` is true, the store records the ledger row as `no_targets` so retries deduplicate without counting it as pending.
+    /// The store sets the ledger row's disposition to `no_targets` so it is not counted as pending.
     pub fn append_pending_agent_drops_with_command(
         &self,
         session_id: &str,
@@ -6186,11 +5944,9 @@ impl McStore {
                 )? as u64;
             }
 
-            // Command ids are lineage-durable. Pruning would make an old outcome-unknown
-            // retry destructive again, so rows leave only with real lineage teardown.
+            // Command IDs remain until lineage teardown because pruning could make an old outcome-unknown retry destructive.
 
-            // When the caller resolved zero targets, mark the ledger row as terminal so it
-            // is not counted among pending commands. The row still exists for idempotency.
+            // When the caller resolves zero targets, the store marks the ledger row terminal so retries deduplicate without creating pending work.
             if zero_targets {
                 if let Some(command_id) = command_id {
                     tx.execute(
@@ -6217,7 +5973,7 @@ impl McStore {
         Ok(outcome)
     }
 
-    /// Load queued ctx_reduce drops in the deterministic drain order.
+    /// The loader reads queued `ctx_reduce` drops in deterministic drain order.
     pub fn load_pending_agent_drops(
         &self,
         session_id: &str,
@@ -6249,11 +6005,9 @@ impl McStore {
         })?)
     }
 
-    /// Mint tag rows for newly-observed block ids and return every requested row.
+    /// The store mints tag rows for newly observed block IDs and returns every requested row.
     /// Existing rows keep their original numbers; fresh rows consume the next numbers
-    /// in the caller's order inside one transaction.
-    // Production callers live module-side behind the test-support seeds; without that
-    // feature only in-crate tests reach these write paths, so silence the lint there.
+    /// Fresh rows consume the next numbers in caller order within one transaction.
     #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub(crate) fn mint_or_get_tags(
         &self,
@@ -6314,7 +6068,6 @@ impl McStore {
         })?)
     }
 
-    /// Load all minted tags for a session in tag-number order. This is the cold baseline fill.
     pub fn load_tags_for_session(&self, session_id: &str) -> Result<Vec<McTagRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
@@ -6332,7 +6085,6 @@ impl McStore {
         })?)
     }
 
-    /// Load only rows minted after `after_tag_number`, in primary-key order.
     pub fn load_tags_after(
         &self,
         session_id: &str,
@@ -6350,11 +6102,10 @@ impl McStore {
         })?)
     }
 
-    /// Return the trigger-maintained tag identity for cache validation without reading blobs.
+    /// The method returns the trigger-maintained tag identity for cache validation without reading blobs.
     ///
-    /// Triggers maintain count and max during rare writes; replacements and deletions derive a
-    /// fresh max from the primary-key prefix. Steady transforms read this one small row instead of
-    /// scanning immutable tag payloads.
+    /// Triggers maintain the cached count and maximum; replacements and deletions recompute the maximum from the primary-key prefix.
+    /// Steady transforms read the cached row instead of tag payloads.
     pub fn tag_cache_summary(&self, session_id: &str) -> Result<TagCacheSummary, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             conn.prepare_cached(
@@ -6374,7 +6125,7 @@ impl McStore {
         })?)
     }
 
-    /// Load only the fields used to decide whether native reasoning is old enough to clear.
+    /// The query loads only the fields used to decide whether native reasoning is old enough to clear.
     pub fn load_tag_numbers_for_session(
         &self,
         session_id: &str,
@@ -6397,7 +6148,6 @@ impl McStore {
         })?)
     }
 
-    /// Load only tag-number rows minted after `after_tag_number`, in primary-key order.
     pub fn load_tag_numbers_after(
         &self,
         session_id: &str,
@@ -6428,8 +6178,8 @@ impl McStore {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Test-only raw SQL seam for proving trigger-backed cache invalidation against out-of-band
-    /// writes. Production tag changes use the fenced transform transaction instead.
+    /// Test-only raw SQL seam verifies trigger-backed cache invalidation after out-of-band writes.
+    /// Production tag changes use the fenced transform transaction.
     #[cfg(any(test, feature = "test-support"))]
     pub fn execute_tag_sql_for_test(&self, sql: &str) -> Result<(), McStoreError> {
         self.inner.with_conn(|conn| {
@@ -6439,7 +6189,6 @@ impl McStore {
         Ok(())
     }
 
-    /// Sum stored token counts for a caller-selected block-id set.
     pub fn sum_tag_token_counts_for_blocks(
         &self,
         session_id: &str,
@@ -6456,7 +6205,7 @@ impl McStore {
             .sum())
     }
 
-    /// Insert one Channel-1 append row if this block has not already received one.
+    /// The store inserts one Channel-1 append row only if the block has not already received one.
     #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub(crate) fn append_channel1_nudge(
         &self,
@@ -6476,7 +6225,7 @@ impl McStore {
         })?)
     }
 
-    /// Load stored Channel-1 append bytes in deterministic order.
+    /// The loader returns stored Channel-1 append bytes in deterministic order.
     pub fn load_channel1_appends(
         &self,
         session_id: &str,
@@ -6503,7 +6252,7 @@ impl McStore {
         })?)
     }
 
-    /// Read the ordinal frontier used to avoid first-applying overlays to closed turns.
+    /// The query reads the ordinal frontier that prevents first-applying overlays to closed turns.
     /// A missing row is distinct from ordinal zero, which is a valid first message.
     pub fn overlay_watermark(&self, session_id: &str) -> Result<Option<u64>, McStoreError> {
         let value = self.inner.with_conn(|conn| {
@@ -6517,10 +6266,9 @@ impl McStore {
         Ok(value.map(|ordinal| ordinal.max(0) as u64))
     }
 
-    /// Freeze first-sight overlay decisions and advance the pass watermark atomically.
-    /// Every candidate is compared with the watermark from before this transaction. A
-    /// racing hint writer returns the already-stored bytes so both callers render the
-    /// same canonical decision.
+    /// The store freezes first-sight overlay decisions and advances the pass watermark atomically.
+    /// Every candidate is compared with the watermark from before this transaction.
+    /// A racing hint writer returns the already-stored bytes so both callers render the same canonical decision.
     #[cfg(test)]
     pub(crate) fn apply_active_overlay_decisions(
         &self,
@@ -6630,7 +6378,7 @@ impl McStore {
         })?)
     }
 
-    /// Persist one auto-search decision, including an empty no-result decision.
+    /// The store persists one auto-search decision, including an empty no-result decision.
     #[cfg(test)]
     pub(crate) fn append_user_hint(
         &self,
@@ -6671,7 +6419,7 @@ impl McStore {
         self.append_channel1_nudge(session_id, block_id, reminder_text, fired_at_ms)
     }
 
-    /// Load exact auto-search overlay bytes and durable empty decisions.
+    /// The loader returns exact auto-search overlay bytes and durable empty decisions.
     pub fn load_user_hints(&self, session_id: &str) -> Result<Vec<UserHintRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
@@ -6695,7 +6443,7 @@ impl McStore {
         })?)
     }
 
-    /// Load persisted marker bytes, including empty no-marker decisions.
+    /// The loader returns persisted marker bytes, including empty no-marker decisions.
     pub fn load_temporal_marks(
         &self,
         session_id: &str,
@@ -6722,8 +6470,7 @@ impl McStore {
         })?)
     }
 
-    /// Set the normalized task list snapshot with replay-safe owner/hash semantics. A cache row
-    /// CAS makes a retry harmless even when a transform commits between the read and update.
+    /// `set_todo_state` treats matching owner_message_id and state_hash as a replay no-op.
     pub fn set_todo_state(
         &self,
         session_id: &str,
@@ -6756,7 +6503,7 @@ impl McStore {
         }))
     }
 
-    /// Arm the durable one-shot refresh consumed by the next eligible transform pass.
+    /// `arm_soft_refresh` persists a one-shot refresh for the next eligible transform pass.
     pub fn arm_soft_refresh(&self, session_id: &str) -> Result<bool, McStoreError> {
         let mut last_conflict = None;
         for _ in 0..8 {
@@ -6859,7 +6606,7 @@ impl McStore {
         })?)
     }
 
-    /// Record a terminal wrapup outcome and return the canonical row on a retry race.
+    /// The transaction records a terminal wrapup outcome and returns the canonical row on a retry race.
     pub fn record_wrapup_command(
         &self,
         session_id: &str,
@@ -6910,7 +6657,7 @@ impl McStore {
         })?)
     }
 
-    /// Return a recorded dream-task result for command-id retry deduplication.
+    /// The method returns a recorded dream-task result for command-id retry deduplication.
     pub fn load_dream_task_command(
         &self,
         session_id: &str,
@@ -6933,8 +6680,7 @@ impl McStore {
         })?)
     }
 
-    /// Record the first terminal dream-task response. INSERT OR IGNORE makes a response-loss
-    /// retry replay the original provider outcome instead of executing a second child session.
+    /// `INSERT OR IGNORE` preserves the first dream-task response across command-id retries.
     pub fn record_dream_task_command(
         &self,
         session_id: &str,
@@ -6964,17 +6710,10 @@ impl McStore {
         })?)
     }
 
-    /// Apply classifier metadata under the memories authority, updating each row only when its
-    /// content hash still matches the supplied hash. Importance and classification writes that
-    /// keep foreign visibility unchanged remain mutation-neutral. A visibility grant/revocation
-    /// appends an internal correction marker in this same transaction so m1 can reconcile the row
-    /// without waiting for a HARD fold.
     pub fn record_wrapup_command_if_current(
         &self,
         record: WrapupCommandRecord<'_>,
     ) -> Result<RecordWrapupCommandOutcome, McStoreError> {
-        // Failed rows can be terminal command results; the module keeps a marker in
-        // their summary so older recoverable failure rows retain their retry behavior.
         let valid_disposition = matches!(
             record.disposition,
             "completed" | "nothing_to_compact" | "failed"
@@ -7029,8 +6768,6 @@ impl McStore {
                     (disposition == "failed").then_some(created_at)
                 });
             if let Some(failed_created_at) = legacy_failure_created_at {
-                // A failed audit row is not replayable. Replace it in this fenced
-                // transaction so a lost successful response becomes durable idempotency.
                 let summary = wrapup_replaced_failure_summary(record.summary, failed_created_at);
                 transaction.execute(
                     "UPDATE mc_wrapup_commands
@@ -7109,8 +6846,6 @@ impl McStore {
         })?)
     }
 
-    /// Check whether an import attempt may begin without staging anything durably.
-    /// The final commit repeats these predicates inside its fenced transaction.
     pub fn preflight_state_import(
         &self,
         session_id: &str,
@@ -7138,10 +6873,6 @@ impl McStore {
         }
     }
 
-    /// Atomically seed compartments into a never-used real-session key and record the
-    /// completed import id. No cache row is created: the normal first transform observes
-    /// the compartments with an empty boundary and performs the bootstrap HARD fold that
-    /// mints the live boundary anchor.
     pub fn commit_state_import(
         &self,
         session_id: &str,
@@ -7164,9 +6895,6 @@ impl McStore {
                 return Ok(StateImportTxnOutcome::SessionNotEmpty);
             }
 
-            // This is the fresh-row form of the cache-state CAS. The predicate and all
-            // compartment writes share one fenced transaction, so a racing bootstrap
-            // cannot slip state between the emptiness check and the imported rows.
             if session_has_durable_state(tx, session_id)? {
                 return Ok(StateImportTxnOutcome::SessionNotEmpty);
             }
@@ -7205,13 +6933,7 @@ impl McStore {
         }
     }
 
-    /// Commit new state under the row_version CAS, inside the epoch-fenced txn.
     ///
-    /// `expected` is the row_version from [`load`] (`None` = expect no row → INSERT).
-    /// On success the row_version is bumped by one. A `CasConflict` means a
-    /// concurrent writer won; the caller re-loads and re-steps. Call ONLY when
-    /// durable state changed — a pure SoftPlus replay must skip the commit entirely
-    /// so the no-write-on-defer guarantee holds.
     pub fn commit(
         &self,
         session_id: &str,
@@ -7222,7 +6944,6 @@ impl McStore {
         self.commit_with_consumed_drops(session_id, expected, core, meta, &[])
     }
 
-    /// Commit cache state and delete consumed ctx_reduce queue rows in one fenced tx.
     pub fn commit_with_consumed_drops(
         &self,
         session_id: &str,
@@ -7256,7 +6977,6 @@ impl McStore {
         )
     }
 
-    /// Commit accepted cache state and its speculative overlays in one CAS transaction.
     pub fn commit_transform(
         &self,
         session_id: &str,
@@ -7339,9 +7059,6 @@ impl McStore {
         let canonical_project_root = project_root
             .filter(|root| !root.is_empty())
             .map(|root| canonical_root(root).to_string_lossy().into_owned());
-        // The accepted cache row version is a stable identity for the pass that produced the
-        // divergence. Overlay timestamps are the request clock when available; direct callers
-        // that omit one still receive a real commit timestamp.
         let divergence_pass_id = next as i64;
         let divergence_at_ms = if overlays.created_at_ms > 0 {
             overlays.created_at_ms
@@ -7350,7 +7067,7 @@ impl McStore {
         };
 
         let outcome = self.inner.with_conn_fenced(|tx| {
-            // Read the current row_version inside the fenced txn; NO_ROW when absent.
+            // The fenced transaction reads the current row_version; it returns NO_ROW when no row exists.
             let current: i64 = tx.query_row(
                 "SELECT COALESCE((SELECT row_version FROM mc_cache_state WHERE session_id = ?1), ?2)",
                 params![session_id, NO_ROW],
@@ -7362,7 +7079,7 @@ impl McStore {
                 Some(v) => current == v as i64,
             };
             if !cas_ok {
-                // Empty txn (commits nothing); the caller re-loads and re-steps.
+                // The transaction commits nothing on a CAS conflict.
                 return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
             }
             if let Some(expected_vector) = claim_snapshot_vector {
@@ -7386,7 +7103,7 @@ impl McStore {
                 }
             }
 
-            // INSERT-or-UPDATE in the same fenced txn (bootstrap has no row to UPDATE).
+            // The fenced transaction uses INSERT because bootstrap has no row to update.
             tx.execute(
                 "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
                   VALUES (?1, ?2, ?3, ?4, ?5)
@@ -7398,7 +7115,7 @@ impl McStore {
                 params![session_id, next as i64, core_json, meta_json, current_time_ms()],
             )?;
             // Every accepted transform owns the current-pass value: stable passes write NULL
-            // rather than leaving an older divergence looking like a present observation.
+            // Stable passes write NULL so an older divergence is not reported as current.
             tx.execute(
                 "INSERT INTO mc_pass_trace (
                      session_id,
@@ -7468,8 +7185,6 @@ impl McStore {
                  ],
             )?;
             if let Some(project_root) = canonical_project_root.as_deref() {
-                // Durable root lineage is committed with the cache CAS, so a restart cannot
-                // authenticate a root that never produced the accepted session state.
                 tx.execute(
                      "INSERT INTO mc_transform_session_roots(
                          session_id, project_root, observed_at
@@ -7604,9 +7319,6 @@ impl McStore {
         }
     }
 
-    /// Apply an authority state update atomically after validating its sequence. Authority
-    /// rows use the regular memory and profile tables read by real-session transforms, while
-    /// compartment and cache-state tables are shared by both lanes.
     pub fn apply_authority_state_sync(
         &self,
         request: ModuleStateSyncRequest<'_>,
@@ -7686,10 +7398,6 @@ impl McStore {
                     }
                 };
                 if meta.initialized {
-                    // A force seed is process-local cold-start behavior, but this cache state is
-                    // durable. Re-adopting a lagging TypeScript mirror would move only the trim
-                    // cursor while retaining the module's newer m0/m1 bytes, so the next defer
-                    // would silently re-emit the already-folded interval as raw tail messages.
                     eprintln!(
                         "mc-store: retained materialized boundary {:?} over state-sync seed {:?} for session {}",
                         core.boundary_id, adoption.boundary_id, request.session_id
@@ -7734,14 +7442,8 @@ impl McStore {
             let mut user_hint_seeds_seeded = 0usize;
             let mut auto_search_hint_skipped = request.auto_search_hint_skipped;
             if request.user_hints_replace_session {
-                // The host's decision list is the complete policy authority
-                // for this session's overlays. One batched NOT IN delete (the
-                // same json_each shape the scope prune uses) keeps the kept
-                // rows' created_at stable and avoids a round-trip per stale
                 // row.
-                // Serializing a Vec<&str> cannot fail in practice; if it
-                // ever does, SKIP the replace-delete (fail closed toward
-                // retention) rather than deleting every hint with an empty
+                // The method skips the replace-delete when serializing hint IDs fails, retaining existing hints.
                 // kept set.
                 if let Ok(kept_json) = serde_json::to_string(
                     &request
@@ -7764,12 +7466,6 @@ impl McStore {
                     continue;
                 }
                 user_hint_seeds_seeded += tx.execute(
-                    // Upsert, not ignore: the host's decision list is the
-                    // policy authority for these overlays, and a reseed can
-                    // legitimately REVOKE a hint whose contributing memory
-                    // was hidden (the host sends the empty no-result shape).
-                    // Benign reseeds carry byte-identical text, so old turns
-                    // stay stable unless policy demanded the change.
                     "INSERT INTO mc_user_hints(session_id, block_id, hint_text, created_at)
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(session_id, block_id) DO UPDATE SET
@@ -7865,7 +7561,6 @@ impl McStore {
             if let Some(watermark) = request.reasoning_cleared_through_tag {
                 meta.reasoning_cleared_through_tag =
                     meta.reasoning_cleared_through_tag.max(watermark);
-                // Keep legacy state readers monotone while the tag-based field rolls out.
                 meta.reasoning_cleared_through_ordinal =
                     meta.reasoning_cleared_through_ordinal.max(watermark);
             }
@@ -7954,8 +7649,8 @@ impl McStore {
         })
     }
 
-    /// Read a session's compartments in chronological order (oldest first), the order
-    /// the decay renderer expects (it indexes from newest internally).
+    /// The decay renderer requires compartments in oldest-first order because it indexes them from newest.
+    /// The caller must pass compartments oldest-first because the decay renderer indexes them from newest.
     pub fn load_compartments(
         &self,
         session_id: &str,
@@ -7975,9 +7670,6 @@ impl McStore {
         Ok(rows)
     }
 
-    /// Return the greatest message ordinal covered by a session's compartments without
-    /// materializing the wide compartment rows. The migration-42 index covers both the session
-    /// predicate and the aggregate value.
     pub fn max_compartment_end_ordinal(&self, session_id: &str) -> Result<i64, McStoreError> {
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -8003,13 +7695,11 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Return the newest ordinal covered by a persisted compacted compartment.
     pub fn last_compacted_ordinal(&self, session_id: &str) -> Result<i64, McStoreError> {
         self.max_compartment_end_ordinal(session_id)
     }
 
-    /// Read only the compacted rows intersecting a range. The SQL limit is intentional: facade
-    /// expansion must not materialize every historical compartment before applying its response
+    /// Expansion must not materialize every historical compartment before applying its response.
     /// budget.
     pub fn load_compartments_for_range(
         &self,
@@ -8046,8 +7736,6 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Read the next chronological compartment page and the highest sequence currently
-    /// published for the session. The caller supplies the protocol page cap.
     pub fn load_compartments_after(
         &self,
         session_id: &str,
@@ -8084,8 +7772,6 @@ impl McStore {
         Ok(page)
     }
 
-    /// Read the compartment rows and session revert epoch in one store snapshot for
-    /// historian assembly. The epoch is the fence carried by the firing until publish.
     pub fn load_historian_assembly_snapshot(
         &self,
         session_id: &str,
@@ -8136,10 +7822,7 @@ impl McStore {
         })
     }
 
-    /// The highest compartment `sequence` for a session (0 when none). A cheap read the
-    /// transform does every pass to detect "a new compartment was published" without
-    /// loading the full compartment rows (those load only on the pass that actually
-    /// re-composes the m1 delta block).
+    /// The method returns 0 when no compartment exists.
     pub fn max_compartment_seq(&self, session_id: &str) -> Result<i64, McStoreError> {
         let max = self.inner.with_conn(|conn| {
             let v: i64 = conn.query_row(
@@ -8152,13 +7835,7 @@ impl McStore {
         Ok(max)
     }
 
-    /// Whether the session has any compartment at all. This is a presence check, NOT a
-    /// count or a max-sequence read: `max_compartment_seq` COALESCEs a missing MAX to 0,
-    /// which is indistinguishable from a real first compartment at sequence 0, so it
-    /// cannot answer "does a compartment exist". The first-fold HARD trigger needs the
-    /// unambiguous existence answer (empty boundary + a compartment present => the first
-    /// fold is due), so this returns a true/false from `SELECT EXISTS` on the session
-    /// index — O(1), never touches the sequence value.
+    /// `SELECT EXISTS` distinguishes an empty session from sequence 0, which `max_compartment_seq` maps to 0.
     pub fn has_compartments(&self, session_id: &str) -> Result<bool, McStoreError> {
         let exists = self.inner.with_conn(|conn| {
             let v: i64 = conn.query_row(
@@ -8171,9 +7848,8 @@ impl McStore {
         Ok(exists != 0)
     }
 
-    /// Resolve and persist one fake-compaction lineage edge under the store's writer fence.
-    /// The method owns every row participating in adoption so callers cannot observe a copied
-    /// compartment set without its marker, anchor, ordinal base, or prior-lineage publish fence.
+    /// The writer-fenced transaction resolves and persists one fake-compaction lineage edge.
+    /// The fenced transaction atomically writes copied compartments with their marker, anchor, ordinal base, and prior-lineage publish fence.
     pub fn descend_lineage(
         &self,
         request: LineageDescentRequest<'_>,
@@ -8551,11 +8227,7 @@ impl McStore {
                     ))
                 }
             };
-            // Fresh-lineage anchors sit at the assigner's origin, and both live
-            // origin bases are legitimate: 1-based (Pi-style) and 0-based (the
-            // CC-leg assigner, whose first message is ordinal 0 on every pass
-            // the module already accepts). Continued lineages anchor at the
-            // placeholder. Anything else is a mid-space anchor and refuses.
+            // Fresh lineages require anchor 0 or 1; continued lineages require the placeholder.
             if anchor.ordinal > 1 && anchor.ordinal != placeholder_ordinal {
                 return Ok(LineageDescentTxnOutcome::Invalid(format!(
                     "descent anchor {} has ordinal {}, expected a fresh origin (0 or 1) or continued ordinal {}",
@@ -8574,9 +8246,8 @@ impl McStore {
                 .last()
                 .map_or(1, |(sequence, _, _)| sequence.saturating_add(1));
 
-            // Prepare every fallible blob mutation before the first row copy. From this point
-            // onward any SQL failure unwinds the fenced transaction instead of returning a
-            // success-shaped validation outcome that could commit a partial adoption.
+            // The transaction prepares every fallible blob mutation before copying the first row.
+            // After the first row copy, any SQL failure must unwind the fenced transaction rather than return a validation outcome that could commit a partial adoption.
             let prior_row = tx
                 .query_row(
                     "SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1",
@@ -8653,8 +8324,7 @@ impl McStore {
                     params![request.target_key],
                 )?;
             }
-            // Session notes follow the descended conversation key. Do not copy smart notes:
-            // their project-wide visibility is independent of one lineage's retained history.
+            // Session notes follow the descended conversation key; the method does not copy smart notes because their project-wide visibility is independent of retained lineage history.
             let note_projects = {
                 let mut statement = tx.prepare_cached(
                     "SELECT DISTINCT project_path FROM mc_notes
@@ -8879,11 +8549,7 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Replace a session's entire compartment set in one fenced transaction. The
-    /// history producer republishes the full chronological set each time, so a
-    /// wholesale delete-then-insert (rather than an incremental upsert) keeps the
-    /// stored `sequence` contiguous. Writes are serialized by the store's single-writer
-    /// lease (the same one guarding the cache-state commit).
+    /// The method replaces a session's entire compartment set in one fenced transaction.
     pub fn replace_compartments(
         &self,
         session_id: &str,
@@ -8906,13 +8572,8 @@ impl McStore {
         Ok(())
     }
 
-    /// Reset the module cache to the never-minted boundary used by native recomp.
     ///
-    /// This is the full-session form of the revert re-cut: compartments and their
-    /// recoverable transcripts are removed, while the cache row is replaced with a
-    /// fresh core/meta pair carrying a bumped revert epoch. The epoch and row-version
-    /// update share one fenced transaction, so an in-flight historian cannot publish
-    /// against the retired compartment set.
+    /// The reset writes default `CoreState` and `ModuleMeta` values with a bumped revert epoch.
     pub fn reset_session_for_recomp(
         &self,
         session_id: &str,
@@ -9009,9 +8670,7 @@ impl McStore {
         }
     }
 
-    /// Delete every compartment after `keep_through_seq` and bump the session revert
-    /// epoch under the same row-version CAS. A no-op truncation returns the current
-    /// epoch/version without rewriting the meta blob.
+    /// The truncation increments the revert epoch under the same row-version CAS. A no-op returns the current epoch and version without rewriting `meta`.
     pub fn truncate_compartments_for_revert(
         &self,
         session_id: &str,
@@ -9160,10 +8819,9 @@ impl McStore {
         }
     }
 
-    /// Append compartments at the current tail without renumbering existing rows.
-    /// The incoming `sequence` values are treated as producer-local hints; durable
-    /// sequences are assigned contiguously after the current max so concurrent readers
-    /// never observe gaps or rewritten history.
+    /// The transaction appends compartments at the current tail without renumbering existing rows.
+    /// The store treats incoming `sequence` values as producer-local hints.
+    /// The store assigns durable sequences contiguously after the current maximum.
     pub fn append_compartments(
         &self,
         session_id: &str,
@@ -9186,10 +8844,6 @@ impl McStore {
         }
     }
 
-    /// Promote validated historian facts into project memories using exact-content
-    /// de-duplication against the active render set. This path is additive only: it
-    /// inserts new `mc_memories` rows and never writes mutation-log rows, so the next
-    /// m1/materialization pass observes the rows solely through the max-memory-id
     /// watermark.
     pub fn abandon_historian_run_if_matching(
         &self,
@@ -9207,9 +8861,8 @@ impl McStore {
         )
     }
 
-    /// Release a matching run and optionally record a failed publish attempt.
-    /// Publication errors can occur after the producer succeeded, so this counter
-    /// lives with the durable historian state rather than producer diagnostics.
+    /// The transaction releases a matching run and optionally records a failed publish attempt.
+    /// The durable historian state records publish failures because publication can fail after producer success.
     pub fn abandon_historian_run_if_matching_with_publish_failure(
         &self,
         session_id: &str,
@@ -9288,9 +8941,6 @@ impl McStore {
         }
     }
 
-    /// Increment publication health without changing the in-flight state. This covers
-    /// failures before a publish transaction can safely abandon the producer run, such
-    /// as side-channel outbox preparation errors.
     pub fn record_historian_publish_failure_if_matching(
         &self,
         session_id: &str,
@@ -9342,12 +8992,11 @@ impl McStore {
         }
     }
 
-    /// Publish a validated historian chunk in one CAS-gated transaction. The publish
-    /// predicate proves the producer still matches the exact firing that created the
-    /// chunk; stale reattaches or a second racing publisher fail before any rows are
-    /// appended. The transaction intentionally leaves render state (`CoreState`,
-    /// `coverage_ordinal`, watermarks, and m1 revision) untouched: new rows become
-    /// visible only through the existing store watermarks on a later materializing pass.
+    /// The transaction publishes a validated historian chunk in one CAS-gated transaction.
+    /// The publish predicate requires the producer to match the exact firing that created the chunk.
+    /// Stale reattaches and racing publishers fail before the transaction writes any rows.
+    /// The transaction leaves render state unchanged; later materialization exposes new rows through existing store watermarks.
+    /// The transaction leaves `CoreState`, `coverage_ordinal`, watermarks, and m1 revision unchanged.
     pub fn publish_historian_chunk(
         &self,
         request: HistorianPublishRequest<'_>,
@@ -9406,10 +9055,8 @@ impl McStore {
                 return Ok(PublishTxnOutcome::StateMismatch(Box::new(meta.historian)));
             }
 
-            // `chunk_fingerprint` remains a readable structural diagnostic; exact
-            // content freshness is verified using the durable block identities. An empty
-            // vector means the firing predates selected-range identity persistence, so it
-            // cannot establish that the selected content is still current.
+            // Block identities verify content freshness.
+            // An empty vector cannot establish that the selected content is current.
             if predicate.selected_range_identities.is_empty() {
                 return Ok(PublishTxnOutcome::FenceRejected(
                     "historian firing has no selected-range content identities".to_string(),
@@ -9506,8 +9153,8 @@ impl McStore {
 
         match outcome {
             PublishTxnOutcome::Committed(result) => {
-                // The accepted payload is already durable beside the compartment commit. Drain
-                // each kind independently now; any failure remains queued for a later transform.
+                // The compartment commit already makes the accepted payload durable.
+                // The transaction drains each historian side-channel kind independently and retains failed work for a later transform.
                 let _ = self.drain_historian_side_channels(
                     session_id,
                     current_time_ms(),
@@ -9545,9 +9192,7 @@ impl McStore {
         }
     }
 
-    /// Drain due historian side-channel work without coupling any target table to another.
-    /// A successful target write marks the outbox row delivered in the same transaction; the
-    /// acknowledgement row is deleted only after that commit, so restart replay is idempotent.
+    /// The transaction drains due historian side-channel work without coupling target tables.
     pub fn drain_historian_side_channels(
         &self,
         session_id: &str,
@@ -9874,13 +9519,11 @@ impl McStore {
         })?)
     }
 
-    /// Load a project's render-eligible memories: `active` + `permanent`, excluding
-    /// expired ones (an `expires_at` at/before `now_ms`, NULL = never expires), ordered
-    /// by importance descending then id ascending (the budget-trim order — highest
-    /// importance survives a trim; id breaks ties deterministically). The expiry cutoff
-    /// is supplied by the caller, NOT read from the live clock, so the full render and
-    /// every later byte-identical replay of it observe the SAME memory set — a live
-    /// clock would expire a memory mid-replay and silently change the rendered bytes.
+    /// `expires_at = NULL` means the row never expires; `expires_at <= now_ms` excludes the row.
+    /// `importance DESC, id ASC` makes trimming retain the highest-importance rows deterministically.
+    /// The caller supplies `now_ms` to fix the expiry cutoff for rendering and replay.
+    /// Caller-supplied `now_ms` makes rendering and replay apply the same expiry cutoff.
+    /// `now_ms` prevents replay from expiring a memory after the original render and changing the rendered bytes.
     pub fn load_compartment_candidates(
         &self,
         session_id: &str,
@@ -9917,11 +9560,10 @@ impl McStore {
         Ok(rows)
     }
 
-    /// Search active/permanent memory content visible to `project_path` with a literal,
-    /// case-insensitive SQL LIKE. Workspace visibility is built by the same helper used by
-    /// Search a session's compartment title and tier text with a literal, case-insensitive
-    /// SQL LIKE. The caller supplies the already-resolved session id; no routing is done in
-    /// this store layer.
+    /// The query searches active, permanent memory visible to `project_path` with literal, case-insensitive SQL `LIKE`.
+    /// Workspace visibility must use the shared visibility fence.
+    /// The query searches the resolved session's compartment title and tier text with literal, case-insensitive SQL `LIKE`.
+    /// The caller supplies the resolved session ID; this store layer does not route sessions.
     pub fn search_compartments_like(
         &self,
         session_id: &str,
@@ -9973,8 +9615,7 @@ impl McStore {
         self.load_chunk_transcripts_for_range_bounded(session_id, start, end, usize::MAX)
     }
 
-    /// Read and decompress at most `limit` transcript rows. Callers serving bounded responses
-    /// should use this variant so the database query and decompression work are bounded before
+    /// The `limit` bounds database reads and transcript decompression.
     /// rendering starts.
     pub fn load_chunk_transcripts_for_range_bounded(
         &self,
@@ -10055,9 +9696,9 @@ impl McStore {
         Ok(())
     }
 
-    /// Load one note through the same project/session visibility fence used by the facade.
-    /// Smart notes are project-visible across sessions; session notes require the provenance
-    /// session to match. The SQL predicate keeps this lookup independent of page size.
+    /// The lookup uses the facade's project/session visibility fence.
+    /// Smart notes are project-visible across sessions; session notes require matching provenance.
+    /// The SQL predicate keeps this lookup independent of page size.
     pub fn get_note_by_id(
         &self,
         project_path: &str,
@@ -10080,8 +9721,7 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Page the notes visible to one session: all project smart notes plus that session's
-    /// ordinary notes. Ownership and pagination both remain in SQL.
+    /// A session sees all project smart notes and its ordinary notes; SQL enforces ownership and pagination.
     pub fn read_visible_notes(
         &self,
         project_path: &str,
@@ -10141,9 +9781,6 @@ impl McStore {
                 "note content must not be empty".to_string(),
             ));
         }
-        // This compatibility entry point keeps legacy callers on the active-status path
-        // used by the previous context-note surface; the full project smart-note writer
-        // below deliberately uses pending instead while still recording condition text.
         self.with_note_conn_fenced(input.project_path, |tx| {
             tx.execute(
                 "INSERT INTO mc_notes
@@ -10227,8 +9864,8 @@ impl McStore {
         self.read_project_notes(project_path, Some(session_id), &["active"], limit, offset)
     }
 
-    /// Read project-owned notes without using session_id as the ownership key. Session id
-    /// remains an optional provenance filter for the legacy session-note view only.
+    /// The query selects project-owned notes by project ownership, not `session_id`.
+    /// `session_id` remains an optional provenance filter only for the legacy session-note view.
     pub fn read_project_notes(
         &self,
         project_path: &str,
@@ -10403,8 +10040,7 @@ impl McStore {
         }
     }
 
-    /// Update note content and/or condition only when both the status and revision still
-    /// match the caller's snapshot. A changed condition clears compiled evaluation state.
+    /// The update changes content or condition only when status and revision match the caller's snapshot; changing the condition clears compiled evaluation state.
     #[allow(clippy::too_many_arguments)]
     pub fn update_note_cas(
         &self,
@@ -10448,17 +10084,13 @@ impl McStore {
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
-            // Presence alone is not an edit: an update that re-supplies the
-            // existing condition unchanged must not invalidate the compiled
-            // artifact, reset a ready note to pending, or fence active claims.
+            // Re-supplying an unchanged condition does not invalidate the compiled artifact, reset a ready note to pending, or fence active claims.
             let condition_changed =
                 surface_condition.is_some() && next_condition != current_condition;
             let content_changed = next_content != current.content;
             let compiler_edit = condition_changed || content_changed;
             if !compiler_edit {
-                // A fully unchanged update is mutation-neutral: bumping the
-                // versions would fence an active evaluation claim and re-run
-                // billable work for compiler inputs that did not change.
+                // An unchanged update does not bump versions because a version bump fences an active evaluation claim.
                 return Ok(NoteCasOutcome::Applied(current));
             }
             let remaining_condition = if condition_changed {
@@ -10560,8 +10192,6 @@ impl McStore {
         })
     }
 
-    /// Dismissal is a status CAS. It wins over a later surfacing claim, but never rewrites
-    /// bytes that a previous claim already placed in a frozen transform response.
     pub fn dismiss_note_cas(
         &self,
         project_path: &str,
@@ -10586,8 +10216,6 @@ impl McStore {
         } = &outcome
         {
             if current.status != "dismissed" {
-                // Dismissal is the terminal user decision. Re-read the winner and apply
-                // one fresh CAS so a concurrent surface/update cannot resurrect the note.
                 return self.transition_note_internal(
                     project_path,
                     note_id,
@@ -10602,9 +10230,6 @@ impl McStore {
         Ok(outcome)
     }
 
-    /// Store a host-evaluated smart-note verdict under the evaluator's source revision.
-    /// The module never interprets condition text; it only performs this CAS write and
-    /// promotes a true verdict to `ready` for a later natural cache bust.
     pub fn write_note_evaluation(
         &self,
         input: NoteEvaluationInput<'_>,
@@ -10706,9 +10331,6 @@ impl McStore {
         })
     }
 
-    /// Claim one due pending smart note for an evaluator. The source revision is the
-    /// status_version observed by the evaluator; the lease itself is represented by the
-    /// module-internal `surfacing` state and is released by a CAS transition.
     pub fn claim_due_note(
         &self,
         project_path: &str,
@@ -10967,10 +10589,6 @@ impl McStore {
         Ok(rows)
     }
 
-    /// Load active user-memory contents (the `<user-profile>` baseline source), ordered
-    /// `promoted_at ASC, id ASC`. The id tiebreaker is load-bearing: `promoted_at` can
-    /// tie at ms granularity and a non-deterministic order would drift the rendered
-    /// bytes between passes. Returns just the contents (the render is `- <content>`).
     pub fn load_active_user_memories(&self) -> Result<Vec<String>, McStoreError> {
         let rows = self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
@@ -10985,9 +10603,6 @@ impl McStore {
         Ok(rows)
     }
 
-    /// Register `project_path` as a member of `workspace`, creating the workspace when it is
-    /// absent. Both writes are conflict-tolerant, so re-seeding an existing member is a no-op
-    /// rather than an error.
     pub fn seed_workspace_member(
         &self,
         workspace: &str,
@@ -11015,11 +10630,7 @@ impl McStore {
         Ok(())
     }
 
-    /// Durably stage one claim command before the host mutates `context.db`.
     ///
-    /// `route_project_root` is the daemon-bound route this request arrived on. The
-    /// memories authority is resolved from that route, not from `binding`, because
-    /// the binding's identity fields are caller-supplied.
     pub fn stage_claim_intent(
         &self,
         route_project_root: &str,
@@ -11061,13 +10672,6 @@ impl McStore {
                         found,
                     });
                 }
-                // A staged replay goes on to execute the context mutation, so it has to
-                // clear the same live fence as a fresh stage. The stored binding proves
-                // only what was true when the row was written: a drain committed since
-                // then has already moved the authority to DRAINING and bumped the
-                // generation, and returning here would commit under the obsolete one.
-                // Terminal and already-committed records are recovery reads and stay
-                // idempotent so a crashed attempt can still be resolved.
                 if record.state == ClaimIntentState::Staged {
                     if let Some(rejection) =
                         claim_intent_stage_fence(tx, route_project_root, binding)?
@@ -11347,8 +10951,6 @@ impl McStore {
         }
     }
 
-    /// Read the durable authority row. A missing row is normal for a store that has
-    /// never opted a project into module ownership.
     pub fn authority_status(
         &self,
         context_store_uuid: &str,
@@ -11367,8 +10969,6 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    /// Enter PREPARING and bump the generation. Repeating the request is idempotent
-    /// only when the row is already preparing at the same generation.
     pub fn authority_begin_prepare(
         &self,
         context_store_uuid: &str,
@@ -11399,10 +10999,6 @@ impl McStore {
                         params![context_store_uuid, project, domain],
                     )?;
                     if domain == "notes" {
-                        // A claim surviving from an earlier MODULE period must
-                        // not block its note under the new generation for a
-                        // full lease; completion is already generation-fenced,
-                        // so terminalize it like the drain transition does.
                         fence_active_note_claims_tx(
                             tx,
                             project,
@@ -11518,9 +11114,6 @@ impl McStore {
                     )));
                 }
                 if domain == "notes" {
-                    // Same fence as the drain transition: a stale claim from a
-                    // prior MODULE period cannot complete under the new
-                    // generation, but left active it blocks its note for a
                     // full lease.
                     fence_active_note_claims_tx(
                         tx,
@@ -11546,10 +11139,6 @@ impl McStore {
             .map_err(map_authority_sql_error)
     }
 
-    /// Record seed verification and complete TS -> MODULE. The host keeps its
-    /// context.db barrier until this transition has committed on the module side.
-    /// The arguments are kept explicit because each value is part of the durable
-    /// transition record and must be validated together.
     #[allow(clippy::too_many_arguments)]
     pub fn authority_finish_prepare(
         &self,
@@ -11595,9 +11184,6 @@ impl McStore {
                 }
                 let next_state = if verified { "MODULE" } else { "TS" };
                 if domain == "notes" {
-                    // Same fence as the drain transition: a stale claim from a
-                    // prior MODULE period cannot complete under the new
-                    // generation, but left active it blocks its note for a
                     // full lease.
                     fence_active_note_claims_tx(
                         tx,
@@ -11653,7 +11239,6 @@ impl McStore {
             .map_err(map_authority_sql_error)
     }
 
-    /// Abort a failed preparation without erasing the diagnostic checksum.
     pub fn authority_abort_prepare(
         &self,
         context_store_uuid: &str,
@@ -11701,9 +11286,6 @@ impl McStore {
                             },
                         )));
                     }
-                    // Takeover or same-lease resume mints a fresh token so the prior
-                    // coordinator cannot keep journaling with a stale attempt identity. It also
-                    // captures a new feed head after a finish fence reports a late append.
                     let token = mint_coordinator_token(lease, lease_expires_at, current.generation);
                     let feed_head: i64 = tx.query_row(
                         "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
@@ -11799,7 +11381,6 @@ impl McStore {
             .map_err(map_authority_sql_error)
     }
 
-    /// Advance one idempotent DRAINING journal bit or its feed cursor.
     #[allow(clippy::too_many_arguments)]
     pub fn authority_drain_step(
         &self,
@@ -11860,9 +11441,6 @@ impl McStore {
             .map_err(map_authority_sql_error)
     }
 
-    /// Complete DRAINING after the host has verified every journal step.
-    /// The checksum, generation, coordinator token, and captured feed head are checked
-    /// together so a stale coordinator cannot publish a partial handoff.
     #[allow(clippy::too_many_arguments)]
     pub fn authority_finish_drain(
         &self,
@@ -11923,8 +11501,6 @@ impl McStore {
                 )?;
                 let captured = current.captured_upper_bound.unwrap_or(0);
                 if feed_head != captured {
-                    // This comparison shares the transaction with the ownership flip. A writer
-                    // either commits before the flip and forces replay, or after TypeScript owns the domain.
                     return Ok(AuthorityFinishDrainOutcome::FeedHeadAdvanced {
                         captured,
                         found: feed_head,
@@ -11962,13 +11538,7 @@ impl McStore {
         }
     }
 
-    /// Seed every row in one authority wire frame under one epoch-fenced transaction.
     ///
-    /// The transaction carries the same active store fence that each old per-row call
-    /// carried. N rows under one fence is equivalent to N fences here: seeding is a
-    /// single-writer operation per project, and the fence rejects strictly-newer epochs.
-    /// A frame is validated and committed atomically, so a bad row fails loudly without
-    /// leaving a partially applied frame behind.
     pub fn seed_authority_rows(
         &self,
         context_store_uuid: &str,
@@ -12163,10 +11733,7 @@ impl McStore {
                 ])?;
                 module_row_ids.push(module_row_id);
             }
-            // Seeds can import pre-v51 artifacts (compiled_check present,
-            // compiled_source_revision NULL) after the boot-time repair
-            // already recorded its completion marker; verify them here so an
-            // unvalidated compiled check never becomes selectable.
+            // Verification prevents an unvalidated compiled check from becoming selectable.
             loop {
                 let processed = repair_note_artifacts_tx(tx, project)?;
                 if processed < NOTE_ARTIFACT_REPAIR_BATCH as usize {
@@ -12177,7 +11744,6 @@ impl McStore {
         })
     }
 
-    /// Pull a bounded, ordered feed page. The cursor is a global feed sequence;
     /// filtering by domain preserves monotonic retry semantics even when domains interleave.
     pub fn pull_changefeed(
         &self,
@@ -12631,9 +12197,8 @@ fn append_compartments_tx(
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
 
-    // Validate the whole append before writing its first row. This keeps a rejected
-    // batch atomic and makes ordinal-overlap corruption impossible even if a caller
-    // bypassed the historian's optimistic publish fence.
+    // The append validator rejects the whole batch before writing its first row.
+    // Whole-batch validation prevents partial batches and ordinal-overlap corruption.
     for (index, compartment) in compartments.iter().enumerate() {
         if let Some((existing_sequence, _, _)) = ranges.iter().find(|(_, start, end)| {
             compartment.start_message <= *end && *start <= compartment.end_message
@@ -12691,8 +12256,7 @@ fn insert_chunk_transcripts_tx(
     if compressed.is_none() && raw_messages_compressed.is_none() {
         return Ok(());
     }
-    // The original schema keeps transcript_deflate NOT NULL. A raw-only row still needs a
-    // harmless condensed payload so durable raw recovery is not discarded with an oversized
+    // Raw-only rows store a condensed payload because transcript_deflate is NOT NULL.
     // historian transcript.
     let compressed = compressed.unwrap_or_else(|| compress_transcript("").unwrap_or_default());
     for (idx, compartment) in compartments.iter().enumerate() {
@@ -12746,8 +12310,8 @@ fn evict_chunk_transcripts_tx(
             return Ok(());
         };
         if retains_raw_messages {
-            // Full message recovery is durable by contract. Retain its raw payload and reclaim
-            // only the optional condensed transcript when the legacy transcript budget fills.
+            // Full-message recovery retains the raw payload.
+            // The transcript budget reclaims only the optional condensed transcript.
             tx.execute(
                 "UPDATE mc_chunk_transcripts
                     SET transcript_deflate = ?3
@@ -12784,8 +12348,8 @@ fn decompress_raw_messages(blob: &[u8]) -> std::io::Result<String> {
 
 fn decompress_transcript(blob: &[u8]) -> std::io::Result<String> {
     let decoder = DeflateDecoder::new(blob);
-    // Read only a small suffix beyond the output cap so a UTF-8 code point split at the cap can
-    // be discarded cleanly without allowing the decompressor to grow an unbounded buffer.
+    // The reader reads only the suffix needed to complete a UTF-8 code point split at the output cap.
+    // The suffix permits discarding a UTF-8 code point split at the cap without unbounded decompressor buffering.
     let mut limited = decoder.take((MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES + 4) as u64);
     let mut inflated_prefix = Vec::new();
     limited.read_to_end(&mut inflated_prefix)?;
@@ -12838,9 +12402,9 @@ fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
 const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id, source_revision, state_version, compiled_source_revision, compiled_project_path, compiled_provider, compiled_config, compiled_at, compile_status";
 const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id, source_revision, state_version, compiled_source_revision, compiled_project_path, compiled_provider, compiled_config, compiled_at, compile_status";
 
-// ?2 = condition changed, ?5 = compiler-input edit (content or condition). A compiler-input
-// edit advances source_revision and resets compiled evaluation state; ?7..?10 replace the
-// compile authoring metadata only when the condition changed.
+// Parameter ?2 denotes a condition change; parameter ?5 denotes a compiler-input edit.
+// A compiler-input edit advances source_revision and resets compiled evaluation state.
+// Parameters ?7 through ?10 replace compile authoring metadata only when the condition changes.
 const NOTE_CAS_UPDATE_SQL: &str = "UPDATE mc_notes SET content = ?1,
     surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
     status = ?4, status_version = status_version + 1, state_version = state_version + 1,
@@ -12930,16 +12494,13 @@ const NOTE_EVAL_CLAIM_COLUMNS: &str = "claim_id, note_id, phase, acquisition_id,
     state_version, policy_version, protocol_epoch, authority_generation, expires_at, \
     completion_id, terminal_kind, terminal_response";
 
-/// Columns the work selector actually reads. Acquisition polls the pending set on
-/// every call, so this deliberately excludes `content`, `manifest_json`, and the
-/// compiled artifact body (bounded at `MAX_COMPILED_CHECK_BYTES`); the selector
-/// only needs to know WHETHER an artifact exists. The full row is loaded once, for
-/// the single selected note.
+/// Acquisition polls the pending set on every call, so the selector excludes content and manifest_json.
+/// Polling omits the compiled artifact body to avoid loading up to `MAX_COMPILED_CHECK_BYTES` per call.
+/// The selector needs only whether an artifact exists.
 const NOTE_EVAL_CANDIDATE_COLUMNS: &str = "id, status, compile_status, created_at_ms, \
     compiled_check IS NOT NULL, check_status, check_quarantined_until, check_next_due_at, \
     check_false_since_at, check_last_liveness_at, policy_version, last_checked_at";
 
-/// One pending smart note as seen by the work selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteEvalCandidate {
     pub id: i64,
@@ -13025,9 +12586,7 @@ fn note_eval_kind_response(kind: &str) -> String {
     serde_json::json!({ "result": kind }).to_string()
 }
 
-/// Resolve the notes-authority row this project's evaluation protocol is fenced on.
-/// A MODULE row wins over stale twins under other context store UUIDs, matching
-/// `module_authority_for_project`; otherwise the lowest UUID reports current state.
+/// The lookup resolves the notes-authority row that fences this project's evaluation protocol.
 fn note_eval_authority_tx(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
@@ -13087,8 +12646,8 @@ fn mark_note_eval_claim_terminal_tx(
     )
 }
 
-/// Terminally fence active claims so in-flight evaluations lose their completion
-/// instead of surfacing stale work. `note_id = None` fences the whole project.
+/// The update terminally fences active claims so in-flight evaluations cannot complete.
+/// `note_id = None` terminally fences every active claim in the project, preventing stale completions.
 fn fence_active_note_claims_tx(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
@@ -13110,12 +12669,11 @@ fn fence_active_note_claims_tx(
     )
 }
 
-/// Ledger garbage collection: expire overdue active claims, tombstone expired
-/// `no_work` decisions (`decision = ''` keeps replay identity), then null the
-/// response of terminal claims once their completion-replay window has passed
-/// (`NOTE_EVAL_RESPONSE_REDACT_MS`, well before row deletion at
-/// `NOTE_EVAL_TERMINAL_RETENTION_MS`). Tombstoned rows replay as `Expired`;
-/// they no longer count against either cap.
+/// The cleanup expires overdue active claims and tombstones expired `no_work` decisions.
+/// `decision = ''` preserves replay identity for tombstoned `no_work` decisions.
+/// The cleanup sets terminal responses to `NULL` after their completion-replay window.
+/// `NOTE_EVAL_RESPONSE_REDACT_MS` nulls terminal responses before terminal-row deletion.
+/// Tombstoned rows replay as `Expired` and do not count against either cap.
 fn collect_note_eval_ledgers_tx(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
@@ -13138,11 +12696,11 @@ fn collect_note_eval_ledgers_tx(
             AND terminal_at_ms IS NOT NULL AND terminal_at_ms <= ?2",
         params![project, now_ms - NOTE_EVAL_RESPONSE_REDACT_MS],
     )?;
-    // Reclaim rows, not just columns. Blanking `decision`/`terminal_response`
-    // stops a row counting toward the cap but leaves it on disk forever, so both
-    // ledgers would grow without bound - one acquisition row per poll, including
-    // every idle no-work poll - and the per-poll GC and cap counts would degrade
-    // into ever-longer scans.
+    // The cleanup deletes tombstoned acquisitions and terminal claims after their retention periods.
+    // `decision = ''` and `terminal_response = NULL` leave rows until retention-based deletion.
+    // Without cleanup, recording every idle `no_work` poll would grow the ledger without bound.
+    // Idle `no_work` polls also create acquisition rows.
+    // Unbounded ledger growth makes per-poll GC and cap counts scan progressively more rows.
     tx.execute(
         "DELETE FROM mc_note_eval_acquisitions
           WHERE project = ?1 AND decision = '' AND expires_at <= ?2",
@@ -13158,12 +12716,10 @@ fn collect_note_eval_ledgers_tx(
 }
 
 impl McStore {
-    /// Acquire one durable evaluation claim or a replayable `no_work` decision.
-    /// `select` receives the pending, unclaimed smart notes and returns either a
-    /// (note, phase) claim or a classified `no_work`; the decision — including a
-    /// `no_work`'s `cycle_exhausted` cause — commits atomically under
-    /// (project, acquisition_id) uniqueness so the same acquisition ID always
-    /// returns the same decision after response loss.
+    /// The operation acquires one durable evaluation claim or a replayable `no_work` decision.
+    /// `select` receives pending, unclaimed smart notes and returns either a `(note, phase)` claim or a classified `no_work` decision.
+    /// `no_work` decisions retain their `cycle_exhausted` cause and commit atomically under `(project, acquisition_id)` uniqueness.
+    /// For a given `(project, acquisition_id)`, response loss replays the original decision.
     #[allow(clippy::too_many_arguments)]
     pub fn acquire_note_evaluation(
         &self,
@@ -13251,10 +12807,6 @@ impl McStore {
                 return Ok(if decision.is_empty() {
                     NoteEvalAcquireOutcome::Expired
                 } else {
-                    // Replay the full recorded decision: a client only sees a
-                    // replay after losing the original response, so the
-                    // exhaustion cause must survive or the worker mistakes a
-                    // reset cursor for a drained queue.
                     NoteEvalAcquireOutcome::NoWork {
                         replayed: true,
                         cycle_exhausted: decision == "no_work_exhausted",
@@ -13340,16 +12892,7 @@ impl McStore {
             let Some(candidate) = candidates.into_iter().find(|note| note.id == note_id) else {
                 return Ok(NoteEvalAcquireOutcome::Invalid);
             };
-            // Selection ran on the narrow projection; load the full row once for
-            // the selected note so the claim snapshot has content,
-            // condition, and the compiled artifact.
             let note = load_note_tx(tx, candidate.id)?;
-            // Bound IN-FLIGHT claims only. Counting terminal rows still inside the
-            // replay-retention window would turn this cap into a rolling
-            // throughput ceiling: once a project completed `ledger_cap`
-            // evaluations within the retention window every further acquisition
-            // would return Busy and all evaluation would stall until rows aged
-            // out. Terminal-row volume is bounded by deletion in
             // `collect_note_eval_ledgers_tx` instead.
             let live: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM mc_note_eval_claims
@@ -13361,12 +12904,6 @@ impl McStore {
                 return Ok(NoteEvalAcquireOutcome::Busy);
             }
             let claim = NoteEvalClaim {
-                // The module's wire protocol caps id fields at 128 bytes and
-                // the client echoes this id on every renew/complete/abandon,
-                // so it must stay bounded regardless of how long the project
-                // identity or acquisition id are. The digest keeps it
-                // deterministic per (project, acquisition); a replayed
-                // acquisition reads the stored row.
                 claim_id: {
                     let mut hasher = Sha256::new();
                     hasher.update(project.as_bytes());
@@ -13420,7 +12957,6 @@ impl McStore {
         })
     }
 
-    /// Extend an active claim's lease by one lease interval.
     pub fn renew_note_evaluation_claim(
         &self,
         project: &str,
@@ -13472,10 +13008,6 @@ impl McStore {
         })
     }
 
-    /// Commit one evaluation outcome. `apply` receives the fenced note snapshot and
-    /// returns the reduced lifecycle columns; every fence (identity, lease, authority
-    /// generation, source revision, state version, pending status) is revalidated in
-    /// the same transaction that writes the note and the replayable terminal result.
     #[allow(clippy::too_many_arguments)]
     pub fn complete_note_evaluation(
         &self,
@@ -13646,9 +13178,6 @@ impl McStore {
             if changed == 0 {
                 return stale(tx);
             }
-            // Every response field is already known locally (the CAS above
-            // asserted `state_version = row.claim.state_version`), so no
-            // re-read of the row is needed.
             let response_json = serde_json::json!({
                 "result": "applied",
                 "note_id": row.claim.note_id,
@@ -13670,8 +13199,6 @@ impl McStore {
         })
     }
 
-    /// Terminally release a claim for controlled cancellation. Never touches
-    /// `mc_notes`; abandoning an already-terminal claim replays its terminal kind.
     pub fn abandon_note_evaluation_claim(
         &self,
         project: &str,
@@ -13706,11 +13233,6 @@ impl McStore {
     }
 }
 
-/// Rebind an active claim to the caller's registration and replay it with the
-/// current note snapshot. The lease is refreshed alongside the rebind: a
-/// re-registered worker schedules its first renewal a full heartbeat interval
-/// out, so replaying a claim with its original near-expiry lease would let the
-/// lease lapse mid-execution and force the billable phase to run again.
 fn rebind_note_eval_claim_tx(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
@@ -13720,10 +13242,6 @@ fn rebind_note_eval_claim_tx(
     now_ms: i64,
 ) -> rusqlite::Result<NoteEvalAcquireOutcome> {
     let expires_at = now_ms + NOTE_EVAL_CLAIM_LEASE_MS;
-    // The slot-recovery path reaches this rebind with a NEW acquisition id.
-    // Persisting it keeps the replay guarantee: a retry of that id hits the
-    // acquisition-keyed lookup and replays this rebind instead of re-entering
-    // slot recovery and extending the lease again.
     tx.execute(
         "UPDATE mc_note_eval_claims
             SET registration_generation = ?1, expires_at = ?2, acquisition_id = ?3
@@ -13752,15 +13270,8 @@ fn rebind_note_eval_claim_tx(
     })
 }
 
-/// Canonical digest binding a compiled smart-note artifact to the condition it was
-/// compiled from. Mirrors hashCheck in packages/plugin smart-notes/compiler.ts;
-/// `manifest_json` is hashed exactly as stored so both sides produce the same hex
 /// digest.
 ///
-/// This is the ONE definition of that digest: `mc-module` recomputes it from the
-/// authoritative condition to admit a compile completion, and the v51 repair uses it
-/// to decide whether a legacy artifact is trustworthy. A second copy would let those
-/// two decisions drift, which either rejects every valid completion or discards every
 /// legacy artifact.
 pub fn note_check_digest(
     surface_condition: Option<&str>,
@@ -13819,11 +13330,6 @@ fn repair_note_artifacts_tx(
     };
     let processed = candidates.len();
     for candidate in candidates {
-        // A row with no recorded digest cannot be verified either way. Treat it as
-        // trusted-as-is rather than discarding a real compiled artifact: wiping it
-        // forces a fresh LLM compile per note and is unrecoverable, whereas
-        // adopting it only carries forward a pre-v51 artifact the previous binary
-        // was already serving.
         let verified = match candidate.check_hash.as_deref() {
             None => true,
             Some(hash) => {
@@ -13871,8 +13377,6 @@ fn sql_like_pattern(query: &str) -> String {
     format!("%{escaped}%")
 }
 
-/// Compute the ctx_memory normalized hash used for duplicate detection. This mirrors the
-/// plugin path: lowercase, collapse whitespace runs to one space, trim, then MD5 hex.
 fn canonical_authority_value(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
@@ -14337,7 +13841,6 @@ mod tests {
             .knows_transform_session_root("canonical-write", target_text)
             .unwrap());
 
-        // Simulate a pre-migration row that retained the symlink spelling.
         store
             .commit(
                 "legacy-row",
@@ -14410,7 +13913,6 @@ mod tests {
         let meta = ModuleMeta::default();
 
         store.commit("ses_a", None, &core, &meta).unwrap(); // row_version now 1
-                                                            // A writer that still thinks the row is absent must conflict.
         let err = store.commit("ses_a", None, &core, &meta).unwrap_err();
         match err {
             McStoreError::CasConflict { expected, found } => {
@@ -14948,8 +14450,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
 
-        // Zero targets: the ledger row is recorded with disposition='no_targets'
-        // so a retry of the same command_id still dedupes.
         let outcome = store
             .append_pending_agent_drops_with_command("ses", Some("cmd-zero"), &[], 1, true)
             .unwrap();
@@ -14963,7 +14463,6 @@ mod tests {
         );
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
-        // Retry of the same command_id must still dedupe (idempotency).
         let retry = store
             .append_pending_agent_drops_with_command("ses", Some("cmd-zero"), &[], 2, true)
             .unwrap();
@@ -14976,9 +14475,6 @@ mod tests {
             }
         );
 
-        // A normal command with actual targets still queues pending drops and does not
-        // set any disposition — the no_targets path only applies when canonicalization
-        // resolved zero block_ids.
         let normal = store
             .append_pending_agent_drops_with_command(
                 "ses",
@@ -14998,8 +14494,6 @@ mod tests {
         );
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
 
-        // The diagnostic ledger must distinguish the terminal no-target result from work
-        // that is still pending; a constant disposition would make incident reads misleading.
         assert_eq!(
             command_ledger_rows(&store, "ses"),
             vec![
@@ -16069,9 +15563,6 @@ mod tests {
     fn schema_version_probe_reads_the_live_store_and_matches_the_shipped_ceiling() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
-        // The live probe must read the namespace this store actually migrates, and the
-        // compile-time ceiling must equal the newest migration the binary ships; a
-        // drift between either pair is exactly the skew the status surface exists to
         // expose.
         let shipped_max = MIGRATIONS
             .iter()
@@ -16089,10 +15580,6 @@ mod tests {
     fn pre_cutover_module_store_is_refused_by_family_not_by_ddl_collision() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.db");
-        // A store written by a pre-cutover binary: `mc_cache` history below the
-        // consolidated bootstrap, with that history's first table already present.
-        // The migration runner would apply the bootstrap over it and fail on
-        // `CREATE TABLE mc_cache_state`, naming a symptom instead of the family.
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -16140,15 +15627,12 @@ mod tests {
     fn fresh_and_current_module_stores_open_without_a_pre_cutover_refusal() {
         let dir = tempfile::tempdir().unwrap();
         let descriptor = descriptor(dir.path());
-        // Fresh: no version history at all.
         let first = McStore::open(&descriptor).unwrap();
         assert_eq!(
             first.module_store_schema_version().unwrap(),
             LATEST_MIGRATION_VERSION
         );
         drop(first);
-        // Reopen: history now records exactly the bootstrap this binary composes,
-        // which the refusal must not mistake for pre-cutover history.
         let second = McStore::open(&descriptor).unwrap();
         assert_eq!(
             second.module_store_schema_version().unwrap(),
@@ -16161,7 +15645,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = descriptor(dir.path());
         let _first = McStore::open(&d).unwrap();
-        // Second live handle on the same database must be rejected (single-writer).
         assert!(McStore::open(&d).is_err());
     }
 
@@ -16382,7 +15865,6 @@ mod tests {
         );
         assert_eq!(read[0].sequence, 1, "oldest first");
 
-        // a wholesale replace fully supplants the prior set
         let replacement = vec![StoredCompartment {
             sequence: 1,
             title: "only".into(),
@@ -16395,7 +15877,6 @@ mod tests {
         assert_eq!(read2.len(), 1);
         assert_eq!(read2[0].title, "only");
 
-        // distinct sessions are isolated
         assert!(store.load_compartments("ses_b").unwrap().is_empty());
     }
 
@@ -16482,7 +15963,6 @@ mod tests {
                 })
                 .unwrap();
         };
-        // two share promoted_at=100 → id breaks the tie deterministically (3 before 4).
         insert(1, "first", "active", 50);
         insert(4, "tie-later-id", "active", 100);
         insert(3, "tie-earlier-id", "active", 100);
@@ -17410,8 +16890,6 @@ mod tests {
         assert_eq!(unchanged.status, ready.status);
         assert_eq!(unchanged.source_revision, ready.source_revision);
         assert_eq!(unchanged.compiled_check, ready.compiled_check);
-        // Mutation-neutral: a version bump would fence an active claim for
-        // compiler inputs that did not change.
         assert_eq!(unchanged.status_version, ready.status_version);
         assert_eq!(unchanged.state_version, ready.state_version);
 
@@ -17525,8 +17003,6 @@ mod tests {
                 .unwrap(),
             1
         );
-        // A newer acknowledged delivery closes the older lost attempt, so the
-        // surfaced note cannot be delivered forever.
         assert!(store
             .claim_note_delivery("git:proj", "serve-session", "pass-3", "pass-3", 70)
             .unwrap()
@@ -18505,10 +17981,6 @@ mod tests {
             } => {
                 assert_eq!(replayed.claim_id, claim.claim_id);
                 assert_eq!(replayed.registration_generation, 2);
-                // The rebind refreshes the lease: a reconnecting worker
-                // schedules its first renewal a full heartbeat interval out,
-                // so replaying with the original near-expiry lease would let
-                // it lapse mid-execution.
                 assert_eq!(replayed.expires_at, 200 + NOTE_EVAL_CLAIM_LEASE_MS);
             }
             other => panic!("expected replayed claim, got {other:?}"),
@@ -18526,8 +17998,6 @@ mod tests {
     fn note_eval_claim_ids_fit_the_wire_id_limit_for_long_project_identities() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
-        // The module rejects id fields over 128 bytes, so a claim id must stay
-        // bounded even when the project identity alone exceeds that budget.
         let project = format!("dir:/{}", "p".repeat(200));
         let preparing = store
             .authority_begin_prepare("ctx", &project, "notes")
@@ -18626,7 +18096,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = note_eval_store(dir.path());
         eval_note(&store, "hidden by a spent cursor");
-        // The caller classifies this pass as cursor-spent, not queue-empty.
         let outcome = store
             .acquire_note_evaluation(
                 EVAL_PROJECT,
@@ -18647,9 +18116,6 @@ mod tests {
                 cycle_exhausted: true
             }
         );
-        // A response-loss retry must reproduce the exhaustion cause, or the
-        // worker mistakes the reset cursor for a drained queue and strands the
-        // work the spent cursor hid.
         assert_eq!(
             store
                 .acquire_note_evaluation(EVAL_PROJECT, "acq-1", "eval-a", 0, 1, pick_first, 200)
@@ -18685,9 +18151,6 @@ mod tests {
                 ..
             } => {
                 assert_eq!(recovered.claim_id, claim.claim_id);
-                // The rebind adopts the new acquisition id so a retry of it
-                // replays this decision from the acquisition-keyed lookup
-                // instead of re-entering slot recovery.
                 assert_eq!(recovered.acquisition_id, "acq-2");
             }
             other => panic!("expected recovered claim, got {other:?}"),
@@ -18719,7 +18182,6 @@ mod tests {
         let store = note_eval_store(dir.path());
         eval_note(&store, "note");
 
-        // One no-work acquisition, then one terminal claim.
         let idle_at = 1_000;
         store
             .acquire_note_evaluation(EVAL_PROJECT, "idle-1", "eval-a", 0, 1, pick_none, idle_at)
@@ -18758,8 +18220,6 @@ mod tests {
         );
         assert_eq!(count("mc_note_eval_claims"), 1);
 
-        // Past both retention windows the GC must RECLAIM rows, not merely blank
-        // their columns; otherwise the ledgers grow for the life of the store.
         let after_retention =
             idle_at + NOTE_EVAL_TERMINAL_RETENTION_MS + NOTE_EVAL_NO_WORK_RETENTION_MS + 1;
         store
@@ -18805,8 +18265,6 @@ mod tests {
             )
             .unwrap();
 
-        // Trigger GC via an idle poll at `at`, then report
-        // (terminal rows, terminal rows still carrying a response).
         let response_state = |at: i64| -> (i64, i64) {
             store
                 .acquire_note_evaluation(
@@ -18866,7 +18324,6 @@ mod tests {
         eval_note(&store, "note");
         let now = 1_000;
 
-        // Retire one claim, leaving a terminal row inside the retention window.
         let claim = eval_claim(&store, "acq-1", 0, now);
         store
             .complete_note_evaluation(
@@ -18880,9 +18337,6 @@ mod tests {
             )
             .unwrap();
 
-        // With the cap squeezed to 1, a retained terminal row must NOT deny new
-        // work: counting it would turn the cap into a rolling throughput ceiling
-        // that stalls the project until rows aged out.
         match store
             .acquire_note_evaluation_with_cap(
                 EVAL_PROJECT,
@@ -18907,10 +18361,6 @@ mod tests {
         let store = note_eval_store(dir.path());
         let note = eval_note(&store, "note");
 
-        // Legacy shape: a compiled artifact with NO check_hash, so verification is
-        // impossible either way. Discarding it would force a fresh LLM compile.
-        // The repair is one-shot per store and already ran during open(), so clear
-        // its completion flag to exercise it against this row.
         store
             .inner
             .with_conn(|conn| {
@@ -20047,10 +19497,6 @@ mod lineage_descent_tests {
         }]
     }
 
-    /// The CC-leg mid assigner is zero-based: a fresh replacement array's
-    /// anchor sits at ordinal 0 (measured on the rig — ccm-0#1 carrying the
-    /// stored summary). A fresh-origin anchor at 0 must descend exactly like
-    /// the 1-based form; the placeholder still lands at prior_last+1.
     #[test]
     fn descent_accepts_a_zero_based_fresh_anchor() {
         let dir = tempfile::tempdir().unwrap();
@@ -20084,8 +19530,6 @@ mod lineage_descent_tests {
         assert_eq!(target.core.boundary_id, "ccm-0#1");
     }
 
-    /// A mid-space anchor (neither a fresh origin nor the placeholder) must
-    /// refuse — the widened origin acceptance is exactly {0, 1}, not "small".
     #[test]
     fn descent_refuses_a_mid_space_anchor() {
         let dir = tempfile::tempdir().unwrap();

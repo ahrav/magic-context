@@ -66,15 +66,13 @@ describe("frame deadline and idle behavior", () => {
         const peer = await h.startPeer();
         const generation = await h.dial(peer, { frameDeadlineMs: 100 });
         const connection = await peer.waitForConnection();
-        // Idle wait between frames is unbounded: far longer than the frame
-        // deadline with zero bytes on the wire must not retire.
+        // An idle connection has no deadline until it receives a frame byte.
         await delay(250);
         expect(generation.isRetired()).toBe(false);
         await roundTrip(generation, connection);
         await delay(150);
         expect(generation.isRetired()).toBe(false);
-        // A frame that stalls after its first header byte hits the frame
-        // deadline that started at that byte.
+        // The frame deadline starts when the first header byte arrives.
         const stalled = encodePeerFrame({
             ty: PeerFrameType.Response,
             channel: CHANNEL,
@@ -105,7 +103,6 @@ describe("frame deadline and idle behavior", () => {
             corr: request.correlation,
             body: Buffer.alloc(256),
         });
-        // Header plus half the body, then silence.
         await connection.sendRaw(Buffer.from(full.subarray(0, 21 + 128)));
         const info = await generation.retired;
         expect(info.reason).toBe("frame_deadline");
@@ -119,8 +116,7 @@ describe("writer capacity and reserved control frames", () => {
         const generation = await h.dial(peer, { maxQueuedFrames: 2 });
         const connection = await peer.waitForConnection();
         connection.pauseReading();
-        // Wedge the writer: the first frame's bytes reach socket.write()
-        // and the socket stops accepting more until 'drain'.
+        // Pausing reads makes the first write await 'drain'.
         const wedge = generation.request({
             channel: CHANNEL,
             epoch: EPOCH,
@@ -198,7 +194,7 @@ describe("writer capacity and reserved control frames", () => {
         generation.enqueueCancel(CHANNEL, EPOCH, 1n);
         generation.enqueueRouteGoodbye(CHANNEL, EPOCH);
         expect(generation.isRetired()).toBe(false);
-        // Third control frame cannot queue safely: retire.
+        // The generation retires when a third control frame exceeds reserved capacity.
         generation.enqueueConnectionGoodbye();
         expect(generation.isRetired()).toBe(true);
         expect(retirements.map((info) => info.reason)).toEqual(["control_capacity_exhausted"]);
@@ -335,7 +331,6 @@ describe("settlement races", () => {
             (terminal) => ({ kind: "resolved" as const, terminal }),
             (error: unknown) => ({ kind: "rejected" as const, error }),
         );
-        // Whichever side won, it won exactly once and cleanup completes.
         if (settled.kind === "rejected") {
             expectCallError(settled.error, "outcome_unknown", "aborted");
         }
@@ -357,7 +352,7 @@ describe("host Ping and correlation namespaces", () => {
             deadline: Deadline.start(5_000),
         });
         expect(request.correlation).toBe(1n);
-        // Interactive priority: valid pure-header flags the Pong must echo.
+        // A Pong echoes the flags from a valid header-only Ping.
         await connection.send({ ty: PeerFrameType.Ping, corr: 1n, flags: 0b0000_0010 });
         await connection.waitFor(() =>
             connection.frames.some((frame) => frame.ty === PeerFrameType.Pong),
@@ -367,8 +362,7 @@ describe("host Ping and correlation namespaces", () => {
         expect(pong?.flags).toBe(0b0000_0010);
         expect(pong?.channel).toBe(0);
         expect(pong?.epoch).toBe(0);
-        // The consumer request is untouched by the numerically equal host
-        // correlation and settles only on its own terminal.
+        // A consumer request ignores a host response with the same numeric correlation and settles only on its own terminal.
         expect(generation.stats().pendingRequests).toBe(1);
         await connection.send({
             ty: PeerFrameType.Response,
@@ -393,7 +387,7 @@ describe("ingress fencing", () => {
             deadline: Deadline.start(5_000),
         });
         const corr = request.correlation;
-        // Stale epoch (route epoch validated before pending lookup).
+        // The route validates the epoch before looking up pending requests.
         await connection.send({
             ty: PeerFrameType.Response,
             channel: CHANNEL,
@@ -410,7 +404,6 @@ describe("ingress fencing", () => {
             body: Buffer.from("unmatched"),
         });
         await waitUntil(() => generation.stats().droppedFrames === 2);
-        // The real terminal.
         await connection.send({
             ty: PeerFrameType.Response,
             channel: CHANNEL,
@@ -420,7 +413,6 @@ describe("ingress fencing", () => {
         });
         const body = (await request.result).body;
         expect("text" in body ? body.text : null).toBe("real");
-        // Duplicate terminal and post-terminal stream frame.
         await connection.send({
             ty: PeerFrameType.Response,
             channel: CHANNEL,
@@ -593,7 +585,6 @@ describe("stream handling (KTD11)", () => {
         });
         expectCallError(await rejection(request.result), "terminal", "unexpected_stream");
         expect(generation.isRetired()).toBe(false);
-        // Drained privately: nothing retained.
         expect(generation.stats().pendingHeldBytes).toBe(0);
         await roundTrip(generation, connection);
     });
@@ -685,8 +676,7 @@ describe("stream handling (KTD11)", () => {
             mode: "stream",
             responseMode: "binary",
         });
-        // A binary stream item is retained as its lease; failing alias
-        // detachment makes that lease quarantine (and throw) on release.
+        // A binary stream item retains its lease; an aliased buffer quarantines and throws when the lease is released.
         const lease = new ReceiveLease(
             [new Uint8Array(new ArrayBuffer(4))],
             () => {},
@@ -719,9 +709,7 @@ describe("stream handling (KTD11)", () => {
         const peer = await h.startPeer();
         const generation = await h.dial(peer);
         const connection = await peer.waitForConnection();
-        // An empty StreamData frame charges zero pending bytes while retaining
-        // one decoded item, so a ceiling the item comparison can never reach
-        // leaves retention unbounded.
+        // An empty StreamData frame retains one decoded item but charges zero pending bytes, so a byte-only limit cannot bound retained items.
         for (const maxStreamItems of [
             Number.POSITIVE_INFINITY,
             Number.NaN,
@@ -745,9 +733,7 @@ describe("stream handling (KTD11)", () => {
             expectCallError(refused, "not_sent", "invalid_max_stream_items");
         }
         expect(generation.stats().pendingRequests).toBe(0);
-        // Publication is asynchronous, so a legal request flushed through the
-        // peer is the observation point: exactly its own Request frame arrives,
-        // proving the refusals allocated no correlation and wrote no bytes.
+        // Rejected requests publish no frames.
         await roundTrip(generation, connection);
         expect(
             connection.frames.filter((frame) => frame.ty === PeerFrameType.Request),
@@ -812,9 +798,7 @@ describe("memory accounting and the 64 MiB boundary", () => {
         expect(leased.segment(leased.segmentCount - 1).at(-1)).toBe(7);
         leased.release();
         const stats = generation.stats();
-        // Accounting proof, not RSS: the body was charged exactly once (a
-        // duplicate full-body copy would exceed the aggregate cap, which
-        // only admits one maximum frame plus fixed overhead).
+        // The aggregate cap permits one maximum frame plus fixed overhead; charging the body twice would exceed it.
         expect(stats.memoryPeak).toBeGreaterThanOrEqual(MAX_FRAME_BODY_LEN);
         expect(stats.memoryPeak).toBeLessThanOrEqual(stats.memoryCap);
         await waitUntil(() => generation.stats().memoryUsed === 0);
@@ -824,7 +808,7 @@ describe("memory accounting and the 64 MiB boundary", () => {
         const peer = await h.startPeer();
         const generation = await h.dial(peer);
         const connection = await peer.waitForConnection();
-        // Header only: the declaration alone must close the generation.
+        // A header declaring an oversized body closes the generation before any body bytes arrive.
         await connection.send({
             ty: PeerFrameType.Response,
             channel: CHANNEL,
@@ -846,7 +830,7 @@ describe("memory accounting and the 64 MiB boundary", () => {
             frameDeadlineMs: 10_000,
         });
         const connection = await peer.waitForConnection();
-        // R1 (stream mode) retains its StreamData privately: 4,096 held.
+        // R1 retains 4,096 bytes of StreamData.
         const first = generation.request({
             channel: CHANNEL,
             epoch: EPOCH,
@@ -872,8 +856,8 @@ describe("memory accounting and the 64 MiB boundary", () => {
             body: Buffer.alloc(4_096, 1),
         });
         await waitUntil(() => generation.stats().pendingHeldBytes === 4_096);
-        // The second large body cannot be admitted under the cap: the
-        // socket pauses before allocation instead of buffering a second
+        // The second large body cannot be admitted under the cap.
+        // The socket pauses before allocating a second body instead of buffering it.
         // large frame.
         await connection.send({
             ty: PeerFrameType.Response,
@@ -936,7 +920,6 @@ describe("correlation lifecycle", () => {
             refused = error;
         }
         expectCallError(refused, "not_sent", "correlations_exhausted");
-        // The final correlation still completes normally.
         await connection.waitFor(() =>
             connection.frames.some((frame) => frame.corr === MAX_CORRELATION),
         );
@@ -1033,7 +1016,7 @@ describe("setup failures", () => {
         expect(generation.stats().activeTimers).toBe(0);
         const connection = await peer.waitForConnection();
         await connection.closed;
-        // No ClientAuth after the malformed server message.
+        // The client sends no ClientAuth after a malformed server message.
         expect(connection.authMessages.length).toBe(1);
     });
 
@@ -1058,10 +1041,10 @@ describe("setup failures", () => {
         const failure = rejection(generation.start(Deadline.start(60_000, () => nowMs)));
         const connection = await peer.waitForConnection();
         await waitUntil(() => connection.authMessages.length === 1);
-        // The budget expires on the fake clock while the real 60s setup
-        // timer stays pending, so the auth reader observes expiry first —
-        // the same shape as auth I/O landing ahead of a lagging timer
-        // callback. Budget exhaustion must not read as an auth failure.
+        // The fake clock expires the budget while the 60-second setup uses the real clock.
+        // The auth reader therefore observes expiry before a lagging timer callback.
+        // The auth reader handles auth I/O before a lagging timer callback runs.
+        // Budget exhaustion must not be reported as an auth failure.
         nowMs = 60_001;
         await connection.sendRaw(Buffer.from([8, 0, 0, 0]));
         const error = await failure;
@@ -1127,7 +1110,6 @@ describe("pending-zero drain notification", () => {
             body: Buffer.from("a"),
         });
         await first.result;
-        // One pending entry remains, so the drain has not completed.
         expect(drains).toBe(0);
         await connection.send({
             ty: PeerFrameType.Response,

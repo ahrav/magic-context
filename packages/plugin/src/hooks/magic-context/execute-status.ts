@@ -33,9 +33,6 @@ import { estimateTokens } from "./read-session-formatting";
 
 function formatExecuteThreshold(detail: ExecuteThresholdDetail, contextLimit: number): string {
     const { percentage, mode } = detail;
-    // Surfaces the silent clamp from issue #241: when the configured value exceeded
-    // the 90% safety cap, append a note showing the configured value and the cap so
-    // the user sees the math (e.g. "190,000 > 90% of 128,000"). "" when not clamped.
     const clampNote = formatThresholdClampNote({
         clamped: detail.clamped,
         mode,
@@ -70,10 +67,6 @@ export function executeStatus(
     windowGeometry?: WindowGeometryResult,
     tailHygiene?: TailHygieneStatus,
 ): string {
-    // Single source of truth — resolver tells us both the effective percentage AND
-    // which config source won (tokens vs percentage). Previously /ctx-status
-    // reimplemented the token-match check here and missed progressive base-model
-    // lookup (e.g. `openai/gpt-5.4-fast` → `openai/gpt-5.4`), causing display drift.
     const thresholdDetail = resolveExecuteThresholdDetail(
         executeThresholdPercentageConfig,
         liveModelKey,
@@ -190,11 +183,6 @@ export function executeStatus(
             );
         }
 
-        // History Compression section — show current block size vs budget.
-        // v2: facts are retired as a render source (they are promoted memories
-        // now), so they are NOT counted into the history block or shown as a
-        // separate count — doing so would mislead operators into thinking facts
-        // still render in <session-history>.
         const compartments = getCompartments(db, sessionId);
         let historyBlockTokens = 0;
         for (const c of compartments) {

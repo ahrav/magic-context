@@ -65,7 +65,6 @@ describe("deferred execute CAS race", () => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                // Ignore EBUSY on Windows
             }
         }
     });

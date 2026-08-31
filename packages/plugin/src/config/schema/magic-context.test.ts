@@ -193,7 +193,6 @@ describe("MagicContextConfigSchema", () => {
                 dreamer: {
                     disable: true,
                     enabled: true,
-                    // Dreamer v2: per-task config. review-user-memories disabled,
                     // maintain-docs scheduled.
                     tasks: {
                         "review-user-memories": { schedule: "" },
@@ -262,7 +261,6 @@ describe("MagicContextConfigSchema", () => {
             expect(result.cache_ttl).toEqual(input.cache_ttl);
         });
 
-        // Accepts preset routing, a guidance override path, and tool-description overrides.
         it("parses prompt-surface defaults, routes, and user overrides", () => {
             const promptSurface = {
                 default: "light" as const,

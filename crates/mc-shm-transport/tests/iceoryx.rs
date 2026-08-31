@@ -1,4 +1,3 @@
-//! iceoryx backend rejection and exact-body-range tests.
 #![cfg(feature = "iceoryx")]
 
 use mc_shm_transport::backend::iceoryx::{IceoryxBackend, IceoryxError, IceoryxProducerError};
@@ -71,17 +70,13 @@ fn payload(
     bytes
 }
 
-/// Seeded-defect detector: a receive path that hands the full sample
-/// allocation to frame decoding instead of the validated declared body
-/// range must fail this test.
+/// The receive path passes only the validated declared body range to frame decoding.
 #[test]
 fn allocation_slack_never_reaches_the_frame_decoder() {
     let backend = IceoryxBackend::create(&iceoryx_profile(), 3).unwrap();
     let body = [0xC3u8; 8];
     let bound = 4096;
 
-    // The loan is deliberately larger than the committed body, so the
-    // published allocation carries capacity slack past the declared range.
     let mut reservation = backend.try_reserve(bound, wire(body.len())).unwrap();
     reservation.write(&body).unwrap();
     reservation.commit(body.len()).unwrap();
@@ -107,8 +102,6 @@ fn allocation_slack_never_reaches_the_frame_decoder() {
 #[test]
 fn stale_node_observation_lists_without_disturbing_a_live_backend() {
     let backend = IceoryxBackend::create(&iceoryx_profile(), 7).unwrap();
-    // The observed value depends on host state left by other processes.
-    // The contract under test: observation succeeds and the live backend still round-trips afterwards.
     let _ = IceoryxBackend::stale_node_observed().unwrap();
     let body = [0x5Au8; 4];
     let mut reservation = backend.try_reserve(64, wire(body.len())).unwrap();
@@ -176,14 +169,12 @@ fn sample_decoder_rejects_truncation_suffix_and_stale_identity() {
         .validate(valid.len(), expected)
         .is_ok());
 
-    // Every truncation point around the fixed prefix.
     for cut in 0..SAMPLE_PREFIX_BYTES {
         assert_eq!(
             SamplePrefix::snapshot(&valid[..cut]),
             Err(DescriptorError::Truncated)
         );
     }
-    // Every truncation point inside the declared body.
     for cut in SAMPLE_PREFIX_BYTES..valid.len() {
         assert_eq!(
             SamplePrefix::snapshot(&valid[..cut])
@@ -192,8 +183,7 @@ fn sample_decoder_rejects_truncation_suffix_and_stale_identity() {
             Err(DescriptorError::InvalidAllocation)
         );
     }
-    // A one-byte suffix is capacity slack: accepted, but excluded from the
-    // validated body range.
+    // A one-byte suffix is accepted as capacity slack and excluded from the validated body range.
     let mut suffixed = valid.clone();
     suffixed.push(0xEE);
     let validated = SamplePrefix::snapshot(&suffixed)
@@ -205,7 +195,6 @@ fn sample_decoder_rejects_truncation_suffix_and_stale_identity() {
         SAMPLE_PREFIX_BYTES..SAMPLE_PREFIX_BYTES + body.len()
     );
 
-    // Stale incarnation, lane, and sequence.
     let stale_incarnation = ReleaseIdentity::new(Incarnation::from_bytes([8; 16]), 3, 9);
     assert_eq!(
         SamplePrefix::snapshot(&valid)
@@ -242,7 +231,6 @@ fn sample_decoder_rejects_schema_length_and_overflow_extremes() {
             .validate(bad_schema.len(), expected),
         Err(DescriptorError::UnsupportedSchema)
     );
-    // Mismatched wire length against the declared body.
     let mismatched = payload(DESCRIPTOR_SCHEMA_VERSION, wire(5), expected, 4, &body);
     assert_eq!(
         SamplePrefix::snapshot(&mismatched)
@@ -250,7 +238,6 @@ fn sample_decoder_rejects_schema_length_and_overflow_extremes() {
             .validate(mismatched.len(), expected),
         Err(DescriptorError::WireHeaderMismatch)
     );
-    // Excessive body beyond the frame maximum.
     let mut oversize_wire = [0u8; WIRE_V2_HEADER_BYTES];
     oversize_wire[..4].copy_from_slice(&(MAX_FRAME_BYTES as u32 + 1).to_le_bytes());
     oversize_wire[4] = 2;
@@ -267,7 +254,6 @@ fn sample_decoder_rejects_schema_length_and_overflow_extremes() {
             .validate(excessive.len(), expected),
         Err(DescriptorError::FrameTooLarge)
     );
-    // An overflowing declared length fails before any range is formed.
     let overflowing = payload(
         DESCRIPTOR_SCHEMA_VERSION,
         wire(4),

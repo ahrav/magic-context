@@ -345,7 +345,7 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         expect(result?.memoryCount).toBe(1);
         expect(result?.block).toContain("<project-memory>");
         expect(result?.block).toContain("User prefers concise responses");
-        // No splicing — original message preserved
+        // Injection preserves the original message without splicing.
         expect(messages.length).toBe(1);
         expect(messages[0].info.id).toBe("m1");
     });
@@ -362,9 +362,8 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         const messages: MessageLike[] = [userMessage("m1", "go")];
         const result = prepareCompartmentInjection(db, SESSION_ID, messages, true, PROJECT_PATH);
 
-        // v2 faithful facts: session_facts is no longer a render source. With no
-        // compartments and no memories, there is nothing to inject — facts alone
-        // do NOT produce a block (they live as promoted memories instead).
+        // session_facts is not a render source.
+        // Facts are rendered only after promotion to memories.
         expect(result).toBeNull();
     });
 
@@ -387,11 +386,9 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
 
         expect(result).not.toBeNull();
         expect(result?.compartmentCount).toBe(0);
-        // v2: facts are retired from rendering (factCount reflects rendered facts = 0).
         expect(result?.memoryCount).toBe(1);
         expect(result?.block).toContain("<project-memory>");
         expect(result?.block).toContain("Never commit without tests");
-        // The session_fact ("Monorepo layout") must NOT appear in the block.
         expect(result?.block).not.toContain("Monorepo layout");
     });
 
@@ -412,7 +409,6 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         expect(renderResult.injected).toBe(true);
         expect(renderResult.compartmentCount).toBe(0);
 
-        // First message should now contain session-history prefix
         const firstPart = messages[0].parts[0] as { type: string; text: string };
         expect(firstPart.text).toContain("<session-history>");
         expect(firstPart.text).toContain("</session-history>");
@@ -423,8 +419,7 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
 
 describe("prepareCompartmentInjection — cross-database cache isolation", () => {
     it("does not replay a block rendered from a different database", () => {
-        // The injection cache is process-global and keyed by session id alone,
-        // while the value it holds is rendered FROM a database. Two independent
+        // The process-global injection cache is keyed only by session ID.
         // stores that share a session id must not see each other's blocks.
         const first = makeDb();
         try {
@@ -445,8 +440,7 @@ describe("prepareCompartmentInjection — cross-database cache isolation", () =>
             closeQuietly(first);
         }
 
-        // Second store: same session id, no memories, and a DEFER pass — the
-        // path that replays the cached injection.
+        // Stores that share a session ID must not see each other's blocks.
         db = makeDb();
         const messages: MessageLike[] = [userMessage("m1", "hi")];
         const replayed = prepareCompartmentInjection(db, SESSION_ID, messages, false, PROJECT_PATH);
@@ -560,7 +554,6 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
             content: "initial directive",
         });
 
-        // Pass 1: no compartments yet — inject memories only
         const pass1Messages: MessageLike[] = [
             userMessage("m1", "hello"),
             userMessage("m2", "follow up"),
@@ -574,10 +567,8 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
         );
         expect(pass1?.compartmentCount).toBe(0);
         expect(pass1?.compartmentEndMessageId).toBe("");
-        // No splice happened — both messages still present
         expect(pass1Messages.length).toBe(2);
 
-        // Historian publishes compartment covering m1
         replaceAllCompartmentState(
             db,
             SESSION_ID,
@@ -596,7 +587,7 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
         );
         clearInjectionCache(SESSION_ID);
 
-        // Pass 2: compartment exists — boundary-based splice should remove m1
+        // A compartment boundary splices m1 from session history.
         const pass2Messages: MessageLike[] = [
             userMessage("m1", "hello"),
             userMessage("m2", "follow up"),
@@ -611,7 +602,6 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
         expect(pass2?.compartmentCount).toBe(1);
         expect(pass2?.compartmentEndMessageId).toBe("m1");
         expect(pass2?.skippedVisibleMessages).toBe(1);
-        // m1 spliced out — only m2 remains
         expect(pass2Messages.length).toBe(1);
         expect(pass2Messages[0].info.id).toBe("m2");
         expect(pass2?.block).toContain("first compartment");
@@ -626,7 +616,6 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
             content: "directive",
         });
 
-        // Bust pass: populate cache
         const bustMessages: MessageLike[] = [userMessage("m1", "hi")];
         const busted = prepareCompartmentInjection(
             db,
@@ -637,7 +626,7 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
         );
         expect(busted?.compartmentCount).toBe(0);
 
-        // Defer pass: should return cached without changing messages
+        // Cached replay leaves messages unchanged.
         const deferMessages: MessageLike[] = [userMessage("m1", "hi"), userMessage("m2", "new")];
         const cached = prepareCompartmentInjection(
             db,
@@ -646,10 +635,9 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
             false,
             PROJECT_PATH,
         );
-        // Replayed-from-cache output must match the busted output structurally
-        // on every field except `rebuiltFromDb` — that flag intentionally
-        // differs (true on bust, false on replay) as a per-pass provenance
-        // signal consumed by the postprocess drain. Plan v6.
+        // The replayed output matches the busted output except for rebuiltFromDb.
+        // rebuiltFromDb is true on a bust and false on replay.
+        // rebuiltFromDb signals per-pass provenance to the postprocess drain.
         expect(busted?.rebuiltFromDb).toBe(true);
         expect(cached?.rebuiltFromDb).toBe(false);
         expect(cached?.block).toBe(busted?.block);
@@ -659,7 +647,7 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
         expect(cached?.skippedVisibleMessages).toBe(busted?.skippedVisibleMessages);
         expect(cached?.factCount).toBe(busted?.factCount);
         expect(cached?.memoryCount).toBe(busted?.memoryCount);
-        // Empty boundary id ⇒ no splice
+        // An empty boundary ID prevents splicing.
         expect(deferMessages.length).toBe(2);
     });
 });
@@ -673,9 +661,6 @@ describe("prepareCompartmentInjection — SQLITE_BUSY handling (issue #23)", () 
             content: "never run migrations manually",
         });
 
-        // Proxy the db to throw SQLITE_BUSY specifically on the UPDATE statement
-        // used by memory_block_cache. Other prepares pass through unchanged so
-        // the rest of prepareCompartmentInjection can complete normally.
         const busyProxy: Database = new Proxy(db, {
             get(target, prop, receiver) {
                 if (prop === "transaction") return target.transaction.bind(target);
@@ -704,7 +689,7 @@ describe("prepareCompartmentInjection — SQLITE_BUSY handling (issue #23)", () 
         });
 
         const messages: MessageLike[] = [userMessage("m1", "hello")];
-        // Should not throw — the BUSY on the optional cache write must be swallowed.
+        // prepareCompartmentInjection must swallow SQLITE_BUSY from the optional cache write.
         const result = prepareCompartmentInjection(
             busyProxy,
             SESSION_ID,
@@ -1153,12 +1138,9 @@ describe("m[0]/m[1] materialization", () => {
     });
 
     it("mustMaterialize does NOT materialize m[0] on a new compartment (it rides m[1])", () => {
-        // Taxonomy invariant: a new compartment is a SOFT delta that surfaces in
-        // m[1] via renderM1's <new-compartments> (sequence > cachedM0Seq). It must
-        // NEVER fold m[0] — folding on every historian publish busts the prompt-
-        // cache prefix on a routine background publish, the exact bug the m[0]/m[1]
-        // split exists to prevent. New compartments fold into m[0] only on a HARD
-        // bust (TTL/system/tools/model change).
+        // New compartments with sequence > cachedM0Seq render in m[1] until a HARD bust.
+        // New compartments remain in m[1] so routine historian publishes preserve the m[0] prompt-cache prefix.
+        // New compartments fold into m[0] only on a HARD bust.
         db = makeDb();
         createOpenCodeMessageTimes([{ id: "m1", timestamp: new Date(2026, 0, 4, 12).getTime() }]);
         const projectDirectory = makeProjectDir();
@@ -1240,10 +1222,8 @@ describe("m[0]/m[1] materialization", () => {
     });
 
     it("mustMaterialize does NOT materialize m[0] on the FIRST compartment (sequence 0)", () => {
-        // The first compartment (sequence 0) is also a SOFT m[1] delta — the
-        // EMPTY_MAX_COMPARTMENT_SEQ=-1 sentinel makes readNewCompartments(-1)
-        // include seq 0, so renderM1 surfaces it. mustMaterialize must NOT fold it
-        // into m[0]; that happens on the next HARD bust.
+        // Use -1 as EMPTY_MAX_COMPARTMENT_SEQ so readNewCompartments includes sequence 0.
+        // `mustMaterialize` leaves sequence 0 in m[1] until the next HARD bust.
         db = makeDb();
         const projectDirectory = makeProjectDir();
         materializeM0({
@@ -1254,7 +1234,6 @@ describe("m[0]/m[1] materialization", () => {
             projectDirectory,
         });
         const state = readStateFromMeta();
-        // First compartment for this session — sequence 0.
         replaceAllCompartmentState(
             db,
             SESSION_ID,
@@ -1313,8 +1292,7 @@ describe("m[0]/m[1] materialization", () => {
     });
 
     it("mustMaterialize treats project docs hash changes as a SOFT defer input", () => {
-        // Project docs live in the frozen prefix, but docs-only edits must not
-        // force a fold: they ride along until a natural HARD bust refreshes m[0].
+        // Docs-only edits remain outside m[0] until a HARD bust refreshes it.
         db = makeDb();
         const projectDirectory = makeProjectDir();
         materializeM0({
@@ -1473,10 +1451,9 @@ describe("m[0]/m[1] materialization", () => {
     });
 
     it("v2: a session facts version bump does NOT trigger re-materialization", () => {
-        // v2 faithful facts: session_facts is retired as a render source, so a
-        // facts-version bump must not force an m[0] rebuild (rendered bytes no
-        // longer depend on session_facts). This guards against the old wasted
-        // re-materialization on every fact change.
+        // Changes to session_facts do not rebuild m[0] because m[0] does not render session_facts.
+        // `facts-version` changes must not rebuild m[0] because m[0] does not render `session_facts`.
+        // Changes to session_facts do not rebuild m[0].
         db = makeDb();
         const projectDirectory = makeProjectDir();
         materializeM0({
@@ -1534,8 +1511,6 @@ describe("m[0]/m[1] materialization", () => {
         );
         expect(JSON.parse(String(row.cached_m0_rendered_revision_locators))).toEqual([]);
         expect(row.cached_m0_project_user_profile_version).toBe(0);
-        // Empty session: maxCompartmentSeq is the empty sentinel (-1), not 0, so
-        // the first compartment (sequence 0) is correctly detected as a change.
         expect(row.cached_m0_max_compartment_seq).toBe(-1);
         expect(row.cached_m0_max_mutation_id).toBe(0);
         expect(row.cached_m0_project_docs_hash).toBe("");
@@ -1626,12 +1601,8 @@ describe("m[0]/m[1] materialization", () => {
     });
 
     it("materializeM0 sizes session-history to the HISTORY budget, not budget minus project-docs", () => {
-        // Regression: the over-budget tightening loop measured the WHOLE m[0]
-        // (which includes <project-docs>/<user-profile>/<project-memory>) against
-        // the history-only budget. A large project-docs block therefore stole
-        // from the history budget and over-archived compartments (live dogfood:
-        // ~20K docs collapsed a 98K history budget to ~73K effective). The loop
-        // must now measure ONLY the <session-history> slice.
+        // The history budget applies only to the `<session-history>` slice.
+        // Large <project-docs> blocks must not reduce the history budget or archive additional compartments.
         const HISTORY_BUDGET = 40_000;
         const mkCompartments = () =>
             Array.from({ length: 120 }, (_, i) => ({
@@ -1651,7 +1622,6 @@ describe("m[0]/m[1] materialization", () => {
                 legacy: 0,
             }));
 
-        // Run 1: tiny project-docs.
         db = makeDb();
         const smallDir = makeProjectDir();
         writeFileSync(join(smallDir, "ARCHITECTURE.md"), "# Small\n");
@@ -1669,7 +1639,6 @@ describe("m[0]/m[1] materialization", () => {
         const smallTags = (smallHist.match(/<compartment\b/g) ?? []).length;
         db.close();
 
-        // Run 2: large project-docs (~15K chars) — must NOT shrink session-history.
         db = makeDb();
         const bigDir = makeProjectDir();
         writeFileSync(
@@ -1688,10 +1657,7 @@ describe("m[0]/m[1] materialization", () => {
         const bigHist = big.m0Text.match(/<session-history>[\s\S]*?<\/session-history>/)?.[0] ?? "";
         const bigTags = (bigHist.match(/<compartment\b/g) ?? []).length;
 
-        // The big-docs m[0] is larger overall (it carries the big docs block)...
         expect(big.m0Text.length).toBeGreaterThan(small.m0Text.length);
-        // ...but session-history renders the SAME number of compartments — docs
-        // size does not steal from the history budget anymore.
         expect(bigTags).toBe(smallTags);
         expect(bigHist.length).toBe(smallHist.length);
     });
@@ -1763,7 +1729,6 @@ describe("m[0]/m[1] materialization", () => {
         expect(typeof state.cachedM0ClaimFormatEpoch).toBe("number");
         expect(state.cachedM0ClaimSnapshotVector).not.toBeNull();
         expect(state.cachedM0RenderedRevisionLocators).toBe("[]");
-        // Empty session: maxCompartmentSeq is the empty sentinel (-1), not 0.
         expect(state.cachedM0MaxCompartmentSeq).toBe(-1);
         expect(state.cachedM0MaxMutationId).toBe(0);
         expect(state.cachedM0ProjectDocsHash).toBe("");
@@ -1786,15 +1751,9 @@ describe("m[0]/m[1] materialization", () => {
     });
 
     it("injectM0M1 does NOT render <project-memory> when projectPath is undefined (memory.enabled=false config bypass guard)", () => {
-        // Regression: when memory.enabled=false the caller passes projectPath
-        // undefined (projectIdentity is deliberately undefined). materializeM0
-        // renders <project-memory> purely on projectPath presence, so the old
-        // `projectIdentity ?? deps.projectPath` fallback re-supplied the launch
-        // path and injected project memories despite the config being OFF. With
-        // the fallback removed, projectPath stays undefined and no memory renders.
+        // Pass `undefined` for `projectPath` so `materializeM0` omits `<project-memory>` when memory is disabled.
         db = makeDb();
         const projectDirectory = makeProjectDir();
-        // Seed memories that WOULD render if the path leaked through.
         insertMemory(db, {
             projectPath: PROJECT_PATH,
             category: "ARCHITECTURE",
@@ -1819,14 +1778,10 @@ describe("m[0]/m[1] materialization", () => {
     });
 
     it("injectM0M1 still injects history when materialization contention exhausts with NO cached baseline (no throw, no empty history)", () => {
-        // Regression for the round-4 BLOCKER: a cache-bust pass clears
-        // cachedM0Bytes, then materialization loses the lock on every retry
-        // (a sibling process keeps mutating). The old code threw → the model got
-        // ZERO session history. The fix renders a fresh non-persisted m[0].
+        // On exhausted contention without cached M0, render a non-persisted m[0].
         db = makeDb();
         const projectDirectory = makeProjectDir();
         const state = readStateFromMeta();
-        // Empty cache (simulates a history-refresh clear earlier this pass).
         state.cachedM0Bytes = null;
         const messages = [userMessage("m1", "hello")];
 
@@ -1837,8 +1792,7 @@ describe("m[0]/m[1] materialization", () => {
             state,
             projectPath: PROJECT_PATH,
             projectDirectory,
-            // Force perpetual contention: every materialize attempt sees a fresh
-            // mutation between snapshot and swap, so all retries fail.
+            // The queued mutation runs between every snapshot and swap, exhausting all retries.
             beforePhase3ForTest: () => {
                 queueM0Mutation(db, {
                     sessionId: SESSION_ID,
@@ -1847,28 +1801,16 @@ describe("m[0]/m[1] materialization", () => {
             },
         });
 
-        // Must NOT throw, must still inject, and m[0] must carry the history
-        // wrapper (not be empty / missing).
         expect(result.injected).toBe(true);
         const m0 = renderedText(messages[0]);
         expect(m0).toContain("<session-history>");
-        // Fresh fallback is non-persisted: the durable cache stays null so the
-        // next (uncontended) pass re-materializes and persists.
         expect(state.cachedM0Bytes).toBeInstanceOf(Buffer);
     });
 
     it("injectM0M1 does not throw on contention when m[0] is cached but m[1] is missing (partial-cache state)", () => {
-        // Regression: the contention-reuse guard checked only cachedM0Bytes. A
-        // prior fresh-fallback pass sets in-memory cachedM0Bytes WITHOUT
-        // persisting cachedM1Bytes — so a subsequent contention pass entered the
-        // reuse branch, then replayCachedM1 threw RenderM1InvalidMarkersError
-        // (m[1] null) and propagated out, dropping injection entirely. The fix
-        // requires BOTH buffers to reuse; the partial state falls through to the
-        // fresh-render branch, which produces a complete m[0]/m[1] pair.
         db = makeDb();
         const projectDirectory = makeProjectDir();
         const state = readStateFromMeta();
-        // Partial cache: m[0] present in memory, m[1] absent.
         state.cachedM0Bytes = Buffer.from("<session-history>stale</session-history>", "utf8");
         state.cachedM1Bytes = null;
         const messages = [userMessage("m1", "hello")];
@@ -1888,17 +1830,12 @@ describe("m[0]/m[1] materialization", () => {
             },
         });
 
-        // Must NOT throw, and must still inject a complete history block.
         expect(result.injected).toBe(true);
         expect(renderedText(messages[0])).toContain("<session-history>");
     });
 
     it("fresh-render contention fallback freezes materializedAt (stable across passes, not live Date.now())", () => {
-        // Regression for the round-5 CRITICAL: the fresh-render fallback fed the
-        // m[1] memory-expiry cutoff from live Date.now(), so two consecutive
-        // contention-fallback defer passes straddling a memory's expires_at would
-        // render different m[1] bytes with ZERO DB mutation — a silent cache bust.
-        // The fix freezes materializedAt to the persisted value (or 0 when none).
+        // Use the persisted materializedAt value, or 0 when none exists, as the m[1] expiry cutoff.
         db = makeDb();
         const projectDirectory = makeProjectDir();
         const state = readStateFromMeta();
@@ -1920,8 +1857,6 @@ describe("m[0]/m[1] materialization", () => {
             projectDirectory,
             beforePhase3ForTest: forceContention,
         });
-        // The frozen cutoff must NOT be a live wall-clock timestamp — it is 0
-        // (no prior persisted materialization), which is deterministic and stable.
         expect(state.snapshotMarkers?.materializedAt).toBe(0);
     });
 
@@ -2114,10 +2049,8 @@ describe("m[0]/m[1] materialization", () => {
     });
 
     it("does NOT drift-refold on a defer pass when m[1] is the empty placeholder (tiny-baseline guard)", () => {
-        // Regression: the +15% drift refold must key off GENUINE accumulated
-        // delta, not the placeholder. With a tiny m[0], the ~80-byte empty
-        // placeholder can exceed m0*0.15 and wrongly trigger a refold every
-        // defer pass — busting the byte-identical-defer cache invariant.
+        // The refold threshold excludes the empty m[1] placeholder; otherwise it can exceed 15% of a tiny m[0].
+        // Including the placeholder would rematerialize m[0] on every defer pass and violate byte-identical defer caching.
         db = makeDb();
         const projectDirectory = makeProjectDir();
         const state = readStateFromMeta();
@@ -2132,7 +2065,7 @@ describe("m[0]/m[1] materialization", () => {
         });
         const firstM0 = renderedText(first[0]);
 
-        // Defer pass: no new memories/compartments → m[1] is the placeholder.
+        // A defer pass with no new memories or compartments uses the empty m[1] placeholder.
         const second = [userMessage("m2", "hi again")];
         const result = injectM0M1({
             db,
@@ -2143,7 +2076,6 @@ describe("m[0]/m[1] materialization", () => {
             projectDirectory,
         });
 
-        // Must NOT refold: placeholder m[1] is the empty state, not delta.
         expect(result.m0RematerializedThisPass).toBe(false);
         expect(renderedText(second[0])).toBe(firstM0);
         expect(result.m1Text).toContain("no new content since last materialization");

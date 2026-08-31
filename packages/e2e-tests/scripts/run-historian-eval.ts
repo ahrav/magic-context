@@ -1,17 +1,11 @@
 #!/usr/bin/env bun
 
 /**
- * Historian structural eval lane — one report artifact per run (U7/R14).
+ * Historian structural eval lane writes one report artifact per run.
  *
- * Deterministic parts run per-PR with no credentials:
- *   run-historian-eval.ts --lint       [--scenarios <dir> | --release <dir>]
- *   run-historian-eval.ts --mutations  [--scenarios <dir> | --release <dir>]
  *
- * Live scenario runs are scheduled or operator-dispatched only (R14):
- *   run-historian-eval.ts --live --release historian-eval/releases/v1 \
  *       --report artifacts/historian-eval-report.json
- * Live routing reads HISTORIAN_EVAL_MODEL ("provider/model"),
- * HISTORIAN_EVAL_PROBE_MODEL ("provider/model"), and ANTHROPIC_API_KEY.
+ * Live routing reads HISTORIAN_EVAL_MODEL and HISTORIAN_EVAL_PROBE_MODEL as provider/model routes and reads ANTHROPIC_API_KEY.
  */
 
 import { execSync } from "node:child_process";
@@ -60,15 +54,10 @@ interface CliArgs {
     releaseDir: string | null;
     reportPath: string;
     /**
-     * Wall-clock budget for the whole live loop, in minutes, or null for none.
+     * deadlineMinutes sets the live loop's wall-clock budget in minutes; null disables the deadline.
      *
-     * A scheduled run needs this because the per-run historian waits are bounded
-     * individually, not in aggregate: the release size budget allows 30 scenarios
-     * and two runs each, so the worst-case waits exceed any job timeout GitHub
-     * permits. Without a budget the runner is killed mid-scenario and publishes no
-     * report at all, having already spent the tokens. With one it stops between
-     * scenarios and publishes what it has. An operator running directly has no such
-     * external killer, so the default is no deadline.
+     * The aggregate deadline lets scheduled runs stop between scenarios and publish partial reports; direct runs default to no deadline.
+     * A release contains at most 30 scenarios and runs each twice, so per-run wait bounds do not bound the job's total duration.
      */
     deadlineMinutes: number | null;
 }
@@ -80,16 +69,7 @@ function parseArgs(args: string[]): CliArgs {
     let reportPath = join(E2E_ROOT, "artifacts", "historian-eval-report.json");
     let deadlineMinutes: number | null = null;
     /**
-     * Value for an option that requires one, or a diagnostic naming the option.
      *
-     * A bare `args[++index]` yields `undefined` for a trailing flag, and
-     * `undefined !== null` skips the default fallback below — so `--lint
-     * --scenarios` reached `resolve(undefined)` and died on `The "paths[0]"
-     * property must be of type string`, which names neither the flag nor the
-     * mistake. Omitting a value mid-command is worse: `--scenarios --report x`
-     * consumed `--report` as the directory and then blamed `x` as an unknown
-     * argument. Rejecting a leading `-` catches that case at the flag that is
-     * actually missing its value.
      */
     const requireValue = (flag: string, value: string | undefined): string => {
         if (value === undefined || value.length === 0) throw new Error(`${flag} requires a value`);
@@ -146,24 +126,16 @@ function loadCorpus(args: CliArgs): { scenarios: HistorianEvalScenario[]; releas
 }
 
 /**
- * Corpus admission for the per-PR gate, built from the same rules freeze
- * promotion applies: per-scenario lint, the release tuple's corpus-level identity
- * rules, and hard-negative family coverage. Mirroring promotion is the point — a
- * corpus this gate accepts but promotion would reject could never be frozen, and
- * the reverse would let a release freeze in a state that keeps this gate
- * permanently red. The release size budget is promotion-only: the dev split is
- * deliberately smaller than a releasable corpus.
+ * The development gate applies promotion's scenario lint, release identity, and hard-negative coverage rules.
+ * Matching promotion prevents corpora that pass development gating but fail promotion.
+ * The dev split may be smaller than a releasable corpus because promotion alone enforces the release-size budget.
  *
- * `buildReleaseTuple` is CALLED rather than its rules restated, because one of
- * them cannot be reproduced by any check written here. Hand-rolled id uniqueness
- * misses a scenario copied under a new id and title: every per-scenario lint stays
- * clean, the ids differ, family coverage is unchanged — and `scenarioFingerprint`
- * covers id and title, so the copy has a new identity by construction and no
- * identity-based test can see it, while it double-weights one evaluation in every
- * aggregate the report publishes. The tuple's name-independent semantic
- * fingerprint is the check that catches it, and promotion already refuses such a
- * corpus. Calling the same function keeps the two exactly as strict as each other
- * instead of as strict as whoever last edited both.
+ * `buildReleaseTuple` enforces promotion's semantic-duplicate check.
+ * A copied scenario with a new id and title passes per-scenario lint, id uniqueness, and family coverage.
+ * `scenarioFingerprint` cannot detect renamed copies as duplicates.
+ * A semantic duplicate double-weights one evaluation in every published aggregate.
+ * `buildReleaseTuple` rejects corpora with name-independent semantic duplicates.
+ * Calling `buildReleaseTuple` keeps corpus admission aligned with promotion.
  */
 function corpusDiagnostics(scenarios: readonly HistorianEvalScenario[]): string[] {
     const diagnostics = scenarios.flatMap((scenario) => lintScenario(scenario));
@@ -212,14 +184,9 @@ function liveModeFromEnv(): LiveHistorianMode {
             "live mode needs ANTHROPIC_API_KEY, HISTORIAN_EVAL_MODEL, and HISTORIAN_EVAL_PROBE_MODEL (provider/model)",
         );
     }
-    // The historian route is validated for shape too: it is passed through to
-    // the plugin config as a whole string, so an empty model component there
-    // also fails only once the historian is invoked.
+    // `parseModelRoute` validates the historian route before the plugin receives it.
     //
-    // The NORMALIZED components are what travel onward. `parseModelRoute` trims
-    // each side, so forwarding the raw value lets `anthropic / claude-sonnet-4-5`
-    // satisfy this preflight and then fail inside the historian on a provider id
-    // containing a space — after the harness, transcript, and run work is spent.
+    // The runner forwards the normalized route so whitespace-padded provider IDs do not reach the plugin.
     // `modelID` keeps any interior `/`, so reassembly is faithful.
     const route = parseModelRoute("HISTORIAN_EVAL_MODEL", historianModel);
     return {
@@ -231,10 +198,9 @@ function liveModeFromEnv(): LiveHistorianMode {
 }
 
 /**
- * Recorded in the run report's system tuple: the installer serves whatever
- * OpenCode release is current, so identical weekly runs can sit on different
- * harness runtimes. Without this, their system identity would match and the
- * reports would look longitudinally comparable when they are not.
+ * The runner records the OpenCode release in the run report's system tuple because the installer serves the current release.
+ * Without the OpenCode release, runs that differ only by harness runtime have identical system identities.
+ * Reports from different harness runtimes are not longitudinally comparable.
  */
 function opencodeVersion(): string | null {
     try {
@@ -246,18 +212,8 @@ function opencodeVersion(): string | null {
 }
 
 /**
- * Deterministic admission for a live run: the same corpus gate and mutation
- * battery the per-PR lane applies, re-run here against the corpus this
- * invocation actually loaded.
+ * The runner applies the same corpus gate and mutation battery before each live run.
  *
- * Only the GitHub workflow chains `--lint` and `--mutations` ahead of `--live`,
- * so a direct `--live --scenarios <dir>` — the documented operator command —
- * would otherwise drive real provider traffic against a semantically invalid or
- * mutation-red corpus and publish stability verdicts off it. The gates are
- * deterministic and cost seconds; a live run costs minutes and tokens, so they
- * run ahead of the loop and refuse rather than warn. Applied to a frozen release
- * too: the release's own evidence proves the battery was green when it froze, not
- * that it is green under the scorer in this checkout.
  */
 function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number {
     const diagnostics = corpusDiagnostics(scenarios);
@@ -278,49 +234,34 @@ function liveAdmissionGate(scenarios: readonly HistorianEvalScenario[]): number 
 }
 
 /**
- * Rebuild the plugin bundle the harness will load, so the recorded commit
- * identifies the code that actually ran.
+ * The runner rebuilds the plugin bundle so OpenCode loads code matching the source tree used for the run.
  *
- * `opencode-runner/spawn.ts` prefers `packages/plugin/dist/index.js` over
- * `src/index.ts` whenever the bundle exists, and `dist/` is gitignored — so
- * `git status --porcelain` never sees it and the runner's dirty-worktree digest
- * excludes it entirely. A stale bundle therefore makes OpenCode load old plugin
- * code while the report names the current source commit, with no system-tuple
- * mismatch to reveal it. That silently invalidates exactly the longitudinal
- * comparison the tuple exists to protect, and a live run is far too expensive to
- * discover it afterwards. The scheduled workflow already builds before running;
- * this is the same command, so the documented direct command behaves the same
+ * `opencode-runner/spawn.ts` loads `packages/plugin/dist/index.js` whenever that bundle exists.
+ * `dist/` is gitignored, so `git status --porcelain` cannot report bundle changes.
+ * The runner's dirty-worktree digest excludes the gitignored `dist/` bundle.
+ * A stale bundle can make OpenCode load old plugin code while the report names the current source commit.
+ * The system tuple cannot reveal a mismatch between stale bundled code and the current source commit.
+ * A stale bundle invalidates longitudinal comparisons because the recorded tuple does not identify the loaded plugin code.
+ * The runner builds before live evaluation because a live run consumes provider time and tokens.
  * way.
  *
- * Rebuilding rather than staleness-checking: an mtime comparison is a weak oracle
- * across checkouts, and building makes the loaded bytes current by construction.
- * `spawn.ts` resolves its plugin entry per spawn rather than at module load, so
- * this build is visible to the run that follows it — including the case where no
- * bundle existed beforehand, which previously latched the entry to `src/` for the
- * whole process and made a direct run exercise a different plugin entrypoint than
- * a prebuilt scheduled run under the same recorded identity.
+ * The runner rebuilds instead of comparing mtimes because checkout metadata makes mtimes unreliable across checkouts.
+ * Building makes the loaded bytes current regardless of checkout metadata.
+ * `spawn.ts` resolves the plugin entry for each spawn, so subsequent spawns use the bundle built here.
  */
 function buildPluginBundle(): number {
     const repoRoot = resolve(E2E_ROOT, "..", "..");
     console.log("building the plugin bundle the harness loads...");
-    // The live credential is already in this process's environment by the time
-    // this runs, and the workflow deliberately builds the plugin in a
-    // credential-free step. Inheriting the ambient environment would hand the
-    // production key to `tsc`, Bun's bundler, and the TUI build script — a build
-    // toolchain with no need for it — before any provider call. Stripped rather
-    // than passing a minimal allowlist, because the build legitimately needs PATH,
-    // HOME, and the Bun install cache, and enumerating those is how a build breaks
-    // on the next toolchain change.
+    // Without removal, the build inherits the live credential from `process.env`.
+    // The build does not require `ANTHROPIC_API_KEY`.
+    // The build requires inherited variables such as `PATH`, `HOME`, and Bun cache configuration.
     const { ANTHROPIC_API_KEY: _live, ...credentialFreeEnv } = process.env;
-    // The RUNNING Bun, not whatever `bun` resolves to on PATH. `runSystemTuple`
-    // records `Bun.version` of this process, so shelling out to a different
-    // executable — an absolute version-manager path invoking the lane is enough —
-    // produced a bundle built by Bun B under a tuple claiming Bun A, which is the
-    // drift the field was added to make visible.
-    // PATH is prefixed as well as the argv0 being explicit, because the package's
-    // `build` script itself shells out to `bun` several times — for the TUI build and
-    // the bundle — and those nested calls resolve from PATH. Setting only argv0 left
-    // them on a different executable, which is the same drift one level down.
+    // `buildPluginBundle` invokes the Bun executable running this process, not `bun` from `PATH`.
+    // `runSystemTuple` records this process's `Bun.version`; the build must use the same executable.
+    // Using `process.execPath` keeps the build's Bun version equal to the version recorded in the system tuple.
+    // The build prefixes `PATH` so nested `bun` invocations use `process.execPath`.
+    // The `build` script invokes `bun` for the TUI build and bundle.
+    // Nested `bun` invocations resolve from `PATH`.
     const build = Bun.spawnSync([process.execPath, "run", "--cwd", "packages/plugin", "build"], {
         cwd: repoRoot,
         stdout: "inherit",
@@ -342,39 +283,23 @@ function buildPluginBundle(): number {
 }
 
 /**
- * Partial report beside the real one, rewritten after every scenario.
  *
- * This — not the deadline below — is what guarantees the run leaves evidence. A
- * per-scenario worst case cannot be predicted usefully: the contract admits 100
- * probes, each of which can take two `sendPrompt` attempts at the harness's
- * 180-second default, so one scenario's true bound is around ten hours, above any
- * job timeout GitHub allows. Gating on that would refuse to start a scenario the
- * lane is supposed to run; gating on anything smaller is an estimate a scenario
- * can exceed. Either way the job can be killed mid-scenario, and the report is
- * only written at the end.
+ * Rewriting the partial report after each scenario preserves finished scenarios when the job is killed.
+ * A scenario permits 100 probes, each with two 180-second `sendPrompt` attempts.
+ * The 200 `sendPrompt` attempts can consume up to 10 hours of timeout time.
+ * The job can be killed mid-scenario, and the final report is written only at the end.
  *
- * So the report becomes incremental instead. A separate `.partial.json` path
- * rather than the real one, because a truncated report at the documented path
- * would read as a complete result for a smaller corpus: the aggregate rates are
- * micro-averaged over whatever it contains. The workflow archives the whole
- * artifacts directory with `if: always()`, so a killed job now uploads the
- * scenarios that finished, labelled as partial, and a completed run
+ * The runner uses a separate partial-report path so incomplete data cannot appear as the final report.
  * removes it.
  */
 /**
- * Directory holding every artifact this lane derives, beside the report.
+ * The artifacts directory stores files derived by this lane next to the report.
  *
- * A PRIVATE namespace, and reports are refused inside it — that pairing is what
- * makes the derived paths unreachable. Decorating the operator's report path
- * instead put each artifact at a name the CLI also accepts as a report, and every
- * such name became a collision to patch: `foo-runs` versus a report named
- * `foo-runs`, `foo.partial.json`, `foo.partial.json.tmp`, then a report nested
- * under `foo-runs/`. One containment refusal covers all of them and every name
- * added later, which is why the per-name guards are gone.
+ * Refusing report paths under the private namespace keeps derived paths unreachable.
+ * One containment check prevents collisions for every derived artifact name.
  *
- * Per-report subdirectory keyed by the report's complete filename: distinct reports
- * in one directory have distinct filenames, so their artifacts cannot collide, and
- * a run only ever clears its own subdirectory.
+ * The runner keys each report's artifact subdirectory by its complete filename so artifacts for distinct reports cannot collide.
+ * Each run clears only its own subdirectory.
  */
 const LANE_ARTIFACTS_DIR = "historian-eval-artifacts";
 
@@ -386,7 +311,7 @@ function laneArtifactsDir(reportPath: string): string {
     return join(laneArtifactsRoot(reportPath), basename(resolve(reportPath)));
 }
 
-/** Run records and DB snapshots, one subdirectory per scenario. */
+/* */
 function liveRunArtifactsDir(reportPath: string): string {
     return join(laneArtifactsDir(reportPath), "runs");
 }
@@ -396,25 +321,14 @@ function partialReportPath(reportPath: string): string {
 }
 
 /**
- * Whether the report itself was aimed inside the lane's private namespace.
  *
- * The one refusal the namespace needs: with reports kept out, no accepted report
- * path can equal or contain any artifact path, so staging files, records trees, and
- * partial reports are all unreachable without a per-name check.
+ * `reportInsideLaneNamespaceError` rejects reports inside `LANE_ARTIFACTS_DIR` to prevent collisions with lane artifacts.
+ * A report path outside `LANE_ARTIFACTS_DIR` cannot contain a lane artifact path.
  */
 function reportInsideLaneNamespaceError(reportPath: string): string | null {
-    // Tested against every ancestor SEGMENT, not against this report's own derived
-    // root. `laneArtifactsRoot` is relative to the report's directory, so a report
-    // already sitting inside a namespace has its root computed one level deeper and
-    // a containment test against that root passes — which is how
-    // `<dir>/historian-eval-artifacts/r.json` slipped through and nested a second
-    // namespace inside the first.
+    // `reportInsideLaneNamespaceError` checks every path segment because `laneArtifactsRoot` for an in-namespace report is computed below the enclosing namespace.
     const report = canonicalPath(reportPath);
-    // The whole path, final segment included. Checking only ancestors let
-    // `--report <dir>/historian-eval-artifacts` through, and then
-    // `laneArtifactsRoot` equalled the report itself: cleanup removed the report,
-    // `mkdirSync` recreated that path as a directory, and the shape check rejected
-    // the run — a report path that can never produce a report but can destroy the
+    // `reportInsideLaneNamespaceError` includes the final path segment because cleanup would delete a report path equal to the artifact directory.
     // previous one.
     if (report.split(sep).includes(LANE_ARTIFACTS_DIR)) {
         return `a report may not live inside a ${LANE_ARTIFACTS_DIR} directory (${report}): that is where this lane derives its own artifacts`;
@@ -435,12 +349,10 @@ function writePartialReport(
             system,
             ...(releaseVersion === null ? {} : { releaseVersion }),
         });
-        // Temp sibling then rename, because `writeFileSync` TRUNCATES before it
-        // writes: a failure partway — a full filesystem is the obvious one — would
-        // otherwise replace the accumulated evidence with truncated JSON, which is
-        // strictly worse than not writing at all and would falsify the guarantee
-        // below. `renameSync` within one directory is atomic, so the partial is
-        // either the previous complete report or the new one.
+        // `writePartialReport` writes to a sibling temporary file and renames it so a failed write cannot truncate the existing partial report.
+        // A failed direct write, such as one caused by a full filesystem, could truncate the existing partial report.
+        // Same-directory `renameSync` atomically replaces the partial report.
+        // Same-directory `renameSync` leaves either the previous complete report or the new report.
         const destination = partialReportPath(reportPath);
         const staging = join(dirname(destination), "partial-report.json.tmp");
         try {
@@ -452,34 +364,19 @@ function writePartialReport(
         }
         return true;
     } catch (error) {
-        // Never let progress bookkeeping fail a run that already has evidence on
-        // disk — a failed write now leaves the previous partial intact, which is
-        // stale but real, because the write above is atomic. The caller decides;
-        // only the SEED write is fatal, because until the first scenario finishes it
-        // is the only report there is.
         console.error(`partial report not written: ${error instanceof Error ? error.message : String(error)}`);
         return false;
     }
 }
 
 /**
- * Whether the operator-named report path already exists in a shape this run cannot
+ * `reportPathShapeError` rejects symlink and non-file report paths because this run writes and clears the report.
  * write.
  *
- * Only the report needs this now. Every other artifact lives inside the lane's
- * private subdirectory, which `clearPreviousLiveArtifacts` removes and recreates
- * wholesale, so it cannot be occupied by something of the wrong shape. Reported as
- * an admission failure so the run refuses before provider traffic instead of
- * surfacing a bare EISDIR from the final write.
  */
 function reportPathShapeError(reportPath: string): string | null {
     const report = resolve(reportPath);
-    // Symlinks first, because a DANGLING one makes `existsSync` false and skips the
-    // shape test below — and `canonicalPath` resolves it to its own location rather
-    // than its target, so the corpus-overlap check compares the wrong path while the
-    // final write follows the link. A live symlink is refused for the same reason:
-    // this path is also removed, and following a link to decide what to delete is
-    // how the namespace-root case below went wrong.
+    // `reportPathShapeError` checks symlinks before `existsSync` because `existsSync` returns false for dangling symlinks.
     if (isSymlink(report)) {
         return `${report} is a symlink; a report path must be a regular file, since this run both writes and clears it`;
     }
@@ -490,16 +387,8 @@ function reportPathShapeError(reportPath: string): string | null {
 }
 
 /**
- * Whether the lane's namespace ROOT is something other than a real directory.
  *
- * The per-report path being safe is not enough: with
- * `<report-dir>/historian-eval-artifacts` linked elsewhere, `laneArtifactsDir`
- * traverses the link and the recursive clear deletes the matching subtree in the
- * target — a link to `/data` makes a run for `report.json` remove `/data/report.json`.
  *
- * Refused rather than replaced, unlike the per-report path. The root is shared by
- * every report in the directory, so removing it would discard sibling reports'
- * evidence, and an operator who linked it did so deliberately.
  */
 function laneNamespaceRootShapeError(reportPath: string): string | null {
     const root = laneArtifactsRoot(reportPath);
@@ -514,20 +403,12 @@ function laneNamespaceRootShapeError(reportPath: string): string | null {
 
 async function runLive(args: CliArgs): Promise<number> {
     const { scenarios, releaseVersion } = loadCorpus(args);
-    // Routing first: it is instantaneous, and an operator who forgot a variable
-    // should not wait out the build and battery to be told so. All three still
-    // precede the first request, which is what "before any token is spent"
     // requires.
     const mode = liveModeFromEnv();
     const built = buildPluginBundle();
     if (built !== 0) return built;
     const admission = liveAdmissionGate(scenarios);
     if (admission !== 0) return admission;
-    // An unresolved version is refused rather than recorded as "unknown". The
-    // installer serves whatever release is current, so this field is the only thing
-    // distinguishing two runs on different OpenCode releases — and a wrapper that
-    // answers `serve` but not `--version` would let a costly evaluation publish a
-    // tuple that silently matches a different release's.
     const opencode = opencodeVersion();
     if (opencode === null) {
         console.error(
@@ -535,16 +416,7 @@ async function runLive(args: CliArgs): Promise<number> {
         );
         return 1;
     }
-    // Built BEFORE the first request, from the same function the runner records, so
-    // an interrupted first scenario still publishes a report that names the commit,
-    // OpenCode version, and model routes that spent the tokens. Supplying it to
-    // `buildLaneReport` also cross-checks it: `resolveReportSystem` rejects a
-    // supplied tuple that disagrees with the scored records'.
     const system = runSystemTuple({ mode, opencodeVersion: opencode });
-    // Same reasoning as the OpenCode version: an exported tree with no `.git` leaves
-    // `resolveRepoCommitSha` at "unknown", and two different code versions then
-    // publish identical tuples after spending tokens. The sha is the primary axis of
-    // this identity, so it is the last thing that should degrade to a placeholder.
     if (system.repoCommitSha === "unknown") {
         console.error(
             "live admission: the checkout commit could not be resolved, so the report could not identify the code it ran",
@@ -552,51 +424,29 @@ async function runLive(args: CliArgs): Promise<number> {
         return 1;
     }
     const reportDir = dirname(resolve(args.reportPath));
-    // Before anything writes into it, including the first partial. Today the
-    // directory happens to exist by the time that write lands, because
-    // `runScenario` creates `<reportDir>/<report-stem>-runs/<id>`
-    // recursively — but that is an accident of where the run artifacts live and of
-    // the runner's internal ordering, and the partial write swallows its errors,
-    // so relying on it would make the guarantee silently depend on both.
-    // Removal of the PREVIOUS run's artifacts happens earlier still, in
-    // `clearPreviousLiveArtifacts`, ahead of everything that can reject.
+    // Relying on `runScenario` would depend on its internal ordering and suppressed partial-write errors.
     mkdirSync(reportDir, { recursive: true });
     mkdirSync(laneArtifactsDir(args.reportPath), { recursive: true });
     const artifactsRoot = liveRunArtifactsDir(args.reportPath);
-    // Refused here rather than discovered inside the first scenario. All three paths
-    // are derived from a user-supplied report name, so each can already exist in the
-    // wrong shape — a previous audit written to `--report <this>-runs`, or a
-    // directory where a report file belongs. `clearPreviousLiveArtifacts` will not
-    // remove any of them, so left unchecked the collision surfaces as a raw ENOTDIR
-    // or EISDIR from deep inside the first scenario, after its tokens are spent.
-    // One entry per scenario from the start, replaced in place as each finishes.
-    // Seeding the whole corpus is what makes every partial describe the whole
-    // corpus, and what leaves evidence when the process dies inside the FIRST
-    // scenario — the case "write after each scenario" cannot cover, because
-    // nothing has completed while the tokens are already spent.
+    // `laneArtifactsDir(args.reportPath)` can already exist because the user supplies `args.reportPath`.
+    // Reject collisions before scenarios spend tokens.
+    // Seeding `scores` makes each partial report include every scenario.
+    // Seeding `scores` gives the initial partial report an incomplete entry for every scenario.
+    // Write the initial partial report before the first request so an interrupted first scenario leaves an incomplete report.
     const scores: ScenarioScore[] = scenarios.map((scenario) => scenarioNotCompletedScore(scenario.id, system));
-    // Measured after the build and battery, so the budget covers the part that
-    // spends tokens rather than the deterministic preamble.
+    // Set `deadlineAt` after the build and battery so it covers token-spending work.
     const deadlineAt = args.deadlineMinutes === null ? null : Date.now() + args.deadlineMinutes * 60_000;
-    // Reserve for the next scenario, learned from the ones already run rather than
-    // predicted. A scenario's true bound is unusable (see `partialReportPath`), and
-    // an invented one is either too pessimistic to run the corpus or too optimistic
-    // to hold. The longest completed scenario is the honest estimate of the next
-    // one, the first scenario always runs, and a scenario that overruns the
-    // estimate costs the partial report rather than the whole artifact.
+    // The longest completed scenario estimates the next scenario's duration.
+    // `index > 0` skips the deadline estimate for the first scenario because no completed scenario provides one.
     let longestScenarioMs = 0;
-    // Admission, not bookkeeping: this seed is the only report until the first
-    // scenario completes, so a directory that cannot take it means an interruption
-    // would leave nothing to archive — after the tokens were spent. Checked here,
-    // still before the first request.
+    // Write the initial partial report before the first request so an interrupted first scenario leaves an incomplete report.
     if (!writePartialReport(args.reportPath, scores, releaseVersion, system)) {
         console.error("live admission: the initial partial report could not be written; refusing to spend tokens");
         return 1;
     }
     for (const [index, scenario] of scenarios.entries()) {
-        // Checked BEFORE starting, never mid-scenario: a scenario abandoned
-        // half-way has spent its tokens and produced no record, so the only useful
-        // decision point is whether to begin.
+        // Check the deadline before each scenario; never stop a scenario mid-run.
+        // Starting a scenario whose estimated duration exceeds the remaining budget can exceed the lane deadline.
         if (deadlineAt !== null && index > 0 && Date.now() + longestScenarioMs > deadlineAt) {
             const unreached = scenarios.slice(index);
             console.error(
@@ -611,11 +461,6 @@ async function runLive(args: CliArgs): Promise<number> {
         const artifactDir = join(artifactsRoot, scenario.id);
         console.log(`running ${scenario.id}...`);
         const startedAt = Date.now();
-        // `repoCommitSha` is deliberately not supplied: the runner's own
-        // resolver folds an uncommitted tracked diff and the untracked set into
-        // the recorded sha, and overriding it with a plain `git rev-parse HEAD`
-        // gave two different experimental trees the same system tuple — exactly
-        // the collision that identity exists to prevent.
         const record = await runScenario(scenario, {
             mode,
             artifactDir,
@@ -633,11 +478,10 @@ async function runLive(args: CliArgs): Promise<number> {
         system,
         ...(releaseVersion === null ? {} : { releaseVersion }),
     });
-    // Same temp-then-rename as the partial, and for a sharper reason: a failure
-    // partway through this write leaves invalid JSON at the path operators are
-    // documented to read as the completed result, which would hide the valid partial
-    // beside it. The partial is removed only after the rename succeeds, so at every
-    // instant at least one complete report exists.
+    // Write the completed report to staging, then rename it so a failed write cannot corrupt the completed-report path.
+    // Write the completed report to staging so a failed write cannot corrupt the completed-report path.
+    // Remove the partial report only after the completed report is renamed.
+    // The rename succeeds before the partial report is removed, so one complete report remains available.
     const reportDestination = resolve(args.reportPath);
     const reportStaging = join(laneArtifactsDir(args.reportPath), "report.json.tmp");
     try {
@@ -655,26 +499,14 @@ async function runLive(args: CliArgs): Promise<number> {
 }
 
 /**
- * Every artifact a previous live run may have left behind, removed together and
- * before anything that can fail.
+ * Remove prior reports and run records before fallible work so a failed run cannot leave stale artifacts.
  *
- * The completed report was already cleared here so an always-run archive step
- * could not collect a stale success after a failure. The partial report and the
- * run-record tree need the same treatment and the same timing: corpus loading,
- * route validation, the plugin build, and the admission gate can all reject, and
- * clearing downstream of them left a previous run's partial and records sitting in
- * a directory whose completed report had just been deleted — evidence that reads
- * as this invocation's.
+ * Remove the completed report before fallible work so archival cannot collect a stale result.
  */
 /**
- * Canonical filesystem location of a path that may not exist yet.
+ * canonicalPath returns a canonical filesystem location for a path that may not exist.
  *
- * `resolve` is purely lexical, so it leaves symlink components intact and a
- * containment test over its output can be defeated by one: with `/tmp/out` linked
- * to `/tmp/dev`, `--report /tmp/out/hse-a.json` is lexically outside
- * `--scenarios /tmp/dev` while writing straight into it. Output paths do not exist
- * when the check runs, and `realpathSync` throws on a missing path, so the nearest
- * EXISTING ancestor is canonicalized and the remaining segments are rejoined.
+ * `resolve` leaves symlink components intact, so containment checks must canonicalize an existing ancestor.
  */
 function canonicalPath(path: string): string {
     const absolute = resolve(path);
@@ -683,8 +515,6 @@ function canonicalPath(path: string): string {
     for (;;) {
         if (existsSync(probe)) return join(realpathSync.native(probe), ...trailing.reverse());
         const parent = dirname(probe);
-        // Filesystem root: nothing above it exists either, so the lexical form is
-        // the best available answer.
         if (parent === probe) return absolute;
         trailing.push(basename(probe));
         probe = parent;
@@ -692,18 +522,15 @@ function canonicalPath(path: string): string {
 }
 
 /**
- * Whether any path this run will WRITE overlaps the corpus it will READ.
  *
- * Checked before a single removal, because the cleanup runs before `loadCorpus`:
- * `--scenarios dev --report dev/hse-foo.json` deletes a scenario and then evaluates
- * the silently reduced corpus, publishing a report over a corpus nobody selected and
- * finally overwriting the input with it. The records directory is worse — a report of
- * `/tmp/a` derives `/tmp/a-runs`, so `--scenarios /tmp/a-runs` has its entire corpus
+ * Check output-path overlap before cleanup to avoid deleting the selected corpus.
+ * Reject artifact paths that overlap the selected corpus before cleanup can delete corpus input.
+ * Cleanup can remove corpus input when an artifact path is inside the corpus.
+ * A report path of `/tmp/a` derives `/tmp/a-runs`; selecting `/tmp/a-runs` as the corpus lets cleanup remove it recursively.
  * recursively removed.
  *
- * Containment is tested BOTH ways: an artifact inside the corpus deletes part of it,
- * and an artifact that contains the corpus deletes all of it. Comparison is on
- * resolved paths with a separator boundary, so `/tmp/a-runs` is not treated as living
+ * The overlap check tests containment in both directions: an artifact inside the corpus deletes part of it, and an artifact containing the corpus deletes all of it.
+ * The overlap check resolves paths and requires a separator boundary, so `/tmp/a-runs` is outside `/tmp/a`.
  * inside `/tmp/a`.
  */
 
@@ -716,9 +543,7 @@ function artifactCorpusOverlapError(args: CliArgs): string | null {
     const within = (inner: string, outer: string): boolean => inner === outer || inner.startsWith(`${outer}${sep}`);
     for (const [label, owned] of [
         ["report", canonicalPath(args.reportPath)],
-        // The per-report artifact directory, because that is what cleanup removes
-        // RECURSIVELY. Listing only its `partial-report.json` and `runs` children
-        // missed a corpus selected from anywhere else inside it.
+        // `artifactCorpusOverlapError` checks `laneArtifactsDir(reportPath)` because cleanup removes that directory recursively.
         ["artifact directory", canonicalPath(laneArtifactsDir(args.reportPath))],
     ] as const) {
         if (within(owned, root) || within(root, owned)) {
@@ -728,7 +553,7 @@ function artifactCorpusOverlapError(args: CliArgs): string | null {
     return null;
 }
 
-/** True for a symlink, including one whose target is missing (`existsSync` is false). */
+/** `isSymlink` returns true for symlinks, including dangling symlinks (`existsSync` returns false). */
 function isSymlink(path: string): boolean {
     try {
         return lstatSync(path).isSymbolicLink();
@@ -737,24 +562,18 @@ function isSymlink(path: string): boolean {
     }
 }
 
-/** Removes a path only when it is a regular file; see `clearPreviousLiveArtifacts`. */
+/* */
 function removeIfFile(path: string): void {
     if (existsSync(path) && lstatSync(path).isFile()) rmSync(path, { force: true });
 }
 
 function clearPreviousLiveArtifacts(reportPath: string): void {
-    // The report is operator-named, so it is only removed when it is a real file —
-    // `rmSync` without `recursive` throws on a directory, and that shape is reported
-    // as an admission failure rather than as a bare filesystem error.
+    // `rmSync` without `recursive` throws when the report path is a directory.
     removeIfFile(resolve(reportPath));
-    // Everything else lives in this report's own subdirectory of the lane namespace,
-    // which no accepted report path can occupy, so one recursive remove is safe
-    // where decorated sibling names needed a guard each.
-    // `lstatSync` does not follow the link, so a SYMLINK here is not a directory and
-    // was skipped — after which `mkdirSync` and every artifact write followed it,
-    // landing outside the private namespace. Both branches end with the path absent;
-    // removing a symlink does not touch its target, and anything at this path is the
-    // lane's to clear because reports are refused from the namespace.
+    // `lstatSync` identifies a symlink without following its target.
+    // Removing a lane symlink prevents artifact writes from following it outside the lane namespace.
+    // Removing either a directory or a symlink leaves `owned` absent.
+    // Removing a symlink unlinks the symlink without removing its target.
     const owned = laneArtifactsDir(reportPath);
     if (existsSync(owned) || isSymlink(owned)) {
         rmSync(owned, { recursive: true, force: true });
@@ -764,10 +583,7 @@ function clearPreviousLiveArtifacts(reportPath: string): void {
 async function main(): Promise<number> {
     const args = parseArgs(Bun.argv.slice(2));
     if (args.mode === "live") {
-        // EVERY path refusal precedes cleanup, which is the whole point: the removals
-        // below are what these checks protect against, so a check running after them
-        // has already lost. Shape first, because a symlinked report or namespace root
-        // makes the containment tests compare the wrong location.
+        // A refusal after cleanup cannot prevent cleanup from removing corpus input.
         for (const problem of [
             reportPathShapeError(args.reportPath),
             laneNamespaceRootShapeError(args.reportPath),

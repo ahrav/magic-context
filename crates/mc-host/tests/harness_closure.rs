@@ -1,7 +1,4 @@
-// `src/harness_closure.rs` reaches the shared mode converter through
-// `crate::file_mode`. This target's crate root is this file, not `lib.rs`, so
-// the library's module declaration is not in scope here and the module has to
-// be declared again for the include to resolve.
+// This crate root must declare `file_mode` because `harness_closure.rs` uses `crate::file_mode`.
 #[path = "../src/file_mode.rs"]
 mod file_mode;
 #[path = "../src/harness_closure.rs"]
@@ -167,9 +164,8 @@ fn resolved_descriptor_is_rewound_after_verification() {
         .resolve_node_descriptor("node_modules/pi/dist/helper.js")
         .expect("resolve node");
 
-    // A macOS child opening `/dev/fd/N` receives a dup of this descriptor with
-    // its offset, so the handed-out descriptor must start at the first byte.
-    // Check both the offset and the bytes a child would read.
+    // A macOS child opening `/dev/fd/N` receives a duplicate descriptor with the original offset, so the handed-out descriptor must start at offset 0.
+    // A macOS child opening `/dev/fd/N` receives a duplicate descriptor with the original offset, so the handed-out descriptor must start at offset 0.
     // SAFETY: `node` owns this descriptor for the duration of the borrow.
     let inherited = unsafe { std::os::fd::BorrowedFd::borrow_raw(node.inherited_fd()) };
     let offset = rustix::fs::seek(inherited, rustix::fs::SeekFrom::Current(0))
@@ -554,8 +550,6 @@ fn prune_reclaims_unprotected_digests_and_stale_temps_only() {
     let closure = store.materialize(&candidate).expect("materialize");
     let digest = closure.digest().to_owned();
 
-    // A staging directory orphaned by an interrupted copy, and an entry the
-    // store did not create (neither digest-named nor `.tmp-`-prefixed).
     std::fs::create_dir(store_root.join(".tmp-deadbeefdeadbeef")).expect("stale temp");
     std::fs::set_permissions(
         store_root.join(".tmp-deadbeefdeadbeef"),
@@ -595,7 +589,7 @@ fn prune_reclaims_unprotected_digests_and_stale_temps_only() {
 fn native_edges_and_native_addons_must_correspond_exactly() {
     let (_temp, _source, candidate) = setup();
 
-    // A non-native edge onto a native addon is rejected, matching the
+    // Validation rejects a non-`Native` dependency edge to a `NativeAddon`.
     // qualification-side biconditional.
     let mut static_edge = candidate.clone();
     static_edge.manifest.nodes[2].dependencies = vec![
@@ -609,8 +603,7 @@ fn native_edges_and_native_addons_must_correspond_exactly() {
         "native dependency kind must correspond exactly to a native addon target"
     );
 
-    // A native addon with no inbound native edge is rejected even when the
-    // graph is otherwise reachable.
+    // Validation rejects a `NativeAddon` with no inbound `Native` dependency even if graph traversal reaches it.
     let mut unclaimed = candidate.clone();
     unclaimed.manifest.nodes[2].dependencies = vec![
         dependency(
@@ -627,12 +620,12 @@ fn native_edges_and_native_addons_must_correspond_exactly() {
     );
 }
 
-/// Paths sort by code point, so a sibling whose next byte after the parent
-/// prefix is below `/` sits between a parent file and its nested child:
-/// `bin/node`, `bin/node.dat`, `bin/node/main.js`. Checking only the
-/// immediately preceding entry read `bin/node.dat` as the parent, missed the
-/// collision with the regular file `bin/node`, and left an unbuildable manifest
-/// to fail during materialization instead of validation.
+/// Lexicographic path order can place `bin/node.dat` between `bin/node` and `bin/node/main.js`.
+/// Lexicographic path order can place `bin/node.dat` between `bin/node` and `bin/node/main.js`.
+/// Validation must reject a regular file that prefixes another manifest path.
+/// Validation must compare every path with its ancestor paths, not only the immediately preceding sorted entry.
+/// Validation rejects a regular file that prefixes another manifest path.
+/// Validation rejects a regular file that prefixes another manifest path.
 #[test]
 fn a_parent_file_collision_is_caught_across_an_intervening_sibling() {
     let (_temp, _source, candidate) = setup();
@@ -680,11 +673,11 @@ fn a_parent_file_collision_is_caught_across_an_intervening_sibling() {
     );
 }
 
-/// The qualifier rejects two edges naming one target, whatever their kinds.
-/// `ClosureDependency` orders on `(path, kind)`, so `(p, Static)` then
-/// `(p, Native)` is strictly increasing as a tuple — the runtime admitted a
-/// manifest the qualifier refuses, which is the gap the native-edge rules above
-/// exist to close.
+/// Validation rejects multiple dependencies that name the same target, regardless of `DependencyKind`.
+/// Dependencies with the same path but different kinds require explicit duplicate-path validation.
+/// Dependencies with the same path but different kinds require explicit duplicate-path validation.
+/// Duplicate dependency validation rejects dependencies with equal paths even when their `DependencyKind` values differ.
+/// Duplicate dependency validation rejects dependencies with equal paths even when their `DependencyKind` values differ.
 #[test]
 fn duplicate_dependency_targets_are_rejected_across_kinds() {
     let (_temp, _source, candidate) = setup();

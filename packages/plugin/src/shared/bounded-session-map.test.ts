@@ -36,7 +36,7 @@ describe("BoundedSessionMap", () => {
         map.set("a", "alpha");
         map.set("b", "bravo");
         map.set("c", "charlie");
-        // Touch "a" — now "b" is the oldest.
+        // get("a") makes "b" the oldest entry.
         expect(map.get("a")).toBe("alpha");
         map.set("d", "delta");
         expect(map.has("b")).toBe(false);
@@ -51,7 +51,7 @@ describe("BoundedSessionMap", () => {
         map.set("b", 2);
         map.set("c", 3);
         expect(map.peek("a")).toBe(1);
-        // Adding a fourth entry should still evict "a" since peek didn't touch it.
+        // Adding a fourth entry evicts "a" because peek() does not refresh recency.
         map.set("d", 4);
         expect(map.has("a")).toBe(false);
     });

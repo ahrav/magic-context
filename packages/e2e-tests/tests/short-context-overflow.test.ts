@@ -1,39 +1,16 @@
 /// <reference types="bun-types" />
 
 /**
- * Short-context emergency-drop regression test.
  *
- * Scenario: 128K context, fast main agent, slow historian (3s delay), no user
- * pauses between turns — the autonomous-loop scenario that previously caused
- * silent overflow. Each turn adds ~8KB of assistant text plus tool-like content
- * so that heuristic cleanup and compartment drops have something to reclaim.
  *
- * ## What this verifies
  *
- * BEFORE the emergency bypass fix (transform-postprocess-phase.ts), drops
- * queued by `queueDropsForCompartmentalizedMessages` would sit in pending_ops
- * indefinitely because every transform pass saw `compartmentRunning=true`.
- * The outgoing request body grew without bound and requests failed past 100%.
  *
- * AFTER the fix, when usage crosses `forceMaterializationPercentage` (85%
- * default), pending drops and heuristic cleanup run EVEN WHEN historian is
- * active. This is safe because historian reads raw opencode.db messages and
- * writes to compartments/facts/memories tables, while drops mutate tags and
- * pending_ops — disjoint data.
  *
- * ## Expected behavior
  *
- *   - Drops materialize promptly once pressure crosses 85%
  *   - Peak request stays under 100% of context
- *   - Session survives 20+ back-to-back turns with slow historian
+ * Session survives at least 20 back-to-back turns with a 3 s historian delay.
  *
- * ## Known residual limit (not a regression)
  *
- * The plugin's protected tail (last `protected_tags` messages, default 20)
- * is never dropped because recent messages are essential context. In
- * pathological workflows where the protected tail alone exceeds context
- * (e.g., 20 messages × 60KB each > 128K), the plugin cannot prevent
- * overflow. Real workflows stay well under this limit.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -106,8 +83,6 @@ describe("short context accumulating overflow", () => {
                 if (isHistorian(body)) return null;
                 mainCalls++;
                 const approxInputTokens = Math.floor(JSON.stringify(body).length / 4);
-                // ~20KB per turn — enough growth to cross 85% within 25 turns
-                // so the emergency bypass path is actually exercised.
                 const reply = bigReplyText(mainCalls, 20_000);
                 return {
                     text: reply,
@@ -131,10 +106,6 @@ describe("short context accumulating overflow", () => {
                         timeoutMs: 60_000,
                     });
                 } catch (err) {
-                    // Track so the test fails if overflow (or any other failure)
-                    // kills a turn — previously we silently swallowed this, which
-                    // made the test unable to detect the very regression it claims
-                    // to guard against.
                     turnErrors.push({
                         turn: i,
                         error: err instanceof Error ? err.message : String(err),
@@ -159,14 +130,9 @@ describe("short context accumulating overflow", () => {
                 );
             }
 
-            // The overflow guard is meaningless if prompts were allowed to fail
-            // silently. Require all 30 turns to succeed. If this assertion fires,
-            // inspect `turnErrors` in the log above to see which turn(s) overflowed
-            // or timed out.
+            // The test must reject failed prompts; otherwise it cannot verify that the overflow guard prevents failures.
             expect(turnErrors).toEqual([]);
 
-            // Verify drops actually materialized in the DB — this is the core
-            // fix: pending ops apply even when compartmentRunning at emergency.
             const ctx = h.contextDb();
             const row = ctx
                 .prepare("SELECT COUNT(*) AS c FROM tags WHERE status='dropped'")
@@ -175,13 +141,8 @@ describe("short context accumulating overflow", () => {
             console.log(`[OVERFLOW-GUARD] dropped tags: ${droppedCount}`);
             expect(droppedCount).toBeGreaterThan(0);
 
-            // Peak should stay under context limit with a margin.
             expect(peakObservedPct).toBeLessThan(100);
         },
-        // Bumped from 240s → 600s for CI: this test does ~30 escalating-load
-        // turns to drive a 128K-context session past 95% pressure. On idle local
-        // hardware this finishes in ~30s, but on GitHub-hosted runners with CPU
-        // contention it can take longer.
         600_000,
     );
 });

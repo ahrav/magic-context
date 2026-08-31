@@ -1,15 +1,6 @@
 /// <reference types="bun-types" />
 
-// Regression guard: the `auto_drop_tool_age` and `drop_tool_structure` config
-// keys (and their camelCase threads `autoDropToolAge` / `dropToolStructure`)
-// were REMOVED in Phase 2 — routine age-based tool drops were replaced by the
-// tiered target-headroom emergency drop, which always full-drops. No production
-// source in the plugin or Pi packages may reference them; a stray reference
-// would either be dead code or a config the schema now rejects with a warning.
 //
-// This is a static source-text scan so it fails at test-time without runtime
-// mocking. Tests, generated files, and the doctor's deletion routine (which
-// must name the dead keys to strip them) are intentionally excluded.
 
 import { describe, expect, it } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
@@ -23,17 +14,12 @@ const FORBIDDEN = [
     "drop_tool_structure",
     "autoDropToolAge",
     "dropToolStructure",
-    // Nudge redesign removed the rolling/iteration nudge config entirely
-    // (Channel 1/2 replaced them). No schema key, no camelCase thread.
     "nudge_interval_tokens",
     "iteration_nudge_threshold",
     "nudgeIntervalTokens",
     "iterationNudgeThreshold",
 ];
 
-// Files allowed to mention the dead keys: the CLI doctor names them to strip
-// them from existing user configs. (The doctor lives in packages/cli, not
-// scanned here, but keep this list as the documented exception surface.)
 const ALLOWED_BASENAMES = new Set<string>([]);
 
 function walkSourceFiles(dir: string, out: string[] = []): string[] {
@@ -86,10 +72,6 @@ describe("removed Phase 2 config keys", () => {
         expect(scanForForbidden(files)).toEqual([]);
     });
 
-    // The keys also leaked into docs, the generated schema, and e2e test
-    // configs (where they're silently ignored — the worst kind, since the test
-    // reads as if the knob still works). Guard those surfaces too so doc/config
-    // drift fails CI alongside source drift.
     it("no docs / generated schema / e2e config references the removed keys", () => {
         const docFiles = [
             join(REPO_ROOT, "CONFIGURATION.md"),
@@ -97,11 +79,8 @@ describe("removed Phase 2 config keys", () => {
             join(REPO_ROOT, "assets", "magic-context.schema.json"),
         ];
         const e2eFiles = walkSourceFiles(join(REPO_ROOT, "packages", "e2e-tests", "tests")).filter(
-            // e2e tests are the consumer surface here, not unit tests of the
-            // keys — scan them despite the .test.ts skip in walkSourceFiles.
             () => true,
         );
-        // walkSourceFiles skips .test.ts, so collect e2e .test.ts explicitly.
         const e2eDir = join(REPO_ROOT, "packages", "e2e-tests", "tests");
         let e2eEntries: string[] = [];
         try {

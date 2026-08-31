@@ -1,10 +1,9 @@
 #!/usr/bin/env bun
 
 // Seeded-defect audit runner: applies exactly one named unit defect,
-// requires its detector to fail, restores the source byte-exactly in
-// `finally`, then requires the clean detector rerun to pass. Cargo-backed
-// detectors are slow, so one unit runs per invocation:
-// `bun scripts/run-mc-shm-hardening-mutation.ts u1..u7`.
+// Each mutation's detector must fail.
+// After restoration, the clean detector rerun must pass.
+// Each invocation runs one unit.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
@@ -222,15 +221,15 @@ if (occurrences !== 1) {
     );
 }
 // Restoration must survive termination while the mutation is applied:
-// `finally` never runs when a SIGINT/SIGTERM default action kills the
-// process, which would leave the mutated source in the working copy.
-// The handlers restore byte-exactly (idempotent) and re-raise the exit.
+// The `finally` block does not run when SIGINT or SIGTERM terminates the process.
+// SIGINT or SIGTERM can leave the mutated source in the working copy.
+// The SIGINT and SIGTERM handlers restore the original bytes, then terminate.
 const restoreSource = (): void => {
     try {
         writeFileSync(selected.source, before);
     } catch {
-        // The exit path must not throw; the byte-exact check below (or
-        // the operator) catches a failed restoration on the normal path.
+        // The exit path must not throw so the byte-exact check detects failed restoration.
+        // The byte-exact check detects failed restoration on the normal exit path.
     }
 };
 const onTermination = (signal: NodeJS.Signals): void => {

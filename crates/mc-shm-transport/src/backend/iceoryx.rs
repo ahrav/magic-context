@@ -20,9 +20,6 @@ use crate::profile::TargetProfile;
 
 const PREFIX_BYTES: usize = SAMPLE_PREFIX_BYTES;
 
-/// Starting data-segment slice size for the publisher. Loans larger than the
-/// current slice bound trigger a PowerOfTwo segment reallocation up to
-/// `MAX_FRAME_BYTES`, so this hint only sets the initial footprint.
 const INITIAL_SLICE_HINT_BYTES: usize = 64 * 1024;
 
 type IpcService = iceoryx2::service::ipc::Service;
@@ -32,7 +29,7 @@ type ByteSubscriber = Subscriber<IpcService, [u8], ()>;
 type UninitByteSample = SampleMutUninit<IpcService, [MaybeUninit<u8>], ()>;
 type ByteSample = Sample<IpcService, [u8], ()>;
 
-/// iceoryx2 0.9.3 candidate with one complete-frame sample per publication.
+/// Publishes one complete frame per sample.
 pub struct IceoryxBackend {
     _node: iceoryx2::node::Node<IpcService>,
     _factory: ByteFactory,
@@ -46,7 +43,6 @@ pub struct IceoryxBackend {
 }
 
 impl IceoryxBackend {
-    /// Creates bounded static-allocation publisher and subscriber endpoints.
     pub fn create(profile: &TargetProfile, lane: u32) -> Result<Self, IceoryxError> {
         if profile.descriptor().backend() != BackendId::Iceoryx
             || profile.descriptor().memory_layout() != MemoryLayout::IceoryxSample
@@ -88,13 +84,6 @@ impl IceoryxBackend {
             .map_err(|_| IceoryxError::SetupFailed)?;
         let publisher = factory
             .publisher_builder()
-            // A static reservation would commit descriptor_depth + max_leases +
-            // loaned samples at the full 64 MiB frame bound (hundreds of MiB,
-            // zeroed at creation), failing outright on hosts with small
-            // /dev/shm. Start from a small slice hint and let the segment grow
-            // geometrically on demand; PowerOfTwo bounds the number of
-            // reallocations (and thus segment ids) to log2 of the frame bound,
-            // unlike BestFit which reallocates per distinct size.
             .initial_max_slice_len(
                 INITIAL_SLICE_HINT_BYTES
                     .checked_add(PREFIX_BYTES)
@@ -145,7 +134,6 @@ impl IceoryxBackend {
 
     /// Acquires one sample and hides iceoryx fragment representation.
     ///
-    /// The lease exposes only the validated body range, never the full
     /// allocation.
     pub fn try_receive(&self) -> Result<Option<IceoryxReceiveLease<'_>>, IceoryxError> {
         let Some(sample) = self
@@ -195,7 +183,6 @@ impl fmt::Debug for IceoryxBackend {
     }
 }
 
-/// Direct cursor-tracked iceoryx sample producer.
 #[must_use = "producer reservation must be committed or dropped"]
 pub struct IceoryxProducerReservation<'backend> {
     backend: &'backend IceoryxBackend,
@@ -207,17 +194,14 @@ pub struct IceoryxProducerReservation<'backend> {
 }
 
 impl IceoryxProducerReservation<'_> {
-    /// Reserved body capacity.
     pub const fn capacity(&self) -> usize {
         self.bound
     }
 
-    /// Body bytes written.
     pub const fn written(&self) -> usize {
         self.cursor
     }
 
-    /// Remaining body capacity.
     pub const fn remaining(&self) -> usize {
         self.bound - self.cursor
     }
@@ -309,13 +293,8 @@ impl fmt::Debug for IceoryxProducerReservation<'_> {
     }
 }
 
-/// Scoped one-span iceoryx receive sample.
 ///
-/// Exposes only the validated exact body range. Allocation bytes beyond the
-/// declared body (provider-documented capacity slack) are unreachable
-/// through this lease. Concurrent mutation of already-published bytes by
-/// the authenticated peer is a peer-contract violation (R4), not a
-/// boundary this lease defends.
+/// Bytes beyond the declared body, including provider-documented capacity slack, are unreachable.
 pub struct IceoryxReceiveLease<'backend> {
     sample: ByteSample,
     body_len: usize,
@@ -325,12 +304,10 @@ pub struct IceoryxReceiveLease<'backend> {
 }
 
 impl IceoryxReceiveLease<'_> {
-    /// Exact committed body length.
     pub const fn len(&self) -> usize {
         self.body_len
     }
 
-    /// Whether body is empty.
     pub const fn is_empty(&self) -> bool {
         self.body_len == 0
     }
@@ -340,7 +317,6 @@ impl IceoryxReceiveLease<'_> {
         1
     }
 
-    /// Returns bounded body span.
     pub fn segment(&self, index: usize) -> Option<&[u8]> {
         (index == 0).then_some(&self.sample.payload()[PREFIX_BYTES..PREFIX_BYTES + self.body_len])
     }
@@ -348,7 +324,6 @@ impl IceoryxReceiveLease<'_> {
     /// Ends sample scope and returns storage to iceoryx2.
     pub fn release(self) {}
 
-    /// Qualified sample release identity.
     pub const fn identity(&self) -> ReleaseIdentity {
         self.identity
     }
@@ -360,18 +335,12 @@ impl fmt::Debug for IceoryxReceiveLease<'_> {
     }
 }
 
-/// iceoryx setup or receive failure.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IceoryxError {
-    /// Target profile does not select iceoryx sample layout.
     ProfileMismatch,
-    /// Bounded endpoint setup failed.
     SetupFailed,
-    /// Receive mechanism failed.
     ReceiveFailed,
-    /// Metadata snapshot is malformed or stale.
     InvalidDescriptor,
-    /// Sequence would wrap within incarnation.
     SequenceExhausted,
 }
 
@@ -395,26 +364,16 @@ impl fmt::Display for IceoryxError {
 
 impl std::error::Error for IceoryxError {}
 
-/// iceoryx direct producer failure.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IceoryxProducerError {
-    /// Bound exceeds legal sample payload.
     BoundExceedsSample,
-    /// Loan pool has no capacity.
     Exhausted,
-    /// Cursor would cross reserved bound.
     Overflow,
-    /// Commit exceeds reservation.
     CommitOutsideReservation,
-    /// Exact bound was not filled.
     Underfill,
-    /// Reservation no longer owns a sample.
     Aborted,
-    /// Sequence would wrap within incarnation.
     SequenceExhausted,
-    /// Wire header disagrees with committed body.
     WireHeaderMismatch,
-    /// Sample publication failed.
     PublicationFailed,
 }
 

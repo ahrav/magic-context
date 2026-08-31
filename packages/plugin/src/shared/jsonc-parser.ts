@@ -117,9 +117,7 @@ export interface ParsedJsonSanitizerOptions {
 }
 
 /**
- * Copy parsed JSON into fresh own-property-only containers while rejecting keys
- * that can alter an object's prototype during a later merge. Rebuilding objects
- * also removes an already-polluted prototype produced by third-party parsers.
+ * sanitizeParsedJson copies parsed JSON into fresh own-property-only containers while rejecting keys that can alter an object's prototype during a later merge.
  */
 export function sanitizeParsedJson<T>(
     value: T,

@@ -29,10 +29,10 @@ import type { MessageLike } from "./transform-operations";
 interface RunCompartmentPhaseArgs {
     canRunCompartments: boolean;
     fullFeatureMode: boolean;
-    /** Compaction-off mode (issue #266): no historian start, no 95% block,
-     *  no boundary resolution — the phase degrades to a stale-flag cleanup. */
+    /** Compaction-off mode skips historian startup and the 95% block.
+     * Compaction-off mode skips boundary resolution and only clears stale flags. */
     compactionOff?: boolean;
-    /** False when historian.disable=true, blocking historian-backed child agents. */
+    /** `historianRunnable` is false when `historian.disable=true`, which blocks historian-backed child agents. */
     historianRunnable?: boolean;
     sessionMeta: { compartmentInProgress: boolean };
     contextUsage: { percentage: number };
@@ -56,79 +56,67 @@ interface RunCompartmentPhaseArgs {
     projectPath?: string;
     injectionBudgetTokens?: number;
     getNotificationParams?: () => import("./send-session-notification").NotificationParams;
-    /** True when this pass is already safe for background compression to run. */
+    /* */
     safeForBackgroundCompression?: boolean;
     deferredHistoryRefreshSessions: Set<string>;
-    /** True when transform already triggered recovery/emergency historian work this pass. */
+    /** `skipAwaitForThisPass` is true after transform-triggered recovery or emergency historian work. */
     skipAwaitForThisPass?: boolean;
-    /** When true, extract user behavior observations from historian output */
+    /** `experimentalUserMemories` extracts user-behavior observations from historian output. */
     experimentalUserMemories?: boolean;
-    /** When true, inject wall-clock dates on compartments in <session-history>. */
+    /** `experimentalTemporalAwareness` injects wall-clock dates into compartments in `<session-history>`. */
     experimentalTemporalAwareness?: boolean;
-    /** When true, run a second editor pass after historian to clean U: lines. */
+    /** `historianTwoPass` runs a second editor pass after historian processing to remove `U:` lines. */
     historianTwoPass?: boolean;
-    /** Cross-session memory feature gate (`memory.enabled`). Issue #44. */
+    /** `memoryEnabled` gates cross-session memory through `memory.enabled`. */
     memoryEnabled?: boolean;
-    /** Auto-promotion gate (`memory.auto_promote`). Issue #44. */
+    /** `autoPromote` gates automatic promotion through `memory.auto_promote`. */
     autoPromote?: boolean;
-    /** Forwarded to compartment runner — see CompartmentRunnerDeps.onCompartmentStatePublished. */
+    /** `onCompartmentStatePublished` forwards state-publication notifications to the compartment runner. */
     onCompartmentStatePublished?: (sessionId: string) => void;
     /**
-     * Boundary snapshot already resolved by THIS pass's trigger decision
-     * (transform-located trigger). When present and runnable, the phase uses it
-     * instead of re-resolving — one boundary resolution per pass, and the
-     * historian starts from exactly the snapshot the fire decision saw. The
-     * ≥80% emergency re-scale fallback below still re-resolves when this
-     * snapshot has no runnable window.
+     * `preResolvedBoundarySnapshot` was resolved by this pass's trigger decision.
+     * When runnable, `preResolvedBoundarySnapshot` comes from the transform-located trigger.
+     * A runnable `preResolvedBoundarySnapshot` prevents a second boundary resolution in the pass.
+     * The historian uses the same boundary snapshot that triggered it.
+     * The ≥80% emergency re-scale fallback re-resolves the boundary when `preResolvedBoundarySnapshot` has no runnable window.
      */
     preResolvedBoundarySnapshot?: ProtectedTailBoundarySnapshot;
 }
 
 /**
- * Prime the raw-message cache for the WHOLE compartment phase, then run it.
  *
- * The phase's boundary resolution (`getRawHistoryEligibility` +
- * `resolveOpenCodeProtectedTailBoundary`) AND the historian runner's
- * `readSessionChunk` all read raw OpenCode history. On a large session an
- * un-primed read is O(session) (multi-second each) and runs on the transform
- * thread — OpenCode awaits `messages.transform` before the LLM call, so a
- * historian-FIRE pass froze ~9.6s at "Thinking". The compartment TRIGGER primes
- * its own scope (`withRawSessionMessageCache` inside `getUnsummarizedTailInfo`),
- * but that scope ends when the trigger returns, so the phase read un-primed.
+ * `getRawHistoryEligibility`, `resolveOpenCodeProtectedTailBoundary`, and `readSessionChunk` read raw OpenCode history.
+ * An unprimed raw-history read is O(session) and blocks the transform thread.
+ * OpenCode awaits `messages.transform` before the LLM call, so raw-history reads block the request.
+ * `getUnsummarizedTailInfo` primes only its own raw-message-cache scope.
+ * The `withRawSessionMessageCache` scope in `getUnsummarizedTailInfo` ends when the trigger returns.
+ * The phase would otherwise read raw history without the trigger's cache.
  *
- * Prime from the TAIL-ONLY DB read (`primeTailRawMessageCache`), NOT the
- * in-memory `args.messages` tail: `extractInMemoryMessageViews` aliases the live
- * `parts` objects, which the transform MUTATES between the trigger and this phase
- * (§N§ prefixes, `[dropped]` sentinels, stripped reasoning). The historian must
- * read RAW content; the DB read is unmutated and O(tail).
+ * `primeTailRawMessageCache` must read raw history rather than the in-memory `args.messages` tail.
+ * `extractInMemoryMessageViews` aliases live `parts` objects from `args.messages`.
+ * The transform mutates those `parts` objects between the trigger and this phase.
+ * The transform can replace `§N§` prefixes, insert `[dropped]` sentinels, and strip reasoning from live `parts`.
+ * `primeTailRawMessageCache` reads raw content because the DB read is unmutated and O(tail).
  *
- * Scope/await correctness: every raw read happens in the phase's SYNCHRONOUS
- * prefix — `runCompartmentPhaseImpl` is `async` but reaches its first `await`
- * only on the ≥95% blocking path (`awaitCompartmentRun`), and the runner's
- * `readSessionChunk` runs in the runner's own synchronous prefix (before its
- * first `await` at `client.session.get`). `withRawSessionMessageCache`'s
- * try/finally clears the cache the moment the wrapped fn RETURNS its promise
- * (i.e. after the synchronous body suspends at the first await), so the cache
- * covers all raw reads; the only post-await work (`prepareCompartmentInjection`)
- * reads context.db, never raw history. Priming once under `resolvedSessionId`
- * covers the runner too — it reads under `args.sessionId`, which equals
+ * `runCompartmentPhaseImpl` reaches its first `await` only on the ≥95% blocking path.
+ * `readSessionChunk` runs before the runner's first `await`, `client.session.get`.
+ * `try/finally` clears the cache when the wrapped function returns its promise.
+ * `try/finally` clears the cache when the wrapped function returns its promise, after the function suspends at its first `await`.
+ * Only `prepareCompartmentInjection` runs after the first `await`.
+ * `prepareCompartmentInjection` reads `context.db`, never raw history.
  * `resolvedSessionId` (transform.ts).
  */
 export function runCompartmentPhase(
     args: RunCompartmentPhaseArgs,
 ): ReturnType<typeof runCompartmentPhaseImpl> {
-    // Only prime (and pay its tail DB read) on a pass that will ACTUALLY read raw
-    // history — i.e. one that starts or blocks on a historian run. On a normal
-    // defer pass the impl does ZERO raw reads (both its start-block and its ≥95%
-    // block are gated off), so priming there would add a useless ~100ms tail read
-    // to EVERY pass on a large session (the regression this gate fixes). The impl
-    // reads raw history in exactly two cases, mirrored here:
-    //   - compartmentInProgress is set (the trigger fired) AND no run is active
-    //     yet → this pass resolves the boundary + the runner reads the chunk, OR
-    //   - usage ≥ 95% with await allowed → the emergency block force-starts.
-    // The active-run guard matters: compartmentInProgress STAYS true for the whole
-    // background run, but while a run is active the impl no-ops (the run owns it),
-    // so without this guard we'd re-prime every pass for the run's full duration.
+    // `runCompartmentPhase` primes only passes that start or block on a historian run.
+    // Normal defer passes perform no raw reads.
+    // Priming normal defer passes would add a tail DB read to every defer pass on a large session.
+    // When `compartmentInProgress` is set and no run is active, this pass resolves the boundary and the runner reads the chunk.
+    // The emergency block force-starts when usage is at least 95% and awaiting is allowed.
+    // `compartmentInProgress` remains true while a background run is active.
+    // An active run owns `compartmentInProgress`; the implementation no-ops while it is active.
+    // The active-run guard prevents re-priming on every pass while a background run is active.
     const historianRunnable = args.historianRunnable !== false;
     const willReadRawHistory =
         historianRunnable &&
@@ -140,7 +128,6 @@ export function runCompartmentPhase(
                 args.contextUsage.percentage >= BLOCK_UNTIL_DONE_PERCENTAGE));
 
     if (!willReadRawHistory) {
-        // No raw reads this pass — skip the prime and its cache scope entirely.
         return runCompartmentPhaseImpl(args);
     }
 
@@ -152,8 +139,7 @@ export function runCompartmentPhase(
                 anchorMessageId: getLastCompartmentEndMessageId(args.db, args.resolvedSessionId),
             });
         } catch (error) {
-            // Priming is a pure optimization — on any failure the phase falls
-            // back to the full read (its prior behavior). Never block the phase.
+            // A `primeTailRawMessageCache` failure falls back to the full read without blocking the phase.
             sessionLog(args.sessionId, "compartment phase: tail prime failed (non-fatal):", error);
         }
         return runCompartmentPhaseImpl(args);
@@ -175,10 +161,6 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
     let rebuiltHistoryThisPass = false;
     const historianRunnable = args.historianRunnable !== false;
 
-    // Compaction-off mode (issue #266): the historian/compartment phase is
-    // fully gated off — no fires, no boundary resolution, no await. A stale
-    // compartmentInProgress flag (a run interrupted before the flip) is
-    // cleared so the session state is honest and flip-back starts clean.
     if (args.compactionOff) {
         if (args.sessionMeta.compartmentInProgress) {
             sessionLog(
@@ -343,10 +325,6 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
 
     let awaitedCompartmentRun = false;
 
-    // At the derived force band, run aggressive heuristic cleanup (dropAllTools) but do NOT block
-    // the transform waiting for historian. Historian runs in the background.
-    // Blocking here freezes the session UI at "Thinking" with no LLM call.
-    // Only 95% (BLOCK_UNTIL_DONE_PERCENTAGE) should block.
 
     if (
         historianRunnable &&
@@ -389,21 +367,8 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             );
         }
         if (activeRun) {
-            // Notify user before blocking — the session will appear frozen at "Thinking"
-            // while historian compacts. Without this, users have no idea what's happening.
             //
-            // CRITICAL: This notification creates a user message via session.prompt
-            // with noReply:true. The message is PERSISTED to OpenCode's session DB,
-            // which gives it a higher ID than the latest assistant. OpenCode's
-            // runLoop break condition checks `lastUser.id < lastAssistant.id`, and
-            // a fresh notification-user-message every transform pass makes that
-            // condition stay false → runLoop keeps iterating → mock returns text
-            // above-force-band usage → transform fires again → notification fires again
-            // → INFINITE LOOP. We've observed this on CI with >1700 requests per turn.
             //
-            // Guard: only send the notification ONCE per active compartment run.
-            // The flag lives on the activeRun and is cleared when the run completes,
-            // so a future compartment run can notify again.
             if (args.client && !activeRun.notificationSent) {
                 activeRun.notificationSent = true;
                 const notifParams = args.getNotificationParams?.() ?? {};
@@ -422,10 +387,6 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                 awaitedCompartmentRun = true;
                 compartmentInProgress = false;
             } else {
-                // Timeout: historian is still running in the background.
-                // Keep compartmentInProgress = true so future passes know the run is active.
-                // Do NOT set awaitedCompartmentRun — the run hasn't actually completed.
-                // The background run will publish when done, and the next pass picks it up.
                 sessionLog(
                     args.sessionId,
                     "transform: proceeding after 95% timeout — historian still running in background",
@@ -434,8 +395,6 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
         }
     }
 
-    // v2: no independent compressor — deterministic decay-tier rendering keeps
-    // the history block within budget at render time, with no LLM pass.
     return {
         pendingCompartmentInjection,
         awaitedCompartmentRun,

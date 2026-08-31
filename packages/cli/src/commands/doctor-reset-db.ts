@@ -1,20 +1,7 @@
 /**
- * `doctor reset-db` abandons an unsupported database family without
- * migrating, salvaging, or deleting data.
  *
- * The reset marker is published BEFORE the final holder inspection and binds
- * the database incarnation plus dev/inode of every family file; holders and
- * identities are rechecked before every move. Quarantine moves the rollback
- * journal, WAL, SHM, main file, and finally the marker into a same-directory
- * private directory. Each rename is atomic because the source and destination
- * are on the same filesystem, so an interruption at any point leaves either
- * the original family plus a pending marker (resumable) or a complete
  * quarantine.
  *
- * The format classification this command acts on — and reports to the operator
- * for confirmation — is the one taken after the first holder inspection finds
- * no live holder. An earlier reading can be torn by a writer checkpointing
- * mid-probe, which would otherwise quarantine a supported database.
  */
 import { chmodSync, lstatSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -378,7 +365,7 @@ async function confirmReset(
     return prompts.confirm(message, false);
 }
 
-/** The two family states reset may abandon; every other state exits early. */
+/* */
 type ResettableFamilyState = Extract<
     DirectDatabaseFamilyState,
     { state: "unsupported" } | { state: "corrupt" }
@@ -393,7 +380,7 @@ function familyIncarnation(state: ResettableFamilyState): string | null {
     return state.state === "unsupported" ? state.databaseIncarnationId : null;
 }
 
-/** Null once the failure has been reported; the caller exits `failed`. */
+/* */
 function captureResetPlan(prompts: PromptIO, deps: ResetDbDeps, dbPath: string): ResetPlan | null {
     try {
         return {
@@ -431,19 +418,8 @@ type ExclusivityRecheck =
     | { readonly outcome: "stop"; readonly code: ResetDbExitCode };
 
 /**
- * Re-classify the family now that the holder inspection found no live holder.
  *
- * The first classification can be taken while a writer is still active, and it
- * reads a probe copy whose main file and sidecars are copied as separate
- * operations — so a checkpoint landing between those copies makes a supported
- * family read as unsupported or corrupt. That reading is inherently racy; one
- * taken after the holder inspection is not. The later reading is therefore the
- * one this command acts on, and the plan reported to the operator below (the
- * text the confirmation prompt refers to) is built from it, so confirmation
- * and quarantine can never describe different classifications.
  *
- * The re-check itself cannot damage the family: classification only reads
- * pragmas and schema from a private throwaway copy.
  */
 function recheckUnderExclusivity(
     prompts: PromptIO,
@@ -611,15 +587,6 @@ export async function runResetDb(options: RunResetDbOptions = {}): Promise<Reset
         return RESET_DB_EXIT.declined;
     }
 
-    // The confirmation prompt is an open-ended window: another process can
-    // upgrade or replace the family in place and exit while it is displayed, and
-    // the holder check afterwards would see nobody. Publishing from the
-    // pre-prompt reading would then bind a marker to a family that no longer
-    // matches it, and because marker verification compares device and inode
-    // while deliberately ignoring size and content, an in-place replacement that
-    // reuses the inode can still pass — quarantining a now-current family. So
-    // reclassify and recapture immediately before publishing and act on that
-    // reading, not the one the user was shown.
     const postConfirmRecheck = recheckUnderExclusivity(prompts, deps, dbPath, confirmedState);
     if (postConfirmRecheck.outcome === "stop") return postConfirmRecheck.code;
     const publishState = postConfirmRecheck.state;

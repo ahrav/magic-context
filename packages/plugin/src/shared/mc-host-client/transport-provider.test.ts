@@ -217,8 +217,8 @@ describe("sanitized provider channel", () => {
                 throw new Error("detach failed");
             },
         );
-        // len disagrees with the lease bytes, so validation fails AFTER the
-        // aggregate charge; the quarantined source must keep that charge.
+        // Validation occurs after the aggregate charge.
+        // A quarantined source retains its aggregate charge.
         handlers.onFrame({
             header: {
                 len: 3,
@@ -240,9 +240,8 @@ describe("sanitized provider channel", () => {
         const budget = new ByteBudget(1024);
         const { handlers, wrapped, closes } = wrap(fakeProviderChannel({}), budget);
         const segment = new Uint8Array(new ArrayBuffer(5));
-        // isReleased() is provider-overridable: a throw during the rejection
-        // path must not unwind the provider's reader callback, and the lease
-        // whose state cannot be read keeps its charge quarantined.
+        // A rejection-path isReleased() throw must not unwind the provider reader callback.
+        // A lease with unreadable release state retains its charge quarantined.
         const sourceLease = new (class extends ReceiveLease {
             override isReleased(): boolean {
                 throw new Error("state unavailable");
@@ -299,8 +298,7 @@ describe("sanitized provider channel", () => {
         };
         handlers.onFrame(frame);
         expect(dispatched.length).toBe(1);
-        // Same still-active lease delivered again: two wrappers over the same
-        // segments would let either release detach the other's body.
+        // Two wrappers over the same segments can detach each other's bodies.
         handlers.onFrame(frame);
         expect(dispatched.length).toBe(1);
         expect(closes.map((entry) => entry.reason)).toEqual(["protocol_violation"]);
@@ -347,8 +345,8 @@ describe("sanitized provider channel", () => {
         const { handlers, wrapped, closes } = wrap(fakeProviderChannel({}), budget, (frame) =>
             dispatched.push(frame),
         );
-        // Retirement order: the owner freezes and zeroes the budget, then
-        // closes the channel; a late provider frame must not re-charge it.
+        // Retirement freezes and zeroes the budget before closing the channel.
+        // A frame arriving after channel closure must not charge the budget.
         budget.freeze();
         wrapped.close(undefined);
         const segment = new Uint8Array(new ArrayBuffer(5));

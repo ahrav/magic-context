@@ -147,7 +147,6 @@ describe("reviewUserMemories", () => {
                 identity,
                 snapshot,
                 manifest,
-                // These cases exercise apply/replay atomicity, not corroboration.
                 promotionThreshold: 1,
                 nowMs: 50_000,
             });
@@ -173,8 +172,8 @@ describe("reviewUserMemories", () => {
             replayed: false,
             staleReason: null,
         });
-        // A project promotion commits a claim, so the outcome has to carry the
-        // effects the dream-run audit records; counts alone lose the claim IDs.
+        // A project promotion must return effects containing its claim IDs.
+        // Counts alone cannot identify committed claim IDs.
         expect(first.result.effects.length).toBeGreaterThan(0);
         expect(claimEffectMemoryChanges(first.result.effects)).not.toBeNull();
         expect(second).toEqual({ ...first, replayed: true });
@@ -224,10 +223,9 @@ describe("reviewUserMemories", () => {
     });
 
     test("an under-corroborated project promotion is refused", () => {
-        // The threshold only decides whether the review runs; a qualifying
-        // snapshot of three unrelated candidates can still yield a manifest that
-        // promotes one of them, turning a single observation into a durable
-        // project claim the prompt said required recurrence.
+        // The threshold gates review execution; it does not corroborate promotions.
+        // A manifest may request promotion of one candidate without corroboration.
+        // A single observation cannot create a durable project claim without recurrence.
         const db = freshDb();
         const holderId = "holder-threshold";
         const acquisition = acquire(db, holderId);
@@ -549,8 +547,8 @@ describe("reviewUserMemories", () => {
         });
         releaseLease(db, holderA, LEASE);
 
-        // The foreign candidate never reached the model, so it cannot be named
-        // in consume_candidate_ids, and it survives project A's consumption.
+        // The model cannot name the foreign candidate in consume_candidate_ids.
+        // Project A's consumption leaves the foreign candidate unconsumed.
         expect(reviewA.prompts.some((prompt) => prompt.includes(foreignContent))).toBe(false);
         expect(resultA.candidatesConsumed).toBe(1);
         expect(getUserMemoryCandidates(db).map((candidate) => candidate.id)).toEqual([

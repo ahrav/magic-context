@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
 import {
@@ -90,8 +89,7 @@ describe("maturity transition predicates", () => {
                 explicitUserEvidence: false,
             }),
         ).toBe("CANDIDATE");
-        // Exact explicit-user evidence unlocks the automatic ladder; repo
-        // content may then corroborate or verify.
+        // Explicit-user evidence unlocks the automatic ladder.
         expect(
             automaticMaturityTarget({
                 kind: "unknown",

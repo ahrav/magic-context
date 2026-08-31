@@ -15,24 +15,18 @@ const PARAMETERS = Object.freeze({
     topology: "fused",
 });
 
-/** Explicit test-only provider. */
+/* */
 export function createExplicitShmTestProvider(
     profile: string,
 ): ClientTransportProvider | undefined {
     if (profile !== QUALIFIED_TEST_PROFILE || !probeCapabilities().available) return undefined;
-    // Replay watermark scoped to one daemon incarnation by the
-    // authenticated daemon identity: the host's candidate sequence is
-    // process-local, and a PID is reusable across incarnations, so a
-    // replacement daemon — even one that received its predecessor's
-    // recycled PID — legitimately starts over at 1 and must not be
-    // rejected against the previous incarnation's high-water mark.
+    // Scope the replay watermark by authenticated daemon identity because candidate IDs reset per daemon incarnation and PIDs can be reused.
     let previousCandidate: { daemonId: Uint8Array; pid: number; candidateId: number } | undefined;
     return {
         transport: "shm",
         capabilityVersion: 1,
         parameters: PARAMETERS,
         connect: (grant, args) => {
-            // Attachment I/O runs in start(), after this decode.
             const watermark =
                 previousCandidate !== undefined &&
                 sameDaemonId(previousCandidate.daemonId, args.daemonId)

@@ -18,8 +18,8 @@ import type { LiveSessionState } from "./live-session-state";
 import { dropSlot } from "./lkg-slot";
 import type { NotificationParams } from "./send-session-notification";
 
-/** Resolve the live session model as a "provider/modelID" key for the last-ditch
- *  historian fallback. Returns undefined when the session's model isn't known yet. */
+/**
+ * */
 function resolveLiveModelKey(
     liveSessionState: LiveSessionState,
     sessionId: string,
@@ -29,82 +29,55 @@ function resolveLiveModelKey(
 }
 
 /**
- * Single source of truth for recomp + session-upgrade orchestration.
  *
- * Before this module there were THREE diverged implementations — the RPC
- * `recomp` handler, the RPC `upgrade` handler, and the hook-side `executeRecomp`
- * closure (used by `/ctx-recomp` and `/ctx-session-upgrade`). They drifted: the
- * RPC handlers had live progress but no model fallback, while the hook path had
- * fallback but no progress. Without shared orchestration,
- * the dialog "Run upgrade now" button (RPC, no fallback) failed when the primary
- * historian model returned empty, while `/ctx-session-upgrade` (hook, with
- * fallback) succeeded via the kimi fallback, leaving the sidebar stuck on a
- * stale "failed" because the command path never updated progress.
  *
- * `runManagedRecomp` / `runManagedUpgrade` give EVERY caller the full set:
- * fallback resilience (config chain + live-session-model last resort), live
- * progress (sidebar / status), and consistent terminal-state + messaging.
  */
 
-/** Config-shape-agnostic context. Callers resolve config values and pass them
- *  in, so this module never couples to the loose RPC config record vs the typed
+/** Callers pass resolved config values to avoid coupling this context to RPC and hook config types.
  *  hook config. */
 export interface ManagedRecompContext {
     client: PluginContext["client"];
     db: Database;
     liveSessionState: LiveSessionState;
-    /** Plugin-startup directory — last-resort fallback for session-dir resolution. */
+    /* */
     directory: string;
     historianChunkTokens: number;
     historianTimeoutMs: number;
     memoryEnabled: boolean;
     autoPromote: boolean;
-    /** Resolved historian fallback chain (config `fallback_models` → builtin). */
+    /* */
     fallbackModels: readonly string[];
     language?: string;
-    /** Pre-resolved last-resort model key (the live session model). When omitted,
-     *  the orchestrator resolves it from `liveModelBySession`. The hook path passes
-     *  this explicitly so it can include its OpenCode-DB fallback (the live map can
-     *  be empty when `/ctx-recomp` runs before the first transform pass). */
+    /**
+     * */
     fallbackModelId?: string;
     userMemoriesEnabled: boolean;
-    /** Two-pass historian (editor cleanup) — config `historian.two_pass`. */
+    /* */
     historianTwoPass?: boolean;
     getNotificationParams: (sessionId: string) => NotificationParams;
     ensureProjectRegistered?: (directory: string, db: Database) => Promise<void>;
 }
 
-/** The runner's outcome messages are headed "## Magic Recomp — <Status>" /
- *  "## Session Upgrade — <Status>". Failed/Skipped wrote nothing. */
+/**
+ * */
 export function isRecompFailure(message: string): boolean {
     return /—\s*(Failed|Skipped)/.test(message);
 }
 
-/** A SKIP (vs a true failure): the run no-op'd because the compartment-state
- *  lease was busy (incremental historian comparting the tail, or another process
- *  mutating state). Transient — retrying in a moment succeeds. Matches the
- *  "— Skipped" heading AND the suffix-less lease/already-running no-op text. */
+/**
+ * */
 export function isRecompSkip(message: string): boolean {
     return /—\s*Skipped|already mutating compartment state|already running/i.test(message);
 }
 
-/** Positive full-success predicate: the recomp rebuilt the ENTIRE requested
- *  range, headed "## Magic Recomp — Complete". This is stricter than
- *  `!isRecompFailure(...)`: a "— Partial" outcome publishes a valid prefix
- *  (`published===true`) but did NOT cover the full range, and a lease-busy
- *  no-op returns a heading with no status suffix at all. Gating the upgrade on
- *  this — not on `!isRecompFailure` — prevents declaring "Complete" + running
- *  the project-wide memory migration when compartments were only partially
- *  rebuilt (tierless legacy rows would remain while memories migrated). A
- *  Partial is reported as Incomplete; re-running the upgrade continues the
- *  rebuild (the upgrade gate still sees the un-rebuilt legacy/tierless rows). */
+/**
+ * */
 export function isRecompComplete(message: string): boolean {
     return /—\s*Complete/.test(message);
 }
 
-/** Strip markdown headings + blank lines from a runner outcome message, leaving
- *  the human reason for compact sidebar/status display. Prevents a raw
- *  "## Magic Recomp — Failed" heading from leaking into the sidebar line. */
+/**
+ * */
 export function extractRecompReason(raw: string): string {
     const meaningful = raw
         .split("\n")
@@ -114,13 +87,8 @@ export function extractRecompReason(raw: string): string {
 }
 
 /**
- * Rewrite a recomp-flow reason string for the UPGRADE flow surface. The shared
- * recomp runner emits lease/active-run skip text that names `/ctx-recomp` — but
- * a user in the upgrade flow must be told to retry `/ctx-session-upgrade`, not
- * `/ctx-recomp` (they are different commands). The dominant skip cause on an
- * active session is the incremental historian briefly holding the
- * compartment-state lease while it comparts the live tail, which is transient,
- * so reframe the guidance as "retry in a moment" rather than a hard failure.
+ * The upgrade flow must direct retries to `/ctx-session-upgrade`, not `/ctx-recomp`.
+ * Lease and active-run messages include retry guidance.
  */
 export function contextualizeUpgradeReason(reason: string): string {
     const rewritten = reason.replace(/\/ctx-recomp\b/g, "/ctx-session-upgrade");
@@ -135,12 +103,8 @@ export function contextualizeUpgradeReason(reason: string): string {
 
 const RECOMP_DONE_GRACE_MS = 30_000;
 
-/** Emit an IMMEDIATE "recomp" progress entry the instant an upgrade/recomp is
- *  requested — before any async work (session-dir resolution, child-session
- *  creation, the first slow historian attempt + fallback). Without this the
- *  sidebar stays blank until the first per-pass emit, which can be 60-90s into a
- *  fallback-heavy run. `totalMessages: 0` renders an
- *  indeterminate "Starting…" state until the loop knows the real range. */
+/**
+ * */
 export function setRecompStarting(
     liveSessionState: LiveSessionState,
     sessionId: string,
@@ -162,9 +126,8 @@ export function setRecompStarting(
     });
 }
 
-/** Update only the transient `note` on the active recomp progress entry (e.g.
- *  "trying fallback sonnet-4.6…") without disturbing the bar's counters. No-op
- *  if there's no active non-terminal entry. */
+/**
+ * */
 export function setRecompNote(
     liveSessionState: LiveSessionState,
     sessionId: string,
@@ -179,9 +142,8 @@ export function setRecompNote(
     });
 }
 
-/** Record a terminal recomp/upgrade phase ("done"/"failed") so the TUI shows the
- *  OUTCOME (not a missed toast). "done" auto-clears after a grace period; "failed"
- *  persists until the next run so the reason stays visible. */
+/**
+ * */
 export function setRecompTerminal(
     liveSessionState: LiveSessionState,
     sessionId: string,
@@ -191,8 +153,6 @@ export function setRecompTerminal(
     const existing = liveSessionState.recompProgressBySession.get(sessionId);
     liveSessionState.recompProgressBySession.set(sessionId, {
         sessionId,
-        // Preserve the flow kind set by setRecompStarting so the terminal entry
-        // keeps "Recomp" vs "Upgrade" labeling.
         kind: existing?.kind ?? "recomp",
         phase,
         processedMessages: existing?.processedMessages ?? 0,
@@ -203,8 +163,6 @@ export function setRecompTerminal(
         updatedAt: Date.now(),
         message,
     });
-    // "done" and the transient "skipped" both auto-clear after a grace period;
-    // "failed" persists until the next run so the reason stays visible.
     if (phase === "done" || phase === "skipped") {
         const t = setTimeout(() => {
             const cur = liveSessionState.recompProgressBySession.get(sessionId);
@@ -214,8 +172,8 @@ export function setRecompTerminal(
     }
 }
 
-/** Build the common executeContextRecomp deps shared by recomp + upgrade:
- *  fallback resilience + live progress + cache-bust signalling. */
+/**
+ * */
 function buildRecompDeps(ctx: ManagedRecompContext, sessionId: string) {
     return {
         client: ctx.client,
@@ -226,9 +184,6 @@ function buildRecompDeps(ctx: ManagedRecompContext, sessionId: string) {
         directory: ctx.directory,
         memoryEnabled: ctx.memoryEnabled,
         autoPromote: ctx.autoPromote,
-        // Fallback resilience (was missing on the RPC dialog paths):
-        //  - fallbackModels: configured chain (e.g. anthropic/claude-sonnet-4-6)
-        //  - fallbackModelId: the live session model as a last-ditch retry
         fallbackModels: ctx.fallbackModels,
         language: ctx.language,
         fallbackModelId:
@@ -240,15 +195,9 @@ function buildRecompDeps(ctx: ManagedRecompContext, sessionId: string) {
             ctx.liveSessionState.historyRefreshSessions.add(sid);
             ctx.liveSessionState.pendingMaterializationSessions.add(sid);
         },
-        // Plan v6: recomp is explicit (applies the marker directly) so this is a
-        // no-op for recomp, but the runner type is shared and the callback is
-        // always optional — wiring it uniformly keeps incremental publishes correct.
         onDeferredMarkerPending: (sid: string) => {
             ctx.liveSessionState.deferredHistoryRefreshSessions.add(sid);
         },
-        // Live progress (was missing on the hook/command path). The runner emits
-        // per-pass entries with no `kind` (it doesn't know the user-facing flow);
-        // preserve the kind set by setRecompStarting so labels stay consistent.
         onRecompProgress: (p: RecompProgress) => {
             const prevKind =
                 ctx.liveSessionState.recompProgressBySession.get(sessionId)?.kind ?? "recomp";
@@ -261,37 +210,24 @@ function buildRecompDeps(ctx: ManagedRecompContext, sessionId: string) {
 }
 
 /**
- * Run a recomp (full or partial), with fallback + live progress + terminal state.
- * Returns the runner's outcome message; the CALLER delivers it (so it can choose
- * force-persist vs toast). Used by `/ctx-recomp` and the RPC `recomp` handler.
  */
 export async function runManagedRecomp(
     ctx: ManagedRecompContext,
     sessionId: string,
     options?: { range?: PartialRecompRange },
 ): Promise<string> {
-    // Immediate sidebar feedback before any async work (see setRecompStarting).
     setRecompStarting(ctx.liveSessionState, sessionId, "Starting recomp…", "recomp");
     try {
         const message = await executeContextRecomp(buildRecompDeps(ctx, sessionId), options);
-        // A lease/already-running SKIP is transient (the incremental historian is
-        // briefly mutating compartment state), NOT a hard failure — surface it as
-        // the neutral "skipped" state with retry guidance instead of red "failed".
         const terminalPhase = isRecompSkip(message)
             ? "skipped"
             : isRecompFailure(message)
               ? "failed"
               : "done";
-        // A successful recomp IS the user resolving an overflow: it rebuilds
-        // compartments from raw history and shrinks the live tail. So clear any
-        // stale needs_emergency_recovery — otherwise the flag (armed by the
-        // overflow that prompted the recomp) keeps force-bumping pressure to 95%
-        // on every later pass even though the session is now small.
         if (terminalPhase === "done") {
             try {
                 clearEmergencyRecovery(ctx.db, sessionId);
             } catch {
-                // best-effort; the historian-trigger disarm path is the backstop.
             }
         }
         setRecompTerminal(
@@ -322,40 +258,20 @@ export async function runManagedUpgrade(
         setRecompTerminal(ctx.liveSessionState, sessionId, "skipped", message);
         return `## Session Upgrade — Skipped\n\n${message}`;
     }
-    // Immediate sidebar feedback before any async work (see setRecompStarting).
     setRecompStarting(ctx.liveSessionState, sessionId, "Starting upgrade…", "upgrade");
     try {
-        // ── Guard: don't recomp an already-upgraded session ──────────────────
-        // Re-running the full recomp on a session whose compartments are all v2
-        // already is wasteful (rebuilds the whole tail) and risky (overwrites
-        // good v2 work). It also confuses the historian — asked to rebuild
-        // compartments that already exist, weaker models reply conversationally
-        // ("these already exist, want me to continue?") and the run fails. So:
-        //   • upgradable compartments present     → full upgrade (recomp + migration)
-        //   • none + migration still pending      → migration only (skip recomp)
-        //   • none + migration already done       → no-op "already upgraded"
         //
-        // "Upgradable" = lacks usable v2 tiers: a pre-v2 `legacy=1` row OR a
-        // malformed `legacy=0` row with no `p1` (interrupted recomp / older
-        // partial-v2 build). Matching ONLY `legacy=1` would trap a session whose
-        // rows are tierless-but-not-flagged-legacy — the gate would say "already
-        // upgraded" and refuse to rebuild.
         const compartments = getCompartments(ctx.db, sessionId);
         const legacyCount = compartments.filter(
             (c) => c.legacy === 1 || !c.p1 || c.p1.trim() === "",
         ).length;
 
         if (legacyCount === 0) {
-            // Every compartment is already v2. Garbage-collect any orphan recomp
-            // staging so a superseded/interrupted-then-completed run can't leave
-            // rows that later trigger a false "resume the interrupted upgrade"
-            // prompt (the staging is dead once all compartments are promoted).
             try {
                 clearRecompStaging(ctx.db, sessionId);
             } catch {
                 /* best-effort GC */
             }
-            // Fully upgraded already — nothing to do.
             setRecompTerminal(ctx.liveSessionState, sessionId, "done", "Already upgraded");
             return [
                 "## Session Upgrade — Already Up To Date",
@@ -366,27 +282,9 @@ export async function runManagedUpgrade(
             ].join("\n");
         }
 
-        // ── Full upgrade: compartment recomp (NO facts) → memory migration ───
-        // Gate the migration on `published` — the GROUND TRUTH that the recomp
-        // actually wrote rebuilt compartments — NOT just on the message text.
-        // A recomp can no-op WITHOUT a "— Failed/Skipped" heading: the lease
-        // guard / `activeRuns` guard return "## Magic Recomp\n\nHistorian is
-        // already running…" (no status suffix), which `isRecompFailure` misses.
-        // The old code then ran the migration and declared the upgrade COMPLETE
-        // even though zero compartments were rebuilt — leaving tierless rows but
-        // migrated memories + a false "Complete" (a
-        // concurrent opencode process for the same project still held the lease,
-        // so the resume's recomp was skipped while migration ran anyway).
         const recompResult = await executeContextRecompWithResult(buildRecompDeps(ctx, sessionId));
 
-        // Require a POSITIVE full-success ("— Complete"), not merely the absence
-        // of a Failed/Skipped heading. A published "— Partial" rebuilt only a
-        // prefix (published===true, not a failure heading) — running migration +
-        // declaring Complete on it would migrate memories while leaving tierless
-        // legacy rows. A lease-busy no-op has no status suffix at all.
         if (!recompResult.published || !isRecompComplete(recompResult.message)) {
-            // Recomp did not fully rebuild (failure, skip/lease-busy, OR partial).
-            // Do NOT run the project-wide migration or declare the upgrade complete.
             const reason = contextualizeUpgradeReason(
                 isRecompFailure(recompResult.message)
                     ? extractRecompReason(recompResult.message)

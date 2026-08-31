@@ -1,8 +1,7 @@
-//! Zero-tool memory classification producer contract.
+//! This module defines the zero-tool memory-classification producer contract.
 //!
-//! The host still owns prompt rendering and XML parsing. This module owns the
-//! provider-facing role and its fixed generation budget so callers cannot turn
-//! this management surface into a generic arbitrary-prompt producer.
+//! The host owns prompt rendering and XML parsing.
+//! The fixed provider-facing role and generation budget prevent callers from using this surface for arbitrary prompts.
 
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -10,39 +9,28 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// The only task currently accepted by `dreamer.run_task`.
+/// `dreamer.run_task` accepts only `CLASSIFY_TASK`.
 pub const CLASSIFY_TASK: &str = "classify";
-/// Host-rendered prompt bodies are bounded before they reach the provider leg.
+/// The host limits rendered prompts to `MAX_CLASSIFY_PROMPT_BYTES` before invoking the provider.
 pub const MAX_CLASSIFY_PROMPT_BYTES: usize = 256 * 1024;
-/// Every chain entry is a potential billable provider run (each failed
-/// attempt advances to the next model), so the request-supplied chain is
-/// capped before any run starts — otherwise the wire path's only bound on
-/// sequential provider attempts would be the request body's byte ceiling.
+/// `MAX_CLASSIFY_MODEL_CHAIN` caps sequential provider attempts at 8 because each failed attempt advances to the next model.
 pub const MAX_CLASSIFY_MODEL_CHAIN: usize = 8;
-/// Classifier generation calibration, kept separate from historian calibration.
 pub const CLASSIFY_TEMPERATURE: f64 = 0.1;
 pub const CLASSIFY_MAX_OUTPUT_TOKENS: u32 = 32_000;
 pub const CLASSIFY_AWAIT_TIMEOUT: Duration = Duration::from_secs(600);
 pub const CLASSIFY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
-/// Work `handle_dreamer_run_task` still has to do AFTER the payload deadline
-/// expires, and therefore the margin a caller must leave between its own
-/// transport budget and the `timeout_ms` it sends.
+/// Callers must reserve `CLASSIFY_CLEANUP_RESERVE` beyond `timeout_ms` for post-deadline cleanup.
 ///
-/// The deadline bounds the start, await, and re-drain windows, so the last of
-/// them returns at the deadline. What follows is bounded but not free:
-/// `HistorianProducer::purge_session` wraps its whole `session.delete` plus
-/// `close` in `request_timeout` (30s), the host then reaps the Broca
-/// subprocess group under `SubprocessLimits::termination_grace` (5s between
-/// SIGTERM and SIGKILL), and the ledger write plus response dispatch need
-/// slack on top. A caller whose transport budget equals `timeout_ms` cancels
-/// inside that window: the handler task is dropped between the producer run
-/// and the purge, so nothing is recorded, no fallback can complete, and the
-/// attempt's billable run stays alive holding the memory-pool prompt.
+/// The payload deadline covers provider start, await, and re-drain; cleanup continues after it.
+/// Callers must reserve 40 seconds beyond `timeout_ms` for purge, subprocess reaping, ledger writes, and response dispatch.
+/// A transport timeout equal to `timeout_ms` can cancel the handler during post-deadline cleanup.
+/// Cancellation during cleanup can drop the handler before it purges the producer session.
+/// Cancellation before purge prevents recording the attempt and completing fallback.
+/// Cancellation before purge can leave a billable provider run alive with the memory-pool prompt.
 pub const CLASSIFY_CLEANUP_RESERVE: Duration = Duration::from_secs(40);
 
-/// This is deliberately a zero-tool system role. The host supplies the pool and
-/// retains the parser because accepting a caller-selected role would reopen the
-/// producer trust boundary.
+/// The system role exposes no tools.
+/// The host retains the parser because accepting a caller-selected role would reopen the producer trust boundary.
 pub const CLASSIFY_SYSTEM_PROMPT: &str = r#"You are a memory classifier for the magic-context system. You classify project memories by metadata only. You do NOT rewrite, merge, archive, verify, or create memories, and you do NOT read code — you judge each memory from its own text.
 
 ### How to score importance (1-100)
@@ -76,7 +64,6 @@ Rules:
 - Every memory in the pool below MUST appear exactly once.
 - importance is an integer 1-100; scope is one of project|ecosystem|universe; shareable is true|false."#;
 
-/// The scope vocabulary a classify entry may carry, mirroring `SCOPES` in
 /// `classify-prompt.ts`.
 const CLASSIFY_SCOPES: [&str; 3] = ["project", "ecosystem", "universe"];
 
@@ -85,11 +72,9 @@ fn memory_entry_pattern() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"<memory\b([^>]*)/?>").expect("memory entry pattern"))
 }
 
-/// Deliberately as permissive as `parseClassifyManifest`'s own
-/// `\bclaim\s*=\s*"([^"]+)"`: the well-formedness check below, not this
-/// pattern, is what separates a claim identity from arbitrary text. A
-/// narrower pattern would silently reclassify a malformed identity as "no
-/// claim attribute" and lose that diagnostic.
+/// The pattern matches the claim syntax accepted by `parseClassifyManifest`.
+/// The well-formedness check, not this regex, distinguishes a claim identity from arbitrary text.
+/// A narrower pattern would classify a malformed identity as missing the claim attribute and suppress that diagnostic.
 fn claim_attr_pattern() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"\bclaim\s*=\s*"([^"]+)""#).expect("claim attribute pattern"))
@@ -124,14 +109,8 @@ fn classify_root_pattern() -> &'static Regex {
     })
 }
 
-/// The body of the classify root element, or `None` when the envelope is
-/// absent or unterminated.
+/// Returns the classify root body, or `None` when the envelope is absent or unterminated.
 ///
-/// Deliberately the same syntax the caller accepts
-/// (`extractCompleteManifestBody` in `manifest-parser.ts`): case-insensitive
-/// and attribute-tolerant, so `<Classify>` or `<classify version="1">` is a
-/// valid envelope here too. A stricter reader would advance the fallback
-/// chain — and eventually fail the command — over output the authority
 /// parses fine.
 fn classify_body(text: &str) -> Option<&str> {
     classify_root_pattern()
@@ -140,27 +119,13 @@ fn classify_body(text: &str) -> Option<&str> {
         .map(|body| body.as_str())
 }
 
-/// Whether one attempt's output is an acceptable classify manifest for
-/// `expected` — the public claim IDs this attempt actually asked about.
 ///
-/// This is the accept predicate for a chain attempt, so it has to live here
-/// rather than only in the TypeScript caller: the module decides whether to
-/// advance to the next model AND whether to write the durable command
-/// response. Accepting on envelope presence alone let an enveloped-but-
-/// invalid manifest end the chain and be ledgered, after which the caller's
-/// own validation threw too late to reach a fallback model and every retry
-/// replayed the same invalid manifest.
 ///
-/// The rules mirror `parseClassifyManifest`/`validateClassifyManifest` in
-/// `classify-prompt.ts`, which stays the authority for INTERPRETING and
-/// applying values; both sides are pinned by tests. Identity is the claim's
-/// opaque public ID — the same `claim="mcm_..."` attribute
+/// Identity is the opaque public claim ID in the `claim` attribute.
 /// `CLASSIFY_SYSTEM_PROMPT` demands.
 ///
-/// Diagnostics name counts the caller supplied, and claim IDs only after
-/// `is_valid_public_claim_id` proves them to be `mcm_` plus 32 lowercase hex
-/// — a fixed-shape opaque token that cannot carry pool text. That check runs
-/// before any other per-entry rule so no diagnostic can echo a
+/// Diagnostics include claim IDs only after `is_valid_public_claim_id` accepts them.
+/// The validator validates claim IDs before other per-entry rules so diagnostics cannot echo model-controlled text.
 /// model-controlled string.
 pub fn validate_classify_manifest(text: &str, expected: &BTreeSet<String>) -> Result<(), String> {
     let body = classify_body(text).ok_or("no complete classify envelope")?;
@@ -197,7 +162,7 @@ pub fn validate_classify_manifest(text: &str, expected: &BTreeSet<String>) -> Re
             return Err(format!("manifest repeats entry {claim}"));
         }
     }
-    // Content that parsed to nothing is an unrecognized shape, not an empty
+    // Content that yields no parsed entries is an unrecognized shape, not an empty manifest.
     // classification.
     if entries == 0 && !body.trim().is_empty() {
         return Err("manifest body has no recognizable entries".to_owned());
@@ -212,17 +177,13 @@ pub fn validate_classify_manifest(text: &str, expected: &BTreeSet<String>) -> Re
     Ok(())
 }
 
-/// Cheap producer-chain guard for completions that succeeded at the transport
-/// layer but did not return even a classify manifest envelope. The TypeScript
-/// host remains responsible for XML parsing, membership checks, and field validation.
 pub fn has_manifest_envelope(text: &str) -> bool {
     let text = text.trim();
     text.contains("<classify>") && text.contains("</classify>")
 }
 
-/// Mint an opaque child id without exposing the command id or project path in
-/// provider/session diagnostics. The registry, rather than this prefix, is the
-/// transform exemption authority.
+/// The child ID is opaque so provider and session diagnostics do not expose the command ID or project path.
+/// The registry determines transform exemptions; the child-ID prefix does not.
 pub fn child_session_id(project: &str, command_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(project.as_bytes());
@@ -232,11 +193,9 @@ pub fn child_session_id(project: &str, command_id: &str) -> String {
     format!("mc-dreamer:classify:{}", hex_prefix(&digest, 16))
 }
 
-/// Derives the deterministic Broca child session for one classify attempt.
-/// `ledger_session` is part of the identity because the durable ledger
-/// scopes commands to `(ledger_session, command_id)`: two module sessions
-/// in the same authority project may reuse a `command_id`, and their
-/// attempts must never attach to (or purge) each other's runs.
+/// The durable ledger scopes commands to `(ledger_session, command_id)`.
+/// `command_id` can repeat across module sessions in the same authority project.
+/// `ledger_session` prevents module sessions that reuse `command_id` from attaching to or purging each other's runs.
 pub fn attempt_child_session_id(
     project: &str,
     ledger_session: &str,
@@ -275,7 +234,7 @@ fn hex_prefix(bytes: &[u8], count: usize) -> String {
 mod tests {
     use super::*;
 
-    /// A well-formed public claim ID, distinct per `seed`.
+    /// The function returns a well-formed public claim ID derived from `seed`.
     fn claim(seed: u8) -> String {
         format!("mcm_{}", format!("{seed:02x}").repeat(16))
     }
@@ -301,8 +260,6 @@ mod tests {
         assert!(child_session_id("project", "command").starts_with("mc-dreamer:classify:"));
     }
 
-    /// The envelope syntax must match what the caller's parser accepts, or
-    /// this gate would advance the chain over output the authority parses.
     #[test]
     fn manifest_root_matching_mirrors_the_caller_parser() {
         let one = claim(1);
@@ -310,9 +267,7 @@ mod tests {
         let entry = format!("<memory claim=\"{one}\" scope=\"project\"/>");
         for text in [
             format!("<classify>{entry}</classify>"),
-            // Case-insensitive root, as `extractCompleteManifestBody` is.
             format!("<Classify>{entry}</Classify>"),
-            // Attributes on the root are tolerated there too.
             format!("<classify version=\"1\">{entry}</classify>"),
             // Surrounding prose is ignored: the root is located, not anchored.
             format!("here you go:\n<classify>{entry}</classify>\ndone"),
@@ -323,7 +278,6 @@ mod tests {
                 "must accept {text:?}"
             );
         }
-        // Provider outage text carries no envelope at all.
         assert!(validate_classify_manifest("All Antigravity endpoints failed", &expected).is_err());
     }
 
@@ -343,9 +297,6 @@ mod tests {
             Ok(())
         );
 
-        // Each of these previously ended the chain and got ledgered as this
-        // command's durable response, so the caller's later validation threw
-        // with no fallback model left to try.
         for (label, text) in [
             ("no envelope", "All Antigravity endpoints failed".to_owned()),
             (
@@ -380,7 +331,6 @@ mod tests {
                 ),
             ),
             (
-                // The retired integer identity is no longer an identity at all.
                 "numeric id instead of a claim",
                 format!(
                     "<classify><memory id=\"1\" scope=\"project\"/>\
@@ -434,9 +384,6 @@ mod tests {
         let secret = "POOL-SECRET-SENTINEL";
         for text in [
             format!("<classify>{secret}</classify>"),
-            // A claim attribute is model-controlled text until
-            // `is_valid_public_claim_id` bounds its shape, so the
-            // well-formedness rejection must not echo it either.
             format!("<classify><memory claim=\"{secret}\" importance=\"80\"/></classify>"),
             format!(
                 "<classify><memory claim=\"{secret}\" scope=\"galaxy\"/>\

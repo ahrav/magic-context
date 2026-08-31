@@ -1,23 +1,11 @@
 /**
- * Regression test for the assistant `toolCall` ↔ `toolResult` pairing
- * preservation through `replaceWithSentinel`.
  *
- * Regression history: an earlier version of `createPiAssistantPart.replaceWithSentinel`
- * replaced the entire toolCall part with `{ type: "text", text: "[dropped §N§]" }`,
- * destroying the `id` field. The corresponding `toolResult` message
- * (separate role, separate `toolCallId`) then became orphaned, and Codex
- * rejected the request with:
  *
- *   `Error: No tool call found for function call output with call_id call_…`
  *
- * (Anthropic produces a similarly fatal "tool_use blocks must be followed by
- * matching tool_result blocks" error in the same scenario.)
+ * Anthropic requires each `tool_use` block to be followed by a matching `tool_result` block.
  *
- * The fix preserves the toolCall structural shape — `{ type: "toolCall", id,
- * name, arguments }` — and only replaces `arguments` with a tiny sentinel
- * marker. The provider serializer still emits a `function_call` / `tool_use`
- * block with the original `call_id`, the toolResult message stays paired,
- * and the API accepts the request.
+ * Sentinel replacement preserves `toolCall.id` and `toolCall.name` and replaces only `toolCall.arguments`.
+ * Anthropic pairs `tool_result.toolCallId` with `tool_use.id`.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -64,25 +52,18 @@ describe("transcript-pi tool pairing preservation", () => {
 
 		const transcript = createPiTranscript(messages, "ses_pair_test");
 
-		// Find the assistant's tool_use part and call drop()/replaceWithSentinel
-		// on it (mirrors what tag-driven heuristic cleanup does in production).
 		const assistantMsg = transcript.messages[1];
 		expect(assistantMsg).toBeDefined();
 		const toolUsePart = assistantMsg.parts.find((p) => p.kind === "tool_use");
 		expect(toolUsePart).toBeDefined();
 		expect(toolUsePart?.id).toBe("call_abc123");
 
-		// This is the call path heuristic-cleanup uses through the TagTarget.drop()
-		// indirection; we exercise it directly here.
 		const replaced = toolUsePart?.replaceWithSentinel("[dropped §42§]");
 		expect(replaced).toBe(true);
 
 		transcript.commit();
 		const out = transcript.getOutputMessages();
 
-		// 1. The assistant message still exists and still has a toolCall part
-		//    with the same id and name. This is the API-level requirement —
-		//    Codex/Anthropic match `tool_use.id` with `tool_result.toolCallId`.
 		const outAssistant = out[1] as {
 			content: Array<{ type: string; id?: string; name?: string }>;
 		};
@@ -91,8 +72,6 @@ describe("transcript-pi tool pairing preservation", () => {
 		expect(outToolCall?.id).toBe("call_abc123");
 		expect(outToolCall?.name).toBe("mcp_read");
 
-		// 2. The toolResult message is unchanged in role/toolCallId — pairing
-		//    intact for the provider serializer.
 		const outToolResult = out[2] as {
 			role: string;
 			toolCallId: string;
@@ -152,11 +131,10 @@ describe("transcript-pi tool pairing preservation", () => {
 		expect(outCall.type).toBe("toolCall");
 		expect(outCall.id).toBe("call_xyz");
 		expect(outCall.name).toBe("mcp_read");
-		// arguments are reduced to the sentinel marker — bulk gone.
 		expect(outCall.arguments).toEqual({
 			__magic_context_dropped__: "[dropped §1§]",
 		});
-		// The full original args do NOT survive.
+		// `replaceWithSentinel` discards the original `toolCall.arguments`.
 		expect(JSON.stringify(outCall.arguments).length).toBeLessThan(200);
 	});
 

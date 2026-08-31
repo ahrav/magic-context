@@ -70,9 +70,7 @@ import {
 import { writePiSettingsPackage } from "./setup-pi";
 
 const PACKAGE_NAME = "@cortexkit/pi-magic-context";
-// Pi 0.74.0 renamed the npm package scope from `@mariozechner/pi-coding-agent`
-// to `@earendil-works/pi-coding-agent`. Magic Context's peerDependency targets
-// the new scope, so older Pi installs cannot load this extension.
+// Pi 0.74.0 changed the package scope from `@mariozechner/pi-coding-agent` to `@earendil-works/pi-coding-agent`; older Pi versions cannot load this extension because its peerDependency uses the new scope.
 const MIN_PI_VERSION = "0.74.0";
 const ROW_COUNT_TABLES = ["tags", "compartments", "claims", "notes", "dream_runs"];
 
@@ -162,7 +160,6 @@ function selfVersion(): string {
             const pkg = req(relPath) as { version?: unknown };
             if (typeof pkg.version === "string") return pkg.version;
         } catch {
-            // Try next layout.
         }
     }
     return "unknown";
@@ -239,20 +236,13 @@ function packagesFrom(settings: Record<string, unknown>): unknown[] {
 }
 
 /**
- * Candidate installed-plugin directories to point the local-embedding-runtime
- * resolver at. Pi's layout varies (verified on disk): a LOCAL DEV-PATH entry in
- * packages[] (e.g. "../../repo/packages/pi-plugin", relative to the agent dir),
- * OR a managed npm install at ~/.pi/agent/npm/node_modules/<pkg> (user) /
- * <cwd>/.pi/npm/node_modules/<pkg> (project). We collect every plausible dir
- * with a package.json; the resolver stays SILENT for any that don't exist.
+ * Pi can install managed packages under `~/.pi/agent/npm/node_modules/<pkg>` or `<cwd>/.pi/npm/node_modules/<pkg>`.
  */
 function piPluginDirCandidates(packages: unknown[], cwd: string): string[] {
     const dirs: string[] = [];
     const agentDir = getPiAgentConfigDir();
 
-    // Local dev-path entries: a string spec that is NOT an npm: specifier and
-    // resolves to a directory on disk. Relative entries are resolved against the
-    // Pi agent dir (Pi's settings.packages base).
+    // Pi resolves relative `packages[]` entries from the agent directory.
     for (const entry of packages) {
         const spec = typeof entry === "string" ? entry.trim() : "";
         if (!spec || spec.startsWith("npm:")) continue;
@@ -260,7 +250,7 @@ function piPluginDirCandidates(packages: unknown[], cwd: string): string[] {
         dirs.push(resolved);
     }
 
-    // Managed npm install roots (hoisted): <root>/node_modules/<pkg>.
+    // Managed installs resolve packages from `<root>/node_modules/<pkg>`.
     dirs.push(join(agentDir, "npm", "node_modules", PACKAGE_NAME));
     dirs.push(join(cwd, ".pi", "npm", "node_modules", PACKAGE_NAME));
 
@@ -278,10 +268,10 @@ function readConfigForEmbedding(
     if (!existsSync(path)) return null;
     try {
         const rawText = readFileSync(path, "utf-8");
-        // SECURITY: project-level config must NOT expand {env:}/{file:} tokens —
-        // a malicious repo could otherwise resolve {env:ANTHROPIC_API_KEY} into a
-        // field we then send to a repo-chosen endpoint. Mirror the runtime loader
-        // (isProjectConfig leaves tokens literal for project config).
+        // Project-level config must leave `{env:}` and `{file:}` tokens literal to prevent a repository-chosen endpoint from receiving secrets.
+        // A malicious repository could resolve `{env:ANTHROPIC_API_KEY}` into a value sent to a repository-chosen endpoint.
+        // Project configuration must leave `{env:}` and `{file:}` tokens literal because a repository can choose the endpoint.
+        // `isProjectConfig` leaves project-config tokens literal, matching the runtime loader.
         const substituted = substituteConfigVariables({
             text: rawText,
             configPath: path,
@@ -549,10 +539,10 @@ async function runHealthChecks(options: {
         add(results, "pass", "Pi Magic Context config loads successfully");
     }
 
-    // Warn when a reasoning model is configured for historian on a provider
-    // known to apply bad default reasoning_effort values (currently GitHub Copilot).
-    // Without an explicit `thinking_level`, Pi leaves the level unset and Copilot
-    // injects "minimal" — which it then rejects with a 400 error.
+    // Copilot injects and rejects `minimal` with HTTP 400 when a reasoning historian omits `thinking_level`.
+    // Without an explicit `thinking_level`, Copilot injects `minimal`, which it rejects with HTTP 400.
+    // Without an explicit `thinking_level`, Pi leaves the level unset and Copilot injects `minimal`.
+    // Copilot rejects its injected `minimal` reasoning effort with HTTP 400.
     const historianModel = loadedConfig.config.historian?.model?.trim() ?? "";
     const historianThinkingLevel = loadedConfig.config.historian?.thinking_level;
     if (historianModel.startsWith("github-copilot/") && !historianThinkingLevel) {
@@ -588,13 +578,11 @@ async function runHealthChecks(options: {
         let db: ContextDatabase | null = null;
         try {
             // Doctor must observe the installed runtime's schema without migrating it.
-            // The existing-only readonly helper applies the schema fence before queries.
             db = options.deps.openExistingContextDatabase(dbPath, { readonly: true });
             if (!db) {
                 add(results, "fail", `Shared context DB no longer exists at ${dbPath}`);
             } else {
                 add(results, "pass", "Opened the shared DB read-only with a supported schema");
-                // Stable storage-version probe: live DB schema vs this binary's fence.
                 const storageVersions = readStorageVersions(db);
                 add(results, "info", formatStorageVersions(storageVersions));
                 const fenceCheck = checkStorageVersionFence(storageVersions);
@@ -639,16 +627,16 @@ async function runHealthChecks(options: {
         }
     }
 
-    // Read user config (tokens expand) and project config (tokens stay literal —
-    // secret boundary) separately so we can apply the same redirect-drop the
-    // runtime loader does: if the PROJECT redirects embedding.endpoint without its
-    // own api_key, the inherited USER api_key must NOT be merged in (it would be
-    // sent to the repo-chosen endpoint — exfiltration).
+    // Doctor reads user and project configs separately so a project endpoint redirect without `api_key` drops the inherited user key.
+    // Project-config tokens remain literal to prevent repository-controlled configuration from reading secrets.
+    // If project configuration redirects `embedding.endpoint` without its own `api_key`, the runtime loader drops the inherited user `api_key`.
+    // The runtime loader must not merge the inherited user `api_key` into a project-controlled endpoint.
+    // Sending the inherited user `api_key` to a repository-chosen endpoint would exfiltrate the key.
     const userRaw = readConfigForEmbedding(userConfigPath, false);
     const projectRaw = readConfigForEmbedding(projectPath, true);
     if (projectRaw) {
-        // Strip project-config fields that must never come from a repo (agent
-        // prompts, sqlite.*, etc.) before they can influence the probe.
+        // Repository-controlled agent prompts and `sqlite.*` fields must not influence the probe.
+        // Repository-controlled agent prompts and `sqlite.*` fields must not influence the probe.
         stripUnsafeProjectConfigFields(projectRaw);
     }
     const mergedEmbedding: Record<string, unknown> = {};
@@ -666,7 +654,7 @@ async function runHealthChecks(options: {
             }
         }
     }
-    // Drop the inherited user api_key if the project redirected the endpoint.
+    // The runtime loader drops the inherited user `api_key` when the project redirects the endpoint.
     if (projectRaw) {
         dropInheritedEmbeddingKeyOnRedirect(
             projectRaw,
@@ -717,11 +705,8 @@ async function runHealthChecks(options: {
     } else if (loadedConfig.config.embedding.provider === "off") {
         add(results, "info", "Embedding provider disabled");
     } else {
-        // Local (default) provider: verify the native ONNX runtime
-        // (onnxruntime-node) actually resolves + has its platform binary. On
-        // Windows it sometimes fails to install and the plugin's static import
-        // throws on every embedding (#128). Layout-agnostic resolution from the
-        // installed plugin dir; stays silent if no plugin dir can be inspected.
+        // The embedding probe requires both `onnxruntime-node` and its platform binary to resolve.
+        // A missing runtime makes the plugin's static import throw for every embedding.
         if (loadedConfig.config.embedding.model === RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL) {
             add(
                 results,
@@ -758,10 +743,7 @@ async function runHealthChecks(options: {
         }
     }
 
-    // Conflict detection — Pi doesn't have known competing context-management
-    // extensions today, but we still check for self-conflicts that the user
-    // can hit (e.g. accidentally registering both an npm entry AND a local
-    // dev-path entry, which causes duplicate plugin loading).
+    // An npm entry and a local development-path entry for the same plugin load the plugin twice.
     const piEntries = packages.filter(isPiMagicContextPackageEntry).map(describePiPackageEntry);
     if (piEntries.length > 1) {
         add(
@@ -811,8 +793,6 @@ async function runHealthChecks(options: {
             .map((line) => line.trim())
             .filter(Boolean);
         add(results, "info", `Log file: ${logPath} (${sizeKb} KB)`);
-        // Sanitize before printing — a raw log line can carry a secret/path the
-        // user then pastes into a public issue.
         const lastLine = lines.at(-1);
         add(
             results,
@@ -823,10 +803,6 @@ async function runHealthChecks(options: {
         add(results, "info", `No plugin log file yet at ${logPath}`);
     }
 
-    // Historian dumps now live per-project under `<dir>/.cortexkit/magic-context/historian/`
-    // and are surfaced grouped by project. The legacy harness-scoped tmp-dir
-    // layout is still listed when no project-local dumps exist (older plugin
-    // versions or fresh installs).
     const diagnosticsForDumps = await collectDiagnostics(options.cwd);
     const dumpBuckets = diagnosticsForDumps.historianDumps.byProject;
     if (dumpBuckets.length > 0) {

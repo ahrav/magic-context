@@ -1,6 +1,4 @@
-//! Echo host support: one handler that echoes every request body, plus an
-//! in-process host runner for tests that need a live wire endpoint without
-//! a child process.
+//! The module provides an in-process echo host for tests that require a live wire endpoint.
 
 #![allow(dead_code)]
 
@@ -66,7 +64,6 @@ impl mc_host::McHostHandler for EchoHandler {
     async fn shutdown(&self) {}
 }
 
-/// An in-process echo host on its own runtime thread.
 pub struct InProcessHost {
     pub publication: PathBuf,
     shutdown: mc_host::CancellationToken,
@@ -74,7 +71,6 @@ pub struct InProcessHost {
 }
 
 impl InProcessHost {
-    /// Starts the host and blocks until its publication exists.
     pub fn start(data_dir: &Path) -> Self {
         let publication = mc_host::runtime_dir_path(Some(data_dir))
             .expect("runtime dir")

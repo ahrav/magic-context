@@ -9,9 +9,8 @@ export interface RegisterCtxApproveDeps {
 	db: ContextDatabase;
 	projectDir: string;
 	projectIdentity: string;
-	/** Resolve the project for the invoking context: Pi can `/cd` between
-	 * projects after boot, so approval must target the ACTIVE project, not
-	 * the registration-time one. Absent resolver falls back to boot values. */
+	/** Pi can `/cd` after boot, so the command resolves the invoking context's active project.
+	 * Without `resolveProject`, the command uses the registration-time `projectDir` and `projectIdentity`. */
 	resolveProject?: (ctx: { cwd: string }) => {
 		projectDir: string;
 		projectIdentity: string;

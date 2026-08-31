@@ -66,13 +66,7 @@ function getUpdateTagInputByteSizeStatement(db: Database): PreparedStatement {
 }
 
 /**
- * Bump a tag's byte_size when a later occurrence of the same call_id
- * carries a larger payload. Used by `tagTranscript` to record the
- * tool-result payload size after the tool-use invocation already
- * reserved the tag with the args size.
  *
- * No-op if newByteSize is not strictly larger than the stored value
- * (caller should compare in memory and only call when necessary).
  */
 export function updateTagByteSize(
     db: Database,
@@ -84,33 +78,21 @@ export function updateTagByteSize(
 }
 
 /**
- * Per-owning-message token totals for the ACTIVE tags of a session, keyed by
- * the real message id (not the synthetic content id). Both the sidebar
- * breakdown and the protected-tail true-raw measurement index into this by the
- * message ids they already hold (their window / eligible slice), so the result
- * is window-scoped by construction — it never overcounts a still-active tag
- * that has been trimmed out of the live window.
+ * `MessageTokenTotal` records active-tag token totals by owning message.
  *
  * Owner derivation:
- *   - tool tags: `tool_owner_message_id` (the assistant message that invoked).
- *   - message/file tags: `message_id` is the content id `${msgId}:pN` /
- *     `${msgId}:fileN`; the real message id is the prefix before the last
+ * For message and file tags, `message_id` has the form `${msgId}:pN` or `${msgId}:fileN`.
+ * The real message ID is `message_id` without its final `:pN` or `:fileN` suffix.
  *     `:p`/`:file` segment.
  *
- * Each entry carries the conversation/toolCall split (reasoning always folds
- * into conversation, mirroring the live per-part walk) plus `hasNull`: true
- * when any contributing tag still has a NULL token_count (legacy row written
- * before the column existed), signalling the caller to tokenize+backfill that
- * message this pass instead of trusting the stored sum.
+ * `hasNull` is true when any contributing tag has a NULL `token_count`.
  */
 export interface MessageTokenTotal {
     conversation: number;
     toolCall: number;
     /**
-     * Tool OUTPUT tokens only (the ctx_reduce-droppable payload), excluding tool
-     * input args — this is the "reclaimable" figure the nudge channels gate on,
-     * matching the legacy `computeTailToolTokens` semantics (which summed
-     * `state.output`). `toolCall` = this + input args, for the sidebar bucket.
+     * `toolOutput` contains only ctx_reduce-droppable tool output and excludes input-argument tokens.
+     * `toolCall` equals `toolOutput` plus input-argument tokens.
      */
     toolOutput: number;
     hasNull: boolean;
@@ -130,14 +112,10 @@ function ownerMessageIdForTagRow(row: {
 }
 
 /**
- * Session-level aggregate of ACTIVE tag token counts — the real live-tail
- * weight EXCLUDING injected m[0]/m[1] blocks (which are never tagged). This is
- * the single source for the nudge channels:
+ * `ActiveTagTokenAggregate` records active-tag token totals for the live tail.
  *   - liveTail   = conversation + toolCall  (real user/assistant + tool I/O)
  *   - reclaimable = toolOutput              (non-dropped, ctx_reduce-droppable)
  *   - usable      = executeThresholdTokens − inputTokens + liveTail
- * `nullCount` > 0 means some active tags are legacy/un-backfilled this pass; the
- * caller may fall back to the byte-approx path until they converge.
  */
 export interface ActiveTagTokenAggregate {
     conversation: number;
@@ -147,24 +125,20 @@ export interface ActiveTagTokenAggregate {
 }
 
 /**
- * @param protectedTags When > 0, the `toolOutput` (reclaimable) total EXCLUDES
- * the top-N active tag numbers — the exact set `ctx_reduce` refuses to drop (it
- * defers the N highest active tag numbers; see ctx-reduce/tools.ts). The nudge's
- * "reclaimable" figure must match what the agent can actually drop, or it nags
- * about protected tail output the agent cannot act on (re-firing forever).
- * `conversation`/`toolCall` are NOT narrowed — they feed `usable`, the full
- * working range, where protected content still counts. Default 0 = no exclusion.
+ * When `protectedTags > 0`, `toolOutput` excludes the N highest active tag numbers.
+ * `ctx_reduce` defers the N highest active tag numbers.
+ * `toolOutput` excludes protected output so the nudge does not re-fire for output the agent cannot drop.
+ * `conversation` and `toolCall` include protected content because `usable` measures the full working range.
  */
 export function getActiveTagTokenAggregate(
     db: Database,
     sessionId: string,
     protectedTags = 0,
 ): ActiveTagTokenAggregate {
-    // Reclaimable tool output excludes the protected top-N tags. The cutoff is
-    // the N-th highest active tag number; a tag is droppable iff its number is
-    // strictly below it. When there are fewer than N active tags the subquery
-    // yields NULL → `tag_number < NULL` is never true → reclaimable 0 (everything
-    // protected), which is correct. protectedTags <= 0 takes the unfiltered path.
+    // The cutoff is the N-th highest active tag number.
+    // A tag is droppable iff its number is below the cutoff.
+    // When fewer than N active tags exist, the cutoff subquery returns `NULL`.
+    // When the cutoff is `NULL`, `tag_number < NULL` is never true, so reclaimable output is 0.
     const toolOutputExpr =
         protectedTags > 0
             ? `COALESCE(SUM(CASE WHEN type = 'tool' AND tag_number < (
@@ -199,36 +173,26 @@ export interface ToolReclaimHintTag {
 }
 
 export interface AgeReclaimToolTag extends ToolReclaimHintTag {
-    /** Cached output + input tokens; null means the legacy row has no size estimate. */
+    /** `null` means no size estimate. */
     reclaimableTokens: number | null;
 }
 
 /**
- * Oldest active tool tags the agent can actually drop (excludes the protected
- * newest active tag window, matching ctx_reduce/applyPendingOperations). Used
- * only to render lightweight nudge hints; it never mutates tag state.
+ * The hint query returns the oldest active tool tags outside the protected newest-tag window.
  */
 /**
- * Tools whose output is task / plan STATE, never appropriate to surface as a
- * "you could drop this" hint regardless of size. `todowrite` is the agent's
- * working plan: the canonical task-list state is the synthetic todowrite we inject
- * (and protect from dropping), so suggesting the agent drop a todowrite output
- * is both pointless and confusing. Name-excluded (not just floor-excluded)
- * because a todowrite output can be several hundred tokens, above the floor.
+ * `todowrite` outputs contain task/plan state and are never valid reclaim hints.
  */
 const RECLAIM_HINT_EXCLUDED_TOOLS = ["todowrite"] as const;
 
 /**
- * A reclaim hint should point at MEANINGFULLY reclaimable output, not a
- * 30-token status line or a tiny control-plane call (ctx_reduce, bash_status,
- * check_comments…). Tags whose cached token total is known AND below this are
- * skipped. A tag with NO cached token count is NOT excluded by the floor (we
- * cannot size it, so we never hide a potentially-large output).
+ * Tags with a known combined token count below `AGE_RECLAIM_MIN_TOKENS` are excluded.
+ * Tags with NULL `token_count` and `input_token_count` remain eligible because their combined size is unknown.
  */
 export const AGE_RECLAIM_MIN_TOKENS = 250;
 
-// Constant-folded literal list (the names are compile-time constants, never
-// user input), so the prepared SQL text stays static across calls.
+// The literal list is compile-time constant and never includes user input.
+// The prepared SQL text remains static across calls.
 const RECLAIM_HINT_EXCLUDED_LIST = RECLAIM_HINT_EXCLUDED_TOOLS.map(
     (name) => `'${name.replace(/'/g, "''")}'`,
 ).join(", ");
@@ -249,10 +213,6 @@ export function getOldestActiveUnprotectedToolTags(
                     ORDER BY tag_number DESC LIMIT 1 OFFSET ?
                 )`
             : "";
-    // Drop task/plan-state tools (todowrite) and trivially-small outputs (below
-    // the token floor) from the hint, since they are not worth a drop suggestion.
-    // Unsized tags (both token columns NULL) pass the floor clause so a
-    // not-yet-backfilled large output is never wrongly hidden.
     const excludeStateTools = RECLAIM_HINT_EXCLUDED_LIST
         ? `AND (tool_name IS NULL OR tool_name NOT IN (${RECLAIM_HINT_EXCLUDED_LIST}))`
         : "";
@@ -287,8 +247,8 @@ export function getOldestActiveUnprotectedToolTags(
 const getActiveToolTagsForAgeReclaimStatements = new WeakMap<Database, PreparedStatement>();
 
 /**
- * Return age-reclaim candidates with the same persisted token estimate used by reclaim hints.
- * The newest ctx_reduce exemplars are omitted before the watermark/value checks in the caller.
+ * The function returns age-reclaim candidates with the same persisted token estimate used by reclaim hints.
+ * The function omits the newest ctx_reduce exemplars.
  * Legacy rows with neither token column populated remain eligible for fail-safe reclaim.
  */
 export function getActiveToolTagsForAgeReclaim(
@@ -331,30 +291,16 @@ export function getActiveToolTagsForAgeReclaim(
 }
 
 /**
- * Upper bound on the historian's true-raw ELIGIBLE tokens for the cheap
- * trigger pre-gate. Sums `active` AND `dropped` tags: a ctx_reduce/emergency
- * drop removes a tool output from the wire (and the active set) but its raw
- * content stays in OpenCode's DB and still counts toward the historian's
- * chunk size — an active-only bound undercounts after drops and wrongly
- * suppresses real tail-size triggers. `compacted` tags are excluded: they sit
- * before the last compartment boundary by construction, so they can't be in
- * the eligible window (including them would only make the gate uselessly
- * conservative). nullCount spans the same active+dropped set — the bound is
- * only trustworthy when every contributing row has a cached token count.
+ * The sum is an upper bound on eligible historian tokens for the pre-gate.
+ * The token bound is valid only when every contributing row has a cached token count.
  */
 export function getTriggerTagTokenUpperBound(
     db: Database,
     sessionId: string,
     floor = 0,
 ): { bound: number; nullCount: number } {
-    // floor > 0 (OpenCode) restricts to the live-wire range (tag_number >= floor).
-    // The bound is an UPPER BOUND on the historian's eligible-tail tokens; the
-    // eligible tail ⊆ the live wire, so the scoped sum is still a valid (tighter,
-    // more accurate) upper bound. Critically it also fixes nullCount: pre-floor
-    // legacy tags are never backfilled (the tagger only backfills the scoped
-    // tail), so a whole-session nullCount stays ~95k forever and the cheap-skip
-    // can NEVER trust the bound — scoping drops nullCount to ~0 so the gate finally
-    // works. floor=0 (Pi / no-floor fallback) keeps the full-session scan.
+    // The eligible tail is a subset of the live wire, so the scoped sum remains an upper bound.
+    // Restricting the scan to `floor` excludes pre-floor rows from `nullCount`.
     const sql =
         floor > 0
             ? `SELECT
@@ -407,8 +353,6 @@ export function getActiveTagTokenTotalsByMessage(
         } else {
             entry.conversation += row.token_count ?? 0;
         }
-        // Reasoning always counts as conversation (mirrors the live walk),
-        // regardless of which tag type it was stored on.
         entry.conversation += reasoning;
         if (row.token_count === null) entry.hasNull = true;
     }
@@ -416,8 +360,6 @@ export function getActiveTagTokenTotalsByMessage(
 }
 
 /**
- * Bump a tag's input_byte_size when a tool_use occurrence is seen
- * after the result occurrence (rare in practice; supports both
  * orderings).
  */
 export function updateTagInputByteSize(
@@ -455,9 +397,6 @@ function getUpdateTagInputTokenCountStatement(db: Database): PreparedStatement {
 }
 
 /**
- * Bump a tag's token_count when a later occurrence of the same call_id carries a
- * larger output payload — the token mirror of `updateTagByteSize`, called from
- * the same site so the cached token count tracks the grown tool result.
  */
 export function updateTagTokenCount(
     db: Database,
@@ -475,7 +414,7 @@ export interface PersistedToolTagAccounting {
     inputTokenCount: number | null;
 }
 
-/** Read the authoritative accounting after an exceptional same-pass owner adoption. */
+/* */
 export function getPersistedToolTagAccounting(
     db: Database,
     sessionId: string,
@@ -504,32 +443,20 @@ export function getPersistedToolTagAccounting(
 }
 
 /**
- * Flat per-message ORIGINAL token map for the protected-tail boundary, keyed by
- * real message id. Sums every tag's stored token weight (output + input +
- * reasoning) for a message REGARDLESS of drop status, because the boundary
- * measures true-raw tokens — the original content the historian re-reads to
- * compact, which lives in opencode.db even when the wire shows a `[dropped]`
- * sentinel. (An active-only sum would undercount the eligible range whenever a
- * tool output had been ctx_reduce-dropped in the live tail.)
+ * The function maps each real message ID to its original token total for the protected-tail boundary.
+ * The boundary includes reasoning tokens regardless of drop status because it uses original content.
  *
- * A message with ANY tag still carrying a NULL token_count (legacy, not yet
- * backfilled) is reported in `nullMessageIds` and omitted from `totals`, so the
- * boundary live-tokenizes it this pass and converges to the stored path after
- * the tagger backfills. Pre-boundary (`compacted`) messages cancel out of the
- * boundary's prefix-difference math, so including them here is harmless.
+ * Messages with a null tag token_count are omitted so the boundary retokenizes them.
+ * Pre-boundary (`compacted`) messages cancel out of the boundary's prefix-difference math.
+ * Pre-boundary (`compacted`) messages cancel out of the boundary's prefix-difference math, so including them is harmless.
  */
 export function getAllStatusTagTokenTotalsFlat(
     db: Database,
     sessionId: string,
     floor = 0,
 ): { totals: Map<string, number>; nullMessageIds: Set<string> } {
-    // floor > 0 (OpenCode) loads only the live-wire range (tag_number >= floor):
-    // tag_number is monotonic with message order, so every tag below the first
-    // wire message is compacted-away history the boundary never indexes. The
-    // boundary only looks up totals for messages in the live slice (all >= floor
-    // by construction), and any excluded slice message degrades to live
-    // tokenization of the same content — byte-identical total. floor=0 (Pi, and
-    // the OpenCode no-floor fallback) keeps the full-session scan unchanged.
+    // tag_number is monotonic with message order.
+    // Tags below the first wire message are compacted history that the boundary never indexes.
     const rows = (
         floor > 0
             ? db
@@ -557,15 +484,9 @@ export function getAllStatusTagTokenTotalsFlat(
     const totals = new Map<string, number>();
     const nullMessageIds = new Set<string>();
     for (const row of rows) {
-        // NULL-owner tool rows (pre-v10 unadopted orphans): `ownerMessageIdForTagRow`
-        // would key them under the bare callId, which `storedTotalForMessage`
-        // (real message ids) never queries — their tokens would be silently
-        // attributed to a key nobody reads, making that MESSAGE's stored total
-        // an undercount. Treat the row as unresolvable instead: we can't know
-        // which message it belongs to, so we can't mark that message NULL
-        // either — skipping is the conservative choice (the affected message's
-        // total simply lacks this orphan's contribution until lazy adoption
-        // resolves the owner, after which it lands under the real id).
+        // NULL-owner tool rows cannot be attributed to a real message id.
+        // NULL-owner tool rows would be keyed by bare callId values that storedTotalForMessage never queries.
+        // A NULL owner cannot identify a message to mark NULL.
         if (row.type === "tool" && row.tool_owner_message_id === null) continue;
         const owner = ownerMessageIdForTagRow(row);
         if (row.token_count === null) {
@@ -583,7 +504,7 @@ export function getAllStatusTagTokenTotalsFlat(
     return { totals, nullMessageIds };
 }
 
-/** Bump a tag's input_token_count — the token mirror of `updateTagInputByteSize`. */
+/* */
 export function updateTagInputTokenCount(
     db: Database,
     sessionId: string,
@@ -594,25 +515,18 @@ export function updateTagInputTokenCount(
 }
 
 /**
- * True when a tag row still has a NULL token_count — i.e. it was written before
- * the token columns existed (legacy) and needs a one-time backfill. Used by the
- * tagger's DB-existing (post-restart cold) path to decide whether to invoke the
- * tokenizer thunk; populated rows skip it so a restart never re-tokenizes.
+ * `NULL` token_count requires backfill.
  */
 export function tagTokenCountIsNull(db: Database, sessionId: string, tagNumber: number): boolean {
     const row = db
         .prepare("SELECT token_count FROM tags WHERE session_id = ? AND tag_number = ?")
         .get(sessionId, tagNumber) as { token_count: number | null } | undefined | null;
-    // `!= null` guards a no-row result (`.get()` yields null, not the JS undefined
-    // sentinel) — `row !== undefined` alone would let that null through to
-    // `null.token_count` and crash.
     return row != null && row.token_count === null;
 }
 
 /**
- * One-time backfill of a legacy tag's token columns. Guarded by
- * `token_count IS NULL` so it is idempotent and a no-op once populated (a later
- * pass / restart cannot clobber a real count). Mirrors the byte columns set at
+ * Backfill legacy token columns only while `token_count` is NULL.
+ * `token_count IS NULL` prevents backfill from overwriting a non-NULL token count.
  * insert time.
  */
 export function backfillTagTokenCounts(
@@ -723,7 +637,6 @@ function isTagRow(row: unknown): row is TagRow {
         typeof r.session_id === "string" &&
         typeof r.tag_number === "number"
     );
-    // reasoning_byte_size may be missing on old rows (ensureColumn adds DEFAULT 0)
 }
 
 function toTagEntry(row: TagRow): TagEntry {
@@ -746,16 +659,10 @@ function toTagEntry(row: TagRow): TagEntry {
         byteSize: row.byte_size,
         reasoningByteSize: row.reasoning_byte_size ?? 0,
         sessionId: row.session_id,
-        // ensureColumn adds DEFAULT 0 but SQLite leaves NULL on pre-existing
-        // rows. Coerce to 0 so downstream callers never see NaN arithmetic.
         cavemanDepth:
             typeof row.caveman_depth === "number" && Number.isFinite(row.caveman_depth)
                 ? row.caveman_depth
                 : 0,
-        // tool_owner_message_id is the third axis of tool-tag identity.
-        // NULL is the legitimate value for non-tool tags AND for legacy
-        // tool tags written before plugin v0.16.x. Lazy adoption +
-        // backfill populate this column at runtime; see plan v3.3.1.
         toolOwnerMessageId:
             typeof row.tool_owner_message_id === "string" ? row.tool_owner_message_id : null,
     };
@@ -778,9 +685,6 @@ function escapeLikePattern(value: string): string {
 }
 
 /**
- * Per-tag token counts (real Claude tokenizer), computed once at insert time.
- * `null` fields mean "not measured" (legacy callers / rows predating the
- * columns); readers treat NULL as a fall-back-per-call signal.
  */
 export interface TagTokenCounts {
     tokenCount: number | null;
@@ -841,11 +745,7 @@ export function updateTagDropMode(
 }
 
 /**
- * Set the caveman compression depth for a tag.
  *
- * Only message tags are expected to receive non-zero depth; callers enforce
- * that. Persisted so later transform passes and restarts can resume without
- * re-compressing text that already matches its target age-tier depth.
  */
 export function updateCavemanDepth(
     db: Database,
@@ -869,7 +769,7 @@ export function updateTagMessageId(
     getUpdateTagMessageIdStatement(db).run(messageId, sessionId, tagId);
 }
 
-/** Return whether this session has any message tag bound to a fallback Pi id. */
+/* */
 export function hasPiFallbackMessageTags(db: Database, sessionId: string): boolean {
     let statement = hasPiFallbackMessageTagStatements.get(db);
     if (!statement) {
@@ -887,12 +787,9 @@ export function hasPiFallbackMessageTags(db: Database, sessionId: string): boole
 }
 
 /**
- * Pi fallback-tag adoption lookup. Find the message-text tag(s) created under a
- * `pi-msg-*` fallback id for a given (session, entry_fingerprint), so the next
- * pass can migrate them onto the message's real SessionEntry id. Returns the
- * candidate rows (tag_number + current message_id) for the caller to apply the
- * per-part uniqueness guard and race-safe migrate. Scoped to `type='message'`
- * and the fallback-id shape so a real-id row is never re-adopted.
+ * The lookup selects message tags under `pi-msg-*` fallback IDs for migration to real SessionEntry IDs.
+ * The caller applies per-part uniqueness checks and race-safe migration to each candidate.
+ * `type = 'message'` and fallback-ID matching exclude real-ID rows from re-adoption.
  */
 export function findAdoptableFallbackTags(
     db: Database,
@@ -913,11 +810,8 @@ export function findAdoptableFallbackTags(
 }
 
 /**
- * Race-safe migrate of a tag's `message_id` from a known old (fallback) value to
- * a new (real) value. The old value in the WHERE clause is the concurrency fence
- * (mirrors `adoptNullOwnerToolTag`'s NULL guard): if a sibling process already
- * migrated or re-keyed the row, `changes === 0` and the caller skips. Returns
- * true iff exactly this migration applied.
+ * `WHERE message_id = oldMessageId` prevents overwriting a row re-keyed by another process.
+ * If another process re-keys the row first, the guarded update affects zero rows.
  */
 export function adoptFallbackTagMessageId(
     db: Database,
@@ -1229,11 +1123,7 @@ export function hasPiFallbackToolOwnerTags(db: Database, sessionId: string): boo
              LIMIT 1`,
         )
         .get(sessionId);
-    // `.get()` returns NULL for a no-row result (empirically true under bun:sqlite;
-    // node:sqlite likewise never returns the JS `undefined` sentinel) — so
-    // `row !== undefined` is TRUE for an EMPTY result, which would defeat this cheap
-    // pre-gate and run the per-pass tool-owner branch-walk for EVERY session. Use
-    // `!= null` to treat both null and undefined as "no row".
+    // `row != null` treats both `null` and `undefined` as no row.
     return row != null;
 }
 
@@ -1297,9 +1187,7 @@ export function adoptPiFallbackToolOwnerTag(
         return { action: "skipped" };
     }
 
-    // The real-id row may have been allocated by a racing pass after adoption's
-    // probe. Preserve that row's tag number so the §N§ already sent on the wire
-    // remains stable, and fold the stale fallback row into it.
+    // A racing pass can allocate the real-id row after adoption.
     foldDuplicateIntoSurvivor(db, sessionId, existing, survivor);
     return {
         action: "folded",
@@ -1345,9 +1233,7 @@ export function adoptPiFallbackMessageTag(
             : { action: "skipped" };
     }
 
-    // A real-id row can appear after the adoption probe but before allocation.
-    // Keep its already-visible tag identity and merge every fallback/duplicate
-    // row into it, rather than replacing the §N§ emitted by the racing pass.
+    // The migration preserves the real-ID row's tag number and merges the fallback row into it.
     const realSurvivor = duplicates[0];
     if (!realSurvivor) return { action: "skipped" };
     const deletedTagNumbers = [tagNumber];
@@ -1364,24 +1250,11 @@ export function adoptPiFallbackMessageTag(
 }
 
 /**
- * Delete every tag whose source content lives on `messageId`. This is
- * the `message.removed` event handler's primary cleanup path.
  *
- * What gets deleted:
- *   - Message tags: `messageId == <removed-msg-id>` (text parts).
- *   - File tags: `messageId LIKE <removed-msg-id>:p%` /
  *     `<removed-msg-id>:file%`.
- *   - Tool tags owned by the removed message:
- *     `tool_owner_message_id == <removed-msg-id>` (v3.3.1 Layer C).
  *
- * Pre-v10 semantics: tool tags used `messageId = callId`, so a removed
- * assistant message would not match any tool tag's `messageId` field
- * (the message id was never written there for tool tags). The fix:
- * include tool tags by composite-owner identity so an assistant
- * message removal correctly cascades to the tool tags it hosted.
+ * Tool tags store the call ID in `messageId`, so removal must match `tool_owner_message_id`.
  *
- * Returns the tag numbers that were deleted (used by the event handler
- * to re-anchor reasoning watermarks and audit logs).
  */
 export function deleteTagsByMessageId(
     db: Database,
@@ -1397,9 +1270,7 @@ export function deleteTagsByMessageId(
             .filter(isTagNumberRow)
             .map((row) => row.tag_number);
 
-        // Tool tags owned by the removed message — `tool_owner_message_id`
-        // can match independent of `messageId` (which is the callId). Pull
-        // these tag numbers BEFORE running the delete so the caller sees
+        // Collect matching tag numbers before deletion so the caller can receive them.
         // the union.
         const ownerScopedTagNumbers = getOwnerScopedToolTagNumbers(db, sessionId, messageId);
 
@@ -1419,7 +1290,7 @@ export function deleteTagsByMessageId(
             deleteToolTagsByOwner(db, sessionId, messageId);
         }
 
-        // De-duplicate — a tag could in theory match both predicates.
+        // Deduplicate matching tag numbers because one tag can match both predicates.
         const merged = new Set<number>([...messageScopedTags, ...ownerScopedTagNumbers]);
         return Array.from(merged).sort((a, b) => a - b);
     });
@@ -1451,11 +1322,8 @@ export function getMaxTagNumberBySession(db: Database, sessionId: string): numbe
 }
 
 /**
- * Look up the tag_number assigned to a specific (session_id, message_id).
  *
- * Used by the tagger's recovery path to bind an existing DB-assigned tag back
- * into the in-memory assignment map without bumping the counter past the DB's
- * actual max. Returns null when no tag exists for that message yet.
+ * Returns null when no tag exists for that message.
  */
 export function getTagNumberByMessageId(
     db: Database,
@@ -1474,23 +1342,17 @@ function isMinTagNumberRow(row: unknown): row is MinTagNumberRow {
     return row !== null && typeof row === "object" && "m" in row;
 }
 /**
- * Lowest `tag_number` among the message/file content-ids of a single raw
- * message id, used to derive the tagger load-scoping floor from the first
- * message(s) in the live wire.
+ * Returns the lowest `tag_number` among message/file content IDs for one raw message ID.
  *
- * message/file tags key on the synthetic content-id `${rawId}:p${n}` /
- * `${rawId}:file${n}`. The half-open range `[rawId+':', rawId+';')` captures
- * exactly one rawId's content-ids: ':' (0x3A) is the field separator and ';'
- * (0x3B) is its immediate successor, so a different rawId (even a prefix like
- * `msg_abc` vs `msg_abcd`) diverges before the ':' and sorts outside the
- * range. This is a sargable index range scan on idx_tags_session_message_id
- * (no LIKE, no wildcard escaping). Tool tags are NOT matched (their message_id
- * is the callId, not `${rawId}:…`) — intentional: the floor bounds message/file
- * tags; tool straddle is handled separately.
+ * Message and file tags use `${rawId}:p${n}` and `${rawId}:file${n}` content IDs.
+ * The half-open range `[rawId + ':', rawId + ';')` selects only `rawId` content IDs.
+ * `:` (0x3A) is the field separator, and `;` (0x3B) is its immediate successor.
+ * `rawId` prefixes sort before `${rawId}:`; the upper bound excludes IDs at or after `${rawId};`.
+ * The range avoids LIKE wildcard escaping.
+ * The range excludes tool tags because their `messageId` is a call ID, not a raw-ID content ID.
  *
- * Returns null when the rawId has no message/file tag yet (untagged synthetic
- * leader) or, defensively, when the rawId itself contains ':' (which would
- * break the delimiter proof — never true for OpenCode `msg_*` ids).
+ * Returns null when `rawId` has no message/file tag.
+ * The function returns null when `rawId` contains `:` because that would invalidate the delimiter range.
  */
 export function getMinMessageTagNumberForRawId(
     db: Database,
@@ -1509,41 +1371,21 @@ export function getMinMessageTagNumberForRawId(
     return isMinTagNumberRow(row) && typeof row.m === "number" ? row.m : null;
 }
 
-// Floor derivation tunables. A LOWER floor only ever loads MORE tags (strictly
-// safe — it can never exclude an in-wire tag); the margin absorbs a tagged
-// leading compaction-summary, near-boundary tool straddles, and reordering at
-// the wire head.
-//   SCAN_HITS    — stop once this many leading messages RESOLVE to a real tag
-//                  (we MIN across them to absorb head reordering).
-//   MAX_PROBES   — hard cap on probes so a fully-ghost/tool-only head can't make
-//                  us scan the whole wire; exhausting it → floor 0 (full scan).
-//   SAFETY_MARGIN     — base margin subtracted from the resolved min.
-//   PER_SKIP_MARGIN   — extra margin per LEADER SKIPPED before the first hit.
+// A lower floor loads more tags and cannot exclude an in-wire tag.
+// Taking the minimum across resolved messages absorbs head reordering.
+// TAGGER_FLOOR_MAX_PROBES caps probes so a ghost- or tool-only head cannot scan the entire wire.
+// If no probe resolves, return floor 0 for a full scan.
+// The margin includes tags immediately preceding the first resolved message.
 export const TAGGER_FLOOR_SCAN_MESSAGES = 8; // SCAN_HITS
 export const TAGGER_FLOOR_MAX_PROBES = 64;
 export const TAGGER_FLOOR_SAFETY_MARGIN = 256;
 export const TAGGER_FLOOR_PER_SKIP_MARGIN = 64;
 
 /**
- * Derive the tagger/scan load-scoping floor from the leading wire message ids:
- * roughly the minimum message/file tag number across the leading messages,
- * minus a safety margin (clamped to 0). Shared by the tagger's `initFromDb` and
- * the compartment trigger's tag scans so both scope to the same live-wire range.
- * Returns 0 when nothing resolves → callers fall back to the full-session scan.
+ * Clamping at 0 preserves 0 as the full-session floor.
+ * The tagger and compartment trigger use the same floor to scope their live-wire tag scans.
  *
- * `getMinMessageTagNumberForRawId` matches ONLY a message's `:p`/`:file` tags,
- * never its tool tags (those key on the callId). So the wire head — which after
- * a compaction marker is frequently a run of tool-only assistant turns and/or
- * tagless ghost/synthetic leaders — returns all-NULL. The old code capped at the
- * first 8 ID-BEARING probes and took their MIN, so such a head exhausted the
- * budget on NULLs → Infinity → floor 0 → the full ~100k-tag scan we are trying
- * to avoid (the live ~66ms compartmentTrigger oscillation).
  *
- * Fix: keep probing PAST NULL leaders until SCAN_HITS messages resolve (bounded
- * by MAX_PROBES). A skipped tool-only leader's tool tags sit just BELOW the
- * first `:p` tag we land on, so we widen the margin by PER_SKIP_MARGIN for every
- * leader skipped before the first hit — the floor still only ever errs LOWER
- * (loads a few extra tags), never higher (never drops a live-wire tag).
  */
 export function deriveTagLoadFloor(
     db: Database,
@@ -1572,11 +1414,7 @@ export function deriveTagLoadFloor(
     return Math.max(0, min - margin);
 }
 
-// Single source-of-truth column list for SELECTs that produce TagEntry.
-// Centralizing this avoids subtle drift when columns are added (e.g.
-// migration v10's tool_owner_message_id) — every TagEntry-producing
-// reader must include the new column or downstream callers will see
-// undefined where they expect a typed field.
+// `TAG_SELECT_COLUMNS` must include every column read by `toTagEntry`.
 const TAG_SELECT_COLUMNS =
     "id, message_id, type, status, drop_mode, tool_name, input_byte_size, byte_size, reasoning_byte_size, session_id, tag_number, caveman_depth, tool_owner_message_id";
 
@@ -1591,24 +1429,9 @@ export function getTagsBySession(db: Database, sessionId: string): TagEntry[] {
     return rows.map(toTagEntry);
 }
 
-// ─── Targeted helpers for the hot transform path ──────────────────────────
 //
-// `getTagsBySession` loads every tag for a session (often 10k–50k rows on
-// long-lived sessions) on every transform pass. Most consumers only need a
-// small slice — the active tags, or the rows whose tag_number is in the
-// current `targets` map, or just the watermark of dropped tag_numbers.
 //
-// These helpers replace the single full-table load with three targeted
-// queries that, combined with the partial indexes added in migration v8
-// (`idx_tags_active_session_tag_number` WHERE status='active' and
-// `idx_tags_dropped_session_tag_number` WHERE status='dropped'), produce
-// index-only scans over the small slice each call site actually cares
-// about. Benchmarked at ~110× speedup on a 49k-tag session (67ms → 0.6ms).
 //
-// We do NOT remove `getTagsBySession`. It remains the right call for the
-// few non-hot-path consumers (compartment-trigger, ctx-reduce tool, etc.)
-// where the full list is genuinely needed. Hot-path consumers (transform,
-// apply-operations, heuristic-cleanup, nudger) should switch to these.
 
 const getActiveTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
 const getNullOwnerToolTagsBySessionStatements = new WeakMap<Database, PreparedStatement>();
@@ -1649,17 +1472,10 @@ function getMaxDroppedTagNumberStatement(db: Database): PreparedStatement {
 }
 
 /**
- * Return only the tags whose status is 'active' for this session.
  *
- * Backed by the partial index `idx_tags_active_session_tag_number` so the
- * scan touches only active rows instead of every tag in the session.
  *
- * Use this in: heuristic cleanup, nudger, caveman replay scope, anywhere
- * that filters `tags.filter(t => t.status === "active")` on the result of
  * `getTagsBySession`.
  *
- * The returned shape matches `TagEntry` exactly so callers can swap with
- * no behavior change beyond seeing fewer (active-only) rows.
  */
 export function getActiveTagsBySession(db: Database, sessionId: string): TagEntry[] {
     const rows = getActiveTagsBySessionStatement(db).all(sessionId).filter(isTagRow);
@@ -1667,10 +1483,8 @@ export function getActiveTagsBySession(db: Database, sessionId: string): TagEntr
 }
 
 /**
- * Attribution rows for final rendered-tail accounting. Active, non-protected
- * rows identify reclaimable token mass (U). Legacy tool rows with no owner are
- * included regardless of status so duplicate call IDs remain visible and the
- * orphan resolver can reject ambiguous matches.
+ * getTailHygieneTags returns tags used for final rendered-tail accounting.
+ * Tool tags with no owner are included regardless of status.
  */
 export function getTailHygieneTags(db: Database, sessionId: string): TagEntry[] {
     const active = getActiveTagsBySession(db, sessionId);
@@ -1693,8 +1507,6 @@ export function getTailHygieneTags(db: Database, sessionId: string): TagEntry[] 
 }
 
 /**
- * Return only dropped tags for a session. The partial dropped-tag index avoids
- * loading active and compacted history when a force seed only needs drop state.
  */
 export function getDroppedTagsBySession(db: Database, sessionId: string): TagEntry[] {
     const rows = getDroppedTagsBySessionStatement(db).all(sessionId).filter(isTagRow);
@@ -1702,19 +1514,9 @@ export function getDroppedTagsBySession(db: Database, sessionId: string): TagEnt
 }
 
 /**
- * Return the tags whose tag_number is in `tagNumbers` for this session.
  *
- * Used by `applyFlushedStatuses` (and similar replay loops) to fetch the
- * subset of tags that match the current pass's visible target set rather
- * than scanning every tag in the session.
  *
- * The IN-list is built dynamically because SQLite caches prepared
- * statements per query string, but we still get prepared-statement reuse
- * for any given list size that happens twice in a row (which is the
- * common case during long sessions).
  *
- * Returns an empty array when `tagNumbers` is empty (avoids generating
- * `IN ()` which is an SQL syntax error).
  */
 export function getTagsForPendingOperations(
     db: Database,
@@ -1757,8 +1559,7 @@ export function getTagsByNumbers(
 ): TagEntry[] {
     if (tagNumbers.length === 0) return [];
 
-    // SQLite parameter limit is 999 by default; chunk just in case very
-    // large target sets ever appear (the common case is ~500-1000).
+    // Chunk target sets stay below SQLite's 999-parameter limit.
     if (tagNumbers.length > 900) {
         const all: TagEntry[] = [];
         for (let i = 0; i < tagNumbers.length; i += 900) {
@@ -1778,7 +1579,7 @@ export function getTagsByNumbers(
     return rows.map(toTagEntry);
 }
 
-/** Return only dropped tags whose numbers are visible replay targets. */
+/* */
 export function getDroppedTagsByNumbers(
     db: Database,
     sessionId: string,
@@ -1806,13 +1607,9 @@ export function getDroppedTagsByNumbers(
 }
 
 /**
- * Return the maximum tag_number among tags whose status is 'dropped' for
- * this session, or 0 if no dropped tags exist.
  *
- * Replaces the full-array iteration `for (tag of tags) if (dropped &&
- * tag_number > max) max = tag_number` with a single SQL aggregate.
- * Backed by the partial index `idx_tags_dropped_session_tag_number` so
- * SQLite resolves the MAX with a backward index seek (O(log N)).
+ * SQL MAX avoids loading all dropped tags into memory.
+ * The dropped-tag partial index can avoid scanning non-dropped rows.
  */
 export function getMaxDroppedTagNumber(db: Database, sessionId: string): number {
     const row = getMaxDroppedTagNumberStatement(db).get(sessionId);
@@ -1846,18 +1643,11 @@ export function getTopNBySize(db: Database, sessionId: string, n: number): TagEn
     return rows.map(toTagEntry);
 }
 
-// ─── Tool-owner composite identity helpers (migration v10) ──────────────────
 //
-// Pre-v10 tool tags were keyed by (session_id, callID); collisions on
-// OpenCode's per-turn callID counter could replay drop status onto fresh
-// content. Post-v10 the persistent identity is the triple
-// (session_id, callID, tool_owner_message_id).
+// Tool tags require composite identity when call IDs can collide.
+// The persistent identity is `(session_id, callID, tool_owner_message_id)`.
 //
-// These helpers form the DB-side surface the runtime tagger uses for the
-// composite-key fast path, the lazy-adoption fallback, and the
-// nearest-prior owner search for result-only windows.
 //
-// See plan v3.3.1 in `.alfonso/plans/tag-owner-fix-plan.md`.
 
 const getToolTagNumberByOwnerStatements = new WeakMap<Database, PreparedStatement>();
 const getNullOwnerToolTagStatements = new WeakMap<Database, PreparedStatement>();
@@ -1879,11 +1669,8 @@ function getGetToolTagNumberByOwnerStatement(db: Database): PreparedStatement {
 }
 
 /**
- * Look up the tag_number for a specific composite tool identity.
  *
- * Returns null when no tag exists for `(sessionId, callId, ownerMsgId)`.
- * This is the fast path for the runtime tagger after a tagger restart
- * or cache eviction.
+ * The runtime tagger uses this lookup after restart or cache eviction.
  */
 export function getToolTagNumberByOwner(
     db: Database,
@@ -1922,20 +1709,10 @@ function getGetNullOwnerToolTagStatement(db: Database): PreparedStatement {
 }
 
 /**
- * Find a NULL-owner tool tag row for `(sessionId, callId)`.
  *
- * Used by the lazy-adoption fast path: when the runtime tagger sees a
- * tool with composite key `(ownerMsgId, callId)` that has no
- * corresponding row in `assignments`, but the underlying callId already
- * exists in DB with NULL owner (legacy pre-v10 row), we want to adopt
- * the orphan rather than allocate a fresh tag. This preserves
- * cache-stable tag numbers across the v9 → v10 upgrade.
+ * Adopt a matching NULL-owner row to preserve its existing tag number.
  *
- * Returns the lowest-numbered NULL-owner row deterministically. The
- * caller is expected to follow up with `adoptNullOwnerToolTag` to
- * atomically claim ownership; if that returns false, another writer
- * adopted first and the caller must re-check the composite-key fast
- * path or allocate a fresh tag.
+ * Treat a false result from `adoptNullOwnerToolTag` as a lost adoption race.
  */
 export function getNullOwnerToolTag(
     db: Database,
@@ -1950,9 +1727,7 @@ export function getNullOwnerToolTag(
 function getAdoptNullOwnerToolTagStatement(db: Database): PreparedStatement {
     let stmt = adoptNullOwnerToolTagStatements.get(db);
     if (!stmt) {
-        // NULL-guarded UPDATE: matches zero rows if another writer
-        // (backfill or a concurrent runtime adoption) already populated
-        // owner. Caller MUST treat changes=0 as "race lost" and
+        // Treat `changes = 0` as a lost adoption race.
         // recover.
         stmt = db.prepare(
             `UPDATE tags
@@ -1965,13 +1740,7 @@ function getAdoptNullOwnerToolTagStatement(db: Database): PreparedStatement {
 }
 
 /**
- * Atomically adopt a NULL-owner tool tag row by setting
- * `tool_owner_message_id = ownerMsgId`. Returns true if exactly one
- * row was updated (we won the race), false if zero (someone else
- * adopted between our SELECT and UPDATE).
  *
- * The NULL guard makes this concurrent-safe with both the backfill
- * pass and concurrent runtime adoptions in other plugin processes.
  */
 export function adoptNullOwnerToolTag(db: Database, rowId: number, ownerMsgId: string): boolean {
     const result = getAdoptNullOwnerToolTagStatement(db).run(ownerMsgId, rowId);
@@ -1979,21 +1748,8 @@ export function adoptNullOwnerToolTag(db: Database, rowId: number, ownerMsgId: s
 }
 
 /**
- * Returns the candidate tool-tag owner ids for `(sessionId, callId)` —
- * every tag with a non-NULL owner. Used by the result-only-window
- * fallback in `tag-messages.ts`: the caller resolves wall-clock times
- * for every candidate against the OpenCode DB (via
- * `getMessageTimesFromOpenCodeDb`) and picks the most recent one whose
- * `time_created` precedes the current result message.
  *
- * The picking logic lives in the caller because resolving message times
- * requires the OpenCode read-only DB handle, which lives in the hooks
- * tree. Keeping that import one-way (hooks → features) avoids what
- * would otherwise be a cycle through the storage barrel.
  *
- * Returns an empty array when no candidates exist; the caller falls back
- * to `messageId` (the result's own id) in that case so the runtime
- * still allocates a stable composite key.
  */
 export function getCandidateToolOwners(db: Database, sessionId: string, callId: string): string[] {
     const rows = db
@@ -2010,21 +1766,8 @@ export function getCandidateToolOwners(db: Database, sessionId: string, callId: 
 }
 
 /**
- * Pick the most recent (by OpenCode `time_created`) candidate owner
- * whose message strictly precedes `currentMessageId`. Tie-break on
- * lexicographic id, matching the legacy single-statement ordering
- * (`ORDER BY time_created DESC, id DESC` limited to rows where
- * `time_created < currentTime`).
  *
- * Returns null when:
- *   - The candidate list is empty
- *   - `currentMessageId` is not present in `times`
- *   - No candidate predates `currentMessageId` in OC time
  *
- * This helper is independent of any DB handle — the caller resolves the
- * `times` map (typically via `getMessageTimesFromOpenCodeDb`) and passes
- * it in. Splitting the lookup from the picking keeps `storage-tags.ts`
- * free of any OpenCode-DB import.
  */
 export function pickNearestPriorOwner(
     candidates: readonly string[],
@@ -2048,18 +1791,8 @@ export function pickNearestPriorOwner(
 }
 
 /**
- * Legacy alias kept for the rare runtime call site that hasn't been
- * migrated to the split lookup-then-pick form. Always returns null
- * (no message-time data available without a DB handle the function
- * itself can't reach). New call sites should use `getCandidateToolOwners`
- * + `getMessageTimesFromOpenCodeDb` + `pickNearestPriorOwner` directly.
+ * Callers needing owner selection must resolve message times before calling `pickNearestPriorOwner`.
  *
- * Why we keep this name: the v3.3.1 plan documents this as the public
- * entry point for the result-only-window fallback. Removing it would
- * require touching `.alfonso/plans/tag-owner-fix-plan.md` and migrating
- * the test fixtures that exercise it. Leaving the symbol present with
- * a noop body keeps existing test scaffolds working while the actual
- * pick happens in the hooks-tree caller.
  */
 export function getPersistedToolOwnerNearestPrior(
     _db: Database,
@@ -2085,16 +1818,8 @@ function getDeleteToolTagsByOwnerStatement(db: Database): PreparedStatement {
 }
 
 /**
- * Delete every tool tag owned by `ownerMsgId` in the session. Used by
- * `message.removed` cleanup to scope the deletion correctly: pre-v10
- * a removed assistant message would `deleteTagsByMessageId(messageId)`
- * which only matched `message_id = messageId` (the contentId for text
- * parts), missing tool tags whose `message_id` is the callID. Post-v10
- * the owner column gives us the right scope.
+ * `NULL` `tool_owner_message_id` rows are not deleted.
  *
- * Returns the number of rows deleted. NULL-owner legacy rows are not
- * matched by this helper — they remain reachable via `message_id`-only
- * deletion paths until adopted or backfilled.
  */
 export function deleteToolTagsByOwner(db: Database, sessionId: string, ownerMsgId: string): number {
     const result = getDeleteToolTagsByOwnerStatement(db).run(sessionId, ownerMsgId);

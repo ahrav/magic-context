@@ -1,40 +1,18 @@
 /**
- * Pi historian runner — Step 4b.3b.
  *
- * Mirrors `compartment-runner-incremental.ts` (OpenCode) but uses
- * `PiSubagentRunner` (spawns `pi --print --mode json` subprocess) for the
- * actual historian invocation instead of `client.session.create` + prompt.
+ * The Pi historian runner invokes `PiSubagentRunner` instead of `client.session.create`.
  *
- * What this runner does:
- *   1. Read existing compartments + facts for this session
- *   2. Validate stored compartments are sane
- *   3. Compute eligible chunk start (after last compartment, before protected tail)
- *   4. Read raw chunk via shared `readSessionChunk` (using Pi RawMessageProvider)
- *   5. Build prompt via shared `buildCompartmentAgentPrompt`
- *   6. Spawn historian subagent via `PiSubagentRunner.run()`
- *   7. Parse + validate output via shared `validateHistorianOutput`
- *   8. On validation failure: try repair pass (one retry)
- *   9. Append new compartments + replace facts atomically
- *  10. Queue drops for compartmentalized message range
- *  11. Promote facts to project memories (if memory.enabled + auto_promote)
- *  12. Emit success notification (if notifier provided)
+ * The eligible chunk begins after the last compartment and excludes the protected tail.
+ * The runner retries validation failures once with a repair pass.
+ * The runner appends compartments and replaces facts atomically.
+ * The runner promotes facts only when `memory.enabled` and `auto_promote` are enabled.
  *
- * What this runner does NOT do (deferred to later slices):
- *   - OpenCode-style compaction markers (Pi has native compaction)
- *   - Compressor pass (Step 4b.4 territory)
- *   - Two-pass editor mode (config option, defer)
- *   - Note nudge triggers (Step 4b.4 territory)
- *   - Emergency 95% recovery (defer)
- *   - User memory candidate extraction (defer to dedicated slice)
- *   - In-flight cancellation via AbortSignal (PiSubagentRunner handles per-run timeout)
+ * Pi relies on native compaction instead of OpenCode-style compaction markers.
+ * `PiSubagentRunner` enforces each run's timeout; this runner does not accept an `AbortSignal`.
  *
- * Failure handling philosophy: like OpenCode, this runner is fail-closed —
- * any validation/parse/spawn failure leaves stored compartments untouched
- * and increments the historian failure counter so the next pass can
- * react. We never write partial state.
+ * On validation, parse, or spawn failure, the runner leaves stored compartments unchanged and increments the historian failure counter.
  *
- * Logs go through the shared sessionLog so OpenCode log-tailing tools
- * see Pi runs in the same `[magic-context][ses_xxx]` format.
+ * Pi logs use `sessionLog` so OpenCode log-tailers receive `[magic-context][ses_xxx]` entries.
  */
 
 import * as crypto from "node:crypto";
@@ -128,7 +106,7 @@ const HISTORIAN_AGENT_NAME = "magic-context-historian";
 const DEFAULT_HISTORIAN_TIMEOUT_MS = 120_000;
 const MAX_HISTORIAN_RETRIES = 2;
 
-/** Keep historian alert noise to once per minute per session. */
+/** The runner emits at most one historian alert per session per minute. */
 const HISTORIAN_ALERT_COOLDOWN_MS = 60 * 1000;
 const lastHistorianAlertBySession = new Map<string, number>();
 
@@ -228,8 +206,7 @@ async function runHistorianSubagentWithTransientRetries(args: {
 		try {
 			result = await args.runner.run({
 				...args.options,
-				// The historian runner owns fallback iteration because every candidate's
-				// output must be parsed and validated before the chain can stop.
+				// The historian runner must parse and validate each candidate before stopping.
 				fallbackModels: undefined,
 			});
 		} catch (error) {
@@ -324,69 +301,69 @@ function shouldSuppressHistorianAlert(sessionId: string): boolean {
 	return false;
 }
 
-/** Cleanup module-scope state on session deletion. */
+/** `clearPiHistorianAlertState` removes the session's module-scope alert state when the session is deleted. */
 export function clearPiHistorianAlertState(sessionId: string): void {
 	lastHistorianAlertBySession.delete(sessionId);
 }
 
 export interface PiHistorianDeps {
-	/** SQLite handle for the shared cortexkit DB. */
+	/** `db` accesses the shared cortexkit SQLite database. */
 	db: Database;
-	/** Pi-resolved sessionId (from `pi.sessionManager.getSessionId()`). */
+	/* */
 	sessionId: string;
-	/** Project working directory (used for memory project-identity scoping). */
+	/** `directory` scopes memory to the project identity. */
 	directory: string;
-	/** Provider that resolves `readRawSessionMessages(sessionId)` to Pi data. */
+	/** `provider` resolves `readRawSessionMessages(sessionId)` to Pi data. */
 	provider: RawMessageProvider;
-	/** Subagent runner (PiSubagentRunner instance) for historian spawn. */
+	/* */
 	runner: SubagentRunner;
-	/** Historian model id (provider/model) — required for PiSubagentRunner. */
+	/** `historianModel` supplies the provider/model ID required by `PiSubagentRunner`. */
 	historianModel: string;
-	/** Optional ordered fallback chain. */
+	/** The fallback chain tries configured models in order. */
 	fallbackModels?: readonly string[];
-	/** Live session model used as the final fallback after configured fallbacks. */
+	/** The live session model runs after all configured fallbacks. */
 	fallbackModelId?: string;
-	/** Historian context window — used to derive chunk token budget. */
+	/** The historian context window determines the chunk token budget. */
 	historianChunkTokens: number;
-	/** Boundary resolved by the Pi trigger/recovery decision with the real model context. */
+	/** The Pi trigger/recovery decision resolves the boundary using the active model's context limit. */
 	boundarySnapshot?: ProtectedTailBoundarySnapshot;
 	/**
-	 * Optional live boundary resolver used only to recover a stale trigger snapshot.
-	 * It must recompute against the currently registered Pi raw-message provider.
+	 * The live boundary resolver recovers a stale trigger snapshot.
+	 * The live boundary resolver must recompute against the registered Pi raw-message provider.
 	 */
 	refreshBoundarySnapshot?: () => ProtectedTailBoundarySnapshot;
-	/** Current resolved context limit used to reject stale snapshots after model switches. */
+	/** The resolved context limit rejects snapshots made before a model switch. */
 	currentContextLimit?: number;
-	/** Optional per-call timeout (default 120s). */
+	/* */
 	historianTimeoutMs?: number;
-	/** Optional cancellation signal for the historian run and retry backoff. */
+	/* */
 	signal?: AbortSignal;
-	/** Test seam for transient retry backoff. Defaults to OpenCode's retry cadence. */
+	/** The retry backoff defaults to OpenCode's retry cadence. */
 	retryBackoffMs?: (retryIndex: number) => number;
-	/** When true, run a second editor pass after a successful first pass to
-	 *  clean low-signal U: lines and cross-compartment duplicates. Mirrors
-	 *  OpenCode's `historian.two_pass` config. Editor validation falls back
-	 *  to the first-pass result on failure. Default: false. */
+	/**
+	 * The second editor pass removes low-signal `U:` lines and cross-compartment duplicates.
+	 * The `twoPass` option corresponds to OpenCode's `historian.two_pass` config.
+	 * */
 	twoPass?: boolean;
-	/** Pi only: explicit thinking level passed as --thinking <level> to
-	 *  historian subagent invocations. When unset, Pi's own resolution runs
-	 *  (works for most providers; may fail for e.g. github-copilot/gpt-5.4). */
+	/** Pi passes the explicit thinking level as `--thinking <level>` to historian subagent invocations.
+	 * When `thinkingLevel` is unset, Pi resolves the thinking level.
+	 * Pi cannot resolve the default thinking level for `github-copilot/gpt-5.4`. */
 	thinkingLevel?: string;
-	/** Cross-session memory feature gate (`memory.enabled`). */
+	/** `memory.enabled` enables cross-session memory. */
 	memoryEnabled?: boolean;
-	/** Allow a session started exactly in the canonical home directory only when user-level configuration enables it. */
+	/** allowHomeProject permits sessions started exactly in the canonical home directory only when user-level configuration enables it. */
 	allowHomeProject?: boolean;
-	/** Automatic-promotion gate (`memory.auto_promote`). */
+	/* */
 	autoPromote?: boolean;
-	/** User-memory feature gate (`dreamer.user_memories.enabled`). Gates whether
-	 *  historian-extracted user observations are persisted as candidates. */
+	/**
+	 * `dreamer.user_memories.enabled` controls whether historian-extracted user observations are persisted as candidates. */
 	userMemoriesEnabled?: boolean;
 	language?: string;
-	/** Optional callback invoked on successful publication for cache-bust signaling. */
+	/** Successful publication invokes the callback to signal cache invalidation. */
 	onPublished?: () => void;
-	/** Holder id for the DB-backed compartment-state lease guarding publish paths. */
+	/** compartmentLeaseHolderId identifies the DB-backed compartment-state lease holder that guards publish paths. */
 	compartmentLeaseHolderId?: string;
-	/** Optional Pi-native compaction append hook (`sessionManager.appendCompaction`). */
+	/** appendCompaction invokes Pi's `sessionManager.appendCompaction` hook. */
 	appendCompaction?: (
 		summary: string,
 		firstKeptEntryId: string,
@@ -394,18 +371,18 @@ export interface PiHistorianDeps {
 		details?: unknown,
 		fromHook?: boolean,
 	) => string | undefined;
-	/** Optional raw Pi branch entries used to map raw ordinals back to entry ids. */
+	/** readBranchEntries supplies raw Pi branch entries for mapping raw ordinals to entry IDs. */
 	readBranchEntries?: () => unknown[];
-	/** Optional callback for surfacing failure notices (Pi UI / logs). */
+	/** notifyIssue surfaces failure notices in the Pi UI or logs. */
 	notifyIssue?: (message: string) => void | Promise<void>;
-	/** Test seam / embedding bootstrap override. Defaults to Pi directory registration. */
+	/* */
 	ensureProjectRegistered?: (
 		directory: string,
 		db: Database,
 	) => void | Promise<void>;
 	/** Manual wrapup bypasses the pressure-window quota but keeps no-progress protection. */
 	forceDrainQuota?: boolean;
-	/** Persist the final weak-lookahead compartment for coverage while skipping promotion. */
+	/** forceKeepLastCompartment persists the final weak-lookahead compartment for coverage without promoting it. */
 	forceKeepLastCompartment?: boolean;
 }
 
@@ -459,8 +436,6 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 
 	updateSessionMeta(db, sessionId, { compartmentInProgress: true });
 
-	// historian_runs telemetry (migration v24) — recorded ONCE in finally so every
-	// exit path is logged. Best-effort. Mirrors the OpenCode incremental runner.
 	const invocationBaseline = getLatestHistorianInvocationId(db, sessionId);
 	const telemetry: Partial<HistorianRunInput> = {
 		runKind: "incremental",
@@ -478,13 +453,11 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 	};
 
 	try {
-		// All session-data reads in the historian path go through the shared
-		// helpers, which consult our RawMessageProvider for this sessionId.
-		// The withRawMessageProvider scope ensures we unregister even on throw.
+		// The shared helpers consult RawMessageProvider for sessionId.
+		// `withRawMessageProvider` unregisters the provider when its callback throws.
 		await withRawMessageProvider(sessionId, provider, async () => {
 			const priorCompartments = getCompartments(db, sessionId);
 
-			// Sanity-check existing stored state before touching anything.
 			const existingValidationError =
 				validateStoredCompartments(priorCompartments);
 			if (existingValidationError) {
@@ -505,7 +478,6 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				return;
 			}
 
-			// Where does the new chunk start?
 			const offset =
 				priorCompartments.length > 0
 					? priorCompartments[priorCompartments.length - 1].endMessage + 1
@@ -532,12 +504,10 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 								currentContextLimit ?? boundarySnapshot.contextLimit,
 						})
 					: { ok: true as const };
-			// A boundary captured at trigger time can go stale before the detached
-			// historian validates it because new live-tail messages may arrive. Re-resolve
-			// once from the current Pi messages and adopt the result only when it still
-			// exposes an eligible head. The refreshed snapshot recomputes the protected
-			// tail from live messages, so the compacted head cannot include a message that
-			// now belongs to the protected tail.
+			// A trigger-time boundary can become stale before detached historian validation.
+			// New live-tail messages can arrive before detached historian validation.
+			// The historian re-resolves the boundary from current Pi messages and adopts it only when it exposes an eligible head.
+			// The refreshed snapshot recomputes the protected tail from live messages.
 			if (
 				!validation.ok &&
 				validation.reason === "stale_snapshot" &&
@@ -584,7 +554,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				} else {
 					recordHighPressureNoEligibleHead(db, boundarySnapshot);
 				}
-				// Tail exhausted — clear the emergency catch-up latch (see OpenCode).
+				// The historian clears the emergency catch-up latch when the tail is exhausted.
 				clearEmergencyDrainLatch(db, sessionId);
 				return;
 			}
@@ -641,7 +611,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				} else {
 					recordHighPressureNoEligibleHead(db, boundarySnapshot);
 				}
-				// Eligible head produced no compactable chunk — clear the latch.
+				// The historian clears the emergency catch-up latch when an eligible head produces no compactable chunk.
 				clearEmergencyDrainLatch(db, sessionId);
 				telemetry.status = "noop";
 				telemetry.failureReason = "chunk empty after filtering";
@@ -669,10 +639,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				return;
 			}
 
-			// Build prompt: include prior compartments, facts, AND read-only
-			// memory block so historian can dedup new facts against existing
-			// project memories. Cross-harness coherence comes free here —
-			// memories written by OpenCode show up in this Pi historian run.
+			// The prompt includes prior compartments, facts, and a read-only memory block so the historian can deduplicate new facts against existing state.
 			const projectPath = resolveProjectIdentityForSession(
 				directory,
 				allowHomeProject,
@@ -696,13 +663,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			const memoryBlock =
 				renderClaimMemoryBlock(memorySnapshot?.items ?? []) ?? undefined;
 
-			// v2 (E6 parity): bounded reference blocks replace the unbounded
-			// existing-state dump. The historian no longer sees ALL prior
-			// compartments — it gets 4 rotating cross-project seed examples
-			// (importance-band calibration) + the last 6 same-session
-			// compartments (continuity) + <project-memory> for fact dedup.
-			// Bounded forever regardless of session age, so no temp-file
-			// offload is needed. Mirrors the OpenCode incremental runner.
+			// The historian receives bounded reference blocks instead of all prior compartments.
+			// The historian receives four rotating cross-project seed examples for importance-band calibration and the last six same-session compartments for continuity.
 			const projectMemory = memoryBlock ?? "";
 			const references = buildReferenceBlocks({
 				sessionId,
@@ -729,8 +691,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				memoryEnabled: memoryEnabled !== false,
 			});
 
-			// Defensive: use MAX(sequence) + 1 over .length to survive any old
-			// recomp gaps. Same logic as OpenCode runner.
+			// The sequence allocator uses `MAX(sequence) + 1` because recompaction can leave sequence gaps.
 			const maxExistingSequence = priorCompartments.reduce(
 				(max, c) => (c.sequence > max ? c.sequence : max),
 				-1,
@@ -743,15 +704,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				`historian: invoking subagent (model=${historianModel}, chunk=${chunk.startIndex}-${chunk.endIndex}, ${chunk.messageCount} msgs, ~${chunk.tokenEstimate} tokens)`,
 			);
 
-			// Per-pass milestone tracing for the Pi child run. We log the
-			// high-signal lifecycle events (`spawned`, `terminal`, `stderr`,
-			// `child_exit`) so historian failure timelines stay readable in
-			// `magic-context.log`, but skip the full per-event NDJSON stream
-			// (`raw_event`, `first_event`) — those were added during the
-			// April timeout investigation, served their purpose, and would
-			// be excessive in production. If a future hang needs deeper
-			// inspection, set MC_PI_HISTORIAN_TRACE=1 to opt into raw-event
-			// logging without rebuilding.
+			// The historian logs lifecycle events by default so failure timelines remain readable in `magic-context.log`.
+			// The logger skips `raw_event` and `first_event` logs unless `MC_PI_HISTORIAN_TRACE=1` to keep `magic-context.log` readable.
 			const traceRawEvents = process.env.MC_PI_HISTORIAN_TRACE === "1";
 			const buildProgressLogger = (passLabel: string) => {
 				return (event: SubagentProgressEvent) => {
@@ -847,19 +801,12 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				priorCompartments,
 				sequenceOffset,
 			);
-			// Track which subagent run actually produced the validated
-			// draft. This matters for the optional two-pass editor refinement
-			// below: when first-pass validation fails but repair succeeds,
-			// the editor must refine the REPAIR draft (the one that
-			// validated), NOT the original first-pass text. Mirrors
-			// OpenCode parity in `compartment-runner-historian.ts`,
-			// which feeds `firstRun.result` or `repairRun.result` into
-			// `runEditorPassOrFallback` based on which run validated.
+			// The historian keeps the validated run's text so the editor receives repair output when the repair validates.
+			// The editor must refine the repair draft that passed validation.
 			let validatedDraftText: string | null = firstResult.ok
 				? firstResult.assistantText
 				: null;
 
-			// Repair retry on validation failure (mirrors OpenCode behavior).
 			if (validatedPass.kind === "validation-failed") {
 				sessionLog(
 					sessionId,
@@ -897,19 +844,12 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					priorCompartments,
 					sequenceOffset,
 				);
-				// If repair produced a valid result, that's the draft we
-				// want the editor to refine. (If repair also failed,
-				// validatedDraftText doesn't matter — we'll bail before
-				// the editor block.)
 				if (validatedPass.kind === "ok" && repairResult.ok) {
 					validatedDraftText = repairResult.assistantText;
 				}
 			}
 
-			// Escalate through the fallback chain on empty/invalid output. Each
-			// candidate is run and validated explicitly because a model can complete
-			// successfully while producing no usable compartments. The live session's
-			// current model is appended as the final last-resort candidate.
+			// The runner validates every candidate because successful completion can still yield no usable compartments.
 			const fallbackChain = buildHistorianFallbackChain(
 				historianModel,
 				fallbackModels,
@@ -984,21 +924,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			}
 			retainDrainReservationForRetryThrottle = false;
 
-			// Optional two-pass editor refinement. Mirrors OpenCode's
-			// `runEditorPassOrFallback` in `compartment-runner-historian.ts`.
-			// When `historian.two_pass` is enabled, the validated draft is
-			// fed back to the historian agent with the editor system
-			// prompt. The editor cleans low-signal U: lines and
-			// cross-compartment redundancy. If the editor pass fails or
-			// its output fails validation, we fall back to the draft.
+			// When `twoPass` is enabled, the historian replaces the draft only with editor output that passes validation.
 			if (twoPass && validatedPass.kind === "ok") {
-				// Feed the editor the draft that ACTUALLY validated. Without
-				// this fix, when first-pass spawn-failed and repair succeeded,
-				// the editor would silently get an empty string and skip the
-				// editor pass entirely (silent feature regression). When
-				// first-pass validation-failed (parsed but invalid) and repair
-				// succeeded, the editor would refine the BAD original draft
-				// instead of the repaired one. See parity audit Round 7.
 				const draftAssistantText = validatedDraftText ?? "";
 				if (draftAssistantText.trim().length > 0) {
 					sessionLog(sessionId, "historian two-pass: running editor on draft");
@@ -1045,22 +972,16 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 							sessionId,
 							`historian two-pass: editor failed (${editorErr}), falling back to draft`,
 						);
-						// Keep validatedPass as the first-pass result.
 					}
 				}
 			}
 
-			// Discard-last boundary healing (E6 parity with OpenCode): the LAST
-			// compartment of a greedy-consume run was decided WITHOUT lookahead,
-			// so its boundary is structurally unreliable. If historian consumed
-			// ~the whole chunk (≤ SLACK messages of lookahead past the last
-			// compartment), drop that provisional compartment so it's re-derived
-			// next run with real following context (offset re-reads its range).
-			// Require at least two emitted compartments so one remains and publication
-			// advances; never leave the persisted boundary inside a completed invocation/
-			// result pair; and retain everything during emergency recovery for immediate
-			// space relief. Outside emergency recovery, the next run safely re-derives a
-			// discarded compartment with additional following context.
+			// The last compartment of a greedy-consume run has no lookahead, so its boundary is unreliable.
+			// The historian drops the final compartment when at most `HISTORIAN_BOUNDARY_HEALING_SLACK` messages follow it, so the next run re-derives it with following context.
+			// The historian requires at least two emitted compartments so one remains after discarding the provisional tail and publication advances.
+			// The historian never persists a boundary inside a completed invocation/result pair.
+			// During emergency recovery, the historian retains all compartments for immediate space relief.
+			// Outside emergency recovery, the historian re-derives the discarded compartment on the next run with additional following context.
 			const inEmergency = getOverflowState(
 				db,
 				sessionId,
@@ -1120,28 +1041,19 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				}
 			}
 
-			// A wrapup caller may request final weak-lookahead preservation, but the
-			// runner is authoritative: a token-capped chunk (`chunk.hasMore`) still has
-			// more raw history after it, so it must use normal discard-last healing and
-			// promotion. Only the actual final chunk keeps its weak-lookahead tail and
-			// skips unanchored promotion.
+			// Preserve a weak-lookahead tail only for the final raw-history chunk.
+			// Treat `chunk.hasMore` as evidence that raw history remains after a token-capped chunk.
+			// Token-capped chunks use discard-last healing and promotion.
 			const discardedLast = newCompartments.length < emittedCompartments.length;
 			const weakLookaheadFinalCompartment = forceKeepLastCompartmentForChunk;
-			// discard-last runs must also skip unanchored promotion: facts cannot be
-			// attributed to the persisted range, and a reworded re-emission next run
+			// Skip unanchored promotion after discard-last runs because facts cannot be attributed to the persisted range.
 			// would double-store.
 			const skipUnanchoredPromotion =
 				discardedLast || weakLookaheadFinalCompartment;
 
-			// Two distinct gates (parity with OpenCode): embeddingActive = memory
-			// feature on (drives registration + embedding, the ctx_search / dreamer
-			// linking substrate); promotionActive additionally requires auto_promote
-			// (drives writing facts as memories).
 			const embeddingActive = memoryEnabled !== false;
 			const promotionActive = embeddingActive && autoPromote !== false;
 
-			// Events: stored, NOT rendered. Best-effort. discard-last: drop events
-			// anchored to the discarded provisional compartment.
 			const publishableEvents = (validatedPass.events ?? []).filter((e) => {
 				if (typeof e.atCompartment !== "number")
 					return !weakLookaheadFinalCompartment;
@@ -1155,11 +1067,9 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			});
 			let persistedIds: number[] = [];
 
-			// Atomic publication: append + durable facts/events/drop queue + clear failure state.
-			// The Pi-native compaction marker payload is staged in the same
-			// transaction so a crash cannot leave compartments without a queued
-			// marker for the deferred materializing drain. BEGIN IMMEDIATE keeps the
-			// holder check and writes on one fresh write-locked snapshot.
+			// The transaction atomically publishes appended compartments, durable facts, events, the drop queue, and failure-state clearing.
+			// Stage the Pi-native compaction marker payload in the transaction so a crash cannot leave compartments without a marker queued for deferred materialization.
+			// BEGIN IMMEDIATE performs the holder check and writes on a single write-locked snapshot.
 			if (!compartmentLeaseHolderId) {
 				sessionLog(
 					sessionId,
@@ -1181,19 +1091,12 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					return;
 				}
 				appendCompartments(db, sessionId, newCompartments);
-				// Resolve durable ids for the just-appended compartments (last N rows by
-				// sequence — appendCompartments inserts at the tail). Used for events
-				// anchoring + post-commit embeddings.
+				// appendCompartments inserts at the tail, so the last N compartments provide durable IDs for event anchoring and post-commit embeddings.
 				persistedIds = getCompartments(db, sessionId)
 					.slice(-newCompartments.length)
 					.map((c) => c.id);
-				// v2 faithful fact lifecycle (E6 parity): facts are no longer a
-				// REPLACE-the-whole-list store. The historian emits only THIS
-				// chunk's facts (deduped against <project-memory> in the prompt);
-				// they flow to project memory via in-transaction durable promotion.
-				// No replaceSessionFacts — promoted facts reach the agent through the
-				// renderer's m[1] new-memories watermark. Promotion is in the SAME
-				// transaction as the boundary floor below, so both commit or both roll back.
+				// Promote only facts from this chunk; do not replace the session fact list.
+				// Promotion and boundary-floor updates commit or roll back together.
 				if (promotionActive && !skipUnanchoredPromotion) {
 					promoteSessionFactsDurable(
 						db,
@@ -1230,17 +1133,12 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				queueDropsForCompartmentalizedMessages(db, sessionId, lastNewEnd);
 
 				clearHistorianFailureState(db, sessionId);
-				// Healthy historian progress clears the drain-failure backoff. Normal
-				// runs also clear overflow recovery; wrapup keeps it armed until the loop
-				// reaches the keep watermark.
+				// Wrapup retains overflow recovery until the loop reaches the keep watermark.
 				clearHistorianDrainFailure(db, sessionId);
 				recordProtectedTailPublicationFloor(db, sessionId, lastNewEnd + 1);
 				if (!isWrapupInProgress(db, sessionId))
 					clearEmergencyRecovery(db, sessionId);
-				// userObservations are inserted POST-COMMIT
-				// (best-effort, below), not inside this publish transaction. An
-				// auxiliary user_memory_candidates failure must never roll back
-				// compartment publication. Mirrors OpenCode.
+				// Insert userObservations after commit so auxiliary failures cannot roll back compartment publication.
 				if (firstKeptEntryId && lastNewEndMessageId) {
 					setPendingPiCompactionMarkerState(db, sessionId, {
 						firstKeptEntryId,
@@ -1258,16 +1156,12 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					try {
 						db.exec("ROLLBACK");
 					} catch {
-						// Transaction may already be closed by an early rollback.
 					}
 				}
 			}
 
-			// Signal deferred materialization/history-refresh immediately after COMMIT.
-			// All publish-visible durable state (compartments, boundary floor, promoted
-			// facts, event attempts, and drop queue) is already in the transaction above;
-			// embedding registration and provider calls below are post-commit best-effort
-			// and must never leave a committed publish marked failed or unsignaled.
+			// The publisher signals deferred materialization and history refresh immediately after COMMIT.
+			// The transaction contains all publish-visible durable state; embedding registration and provider calls run post-commit on a best-effort basis.
 			onPublished?.();
 			completedSuccessfully = true;
 
@@ -1276,15 +1170,10 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				`historian: published ${newCompartments.length} compartment(s), ${validatedPass.facts?.length ?? 0} fact(s) covering messages ${chunk.startIndex}-${lastNewEnd}`,
 			);
 
-			// Note-nudge trigger #1 (of 3): historian publication is a natural
-			// work boundary, so signal that deferred notes should surface on
-			// the next user turn. Mirrors OpenCode's placement.
+			// Historian publication signals deferred notes for the next user turn.
 			onNoteTrigger(db, sessionId, "historian_complete");
 
-			// user observations are inserted POST-COMMIT,
-			// best-effort, so an auxiliary failure never rolls back the publish.
-			// Gated on the user-memory feature so opted-out users never have
-			// behavioral candidates persisted (privacy parity with OpenCode).
+			// The user-memory gate prevents opted-out users from persisting behavioral candidates.
 			if (
 				userMemoriesEnabled === true &&
 				!skipUnanchoredPromotion &&
@@ -1313,9 +1202,6 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				}
 			}
 
-			// Primers v1 are recall-only side-table writes (dashboard + ctx_search),
-			// never prompt injection. They use the same actual-final weak-lookahead
-			// gate as facts and observations.
 			if (
 				!skipUnanchoredPromotion &&
 				validatedPass.primerCandidates?.length &&
@@ -1324,14 +1210,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				try {
 					const firstNew = newCompartments[0];
 					const lastNew = newCompartments[newCompartments.length - 1];
-					// Stable occurrence key intentionally excludes question text, so a
-					// source chunk stores at most one candidate occurrence (its
-					// origin-compartment tag is the single tagged origin).
 					const [candidate] = validatedPass.primerCandidates;
-					// Origin-tag (mirrors OpenCode): narrow the source to the SPECIFIC
-					// compartment the question came from. originCompartmentIndex is
-					// 1-based into the emitted list (same convention as <events>);
-					// chunk-span fallback when untagged or out of range (non-fatal).
+					// originCompartmentIndex identifies the emitted compartment that produced the question.
 					const idx = candidate.originCompartmentIndex;
 					const origin =
 						typeof idx === "number" && idx >= 1 && idx <= newCompartments.length
@@ -1370,8 +1250,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				}
 			}
 
-			// Raw chunk embeddings: the ctx_search semantic substrate over session
-			// history. Fire-and-forget, best-effort, memory-gated.
+			// Raw chunk embeddings support ctx_search over session history.
 			if (embeddingActive) {
 				const chunksToEmbed = newCompartments
 					.map((c, i) => ({
@@ -1408,7 +1287,6 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				})();
 			}
 
-			// historian_runs telemetry — full success metrics.
 			{
 				const facts = validatedPass.facts ?? [];
 				const validIds = persistedIds.filter(
@@ -1452,9 +1330,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			if (!retainDrainReservationForRetryThrottle) {
 				rollbackDrainReservation();
 			} else {
-				// Genuine historian failure (the retained-reservation retry-throttle
-				// condition) — suppress the emergency catch-up latch bypass for a
-				// short backoff so a broken historian can't retry-thrash. Mirrors
+				// Suppress the emergency catch-up latch during the retained-reservation retry backoff.
 				// OpenCode.
 				recordHistorianDrainFailure(db, sessionId);
 			}
@@ -1490,12 +1366,12 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				discardedLast: telemetry.discardedLast ?? false,
 			});
 		} catch {
-			/* telemetry must not break compaction */
+			/* Telemetry failures must not interrupt compaction. */
 		}
 	}
 }
 
-/** Internal validation result classification — mirrors OpenCode pass result shape. */
+/* */
 type ValidationOutcome =
 	| {
 			kind: "ok";
@@ -1586,12 +1462,10 @@ export function buildPiCompactionSummary(
 		const last = compartments[compartments.length - 1];
 		return `Magic Context compacted messages ${first?.startMessage ?? "?"}-${last?.endMessage ?? "?"}.`;
 	}
-	// Cap the title list so the marker summary stays bounded. This summary lives
-	// behind the compaction boundary (not model-visible — filterCompacted stops
-	// here and <session-history> replaces it), but it IS written to the JSONL and
-	// can surface in Pi's resume picker. Joining ALL titles grows unbounded with
-	// compartment count (a recomp/upgrade on a long session has hundreds), so cap
-	// to the first N and summarize the remainder.
+	// Cap the title list so the marker summary stays bounded.
+	// The marker summary is not model-visible because filterCompacted replaces it with <session-history>.
+	// The marker summary remains written to JSONL.
+	// Joining all titles makes the marker grow without bound as compartment count increases.
 	const MAX_SUMMARY_TITLES = 5;
 	if (titles.length <= MAX_SUMMARY_TITLES) {
 		return `Magic Context compacted: ${titles.join("; ")}`;
@@ -1603,66 +1477,26 @@ export function buildPiCompactionSummary(
 }
 
 /**
- * Find the Pi SessionEntry id whose RawMessage ordinal corresponds to
- * `lastCompactedOrdinal + 1` — i.e., the first entry whose content
- * should survive a Pi-native compaction marker placed after the
- * compartment that ends at `lastCompactedOrdinal`.
+ * Set firstKeptEntryId to the SessionEntry ID for RawMessage ordinal lastCompactedOrdinal + 1 so entries after the compacted compartment survive.
  *
- * # Why this routes through convertEntriesToRawMessages
  *
- * Historian publishes compartments whose `endMessage` ordinal comes
- * from `read-session-pi.ts:convertEntriesToRawMessages` — the
- * canonical Pi ordinal source. Pi's `appendCompaction` API expects
- * `firstKeptEntryId` as a real SessionEntry id.
+ * Use convertEntriesToRawMessages for ordinals because Historian publishes its endMessage values from that source, while appendCompaction requires a real SessionEntry ID for firstKeptEntryId.
  *
- * A previous implementation walked `entries` with its own counter
- * that incremented only on user|assistant roles. That counter
- * diverged from `convertEntriesToRawMessages`, which also emits
- * synthetic-user RawMessages for `toolResult→assistant` transitions
- * (the common pattern in tool-heavy sessions: ~3,005 such transitions
- * out of ~7,423 ordinals in a 2-week tool-heavy session).
+ * Use `convertEntriesToRawMessages` because it emits synthetic-user RawMessages for `toolResult→assistant` transitions.
  *
- * When the counters diverged, the function could never count past
- * `(user_count + assistant_count)` ordinals, returned null for any
- * `lastCompactedOrdinal` beyond that point, and Pi's native compaction
- * marker was silently never written. The Pi JSONL grew unbounded
- * while magic-context kept publishing compartments to its DB
- * (cortexkit issue #X1, surfaced by pi-deferred-compaction-marker
  * e2e test).
  *
- * Now the function delegates to the canonical ordinal source. The
- * RawMessage at ordinal `N` carries `id` populated from either the
- * real underlying entry (user|assistant|unknown role) or the first
- * folded toolResult entry (synthetic user) — never empty.
  *
- * # Why we DEFER (not advance) when the kept-start ordinal is synthetic
  *
- * A folded-toolResult run is emitted as a synthetic-user RawMessage whose id is
- * `${SYNTH_USER_ID_PREFIX}<realToolResultId>` — NOT a real SessionEntry id. Pi's
- * compaction replay (`getBranch`/`buildSessionContext`) starts the kept tail at
- * the entry whose real `entry.id === compaction.firstKeptEntryId`; a synthetic
- * id matches nothing, so the deferred drain would treat the marker as stale,
- * CAS-clear the pending blob, and the native marker would never be written.
+ * Do not pass a folded toolResult RawMessage ID as firstKeptEntryId: its synthetic ID is not a real SessionEntry ID, and compaction replay locates the kept tail by real entry.id.
+ * Synthetic-user IDs do not match `SessionEntry.id` values.
  *
- * `target = lastCompactedOrdinal + 1` is BY CONSTRUCTION the first KEPT-tail
- * raw message (everything at ordinal ≤ lastCompactedOrdinal is summarized). So
- * if the message AT `target` is a synthetic-user (folded toolResult run), it is
- * un-summarized kept-tail content. We must NOT advance past it to a later
- * assistant: that would drop the folded toolResult run entirely (it is neither
- * in the summary — ordinal > the compartment's endMessage — nor in the kept
- * tail). We also cannot cut the boundary AT a toolResult, because the kept tail
- * must not start with an orphaned tool result whose tool_use was summarized
- * (provider 400). Both unsafe options collapse to one correct action: return
- * null and DEFER the marker. The caller stages no marker this pass; the next
- * historian pass re-resolves the boundary once a real, replay-safe entry (the
- * following assistant/user) heads the kept tail — exactly Pi's native behavior
- * of never choosing a tool-result tail as a cut point. Deferring loses no
- * content (nothing is trimmed until a safe boundary exists) and the branch keeps
- * accumulating safely until then.
+ * Ordinals ≤ `lastCompactedOrdinal` are summarized.
+ * A synthetic-user message at `target` is un-summarized kept-tail content.
+ * The function must not advance past an un-summarized synthetic-user boundary to a later assistant.
+ * Advancing to a later assistant would omit the folded toolResult run from the summary and kept tail.
+ * The boundary must not be a toolResult: the kept tail cannot start with a toolResult whose `tool_use` was summarized.
  *
- * If the boundary message resolves to a real (non-synthetic) entry id, use it
- * directly. An empty-id slot (unknown role with no entry id) is also unsafe to
- * cut at, so defer there too.
  */
 export function findFirstKeptEntryId(
 	entries: unknown[],
@@ -1672,11 +1506,6 @@ export function findFirstKeptEntryId(
 	const target = lastCompactedOrdinal + 1;
 	const boundary = rawMessages.find((m) => m.ordinal === target);
 	if (!boundary) return null;
-	// The kept tail must START at this exact message. If it carries a real,
-	// replay-safe entry id, use it. If it is synthetic (folded toolResult run)
-	// or has no id, cutting here is unsafe and advancing past it would drop
-	// kept-tail content — defer the marker until a later pass when a real entry
-	// heads the kept tail.
 	if (boundary.id.length === 0) return null;
 	if (boundary.id.startsWith(SYNTH_USER_ID_PREFIX)) return null;
 	return boundary.id;

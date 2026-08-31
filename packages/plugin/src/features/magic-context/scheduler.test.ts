@@ -122,13 +122,11 @@ describe("createScheduler", () => {
 
     it("never executes from TTL idle when cacheTtl is 'never'", () => {
         const scheduler = createScheduler({ executeThresholdPercentage: 65 });
-        // Last response was 10 days ago — well past any normal TTL.
         const tenDaysAgo = BASE_TIME - 10 * 24 * 60 * 60 * 1000;
         const sessionMeta = createSessionMeta({
             cacheTtl: "never",
             lastResponseTime: tenDaysAgo,
         });
-        // Percentage is below threshold, so the only path to "execute" is TTL expiry.
         const contextUsage = createContextUsage(50);
 
         const decision = scheduler.shouldExecute(sessionMeta, contextUsage, BASE_TIME);
@@ -142,7 +140,6 @@ describe("createScheduler", () => {
             cacheTtl: "never",
             lastResponseTime: BASE_TIME - 10_000,
         });
-        // At threshold — should still execute.
         const contextUsage = createContextUsage(65);
 
         const decision = scheduler.shouldExecute(sessionMeta, contextUsage, BASE_TIME);

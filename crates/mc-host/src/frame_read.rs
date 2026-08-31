@@ -1,38 +1,21 @@
-//! Deadline- and cancellation-bounded frame reads, shared by the host's framing
-//! layer and the client's reader.
 //!
-//! These are the byte-moving mechanics only: fill a buffer, fill a body, discard a
-//! declared body. The protocol policy around them — which lengths are legal, what
-//! an oversize control body means, whether a short read is corruption or an
-//! orderly close — stays with each caller, because the two answer those questions
 //! differently.
 //!
-//! Single-sourced because the mechanics are where the subtle parts live: the
-//! `biased` select that prefers cancellation over another read, treating a
-//! zero-length read as end-of-stream rather than looping, and capping the body
-//! read at the frame boundary so a pipelined next header is never consumed as
-//! body. Two copies of that drifting apart reintroduces exactly the bugs the
-//! comments around them describe.
+//! `biased` gives cancellation precedence when cancellation and a read are both ready.
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Why a bounded read stopped short. Callers map this onto their own error type,
-/// since the same stop means different things to a host framing layer and to a
 /// client reader.
 #[derive(Debug)]
 pub(crate) enum ReadStop {
-    /// The cancellation token fired; no further read was attempted.
     Cancelled,
-    /// A read returned zero bytes with the buffer unfilled.
     Eof,
-    /// The deadline passed before the buffer filled.
     DeadlineExpired,
     Io(std::io::Error),
 }
 
-/// Fills `buf` completely, or stops.
 pub(crate) async fn read_exact<R>(
     reader: &mut R,
     buf: &mut [u8],
@@ -60,11 +43,9 @@ where
     Ok(())
 }
 
-/// Appends exactly `len` body bytes into `buf`.
 ///
-/// `read_buf` appends into spare capacity without zero-initializing it, and
-/// `take` caps the read at the frame boundary even when the allocated capacity
-/// exceeds `len` — without that cap a pipelined next header would be read as this
+/// `read_buf` appends into spare capacity without zero-initializing it.
+/// `take(len as u64)` caps reads at the frame boundary, preventing spare capacity from consuming a pipelined next-frame header.
 /// frame's body.
 pub(crate) async fn read_body<R>(
     reader: &mut R,
@@ -93,8 +74,7 @@ where
     Ok(())
 }
 
-/// Discards exactly `declared` bytes, realigning the stream on a body the caller
-/// refused to buffer.
+/// A successful call discards exactly `declared` bytes to realign the stream.
 pub(crate) async fn drain<R>(
     reader: &mut R,
     declared: usize,

@@ -194,11 +194,8 @@ function findToolUseId(
 }
 
 /**
- * Every todowrite tool-use id in one assistant message.
  *
- * Returning only the first id makes a second pair inside the SAME assistant
- * message invisible, which is one of the two ways a premature newer state hides
- * beside a frozen pair (the other is a second assistant/user shell).
+ * Returning all matching IDs detects a second pair in adjacent assistant and user messages.
  */
 function findToolUseIds(
     message: WireMessage,
@@ -242,21 +239,15 @@ function findToolResultBlock(
     return null;
 }
 
-/** Deterministic prefix carried by every injected synthetic call id. */
+/* */
 export const SYNTHETIC_TODO_CALL_ID_PREFIX = "mc_synthetic_todo_";
 
 /**
- * Every pair on the wire whose tool name is todowrite, in message order.
  *
- * A check that only looks for one expected call id cannot see an ADDITIONAL
- * pair beside it, which is how a premature newer state leaks onto a defer turn
- * while the expected frozen bytes stay intact. All matching ids within an
- * assistant message are enumerated, not just the first, so a second pair sharing
- * one assistant/user shell is counted too.
+ * Returning all matching IDs lets validation detect an additional pair in adjacent assistant and user messages.
  *
- * This matches on tool NAME, so a real executed todowrite pair replayed in
- * history also qualifies. Callers that need injected pairs only must filter on
- * `SYNTHETIC_TODO_CALL_ID_PREFIX` — see `injectedTodoPairs`.
+ * `findSyntheticPairs` matches tool names, so replayed real `todowrite` pairs qualify.
+ * Callers that require injected pairs must filter by `SYNTHETIC_TODO_CALL_ID_PREFIX`.
  */
 export function findSyntheticPairs(
     body: RequestBody,
@@ -287,9 +278,7 @@ export function findSyntheticPairs(
 }
 
 /**
- * The pairs an injector produced, identified by the deterministic call-id
- * prefix rather than by tool name, so a real executed todowrite pair replayed in
- * history is never counted as an injected one.
+ * `SYNTHETIC_TODO_CALL_ID_PREFIX` excludes replayed real `todowrite` pairs.
  */
 export function injectedTodoPairs(body: RequestBody): SyntheticPair[] {
     return findSyntheticPairs(body).filter((pair) =>
@@ -311,7 +300,7 @@ export function syntheticPairBytes(
     return findSyntheticPair(body, callId)?.bytes ?? null;
 }
 
-/** The `todos` array carried by a pair's tool-use input. */
+/* */
 export function pairTodoInput(pair: SyntheticPair | null): unknown {
     if (pair === null) return null;
     const parsed = JSON.parse(pair.bytes) as unknown;
@@ -321,11 +310,7 @@ export function pairTodoInput(pair: SyntheticPair | null): unknown {
 }
 
 /**
- * The todos the pair's tool RESULT reports back.
  *
- * Validating only the assistant-side input leaves the half the agent actually
- * reads unchecked: a correct input and call id beside a stale or fabricated
- * result is a contradictory pair that still satisfies every existence and id
  * assertion.
  */
 export function pairToolResultTodos(pair: SyntheticPair | null): unknown {
@@ -354,10 +339,6 @@ export function pairToolResultTodos(pair: SyntheticPair | null): unknown {
 }
 
 /**
- * Do the wire todos carry exactly the expected items, with priorities already
- * defaulted? Compared field by field on purpose: running the wire side through
- * `normalizedTodoJson` would default a MISSING priority to `medium` and mask the
- * very omission this is meant to catch.
  */
 export function wireTodosMatch(
     wire: unknown,
@@ -647,11 +628,6 @@ function preconditionDependentTodo(
     observation: NormalizedObservation,
 ): PreconditionOutcome {
     const value = observation as DependentTodoObservation;
-    // A missing toolchain is a prerequisite gap, not a blocked dependency
-    // on the root injection variant. Registration-level
-    // `prerequisite: rustPrerequisite` publishes `unavailable` before the
-    // driver runs, so this branch is defense in depth for an observation
-    // produced without the toolchain.
     if (!value.prerequisitesMet) {
         return unmet();
     }
@@ -956,11 +932,6 @@ export async function runOpenCodeTodoScenario(
         return [
             t0Bytes === null ? "replay-t0-present" : null,
             t1Bytes === t0Bytes ? null : "replay-byte-identity",
-            // Anchor T0 to the EXPECTED values before comparing T1 to it. The
-            // four sibling scenarios all cross-check persisted meta against
-            // expected values; this one compared the two reads only to each
-            // other, which two nulls satisfy — so a replay that persists no
-            // anchor at all read as a stable frozen identity.
             metaT0?.todo_synthetic_call_id === prepared.callId
                 ? null
                 : "replay-frozen-call-id",
@@ -1010,10 +981,6 @@ export async function runOpenCodeTodoScenario(
         return [
             baselineBytes === null ? "baseline-pair" : null,
             deferBytes === baselineBytes ? null : "newer-todo-deferred",
-            // Byte-comparing the frozen call id cannot see a SECOND injected
-            // pair emitted for the newer state beside it, and every durable
-            // assertion below stays frozen in that case too. The Rust branch
-            // requires the same single-pair invariant.
             deferBody !== null && injectedTodoPairs(deferBody).length === 1
                 ? null
                 : "newer-todo-single-pair",
@@ -1081,12 +1048,6 @@ export async function runOpenCodeTodoScenario(
     const meta = readOpenCodeTodoMeta(h, sessionId);
     return [
         pressureUsedRealBytes ? null : "real-byte-pressure",
-        // Any synthetic pair, not just the prior call id: a terminal state must
-        // clear the anchor outright, so a REBUILT pair under a fresh call id is
-        // the same defect and must not read as a clean clear. An UNCAPTURED
-        // request is not a clean clear either: `body && …` would short-circuit
-        // to null and report the anchor as cleared when the terminal turn never
-        // reached the provider at all.
         body === null
             ? "terminal-request-captured"
             : findSyntheticPair(body)
@@ -1276,19 +1237,8 @@ async function driveRustRoot(context: CaseDriverContext): Promise<{
                 moduleTodoStateCaptured,
                 providerSyntheticPairPresent:
                     pair !== null &&
-                    // A correct pair beside another injected one still satisfies
-                    // an existence check, and the durable assertion is blind to
-                    // the extra pair, so duplicate or conflicting synthetic
-                    // todos could reach the agent unnoticed.
                     body !== null &&
                     injectedTodoPairs(body).length === 1,
-                // The call id is a hash of the normalized state, so an id match
-                // alone says the injector DERIVED the id from the right state,
-                // not that it shipped that state. Both halves of the pair are
-                // compared: stale or fabricated argument bytes under the
-                // expected id, or a result contradicting its own input, would
-                // otherwise read as correct while the agent sees wrong todos.
-                // `moduleTodoStateCaptured` only proves the durable side.
                 deterministicCallIdMatched:
                     pair?.callId === callId &&
                     wireTodosMatch(pairTodoInput(pair), STATE_X_TODOS) &&
@@ -1296,8 +1246,6 @@ async function driveRustRoot(context: CaseDriverContext): Promise<{
             },
         };
     } catch (error) {
-        // Callers own disposal only once this returns a harness; a setup
-        // failure here would otherwise leak the Rust host for the whole run.
         await h.dispose();
         throw error;
     }
@@ -1315,10 +1263,6 @@ export async function driveTodoSyntheticInjection(
 }
 
 /**
- * Drop the frozen synthetic pair from module-owned state while keeping
- * `last_todo_state`, which is exactly the legacy shape: a session that
- * captured `last_todo_state` before anchors existed. The module rebuilds the
- * pair from that state on the next bust pass
  * (`advance_injection_from_meta`).
  */
 function seedRustLegacyAnchor(h: RustTestHarness, sessionId: string): boolean {
@@ -1387,10 +1331,6 @@ async function driveDependent(
                 providerTransitionCorrect:
                     bytes0 !== null &&
                     bytes1 === bytes0 &&
-                    // Each defer wire must carry exactly one injected pair. The
-                    // byte comparison resolves `root.callId`, so a second pair
-                    // beside the frozen one is invisible to it, and the initial scenario's
-                    // single-pair check covers only the initial bust.
                     [t0, t1].every(
                         (body) =>
                             body !== null &&
@@ -1398,11 +1338,6 @@ async function driveDependent(
                     ),
                 durableTransitionCorrect:
                     state0?.syntheticCallId === root.callId &&
-                    // Both reads being null satisfies plain equality, so an
-                    // implementation that replays the pair while never
-                    // persisting anchor_mid reads as a correct frozen
-                    // transition. Reanchoring each defer can preserve the
-                    // compared bytes too, so the anchor must exist and hold.
                     state0.syntheticAnchorMessageId !== null &&
                     state1?.syntheticCallId === state0.syntheticCallId &&
                     state1?.syntheticAnchorMessageId ===
@@ -1444,10 +1379,6 @@ async function driveDependent(
             const deferBytes = defer
                 ? syntheticPairBytes(defer, root.callId)
                 : null;
-            // Byte-comparing the frozen call id cannot see a SECOND injected
-            // pair emitted for the newer state beside it, and the durable
-            // fields stay frozen in that case too. Require the frozen pair to
-            // be the only injected pair on this wire.
             const deferInjectedPairs = defer ? injectedTodoPairs(defer).length : 0;
             const state = root.h.readModuleTodoState(root.sessionId);
             return {
@@ -1492,14 +1423,6 @@ async function driveDependent(
                     legacySeeded &&
                     before?.syntheticCallId === null &&
                     pressureUsedRealBytes,
-                // The rebuilt pair must carry the deterministic call id for the
-                // retained state, and the following defer pass must replay it
-                // byte-for-byte rather than rebuild it again. Byte-identity
-                // between the two passes says nothing about WHAT was rebuilt:
-                // healing reconstructs the pair after synthetic_todo is deleted,
-                // so incorrect input or result bytes replayed consistently would
-                // pass. The initial scenario's payload check covers the original injection,
-                // not this rebuild.
                 providerTransitionCorrect:
                     bustBytes !== null &&
                     deferBytes === bustBytes &&
@@ -1512,11 +1435,6 @@ async function driveDependent(
                     after?.syntheticCallId === root.callId &&
                     after?.lastTodoState ===
                         normalizedTodoJson(STATE_X_TODOS) &&
-                    // Healing must persist the anchor linkage too. The provider
-                    // bytes cannot stand in: they can be byte-identical while
-                    // `anchor_mid` stays null, which is exactly the catalog's
-                    // invalid "wrong persisted state linkage" shape this
-                    // known-red case is supposed to keep reproducing.
                     after?.syntheticAnchorMessageId !== null,
             };
         }
@@ -1549,14 +1467,8 @@ async function driveDependent(
         return {
             ...base,
             ownActionExecuted: terminalProbe.executed,
-            // Any pair, not just the prior call id: a rebuilt pair under a
-            // fresh call id is the same failure to clear the anchor.
             providerTransitionCorrect:
                 body !== null && findSyntheticPair(body) === null,
-            // Both halves of the frozen pair must go. Clearing the call id
-            // alone also removes the provider pair, so `providerTransitionCorrect`
-            // cannot catch a durable anchor left behind — this case would score
-            // as a resolution candidate with a stale `anchor_mid` still on disk.
             durableTransitionCorrect:
                 terminalCaptured &&
                 state?.lastTodoState === terminalState &&
@@ -1598,12 +1510,6 @@ const RUST_IMPLEMENTATION_FILES = [
     "packages/e2e-tests/src/rust-runner/hermetic-mc-host.ts",
     "packages/plugin/src/hooks/magic-context/hook-handlers.ts",
     "crates/mc-module/src/injection.rs",
-    // `injection.rs` supplies the pure producer (call id, pair bytes, capture
-    // and advance decisions); `transform.rs` is what calls it and performs the
-    // behavior the five Rust cases actually assert — provider-wire insertion,
-    // anchor persistence and reanchoring, and terminal clearing. Omitting it
-    // lets every Rust verdict change while the implementation and selected-set
-    // digests stay constant.
     "crates/mc-module/src/transform.rs",
 ];
 

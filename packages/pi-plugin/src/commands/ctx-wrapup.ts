@@ -284,7 +284,6 @@ export async function runPiWrapup(
 					lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId),
 				});
 			} catch (err) {
-				// A missed renewal is safe because the wrapup marker has a five-minute TTL.
 				console.warn(
 					`[magic-context][pi] /ctx-wrapup marker renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
 				);
@@ -389,7 +388,6 @@ export async function runPiWrapup(
 					try {
 						renewCompartmentLease(deps.db, sessionId, leaseHolder);
 					} catch (err) {
-						// A missed renewal is safe because the compartment lease has a five-minute TTL.
 						console.warn(
 							`[magic-context][pi] /ctx-wrapup compartment lease renewal failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
 						);
@@ -439,8 +437,6 @@ export async function runPiWrapup(
 							}),
 						ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 						forceDrainQuota: true,
-						// The runner applies this only to the actual final chunk; token-capped
-						// chunks are downgraded based on readSessionChunk().hasMore.
 						forceKeepLastCompartment: true,
 						onPublished: () => {
 							updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd });
@@ -477,7 +473,6 @@ export async function runPiWrapup(
 			try {
 				clearEmergencyRecovery(deps.db, sessionId);
 			} catch {
-				// Best-effort: normal historian recovery disarm remains the backstop.
 			}
 			return `## Magic Wrapup\n\nWrapped up ${messagesWrapped} messages into ${compartmentsCreated} compartments. The compacted history is queued and materializes on your next message.`;
 		} finally {
@@ -500,7 +495,6 @@ function resolvePiContextLimit(
 		const detected = getOverflowState(db, sessionId).detectedContextLimit;
 		if (detected > 0) detectedContextLimit = detected;
 	} catch {
-		// Wrap-up can continue with the runtime model window.
 	}
 	return (
 		resolvePiUsableContextLimit({

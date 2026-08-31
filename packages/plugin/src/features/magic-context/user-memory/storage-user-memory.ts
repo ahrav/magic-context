@@ -1,10 +1,6 @@
 import type { Database } from "../../../shared/sqlite";
 
 /**
- * Default candidate decay TTL (30 days). review-user-memories runs daily with a
- * default promotion_threshold of 3, and genuine user traits recur over days-to-
- * weeks, so 30d leaves ample room for a real pattern to accumulate its variants
- * while pruning one-off noise that never recurs. Tune if promotion starves.
  */
 export const USER_MEMORY_CANDIDATE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -35,7 +31,6 @@ export interface UserMemory {
     updatedAt: number;
 }
 
-// ── Candidates ──────────────────────────────────────────────────────────
 
 export function insertUserMemoryCandidates(
     db: Database,
@@ -93,7 +88,7 @@ export function deleteUserMemoryCandidates(db: Database, ids: number[]): void {
     db.prepare(`DELETE FROM user_memory_candidates WHERE id IN (${placeholders})`).run(...ids);
 }
 
-/** Candidate IDs without a session-project mapping return an empty array. */
+/* */
 export function getUserMemoryCandidateProjectIdentities(
     db: Database,
     ids: readonly number[],
@@ -121,14 +116,6 @@ export function getUserMemoryCandidateProjectIdentities(
 }
 
 /**
- * Time-based decay: drop candidate observations older than the TTL that never
- * accumulated enough corroborating variants to be promoted. Without this, a
- * one-off observation that never recurs sits in the pool forever (review only
- * consumes candidates when the pool reaches the promotion threshold, so an
- * under-threshold trickle of noise accrues indefinitely). The TTL must comfortably
- * exceed promotion_threshold × the typical recurrence interval of a real trait so
- * decay prunes only noise, never a slow-but-genuine pattern mid-accumulation.
- * Returns rows pruned.
  */
 export function pruneExpiredUserMemoryCandidates(
     db: Database,
@@ -142,7 +129,6 @@ export function pruneExpiredUserMemoryCandidates(
     return Number(result.changes ?? 0);
 }
 
-// ── Stable user memories ────────────────────────────────────────────────
 
 function loadUserMemorySourceProvenance(
     db: Database,
@@ -217,9 +203,6 @@ export function insertUserMemory(
 export function getActiveUserMemories(db: Database): UserMemory[] {
     const rows = db
         .prepare(
-            // id ASC tiebreaker: promoted_at can tie at millisecond granularity;
-            // without a stable secondary sort the <user-profile> render order is
-            // non-deterministic across passes, drifting m[0]/m[1] bytes.
             "SELECT id, content, status, promoted_at, source_candidate_ids, source_candidate_provenance, created_at, updated_at FROM user_memories WHERE status = 'active' ORDER BY promoted_at ASC, id ASC",
         )
         .all() as Array<{

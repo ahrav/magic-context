@@ -35,7 +35,6 @@ test = false
 doc = false
 bench = false
 
-# The root workspace excludes this directory, so this manifest declares a
 # standalone workspace.
 [workspace]
 members = ["."]

@@ -1,37 +1,24 @@
 /**
- * Pi synthetic-todowrite injection.
  *
- * # Why this is separate from OpenCode's path
  *
  * OpenCode synthesizes a single `tool` part on the latest assistant message
- * (`buildSyntheticTodoPart` in the shared planning-tool implementation):
  *
  * ```text
  * packages/plugin/src/hooks/magic-context/todo-view.ts
  * ```
- * OpenCode's wire serializer (`MessageV2.toModelMessagesEffect`) splits that
- * combined part into provider-shape `tool_use` (assistant) and `tool_result`
- * (next user) at wire-emit time.
+ * OpenCode's wire serializer splits the combined part into an assistant `tool_use` and a next-user `tool_result` at wire-emit time.
  *
- * Pi RPC has no equivalent split — Pi delivers a `Message[]` (UserMessage |
- * AssistantMessage | ToolResultMessage) where assistant `toolCall` blocks
- * and `toolResult` messages already live in separate top-level messages. To
- * produce the same on-wire shape we must:
+ * Pi RPC delivers assistant `toolCall` blocks and `toolResult` values in separate top-level messages.
+ * The injector must add a `toolCall` block to the latest assistant and insert its `PiToolResultMessage` immediately after that assistant.
  *
- *   1. Push a Pi `ToolCall` block onto the latest assistant's `content`.
- *   2. Insert a Pi `ToolResultMessage` immediately after it.
  *
- * # Cache safety
  *
- * - Pi message identity uses `AssistantMessage.responseId` when present,
- *   else `String(timestamp)`. Persisted `messageId` is used on later defer
- *   passes to re-anchor at the same assistant message, idempotent on
  *   callID match.
- * - This injection runs AFTER tagging + drops + nudges in `runPipeline`,
- *   so the synthetic blocks are never tagged, never dropped, and never
+ * The injector runs after tagging, drops, and nudges in `runPipeline`.
+ * Running after tagging, drops, and nudges prevents synthetic blocks from being tagged, dropped, or passed to `ctx_reduce`.
  *   reach `ctx_reduce`.
- * - The synthetic callID is deterministic (`mc_synthetic_todo_<sha256[:16]>`),
- *   so identical persisted state produces byte-identical wire shape.
+ * The injector derives `callID` as `mc_synthetic_todo_<sha256[:16]>` from persisted state.
+ * Identical persisted state produces byte-identical wire shape.
  */
 
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -45,9 +32,7 @@ import {
 	type SyntheticTodoPart,
 } from "@magic-context/core/hooks/magic-context/todo-view";
 
-// Pi message shape (mirrors @earendil-works/pi-ai types — kept local because
-// the pi-plugin builds against a stable subset of those types via TypeScript
-// path mapping into packages/plugin/src for the rest of magic-context).
+// These local types mirror the Pi AI fields used here.
 //
 // Only the fields we read/write are typed; other fields pass through opaquely.
 type PiToolCallBlock = {
@@ -55,8 +40,7 @@ type PiToolCallBlock = {
 	id: string;
 	name: string;
 	arguments: Record<string, unknown>;
-	// Carry the synthetic marker so other Pi paths (e.g. tagger) can detect
-	// these blocks if needed. Mirrors `SyntheticTodoPart.syntheticTodoMarker`.
+	// Mirrors `SyntheticTodoPart.syntheticTodoMarker`.
 	syntheticTodoMarker: true;
 };
 
@@ -89,19 +73,13 @@ function getMessageId(message: PiAssistantMessage): string {
 	if (typeof message.timestamp === "number") {
 		return `pi-ts-${message.timestamp}`;
 	}
-	// Last-resort fallback: index-based ID would change every pass, which
-	// would defeat replay byte-stability. Caller is expected to filter
-	// these out, but return a stable empty marker just in case.
+	// An index-based fallback would change across passes and break replay byte stability.
 	return "";
 }
 
 /**
- * Pi's provider serializers (`transform-messages.ts`) skip errored/aborted
- * assistant messages entirely when building the wire request, but pass
- * top-level toolResult messages through unconditionally. Anchoring the
- * synthetic pair to such an assistant therefore ships an orphaned
- * function_call_output with no matching function_call, which OpenAI-family
- * providers reject with a 400 on every subsequent turn.
+ * Pi omits aborted and errored assistant messages from wire requests but forwards top-level `toolResult` messages.
+ * Anchoring a pair to an omitted assistant creates an orphaned `function_call_output`.
  */
 function isReplayableAnchor(message: PiAssistantMessage): boolean {
 	return message.stopReason !== "aborted" && message.stopReason !== "error";
@@ -132,17 +110,13 @@ function findToolResultAfter(
 		const role = (m as { role?: unknown }).role;
 		const tcId = (m as { toolCallId?: unknown }).toolCallId;
 		if (role === "toolResult" && tcId === callId) return i;
-		// Stop at the next assistant — Pi pairs tool calls/results within
-		// the same assistant turn.
+		// Stop before the next assistant because Pi matches tool results to the preceding assistant turn.
 		if (role === "assistant") return -1;
 	}
 	return -1;
 }
 
 /**
- * Pi-shape adapter for the OpenCode `SyntheticTodoPart`. Builds the
- * provider-style `toolCall` block + `toolResult` message that Pi will
- * forward to the LLM.
  */
 function piBlocksFromSynthetic(part: SyntheticTodoPart): {
 	call: PiToolCallBlock;
@@ -168,10 +142,6 @@ function piBlocksFromSynthetic(part: SyntheticTodoPart): {
 }
 
 /**
- * Inject the synthetic toolCall/toolResult pair onto the assistant message
- * matching `messageId`. Idempotent on callID — if the pair is already
- * present, returns `true` without mutating. Returns `false` when the target
- * assistant or its paired position isn't available in the visible window.
  */
 function injectByAssistantId(
 	messages: PiMessage[],
@@ -186,16 +156,13 @@ function injectByAssistantId(
 		if (getMessageId(assistant) !== messageId) continue;
 		if (!isReplayableAnchor(assistant)) return false;
 		if (hasToolCallWithId(assistant, part.callID)) {
-			// Already injected — verify the result is also still next to it.
 			if (findToolResultAfter(messages, i, part.callID) >= 0) return true;
-			// toolCall present but result missing (shouldn't happen). Re-insert.
 		}
 		const { call, result } = piBlocksFromSynthetic(part);
 		if (!Array.isArray(assistant.content)) assistant.content = [];
 		if (!hasToolCallWithId(assistant, part.callID)) {
 			assistant.content.push(call as unknown as Record<string, unknown>);
 		}
-		// Insert result right after assistant if not already present.
 		if (findToolResultAfter(messages, i, part.callID) < 0) {
 			messages.splice(i + 1, 0, result);
 		}
@@ -205,9 +172,6 @@ function injectByAssistantId(
 }
 
 /**
- * Append the synthetic pair to the latest assistant message in the array.
- * Returns the assistant's message id on success, null when there's no
- * assistant to anchor to (e.g. first turn before assistant has spoken).
  */
 function injectIntoLatestAssistant(
 	messages: PiMessage[],
@@ -238,12 +202,9 @@ function injectIntoLatestAssistant(
 }
 
 /**
- * Pi synthetic-todowrite injection entry point. Mirrors the B7 block in
- * OpenCode's `transform-postprocess-phase.ts` but uses Pi's wire-shape
  * helpers.
  *
- * Returns the (possibly-mutated) messages array. The array itself is
- * mutated in place; the return is for call-site clarity.
+ * The injector mutates `messages` in place and returns the same array.
  */
 export function injectSyntheticTodowriteForPi(args: {
 	db: ContextDatabase;
@@ -273,10 +234,6 @@ export function injectSyntheticTodowriteForPi(args: {
 			persistedAnchor.callId === part.callID &&
 			injectByAssistantId(args.messages, persistedAnchor.messageId, part)
 		) {
-			// Snapshot unchanged AND persisted anchor still present —
-			// idempotent re-inject; backfill stateJson if it was empty
-			// (legacy row from a build that persisted callID without state).
-			// Mirrors the same self-heal in the OpenCode task-list injection path.
 			if (persistedAnchor.stateJson.length === 0) {
 				setPersistedTodoSyntheticAnchor(
 					args.db,
@@ -303,10 +260,6 @@ export function injectSyntheticTodowriteForPi(args: {
 		return args.messages;
 	}
 
-	// Defer pass — byte-identical replay from PERSISTED state, not current
-	// snapshot. The agent may have called todowrite between T0 and T1; if
-	// we rebuilt from the current snapshot we'd inject a different shape
-	// and bust Anthropic prompt cache.
 	if (!persistedAnchor || persistedAnchor.stateJson.length === 0) {
 		return args.messages;
 	}
@@ -314,10 +267,6 @@ export function injectSyntheticTodowriteForPi(args: {
 	if (part === null || part.callID !== persistedAnchor.callId) {
 		return args.messages;
 	}
-	// If the anchor is not in Pi's visible window, skip silently — same
-	// behavior as OpenCode's `injectToolPartIntoAssistantById`. Re-anchoring
-	// on defer would change the message-array position versus prior defer
-	// passes and bust prompt-cache wire shape.
 	injectByAssistantId(args.messages, persistedAnchor.messageId, part);
 	return args.messages;
 }

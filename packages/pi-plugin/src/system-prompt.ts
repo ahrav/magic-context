@@ -1,11 +1,9 @@
 /**
- * Pi-side system prompt injector helpers.
  *
- * v2 cache architecture keeps only stable instructions in the Pi system
- * prompt: Magic Context guidance and Pi/OpenCode's existing "Today's date"
- * line (sticky-frozen by processSystemPromptForCache). Project docs,
- * user profile, key files, memories, facts, and compartments are rendered
- * by the m[0]/m[1] message materializer instead.
+ * The Pi system prompt contains only stable instructions.
+ * The Pi system prompt retains Magic Context guidance and Pi/OpenCode's existing `Today's date` line.
+ * `processSystemPromptForCache` freezes the `Today's date` line for cache stability.
+ * The message materializer renders user profiles, key files, memories, facts, and compartments in `m[0]`/`m[1]`.
  */
 
 import { createHash } from "node:crypto";
@@ -26,8 +24,7 @@ const USER_PROFILE_MARKER = "<user-profile>";
 const MAGIC_CONTEXT_MARKER = "## Magic Context";
 
 /**
- * Sticky date cache. Module-scoped so clearPiSystemPromptSession can release
- * entries when Pi shuts down or switches sessions.
+ * `stickyDateBySession` is module-scoped so `clearPiSystemPromptSession` can release its entries.
  */
 const stickyDateBySession = new Map<string, string>();
 
@@ -35,10 +32,10 @@ export interface BuildMagicContextBlockOptions {
 	db: ContextDatabase;
 	cwd: string;
 	sessionId?: string;
-	/** Reserved for compatibility; project memories now live in m[0]/m[1]. */
+	/** `memoryEnabled` is reserved for compatibility; project memories live in `m[0]`/`m[1]`. */
 	memoryEnabled: boolean;
 	memoryBudgetChars?: number;
-	/** When true (default), emit the `## Magic Context` guidance section. */
+	/* */
 	includeGuidance?: boolean;
 	protectedTags?: number;
 	ctxReduceCallable?: boolean;
@@ -48,17 +45,16 @@ export interface BuildMagicContextBlockOptions {
 	language?: string;
 	promptSurfacePreset?: PromptSurfacePreset;
 	primaryGuidanceOverride?: string;
-	/** Reserved for compatibility; user profile now lives in m[0]. */
+	/** `userMemoriesEnabled` is reserved for compatibility; the user profile lives in `m[0]`. */
 	userMemoriesEnabled?: boolean;
 	existingSystemPrompt?: string;
 	isCacheBusting?: boolean;
 }
 
 /**
- * Build the Pi system-prompt addendum. In v2 this intentionally contains
- * guidance only. The volatile/data-bearing blocks moved to m[0]/m[1], so
- * this function must never emit `<project-docs>` or `<user-profile>` even when
- * legacy options are true.
+ * `buildMagicContextBlock` emits guidance only.
+ * The message materializer renders volatile data-bearing blocks in `m[0]`/`m[1]`.
+ * `buildMagicContextBlock` never emits `<project-docs>` or `<user-profile>`, even when legacy options are true.
  */
 export function buildMagicContextBlock(
 	opts: BuildMagicContextBlockOptions,
@@ -77,8 +73,7 @@ export function buildMagicContextBlock(
 		opts.cavemanTextCompressionEnabled ?? false,
 		false,
 		opts.language,
-		// Drop ctx_memory guidance when memory is off (the tool is gated via
-		// registerMagicContextTools memoryToolEnabled). ctx_search guidance stays.
+		// `memoryEnabled !== false` suppresses `ctx_memory` guidance; `ctx_search` guidance remains.
 		opts.memoryEnabled !== false,
 		opts.promptSurfacePreset,
 		opts.primaryGuidanceOverride,
@@ -93,41 +88,34 @@ export function composeMagicContextSystemPrompt(
 }
 
 export interface SystemPromptHashResult {
-	/** The system prompt to send to the LLM, possibly with date frozen. */
+	/** `systemPrompt` is the prompt sent to the LLM and may contain a frozen date. */
 	systemPrompt: string;
-	/** Whether prompt content or prompt-surface preset changed vs the persisted hash. */
+	/** `hashChanged` reports whether prompt content or the prompt-surface preset differs from the persisted hash. */
 	hashChanged: boolean;
-	/** The new content + prompt-surface preset hash persisted to session_meta. */
+	/** `currentHash` is the content-and-preset hash persisted to `session_meta`. */
 	currentHash: string;
 }
 
 const DATE_PATTERN = /Today's date: .+/;
 
 /**
- * Process the assembled system prompt for cache stability:
  *
- *  1. Detect content or prompt-surface preset change vs the persisted
- *     `session_meta.system_prompt_hash`. The transition marks the semantic
- *     prompt epoch boundary, so we return `hashChanged=true` and let the caller
- *     signal downstream refresh sets.
+ * The persisted `session_meta.system_prompt_hash` detects content and prompt-surface preset changes.
+ * `processSystemPromptForCache` returns `hashChanged=true` when the persisted hash changes.
  *
- *  2. Freeze `Today's date: ...` to the first observed value, UNLESS
- *     this turn is already cache-busting (either the caller flagged
- *     it via `isCacheBusting` OR we just detected a hash change). On a
- *     real cache-busting turn we update the sticky date to the live
- *     value so future stable turns freeze on the new date.
+ * `processSystemPromptForCache` freezes `Today's date` unless `isCacheBusting` or a hash change busts the cache.
+ * A cache-busting turn updates the sticky date to the live date.
  */
 export function processSystemPromptForCache(args: {
 	db: ContextDatabase;
 	sessionId: string;
 	systemPrompt: string;
-	/** When true, the caller has already determined this turn is busting cache. */
+	/** `isCacheBusting` means the caller has already determined that this turn busts the cache. */
 	isCacheBusting: boolean;
 	promptSurfacePreset?: PromptSurfacePreset;
 }): SystemPromptHashResult {
 	const { db, sessionId, systemPrompt, isCacheBusting } = args;
 
-	// Step 1: hash detection vs persisted value.
 	let sessionMeta:
 		| import("@magic-context/core/features/magic-context/types").SessionMeta
 		| undefined;
@@ -144,8 +132,7 @@ export function processSystemPromptForCache(args: {
 	const previousHash = sessionMeta?.systemPromptHash ?? "";
 	const isFirstHash = previousHash === "" || previousHash === "0";
 
-	// Decide whether content or preset already requires a bust before choosing
-	// which date to hash. This lets a midnight date change ride the same fold.
+	// A content or preset change permits the date to advance in the same cache-busting pass.
 	let frozenPrompt = systemPrompt;
 	const dateMatch = systemPrompt.match(DATE_PATTERN);
 	const liveDate = dateMatch ? dateMatch[0] : null;
@@ -198,8 +185,6 @@ export function processSystemPromptForCache(args: {
 		);
 	}
 
-	// Persist hash + token estimate so dashboard / status surfaces are
-	// up-to-date and the next turn can compare against this value.
 	const systemPromptTokens = estimateTokens(frozenPrompt);
 	if (sessionMeta) {
 		if (currentHash !== previousHash) {
@@ -222,15 +207,12 @@ export function processSystemPromptForCache(args: {
 }
 
 /**
- * Clear per-session system prompt cache state. Data-block caches are no
- * longer owned by this file; m[0]/m[1] caches are cleared by the lifecycle
- * handlers in context-handler/index.
  */
 export function clearPiSystemPromptSession(sessionId: string): void {
 	stickyDateBySession.delete(sessionId);
 }
 
-/** Test-only markers for system-prompt parity assertions. */
+/* */
 export const MAGIC_CONTEXT_GUIDANCE_MARKER = MAGIC_CONTEXT_MARKER;
 export const SYSTEM_PROMPT_DATA_MARKERS = {
 	projectDocs: PROJECT_DOCS_MARKER,

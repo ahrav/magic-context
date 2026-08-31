@@ -56,10 +56,9 @@ describe("parseDaemonResult", () => {
     });
 
     test("rejects a probe command in a result and accepts the status it really emits", () => {
-        // `probe` is an accepted argv spelling, but the contract's command union
-        // is start/stop/restart/status/doctor, and the binary answers the
-        // read-only observation as `status`. Tolerating `probe` in a *result*
-        // would let the client accept a payload no contract consumer admits.
+        // `probe` is accepted in argv but not in result payloads.
+        // Result commands are `start`, `stop`, `restart`, `status`, or `doctor`.
+        // `probe` results must use `status`.
         expect(() =>
             parseDaemonResult(
                 JSON.stringify(
@@ -110,9 +109,9 @@ describe("parseDaemonResult", () => {
                 withReadiness({ transport: { state: "ready", reason: "internal_error" } }),
             ),
         ).toThrow(/readiness\.transport is ready with a failing reason/);
-        // The converse stays legal, and must: `unsupported` with
-        // `synapse_unsupported` is a non-failing pairing for a non-ready state,
-        // and every `starting` reason is a failing one.
+        // `unsupported` with `synapse_unsupported` remains legal for a non-ready state.
+        // `synapse_unsupported` is non-failing for `unsupported`.
+        // `starting` requires a failing reason.
         const legal = parseDaemonResult(
             withReadiness({
                 transport: { state: "ready", reason: "healthy" },
@@ -143,15 +142,13 @@ describe("parseDaemonResult", () => {
         expect(() => parseDaemonResult(withCheck("fail", "healthy", null))).toThrow(
             /failing check carries a non-failing reason/,
         );
-        // warn and skip are not a class summary: a warn is degraded-but-usable
-        // and a skip is an absence of evidence, so neither is constrained.
+        // `warn` means degraded but usable, and `skip` means absent evidence, so neither status constrains the reason class.
         for (const status of ["warn", "skip"]) {
             const parsed = parseDaemonResult(withCheck(status, "internal_error", "report_bug"));
             expect(parsed.checks[0]?.status).toBe(status);
             const nonFailing = parseDaemonResult(withCheck(status, "healthy", null));
             expect(nonFailing.checks[0]?.reason).toBe("healthy");
         }
-        // The conforming pairings still parse.
         expect(parseDaemonResult(withCheck("pass", "healthy", null)).checks[0]?.status).toBe(
             "pass",
         );
@@ -161,10 +158,7 @@ describe("parseDaemonResult", () => {
     });
 
     test("rejects a successful restart carrying no effects at all", () => {
-        // Requiring `start_committed` only inside the non-null branch left the
-        // evidence-free case open, so a caller learned the restart succeeded but
-        // not that the stop and successor start committed. Every native
-        // cmd_restart() return path supplies effects.
+        // A successful restart requires `effects.start_committed: true`.
         expect(() =>
             parseDaemonResult(
                 JSON.stringify(
@@ -181,8 +175,8 @@ describe("parseDaemonResult", () => {
                 ),
             ),
         ).toThrow(/successful restart must carry its effects/);
-        // A failed restart may omit them: a killed transaction's outcome is
-        // genuinely unknown, and the policy reports null rather than claiming
+        // A failed restart may omit `effects` because a killed transaction's outcome is unknown.
+        // The policy reports `effects: null` rather than claiming that either operation committed.
         // nothing committed.
         const killed = parseDaemonResult(
             JSON.stringify(
@@ -202,8 +196,8 @@ describe("parseDaemonResult", () => {
     });
 
     test("rejects a successful restart that committed no start", () => {
-        // `ok` for a restart is the successor start's outcome, so this pair is
-        // self-contradictory and exit 0 agrees with it.
+        // `ok: true` requires `effects.start_committed: true` because restart success is the successor start's outcome.
+        // `ok: true` produces exit code 0.
         expect(() =>
             parseDaemonResult(
                 JSON.stringify(
@@ -220,8 +214,8 @@ describe("parseDaemonResult", () => {
                 ),
             ),
         ).toThrow(/successful restart must report a committed start/);
-        // The converse stays legal: a failed restart whose start did commit is
-        // evidence of a committed effect, not a contradiction.
+        // `ok: false` may coexist with `effects.start_committed: true`.
+        // `effects.start_committed: true` records a committed effect, not a contradiction.
         const partial = parseDaemonResult(
             JSON.stringify(
                 validResult({
@@ -240,9 +234,8 @@ describe("parseDaemonResult", () => {
     });
 
     test("rejects a remediation borrowed from another reason", () => {
-        // Both values are inside their own closed unions; only the pairing is
-        // wrong. Accepting it sends an operator to free storage when the native
-        // payload is simply absent.
+        // State the exact invalid `state` and `reason` values.
+        // Accepting the invalid pair would instruct an operator to free storage when the native payload is absent.
         expect(() =>
             parseDaemonResult(
                 JSON.stringify(
@@ -488,9 +481,8 @@ describe("exit/result agreement", () => {
     });
 
     test("agreement cannot be reached by a failing reason wearing ok:true", () => {
-        // Agreement reads `ok` alone, so a result pairing `ok:true` with a
-        // failing reason would agree with exit 0 and let callers proceed on a
-        // failure. Parsing rejects the pairing, so no such result exists.
+        // Exit-status validation uses `ok` alone.
+        // An `ok: true` result with a failing reason would produce exit code 0 and let callers proceed after a failure.
         expect(() =>
             parseDaemonResult(JSON.stringify(validResult({ reason: "internal_error" }))),
         ).toThrow(ContractViolation);
@@ -583,8 +575,8 @@ describe("pre-native root classifier", () => {
     test("the shared cortexkit subtree alone is not daemon residue", () => {
         const root = tempRoot();
         try {
-            // `data-path.ts` puts the application SQLite store here on every
-            // install, so its presence must not imply a daemon ever ran.
+            // `data-path.ts` creates the application SQLite store on every installation, so the store's presence does not imply that a daemon ran.
+            // The application SQLite store's presence does not imply that a daemon ran.
             mkdirSync(path.join(root, "cortexkit", "magic-context"), { recursive: true });
             const classification = classifyPreNativeRoots(root);
             expect(classification).toEqual({ kind: "absent" });

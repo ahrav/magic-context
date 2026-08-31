@@ -17,7 +17,6 @@ pub const OP_TRANSPORT_NEGOTIATE: &str = "transport.negotiate";
 pub const OP_TRANSPORT_ACTIVATE: &str = "transport.activate";
 pub const OP_TRANSPORT_COMMIT: &str = "transport.commit";
 
-/// The negotiation grammar version this module implements.
 pub const NEGOTIATION_VERSION: u32 = 1;
 /// The required fallback transport name (protocol §7.7.2).
 pub const TRANSPORT_TCP: &str = "tcp";
@@ -25,11 +24,10 @@ pub const TRANSPORT_TCP: &str = "tcp";
 pub const MAX_OFFERS: usize = 8;
 /// Transport names are 1-32 ASCII bytes matching `^[a-z][a-z0-9._-]{0,31}$`.
 pub const MAX_TRANSPORT_NAME_BYTES: usize = 32;
-/// Opaque `parameters`/`descriptor` compact-JSON sub-cap (protocol §7.7.1).
+/// `parameters` and `descriptor` are limited to 8192 compact-JSON bytes (protocol §7.7.1).
 pub const MAX_OPAQUE_BYTES: usize = 8192;
-/// Opaque `parameters`/`descriptor` nesting bound, counted as in §7.1.
+/// `parameters` and `descriptor` are limited to nesting depth 8, counted as in §7.1.
 pub const MAX_OPAQUE_DEPTH: usize = 8;
-/// Activation tokens are exactly 32 lowercase hexadecimal ASCII characters.
 pub const ACTIVATION_TOKEN_LEN: usize = 32;
 
 /// Candidate consumer correlation reserved for `transport.activate`.
@@ -39,7 +37,7 @@ pub const COMMIT_CORRELATION: u64 = 2;
 /// First candidate consumer correlation available to application requests.
 pub const FIRST_APPLICATION_CORRELATION: u64 = 3;
 
-/// Bounded decode/encode failure taxonomy. Stable snake-case wire names via
+/// `NegotiationErrorCode::as_str` provides stable snake-case wire names.
 /// [`NegotiationErrorCode::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NegotiationErrorCode {
@@ -109,8 +107,6 @@ impl fmt::Display for NegotiationError {
 
 impl std::error::Error for NegotiationError {}
 
-/// Closed fallback vocabulary (protocol §7.7.3). Fallback always selects the
-/// offered `tcp` entry; every other setup outcome fails closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackReason {
     Unavailable,
@@ -134,8 +130,7 @@ impl FallbackReason {
     }
 }
 
-/// One-use grant token: exactly 32 lowercase hexadecimal ASCII characters.
-/// No `Display`, and `Debug` redacts, so the token cannot leak through
+/// Activation tokens are exactly 32 lowercase hexadecimal ASCII characters.
 /// formatting (R14).
 #[derive(Clone)]
 pub struct ActivationToken(String);
@@ -145,7 +140,7 @@ impl PartialEq for ActivationToken {
     fn eq(&self, other: &Self) -> bool {
         // The length guard keeps `zip` from truncating the comparison: without
         // it, tokens of unequal length sharing a prefix would compare equal.
-        // Token length is a fixed public constant, so the early exit leaks
+        // The length guard may return early on unequal lengths because token length is public.
         // nothing.
         self.0.len() == other.0.len()
             && self
@@ -186,7 +181,6 @@ impl fmt::Debug for ActivationToken {
     }
 }
 
-/// One ordered client offer. `parameters` is opaque provider data; `Debug`
 /// redacts it.
 #[derive(Clone, PartialEq)]
 pub struct TransportOffer {
@@ -219,15 +213,12 @@ pub struct SelectedTransport {
     pub capability_version: u32,
 }
 
-/// The validated `transport.negotiate` response. The enum encodes the field
-/// mix invariants: only a TCP selection may carry a `reason`, and only a
-/// non-TCP grant carries the token/descriptor pair.
+/// Only `Tcp` may carry `reason`.
 #[derive(Clone, PartialEq)]
 pub enum NegotiateResponse {
     /// The offered `tcp` entry, directly or as an explicit fallback.
     Tcp { reason: Option<FallbackReason> },
-    /// A non-TCP grant: exact offered entry, one-use token, and an opaque
-    /// bounded provider descriptor.
+    /// A `Grant` contains the exact offered non-TCP entry, a one-use token, and a bounded opaque provider descriptor.
     Grant {
         selected: SelectedTransport,
         activation_token: ActivationToken,
@@ -271,8 +262,7 @@ fn parse_root(body: &[u8]) -> Result<serde_json::Map<String, serde_json::Value>,
     }
 }
 
-/// Rejects any key outside `allowed`. The unknown key itself is
-/// client-supplied and is deliberately not echoed into the error path.
+/// The error path omits client-supplied unknown keys.
 fn check_closed_fields(
     fields: &serde_json::Map<String, serde_json::Value>,
     allowed: &[&str],
@@ -314,8 +304,7 @@ fn require_op(
     Ok(())
 }
 
-/// A version field is a JSON integer in `1..=u32::MAX`. Zero, fractions,
-/// exponent forms (which parse as floats), and larger values all fail.
+/// A version is a JSON integer in `1..=u32::MAX`; zero, fractions, exponent forms, and larger values fail.
 fn require_version(
     fields: &serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -379,12 +368,8 @@ fn require_transport_name<'a>(
     Ok(name)
 }
 
-/// Opaque `parameters`/`descriptor` bounds: a JSON object at most
-/// [`MAX_OPAQUE_BYTES`] compact bytes and [`MAX_OPAQUE_DEPTH`] levels deep.
-/// Duplicate keys inside the value were already rejected by the strict parse.
-/// Counts serialized bytes and fails past `limit` without retaining them,
-/// so an oversized provider value is rejected during traversal instead of
-/// materializing a full compact document on the connection read loop.
+/// Opaque `parameters` and `descriptor` values must be JSON objects no larger than [`MAX_OPAQUE_BYTES`] compact bytes and no deeper than [`MAX_OPAQUE_DEPTH`] levels.
+/// The validator rejects values whose compact serialization exceeds `limit` without retaining serialized bytes.
 struct CappedCounter {
     written: usize,
     limit: usize,
@@ -407,12 +392,7 @@ impl std::io::Write for CappedCounter {
     }
 }
 
-/// Iterative depth bound with the §7.1 counting (1 at the subtree root, +1
-/// per nested container). Runs BEFORE any recursive traversal: a
-/// provider-constructed value carries no parser recursion cap the way a
-/// decoded client value does, so a deeply nested descriptor would otherwise
-/// exhaust the connection task's stack inside `serde_json` or `value_depth`
-/// before the bound could reject it.
+/// The validator counts depth from 1 at the subtree root and checks provider-constructed values iteratively before recursive traversal.
 fn exceeds_opaque_depth(value: &serde_json::Value, limit: usize) -> bool {
     let mut pending = vec![(value, 1usize)];
     while let Some((node, depth)) = pending.pop() {
@@ -438,8 +418,7 @@ fn check_opaque(value: &serde_json::Value, path: &str) -> Result<(), Negotiation
             path,
         ));
     }
-    // Depth first, iteratively: bounds the recursion depth every later
-    // traversal (serialization below, and any recursive walk) will reach.
+    // Iterative depth-first validation bounds recursion in later serialization and recursive walks.
     if exceeds_opaque_depth(value, MAX_OPAQUE_DEPTH) {
         return Err(NegotiationError::new(
             NegotiationErrorCode::OpaqueTooDeep,
@@ -532,12 +511,9 @@ fn decode_offers(
     Ok(offers)
 }
 
-/// Decodes and fully validates one `transport.negotiate` request body.
 ///
-/// The strict duplicate-aware parse runs first, so repeated keys at any
-/// depth — including inside opaque `parameters` — fail before any typed
-/// decoding. An unsupported-but-valid `negotiation_version` decodes
-/// successfully: the version-mismatch fallback is host policy, not grammar.
+/// Strict parsing rejects duplicate keys at every depth, including inside opaque `parameters`, before typed decoding.
+/// Unsupported valid `negotiation_version` values parse successfully; version-mismatch fallback is host policy.
 pub fn decode_negotiate_request(body: &[u8]) -> Result<NegotiateRequest, NegotiationError> {
     let fields = parse_root(body)?;
     check_closed_fields(&fields, &["op", "negotiation_version", "offers"], "body")?;
@@ -551,9 +527,7 @@ pub fn decode_negotiate_request(body: &[u8]) -> Result<NegotiateRequest, Negotia
     })
 }
 
-/// Decodes and fully validates one `transport.negotiate` response body
-/// against the request's `offers`: the selection MUST name an exact offered
-/// `(transport, capability_version)` entry (protocol §7.7.2).
+/// The selection must match an offered `(transport, capability_version)` pair (protocol §7.7.2).
 pub fn decode_negotiate_response(
     body: &[u8],
     offers: &[TransportOffer],
@@ -674,7 +648,7 @@ pub fn decode_negotiate_response(
     })
 }
 
-/// Decodes one candidate `transport.activate` request body (correlation 1).
+/// The protocol assigns correlation 1 to `transport.activate` requests.
 pub fn decode_activate_request(body: &[u8]) -> Result<ActivateRequest, NegotiationError> {
     let fields = parse_root(body)?;
     check_closed_fields(
@@ -712,18 +686,16 @@ fn require_activation_token(
     Ok(activation_token)
 }
 
-/// Decodes one tagged candidate `transport.activate` response body. Carries
-/// no provider data: any additional field is malformed (protocol §7.7.4).
+/// `transport.activate` requests carry no provider data; additional fields are malformed (protocol §7.7.4).
 pub fn decode_activate_response(body: &[u8]) -> Result<(), NegotiationError> {
     decode_tagged_only(body, OP_TRANSPORT_ACTIVATE)
 }
 
-/// Decodes one candidate `transport.commit` request body (correlation 2).
+/// The protocol assigns correlation 2 to `transport.commit` requests.
 pub fn decode_commit_request(body: &[u8]) -> Result<(), NegotiationError> {
     decode_tagged_only(body, OP_TRANSPORT_COMMIT)
 }
 
-/// Decodes one tagged candidate `transport.commit` response body.
 pub fn decode_commit_response(body: &[u8]) -> Result<(), NegotiationError> {
     decode_tagged_only(body, OP_TRANSPORT_COMMIT)
 }
@@ -783,9 +755,7 @@ struct WireNegotiateResponse<'a> {
     descriptor: Option<&'a serde_json::Value>,
 }
 
-/// Encodes one compact canonical `transport.negotiate` request after
-/// revalidating the same bounds the decoder enforces, so a conforming
-/// encoder cannot emit out-of-contract bytes.
+/// The encoder revalidates decoder bounds before encoding to prevent out-of-contract bytes.
 pub fn encode_negotiate_request(request: &NegotiateRequest) -> Result<Vec<u8>, NegotiationError> {
     if request.negotiation_version == 0 {
         return Err(NegotiationError::new(
@@ -850,14 +820,10 @@ pub fn encode_negotiate_request(request: &NegotiateRequest) -> Result<Vec<u8>, N
     .expect("negotiate request serialization cannot fail"))
 }
 
-/// Encodes one compact canonical `transport.negotiate` response. The TCP
-/// selection names the required `tcp` offer entry with `capability_version`
-/// taken from `tcp_capability_version` (the exact offered value).
+/// For TCP, the response selects the offered `tcp` entry using `tcp_capability_version`.
 ///
-/// `negotiation_version` is the *request's* grammar version, echoed per
-/// §7.7.2. Echoing matters for the `negotiation_version_mismatch` fallback:
-/// a peer speaking another version must be able to decode the response and
-/// retain TCP (R8), which it cannot do if the host stamps its own version.
+/// The response echoes the request's `negotiation_version` (protocol §7.7.2).
+/// Echoing lets a peer with another grammar version decode the response and retain TCP during `negotiation_version_mismatch` fallback.
 pub fn encode_negotiate_response(
     response: &NegotiateResponse,
     negotiation_version: u32,
@@ -930,7 +896,7 @@ struct WireActivateRequest<'a> {
     activation_token: &'a str,
 }
 
-/// Encodes the candidate `transport.activate` request (correlation 1).
+/// The protocol assigns correlation 1 to `transport.activate` requests.
 pub fn encode_activate_request(token: &ActivationToken) -> Vec<u8> {
     serde_json::to_vec(&WireActivateRequest {
         op: OP_TRANSPORT_ACTIVATE,
@@ -946,9 +912,7 @@ struct WireTaggedBody {
     negotiation_version: u32,
 }
 
-/// One `{op, negotiation_version}` candidate body. Built from the module
-/// constants rather than a frozen literal so a `NEGOTIATION_VERSION` bump
-/// cannot leave these emitting a version their own decoders reject.
+/// `NEGOTIATION_VERSION` prevents version bumps from making encoders emit versions their decoders reject.
 fn tagged_body(op: &'static str) -> Vec<u8> {
     serde_json::to_vec(&WireTaggedBody {
         op,
@@ -957,17 +921,17 @@ fn tagged_body(op: &'static str) -> Vec<u8> {
     .expect("tagged negotiation body serialization cannot fail")
 }
 
-/// The tagged candidate `transport.activate` response (correlation 1).
+/// The protocol assigns correlation 1 to `transport.activate` responses.
 pub fn activate_response_json() -> Vec<u8> {
     tagged_body(OP_TRANSPORT_ACTIVATE)
 }
 
-/// The candidate `transport.commit` request (correlation 2).
+/// The protocol assigns correlation 2 to `transport.commit` requests.
 pub fn commit_request_json() -> Vec<u8> {
     tagged_body(OP_TRANSPORT_COMMIT)
 }
 
-/// The tagged candidate `transport.commit` response (correlation 2).
+/// The protocol assigns correlation 2 to `transport.commit` responses.
 pub fn commit_response_json() -> Vec<u8> {
     tagged_body(OP_TRANSPORT_COMMIT)
 }

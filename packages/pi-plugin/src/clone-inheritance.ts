@@ -1,4 +1,3 @@
-// Pi clone inheritance follows the durable-state rules documented in issue #225.
 import { readFile } from "node:fs/promises";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -157,7 +156,7 @@ export async function readPiSessionIdFromFile(
 	return header.id;
 }
 
-/** Fail-open session-start entry point for Pi fork/clone state inheritance. */
+/* */
 export async function handlePiCloneSessionStart(
 	event: CloneStartEventLike,
 	ctx: CloneContextLike,

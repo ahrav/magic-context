@@ -134,8 +134,6 @@ describe("pi slow historian vs fast main", () => {
 
             await h.waitFor(
                 () => h.mock.requests().filter((r) => isHistorianRequest(r.body)).length >= 1,
-                // Bumped from 10s → 30s for CI: Pi historian spawns a `pi --print`
-                // subprocess; the round-trip to the mock provider is slower on
                 // shared runners.
                 { timeoutMs: 300_000, label: "pi historian request captured" },
             );
@@ -144,7 +142,6 @@ describe("pi slow historian vs fast main", () => {
             console.log(`[TEST] pi historian requests observed: ${historianRequests.length}`);
             expect(historianRequests.length).toBe(1);
         },
-        // Bumped from 120s → 600s for CI to give the bumped waitFor headroom.
         600_000,
     );
 });

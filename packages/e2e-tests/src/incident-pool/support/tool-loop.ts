@@ -1,9 +1,5 @@
 /**
- * Incident-case harness and context-database support.
  *
- * `createCaseHarness` boots the shared TestHarness INSIDE the case-owned
- * workspace (relocated TMPDIR) and enforces the KTD7 canonical-path check so
- * a driver can never mutate the ambient developer store.
  */
 
 import { mkdirSync, realpathSync } from "node:fs";
@@ -26,7 +22,7 @@ export const EXECUTE_USAGE: MockUsage = {
     cache_read_input_tokens: 0,
 };
 
-/** High enough to trip the historian trigger (threshold-relative pressure). */
+/** 90,000 input and cache-creation tokens trigger the historian. */
 export const HISTORIAN_TRIGGER_USAGE: MockUsage = {
     input_tokens: 90_000,
     output_tokens: 20,
@@ -35,10 +31,7 @@ export const HISTORIAN_TRIGGER_USAGE: MockUsage = {
 };
 
 /**
- * Boot the shared TestHarness inside the case-owned workspace. The harness
- * allocates its isolated env under `os.tmpdir()`, so TMPDIR is pointed at a
- * workspace subdirectory for the duration of the boot; the KTD7 canonical-path
- * check then proves the durable store really lives inside the workspace.
+ * `TestHarness.create` allocates under `os.tmpdir()`, so `createCaseHarness` redirects sandbox-directory variables during creation and rejects a resolved `dataDir` outside `context.workspaceRoot`.
  */
 export async function createCaseHarness(
     context: CaseDriverContext,
@@ -72,7 +65,7 @@ export async function createCaseHarness(
     return harness;
 }
 
-/** KTD7 canonical-path check: the durable store lives inside the workspace. */
+/* */
 export function caseHarnessIsWorkspaceScoped(
     h: TestHarness,
     context: CaseDriverContext,
@@ -86,7 +79,7 @@ export function caseHarnessIsWorkspaceScoped(
     }
 }
 
-/** KTD7 unique-namespace check for the case-owned store namespace. */
+/* */
 export function caseNamespaceIsUnique(context: CaseDriverContext): boolean {
     return (
         context.storeNamespace.startsWith("incident-") &&
@@ -95,15 +88,8 @@ export function caseNamespaceIsUnique(context: CaseDriverContext): boolean {
 }
 
 /**
- * Historian identity substring, deliberately shorter than the production
- * signature line so this stays a *selector* rather than the broad hidden-agent
- * *filter* in `cache-analysis.ts`. This one answers "should my matcher reply to
- * this request", so it must match the historian and not the dreamer, sidekick,
- * or OpenCode's own title/summary/compaction agents.
+ * HISTORIAN_SYSTEM_MARKER excludes dreamer, sidekick, and OpenCode title, summary, and compaction requests; HISTORIAN_SYSTEM_MARKER must remain a substring of the production opener.
  *
- * Its relationship to the shared signature is pinned by a test in
- * `cache-analysis.test.ts`: editing the production historian opener without
- * updating this marker fails loudly instead of silently desyncing.
  */
 const HISTORIAN_SYSTEM_MARKER =
     "the hippocampus of a long-running coding agent";
@@ -130,16 +116,14 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
     return false;
 }
 
-/** Parse the `[N] U:` / `[N] A:` ordinal range from a historian prompt. */
+/* */
 function findOrdinalRange(
     body: Record<string, unknown>,
 ): { start: number; end: number } | null {
     const messages =
         (body.messages as Array<{ content: unknown }> | undefined) ?? [];
     for (const message of messages) {
-        // A provider message may carry content as a bare string; treating that
-        // as "no blocks" silently degraded the historian response to an empty
-        // compartment set instead of covering the offered chunk.
+        // Provider messages may use string content; treating it as no blocks produces no compartments for the offered chunk.
         const blocks = Array.isArray(message.content)
             ? message.content
             : typeof message.content === "string"
@@ -167,10 +151,7 @@ function findOrdinalRange(
 }
 
 /**
- * Route historian requests to a valid single-compartment response covering
- * the offered chunk (same shape as tests/cache-invariants.test.ts). The
- * synthetic payload deliberately carries NO scenario fixture tokens so it can
- * never satisfy a search assertion by accident.
+ * The adapter returns one valid compartment spanning the offered range; its content is fixture-free so search assertions cannot pass accidentally.
  */
 export function installHistorianMatcher(h: TestHarness): void {
     h.mock.addMatcher((body) => {
@@ -208,14 +189,11 @@ export function installHistorianMatcher(h: TestHarness): void {
 }
 
 /**
- * Open the case harness's context.db read-only and run `fn` over it.
  *
- * Through `openTestDb`, never a bare `new Database`: the plugin under test writes
- * to this same file while a case reads it, and a handle with the default
- * `busy_timeout = 0` fails instantly with SQLITE_BUSY the moment the writer holds
- * the lock. That surfaces as "database is locked" in whichever driver happens to
- * collide, not as a real regression. The path comes from the harness for the same
- * reason it is not rebuilt by hand — one definition, no drift.
+ * Case reads use `openTestDb` because they can overlap plugin writes to `context.db`.
+ * `busy_timeout = 0` makes lock collisions fail immediately with `SQLITE_BUSY`.
+ * A lock collision reports "database is locked" in the colliding driver.
+ * The harness supplies the path to prevent duplicate path definitions from drifting.
  */
 export function readContextDb<T>(h: TestHarness, fn: (db: Database) => T): T {
     const db = openTestDb(h.contextDbPath(), { readonly: true });
@@ -227,10 +205,6 @@ export function readContextDb<T>(h: TestHarness, fn: (db: Database) => T): T {
 }
 
 /**
- * Open the case harness's context.db WRITABLE. KTD7: callers may use this
- * only after the canonical-path / schema-sentinel / empty-state / unique-
- * namespace preconditions passed, and only for the source-documented
- * out-of-band setup a case reproduces.
  */
 export function writeContextDb<T>(h: TestHarness, fn: (db: Database) => T): T {
     const db = openTestDb(h.contextDbPath());

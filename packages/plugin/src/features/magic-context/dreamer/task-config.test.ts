@@ -36,7 +36,6 @@ describe("buildClassifyModelChain", () => {
             classify?.fallbackModels,
         );
         expect(chain).toEqual(["prov/dream-default", "prov/fb"]);
-        // Historian-model exclusion is asserted by the Rust decoder test `dreamer_run_task_uses_request_chain_and_route_harness` (crates/mc-module/src/lib.rs), where the poisoned chain reaches real production code; a local historian object here does not.
     });
 
     test("drops non-canonical entries and yields an empty chain when nothing is configured", () => {

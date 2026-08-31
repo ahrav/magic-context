@@ -282,7 +282,7 @@ describe("long-running Pi Magic Context session", () => {
                 };
             });
 
-            // Phase 1: Warm-up turns 1-3 stay below threshold; the cached prefix is byte-identical.
+            // Turns 1–3 stay below the threshold and preserve a byte-identical cached prefix.
             for (let i = 1; i <= 3; i += 1) {
                 await send(`turn ${i}: Pi warm-up cache-stability probe ${h.ballast(2_500)}`, `pi phase 1 assistant ${i}`);
             }
@@ -293,7 +293,6 @@ describe("long-running Pi Magic Context session", () => {
             expect(new Set(warmup.slice(1, 3).map((request) => serialize(request.body.system))).size).toBe(1);
             expect(readMeta<{ last_context_percentage: number }>(h, sessionId, "last_context_percentage")?.last_context_percentage ?? 100).toBeLessThan(20);
 
-            // Phase 2: First execute. Turn 4 records high pressure; turn 5 executes cleanup; turn 6 recovers stability.
             const beforeExecutePressure = readMeta<{ last_context_percentage: number }>(h, sessionId, "last_context_percentage")?.last_context_percentage ?? 0;
             emitToolOnce(h, /^ctx_search$/, { query: "phase two harmless cleanup probe", limit: 1 }, FORCE_CLEANUP_USAGE);
             await send("turn 4: raise Pi pressure with a harmless tool call so the next pass must execute", "pi phase 2 pressure", FORCE_CLEANUP_USAGE);
@@ -301,16 +300,12 @@ describe("long-running Pi Magic Context session", () => {
             expect(beforeExecutePressure).toBeLessThan(20);
             expect(afterExecutePressure).toBeGreaterThanOrEqual(20);
             await send("turn 5: Pi execute pass should run heuristic cleanup", "pi phase 2 execute cleanup");
-            // No routine drops anymore: need-blind age-drops were removed with
-            // the tiered emergency-drop redesign (mirrors the OpenCode
-            // long-running test). The invariant kept is byte-identical cache
-            // recovery on the following defer pass; need-driven drops (≥85%
-            // tiered, historian queue-drops) are covered elsewhere.
+            // The following defer pass must recover a byte-identical cache.
             await send("turn 6: Pi defer after first execute should recover cache", "pi phase 2 cache recovery");
             const phase2Tail = mainRequests().slice(-2);
             expect(serialize(phase2Tail[1]!.body.messages?.[0])).toBe(serialize(phase2Tail[0]!.body.messages?.[0]));
 
-            // Phase 3: ctx_note write plus terminal task-list trigger. The nudge is delayed to a fresh user turn and then replayed.
+            // A ctx_note write and terminal task-list trigger delay the nudge until a fresh user turn, then replay the nudge.
             emitToolOnce(h, /^ctx_note$/, { action: "write", content: "Revisit the long-running Pi assertions after verification." });
             await send("turn 7: write a deferred Pi session note with ctx_note", "pi phase 3 after note write");
             expect(
@@ -334,7 +329,7 @@ describe("long-running Pi Magic Context session", () => {
             }
             // The 15-minute cooldown uses process-local wall-clock time; this long test cannot advance it without sleeping.
 
-            // Phase 4: ctx_reduce queues a real drop; the next execute materializes a dropped shell and suppresses cleanup nudges.
+            // ctx_reduce queues a real drop; the next execute materializes a dropped shell and suppresses cleanup nudges.
             const reduceTarget = await h.waitFor(
                 () => {
                     const row = h
@@ -360,13 +355,10 @@ describe("long-running Pi Magic Context session", () => {
             await send("turn 16: Pi ctx_reduce defer replay remains stable", "pi phase 4 stable replay");
             expect(JSON.stringify(mainRequests().at(-1)!.body)).toContain("[dropped");
 
-            // Phase 5: Historian publishes. Pi uses native JSONL compaction entries, not OpenCode's deferred marker blob.
+            // Pi uses native JSONL compaction entries, not OpenCode's deferred marker blob.
             await send("turn 17: Pi historian trigger pressure with eligible long tail", "pi phase 5 historian trigger", HISTORIAN_TRIGGER_USAGE);
-            // Turn 18's RESPONSE usage stays high so the first ordinary drive
-            // turn AFTER publication still sees >=85% and force-materializes
-            // (canConsumeDeferredLate) — that is the consuming pass which drains
-            // the staged marker. A low-usage turn 18 would leave the next pass
-            // in defer, where the deferred-history drain gate never opens.
+            // Turn 18 must retain ≥85% pressure so the next ordinary drive consumes the staged marker.
+            // Without ≥85% pressure on turn 18, the next pass defers and cannot drain deferred history.
             await send("turn 18: Pi follow-up starts historian publication", "pi phase 5 historian follow-up", HISTORIAN_TRIGGER_USAGE);
             await h.waitFor(
                 () => {
@@ -385,14 +377,8 @@ describe("long-running Pi Magic Context session", () => {
             expect(historianRange).not.toBeNull();
             expect(compartment.start_message).toBe(historianRange!.start);
             expect(compartment.end_message).toBe(historianRange!.end);
-            // Ordinary drive turn (NO HARD bust / m0-mutation injection): the
-            // publication's onPublished armed the deferred history-refresh +
-            // materialization signals, and this pass force-materializes (turn
-            // 18 kept pressure >=85%), rendering the new compartment into m[1].
-            // The widened coverage predicate (m[0] boundary OR current-pass
-            // m[1] delta) drains the staged marker into a native compaction
-            // entry on this consuming pass — parity with OpenCode's
-            // consuming-pass drain, which also rides ordinary send turns.
+            // The ordinary drive pass force-materializes the published compartment under ≥85% pressure.
+            // The m[0]-boundary-or-current-pass-m[1]-delta predicate drains the staged marker into a native compaction entry.
             await send("turn 18b: ordinary Pi drive turn consumes the historian publication", "pi phase 5 consuming pass");
             const compactions = await h.waitFor(() => {
                 const entries = readCompactionEntries(h);
@@ -401,25 +387,22 @@ describe("long-running Pi Magic Context session", () => {
             expect(compactions.at(-1)?.fromHook).toBe(true);
             expect(readMeta<{ pending_compaction_marker_state: string | null }>(h, sessionId, "pending_compaction_marker_state")?.pending_compaction_marker_state ?? null).toBeNull();
 
-            // Phase 6: Synthetic todowrite appears on the next cache-busting pass and replays byte-identically on defer.
+            // The next cache-busting pass injects the synthetic todowrite and replays it byte-identically on defer.
             emitToolOnce(h, /todo.*write|write.*todo|todowrite/i, { todos: ACTIVE_TODOS });
             await send("turn 19: Pi active todowrite snapshot", "pi phase 6 active todos");
             const stateJson = normalizedTodos(ACTIVE_TODOS);
             expect(readMeta<{ last_todo_state: string }>(h, sessionId, "last_todo_state")?.last_todo_state).toBe(stateJson);
             await send("turn 20: Pi pressure to make synthetic todowrite visible on next execute", "pi phase 6 pressure", HIGH_USAGE);
-            // The injection lands on the next cache-busting pass that is NOT
-            // vetoed by an in-flight historian. Phase 5's publication can
-            // legitimately trigger a follow-up historian run over the remaining
-            // tail; while it runs, execute passes defer mutations (matching
-            // OpenCode's compartment-running veto). Retry the execute turn
-            // WITH pressure until a non-vetoed pass injects the pair — a
-            // low-usage turn after the historian finishes would never bust,
-            // so pressure is what invites the execute pass the injection rides.
+            // The next cache-busting execute pass injects the synthetic todowrite without an in-flight historian.
+            // An in-flight historian vetoes execute-pass mutations.
+            // The retry uses ≥85% pressure after the historian finishes.
+            // A low-usage turn after the historian finishes cannot bust the cache.
+            // HIGH_USAGE triggers the cache-busting execute pass.
             const syntheticCallId = computeSyntheticCallId(stateJson);
             let syntheticPair: ReturnType<typeof findSyntheticTodoPair> = null;
             for (let attempt = 0; attempt < 6 && syntheticPair === null; attempt += 1) {
-                // The historian holds the compartment lease while running; wait
-                // for it to free so this attempt's pass is not veto-deferred.
+                // The historian holds the compartment lease while running.
+                // The pass waits until the historian releases the compartment lease to avoid veto deferral.
                 await h.waitFor(() => {
                     const lease = h
                         .contextDb()
@@ -436,7 +419,7 @@ describe("long-running Pi Magic Context session", () => {
             await send("turn 22: Pi defer pass replays synthetic todowrite bytes", "pi phase 6 synthetic replay");
             expect(findSyntheticTodoPair(mainRequests().at(-1)!.body, syntheticCallId)?.bytes).toBe(syntheticPair!.bytes);
 
-            // Phase 7: Auto-search hint from a seeded memory is appended and persisted for same-turn replay.
+            // A seeded-memory auto-search hint is appended and persisted for same-turn replay.
             seedMemory(h, "zebra pi ritual: when debugging long Pi sessions, inspect prefix bytes before changing runtime code");
             const beforeAutoSearch = h.mock.requests().length;
             emitToolOnce(h, /^ctx_note$/, { action: "read" });
@@ -451,7 +434,7 @@ describe("long-running Pi Magic Context session", () => {
                 expect(autoSearchDecisions).toContain("ctx-search-hint");
             }
 
-            // Phase 8: Compressor is intentionally disabled for this file to keep the long e2e under the 10-15 minute budget.
+            // Compression is disabled because the test does not exercise compression.
             await send("turn 24: Pi final low-pressure defer confirms session still works", "pi phase 8 compressor skipped");
         } finally {
             await h.dispose();

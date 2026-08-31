@@ -1,21 +1,14 @@
 /**
- * Persistent WebSocket to the server plugin's RPC server, replacing the old
- * 500ms HTTP notification poll.
  *
- * Why this exists: the TUI plugin and the server plugin run in separate Bun
- * runners in the same process, so they bridge over a localhost socket. The old
- * bridge polled `pending-notifications` over HTTP every 500ms — and each poll
- * opened a NEW loopback TCP connection (Bun's fetch isn't pooled to our server),
- * which was the entire source of idle TUI CPU (#200). A single long-lived WS
- * carries server→TUI pushes with zero per-event connection cost, and the server
- * pushes notifications the instant they're queued (no polling latency).
+ * The TUI and server plugins run in separate Bun runners in the same process and communicate over a localhost socket.
+ * The persistent socket avoids opening a loopback TCP connection for each notification.
+ * The server pushes queued notifications over the socket.
  *
- * Session scope: the socket carries the TUI's active session in its `hello` so
- * the server delivers only that session's (plus global) notifications and its
- * `isTuiConnected(session)` routing stays correct. The active session is tracked
- * with a cheap watcher that only reads `api.route.current` (a property access,
- * no IPC) and re-scopes the socket ONLY when the session actually changes — so
- * unlike the old poll it does no network work at idle.
+ * The socket includes the TUI's active session in its `hello`.
+ * The server delivers notifications for the active session and global notifications only.
+ * The active-session `hello` keeps `isTuiConnected(session)` routing correct.
+ * The watcher reads only `api.route.current`.
+ * The watcher re-scopes the socket only when the active session changes.
  */
 
 import { getRpcClient, getRpcGeneration } from "./context-db";
@@ -28,17 +21,17 @@ export interface SocketNotification {
 }
 
 interface NotificationSocketOptions {
-    /** Current active session id (re-read cheaply to follow session switches). */
+    /* */
     getSessionId: () => string | null;
-    /** Handle one delivered notification. Returns true only after it is fully
-     *  consumed and can be acknowledged. Async because dialog handlers await. */
+    /** `onNotification` returns `true` only after the notification can be acknowledged.
+     * `onNotification` may be asynchronous because dialog handlers await. */
     onNotification: (notification: SocketNotification) => boolean | Promise<boolean>;
 }
 
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 10_000;
-/** Cheap session-watch interval. Reads a property only; no network. The CPU bug
- *  was the per-tick fetch, not the timer — this tick does zero IPC at idle. */
+/** The interval reads a property and performs no IPC or network work while idle.
+ * */
 const SESSION_WATCH_MS = 1_000;
 
 let socket: WebSocket | null = null;
@@ -49,10 +42,10 @@ let closed = false;
 let helloedSession: string | null = null;
 let opts: NotificationSocketOptions | null = null;
 let activeToken: string | null = null;
-/** Generation of the rpc client used by the active socket. */
+/* */
 let connectGeneration = 0;
-/** Exactly one endpoint lookup may be active. A monotonically increasing id lets
- * stop/restart invalidate a late lookup before it can publish a socket. */
+/** At most one endpoint lookup may be active.
+ * Stopping or restarting invalidates a late endpoint lookup before it publishes a socket. */
 let nextAttemptId = 0;
 let inFlightAttemptId: number | null = null;
 
@@ -63,9 +56,9 @@ const LEGACY_INSTANCE_ID = "legacy";
 type NotificationProtocolMode = "legacy" | "v2";
 
 /**
- * Notification ids restart with every server instance. Epoch-prefixing cursor keys
- * and deduplication ids prevents a surviving TUI from applying a replaced server's
- * high watermark or remembered ids to the replacement's fresh queue.
+ * Server-instance epochs isolate cursor state because notification IDs restart for each server instance.
+ * Epoch-prefixing deduplication IDs prevents remembered IDs from one server instance from suppressing another instance's notifications.
+ * Epoch-scoped state prevents a replacement server from inheriting the previous server's cursor watermark or deduplicated IDs.
  */
 let activeInstanceId: string | null = null;
 let notificationProtocolMode: NotificationProtocolMode | null = null;
@@ -78,7 +71,7 @@ const legacyConsumedIdsByCursor = new Map<string, Set<number>>();
 /** Dialog actions share UI state, so notification handlers must never overlap. */
 let notificationHandlingChain: Promise<void> = Promise.resolve();
 
-/** Open the persistent notification socket. Reconnects on its own after a drop. */
+/* */
 export function startNotificationSocket(options: NotificationSocketOptions): void {
     opts = options;
     closed = false;
@@ -88,7 +81,7 @@ export function startNotificationSocket(options: NotificationSocketOptions): voi
     }
 }
 
-/** Close the socket and release all state owned by this TUI initialization. */
+/* */
 export function stopNotificationSocket(): void {
     closed = true;
     nextAttemptId += 1;
@@ -215,8 +208,8 @@ function sendHello(ws: WebSocket, token: string | null): void {
             instanceId: activeInstanceId,
             token: token ?? "",
             sessionId,
-            // Older servers still read these scoped cursors. Protocol 2 servers
-            // rely only on exact acknowledgements and do not prune from them.
+            // Legacy servers read scoped cursors.
+            // Protocol 2 servers prune notifications only from exact acknowledgements, not scoped cursors.
             lastReceivedId: cursorForKey(cursorKeyForSession(sessionId)),
             globalLastReceivedId: cursorForKey(cursorKeyForSession(undefined)),
         }),
@@ -241,13 +234,12 @@ function handleSocketMessage(ws: WebSocket, raw: string, token: string | null): 
             notificationProtocolMode = "v2";
             if (msg.instanceId !== activeInstanceId) {
                 switchNotificationEpoch(msg.instanceId);
-                // The server does not prune protocol 2 backlog from hello cursors, so a
-                // corrected hello safely establishes fresh epoch-scoped state.
+                // A `hello` with a changed instance ID establishes fresh epoch-scoped state.
                 sendHello(ws, token);
             }
         } else {
-            // A hello-ack without an instance id is the frozen v0.32 shape. Its
-            // server ignores exact-id acks, so cursors must remain gap-safe.
+            // A hello-ack without an instance ID identifies the legacy protocol.
+            // Legacy servers ignore exact-ID acknowledgements, so cursors must remain gap-safe.
             notificationProtocolMode = "legacy";
             switchNotificationEpoch(LEGACY_INSTANCE_ID);
         }
@@ -265,8 +257,7 @@ function handleSocketMessage(ws: WebSocket, raw: string, token: string | null): 
     }
 
     if (msg.type === "error") {
-        // Server rejected us (bad token, etc.). Close and let backoff retry after
-        // rediscovering the port/token (the server may have been replaced).
+        // Server rejection closes the socket so backoff retries after rediscovering the port and token.
         try {
             ws.close();
         } catch {
@@ -284,8 +275,7 @@ function queueNotification(ws: WebSocket, notification: SocketNotification): voi
     const deliveryInstanceId = activeInstanceId ?? LEGACY_INSTANCE_ID;
     const deliveryMode = notificationProtocolMode;
     if (deliveryMode === null) return;
-    // A single promise chain prevents two dialog actions from replacing each
-    // other's UI while either handler is still awaiting user input.
+    // The promise chain prevents one dialog action from replacing another action's UI while either awaits user input.
     notificationHandlingChain = notificationHandlingChain
         .then(() => handleNotification(ws, notification, deliveryInstanceId, deliveryMode))
         .catch(() => {});
@@ -305,8 +295,7 @@ async function handleNotification(
     ) {
         return;
     }
-    // Client-side session filtering follows session switches that happen between
-    // queueing and delivery. Global notifications always apply.
+    // Session filtering uses the session active at delivery time; global notifications bypass the filter.
     const active = opts?.getSessionId() ?? null;
     if (notification.sessionId !== undefined && notification.sessionId !== active) return;
 
@@ -323,8 +312,7 @@ async function handleNotification(
     } catch {
         consumed = false;
     }
-    // A dispose, reconnect, or epoch correction during an awaited dialog invalidates
-    // the delivery. The server retains it for the current socket to redeliver.
+    // The client does not acknowledge a delivery after the socket, RPC generation, instance, or protocol mode changes while `onNotification` awaits.
     if (
         socket !== ws ||
         getRpcGeneration() !== connectGeneration ||
@@ -441,11 +429,9 @@ function sendAck(
             return;
         }
         // Exact ids avoid deleting an earlier notification whose handler failed
-        // while a later notification was consumed successfully.
         ws.send(JSON.stringify({ type: "ack", ids: [notification.id] }));
     } catch {
-        // Best-effort: an unacknowledged row is safely deduplicated and re-acked
-        // when the server delivers it again after reconnecting.
+        // The client re-acknowledges duplicate notifications after reconnecting so the server stops redelivering them.
     }
 }
 
@@ -453,13 +439,12 @@ export function _resetNotificationSocketStateForTesting(): void {
     stopNotificationSocket();
 }
 
-/** Cheap session-change watcher: re-scope the socket only when the active session
- *  actually changes. Reads a property; no network at idle. */
+/**
+ * */
 function watchSession(): void {
     if (closed || !socket || socket.readyState !== WebSocket.OPEN) return;
     const current = opts?.getSessionId() ?? null;
     if (current === helloedSession) return;
-    // Re-hello with the token authenticated by this socket; no rediscovery or
-    // network request is needed for a local route change.
+    // The client reuses the socket's authenticated token for local route changes without rediscovering the port or token.
     sendHello(socket, activeToken);
 }

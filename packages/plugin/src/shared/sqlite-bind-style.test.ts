@@ -3,35 +3,16 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * Guard: SQLite statement binds must use SPREAD positional args
- * (`stmt.run(a, b)`), never the ARRAY form (`stmt.run([a, b])`).
  *
- * Why this is a CI guard, not just a style preference: bun:sqlite (OpenCode)
- * binds a lone array positionally, but node:sqlite (Pi, OpenCode Desktop) reads
- * it as NAMED params ("0","1") and throws `Unknown named parameter '0'`. An
- * array-form bind therefore passes every OpenCode/Bun test yet breaks Pi/Desktop
- * silently — exactly how issue #151 (/ctx-dream) shipped. The sqlite.ts
- * chokepoint now normalizes array binds for node:sqlite so it can no longer
- * CRASH, but the array form is still discouraged: it relies on the shim, reads
- * inconsistently with the rest of the codebase (all spread), and the guard
- * catches it at PR time so the shim stays a safety net, not a crutch.
  */
 
-// Scan EVERY package's src, not just plugin's. pi-plugin and cli have no
-// sqlite.ts of their own — they run on the shared chokepoint — so an array-form
-// bind written in their code would break under node:sqlite (Pi/Desktop) exactly
-// like #151, and the plugin-only scan would never see it. Roots are resolved
-// relative to plugin/src so the guard works from the plugin package.
 const PLUGIN_SRC = join(import.meta.dir, "..");
 const SCAN_ROOTS = [
     PLUGIN_SRC,
     join(PLUGIN_SRC, "../../pi-plugin/src"),
     join(PLUGIN_SRC, "../../cli/src"),
 ].filter((dir) => existsSync(dir));
-// The chokepoint itself documents the pattern in prose/comments; the guard's own
-// source mentions it; allow those two (relative to whichever root contains them).
 const ALLOWED = new Set(["shared/sqlite.ts", "shared/sqlite-bind-style.test.ts"]);
-// `stmt.run([` / `.get([` / `.all([` — but `.all([` also matches Promise.all([.
 const BIND_PATTERN = /\.(run|get|all)\(\[/;
 
 function collectTsFiles(dir: string, acc: string[] = []): string[] {
@@ -59,10 +40,8 @@ describe("sqlite bind style", () => {
                     if (!BIND_PATTERN.test(line)) return;
                     // Promise.all([...]) is not a SQLite statement bind.
                     if (line.includes("Promise.all(")) return;
-                    // Skip comment lines.
                     const trimmed = line.trim();
                     if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
-                    // Disambiguate which package the hit is in.
                     const pkg = root.includes("pi-plugin")
                         ? "pi-plugin"
                         : root.includes("cli")

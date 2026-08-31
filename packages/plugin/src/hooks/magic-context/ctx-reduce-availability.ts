@@ -4,78 +4,46 @@ import { sessionLog } from "../../shared/logger";
 import { openCodeDbExists, withReadOnlySessionDb } from "./read-session-db";
 
 /**
- * Whether a given tool is actually CALLABLE in a session's tool set.
  *
- * Magic Context registers tools process-globally, but a parent agent (or the
- * user's OpenCode config) can spawn a session with an explicit allow-list
- * tools map ({"*": false, read: true, ...}) that filters a tool out. For such
- * sessions any surface that urges or replays that tool — ctx_reduce §N§
- * prefixes and nudges, or synthetic todowrite pairs — is pure overhead urging
- * a tool the model cannot call (plus cargo-cult risk with no benefit).
+ * A session's explicit tools map can exclude a globally registered tool.
+ * A tools map such as `{"*": false, read: true}` excludes tools not explicitly enabled.
+ * Guidance and synthetic calls must not target tools excluded by the session's tools map.
  *
- * CACHE STABILITY: the verdict is resolved ONCE per session per tool from the
- * FIRST user message's tools map and cached for the process lifetime. Per-turn
- * tool maps can differ (mode switches toggle edit tools), and a flapping
- * verdict would oscillate provider-visible bytes — a per-turn HARD bust. The
- * first-message map is fixed at session spawn, so the verdict is deterministic
- * across passes and restarts.
+ * The bounded cache retains each tool's first-user-message verdict until eviction.
+ * A changing verdict would change provider-visible bytes every turn.
  *
- * The ctx_reduce verdict intentionally remains frozen even when OpenCode's live
- * permission rules deny the tool. Its value gates guidance and the system-prompt
- * hash; changing it mid-session would invalidate the provider prefix for a
- * permission change that is otherwise not part of the prompt. Todowrite's
- * synthetic pair has a separate live permission check at cache-busting
- * boundaries, so this asymmetry is deliberate and load-bearing.
+ * The resolver keeps the `ctx_reduce` verdict frozen when live permissions deny the tool because the verdict gates guidance and the system-prompt hash.
+ * Changing the ctx_reduce verdict mid-session would invalidate the provider prefix even though permission changes do not alter the prompt.
+ * Todowrite checks live permissions only at cache-busting boundaries.
  *
- * Fail-open: no tools map (normal sessions), no wildcard-deny, or an
- * unreadable OpenCode DB all resolve to "available" — current behavior.
+ * When the tools map is absent, does not deny the wildcard, or the OpenCode DB is unreadable, availability defaults to true.
  */
 
-/** Availability verdict plus whether it is final for the session's lifetime. */
+/** The verdict records whether its result is final for the session's lifetime. */
 export interface ToolAvailabilityVerdict {
     callable: boolean;
-    /** True when resolved from the session's first user message (cached).
-     *  False when the verdict is a provisional fail-open default — consumers
-     *  that PERSIST state derived from the verdict (e.g. the system-prompt
-     *  hash) must skip persistence until a frozen verdict exists, or a later
-     *  final verdict flips the persisted bytes and busts the prompt cache. */
+    /** `frozen` is true when the verdict comes from the session's first user message.
+     * When `frozen` is false, consumers must not persist state derived from the verdict because a later final verdict can change persisted bytes and bust the prompt cache.
+     * */
     frozen: boolean;
 }
 
-// `ctx_reduce` is registered process-globally by the tool registry at boot.
-// In compaction-off mode (the `compaction` config block's `enabled` field set
-// to false) the registry skips registering it, so no session can ever call
-// the tool — regardless of the per-session spawn tools map (a normal session
-// with no tools map would otherwise fail-open to "callable"). This
-// process-global override makes unregistration flow naturally to every
-// ctx_reduce-availability consumer: the no-reduce guidance variant
-// (system-prompt-hash.ts), Channel-1/Channel-2 nudges, and §N§ prefix
-// injection (transform.ts). Default true (registered) preserves today's
-// behavior for tests/legacy callers that never call the setter. The
-// compaction-off mode reuses the existing no-reduce guidance variant
-// machinery rather than minting a third template.
 let ctxReduceRegisteredGlobally = true;
 
 /**
- * Set whether `ctx_reduce` is registered process-globally. Called once at
- * plugin boot from the tool registry resolution. When false, every
- * `resolveCtxReduceAvailability*` call returns a frozen `callable: false`
- * verdict without consulting the per-session tools map or the OpenCode DB.
+ * `resolveCtxReduceAvailability*` returns a frozen `callable: false` verdict when `ctx_reduce` is not registered globally.
  */
 export function setCtxReduceRegisteredGlobally(registered: boolean): void {
     ctxReduceRegisteredGlobally = registered;
 }
 
-/** Test-only reset so the availability suite's default-true baseline is
- *  unaffected by a prior test that flipped the override. Production code
- *  never needs to re-enable mid-process (boot-resolved, process-stable). */
+/**
+ * */
 export function resetCtxReduceRegisteredGloballyForTest(): void {
     ctxReduceRegisteredGlobally = true;
 }
 
-/** Historical alias. ctx_reduce was the first consumer of this resolver; the
- * verdict shape is identical for every tool, so the name is kept so existing
- * ctx_reduce call sites stay untouched.
+/**
  */
 export type CtxReduceAvailabilityVerdict = ToolAvailabilityVerdict;
 
@@ -83,21 +51,19 @@ const CTX_REDUCE_TOOL = "ctx_reduce";
 const TODOWRITE_TOOL = "todowrite";
 
 /**
- * Verdicts are cached per (tool, session). Two tools resolve independently for
- * the same session, so the key is a composite. The NUL separator cannot appear
- * in either a tool name or an OpenCode session id. Cap covers ~500 sessions
- * across the two tools we currently resolve (ctx_reduce + todowrite).
+ * Verdicts are cached independently for each `(tool, session)` pair.
+ * The 1,000-entry cap supports at most 500 sessions when both `ctx_reduce` and `todowrite` have entries.
  */
 const availabilityBySession = new BoundedSessionMap<boolean>(1000);
 
 /** The cached permission verdict is updated only during cache-busting passes;
- * defer passes reuse it without performing a live permission read. */
+ * Defer passes reuse the cached permission verdict without a live permission read. */
 const permissionDeniedBySession = new BoundedSessionMap<boolean>(2000);
 const ctxReducePermissionDenyLogged = new BoundedSessionMap<boolean>(1000);
 
 type PermissionAction = "ask" | "allow" | "deny";
 
-/** The small rule shape used by OpenCode's Permission.disabled evaluator. */
+/* */
 export interface PermissionRule {
     permission: string;
     pattern: string;
@@ -112,30 +78,25 @@ function cacheKey(toolName: string, sessionId: string): string {
     return `${toolName}\u0000${sessionId}`;
 }
 
-/** Verdict for one tool from one tools map; null = map carries no signal. */
+/** A null result means the tools map carries no signal. */
 function verdictFromToolsMap(tools: unknown, toolName: string): boolean | null {
     if (tools === null || typeof tools !== "object" || Array.isArray(tools)) return null;
     const map = tools as Record<string, unknown>;
     if (map[toolName] === true) return true;
     if (map[toolName] === false) return false;
-    // Explicit allow-list (wildcard deny) without this tool → filtered out.
     if (map["*"] === false) return false;
     return null;
 }
 
 /**
- * Resolve from the in-memory transform message array (preferred — free).
- * Caches the verdict on first resolution.
+ * The resolver prefers the in-memory transform message array over the OpenCode DB.
+ * The resolver caches verdicts derived from the first user message.
  */
 export function resolveToolAvailabilityFromMessages(
     sessionId: string,
     toolName: string,
     messages: ReadonlyArray<{ info?: { role?: string; tools?: unknown } }>,
 ): ToolAvailabilityVerdict {
-    // Process-global registration override: when ctx_reduce is not registered
-    // (compaction-off mode) the tool is uncallable for every session, full
-    // stop. Frozen so the system-prompt hash persists this verdict as the
-    // session baseline (no provisional-then-flip cache bust).
     if (toolName === CTX_REDUCE_TOOL && !ctxReduceRegisteredGlobally) {
         return { callable: false, frozen: true };
     }
@@ -146,38 +107,31 @@ export function resolveToolAvailabilityFromMessages(
     for (const message of messages) {
         if (message.info?.role !== "user") continue;
         // First user message decides: explicit signal, or no-signal → available.
-        // Either way the verdict is final — freeze it.
+        // The first user message always produces a frozen verdict.
         const verdict = verdictFromToolsMap(message.info.tools, toolName) ?? true;
         availabilityBySession.set(key, verdict);
         return { callable: verdict, frozen: true };
     }
-    // No user message in the array at all (not a real prompt — e.g. a stray
-    // pass on an empty session). Fail open but do NOT freeze: caching true here
-    // would lock a deny-list session into the tool's surface before its first
-    // user message ever arrives to say otherwise.
+    // When no user message exists, the resolver fails open without freezing so the first user message can set the verdict.
     return { callable: true, frozen: false };
 }
 
 /**
- * Resolve from the OpenCode DB (paths that may run before the transform has
- * seen any messages — e.g. the system-prompt hook, or tool.execute.after).
- * Falls back to "available" when the DB is absent (Pi-only installs) or the
+ * The resolver reads the OpenCode DB and fails open when it is unavailable or unreadable.
  * read fails.
  */
 export function resolveToolAvailability(
     sessionId: string,
     toolName: string,
 ): ToolAvailabilityVerdict {
-    // Process-global registration override (see resolveToolAvailabilityFromMessages).
+    // `ctx_reduce` is uncallable for every session when it is not globally registered.
     if (toolName === CTX_REDUCE_TOOL && !ctxReduceRegisteredGlobally) {
         return { callable: false, frozen: true };
     }
     const key = cacheKey(toolName, sessionId);
     const cached = availabilityBySession.get(key);
     if (cached !== undefined) return { callable: cached, frozen: true };
-    // No opencode.db at all: this handler only runs inside OpenCode, where the
-    // DB always exists — this branch is test/degraded-install territory, not
-    // the pre-first-user race. Treat as final so hash persistence proceeds.
+    // The resolver freezes the fail-open verdict when no database exists so hash persistence can proceed.
     if (!openCodeDbExists()) return { callable: true, frozen: true };
     try {
         const row = withReadOnlySessionDb(
@@ -202,12 +156,11 @@ export function resolveToolAvailability(
     }
 }
 
-/** Drop a cached verdict for one tool of one session (test/reset helper). */
+/* */
 export function clearToolAvailability(sessionId: string, toolName: string): void {
     availabilityBySession.delete(cacheKey(toolName, sessionId));
 }
 
-// --- ctx_reduce convenience wrappers (behavior-identical to the original) ---
 
 export function resolveCtxReduceAvailabilityFromMessages(
     sessionId: string,
@@ -224,7 +177,6 @@ export function clearCtxReduceAvailability(sessionId: string): void {
     clearToolAvailability(sessionId, CTX_REDUCE_TOOL);
 }
 
-// --- live OpenCode permission signal ---
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -247,10 +199,7 @@ function permissionNameMatches(rulePermission: string, toolName: string): boolea
 }
 
 /**
- * Apply OpenCode's Permission.disabled rule: the last matching permission
- * rule wins, and only a deny of the whole permission pattern disables it.
- * Keeping this evaluator pure makes the findLast behavior testable without a
- * live OpenCode server.
+ * The last matching `Permission.disabled` rule wins; only a deny of the whole permission pattern disables it.
  */
 export function permissionDisabled(toolName: string, rules: readonly PermissionRule[]): boolean {
     let finalRule: PermissionRule | undefined;
@@ -285,7 +234,7 @@ function appendPermissionRule(
     }
 }
 
-/** Normalize both OpenCode's object shorthand and its already-expanded rules. */
+/** The normalizer accepts both OpenCode's object shorthand and its already-expanded rules. */
 function permissionRules(value: unknown): PermissionRule[] {
     if (Array.isArray(value)) {
         const result: PermissionRule[] = [];
@@ -308,8 +257,7 @@ function permissionRules(value: unknown): PermissionRule[] {
         if (permission === "rules") continue;
         const simpleAction = actionOf(configured);
         if (simpleAction) {
-            // OpenCode's simple string form (`todowrite: "deny"`) expands to
-            // the same whole-tool rule used by Permission.disabled.
+            // OpenCode interprets a simple string permission as a whole-tool rule.
             appendPermissionRule(result, permission, "*", simpleAction);
             continue;
         }
@@ -328,10 +276,7 @@ function activeAgentNameFromSession(value: unknown): string | undefined {
 }
 
 /**
- * Read OpenCode's merged agent permissions plus the session overlay and apply
- * the same last-rule evaluator OpenCode uses. The SDK declarations in older
- * plugin peer versions do not expose the newer permission fields, so the
- * response is intentionally narrowed at this boundary.
+ * Session rules follow agent rules, so later session rules override agent rules.
  */
 export async function resolveToolPermissionDenied(
     client: PluginContext["client"],
@@ -374,7 +319,7 @@ export function todowritePermissionDenied(
     return resolveToolPermissionDenied(client, sessionId, TODOWRITE_TOOL, activeAgent);
 }
 
-/** Cached live verdict used by defer passes; undefined means no bust has read it yet. */
+/* */
 export function cachedToolPermissionDenied(
     sessionId: string,
     toolName: string,
@@ -400,7 +345,6 @@ export function markCtxReducePermissionDenyLogged(sessionId: string): void {
     ctxReducePermissionDenyLogged.set(sessionId, true);
 }
 
-// --- todowrite convenience wrappers ---
 
 export function resolveTodowriteAvailabilityFromMessages(
     sessionId: string,

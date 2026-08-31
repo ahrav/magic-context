@@ -73,8 +73,6 @@ function createArgs(content: string) {
 }
 
 /**
- * A model that saw a clamped tool call in reduced history imitates that wrapper.
- * Mutations must survive the imitation, tokens included.
  */
 function reduced(inner: Record<string, unknown>) {
     return { reduced: true, summary: JSON.stringify(inner) };
@@ -106,11 +104,6 @@ describe("ctx_memory U4 scenario 1: create uses direct claims", () => {
         }
     });
     test("an out-of-taxonomy category is refused instead of persisted", async () => {
-        // The schema types `category` as an enum, but a parse failure falls back
-        // to executing the raw argument object so provider-shaped calls keep
-        // working — and because the schema is `passthrough`, only a MALFORMED
-        // advertised field fails a parse. Storage checks non-empty only, so the
-        // action layer is what keeps the taxonomy closed.
         const db = createClaimReaderTestDatabase();
         try {
             const tool = harness(db);
@@ -121,7 +114,6 @@ describe("ctx_memory U4 scenario 1: create uses direct claims", () => {
             expect(created).toContain("unknown claim category: arbitrary");
             expect(db.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({ count: 0 });
 
-            // A valid category on the same shape still applies.
             const ok = parseResult(
                 await tool.execute(createArgs("In taxonomy."), "call-good-category"),
             );

@@ -1,7 +1,4 @@
 /**
- * Test-only support for exercising the Synapse detailed (versioned-receipt)
- * embedding path against a deterministic in-process host double. Used by the
- * writer suites and the crash matrix; never imported by production code.
  */
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
@@ -28,9 +25,6 @@ export interface RecordedHostCall {
 }
 
 /**
- * Deterministic host double: embed.batch always answers with a job descriptor
- * and embed.result serves the job's exact item set. `resultPages` scripts
- * multi-page or failing result flows; `vectorFor` shapes per-item vectors.
  */
 export class DetailedSynapseTestHost implements SynapseClientLike {
     readonly calls: RecordedHostCall[] = [];
@@ -157,19 +151,19 @@ export function synapseTestConfig(): EmbeddingConfig {
 }
 
 export interface CrashInjection {
-    /** SQL matcher for statements whose execution should throw. */
+    /** The wrapper throws when this matcher selects a statement. */
     matcher: RegExp;
-    /** How many MATCHING executions to let through before throwing. */
+    /** The wrapper allows this many matching executions before throwing. */
     skip?: number;
-    /** How many injected throws to perform before passing through again. */
+    /** The wrapper resumes pass-through execution after this many injected throws. */
     times?: number;
 }
 
 /**
- * Wrap a Database so chosen statements throw on execution, simulating a
- * process crash at that exact write. Delegates everything else unchanged;
- * transactions opened through the wrapper roll back on the injected throw,
- * matching what SQLite does when a process dies before COMMIT.
+ * The wrapper throws when the configured matcher selects a statement, simulating a crash at that statement.
+ * The wrapper delegates all unmatched `Database` operations unchanged.
+ * Transactions opened through the wrapper roll back when an injected throw occurs.
+ * SQLite rolls back transactions when a process dies before `COMMIT`.
  */
 export function crashingDatabase(db: Database, injection: CrashInjection): Database {
     let remainingSkips = injection.skip ?? 0;

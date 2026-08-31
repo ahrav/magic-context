@@ -19,10 +19,7 @@ export function incidentUnitFiles(root: string = E2E_ROOT): string[] {
             cwd: root,
             onlyFiles: true,
         }),
-        // Globbed, not listed: `assertSrcTestsClassified` only scans `src/`, so a
-        // hand-maintained list here would silently drop a newly added
-        // `scripts/*.test.ts` from the default, host, and incident-unit
-        // selections without tripping any guard.
+        // The glob includes script tests because `assertSrcTestsClassified` scans only `src/`.
         ...[...new Glob("scripts/*.test.ts").scanSync({
             cwd: root,
             onlyFiles: true,
@@ -33,11 +30,9 @@ export function incidentUnitFiles(root: string = E2E_ROOT): string[] {
 }
 
 /**
- * Hermetic unit tests that live outside `tests/` and outside the incident-pool
- * tree, so neither the mode manifest nor the incident-unit selection can see
- * them. The mode selection carries them because it replaced a bare `bun test`
- * as the package's default suite; without this they run nowhere. These need
- * nothing beyond Bun, so every mode can run them.
+ * Prospective unit tests run only through this default suite because no manifest or incident-unit selection includes them.
+ * Mode selection includes these files because neither the manifest nor the incident-unit selection selects them.
+ * Every mode can run prospective-unit tests because they require only Bun.
  */
 export function prospectiveUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
@@ -52,9 +47,7 @@ export function prospectiveUnitFiles(root: string = E2E_ROOT): string[] {
 }
 
 /**
- * Pure-data historian-eval lane tests (contract, scorer, mutation battery,
- * promote). Harness-booting lane tests live in the OpenCode standalone list
- * instead, so they never run under rust or pi modes.
+ * The OpenCode standalone list contains harness-booting historian-eval tests so Rust and Pi modes never run them.
  */
 export function historianEvalUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
@@ -69,7 +62,7 @@ export function historianEvalUnitFiles(root: string = E2E_ROOT): string[] {
     return files;
 }
 
-/** Credential-free dreamer manifest contract and scorer tests. */
+/** These tests validate the credential-free dreamer manifest contract and scorer. */
 export function dreamerEvalUnitFiles(root: string = E2E_ROOT): string[] {
     const files = [
         ...new Glob("src/dreamer-eval/**/*.test.ts").scanSync({
@@ -82,16 +75,9 @@ export function dreamerEvalUnitFiles(root: string = E2E_ROOT): string[] {
 }
 
 /**
- * Historian-eval tests that boot the TestHarness (`opencode serve` + mock
- * provider). TS-mode only: `mc-module`'s Rust historian producer does not
- * promote claims, so these must never join a rust or pi selection.
+ * TS mode alone runs TestHarness-booting historian-eval tests because the Rust historian producer does not promote claims.
  *
- * Forward declaration: entries are excluded from `historianEvalUnitFiles()` and
- * claimed by `tsOpenCodeStandaloneFiles()` the moment they land, so adding one
- * never trips `assertSrcTestsClassified` — which every CLI path runs, and which
- * would otherwise break `--mode ts` and `--incident-unit` alike. Listing a name
- * before the file exists is therefore deliberate, and the presence filter in
- * `tsOpenCodeStandaloneFiles` is what makes it harmless.
+ * `assertSrcTestsClassified` must accept present harness-test entries.
  */
 export const HISTORIAN_EVAL_HARNESS_TESTS = ["src/historian-eval/runner.test.ts"];
 
@@ -106,7 +92,7 @@ export function standaloneUnitFiles(root: string = E2E_ROOT): string[] {
     return assertPresent(files, root);
 }
 
-/** OpenCode-only oracle tests that require the TypeScript TestHarness. */
+/** These OpenCode-only oracle tests require the TypeScript TestHarness. */
 export function tsOpenCodeStandaloneFiles(root: string = E2E_ROOT): string[] {
     return [
         ...assertPresent(
@@ -116,32 +102,21 @@ export function tsOpenCodeStandaloneFiles(root: string = E2E_ROOT): string[] {
             ],
             root,
         ),
-        // Presence-filtered, not asserted: the harness list is a forward
-        // declaration (see HISTORIAN_EVAL_HARNESS_TESTS), so a name may legally
-        // precede its file. Claiming the ones that do exist is what keeps the
-        // historian-eval exclusion wired to a destination.
+        // `tsOpenCodeStandaloneFiles()` filters absent entries because `HISTORIAN_EVAL_HARNESS_TESTS` may name a test before its file exists.
         ...HISTORIAN_EVAL_HARNESS_TESTS.filter((file) => existsSync(resolve(root, file))),
     ];
 }
 
 /**
- * Standalone tests that build the direct-host Cargo fixture. They belong to the
- * Rust selection alone: a public TypeScript checkout has no `../commons` path
- * dependencies, so building the fixture there fails, and these tests carry no
- * skip guard of their own. The Rust selection gates on the prerequisite probe
- * before it reaches them.
+ * The Rust selection alone runs these Cargo-fixture tests because TypeScript checkouts lack `../commons` and the tests have no skip guard.
  */
 export function rustStandaloneFiles(root: string = E2E_ROOT): string[] {
     return assertPresent(["src/rust-runner/hermetic-mc-host.test.ts"], root);
 }
 
 /**
- * Two-way guard for the hand-maintained standalone lists above: every
- * `src/**\/*.test.ts` on disk must be claimed by exactly one selection
- * (incident-unit glob, standalone units, or Rust standalone), mirroring the
- * manifest's own missing/dead-path check for `tests/**`. Without this, a new
- * test file outside `tests/` that is absent from the literals runs in no
- * selection and silently drops coverage.
+ * `src/**/*.test.ts` files must be claimed by at least one selection.
+ * A new `src/` test file that no selection claims runs in no selection.
  */
 export function assertSrcTestsClassified(root: string = E2E_ROOT): void {
     const onDisk = [
@@ -307,9 +282,6 @@ async function main(): Promise<number> {
         }
     }
     const wrapper = "tests/incident-pool-green.test.ts";
-    // The wrapper drives the whole pool in-process, so it runs alone in a
-    // second phase. Hermetic standalone units ride the first phase; the
-    // Cargo-fixture ones join only when Rust prerequisites were proven above.
     const standalone =
         args.incidentUnit || args.prospectiveUnit || args.historianEvalUnit || args.dreamerEvalUnit
             ? []

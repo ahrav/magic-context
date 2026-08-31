@@ -6,9 +6,8 @@ import { parseProviderModel } from "./resolve-fallbacks";
 
 type Client = ReturnType<typeof createOpencodeClient>;
 
-/** Max time to wait for the best-effort child-session abort HTTP call before
- *  giving up on its response (the abort still proceeds server-side). Keeps a
- *  wedged abort endpoint from masking the original timeout/abort error. */
+/**
+ * The 3-second limit prevents a wedged abort endpoint from masking the original timeout or abort error. */
 const ABORT_CALL_TIMEOUT_MS = 3000;
 
 export type PromptBody = {
@@ -24,66 +23,58 @@ export type PromptArgs = {
 };
 
 /**
- * Keep a prompt body independent from SDK/client mutation. Some prompt facades
- * normalize or consume request bodies while handling a failed attempt; fallback
- * attempts must start from the original system prompt and request body every time.
+ * Some prompt facades normalize or consume request bodies after failed attempts.
+ * Fallback attempts must receive a fresh copy of the original request body.
  */
 function copyPromptArgs(args: PromptArgs, body: PromptBody): PromptArgs {
     return { ...args, body: { ...body } };
 }
 
 export interface PromptAttemptInfo {
-    /** Human-readable model label used in logs ("primary" or "provider/model"). */
+    /** `label` identifies the model in logs as `primary` or `provider/model`. */
     label: string;
     /** Zero-based attempt index: 0 is primary, 1+ are fallback models. */
     attemptIndex: number;
-    /** True for configured fallback models, false for the primary attempt. */
+    /** `isFallback` is true for configured fallbacks and false for the primary attempt. */
     isFallback: boolean;
-    /** Total attempted models including the primary and all configured fallbacks. */
+    /** `totalAttempts` includes the primary and every configured fallback. */
     totalAttempts: number;
-    /** Explicit model override for this attempt, when one was supplied. */
+    /** `model` overrides the model for this attempt when supplied. */
     model?: { providerID: string; modelID: string };
 }
 
 export interface PromptRetryOptions {
     timeoutMs?: number;
-    /** External abort signal — cancels the in-flight LLM prompt immediately when aborted */
+    /** External abort signal cancels the in-flight LLM prompt when aborted. */
     signal?: AbortSignal;
     /**
-     * Ordered list of "provider/modelID" alternates to try if the primary call
-     * (and its single-suggestion retry) fails. Empty / undefined = no fallback
-     * iteration (legacy behavior).
+     * `fallbackModels` lists alternates to try after the primary attempt fails.
+     * Empty or undefined `fallbackModels` disables fallback iteration.
      *
      * Fallback policy:
      *   - Each fallback gets the FULL `timeoutMs` budget (per-attempt, not total).
-     *   - Suggestion-retry runs inside each attempt (so "did you mean X?" errors
-     *     still self-heal at the primary AND at each fallback).
-     *   - Iteration stops immediately on abort/timeout/context-overflow errors —
-     *     fallbacks won't help and the caller's emergency-recovery path needs
-     *     to handle these.
-     *   - On all-failed, the LAST error is thrown (matches legacy behavior when
-     *     `fallbackModels` is empty).
+     * Each attempt runs its suggestion retry once.
+     * Each attempt retries a `did you mean X?` error once.
+     * Abort, timeout, and context-overflow errors stop fallback iteration.
+     * The retry loop throws the last error after all attempts fail.
      */
     fallbackModels?: readonly string[];
     /**
-     * Identifier for structured logging (e.g. "dreamer:consolidate",
-     * "historian", "compressor", "sidekick"). Helps correlate fallback
-     * attempts to a specific call site in `magic-context.log`. Defaults to
-     * "subagent" if not provided.
+     * `callContext` identifies the call site in structured logs.
+     * Structured logs use `callContext` to correlate fallback attempts with a call site.
+     * `callContext` defaults to `subagent`.
      */
     callContext?: string;
 }
 
 export interface ValidatedPromptRetryOptions<TOutput, TValidated> extends PromptRetryOptions {
     /**
-     * Fetch the output produced by the just-completed prompt attempt. This is
-     * intentionally caller-owned because OpenCode exposes results via session
-     * messages and each caller validates a different shape.
+     * OpenCode exposes results through session messages.
+     * Each caller validates a different output shape.
      */
     fetchOutput: (args: PromptArgs, attempt: PromptAttemptInfo) => Promise<TOutput>;
     /**
-     * Validate and optionally transform the fetched output. Throw to reject this
-     * model's output and advance to the next configured fallback model.
+     * A thrown validation error rejects the model output and advances to the next fallback.
      */
     validateOutput: (
         output: TOutput,
@@ -170,19 +161,13 @@ async function promptWithTimeout(
     timeoutMs: number,
     signal?: AbortSignal,
 ): Promise<void> {
-    // Bail immediately if the caller's signal is already aborted (e.g.
-    // lease loss before this attempt was scheduled). Per spec
-    // `addEventListener('abort', ...)` on an already-aborted signal fires
-    // synchronously in modern Node/Bun, but an explicit guard is clearer
-    // and avoids one wasted upstream `client.session.prompt` round-trip
-    // before `isNonRetryable` catches the cancellation at the chain loop.
+    // The external-abort check prevents an upstream prompt call after external abort.
     if (signal?.aborted) {
         throw new Error("prompt aborted by external signal");
     }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-    // Link external signal to internal controller so external abort cancels the fetch
     const onExternalAbort = () => controller.abort();
     signal?.addEventListener("abort", onExternalAbort);
 
@@ -193,16 +178,12 @@ async function promptWithTimeout(
         } as Parameters<typeof client.session.prompt>[0]);
     } catch (error) {
         if (signal?.aborted) {
-            // External abort (e.g. dreamer lease loss): the child run loop is an
-            // independent SERVER-SIDE fiber — cancelling our client fetch alone
-            // leaves it looping the LLM forever (issue #154). Force-stop it.
+            // External abort cancels only the client fetch; abort the child session.
             await abortChildRun(client, args.path.id);
             throw new Error("prompt aborted by external signal");
         }
         if (controller.signal.aborted) {
-            // Our timeout fired. Same problem: abort the server-side run loop, not
-            // just our fetch, or the child keeps re-calling the LLM past the
-            // timeout (uncancellable by the user's ESC — issue #154).
+            // A timeout aborts only the client fetch; abort the child session.
             await abortChildRun(client, args.path.id);
             throw new Error(`prompt timed out after ${timeoutMs}ms`);
         }
@@ -214,18 +195,12 @@ async function promptWithTimeout(
 }
 
 /**
- * Force-stop a spawned child session's server-side run loop. `controller.abort()`
- * on the prompt signal only cancels OUR client fetch; the run loop is a separate
- * instance-scoped fiber that `POST /session/{id}/abort` interrupts. Best-effort —
- * a failure here must not mask the original timeout/abort error.
+ * The child session continues running after a prompt timeout or external abort.
+ * An abort-session failure must not mask the original timeout or abort error.
  */
 async function abortChildRun(client: Client, sessionId: string): Promise<void> {
     try {
-        // Bound the abort call: it's best-effort cleanup, and if the abort
-        // endpoint itself stalls (the runner is wedged) an unbounded await here
-        // would hang the caller and MASK the original timeout/abort error that we
-        // still need to surface. Race against a short timer; the abort keeps
-        // running server-side regardless of whether we wait for its response.
+        // The 3-second cleanup timeout prevents cleanup from delaying the original timeout or abort error.
         await Promise.race([
             client.session.abort({ path: { id: sessionId } }),
             new Promise<void>((resolve) => setTimeout(resolve, ABORT_CALL_TIMEOUT_MS)),
@@ -236,19 +211,10 @@ async function abortChildRun(client: Client, sessionId: string): Promise<void> {
 }
 
 /**
- * Returns true if the error indicates a NON-RETRYABLE condition where iterating
- * to a fallback model would be pointless or harmful:
  *
- *   - External abort (user cancellation, lease loss, etc.) — caller wants to
- *     stop, not retry.
- *   - Context overflow — same prompt will overflow on any reasonably-sized
- *     model. Caller has its own emergency-recovery path for this.
- *   - Timeout — same wall-clock budget on the same prompt is unlikely to
- *     succeed on another model. Caller decides whether to retry at a higher
- *     level (e.g. historian's MAX_HISTORIAN_RETRIES loop).
+ * A timeout stops fallback iteration.
  *
- * Everything else (auth errors, ProviderModelNotFoundError without suggestion,
- * rate limits, transient network failures, etc.) is considered retryable on a
+ * Other errors remain eligible for fallback retries.
  * different model.
  */
 function isNonRetryable(error: unknown, externalSignal?: AbortSignal): boolean {
@@ -256,7 +222,7 @@ function isNonRetryable(error: unknown, externalSignal?: AbortSignal): boolean {
 
     if (error instanceof Error) {
         if (error.name === "AbortError") return true;
-        // promptWithTimeout wraps both abort cases in plain `Error` with a
+        // `promptWithTimeout` wraps external aborts and timeouts in `Error` messages.
         // recognizable message.
         if (error.message === "prompt aborted by external signal") return true;
         if (/^prompt timed out after \d+ms$/.test(error.message)) return true;
@@ -277,9 +243,7 @@ function shortErr(error: unknown): string {
 }
 
 /**
- * Try a single prompt attempt against the supplied body, with the existing
- * single-suggestion retry layered inside (so "did you mean X?" still self-heals
- * per attempt). Throws on failure; returns on success.
+ * The function retries once when the SDK suggests a replacement model.
  */
 async function attemptOnce(
     client: Client,
@@ -289,23 +253,19 @@ async function attemptOnce(
     callContext: string,
     label: string,
 ): Promise<void> {
-    // Keep this snapshot separate from the object passed to the client. A
-    // failed prompt facade may rewrite its request body before rejecting; the
-    // model-suggestion retry still needs the original system prompt.
+    // Failed prompt facades may rewrite request bodies before rejecting, so `originalBody` remains separate.
+    // `originalBody.model` identifies the model that the suggested retry replaces.
     const originalBody = { ...args.body };
     const attemptArgs = copyPromptArgs(args, originalBody);
     try {
         await promptWithTimeout(client, attemptArgs, timeoutMs, signal);
         return;
     } catch (error) {
-        // If non-retryable (abort, overflow, timeout), bubble up immediately.
-        // Don't even try suggestion retry — caller needs the original error.
         if (isNonRetryable(error, signal)) throw error;
 
         const suggestion = parseModelSuggestion(error);
         if (!suggestion || !originalBody.model) {
-            // No suggestion available — caller's fallback loop will decide
-            // whether to try the next chain entry.
+            // The caller's fallback loop selects the next model when no suggested model is available.
             throw error;
         }
 
@@ -330,18 +290,12 @@ async function attemptOnce(
 }
 
 /**
- * Run an OpenCode subagent prompt with model fallback support.
  *
- * Attempts the configured primary model first (whatever `args.body.model` or
- * the registered agent default resolves to), then iterates through
- * `options.fallbackModels` if provided. Each attempt internally retries once on
- * the SDK's "model not found, did you mean X?" suggestion. Aborts, timeouts,
- * and context-overflow errors short-circuit the fallback loop because retrying
- * the same prompt against another model won't help.
+ * The function tries the resolved primary model before `options.fallbackModels`.
+ * Each attempt retries once when the SDK suggests a replacement model.
+ * `isNonRetryable` errors stop fallback retries.
  *
- * Behavior with `fallbackModels` empty/undefined is identical to the pre-v0.18
- * single-suggestion retry — fully backward-compatible for callers that haven't
- * been updated to thread a chain.
+ * With no fallback models, only the model-suggestion retry runs.
  */
 export async function promptSyncWithModelSuggestionRetry(
     client: Client,
@@ -351,14 +305,10 @@ export async function promptSyncWithModelSuggestionRetry(
     const timeoutMs = options.timeoutMs ?? 300_000;
     const callContext = options.callContext ?? "subagent";
     const fallbacks = options.fallbackModels ?? [];
-    // Snapshot the body before the first client call. The Pi facade and the
-    // OpenCode SDK both receive this same shape, and either may mutate it while
-    // handling a failed request. Fallbacks must never inherit that mutation.
+    // Fallbacks must not inherit request-body mutations from failed requests.
     const baseBody = { ...args.body };
     const baseArgs = copyPromptArgs(args, baseBody);
 
-    // Attempt 0 = whatever the agent or explicit body.model resolves to.
-    // Subsequent attempts override body.model with each fallback in order.
     const explicitPrimaryLabel =
         baseBody.model?.providerID && baseBody.model.modelID
             ? `${baseBody.model.providerID}/${baseBody.model.modelID}`
@@ -381,9 +331,6 @@ export async function promptSyncWithModelSuggestionRetry(
         if (isNonRetryable(error, options.signal)) throw error;
 
         if (fallbacks.length === 0) {
-            // No fallbacks configured — behave exactly like legacy: propagate
-            // the original error (which may already have had its suggestion
-            // retry attempted inside `attemptOnce`).
             throw error;
         }
 
@@ -425,8 +372,6 @@ export async function promptSyncWithModelSuggestionRetry(
         }
     }
 
-    // All exhausted. Log the full chain and throw the last error so the
-    // caller's report (e.g. /ctx-dream tasks_json) still surfaces a real
     // diagnostic.
     log(
         `[${callContext}] all models exhausted; tried: ${[explicitPrimaryLabel, ...fallbacks].join(", ")}; last error: ${shortErr(lastError)}`,
@@ -450,16 +395,7 @@ async function attemptAndValidate<TOutput, TValidated>(
 }
 
 /**
- * Run a prompt with model fallback support, but accept an attempt only after the
- * caller validates the model's actual output. This covers "empty success" cases
- * where the provider/OpenCode prompt call completes successfully but the subagent
- * produced no usable assistant text / JSON.
  *
- * The happy path is still one prompt + one caller-owned output fetch: callers
- * should use the returned output instead of fetching messages a second time.
- * Validation failures are retryable across configured fallback models. If every
- * attempt produces invalid output (or otherwise fails retryably), the first
- * failure is re-thrown so callers surface the original failure semantics.
  */
 export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = TOutput>(
     client: Client,
@@ -469,9 +405,6 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
     const timeoutMs = options.timeoutMs ?? 300_000;
     const callContext = options.callContext ?? "subagent";
     const fallbacks = options.fallbackModels ?? [];
-    // Snapshot the body before the first client call. The Pi facade and the
-    // OpenCode SDK both receive this same shape, and either may mutate it while
-    // handling a failed request. Fallbacks must never inherit that mutation.
     const baseBody = { ...args.body };
     const baseArgs = copyPromptArgs(args, baseBody);
 

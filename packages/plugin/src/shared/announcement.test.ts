@@ -4,19 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 /**
- * `announcement.ts` reads/writes a single `last_announced_version` file under
- * `getMagicContextStorageDir()`. The behavior we test:
- *   1. `markAnnouncementSeen` then `readLastAnnouncedVersion` round-trips
- *   2. `shouldShowAnnouncement` returns false after a matching mark
- *   3. `shouldShowAnnouncement` returns true after a non-matching (older) mark
- *   4. `shouldShowAnnouncement` seeds state + returns false on first run / wiped
- *      sandbox (no prior file), so fresh installs and ephemeral envs aren't
- *      spammed with a changelog (issue #99)
- *   5. Empty-version inputs are no-ops (don't crash, don't write garbage)
+ * On first run, the gate stores the current version and returns false to avoid showing a changelog without prior context.
+ * Empty version marks do not modify the stored version.
  *
- * We isolate writes by pointing `XDG_DATA_HOME` at a temp dir before requiring
- * the module fresh per test, since the module captures the storage path at
- * import time via `getMagicContextStorageDir()`.
+ * The module must be imported after XDG_DATA_HOME is set because it captures its storage path at import time.
  */
 
 let tmpRoot = "";
@@ -44,7 +35,7 @@ afterEach(() => {
 
 describe("announcement state persistence", () => {
     test("round-trips a dismissed version through the file", async () => {
-        // Fresh import after XDG override so the module captures the temp path
+        // Import the module after setting XDG_DATA_HOME because it captures the temporary path at import time.
         const mod = await import(`./announcement?t=${Date.now()}-rt`);
         const { readLastAnnouncedVersion, markAnnouncementSeen } = mod;
 
@@ -69,8 +60,6 @@ describe("announcement state persistence", () => {
         const mod = await import(`./announcement?t=${Date.now()}-mkdir`);
         const { markAnnouncementSeen } = mod;
 
-        // Storage dir lives under tmpRoot + cortexkit/magic-context — does not
-        // exist yet at the start of the test
         const expectedDir = path.join(tmpRoot, "cortexkit", "magic-context");
         expect(fs.existsSync(expectedDir)).toBe(false);
 
@@ -104,8 +93,6 @@ describe("shouldShowAnnouncement gating", () => {
             shouldShowAnnouncement,
         } = mod;
 
-        // Skip the test if announcements are disabled (empty constants)
-        // — the gate's empty-input behavior is covered separately below.
         if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
             return;
         }
@@ -124,18 +111,17 @@ describe("shouldShowAnnouncement gating", () => {
         } = mod;
 
         if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
-            // When empty, the gate is always false regardless of state
+            // The gate returns false when ANNOUNCEMENT_VERSION is empty or ANNOUNCEMENT_FEATURES has no entries.
             expect(shouldShowAnnouncement()).toBe(false);
             return;
         }
 
-        // No mark exists yet (fresh install or ephemeral/wiped sandbox). The
-        // gate must NOT announce — it seeds the state to the current version and
-        // returns false, so first-run users and disposable containers are never
-        // spammed with a changelog they have no context for.
+        // When no stored mark exists, the gate seeds the current version and returns false.
+        // The gate seeds the stored version with the current version and returns false when no mark exists.
+        // The gate returns false after seeding a missing mark so first-run users do not see a changelog without prior context.
+        // The gate returns false after seeding a missing mark so first-run users do not see a changelog without prior context.
         expect(readLastAnnouncedVersion()).toBe("");
         expect(shouldShowAnnouncement()).toBe(false);
-        // The seed was written, so a subsequent check stays quiet too.
         expect(readLastAnnouncedVersion()).toBe(ANNOUNCEMENT_VERSION);
         expect(shouldShowAnnouncement()).toBe(false);
     });
@@ -188,9 +174,9 @@ describe("shouldShowAnnouncement gating", () => {
             return;
         }
 
-        // Stored version is far newer than the running binary (user downgraded).
-        // A bare string-inequality gate would re-show the OLD announcement; the
-        // semver gate must stay quiet (current is NOT > stored).
+        // A stored version newer than the running binary indicates a downgrade.
+        // String inequality would re-show an older announcement after a downgrade.
+        // The gate returns false when ANNOUNCEMENT_VERSION is empty, ANNOUNCEMENT_FEATURES has no entries, no stored mark exists, or the current version is not greater than the stored version.
         markAnnouncementSeen("999.0.0");
         expect(shouldShowAnnouncement()).toBe(false);
     });

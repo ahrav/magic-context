@@ -90,9 +90,6 @@ describe("imitated reduced argument revalidation", () => {
     }
 });
 
-// Object-valued fields exist because claim mutations carry a mutation token, whose
-// every field the tool consumes. Decode must accept the exact token shape and
-// nothing else, since a decoded object bypasses the adapter's own arg schema.
 const TOKEN_RULE: ImitatedArgRule = {
     type: "object",
     fields: {

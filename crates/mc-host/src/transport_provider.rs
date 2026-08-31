@@ -1,16 +1,5 @@
-//! Private transport-provider registry and grant records (plan U4).
 //!
-//! Production construction contains TCP only: the default registry holds no
-//! injected providers, so a production host can never grant a non-TCP
-//! channel (R6). Injected providers exist for tests and must satisfy KTD9 —
-//! owner-only endpoint access, exclusive peer attachment, provider-
-//! incarnation fencing, and stale-descriptor rejection — before yielding a
-//! candidate; any failure is a bounded [`ProviderFailure`] that fails the
-//! setup closed (KTD6, R12).
 //!
-//! Everything here is `#[doc(hidden)]`: the module is a crate-internal seam
-//! reachable only so the integration-test harness can inject fake providers
-//! through `HostConfig` the same way it injects every other test knob.
 
 use std::fmt;
 use std::future::Future;
@@ -25,13 +14,8 @@ use crate::frame_channel::{BoxedReceiver, FrameSender};
 use crate::transport_negotiation::ActivationToken;
 use crate::wire::ByteBudget;
 
-/// The host's TCP capability version: the only version the bootstrap
-/// transport speaks, and the version every TCP selection names.
 pub const TCP_CAPABILITY_VERSION: u32 = 1;
 
-/// Bounded provider-failure taxonomy (KTD9 gate outcomes plus general
-/// unavailability). Carries no provider payloads, descriptors, or endpoints,
-/// so it is safe on every diagnostic surface (R14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderFailure {
     /// The endpoint could not be restricted to owner-only access.
@@ -46,10 +30,7 @@ pub enum ProviderFailure {
     Unavailable,
 }
 
-/// Host resources a provider may draw on while constructing a candidate
-/// channel, plus the selected offer's advertised parameters. Resource
-/// fields are crate-internal; injected providers pass the context through
-/// to [`memory_candidate`] unchanged.
+/// ProviderContext supplies candidate-construction resources and the selected offer's advertised parameters.
 pub struct ProviderContext {
     pub(crate) ingress: ByteBudget,
     pub(crate) queue_frames: usize,
@@ -58,28 +39,19 @@ pub struct ProviderContext {
 }
 
 impl ProviderContext {
-    /// The selected offer's opaque `parameters` exactly as decoded from the
-    /// negotiation request, or `None` when the offer carried none. A
-    /// provider whose service naming, capacity, or compatibility handshake
-    /// depends on its advertised parameters reads them here.
     pub fn offer_parameters(&self) -> Option<&serde_json::Value> {
         self.offer_parameters.as_ref()
     }
 }
 
-/// One prepared, setup-only, non-routable candidate channel (host side).
-/// Opaque outside the crate: tests obtain one from [`memory_candidate`].
 pub struct Candidate {
     pub(crate) sender: FrameSender,
     pub(crate) receiver: BoxedReceiver,
     pub(crate) io: Pin<Box<dyn Future<Output = ()> + Send>>,
-    /// Candidate generation root: cancelling retires the candidate.
     pub(crate) root: CancellationToken,
     pub(crate) read_cancel: CancellationToken,
 }
 
-/// What a provider yields once the KTD9 gate passed: a bounded opaque
-/// descriptor for the client, a binding identity, and the candidate channel.
 pub struct PreparedCandidate {
     pub descriptor: serde_json::Value,
     pub candidate_id: u64,
@@ -88,7 +60,6 @@ pub struct PreparedCandidate {
 
 impl fmt::Debug for PreparedCandidate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The descriptor is provider data and never reaches formatting (R14).
         f.debug_struct("PreparedCandidate")
             .field("descriptor", &"<opaque>")
             .field("candidate_id", &self.candidate_id)
@@ -96,24 +67,20 @@ impl fmt::Debug for PreparedCandidate {
     }
 }
 
-/// Preflight verdict for one offer (KTD6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreflightEligibility {
     Serveable,
-    /// Permanent absence or static ineligibility.
+    /// StaticallyOmitted denotes permanent absence or static ineligibility.
     StaticallyOmitted,
-    /// Transient readiness or admission pressure.
+    /// DynamicallyUnavailable denotes transient readiness or admission pressure.
     DynamicallyUnavailable,
 }
 
-/// A test-injected transport provider. Implementations must run KTD9's
-/// attachment gate inside `prepare` and fail with a bounded
-/// [`ProviderFailure`] before yielding a candidate.
 pub trait InjectedProvider: Send + Sync + 'static {
     fn transport(&self) -> &str;
     fn capability_version(&self) -> u32;
 
-    /// Implementations must not create resources, run cleanup, or touch workers here (R6).
+    /// Implementations must not create resources, run cleanup, or touch workers in `preflight`.
     /// Readiness changes govern new offers only, never existing candidates.
     fn preflight(&self, _parameters: Option<&serde_json::Value>) -> PreflightEligibility {
         PreflightEligibility::Serveable
@@ -122,7 +89,6 @@ pub trait InjectedProvider: Send + Sync + 'static {
     fn prepare(&self, ctx: &ProviderContext) -> Result<PreparedCandidate, ProviderFailure>;
 }
 
-/// One registered provider with its identity snapshotted at registration.
 #[derive(Clone)]
 struct ProviderEntry {
     transport: Box<str>,
@@ -130,32 +96,23 @@ struct ProviderEntry {
     provider: Arc<dyn InjectedProvider>,
 }
 
-/// One queued preparation for the registry's dedicated worker thread.
+/// PrepareJob sends one provider preparation to the registry worker.
 type PrepareJob = (
     Arc<dyn InjectedProvider>,
     ProviderContext,
     tokio::sync::oneshot::Sender<Result<PreparedCandidate, ProviderFailure>>,
 );
 
-/// Bounds preparations queued behind a wedged gate: a hung `prepare` can
-/// strand at most this many unreachable provider/context tuples before
-/// later negotiations fail closed immediately instead of growing host
-/// memory per reconnect.
+/// Limits queued preparations so a hung `prepare` cannot cause unbounded reconnect memory growth.
 const PREPARE_QUEUE_BOUND: usize = 8;
 
-/// The registry's single, lazily started preparation thread. `prepare` runs
-/// here — never on a Tokio worker or the blocking pool — so a provider gate
-/// that blocks forever occupies exactly this one OS thread: later attempts
-/// queue behind it (up to [`PREPARE_QUEUE_BOUND`]) and fail at their own
-/// setup deadlines instead of consuming another pool worker per reconnect,
-/// and runtime shutdown never waits on it.
+/// `prepare` runs on one dedicated OS thread; blocked calls queue later attempts without consuming Tokio or blocking-pool workers.
 #[derive(Default)]
 struct PrepareWorker {
     sender: Mutex<Option<std::sync::mpsc::SyncSender<PrepareJob>>>,
 }
 
-/// The host's provider registry. `Default` (production) is empty: TCP is the
-/// implicit bootstrap transport and the only production channel.
+/// `Default` creates an empty production registry; TCP is the implicit bootstrap transport and the only production channel.
 #[derive(Clone, Default)]
 pub struct TransportProviders {
     injected: Vec<ProviderEntry>,
@@ -164,25 +121,16 @@ pub struct TransportProviders {
 
 impl TransportProviders {
     /// The registry retains built-in TCP when tests inject providers.
-    /// Provider-authored `transport()` and `capability_version()` run once,
-    /// here: negotiation lookups on a connection's read loop touch only the
-    /// snapshot, so a slow or blocking metadata method cannot stall reads
-    /// before the setup deadline exists.
+    /// Provider metadata is snapshotted during registration, so slow metadata getters cannot stall read-loop negotiation before the setup deadline exists.
     ///
     /// # Panics
     ///
-    /// A static configuration error — a transport name outside the wire
-    /// grammar, the reserved `tcp` name, or a duplicate
-    /// `(transport, capability_version)` identity — panics with a bounded
-    /// message. Nothing provider-authored is echoed, so an invalid name
-    /// never reaches the registry (and therefore never its `Debug`, which
-    /// `HostConfig` derives through).
+    /// A transport name outside the wire grammar, the reserved `tcp` name, or a duplicate `(transport, capability_version)` identity panics with a bounded message.
+    /// Panic messages exclude provider-authored values.
+    /// Validation failure prevents `TransportProviders` construction.
     pub fn with_injected(injected: Vec<Arc<dyn InjectedProvider>>) -> Self {
-        // Metadata getters are provider code: the redaction hook must exist
-        // before they run (registration happens before `run` installs it),
-        // and each call executes under the poll guard so a panicking getter
-        // cannot print provider data through the hook. The panic still
-        // fails registration loudly.
+        // The registration path installs the panic redaction hook before invoking provider metadata getters.
+        // A panicking metadata getter aborts registration.
         crate::panic_boundary::install();
         let entries: Vec<ProviderEntry> = injected
             .into_iter()
@@ -217,10 +165,9 @@ impl TransportProviders {
         }
     }
 
-    /// Queues `provider.prepare(ctx)` on the registry's dedicated worker
-    /// thread and returns the reply channel. A dropped or timed-out receiver
-    /// leaves the job to complete (or hang) on that one thread; the caller's
-    /// own deadline governs how long it waits.
+    /// Dropping or timing out the receiver does not cancel the queued job.
+    /// The dedicated worker can remain blocked in a job after the caller stops waiting.
+    /// The caller's deadline governs how long it waits.
     pub(crate) fn prepare_on_worker(
         &self,
         provider: Arc<dyn InjectedProvider>,
@@ -234,12 +181,7 @@ impl TransportProviders {
                 .name("mc-host-provider-prepare".to_owned())
                 .spawn(move || {
                     while let Ok((provider, ctx, reply)) = job_rx.recv() {
-                        // A panicking gate is one failed preparation, not a
-                        // dead worker. `redact_sync` keeps the panic hook
-                        // from printing a payload that may carry provider
-                        // data; `catch_unwind` (the same containment the
-                        // composite handler boundary uses) keeps the thread
-                        // alive, and that setup fails closed.
+                        // A panic while preparing one job does not terminate the worker.
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 crate::panic_boundary::redact_sync(|| provider.prepare(&ctx))
@@ -251,21 +193,19 @@ impl TransportProviders {
             if spawned.is_ok() {
                 *sender = Some(job_tx);
             }
-            // On spawn failure the reply sender drops below and the caller
-            // observes a closed channel: the setup fails closed.
+            // A spawn failure closes the reply channel.
         }
         if let Some(job_tx) = sender.as_ref() {
-            // try_send: a wedged worker rejects new jobs instead of queueing
-            // unreachable provider/context tuples without bound; the dropped
-            // reply sender fails that caller's setup closed immediately.
+            // A wedged worker cannot accumulate jobs beyond `PREPARE_QUEUE_BOUND`.
+            // Dropping a rejected job's reply sender fails its setup immediately.
             let _ = job_tx.try_send((provider, ctx, reply_tx));
         }
         reply_rx
     }
 
-    /// Provider identity is `(transport, capability_version)`: the same
-    /// transport may be installed at several capability versions, so a
-    /// name-only match could return a mismatched sibling and hide a
+    /// Providers are identified by `(transport, capability_version)`, not transport alone.
+    /// A transport can have providers at multiple capability versions.
+    /// A name-only lookup can select a provider at the wrong capability version.
     /// serveable provider.
     pub(crate) fn find(
         &self,
@@ -280,9 +220,8 @@ impl TransportProviders {
             .map(|entry| &entry.provider)
     }
 
-    /// True when some provider serves `transport` at any capability version.
-    /// Separates "unknown transport" from "known transport, wrong version"
-    /// so the fallback reason names the real cause (§7.7.3).
+    /// A name-only lookup can report `true` for an unsupported capability version.
+    /// Together, `find` and `serves_transport` distinguish an unknown transport from a known transport lacking the requested capability version.
     pub(crate) fn serves_transport(&self, transport: &str) -> bool {
         self.injected
             .iter()
@@ -299,9 +238,6 @@ impl fmt::Debug for TransportProviders {
     }
 }
 
-/// Builds a candidate channel over an in-memory duplex stream carrying the
-/// ordinary v2 frame encoding, returning the peer half for the test to
-/// drive. This is the only way tests can construct a [`Candidate`].
 pub fn memory_candidate(
     ctx: &ProviderContext,
     buffer_bytes: usize,
@@ -347,9 +283,8 @@ impl ProviderContext {
     }
 }
 
-/// Everything a grant is bound to (KTD4): the token authorizes nothing by
-/// itself — activation must present it on the exact candidate this record
-/// names, inside the same daemon, bootstrap generation, and negotiation.
+/// A grant authorizes only an activation whose `GrantBinding` exactly matches the record.
+/// An activation must present both the record's token and its exact `GrantBinding`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantBinding {
     pub daemon_id: [u8; 16],
@@ -360,7 +295,6 @@ pub struct GrantBinding {
     pub candidate_id: u64,
 }
 
-/// Why an activation did not consume the grant. Bounded; no token material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantRejection {
     TokenMismatch,
@@ -368,8 +302,7 @@ pub enum GrantRejection {
     AlreadyConsumed,
 }
 
-/// One-use grant record (KTD4). The token is compared in constant time and
-/// the record is consumed atomically by exactly one matching activation.
+/// Exactly one matching activation atomically consumes the record.
 pub struct GrantRecord {
     binding: GrantBinding,
     token: ActivationToken,
@@ -385,10 +318,7 @@ impl GrantRecord {
         }
     }
 
-    /// Validates and consumes the grant. The token comparison runs in
-    /// constant time over the fixed 32-byte form; a mismatched token or
-    /// binding never consumes the record, and a matching activation consumes
-    /// it exactly once even under concurrent duplicates.
+    /// Exactly one matching activation consumes the record despite concurrent duplicates.
     pub fn consume(
         &self,
         presented: &ActivationToken,
@@ -417,8 +347,6 @@ impl fmt::Debug for GrantRecord {
     }
 }
 
-/// Mints a fresh 128-bit activation token from the OS CSPRNG as 32 lowercase
-/// hexadecimal characters (protocol §7.7.2).
 pub(crate) fn fresh_activation_token() -> ActivationToken {
     use std::fmt::Write;
     let mut raw = [0u8; 16];
@@ -479,7 +407,7 @@ mod tests {
             record.consume(&good, &wrong),
             Err(GrantRejection::BindingMismatch)
         );
-        // Neither rejection consumed the record.
+        // `TokenMismatch` and `BindingMismatch` leave the record unconsumed.
         assert_eq!(record.consume(&good, &binding()), Ok(()));
         assert_eq!(
             record.consume(&good, &binding()),

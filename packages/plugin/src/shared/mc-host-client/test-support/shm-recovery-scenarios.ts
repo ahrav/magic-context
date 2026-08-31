@@ -1,12 +1,9 @@
 /**
- * Runtime-neutral fresh-generation re-upgrade scenarios (U3, R9-R11).
+ * These scenarios exercise runtime-neutral fresh-generation re-upgrades.
  *
- * Each scenario drives a real `McHostClient` against the independent
- * `FakePeer` plus the in-process fake paired provider using
- * `node:assert/strict` only — no bun:test — so the same key scenarios also
- * execute under Node 24 through `run-mc-host-client-node.ts`.
- * `shm-recovery.test.ts` wraps every scenario in a bun test and adds
- * bun-specific cases on top.
+ * Each scenario runs a real `McHostClient` against an independent `FakePeer` and an in-process fake paired provider using only `node:assert/strict`.
+ * `run-mc-host-client-node.ts` also runs these scenarios under Node 24.
+ * `shm-recovery.test.ts` wraps each scenario in a Bun test and adds Bun-specific cases.
  */
 
 import assert from "node:assert/strict";
@@ -50,11 +47,11 @@ export interface RecoveryScenario {
     run(ctx: RecoveryContext): Promise<void>;
 }
 
-/** Tracked peers/clients/tmp files, torn down after each scenario. */
+/* */
 export interface RecoveryContext {
     startPeer(options?: Parameters<typeof FakePeer.start>[0]): Promise<FakePeer>;
     connect(peer: FakePeer, overrides?: Partial<McHostClientOptions>): Promise<McHostClient>;
-    /** Path of the connection file written by the most recent `connect`. */
+    /* */
     lastConnectionFile: string;
 }
 
@@ -99,7 +96,7 @@ export async function runRecoveryScenario(scenario: RecoveryScenario): Promise<v
 }
 
 // ----------------------------------------------------------------------
-// Shared wire helpers (peer-side scripting, never production encoders).
+// The shared helpers script peer-side frames and do not encode production traffic.
 // ----------------------------------------------------------------------
 
 export function tcpSelectionBody(reason?: string): Record<string, unknown> {
@@ -132,9 +129,7 @@ function respondJson(conn: FakePeerConnection, corr: bigint, value: unknown): vo
 }
 
 /**
- * Script every `transport.negotiate` across ALL connections in accept
- * order: `bodies(index)` returns the response body for the index-th
- * negotiation, or `null` to stay silent.
+ * The helper scripts every `transport.negotiate` across all connections in accept order; `bodies(index)` returns the response body for negotiation `index` or `null` to suppress its response.
  */
 export function scriptNegotiations(
     peer: FakePeer,
@@ -198,7 +193,7 @@ export function serveTcpRoutes(conn: FakePeerConnection, firstChannel: number): 
     };
 }
 
-/** Default provider-host script serving managed routes on channel 5. */
+/** The default provider-host script serves managed routes on channel 5. */
 export function recoveryProvider(): FakePairedProvider {
     const provider = createFakePairedProvider();
     provider.host.onFrame = candidateAutoResponder(RECOVERY_GRANT_TOKEN, (frame, host) => {
@@ -236,7 +231,7 @@ function connectedTransports(events: McHostDiagnosticsEvent[]): string[] {
     return events.filter((e) => e.type === "connected").map((e) => e.transport ?? "");
 }
 
-/** Runs `turns` `setImmediate` turns without timer delays. */
+/** The helper executes `turns` `setImmediate` turns without timer delays. */
 export async function settle(turns = 10): Promise<void> {
     for (let index = 0; index < turns; index++) {
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -244,14 +239,11 @@ export async function settle(turns = 10): Promise<void> {
 }
 
 // ----------------------------------------------------------------------
-// Key scenarios (each maps to one or more U3 test-scenario bullets).
 // ----------------------------------------------------------------------
 
 export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
     {
-        // AE7/R9-R10: commit TCP with `unavailable`, serve managed and raw
-        // traffic, retry repeated unavailable, then commit shared memory
-        // before the original deadline; only later managed calls move.
+        // The scenario commits TCP with `unavailable`, serves managed and raw traffic, retries repeated `unavailable`, then commits shared memory before the original deadline; only managed calls opened afterward use shared memory.
         name: "unavailable TCP re-upgrades to shared memory while old traffic drains",
         async run(ctx) {
             const provider = recoveryProvider();
@@ -270,7 +262,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             serveTcpRoutes(conn1, 7);
 
             // Managed and raw traffic complete on the committed TCP primary
-            // while shadow attempts keep failing with repeated unavailable.
+            // Shadow attempts keep failing with repeated `unavailable`.
             const rawHandle = await client.routeOpen(TOOL_TARGET, IDENTITY);
             assert.deepEqual(await client.request(rawHandle, { n: 1 }), { served: "tcp" });
             assert.deepEqual(await client.call("magic-context", "m1"), { served: "tcp" });
@@ -280,8 +272,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             await waitUntil(() => connectedTransports(events).includes("fake.shm"), 10_000);
             assert.equal(events.filter((e) => e.type === "retired").length, 0);
 
-            // New managed acquisitions route through the promoted
-            // shared-memory generation only.
+            // New managed acquisitions route only through the promoted shared-memory generation.
             assert.deepEqual(await client.call("magic-context", "m2"), { served: "shm" });
             assert.ok(
                 provider.host.frames.some(
@@ -289,9 +280,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
                 ),
             );
 
-            // The raw TCP handle stays usable on its own generation until
-            // its explicit close (R10); the predecessor retires only after
-            // its pending set and route set are both empty.
+            // The raw TCP handle remains usable on its generation until explicit close; the predecessor retires only after both its pending set and route set are empty.
             assert.deepEqual(await client.request(rawHandle, { n: 2 }), { served: "tcp" });
             assert.equal(conn1.socket.destroyed, false);
             await client.closeRoute(rawHandle);
@@ -302,11 +291,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
         },
     },
     {
-        // Seeded-defect detector for the pending-zero/continuation race: a
-        // route.open terminal empties the predecessor's pending set BEFORE
-        // the awaiting continuation records the handle in `liveRoutes`, so
-        // retirement must defer until the continuation completes and the
-        // caller's raw handle serves until its explicit close (R10).
+        // A `route.open` terminal can empty the predecessor's pending set before its awaiting continuation records the handle in `liveRoutes`; retirement must wait for that continuation, and the raw handle remains usable until explicit close.
         name: "a route.open resolving during predecessor drain keeps the handle usable",
         async run(ctx) {
             const provider = recoveryProvider();
@@ -323,8 +308,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             });
             const conn1 = peer.connections[0] as FakePeerConnection;
 
-            // Withhold the route.open response so the open is still
-            // in flight when promotion turns conn1 into the predecessor.
+            // The test withholds `route.open` so promotion makes `conn1` the predecessor while `client.routeOpen` remains pending.
             const pendingOpen = client.routeOpen(TOOL_TARGET, IDENTITY);
             await conn1.waitFor(() =>
                 conn1.frames.some((frame) => isControlOp(frame, "route.open")),
@@ -336,7 +320,6 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             allowGrant = true;
             await waitUntil(() => connectedTransports(events).includes("fake.shm"), 10_000);
 
-            // Serve later routed requests on the granted channel.
             const answered = new Set<bigint>();
             const serveChannel = (): void => {
                 for (const frame of conn1.frames) {
@@ -361,10 +344,8 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             };
             conn1.socket.on("data", () => setImmediate(serveChannel));
 
-            // The terminal lands while conn1 is the draining predecessor:
-            // its arrival reaches pending-zero before the routeOpen
-            // continuation resumes, which must not retire the generation
-            // out from under the handle.
+            // A terminal can reach pending-zero while `conn1` is the draining predecessor before `routeOpen` resumes.
+            // The `routeOpen` continuation must not retire the generation before returning the handle.
             respondJson(conn1, openFrame.corr, {
                 op: "route.open",
                 route_channel: 7,
@@ -385,13 +366,10 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
         },
     },
     {
-        // Seeded-defect detector for the terminal-lease/retirement race: a
-        // binary response settles its terminal and empties the
-        // predecessor's pending set BEFORE the awaiting requestBinary
-        // continuation receives the ReceiveLease, and retirement
-        // force-releases every channel lease, so a pending-zero retirement
-        // with no live routes would hand the caller an already-released
-        // lease. The drain must stay open until the caller releases it.
+        // A binary terminal can empty the predecessor's pending set before `requestBinary` receives its `ReceiveLease`; draining must retain the lease until the caller releases it.
+        // Retirement force-releases each channel lease owned by the retiring generation.
+        // A pending-zero retirement with no live routes can release a channel lease before the caller receives it.
+        // The drain must remain open until the caller releases the `ReceiveLease`.
         name: "a binary response resolving during predecessor drain keeps its lease usable",
         async run(ctx) {
             const provider = recoveryProvider();
@@ -408,8 +386,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             });
             const conn1 = peer.connections[0] as FakePeerConnection;
 
-            // Open the raw route while conn1 is primary, then withhold the
-            // binary response so the request is pending across promotion.
+            // The test opens a raw route while `conn1` is primary and keeps the binary response pending across promotion.
             const stopServing = serveTcpRoutes(conn1, 7);
             const rawHandle = await client.routeOpen(TOOL_TARGET, IDENTITY);
             stopServing();
@@ -423,15 +400,12 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             allowGrant = true;
             await waitUntil(() => connectedTransports(events).includes("fake.shm"), 10_000);
 
-            // Close the last raw route while the request is still pending:
-            // the pending entry alone now holds the drain open.
+            // Closing the last raw route while the request remains pending leaves the pending entry as the drain obligation.
             await client.closeRoute(rawHandle);
             assert.equal(conn1.socket.destroyed, false);
 
-            // The binary terminal lands on the draining predecessor: its
-            // arrival reaches pending-zero before the requestBinary
-            // continuation resumes, which must not retire the generation
-            // out from under the lease it just handed to the caller.
+            // A binary terminal can reach pending-zero on the draining predecessor before `requestBinary` resumes.
+            // The `requestBinary` continuation must not retire the generation before returning its lease.
             const requestFrame = conn1.frames.find(
                 (frame) => frame.ty === PeerFrameType.Request && frame.channel === 7,
             ) as PeerFrame;
@@ -461,9 +435,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
         },
     },
     {
-        // AE9/AE15: daemon restart retires old pending work with its
-        // existing outcome classification, reconnects over exact
-        // `unavailable`, and a fresh commit serves only later managed calls.
+        // After daemon restart, old pending work retains its outcome classification; reconnect uses exact `unavailable`, and a fresh commit serves only later managed calls.
         name: "daemon restart surfaces outcome_unknown once and never replays on the new generation",
         async run(ctx) {
             const provider = recoveryProvider();
@@ -482,8 +454,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             const stopServing = serveTcpRoutes(conn1, 7);
             const rawHandle = await client.routeOpen(TOOL_TARGET, IDENTITY);
 
-            // Publish a marked body, then kill the daemon connection before
-            // any terminal: the pending entry must classify outcome_unknown
+            // If the connection closes before a terminal arrives, the pending entry must classify the outcome as `outcome_unknown` exactly once.
             // exactly once.
             stopServing();
             const pending = client.request(rawHandle, { marker: "replay-canary-77" });
@@ -506,8 +477,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             serveTcpRoutes(conn2, 21);
             assert.ok(["tcp", "shm"].includes((await call).served));
 
-            // Recovery promotes a fresh shared-memory generation; only
-            // LATER managed calls move to it.
+            // Recovery promotes a fresh shared-memory generation; only later managed calls use it.
             await waitUntil(() => connectedTransports(events).includes("fake.shm"), 10_000);
             assert.deepEqual(await client.call("magic-context", "later"), { served: "shm" });
 
@@ -521,10 +491,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
         },
     },
     {
-        // R11: every non-`unavailable` selection starts no automatic probe.
-        // The fallback vocabulary is closed to `unavailable` and
-        // `capability_version_mismatch` (§7.7.3); any other reason string is
-        // malformed and fails closed before probe logic can even observe it.
+        // Only `unavailable` and `capability_version_mismatch` (§7.7.3) are fallback reasons; every other reason is malformed and fails closed before probe logic runs.
         name: "no other fallback reason or reasonless TCP starts a recovery probe",
         async run(ctx) {
             const reasons: (string | undefined)[] = [undefined, "capability_version_mismatch"];
@@ -536,8 +503,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
                 let paces = 0;
                 const client = await ctx.connect(peer, {
                     transportProviders: [provider],
-                    // The injected `sleep` increments `paces` so the test
-                    // can assert that no recovery attempt was paced.
+                    // A zero `paces` count proves recovery did not invoke pacing.
                     sleep: async () => {
                         paces += 1;
                     },
@@ -555,9 +521,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
                 assert.equal(provider.connectCount, 0, label);
                 assert.equal(paces, 0, label);
             }
-            // The legacy terminal (exact `unsupported_operation`) is not
-            // fallback evidence (§7.7.3): negotiation fails closed with no
-            // same-generation TCP continuation and no recovery probe.
+            // The exact `unsupported_operation` terminal is not fallback evidence (§7.7.3); negotiation fails closed without a same-generation TCP continuation or recovery probe.
             const provider = recoveryProvider();
             const peer = await ctx.startPeer({ negotiate: "unsupported-op" });
             let paces = 0;
@@ -580,9 +544,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
         },
     },
     {
-        // KTD5 seeded-defect detector: the fake clock proves attempts stop
-        // at the 30-second episode deadline despite every shadow selection
-        // returning `unavailable` (a reset deadline would dial forever).
+        // Recovery attempts stop at the original 30-second episode deadline when every shadow selection returns `unavailable`.
         name: "recovery attempts stop at the original 30s deadline despite repeated unavailable",
         async run(ctx) {
             let now = 0;
@@ -611,9 +573,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
         },
     },
     {
-        // KTD6 seeded-defect detector: a permanent connection-file failure
-        // (malformed content) stops the recovery episode instead of
-        // rereading the invalid file until the 30-second deadline.
+        // Malformed connection-file content ends the recovery episode instead of being reread until the 30-second deadline.
         name: "a permanently invalid connection file stops the recovery episode",
         async run(ctx) {
             let now = 0;
@@ -633,8 +593,7 @@ export const shmRecoveryScenarios: readonly RecoveryScenario[] = [
             serveTcpRoutes(peer.connections[0] as FakePeerConnection, 7);
             assert.deepEqual(await client.call("magic-context", "m1"), { served: "tcp" });
 
-            // Permanent validation evidence, not discovery churn: probe
-            // attempts must stop instead of pacing to the full deadline.
+            // Permanent validation evidence stops probes instead of pacing until the episode deadline.
             await writeFile(ctx.lastConnectionFile, "{ not json", { mode: 0o600 });
             let pacedToDeadline = true;
             try {

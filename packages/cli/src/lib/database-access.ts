@@ -56,14 +56,12 @@ export class UnsupportedSchemaVersionError extends Error {
 }
 
 /**
- * A CLI write must not make a live database newer than a running plugin can
- * read. The current checkout is therefore the mutation floor; read-only
- * diagnostics may still inspect older supported schemas without changing them.
+ * A CLI write must not make a live database newer than a running plugin supports.
+ * The current checkout is the mutation floor; read-only diagnostics may inspect older supported schemas without changing them.
  */
 export const CLI_SCHEMA_FLOOR_VERSION = LATEST_SUPPORTED_VERSION;
 
 function configureWriteConnection(db: DatabaseType): void {
-    // Total lock budget: 25.9s = five 5s waits + 900ms backoff.
     db.exec("PRAGMA busy_timeout=5000");
     db.exec("PRAGMA foreign_keys=ON");
     const row = db.prepare("PRAGMA foreign_keys").get() as Record<string, unknown>;
@@ -74,8 +72,7 @@ function configureWriteConnection(db: DatabaseType): void {
 }
 
 /**
- * Opens an existing SQLite file without silently creating an empty replacement.
- * Callers must treat null as a graceful missing-database path.
+ * openExistingDatabase opens an existing SQLite file without silently creating an empty replacement.
  */
 export function openExistingDatabase(
     path: string,
@@ -87,16 +84,9 @@ export function openExistingDatabase(
         return db;
     }
 
-    // Open read-write WITHOUT SQLITE_OPEN_CREATE, so the race where the file
-    // disappears between the existence check and the constructor errors instead
-    // of silently creating an empty database. The two backends need different
-    // spellings: bun:sqlite's Linux build rejects file:// URIs ("unable to open
-    // database file") but honors { create: false }, while node:sqlite has no
-    // create option and needs the URI's mode=rw.
+    // openExistingDatabase opens read-write without SQLITE_OPEN_CREATE so a file that disappears after existsSync causes a constructor error instead of creating an empty database.
     if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
-        // SAFETY: create/readwrite are bun:sqlite-only options, absent from the
-        // shared better-sqlite3-shaped Options type the wrapper exports; the Bun
-        // branch above guarantees the bun:sqlite constructor receives them.
+        // SAFETY: The Bun branch is the only branch that passes bun:sqlite-only create and readwrite options.
         const db = new Database(path, { create: false, readwrite: true } as unknown as {
             readonly: boolean;
         });
@@ -111,8 +101,7 @@ export function openExistingDatabase(
 }
 
 /**
- * Applies the shared schema fence immediately after opening context.db. No query
- * or migration write may run until this check accepts the persisted version.
+ * openExistingContextDatabase applies the schema fence before any migration write.
  */
 export function openExistingContextDatabase(
     path: string,
@@ -120,11 +109,7 @@ export function openExistingContextDatabase(
 ): DatabaseType | null {
     if (!existsSync(path)) return null;
     if (!options.readonly) {
-        // Artifact-only pre-open gate: a pending reset or an orphan/hot-journal
-        // family must be refused before SQLite can recover it. Content
-        // classification happens on the live connection below instead of a
-        // whole-family temp copy, which on a large store means reading and
-        // rewriting every byte of context.db before any work begins.
+        // The pre-open classifier refuses unsupported artifact families before SQLite recovery.
         const preOpen = classifyPreOpenFamily(path, {
             artifacts: listDatabaseFamilyArtifacts(path),
             mainFileExists: true,
@@ -160,9 +145,6 @@ export function openExistingContextDatabase(
             );
         }
         if (!options.readonly) {
-            // The CLI has no module route during database open. It can mint the
-            // local store identity, but REGRESSED detection remains a later
-            // module-reconciliation step when the module becomes reachable.
             const hasIdentityTable = Boolean(
                 db
                     .prepare(
@@ -180,15 +162,12 @@ export function openExistingContextDatabase(
 }
 
 /**
- * Opens a live context database for a CLI mutation without running schema
- * migrations. The plugin boot path owns schema upgrades; while the plugin is
- * running, it may enforce an older maximum schema version.
  */
 export function openExistingContextDatabaseForMutation(path: string): DatabaseType | null {
     return openExistingContextDatabase(path, { readonly: false });
 }
 
-/** Create a consistent SQLite snapshot, including committed WAL contents. */
+/* */
 export async function backupDatabaseSnapshot(db: DatabaseType, destination: string): Promise<void> {
     const serializable = db as DatabaseType & { serialize?: () => Uint8Array };
     if (typeof serializable.serialize === "function") {
@@ -207,9 +186,6 @@ export async function backupDatabaseSnapshot(db: DatabaseType, destination: stri
 }
 
 // ---------------------------------------------------------------------------
-// U11 direct-format family state (KTD11, R15): read-only CLI access that
-// distinguishes current, pristine, unsupported, reset-pending, and corrupt
-// direct-format state without initializing schema or mutating the family.
 // ---------------------------------------------------------------------------
 
 export type DirectDatabaseFamilyState =
@@ -217,7 +193,7 @@ export type DirectDatabaseFamilyState =
     | { readonly state: "current"; readonly databaseIncarnationId: string }
     | {
           readonly state: "reset-pending";
-          /** Present marker, or the malformed-read reason recovery must refuse on. */
+          /* */
           readonly marker:
               | { readonly status: "present"; readonly marker: DatabaseResetMarker }
               | { readonly status: "malformed"; readonly reason: string };
@@ -226,7 +202,7 @@ export type DirectDatabaseFamilyState =
           readonly state: "unsupported";
           readonly family: DatabaseFormatFamily;
           readonly reasons: readonly string[];
-          /** Incarnation when the family carries a readable direct-format marker. */
+          /* */
           readonly databaseIncarnationId: string | null;
       }
     | {
@@ -268,40 +244,30 @@ function readDirectFormatHeaderSignals(dbPath: string): string[] {
 }
 
 /**
- * Open a throwaway family copy read-write so SQLite can roll back a hot journal
- * before classification reads the image. Never used on a real family.
+ * The probe opens a throwaway family copy read-write so SQLite can roll back a hot journal.
+ * The probe connection never opens the real database family.
  */
 function openProbeCopyForRecovery(probePath: string): DatabaseType {
     if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
-        // SAFETY: create/readwrite are bun:sqlite-only options, absent from the
-        // shared better-sqlite3-shaped Options type the wrapper exports; the Bun
-        // branch above guarantees the bun:sqlite constructor receives them.
+        // The wrapper's shared Options type does not include Bun's create and readwrite options.
         return new Database(probePath, { create: false, readwrite: true } as unknown as {
             readonly: boolean;
         });
     }
-    // The better-sqlite3-shaped constructor opens read-write by default and
-    // throws rather than creating when the file is absent.
     return new Database(probePath);
 }
 
 /**
- * Classify the on-disk database family for CLI diagnostics and reset. Never
+ * The diagnostic classifier classifies the on-disk database family for CLI diagnostics and reset.
  * initializes schema.
  *
- * Content is read from a private temp copy of the whole family — main, WAL,
- * SHM, and rollback journal — because even a read-only SQLite open rewrites an
- * existing SHM file; artifact presence is still checked at the real path.
+ * The probe reads a private isolated copy of the main database, WAL, SHM, and rollback journal; artifact presence is checked at the real path.
+ * The probe copies the main database, WAL, SHM, and rollback journal because a read-only SQLite open can rewrite an existing SHM file.
  *
- * The copy is opened read-write, and both halves of that matter. A rollback
- * journal left by a process that died mid-transaction is HOT: the main image is
- * unrecovered until SQLite rolls it back, so classifying without the journal
- * reads a pre-rollback image, and copying the journal while opening read-only
- * makes it worse — SQLite sees the pending rollback, cannot perform it, and
- * fails the open, so a recoverable family would classify as corrupt and
- * `doctor reset-db` would offer to quarantine it. Read-write on a throwaway copy
- * lets recovery run where it cannot harm the real family. `create: false` keeps
- * a missing copy from opening as a fresh empty database, which would classify as
+ * A rollback journal can remain hot after an interrupted transaction.
+ * A read-only connection cannot recover the copied hot journal, so opening it read-only would classify a recoverable family as corrupt.
+ * Opening the probe copy lets SQLite recover a hot journal without modifying the real family.
+ * `create: false` prevents a missing copy from opening as a fresh database and classifying as pristine.
  * pristine.
  */
 export function inspectDirectDatabaseFamilyState(dbPath: string): DirectDatabaseFamilyState {
@@ -329,8 +295,6 @@ export function inspectDirectDatabaseFamilyState(dbPath: string): DirectDatabase
             if (existsSync(source)) copyFileSync(source, `${probePath}${suffix}`);
         }
         db = openProbeCopyForRecovery(probePath);
-        // Content comes from the probe connection; existence and artifact
-        // checks inside inspectDatabaseForClassification use the real path.
         const inspection = inspectDatabaseForClassification(db, dbPath);
         const classification = classifyDatabaseFormatFamily(inspection, getExpectedDirectFormat());
         const databaseIncarnationId =

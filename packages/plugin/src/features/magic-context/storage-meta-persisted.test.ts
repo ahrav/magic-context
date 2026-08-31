@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";

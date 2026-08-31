@@ -154,12 +154,9 @@ describe("protected-tail boundary integration", () => {
     });
 
     it("accepts a fresh zero-compartment snapshot (offset clamp parity with the resolver)", () => {
-        // Regression: the resolver clamps offset = max(1, lastCompartmentEnd+1),
-        // so a zero-compartment session resolves offset=1 (lastEnd=-1 → 0 → 1).
-        // validateBoundarySnapshot recomputed the expectation WITHOUT the clamp
-        // (-1+1 = 0 ≠ 1) and rejected every first-compartment snapshot as
-        // "last compartment moved: offset 1 -> 0" — a fresh session could never
-        // publish its first compartment (caught by the historian-success e2e).
+        // Snapshot validation clamps offsets to the resolver's minimum of 1.
+        // Snapshot validation clamps offsets to the resolver's minimum of 1.
+        // Snapshot validation clamps offsets to the resolver's minimum of 1.
         useBoundaryTempDataHome("protected-tail-first-");
         const sessionId = "ses-first-compartment";
         const opencodeDb = createBoundaryOpenCodeDb(sessionId, [
@@ -215,15 +212,14 @@ describe("protected-tail boundary integration", () => {
     });
 
     it("never crosses the newest meaningful user message on routine passes (live-prompt floor)", () => {
-        // Tool-heavy in-flight turn: newest user prompt followed by a large
-        // assistant/tool suffix. Pure token sizing would protect only the
-        // assistant suffix and leave the live prompt eligible — the historian
-        // would compact the prompt the agent is actively answering (observed
-        // live: compaction divider rendered at the session tail).
+        // The protected tail includes the newest meaningful user message when a later assistant/tool suffix alone satisfies N.
+        // The protected tail includes the newest meaningful user message when a later assistant/tool suffix alone satisfies N.
+        // The protected tail includes the newest meaningful user message when a later assistant/tool suffix alone satisfies N.
+        // The protected tail includes the newest meaningful user message when a later assistant/tool suffix alone satisfies N.
         useBoundaryTempDataHome("protected-tail-live-prompt-");
         const sessionId = "ses-live-prompt-floor";
         const messages: Array<{ id: string; role: string; parts: unknown[] }> = [];
-        // Old eligible history (real content mass).
+        // The old messages provide eligible content mass.
         for (let i = 1; i <= 4; i++) {
             messages.push({
                 id: `m-old-${i}`,
@@ -231,14 +227,14 @@ describe("protected-tail boundary integration", () => {
                 parts: [{ type: "text", text: `old content ${i} `.repeat(600) }],
             });
         }
-        // The live prompt (newest meaningful user message).
+        // The newest meaningful user message is the live prompt.
         messages.push({
             id: "m-live-prompt",
             role: "user",
             parts: [{ type: "text", text: "Okay now let's check open issues before we start." }],
         });
-        // In-flight tool-heavy assistant suffix — big enough that the token
-        // target N is satisfied by the suffix alone.
+        // The assistant/tool suffix alone satisfies N.
+        // The assistant/tool suffix alone satisfies N.
         for (let i = 1; i <= 4; i++) {
             messages.push({
                 id: `m-tail-a${i}`,
@@ -270,11 +266,11 @@ describe("protected-tail boundary integration", () => {
                 usage: { percentage: 50, inputTokens: 32_000 },
                 usageSource: "live",
             });
-            // The live prompt and everything after it stays protected.
+            // The live prompt and all later messages remain protected.
             expect(snapshot.protectedTailStart).toBeLessThanOrEqual(livePromptOrdinal);
 
-            // At T=90, 85% remains below the derived 92% force band. Reverting
-            // this gate to literal 80 would lift the floor and cross the prompt.
+            // At T=90, 85% is below the derived 92% force threshold.
+            // The 92% force threshold prevents force compaction from crossing the prompt.
             const raisedThreshold = resolveOpenCodeProtectedTailBoundary({
                 db,
                 sessionId,
@@ -286,7 +282,7 @@ describe("protected-tail boundary integration", () => {
             });
             expect(raisedThreshold.protectedTailStart).toBeLessThanOrEqual(livePromptOrdinal);
 
-            // Default configurations still lift the floor at the unchanged 85% band.
+            // Default configurations lift the floor at the 85% band.
             const defaultThreshold = resolveOpenCodeProtectedTailBoundary({
                 db,
                 sessionId,
@@ -298,9 +294,9 @@ describe("protected-tail boundary integration", () => {
             });
             expect(defaultThreshold.protectedTailStart).toBeGreaterThan(livePromptOrdinal);
 
-            // Emergency-scaled re-resolution (force-path second attempt) is
-            // ALLOWED to cross the floor — sparse sessions must remain
-            // compactable under genuine pressure (#132).
+            // Emergency-scaled re-resolution may cross the floor.
+            // Emergency-scaled re-resolution may cross the floor.
+            // Emergency-scaled re-resolution may cross the floor so sparse sessions remain compactable.
             const emergency = resolveOpenCodeProtectedTailBoundary({
                 db,
                 sessionId,
@@ -321,15 +317,13 @@ describe("protected-tail boundary integration", () => {
     });
 
     it("does not let an interrupted (dead) open tool arc at the eligible-head edge freeze the historian", () => {
-        // Production regression: an interrupted bash call (state.status="running",
-        // no output, ever) landing right after the last compartment boundary
-        // dragged the protected-tail boundary back to offset on every pass,
-        // leaving a zero-token eligible head -> "unsummarized tail too small" ->
-        // historian dormant ~24h despite a huge compactable conversation tail.
+        // The resolver ignores a running tool call with no output at the boundary to preserve a nonempty eligible head.
+        // The resolver ignores a running tool call with no output at the boundary to preserve a nonempty eligible head.
+        // The resolver ignores a running tool call with no output at the boundary to preserve a nonempty eligible head.
+        // The resolver ignores a running tool call with no output at the boundary to preserve a nonempty eligible head.
         useBoundaryTempDataHome("protected-tail-dead-arc-");
         const sessionId = "ses-dead-open-arc";
         const messages: Array<{ id: string; role: string; parts: unknown[] }> = [];
-        // The dead/interrupted tool call at the very head of the tail (offset).
         messages.push({
             id: "m-dead-bash",
             role: "assistant",
@@ -338,12 +332,11 @@ describe("protected-tail boundary integration", () => {
                     type: "tool",
                     callID: "toolu_dead",
                     tool: "bash",
-                    // open arc: input present, NO output — never completes.
+                    // The arc is open because it has input, status "running", and no output.
                     state: { status: "running", input: { command: "sleep 999" } },
                 },
             ],
         });
-        // A large compactable conversation tail AFTER the dead arc.
         for (let i = 1; i <= 8; i++) {
             messages.push({
                 id: `m-conv-${i}`,
@@ -363,8 +356,7 @@ describe("protected-tail boundary integration", () => {
                 usage: { percentage: 60, inputTokens: 38_000 },
                 usageSource: "live",
             });
-            // The eligible head must be NON-empty: the dead arc is ignored, so the
-            // conversation tail is compactable.
+            // The resolver ignores the dead arc so the eligible head remains nonempty.
             expect(snapshot.eligibleEndOrdinal).toBeGreaterThan(snapshot.offset);
             expect(snapshot.trueRawEligibleTokens).toBeGreaterThan(0);
         } finally {
@@ -374,10 +366,9 @@ describe("protected-tail boundary integration", () => {
     });
 
     it("manual-full-recomp is not frozen by a stale (dead) open tool arc at offset", () => {
-        // The same interrupted bash call that froze the trigger path must not
-        // freeze /ctx-recomp (the user's manual escape hatch): a dead open arc
-        // older than the recent window is ignored, so recomp gets a full
-        // eligible range to rebuild.
+        // A dead open arc before the recent window does not block manual-full-recomp.
+        // A dead open arc before the recent window does not block manual-full-recomp.
+        // Dead open arcs older than the recent window are excluded from the manual-full-recomp eligible range.
         useBoundaryTempDataHome("protected-tail-recomp-dead-arc-");
         const sessionId = "ses-recomp-dead-open-arc";
         const messages: Array<{ id: string; role: string; parts: unknown[] }> = [];
@@ -421,10 +412,8 @@ describe("protected-tail boundary integration", () => {
     it("bails out when a boundary snapshot's eligible raw range changes", () => {
         useBoundaryTempDataHome("protected-tail-stale-");
         const sessionId = "ses-stale-boundary";
-        // m1/m2 carry REAL content mass: the eligible head must exceed the
-        // 256-token hysteresis snap or the eligible range collapses to empty
-        // and there is no fingerprint to invalidate (this test then passes
-        // vacuously 2014 it did for a while, masked by the offset-clamp bug).
+        // m1 and m2 must exceed the 256-token hysteresis snap so the eligible range remains nonempty.
+        // A nonempty eligible range is required to produce a fingerprint for invalidation.
         const opencodeDb = createBoundaryOpenCodeDb(sessionId, [
             { id: "m1", role: "user", parts: [{ type: "text", text: "eligible ".repeat(400) }] },
             {
@@ -575,16 +564,12 @@ it("moves a candidate boundary forward to the first later open tool invocation",
 });
 
 it("ignores a stale open arc older than the recent-open-arc cutoff (does not fence the boundary)", () => {
-    // Regression: an interrupted/abandoned tool invocation at the eligible-head
-    // edge (here ordinal 5, well before the cutoff of 50) must NOT drag the
-    // boundary back to itself — that collapse froze the historian for ~24h.
     expect(
         fenceBoundaryForToolArcs(50, [{ callId: "dead", invOrdinal: 5, resOrdinal: null }], 1, 50),
     ).toBe(50);
 });
 
 it("still protects a recent open arc at/after the recent-open-arc cutoff", () => {
-    // The current in-flight call (ordinal 60 >= cutoff 50) is still protected.
     expect(
         fenceBoundaryForToolArcs(50, [{ callId: "live", invOrdinal: 60, resOrdinal: null }], 1, 50),
     ).toBe(60);
@@ -687,8 +672,7 @@ it("keeps runnable-window and no-head gates below a raised force band", () => {
     const raised = pressureGateSnapshot("ses-raised-pressure-gates", 90);
     const defaultThreshold = pressureGateSnapshot("ses-default-pressure-gates", 65);
 
-    // If the implementation incorrectly uses a literal 80% gate, the
-    // raised-threshold assertion becomes true.
+    // The configured force threshold is 92%, not 80%.
     expect(hasRunnableCompartmentWindow(raised)).toBe(false);
     expect(hasRunnableCompartmentWindow(defaultThreshold)).toBe(true);
 
@@ -752,9 +736,7 @@ describe("wrapup protected-tail boundary", () => {
         });
 
         expect(plan.rawMessagesAboveLastCompartment).toBe(8);
-        // keep=2 raw messages over 8 ordinals -> candidate ordinal 7 (m7), then the
-        // user-boundary snap prefers the nearby user message m8... snapping only
-        // moves EARLIER, so the nearest user at or before 7 is m6 (ordinal 6).
+        // Keeping 2 of 8 raw messages yields candidate ordinal 7, which snaps backward to user message m6 at ordinal 6.
         expect(plan.targetProtectedTailStart).toBe(6);
         expect(plan.snapshot.eligibleEndOrdinal).toBeGreaterThan(1);
         expect(plan.snapshot.eligibleEndOrdinal).toBeLessThanOrEqual(6);

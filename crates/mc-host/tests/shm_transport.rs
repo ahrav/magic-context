@@ -1,9 +1,8 @@
 mod support;
 
-// These tests drive `transport.negotiate` themselves, so they need a client that
-// is authenticated but has not negotiated yet. `client()` completes a TCP
-// negotiation during connect, and selection is sticky (§7.7.5): a second
-// negotiation on the same generation is a protocol failure that closes it.
+// Tests that drive `transport.negotiate` need an authenticated client that has not negotiated.
+// `client()` negotiates TCP during connection establishment.
+// Selection is sticky (§7.7.5), so a second negotiation on one generation closes the connection.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -408,7 +407,6 @@ fn shared_memory_errors_and_debug_output_are_redacted() {
 }
 
 // ---------------------------------------------------------------------------
-// Preflight readiness/eligibility matrix over a fake recovery-aware provider.
 // ---------------------------------------------------------------------------
 
 const MATRIX_TRANSPORT: &str = "fake";
@@ -434,7 +432,7 @@ fn matrix_offers(parameters: serde_json::Value) -> serde_json::Value {
 
 #[derive(Clone, Copy)]
 enum MatrixMode {
-    // Cleanup parks forever: readiness stays Recovering for the whole test.
+    // Cleanup leaves readiness `Recovering`.
     Block,
     Uncertain,
 }
@@ -566,22 +564,21 @@ async fn negotiate_matrix(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preflight_matrix_keeps_static_and_dynamic_states_distinct_and_side_effect_free() {
-    // Ready + statically eligible: the only combination that creates an offer.
+    // Only ready, statically eligible parameters create an offer.
     let provider = MatrixProvider::install(MatrixMode::Uncertain, 1);
     let response = negotiate_matrix(&provider, matrix_parameters()).await;
     assert_eq!(response.json()["selected"]["transport"], MATRIX_TRANSPORT);
     assert_eq!(provider.counters(), (0, 0, 1));
 
-    // Ready + statically ineligible parameters: reasonless TCP, no effects.
+    // Ready but statically ineligible parameters fall back to reasonless TCP.
     let provider = MatrixProvider::install(MatrixMode::Uncertain, 1);
     let response = negotiate_matrix(&provider, serde_json::json!({})).await;
     assert_eq!(response.json()["selected"]["transport"], "tcp");
     assert!(response.json().get("reason").is_none());
     assert_eq!(provider.counters(), (0, 0, 0));
 
-    // Recovering + eligible: exact `unavailable`, and the preflight-only
-    // negotiation moves no cleanup, probe, prepare, or admission counter —
-    // the detector for cleanup seeded into preflight (KTD12).
+    // A recovering eligible offer reports `unavailable` without invoking cleanup, probing, preparation, or admission.
+    // Preflight negotiation must not invoke cleanup, probing, preparation, or admission.
     let provider = MatrixProvider::install(MatrixMode::Block, 2);
     let suspect = provider.recovery.admit_candidate(
         1,
@@ -605,13 +602,13 @@ async fn preflight_matrix_keeps_static_and_dynamic_states_distinct_and_side_effe
     assert_eq!(provider.admission.snapshot().expect("snapshot"), accounting);
     assert_eq!(provider.recovery.readiness(), ProviderReadiness::Recovering);
 
-    // Recovering + statically ineligible: static omission still wins.
+    // Static ineligibility overrides recovering readiness.
     let response = negotiate_matrix(&provider, serde_json::json!({})).await;
     assert_eq!(response.json()["selected"]["transport"], "tcp");
     assert!(response.json().get("reason").is_none());
     assert_eq!(provider.counters(), baseline);
 
-    // Quarantined + eligible: exact `unavailable`, still side-effect-free.
+    // A quarantined, eligible offer returns exact `unavailable`.
     let provider = MatrixProvider::install(MatrixMode::Uncertain, 1);
     let suspect = provider.recovery.admit_candidate(
         1,
@@ -633,7 +630,7 @@ async fn preflight_matrix_keeps_static_and_dynamic_states_distinct_and_side_effe
     assert_eq!(provider.counters(), baseline);
     assert_eq!(provider.admission.snapshot().expect("snapshot"), accounting);
 
-    // Ready + eligible but admission-saturated: dynamic, not static.
+    // Admission saturation makes an otherwise eligible offer dynamically unavailable.
     let provider = MatrixProvider::install(MatrixMode::Uncertain, 1);
     let held = provider
         .admission
@@ -648,12 +645,10 @@ async fn preflight_matrix_keeps_static_and_dynamic_states_distinct_and_side_effe
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_outranks_capability_mismatch_across_offers() {
-    // A dynamically unavailable eligible offer alongside a version-
-    // mismatched sibling must fall back with exact `unavailable` in either
-    // preference order: it is the only reason that authorizes a client
-    // re-upgrade probe (§7.7.3), and only the unavailable offer is
-    // transient — a static mismatch reported instead would permanently
-    // suppress recovery of the unavailable transport.
+    // An unavailable eligible offer takes precedence over a version-mismatched sibling in either preference order.
+    // An unavailable eligible offer and a version-mismatched sibling must fall back with `unavailable` in either preference order.
+    // Only `unavailable` authorizes a client re-upgrade probe (§7.7.3).
+    // Reporting a static mismatch instead of `unavailable` would suppress recovery probing.
     for unavailable_first in [true, false] {
         let provider = MatrixProvider::install(MatrixMode::Uncertain, 1);
         let held = provider
@@ -744,9 +739,8 @@ async fn readiness_changes_govern_new_offers_while_the_existing_candidate_serves
     let victim = commit_candidate(&host).await;
     assert_eq!(provider.preparation_count(), 2);
 
-    // The victim's quarantined close makes further admission impossible:
-    // active + quarantined + one more candidate exceeds the frozen limits,
-    // so readiness resolves to Quarantined.
+    // A quarantined victim prevents admission when active quarantined charges plus one candidate exceed the frozen limits.
+    // When active quarantined charges plus a new candidate exceed the frozen limits, readiness resolves to `Quarantined`.
     provider.quarantine_next_close();
     tokio::task::block_in_place(|| victim.send(goodbye_header(), &[]).expect("victim goodbye"));
     wait_for("quarantined readiness", || {
@@ -758,7 +752,7 @@ async fn readiness_changes_govern_new_offers_while_the_existing_candidate_serves
     assert_eq!(accounting.quarantined, provider.profile_charges());
     assert_eq!(accounting.active, provider.profile_charges());
 
-    // The existing candidate keeps serving traffic across the readiness
+    // The existing candidate continues serving traffic while readiness is `Quarantined`.
     // change (R6).
     let open = serde_json::to_vec(&serde_json::json!({
         "op": "route.open",
@@ -793,8 +787,7 @@ async fn readiness_changes_govern_new_offers_while_the_existing_candidate_serves
     assert_eq!((header.ty, header.corr), (FrameType::Response, 4));
     assert_eq!(body, vec![42; 512]);
 
-    // A new offer is denied with the exact dynamic reason, creates no
-    // worker or resource, and the fallen-back TCP generation stays healthy.
+    // A new eligible offer is denied with `unavailable`, creates no worker or resource, and leaves the TCP generation healthy.
     let mut fresh = host.setup_client().await;
     let response = control_response(&mut fresh, &offers(qualified_test_parameters())).await;
     assert_eq!(response.json()["selected"]["transport"], "tcp");
@@ -831,8 +824,7 @@ async fn readiness_changes_govern_new_offers_while_the_existing_candidate_serves
     assert_eq!(frame.ty, TY_RESPONSE);
     assert_eq!(frame.body, vec![7; 64]);
 
-    // The surviving candidate's clean close returns its exact active
-    // charges; the quarantined charges stay visible.
+    // The surviving candidate's clean close releases its active accounting charges; quarantined charges remain visible.
     tokio::task::block_in_place(|| {
         survivor
             .send(goodbye_header(), &[])

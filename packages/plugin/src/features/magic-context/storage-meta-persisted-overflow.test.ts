@@ -11,8 +11,7 @@ import {
 import { ensureSessionMetaRow } from "./storage-meta-shared";
 
 /**
- * Minimal session_meta schema for unit tests. We don't need the full plugin
- * DB machinery — just enough to exercise the overflow state functions.
+ * Tests require only the session_meta columns used by overflow state functions.
  */
 function createTestDb(): Database {
     const db = new Database(":memory:");
@@ -77,7 +76,6 @@ describe("recordDetectedContextLimit", () => {
     });
 
     it("creates the session_meta row when missing (like recordOverflowDetected)", () => {
-        // Do NOT call ensureSessionMetaRow first.
         recordDetectedContextLimit(db, "ses_fresh", 64_000);
 
         const state = getOverflowState(db, "ses_fresh");

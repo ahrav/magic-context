@@ -41,11 +41,6 @@ describe("ensureProjectRegisteredFromOpenCodeDirectory", () => {
         process.env.HOME = tempDir("mc-legacy-home-");
         process.env.XDG_CONFIG_HOME = tempDir("mc-legacy-config-");
         process.env.XDG_DATA_HOME = tempDir("mc-legacy-data-");
-        // Read-legacy-on-conflict: the CortexKit base is absent but THIS harness's
-        // legacy project config exists, so it is read and trusted — NOT treated as
-        // an untrusted/observation load that would suppress registration. The real
-        // embedding identity is registered so the project is fully functional
-        // before the user consolidates.
         writeFileSync(
             join(projectDir, "magic-context.jsonc"),
             '{"embedding":{"provider":"openai-compatible","model":"qwen3","endpoint":"http://localhost:1234/v1"}}',

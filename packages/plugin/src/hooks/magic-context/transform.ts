@@ -135,19 +135,13 @@ import { logTransformTiming } from "./transform-stage-logger";
 
 export { EmergencyFailClosedError } from "./emergency-fail-closed";
 
-// Per-session message token cache. Keyed by message ID, value is the token
-// contribution of that message split into conversation (text/reasoning/images)
-// and tool call (tool_use/tool_result/tool/tool-invocation) buckets.
+// Conversation tokens include text, reasoning, and images.
+// Tool-call tokens include tool_use, tool_result, tool, and tool-invocation content.
 //
-// Messages are append-only once streaming completes, so the cached value is
-// stable across transform passes. Cleared on session.deleted and entries are
-// invalidated on message.removed via clearMessageTokensCache().
+// Completed messages are append-only, so cached token counts remain stable across transform passes.
 //
-// Bounded LRU on the outer key: sessions that are never explicitly deleted
-// (crashed OpenCode, archived but not deleted sessions, sessions outliving
-// the plugin process's interest) would otherwise leak their inner Maps
-// forever. 100 sessions is generously above any realistic active working
-// set — evicted entries are recomputed lazily on the next transform pass.
+// The outer cache is bounded because undeleted sessions would otherwise retain inner maps indefinitely.
+// Evicted session entries are recomputed lazily on the next transform pass.
 const MESSAGE_TOKENS_CACHE_MAX = 100;
 const messageTokensBySession = new BoundedSessionMap<
     Map<string, { conversation: number; toolCall: number }>
@@ -190,31 +184,26 @@ export function clearMessageTokensCache(sessionId: string, messageId?: string): 
     if (cache) cache.delete(messageId);
 }
 
-// Hot-path guard: the session→project ownership binding is immutable per session,
-// so the DB upsert+repair only needs to run when the resolved identity first
-// appears (or changes) for a session in this process — not on every transform
-// pass. Bounded so crashed/abandoned sessions can't leak the guard forever.
+// The DB upsert and repair run only when a session's resolved identity first appears or changes.
+// The guard suppresses repeated DB upserts and repairs during later transform passes in the same process.
+// The guard is bounded so crashed or abandoned sessions cannot retain it indefinitely.
 const recordedSessionProjectIdentity = new BoundedSessionMap<string>(MESSAGE_TOKENS_CACHE_MAX);
 
-// Tagger / trigger load-scoping floor (OpenCode only). Several hot-path reads
-// preload an in-memory map or aggregate over a session's tags; on a large/old
-// session that is the full tag history (100K+ rows): the tagger's content-key
-// map (~32ms), the boundary's stored-token map (~52ms), the trigger pre-gate's
-// upper-bound sum (~37ms). The wire passed to the transform is the
-// post-compaction-boundary tail (m[0]/m[1] are prepended LATER, in postprocess),
-// and tag_number is monotonic with message order, so the front of the wire holds
-// the lowest tags — everything below is compacted-away history not in the wire.
+// Only OpenCode uses the tagger/trigger tag-load floor.
+// Large, old sessions make these reads process their full tag histories.
+// The transform receives the post-compaction-boundary tail.
+// Postprocess prepends m[0] and m[1] after the transform.
+// Because tag_number increases with message order, the wire's front has the lowest tags.
+// Tags below the floor belong to compacted-away history and are absent from the wire.
 // We derive one floor per pass and scope every such read to `tag_number >= floor`.
 //
-// `deriveTagLoadFloor` takes the MIN over the first K id-bearing messages, NOT
-// the first one's tag: a tagged leading compaction-summary has a RECENTLY-assigned
-// (high) tag despite sitting at the front, so the first message's tag could wrongly
-// exclude the genuinely-oldest message behind it. A small margin is subtracted —
-// a LOWER floor only ever loads MORE (strictly safe; never excludes an in-wire
-// tag) and absorbs near-boundary tool-result straddles and minor id reordering.
-// Deriving live every pass (not memoized) is ~K×2.8µs and is inherently
-// revert-safe: it tracks the actual post-cleanup wire with no stored state to go
-// stale. Returns 0 (today's full load) when nothing is tagged yet.
+// deriveTagLoadFloor takes the minimum tag among the first K ID-bearing messages.
+// A leading compaction summary can have a recently assigned, high tag.
+// Using the first message's tag could exclude an older message later in the wire.
+// A lower floor loads more tags and never excludes an in-wire tag.
+// The margin absorbs near-boundary tool-result straddles and minor ID reordering.
+// The floor is derived each pass from the post-cleanup wire.
+// The floor uses no stored state.
 function activeAgentFromMessages(messages: readonly MessageLike[]): string | undefined {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
         const info = messages[index]?.info as { role?: unknown; agent?: unknown } | undefined;
@@ -239,9 +228,6 @@ function deriveTaggerLoadFloor(
 }
 
 /**
- * Test-only accessor that returns (and lazily creates) the per-session token
- * cache map so tests can seed and inspect entries without running the full
- * transform pipeline. Not exported from any barrel.
  */
 export function __getMessageTokensCacheForTest(
     sessionId: string,
@@ -250,15 +236,12 @@ export function __getMessageTokensCacheForTest(
 }
 
 /**
- * Compute whether the provider cache expired due to idle time.
- * Extracted so callers that don't run the full transform pipeline can still
- * evaluate the TTL idle window with the same parseCacheTtl semantics.
+ * Callers outside the transform pipeline use `parseCacheTtl` semantics.
  *
- * Returns false when cacheTtl is "never" (Infinity) because any finite
- * elapsed time is < Infinity.
+ * Returns false for `cacheTtl === "never"` because finite elapsed time is less than `Infinity`.
  *
- * @param onInvalid Optional callback invoked when cacheTtl fails to parse;
- *        the 5m fallback is applied AFTER the callback returns.
+ * @param onInvalid The function calls onInvalid when cacheTtl fails to parse.
+ * The function applies the 5m fallback after `onInvalid` returns.
  */
 export function computeHardCacheExpired(
     cacheTtl: string,
@@ -273,23 +256,18 @@ export function computeHardCacheExpired(
         onInvalid?.(error);
         ttlMs = 5 * 60 * 1000;
     }
-    // Strict > matches the Rust scheduler's predicate exactly: at elapsed == ttl
-    // both sides DEFER (one more pass at the boundary is safe; a premature HARD
-    // fold is a paid cache rebuild). Keep the comparators identical — the Rust
-    // doc comment asserts this parity and an audit caught them disagreeing.
+    // Strict `>` matches the Rust scheduler's predicate.
+    // At `elapsed === ttl`, both schedulers defer for one more pass to avoid a premature paid cache rebuild.
     return lastResponseTime > 0 && now - lastResponseTime > ttlMs;
 }
 
 /**
- * Extract the provider/model from the last assistant message in the array.
- * Used for early model-change detection before loadContextUsage.
  */
 function findLastAssistantModel(
     messages: MessageLike[],
 ): { providerID: string; modelID: string } | null {
     for (let i = messages.length - 1; i >= 0; i--) {
-        // OpenCode message objects have providerID/modelID under info, though
-        // our narrow MessageInfo type doesn't declare them.
+        // OpenCode stores assistant `providerID` and `modelID` under `info`, although `MessageInfo` does not declare them.
         const info = messages[i].info as {
             role?: string;
             providerID?: string;
@@ -303,19 +281,8 @@ function findLastAssistantModel(
 }
 
 /**
- * Extract the selected model from the newest USER message in the array. This is
- * the model the outgoing request will ACTUALLY go to: OpenCode's loop resolves
- * the request model from `lastUser.model` (verified with the OpenCode
- * maintainer). On a mid-session model switch, the array ends with
- * `[..., OLD-model assistant, NEW user message]` (the new model has not
- * produced an assistant message yet), so the last ASSISTANT still carries the
- * OLD model while the newest USER carries the NEW one. Preferring this over the
- * last-assistant model is what stops the model-change detector from false-firing
- * on the switching turn.
  *
- * Note the role asymmetry in OpenCode's schema: user messages nest the model
- * under `info.model.{providerID,modelID}`, whereas assistant messages carry it
- * flat as `info.providerID`/`info.modelID`.
+ * OpenCode user messages nest the model under `info.model`, while assistant messages store it directly under `info`.
  */
 function findNewestUserModel(
     messages: MessageLike[],
@@ -326,11 +293,7 @@ function findNewestUserModel(
             model?: { providerID?: string; modelID?: string };
         };
         if (info.role !== "user") continue;
-        // The NEWEST (last) user message is the one OpenCode resolves the
-        // outgoing request model from (`lastUser.model`). Return its model, or
-        // null if it carries none (do NOT keep scanning to an OLDER user, whose
-        // model is not what this request goes to). A null return lets the caller
-        // fall back to the last-assistant model.
+        // Return the newest user's requested model; do not use an older user's model when the newest user has none.
         if (info.model?.providerID && info.model.modelID) {
             return { providerID: info.model.providerID, modelID: info.model.modelID };
         }
@@ -371,9 +334,8 @@ function authorityModuleForProject(
 }
 
 /**
- * Restore a project to TypeScript ownership after its transform_mode setting no
- * longer selects Rust. The durable marker keeps writes fenced until the module
- * confirms every module-owned domain has drained back through its normal protocol.
+ * recoverTsAuthorityProject restores TypeScript ownership when transform_mode no longer selects Rust.
+ * The durable marker fences writes until every module-owned domain drains through the module protocol.
  */
 export async function recoverTsAuthorityProject(args: {
     db: ContextDatabase;
@@ -399,8 +361,8 @@ export async function recoverTsAuthorityProject(args: {
     let drainedDomain = false;
     for (const { domain, authority } of statuses) {
         if (!authority || authority.state === "TS") continue;
-        // The module's begin route owns MODULE → DRAINING. Calling drainAuthority
-        // preserves the lease, mirror replay, checksum, and recovery choreography.
+        // The module's begin route owns MODULE → DRAINING.
+        // Calling drainAuthority preserves the lease, mirror replay, checksum, and recovery choreography.
         if (authority.state !== "MODULE" && authority.state !== "DRAINING") {
             return "retryable";
         }
@@ -430,8 +392,7 @@ export async function recoverTsAuthorityProject(args: {
     }
 
     // drainAuthority removes the shared marker only after every domain is TS.
-    // After a completed replay, bump the project memory epoch once so the memory
-    // view re-renders any changes mirrored during recovery.
+    // After a completed replay, bump the project memory epoch once so the memory view re-renders changes mirrored during recovery.
     if (drainedDomain && !getAuthorityManagedMarker(args.db, args.projectPath)) {
         bumpProjectMemoryEpoch(args.db, args.projectPath);
         return "completed";
@@ -476,8 +437,6 @@ export function scheduleTsAuthorityRecovery(args: {
                 tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
                 log(`[magic-context] authority drain complete for project ${args.projectPath}`);
             } else {
-                // A bounded contention result is durable and resumable. Do not cache it
-                // so the next project setup can resume the module's DRAINING state.
                 tsAuthorityRecoveryStateByProject.delete(args.projectPath);
             }
         })
@@ -507,38 +466,24 @@ export interface TransformDeps {
     >;
     db: ContextDatabase;
     /**
-     * Channel 1 (ctx_reduce tool-output nudge) per-session metric baseline,
-     * refreshed at the end of each transform pass where ctx_reduce is callable
-     * and read in tool.execute.after.
      */
     channel1StateBySession?: Map<string, import("./ctx-reduce-nudge").Channel1State>;
-    /** Module-authored Channel 2 text held until the terminal `message.updated` event, when the host delivers the pending nudge. */
+    /* */
     channel2DirectiveTextBySession?: Map<string, string>;
     protectedTags: number;
     /**
-     * ctx_reduce visibility is resolved per session from the session's tool
-     * allow-list. Tag DB rows are still maintained when the tool is unavailable,
-     * but §N§ prefixes and nudges are suppressed. See tag-messages.ts for the gate.
      */
-    /** Smart-drops (experimental, default off): also reclaim tool output that a
-     *  later call supersedes, on top of the age-based auto-drop. Off → messages
-     *  sent to the model are byte-identical to the age-based-only behavior. */
+    /**
+     * */
     smartDrops?: boolean;
     clearReasoningAge: number;
-    /** Commit-cluster historian trigger config (`commit_cluster_trigger`). */
+    /* */
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
     /**
-     * One-shot signal that `<session-history>` injection cache is stale and
-     * `prepareCompartmentInjection` should rebuild on this pass. Drained
-     * after the rebuild so subsequent defer passes hit the fresh cache.
-     * Each cache-busting signal has one consumer and lifetime.
      */
     historyRefreshSessions: Set<string>;
     deferredHistoryRefreshSessions?: Set<string>;
     /**
-     * Persistent signal that pending ops + heuristics need to materialize.
-     * Survives across defer passes when `compartmentRunning` blocks the
-     * heuristic pass. Drained only after `shouldRunHeuristics` succeeds.
      */
     pendingMaterializationSessions: Set<string>;
     deferredMaterializationSessions?: Set<string>;
@@ -546,44 +491,34 @@ export interface TransformDeps {
     commitSeenLastPass?: Map<string, boolean>;
     client?: PluginContext["client"];
     directory?: string;
-    /** Whether user-level configuration lets this session use the canonical home directory as its project. */
+    /* */
     allowHomeProject?: boolean;
     memoryConfig?: {
         enabled: boolean;
         injectionBudgetTokens: number;
-        /** When true, historian/recomp auto-promote eligible session facts
-         *  to project memories. When false, promotion is skipped — agents can
-         *  still write memories explicitly via `ctx_memory write`. Issue #44. */
+        /**
+         * */
         autoPromote: boolean;
     };
-    /** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
+    /* */
     injectDocs?: boolean;
     ensureProjectRegistered?: (directory: string, db: ContextDatabase) => Promise<void>;
     /**
-     * Returns the historian chunk budget. Called at each historian spawn site
-     * so the value is always derived from current config — keeping hook,
-     * RPC, and TUI trigger paths consistent and honoring runtime config changes.
-     * Optional for tests; production (hook.ts) always provides it.
      */
     getHistorianChunkTokens?: () => number;
     historyBudgetPercentage?: number;
     executeThresholdPercentage?: number | { default: number; [modelKey: string]: number };
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined };
     historianTimeoutMs?: number;
-    /** Resolved fallback chain for historian-family calls. */
+    /* */
     fallbackModels?: readonly string[];
-    /** False when historian.disable=true, blocking historian-backed child agents. */
+    /** Historian-backed child agents are blocked when historian.disable=true. */
     historianRunnable?: boolean;
     /**
-     * Compaction-off mode (issue #266), boot-resolved and process-stable.
-     * When true the transform runs additive-only: m[0]/m[1] memory/docs
-     * injection, measurement and identity recording stay; every mutating
-     * compaction gate (historian, drops, strips, nudges, emergency, markers,
-     * tag writes) is off. Precedence: every mutating gate becomes
-     * `existingGate && !compactionOff` — the mode wins over both the primary
-     * and the subagent path. It does NOT alias fullFeatureMode=false: the
-     * m[0]/m[1] injection gate is re-expressed as identity-present AND
-     * (fullFeatureMode || compactionOff) so the mode cannot swallow memory
+     * Compaction-off mode is boot-resolved and process-stable.
+     * `compactionOff` preserves memory and docs injection while disabling mutating compaction.
+     * `compactionOff` disables every mutating compaction gate, including subagent gates.
+     * `compactionOff` preserves `m[0]`/`m[1]` injection even when `fullFeatureMode` is false.
      * delivery.
      */
     compactionOff?: boolean;
@@ -595,37 +530,33 @@ export interface TransformDeps {
     projectPath?: string;
     experimentalUserMemories?: boolean;
 
-    /** When true, inject wall-clock gap markers (<!-- +Xm -->) on user messages and
-     *  add compact date ranges to compartment headings in <session-history>.
-     *  Controlled by `experimental.temporal_awareness` config. */
+    /** Temporal-awareness injection adds wall-clock gap markers (`<!-- +Xm -->`) to user messages when enabled.
+     * The transform adds compact date ranges to `<session-history>` compartment headings.
+     * The `experimental.temporal_awareness` config controls temporal-awareness injection. */
     experimentalTemporalAwareness?: boolean;
-    /** mural.enabled — when true (and the fold's model accepts
-     *  images), materializeM0 renders the deterministic mural on demand and folds
-     *  its image into the m[0] baseline. */
+    /** When `mural.enabled` is true and the fold's model accepts images, `materializeM0` renders the mural on demand.
+     * `materializeM0` renders the deterministic mural on demand and folds its image into the `m[0]` baseline.
+     * */
     muralEnabled?: boolean;
-    /** When true, run a second editor pass after historian to clean U: lines.
-     *  Enables the historian-editor agent. Controlled by `historian.two_pass` config. */
+    /** The `historian.two_pass` config runs a second editor pass after historian to clean `U:` lines.
+     * The `historian.two_pass` config enables the historian-editor agent. */
     historianTwoPass?: boolean;
     liveModelBySession?: LiveModelBySession;
     /**
-     * Process-scoped cache of resolved session.directory values. When provided,
-     * we look up here before hitting OpenCode's API and populate after a
-     * successful lookup. The session→project binding is immutable in OpenCode,
-     * so this cache lives until the session is deleted.
+     * The process-scoped cache stores resolved `session.directory` values.
+     * The cache checks entries before querying OpenCode's API and stores successful lookups.
      */
     sessionDirectoryBySession?: Map<string, string>;
     /**
-     * Process-scoped set of Magic Context's OWN hidden child sessions
-     * (historian/dreamer/sidekick/memory-migration), detected by title prefix
-     * at `session.created`. When a session is in this set the transform returns
-     * immediately (messages unmodified) — these children have their own fixed
-     * agent identity and never use any MC feature, so even reduced-mode work
-     * (tagging, heuristic drops) is pure overhead. See live-session-state.ts.
+     * The process-scoped set records Magic Context hidden child sessions.
+     * The `session.created` handler detects these sessions by title prefix.
+     * The `session.created` handler adds title-prefixed hidden child sessions to the set; the transform returns their messages unmodified.
+     * The transform returns hidden child-session messages unmodified because those sessions have fixed agent identities.
      */
     internalChildSessions?: Set<string>;
-    /** Experimental auto-search hint — transform-time ctx_search on each new
-     *  user message; when top hit clears the threshold, append a compact
-     *  fragment hint to the user message. Controlled by
+    /** Auto-search runs `ctx_search` for each new user message.
+     * The transform appends a compact fragment hint when the top hit meets the threshold.
+     * The `experimental.auto_search.*` config controls auto-search.
      *  `experimental.auto_search.*` config. */
     autoSearch?: {
         enabled: boolean;
@@ -635,32 +566,30 @@ export interface TransformDeps {
         ensureProjectRegistered?: (directory: string, db: ContextDatabase) => Promise<void>;
     };
     /**
-     * Experimental age-tier caveman text compression — rewrites long
-     * user/assistant text parts with progressively aggressive caveman
-     * rules based on their position in the eligible tag window. Only runs for
-     * primary sessions; subagents are excluded because their context is curated
-     * by the parent and they have no ctx_expand recovery path.
+     * Age-tier caveman compression rewrites long user and assistant text.
+     * Compression applies progressively aggressive caveman rules according to each part's position in the eligible tag window.
+     * Compression runs only for primary sessions.
+     * Compression excludes subagents because their context is curated by the parent and they have no `ctx_expand` recovery path.
      */
     cavemanTextCompression?: {
         enabled: boolean;
         minChars: number;
     };
-    /** Fire-and-forget active-session embed backfill after transform returns. */
+    /** The transform schedules active-session embed backfill without awaiting it. */
     maybeAutoEmbedSession?: (sessionId: string) => void;
-    /** Resolved project mode. Rust mode bypasses every TS mutation below. */
+    /** `transformMode` is the resolved project mode; Rust mode bypasses every TypeScript mutation below. */
     transformMode?: "ts" | "rust";
-    /** Prompt-surface routing and USER description overrides forwarded to Rust mode. */
+    /** Rust mode receives prompt-surface routing and USER description overrides. */
     promptSurface?: PromptSurfaceConfig;
-    /** Resolves trusted USER guidance files before crossing the module boundary. */
+    /** The runtime resolves trusted USER guidance files before the module boundary. */
     promptSurfaceRuntime?: PromptSurfaceRuntime;
-    /** Module transport injected by the hook; tests use a deterministic mock. */
+    /* */
     rustModeModuleClient?: RustModeModuleClient;
-    /** Test-only opt-out for transform-wire fixtures without the authority protocol. */
+    /* */
     rustModeAllowAuthorityProtocolBypassForTests?: boolean;
     rustModeProjectRoot?: string;
     /**
-     * Module route used only to recover a project whose config changed from Rust
-     * transforms back to TypeScript while the durable authority marker remains.
+     * The recovery module restores projects that switched from Rust to TypeScript while their durable authority marker remains.
      */
     tsAuthorityRecoveryModuleClient?: RustModeModuleClient;
     onRustModeParked?: (sessionId: string, message: string) => void;
@@ -714,7 +643,7 @@ export function createTransform(deps: TransformDeps) {
         const tMeta = performance.now();
         let sessionMeta: import("../../features/magic-context/types").SessionMeta | undefined;
         try {
-            // Intentional fail-open: magic-context should not block live chat if session state read fails.
+            // Magic Context does not block live chat when a session-state read fails.
             sessionMeta = getOrCreateSessionMeta(db, sessionId);
         } catch (error) {
             passOutcome.record("session-meta-early-return", "fatal");
@@ -723,32 +652,14 @@ export function createTransform(deps: TransformDeps) {
         }
         logTransformTiming(sessionId, "getOrCreateSessionMeta", tMeta);
 
-        // Magic Context's OWN hidden children (historian/dreamer/sidekick/
-        // memory-migration) are fully exempt from the transform. They have a
-        // fixed agent identity + single-shot/bounded job and use zero MC
-        // features, so even reduced-mode work (tagging, heuristic drops) is
-        // pure overhead and conceptual noise. Detected at session.created by
-        // the `magic-context-` title prefix. Returning here leaves messages
-        // unmodified. (Worst case the very first pass races the session.created
-        // event and runs reduced-mode once — harmless for these short sessions.)
         if (deps.internalChildSessions?.has(sessionId)) {
             sessionLog(sessionId, "transform skipped (internal magic-context child session)");
             return;
         }
 
-        // Compaction mode is session hygiene shared by both renderer authorities.
-        // Resolve it before either mode can return so stale markers and latches are
-        // reconciled even when Rust owns normal transform rendering.
+        // Compaction-mode reconciliation must run before either renderer returns so stale markers and latches are reconciled.
         const compactionOff = deps.compactionOff === true;
 
-        // Mode-transition reconciliation runs on every pass and is a no-op
-        // once the session's durable record matches the boot-resolved mode —
-        // so the transition work (marker cleanup, latch/intent/pending-op
-        // clears, catch-up signal) happens exactly once per session, on the
-        // first pass after a restart that changed the resolved value. A notice
-        // transition first stages a durable pending record, then commits its
-        // settled value only after delivery; a failure therefore retries the
-        // same logical transition across process restarts.
         try {
             const transition = reconcileCompactionMode({
                 db,
@@ -765,9 +676,6 @@ export function createTransform(deps: TransformDeps) {
                 transition.historianCatchUpSignaled;
             if (hasTransitionEffects) {
                 if (transition.invalidatedM0Baseline) {
-                    // The persisted baseline bytes were nulled; drop the
-                    // pass-local copies too so this pass re-materializes
-                    // instead of replaying the pre-flip render.
                     sessionMeta = {
                         ...sessionMeta,
                         cachedM0Bytes: null,
@@ -783,17 +691,9 @@ export function createTransform(deps: TransformDeps) {
                     sessionMeta = { ...sessionMeta, compartmentInProgress: true };
                 }
                 const notice = transition.notice;
-                // A missing client is the existing no-notification test/headless
-                // seam. Production OpenCode transforms always provide one; when
-                // present, its delivery result controls whether the settled record
-                // commits. The reconciler has already persisted a pending notice
-                // record, so a restart retries instead of losing this delivery.
+                // The delivery path treats a missing client as successful notice delivery and commits the settled record only after successful delivery.
                 let noticeDelivered = notice === null || deps.client === undefined;
                 if (notice && deps.client) {
-                    // Out-of-band only — never the message array or nudge
-                    // channels. A failed delivery leaves the durable pending
-                    // record in place, accepting a duplicate after a crash
-                    // rather than permanently losing the notice.
                     noticeDelivered =
                         (await sendIgnoredMessage(
                             deps.client,
@@ -816,21 +716,15 @@ export function createTransform(deps: TransformDeps) {
             sessionLog(sessionId, "compaction mode transition failed (retrying next pass):", error);
         }
 
-        // Rust mode is an authority adapter, not a second implementation of the
-        // TypeScript renderer. Compaction-off still dispatches so the module can
-        // provide the shared additive-only memory/docs contract.
         if (deps.transformMode === "rust") {
             if (!rustModeTransform) {
                 sessionLog(sessionId, "rust transform unavailable; using raw passthrough");
                 return;
             }
-            // Enforcement-artifact revalidation must run in Rust mode too:
-            // the TypeScript renderer's probe call sits after this early
-            // return, and without one here an edited or deleted artifact
-            // never withdraws ENFORCED maturity in a Rust-mode-only
-            // session. Same throttle and failure semantics as the TS-path
-            // call; the directory resolution mirrors the session-directory
-            // cache the TS path consults.
+            // Rust mode revalidates artifacts because the TypeScript probe runs after Rust mode returns.
+            // An edited or deleted artifact must withdraw ENFORCED maturity in Rust-only sessions.
+            // Rust mode uses the TypeScript path's revalidation throttle and failure semantics.
+            // Rust mode resolves the probe directory from the same session-directory cache as the TypeScript path.
             if (deps.memoryConfig?.enabled) {
                 try {
                     const probeDirectory =
@@ -854,64 +748,41 @@ export function createTransform(deps: TransformDeps) {
             return;
         }
 
-        // System prompt change detection is handled in experimental.chat.system.transform
-        // (see system-prompt-hash.ts), not here. The messages transform only receives
-        // user/assistant messages, not the system prompt.
+        // `experimental.chat.system.transform` detects system prompt changes.
+        // The transform detects system-prompt changes from user and assistant messages, not system messages.
 
         const reducedMode = sessionMeta.isSubagent;
         const fullFeatureMode = !reducedMode;
-        // Compaction-off mode (issue #266) is a THIRD flag, orthogonal to the
-        // subagent split above: every mutating gate below becomes
-        // `existingGate && !compactionOff`, and the m[0]/m[1] injection gate
-        // is re-expressed as identity-present AND (fullFeatureMode ||
-        // compactionOff) so the mode cannot swallow memory delivery.
+        // Compaction-off mode is independent of subagent mode.
+        // `m[0]/m[1]` injection requires identity and `(fullFeatureMode || compactionOff)`.
+        // `compactionOff` preserves memory delivery.
 
-        // §N§ prefix + ctx_reduce + Channel 1 are gated on this single signal,
-        // NOT on subagent status. `ctx_reduce` is registered process-globally
-        // (tool-registry.ts), so subagents may have the tool — they just need
-        // the §N§ prefix + Channel 1 baseline + guidance to use it.
+        // `ctxReduceCallable` gates the §N§ prefix, `ctx_reduce`, and Channel 1.
+        // `ctxReduceCallable` does not depend on subagent status.
+        // `ctx_reduce` is registered process-globally, so subagents can have the tool.
+        // Subagents need the §N§ prefix, Channel 1 baseline, and guidance to use `ctx_reduce`.
         //
-        // ALSO gated on the session's actual tool availability: a parent agent
-        // can spawn this session with an explicit allow-list tools map that
-        // filters ctx_reduce out entirely — §N§ prefixes and nudges for a tool
-        // the model can't call are pure overhead plus cargo-cult risk. The
-        // verdict is frozen per session (first user message's tools map) so it
-        // can never flap mid-session and bust the cache.
+        // `ctxReduceCallable` also requires the session's tool allow-list to include `ctx_reduce`.
+        // A session can use an explicit tool allow-list that excludes `ctx_reduce`.
+        // `transform` must not inject §N§ prefixes or nudges when `ctx_reduce` is unavailable.
+        // `transform` must not inject prefixes or nudges for unavailable tools.
+        // `ctxReduceAvailability` must remain fixed for the session from the first user message's tool map.
+        // `ctxReduceAvailability` remains unchanged for the session, preserving cache keys.
         const ctxReduceAvailability: CtxReduceAvailabilityVerdict =
             resolveCtxReduceAvailabilityFromMessages(sessionId, messages);
         const ctxReduceCallable = ctxReduceAvailability.callable;
 
-        // Same frozen-per-session verdict for the native `todowrite` tool. When
-        // a session's tools map filters todowrite out, the synthetic task-list pair
-        // injection (postprocess B7 block) must not replay a pair for a tool the
-        // model cannot call. Resolved here from the same first-user-message map
-        // so the verdict is frozen identically and never flaps mid-session.
+        // `todowriteAvailability` is frozen for each session.
+        // `transform` must not inject the synthetic task-list pair when the session tool map excludes `todowrite`.
+        // `todowriteAvailability` uses the first user message's tools map.
         const todowriteAvailability: ToolAvailabilityVerdict =
             resolveTodowriteAvailabilityFromMessages(sessionId, messages);
 
-        // Resolve the *session's* working directory, not the OpenCode launch
-        // directory. When the user runs `opencode -s <id>` from outside the
-        // project, `deps.directory` (captured at plugin init) reflects the
-        // launch dir (often $HOME) while the session itself is bound to the
-        // project. Historian/dreamer/recomp child sessions and project-scoped
-        // memory all need the session's real directory.
+        // `deps.directory` is captured at plugin initialization and can differ from the session project directory.
         //
-        // We call `client.session.get(...)` (OpenCode's public SDK) once per
-        // session per plugin-process lifetime and cache the result in
-        // `liveSessionState.sessionDirectoryBySession`. The session→project
-        // binding is immutable in OpenCode (the `directory` field is set at
-        // session create time and never modified), so caching for the entire
-        // session lifetime is safe.
         //
-        // Without the cache, this HTTP round trip ran on every transform pass
-        // and was observed to take 1.5s+ for large sessions under Electron
-        // Desktop, dominating transform latency. We deliberately keep using
-        // the public SDK rather than reading OpenCode's internal SQLite
-        // directly — the schema is OpenCode's private contract and could
-        // change without notice.
+        // `transform` must use the public SDK because OpenCode's internal SQLite schema is private and may change without notice.
         //
-        // session.get failure is non-fatal — fall back to deps.directory so
-        // transform never blocks on a permanent SDK error.
         let sessionDirectory: string = deps.directory ?? "";
         let sessionDirectoryResolvedFromHost = false;
         const cachedDirectory = deps.sessionDirectoryBySession?.get(sessionId);
@@ -931,10 +802,7 @@ export function createTransform(deps: TransformDeps) {
                     sessionInfo.directory.length > 0
                 ) {
                     sessionDirectory = sessionInfo.directory;
-                    // Populate cache for future transforms in this session.
-                    // Don't cache the fallback (deps.directory) — it might be
-                    // wrong for `opencode -s <id>` launches from a different
-                    // cwd, and the next transform should retry the SDK lookup.
+                    // `deps.directory` is used only when session-directory resolution fails.
                     deps.sessionDirectoryBySession?.set(sessionId, sessionDirectory);
                     sessionDirectoryResolvedFromHost = true;
                 }
@@ -955,51 +823,26 @@ export function createTransform(deps: TransformDeps) {
         const fallbackModelId = deps.getFallbackModelId?.(sessionId);
 
         const tModelDetect = performance.now();
-        // Snapshot persisted usage BEFORE any reset this pass. Both the
-        // model-change clear (just below) and the first-pass reset (further down)
-        // zero last_context_percentage / last_input_tokens; the proactive
-        // shrinking-switch arm and the protected-tail boundary sizing need the
-        // pre-reset values, so capture them once, here, up front.
+        // `transform` must capture persisted usage before resets because model-change and first-pass resets clear `last_context_percentage` and `last_input_tokens`.
         const persistedUsageBeforeResets = loadPersistedUsage(db, sessionId);
 
-        // Detect model changes early in the transform, BEFORE loading context
-        // usage, so threshold checks (95% blocking, 80% emergency nudge) and the
-        // history budget don't run on the previous model's numbers.
+        // `transform` must detect model changes before loading context usage so threshold checks and the history budget use the current model's numbers.
         if (deps.liveModelBySession) {
-            // The model the request will ACTUALLY go to. The newest USER message
-            // carries the selected (possibly just-switched) model, and OpenCode
-            // resolves the outgoing request from it (`lastUser.model`). On a
-            // switching turn the array ends with [..., OLD assistant, NEW user]:
-            // the last ASSISTANT still reads OLD (assistant model is flat
-            // info.providerID/modelID) while the newest USER reads NEW (nested
-            // info.model). Prefer the newest user; if that message somehow
-            // carries no model, prefer the live map (chat.message set it to the
-            // just-selected model BEFORE this pass) over the last assistant. The
-            // last assistant still reads the OLD model on a switching turn, so
-            // falling straight to it would reintroduce the mis-resolution. Use the
-            // last assistant only when neither is available (fork / cold-start
-            // replay with an empty live map).
+            // `transform` must use the newest user message's nested `info.model`; it determines the request model and reflects a switch before the preceding assistant message's flat model fields.
+            // On a switching turn, the last assistant has the old model.
             const currentOutgoingModel =
                 findNewestUserModel(messages) ??
                 deps.liveModelBySession.get(sessionId) ??
                 findLastAssistantModel(messages);
             if (currentOutgoingModel) {
-                // Always track the outgoing model as the live model (seeds an
-                // empty map after restart; keeps it current otherwise).
+                // `liveModelBySession` is seeded after restart.
                 deps.liveModelBySession.set(sessionId, currentOutgoingModel);
 
-                // Model-change detection drives stale per-model state clearing.
-                // Trigger off the model that produced the LAST PERSISTED USAGE
-                // (lastObservedModelKey), NOT the volatile liveModelBySession: on
-                // a LIVE switch chat.message has already set liveModelBySession to
-                // the new model before transform runs, so a liveModel-vs-outgoing
-                // comparison never sees the change, and hook-handlers.ts does not
-                // clear on a live switch either. The persisted usage's model is
-                // the authoritative "what the last measured turn ran on" signal;
-                // when it differs from the outgoing model the model genuinely
-                // changed since the last turn, so the old model's detected-limit /
-                // reasoning watermark / emergency state must be cleared. One
-                // trigger covers live switch, cold start, and fork alike.
+                // Model-change detection compares outgoingModelKey with lastObservedModelKey, not liveModelBySession.
+                // Comparing liveModelBySession with outgoingModelKey misses live switches.
+                // lastObservedModelKey identifies the model that produced the last persisted usage.
+                // A differing outgoingModelKey means the model changed after the last measured turn.
+                // A model change requires clearing the prior model's detected limit, reasoning watermark, and emergency state.
                 const outgoingModelKey = resolveModelKey(
                     currentOutgoingModel.providerID,
                     currentOutgoingModel.modelID,
@@ -1025,17 +868,14 @@ export function createTransform(deps: TransformDeps) {
                     });
                     clearHistorianFailureState(db, sessionId);
                     clearPersistedReasoningWatermark(db, sessionId);
-                    // The emergency-drop watermark is keyed to the prior model's
-                    // ceiling (contextLimit × executeThreshold); a model change
-                    // moves the ceiling, so reset the latch to re-evaluate the
-                    // full tail. The detected-overflow limit + recovery flag were
-                    // specific to the prior model and must not leak into the new
-                    // model's pressure math, so clear them too (the proactive arm
-                    // below re-arms from scratch against the new model if needed).
+                    // A model change resets the emergency-drop watermark because its contextLimit × executeThreshold ceiling changes.
+                    // Clearing the emergency state forces a full-tail reevaluation.
+                    // A model change clears the detected-overflow limit and recovery flag because both are model-specific.
+                    // The proactive recovery arm reevaluates the new model after a model change.
                     clearEmergencyDropSample(db, sessionId);
                     clearDetectedContextLimit(db, sessionId);
                     clearEmergencyRecovery(db, sessionId);
-                    // Clear the in-memory usage map so loadContextUsage recomputes.
+                    // Clearing the in-memory usage map makes loadContextUsage recompute usage.
                     deps.contextUsageMap.delete(sessionId);
                     sessionMeta = {
                         ...sessionMeta,
@@ -1055,12 +895,8 @@ export function createTransform(deps: TransformDeps) {
         const isFirstTransformPassForSession = !loadedSessions.has(sessionId);
         loadedSessions.add(sessionId);
 
-        // First-pass reset MUST run BEFORE loadContextUsage so threshold checks
-        // (95% blocking, 80% emergency nudge) don't fire on stale data from a
-        // different model, reverted message, or previous session state.
-        // `persistedUsageBeforeResets` (captured above, before the model-change
-        // clear too) holds the pre-reset usage that restart recovery and
-        // protected-tail boundary sizing rely on.
+        // The first-pass reset precedes loadContextUsage so stale data cannot trigger 95% blocking or an 80% emergency nudge.
+        // persistedUsageBeforeResets retains pre-reset usage for restart recovery and protected-tail boundary sizing.
         const historianFailureState = getHistorianFailureState(db, sessionId);
 
         if (isFirstTransformPassForSession && sessionMeta) {
@@ -1073,20 +909,15 @@ export function createTransform(deps: TransformDeps) {
                 updateSessionMeta(db, sessionId, {
                     lastContextPercentage: 0,
                     lastInputTokens: 0,
-                    // Do NOT clear compartmentInProgress here — runCompartmentPhase needs it
-                    // to resume a historian run that was in progress when the process restarted.
-                    // The compartment phase checks hasEligibleHistoryForCompartment() and either
-                    // starts a new run or clears the flag if there's no eligible history.
+                    // `transform` must not clear `compartmentInProgress`: `runCompartmentPhase` needs it to resume interrupted historian runs.
+                    // runCompartmentPhase resumes historian runs interrupted by process restart.
                 });
-                // Do NOT clear historian failure state here — restart recovery uses it
+                // `transform` must not clear historian failure state because restart recovery uses it.
                 deps.contextUsageMap.delete(sessionId);
-                // Update local sessionMeta copy so downstream checks don't use stale values
                 sessionMeta = { ...sessionMeta, lastContextPercentage: 0, lastInputTokens: 0 };
             }
         }
 
-        // Compute context usage AFTER first-pass reset so threshold checks use
-        // clean state (0%) instead of stale values from a previous model/session.
         let contextUsageEarly = loadContextUsage(deps.contextUsageMap, db, sessionId);
 
         let recoveryNoHeadEscapeActive = false;
@@ -1094,45 +925,17 @@ export function createTransform(deps: TransformDeps) {
         let emergencyRecoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null = null;
         let usagePercentageSynthetic = false;
 
-        // Overflow-triggered emergency recovery: if a prior provider response
-        // included a context-overflow error, the event handler persisted
-        // needs_emergency_recovery=1. On the very next transform pass we bump
-        // the effective percentage to 95% so the existing emergency path
-        // (abort + historian + aggressive drops) fires regardless of what
-        // pressure math says. Without this, an overflow on a session whose
-        // limit resolver over-reported the real limit would never enter the
-        // emergency path — we'd just keep hitting the same overflow error.
+        // `transform` sets effective usage to 95% on the pass after a persisted context-overflow error so emergency recovery runs when the resolved limit exceeds the provider's actual limit.
         //
-        // Compaction-off mode: the whole overflow/emergency machinery is
-        // gated off — no proactive arming, no synthetic 95% bump, no
-        // no-head escape notice. A persisted latch is cleared by the
-        // off-transition, never consumed; overflow propagates to native
+        // `transform` bypasses overflow recovery when `compactionOff` is true, allowing native provider compaction without consuming the persisted emergency latch.
         // compaction instead.
         if (fullFeatureMode && !compactionOff) {
             try {
-                // Proactive arm for a shrinking model switch (large->small
-                // context). After switching to a smaller-context model, the
-                // last-measured input (produced by the previous, larger model)
-                // can already exceed the new model's hard cap. On this first pass
-                // the pressure math still reads the OLD model's ratio (well under
-                // threshold), so without this the oversized prompt is sent and
-                // rejected, and recovery only arms on the NEXT pass from the
-                // provider error. Detect it here: if the last input (measured on
-                // a DIFFERENT model) exceeds the CURRENT model's catalog cap, the
-                // next request will overflow, so arm recovery now and let the bump
-                // below compact before the request goes out.
+                // `transform` arms recovery after a switch to a smaller context window when the previous model's measured input exceeds the current catalog limit.
                 //
-                // Guards (each prevents a gratuitous compaction/cache bust):
-                //  - DIFFERENT-model only: lastObservedModelKey !== current. A
-                //    same-model "input > limit" is NOT an overflow: that input
-                //    was already ACCEPTED under this model, so a now-smaller limit
-                //    is cache regression (#179), not a real shrink.
-                //  - getSdkContextLimit (NOT resolveTrustedContextLimit): the new
-                //    model's catalog/auth cap only, never a detected-overflow
-                //    limit. A stale unkeyed detected limit from the old model
-                //    could otherwise read low and false-arm.
-                //  - flag-only arm: never writes detected_context_limit from a
-                //    catalog value (that would pin a stale-low cap).
+                // `transform` arms recovery only when canonical model keys differ.
+                // `transform` uses `getSdkContextLimit` so a stale unkeyed detected limit from the prior model cannot false-arm recovery.
+                // The recovery arm keeps `armCatalogLimit` separate from `detected_context_limit` so a stale-low catalog value cannot pin the cap.
                 const armModel = deps.liveModelBySession?.get(sessionId);
                 const armModelKey = deps.getModelKey?.(sessionId);
                 const armSnapshot = persistedUsageBeforeResets;
@@ -1148,8 +951,6 @@ export function createTransform(deps: TransformDeps) {
                     typeof armCatalogLimit === "number" &&
                     armCatalogLimit > 0 &&
                     lastMeasuredInput > armCatalogLimit &&
-                    // different-model guard: the prior input was measured on a
-                    // model other than the one we're about to send to.
                     lastMeasuredModelKey != null &&
                     armModelKey != null &&
                     piModelRefToCanonical(lastMeasuredModelKey) !==
@@ -1160,8 +961,6 @@ export function createTransform(deps: TransformDeps) {
                         sessionId,
                         `transform: last input ${lastMeasuredInput} (model ${lastMeasuredModelKey}) exceeds new model ${armModelKey} catalog limit ${armCatalogLimit}; arming overflow recovery proactively for the shrinking switch`,
                     );
-                    // Flag-only arm: undefined reportedLimit sets
-                    // needs_emergency_recovery WITHOUT writing
                     // detected_context_limit.
                     dropSlot(sessionId, "overflow-recovery-arm");
                     recordOverflowDetected(
@@ -1171,10 +970,7 @@ export function createTransform(deps: TransformDeps) {
                         armModelKey,
                         "proactive_model_shrink",
                     );
-                    // recordOverflowDetected does NOT reset the no-eligible-head
-                    // count. A stale count from the prior model would make
-                    // noHeadEscape (below) suppress the bump we just armed, so
-                    // reset it for a fresh evaluation against the new model.
+                    // Model-change arming resets `noEligibleHeadCount` because a stale prior-model count would let `noHeadEscape` suppress the newly armed bump.
                     resetProtectedTailNoEligibleHead(db, sessionId);
                 }
 
@@ -1220,39 +1016,26 @@ export function createTransform(deps: TransformDeps) {
                 );
             }
         }
-        // Resolve the model's stable context limit directly so the history
-        // budget does not depend on volatile live-usage percentage (which is 0
-        // on the first pass after restart). Mirrors how the event handler
-        // computes percentage — same (providerID, modelID) + detected-overflow
-        // override from session_meta.
+        // `transform` resolves the stable model limit directly so the first post-restart pass, whose live usage is 0%, receives a nonvolatile history budget.
         //
-        // Model resolution order: the in-memory live map (seeded above from the
-        // visible message array) first, then a read-only OpenCode-DB recovery
-        // (findLastAssistantModelFromOpenCodeDb) for the case where older
-        // messages — including the last assistant tuple — are NOT in the visible
-        // array (trimmed window). Without the DB fallback a compartmented
-        // session could miss its model on a cold pass and fall back to 60K.
+        // `liveModelBySession` can omit the last assistant model when `messages` omits that tuple.
+        // If the visible message array omits the last assistant tuple, fall back to findLastAssistantModelFromOpenCodeDb; otherwise a cold compartmented session falls back to 60K.
         //
-        // We use resolveTrustedContextLimit (NOT resolveContextLimit): it
-        // returns a limit only on a real models.dev hit or a detected-overflow
-        // limit, and `undefined` for an unknown model. Passing the generic 128K
-        // default for an unknown large-context model would shrink history below
-        // what the live-usage back-derivation yields — so for unknown models we
-        // deliberately fall through to the live-usage path inside the resolver.
+        // `resolveTrustedContextLimit` returns only models.dev or detected-overflow limits; `resolveContextLimit` can return the generic 128K default.
+        // The generic 128K default would shrink an unknown large-context model's history below the live-usage-derived budget.
+        // Unknown models fall through to the live-usage path in the resolver.
         let modelForBudget = deps.liveModelBySession?.get(sessionId);
         if (!modelForBudget) {
             const recovered = findLastAssistantModelFromOpenCodeDb(sessionId);
             if (recovered) {
                 modelForBudget = recovered;
-                // Seed the live map so the scheduler / notification / sidebar
-                // paths reuse it this process without re-hitting the DB.
                 deps.liveModelBySession?.set(sessionId, recovered);
             }
         }
-        // Single pass-local provider resolution for every empty-sentinel producer.
-        // A cold pass may recover the model from OpenCode's DB above; hot passes hit
-        // the live map. Reusing this value keeps cold/hot output identical and keeps
-        // postprocess from making a divergent provider decision later in the pass.
+        // resolvedProviderID supplies every empty-sentinel producer during the pass.
+        // A cold pass can recover modelForBudget from OpenCode's DB; hot passes use deps.liveModelBySession.
+        // Both cold and hot passes derive empty-sentinel eligibility from resolvedProviderID.
+        // Postprocessing must reuse resolvedProviderID rather than resolve the provider again.
         const resolvedProviderID = modelForBudget?.providerID;
         const canUseEmptySentinels = modelAcceptsEmptyContent(resolvedProviderID);
         const resolvedContextLimit = modelForBudget
@@ -1315,23 +1098,18 @@ export function createTransform(deps: TransformDeps) {
             deps.executeThresholdTokens,
             resolvedContextLimit,
         );
-        // Ceiling for the tiered emergency drop = contextLimit × executeThreshold%
-        // (the usable working ceiling, NOT scaled by history_budget_percentage).
-        // Resolve the limit the same way resolveHistoryBudgetTokens does: prefer
-        // the model's stable limit, else back-derive from live usage. The
-        // emergency drop only fires at the derived force band, where percentage is reliably high,
-        // so the back-derivation is sound (it would only be unreliable at the
-        // percentage=0 cold start, which is far below the trigger). Undefined
-        // when neither is available → emergency drop skips, 95% block backstops.
+        // The ceiling does not scale with history_budget_percentage.
+        // The emergency-drop limit uses the stable model limit or back-derives a limit from live usage.
+        // Back-derivation is unreliable only when percentage is 0, below the emergency-drop trigger.
+        // When neither limit is available, emergency drop skips and the 95% block remains the fallback.
         const emergencyCeilingLimit = thresholdContextLimit ?? 0;
         const emergencyCeilingTokens =
             Number.isFinite(emergencyCeilingLimit) && emergencyCeilingLimit > 0
                 ? Math.floor(emergencyCeilingLimit * (effectiveExecuteThresholdPercentage / 100))
                 : undefined;
-        // Compaction-off: drop scheduling is gated off — the scheduler never
-        // approves an execute pass, so no pending-op drain, heuristic cleanup,
-        // age sweep or smart drop can fire, and the execute-only
-        // lastResponseTime watermark write below stays quiet too.
+        // With compaction off, the scheduler approves no execute pass, so pending-operation draining cannot run.
+        // With compaction off, age sweeps and smart drops cannot run.
+        // With compaction off, execute passes do not write the lastResponseTime watermark.
         const schedulerDecisionEarly = compactionOff
             ? ("defer" as const)
             : resolveSchedulerDecision(
@@ -1370,10 +1148,9 @@ export function createTransform(deps: TransformDeps) {
             sessionId,
             `[boundary-exec] base=${schedulerDecisionEarly} bypass=${bypassReason} midTurn=${midTurn} effective=${midTurnAdjustedSchedulerDecision} sideEffect=${sideEffect}`,
         );
-        // Capture explicit history refresh immediately before the first
-        // prepareCompartmentInjection consumer and before any drain. This is a
-        // per-pass local, not shared deps state: concurrent transforms must not
-        // overwrite each other's explicit/deferred attribution.
+        // The pass captures explicit history refresh before prepareCompartmentInjection consumes it or any drain runs.
+        // The explicit-history-refresh value is pass-local rather than shared deps state.
+        // Concurrent transforms must not overwrite another pass's explicit or deferred attribution.
         //
         const historyRefreshExplicitBeforePrepare = deps.historyRefreshSessions.has(sessionId);
         const deferredHistoryWasPendingAtPassStart = deferredHistoryRefreshSessions.has(sessionId);
@@ -1489,21 +1266,15 @@ export function createTransform(deps: TransformDeps) {
                 experimentalUserMemories: deps.experimentalUserMemories,
                 experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
                 historianTwoPass: deps.historianTwoPass,
-                // Issue #44: gate historian-driven memory promotion so users
-                // who disable the feature actually see no memories created.
                 memoryEnabled: deps.memoryConfig?.enabled,
                 autoPromote: deps.memoryConfig?.autoPromote,
                 ensureProjectRegistered: deps.ensureProjectRegistered,
-                // Historian publication invalidates the injection cache AND
-                // changes compartments/facts that render into message[0]. We
+                // Historian publication invalidates the injection cache because it changes the compartments and facts rendered into message[0].
                 // signal:
-                //   - deferredHistoryRefreshSessions: rebuilds only when a
-                //     materializing pass can consume history + drops together.
-                //   - deferredMaterializationSessions: queues drops that
-                //     historian published until heuristics actually run.
-                // We deliberately do NOT signal systemPromptRefreshSessions —
-                // historian doesn't change disk-backed adjuncts (docs/profile/
-                // key-files), so re-reading them would burn IO for nothing.
+                // A materializing pass rebuilds deferred history only when it can consume history and drops together.
+                // deferredMaterializationSessions queues drops for a later materializing pass.
+                // deferredMaterializationSessions retains historian-published drops until a materializing pass consumes them.
+                // Historian publication does not change disk-backed adjuncts, so `systemPromptRefreshSessions` remains unsignaled.
                 preserveInjectionCacheUntilConsumed: true,
                 onCompartmentStatePublished: (sid) => {
                     deferredHistoryRefreshSessions.add(sid);
@@ -1524,11 +1295,7 @@ export function createTransform(deps: TransformDeps) {
             skipCompartmentAwaitForThisPass = true;
             const emergencyPercentage = contextUsageEarly.percentage.toFixed(1);
             const recoveryStarted = startRecoveryRun();
-            // If recovery can't start because there is no eligible pre-tail
-            // history to compact, the runner no-op that normally counts this
-            // condition never fires. Count it here too so a genuinely in-progress
-            // tail can escape the abort loop after a bounded number of passes;
-            // keep recovery armed so compaction still happens once the arc closes.
+            // Recovery remains armed until the protected tail closes.
             if (!recoveryStarted && !getEligibleHistoryForCompartment()) {
                 const noHeadSnapshot =
                     getRunnableBoundaryForCompartment(
@@ -1570,12 +1337,6 @@ export function createTransform(deps: TransformDeps) {
 
         logTransformTiming(sessionId, "emergencyRecoveryBlock", tFirstPass);
 
-        // Resolve project identity ONCE per transform pass. Used by both
-        // prepareCompartmentInjection (memory filtering by project) and
-        // runCompartmentPhase (historian memory resolution). Computing it
-        // twice per turn is wasteful — resolveProjectIdentity caches by
-        // directory but still does a cache lookup on each call, and the
-        // first call per directory in a new process spawns `git rev-list`.
         const memoryProjectDirectory = compartmentDirectory || process.cwd();
         const projectIdentity = deps.memoryConfig?.enabled
             ? resolveProjectIdentity(memoryProjectDirectory)
@@ -1589,11 +1350,6 @@ export function createTransform(deps: TransformDeps) {
             );
         }
         if (projectIdentity) {
-            // Ongoing enforcement-artifact revalidation: ENFORCED maturity is
-            // earned by exact artifact bytes, and deleting or editing the
-            // recorded file must withdraw the rung instead of standing
-            // forever. Internally throttled (one filesystem pass per project
-            // per interval); failures are non-fatal and retry on a later
             // pass.
             try {
                 revalidateEnforcementArtifacts(
@@ -1608,16 +1364,7 @@ export function createTransform(deps: TransformDeps) {
                 );
             }
         }
-        // Session-scoped project identity for note-nudge and auto-search, which
-        // must target the SESSION's project — not the launch cwd. `deps.projectPath`
-        // is resolved once at hook init from the launch directory; on
-        // `opencode -s <id>` started from a different repo it points at the wrong
-        // project, so note nudges and auto-search would query the launch project's
-        // notes/memories. Reuse the memory identity when memory is enabled
-        // (identical value, no extra resolve); otherwise resolve from the session
-        // directory, falling back to the launch identity only when unavailable.
-        // resolveProjectIdentity is per-directory cached, so the common case
-        // (session dir == launch dir) costs nothing extra.
+        // Nudges and auto-search use the session's project identity.
         const sessionProjectIdentity =
             projectIdentity ??
             (sessionDirectory ? resolveProjectIdentity(sessionDirectory) : deps.projectPath);
@@ -1627,8 +1374,7 @@ export function createTransform(deps: TransformDeps) {
         if (sessionDirectory) {
             maybeSendProjectIdentityWarning(deps, sessionId, sessionDirectory, notificationParams);
         }
-        // Keep the marker lookup in the same identity vocabulary that Rust authority
-        // setup used: memory-enabled projects use their MC identity, never a raw path.
+        // Memory-enabled projects use their MC identity, never a raw path.
         // Scheduling only starts background recovery; this transform continues normally.
         const authorityProjectPath =
             (deps.memoryConfig?.enabled ? projectIdentity : undefined) ??
@@ -1642,11 +1388,9 @@ export function createTransform(deps: TransformDeps) {
                 module: deps.tsAuthorityRecoveryModuleClient,
             });
         }
-        // Persist only host-resolved session bindings. The launch-directory
-        // fallback keeps transforms non-fatal, but storing it as ownership would
-        // let a transient SDK failure permanently mis-scope chunk backfills.
-        // Guarded to fire once per (session, identity) in this process so the
-        // hot path carries no per-pass DB write once the binding is recorded.
+        // The transform persists only host-resolved session bindings.
+        // The launch-directory fallback keeps transforms non-fatal.
+        // The transform does not persist the launch-directory fallback as ownership because a transient SDK failure could permanently mis-scope chunk backfills.
         if (
             sessionIdentityForBinding &&
             sessionDirectoryResolvedFromHost &&
@@ -1656,37 +1400,19 @@ export function createTransform(deps: TransformDeps) {
             recordedSessionProjectIdentity.set(sessionId, sessionIdentityForBinding);
         }
 
-        // Historian trigger decision — relocated here from the message.updated
-        // event handler. The event handler has no message array, so it re-read
-        // the session tail from opencode.db on EVERY streaming delta (~186ms of
-        // synchronous SQLite per event on a large session, freezing the event
-        // loop and making parallel hooks like tool.definition measure seconds).
-        // The transform already receives the post-compaction-marker tail —
-        // the exact eligible window — as parsed objects, so the inspection runs
-        // from memory with zero opencode.db reads (live-verified byte-identical
-        // boundary on every decision field before the cutover). Cadence is
-        // once per LLM request (this hook) instead of per streaming delta,
-        // which is when the decision inputs actually change. Runs here because
+        // `messages` contains the post-compaction-marker eligible tail as parsed objects.
+        // Trigger inspection does not read `opencode.db`.
+        // The transform evaluates the trigger once per LLM request because its inputs change only then.
         // `messages` is still the clean pre-injection, pre-mutation tail.
-        // On shouldFire we set the flag AND mutate the local sessionMeta so
-        // runCompartmentPhase starts the historian in this same pass (the same
-        // pass it would have started under the event-handler flow). The
-        // resolved boundary snapshot is handed through so the phase doesn't
+        // The transform mutates `sessionMeta` when `shouldFire` so `runCompartmentPhase` starts the historian in the same pass.
+        // The caller passes the resolved boundary snapshot to avoid resolving it again.
         // re-resolve it.
-        // Tag load-scoping floor: derived once per pass from the raw wire ids and
-        // reused by the trigger's tag scans (below) AND the tagger initFromDb
-        // (later). Computed here — NOT inside the trigger from inMemoryTail —
-        // because the trigger's in-memory tail is gated on the compaction-marker
-        // anchor and bails (undefined) post-restart / during marker-drain lag;
-        // the floor only needs the leading wire ids, which are always present, so
-        // deriving it here keeps both tag scans scoped on every pass (those
-        // anchor-miss passes were the residual ~90ms full-scan regression).
+        // The transform derives `taggerFloor` from raw wire IDs so the trigger and tagger scans share a scope.
+        // `taggerFloor` defines the scope for trigger scans and `initFromDb`.
+        // The transform derives `taggerFloor` from raw wire IDs because `inMemoryTail` can be unavailable without a compaction anchor.
+        // `taggerFloor` requires only leading wire IDs.
         const taggerFloor = compactionOff ? 0 : deriveTaggerLoadFloor(messages, sessionId, db);
-        // floor 0 = no leading wire message resolved to a tag → BOTH tag scans
-        // (tagger initFromDb + the trigger's token scans) fall back to the full
-        // ~O(session) load. On a large session that's the ~70ms compartmentTrigger
-        // we are trying to avoid, so surface it as a one-line health signal rather
-        // than letting it hide as silent latency.
+        // When `taggerFloor` is `0`, both tag scans use the full history.
         if (!compactionOff && taggerFloor === 0 && messages.length > 0) {
             sessionLog(
                 sessionId,
@@ -1742,11 +1468,8 @@ export function createTransform(deps: TransformDeps) {
 
         let pendingCompartmentInjection: PreparedCompartmentInjection | null = null;
         let rebuiltHistoryFromInitialPrepare = false;
-        // Compaction-off bypasses compartment-history preparation entirely,
-        // even when historical compartment rows exist: no <session-history>
-        // render, no raw-tail trim, no boundary splice, no marker write.
-        // Memory/docs surfaces materialize independently through the
-        // zero-compartment m[0]/m[1] path in postprocess.
+        // Compaction-off skips preparation even when historical compartment rows exist.
+        // Compaction-off renders no `<session-history>`, trims no raw tail, splices no boundary, and writes no marker.
         if (fullFeatureMode && !compactionOff) {
             const tInj = performance.now();
             pendingCompartmentInjection = prepareCompartmentInjection(
@@ -1760,30 +1483,15 @@ export function createTransform(deps: TransformDeps) {
             );
             logTransformTiming(sessionId, "prepareCompartmentInjection", tInj);
 
-            // ── Drain historyRefreshSessions (one-shot semantics) ──
-            // The injection rebuild — the only consumer of this signal in
-            // the messages-transform path — has now run. Future defer
-            // passes within the same TTL window MUST hit the cached
-            // injection result so the Anthropic prompt-cache prefix
-            // stays stable. The captured local `isCacheBusting` const
-            // above retains its value for downstream background-compressor
-            // gating, so this drain doesn't affect later behavior in this
-            // pass — only future passes.
+            // The transform consumes each `historyRefreshSessions` entry once.
+            // The injection rebuild is the messages-transform path's only `historyRefreshSessions` consumer.
+            // Cached injection results keep the Anthropic prompt-cache prefix stable within the TTL window.
+            // Draining `historyRefreshSessions` does not change the captured `isCacheBusting` value in this pass.
             //
-            // This preserves one-shot signal consumption: the previous
-            // single-set design left the flush flag alive whenever
-            // compartmentRunning blocked heuristics, so every defer pass
-            // re-fired prepareCompartmentInjection with isCacheBusting=true
-            // and burned cache reuse for nothing.
+            // Calling `prepareCompartmentInjection` consumes the one-shot deferred-history signal.
             if (isCacheBusting) {
-                // Cache-busting pass invoked prepareCompartmentInjection. Treat
-                // this as a history rebuild regardless of whether the prepare
-                // returned a populated injection — even a null result (no
-                // compartments yet) consumes the deferred-history signal
-                // because the next pass will get a fresh prepare. The
-                // separate `compartmentInjectionRebuiltFromDb` flag (plan v6)
-                // exposes the narrower "real rebuild happened" signal to
-                // postprocess for the marker-drain decision.
+                // The transform records a history rebuild even when `prepareCompartmentInjection` returns no injection.
+                // `compartmentInjectionRebuiltFromDb` reports only an actual database rebuild.
                 rebuiltHistoryFromInitialPrepare = true;
             }
             if (historyRefreshExplicitBeforePrepare) {
@@ -1801,29 +1509,10 @@ export function createTransform(deps: TransformDeps) {
         let messageTagNumbers = new Map<MessageLike, number>();
         let batch: { finalize: () => void } | null = null;
         let hasRecentReduceCall = false;
-        // Inject temporal markers before tagging so the §N§ tag prefix wraps
-        // around our marker.
+        // `injectTemporalMarkers` runs before tagging so each `§N§` prefix wraps a marker.
         //
-        // Intentional — this runs on EVERY transform pass, including defer /
-        // cache-safe passes that are otherwise gated. Three invariants make
         // that safe:
-        //   1. Idempotent: injectTemporalMarkers detects existing markers by
-        //      regex and will not double-prefix.
-        //   2. Deterministic: the marker value derives from immutable
-        //      message.time.created / time.completed timestamps — same input,
-        //      same output, every pass.
-        //   3. Required every pass: OpenCode rebuilds the messages array from
-        //      its DB for every transform, so markers must be re-applied on
-        //      each pass or they would disappear on defer passes. Skipping
-        //      defer passes here would cause the marker to flicker in/out and
-        //      bust cache when it reappeared.
         //
-        // The retroactive-on-flag-flip behavior is the same mechanism — when
-        // the flag turns on, the first pass marks every eligible user message
-        // and subsequent passes just observe the already-marked content.
-        // Compaction-off: temporal markers/overlays are part of the gated
-        // compaction surface (additive but mode-owned), so the wire stays
-        // untouched in this mode.
         if (deps.experimentalTemporalAwareness && !compactionOff) {
             const tTemporal = performance.now();
             const injected = injectTemporalMarkers(messages);
@@ -1834,27 +1523,15 @@ export function createTransform(deps: TransformDeps) {
         }
 
         let taggingSucceeded = false;
-        // Compaction-off mode: the tagger writes ZERO tag rows and emits no
-        // §N§ prefixes (spec #266 decision #6). Every consumer of the tag
-        // walk's outputs (drops, heuristics, nudges, caveman, flushed-status
-        // replay) is itself gated off in this mode, so the whole walk is
-        // skipped — no rows, no prefixes, no commit scan. Flip-back
-        // self-heals: the tagger lazily mints on first observation of
-        // untagged wire content once this gate reopens.
+        // Compaction-off mode writes no tag rows and emits no `§N§` prefixes.
+        // When compactionOff becomes false, tagMessages assigns tags to untagged messages.
         if (!compactionOff) {
             try {
                 const t0 = performance.now();
                 const tInitFromDb = performance.now();
-                // taggerFloor was derived once above (before the trigger block) and is
-                // reused here so the tagger map and the trigger's tag scans scope to
-                // the identical live-wire floor.
                 deps.tagger.initFromDb(sessionId, db, taggerFloor);
                 logTransformTiming(sessionId, "tag.initFromDb", tInitFromDb);
-                // Skip §N§ prefix injection only when ctx_reduce is unavailable in
-                // this session's tool allow-list. Subagents with the tool DO get
-                // prefixes now — they self-manage tool bloat. DB tag records are
-                // maintained either way so heuristics and drops continue to work;
-                // only the agent-visible prefix is gated.
+                // `skipPrefixInjection` suppresses agent-visible `§N§` prefixes while retaining DB tags when `ctxReduceCallable` is false.
                 const skipPrefixInjection = !ctxReduceCallable;
                 const result = tagMessages(sessionId, messages, deps.tagger, db, {
                     skipPrefixInjection,
@@ -1866,10 +1543,8 @@ export function createTransform(deps: TransformDeps) {
                 hasRecentReduceCall = result.hasRecentReduceCall;
                 const hadPriorCommitState = deps.commitSeenLastPass?.has(sessionId) ?? false;
                 const sawCommitLastPass = deps.commitSeenLastPass?.get(sessionId) ?? false;
-                // Only trigger on NEW commits — not on first pass after restart where
-                // we have no baseline. First pass establishes the baseline silently.
-                // Subagents never deliver note nudges (gated in postprocess), so skip
-                // accumulating orphan trigger state.
+                // Triggering requires commit state from a prior pass.
+                // The first pass establishes commit state without triggering.
                 if (
                     fullFeatureMode &&
                     hadPriorCommitState &&
@@ -1888,12 +1563,10 @@ export function createTransform(deps: TransformDeps) {
                     "transform tag persistence failed; continuing without tagging:",
                     error,
                 );
-                // Drop in-memory tagger state for this session so the next pass
-                // re-loads from the DB. Without this, a stale counter or stale
-                // assignments map can keep producing the same UNIQUE collision
-                // turn after turn until the process restarts. With the DB-
-                // authoritative allocation in tagger.assignTag, a fresh load
-                // typically self-heals in one pass.
+                // cleanup forces the next pass to reload the tagger from the DB.
+                // Reloading prevents stale tagger state from repeating UNIQUE collisions.
+                // A stale assignments map can repeat a UNIQUE collision.
+                // tagger.assignTag allocates tags from the DB, so reloading restores authoritative state.
                 try {
                     deps.tagger.cleanup(sessionId);
                 } catch (cleanupError) {
@@ -1902,27 +1575,15 @@ export function createTransform(deps: TransformDeps) {
             }
         }
 
-        // P0 perf: replace single SELECT-everything load with three
-        // targeted queries. The hot transform path used to load every
-        // tag in the session (~50k rows on long-lived sessions) every
-        // pass; benchmark in scripts/benchmark-tag-queries.ts showed
-        // this single change recovers ~67ms per pass.
+        // Targeted queries avoid loading every tag in the session.
         //
-        //   activeTags          → drives heuristic cleanup, nudger,
-        //                         caveman scope (active subset only;
-        //                         partial-index scan, ~0.6ms)
-        //   targetsSliceTags    → drives applyFlushedStatuses + caveman
-        //                         replay (visible target subset only;
-        //                         IN-list lookup against the existing
-        //                         (session_id, tag_number) index)
-        //   maxDroppedTagNumber → replaces the watermark for-loop with
-        //                         a single MAX() aggregate
+        // activeTags limits heuristic cleanup, nudger, and caveman scope to active tags.
+        // targetsSliceTags supplies the visible target subset to applyFlushedStatuses and caveman replay.
+        // The lookup uses an IN list over the existing (session_id, tag_number) index.
         //
-        // applyHeuristicCleanup and nudger both filter on
-        // status === "active" and short-circuit otherwise, so feeding
-        // them active-only is identical behavior. applyFlushedStatuses
-        // and caveman replay both filter to targets.has(tagNumber), so
-        // pre-filtering by tag_number is a no-op for correctness.
+        // applyHeuristicCleanup and nudger ignore non-active tags, so active-only input preserves behavior.
+        // applyFlushedStatuses and caveman replay ignore tag numbers outside targets.
+        // Prefiltering tag numbers to targets preserves applyFlushedStatuses and caveman replay behavior.
         const t1 = performance.now();
         const activeTags = compactionOff ? [] : getActiveTagsBySession(db, sessionId);
         logTransformTiming(sessionId, "getActiveTagsBySession", t1, `count=${activeTags.length}`);
@@ -1940,13 +1601,8 @@ export function createTransform(deps: TransformDeps) {
         );
 
         let didMutateFromFlushedStatuses = false;
-        // Only run mutation stages when tagging succeeded. With targets={}
-        // applyFlushedStatuses can't drive any of the persisted drops/
-        // truncates/source restores it's responsible for, and running it
-        // anyway risks fanning out partial work that can't be undone on the
-        // next pass. Skip it cleanly so the session enters the next pass
-        // with consistent state and the next initFromDb refresh re-binds
-        // tags from the DB.
+        // Mutation stages run only after successful tagging because failed tagging leaves `targets` empty.
+        // Without targets, applyFlushedStatuses cannot persist drops.
         if (taggingSucceeded) {
             try {
                 const t2 = performance.now();
@@ -1966,9 +1622,6 @@ export function createTransform(deps: TransformDeps) {
         }
 
         const t3 = performance.now();
-        // Empty text part sentinels are safe only for canonical Anthropic, where
-        // OpenCode filters them before the wire. Other providers keep native
-        // structural parts so an empty text block cannot break tool adjacency.
         const strippedStructuralNoise =
             canUseEmptySentinels && !compactionOff ? stripStructuralNoise(messages) : 0;
         logTransformTiming(
@@ -1978,19 +1631,9 @@ export function createTransform(deps: TransformDeps) {
             `strippedParts=${strippedStructuralNoise}`,
         );
 
-        // Replay persisted reasoning clearing on EVERY pass (including defer).
-        // This ensures reasoning cleared on a previous cache-busting pass stays cleared
-        // even when OpenCode rebuilds messages fresh from its own DB.
         const persistedReasoningWatermark = sessionMeta?.clearedReasoningThroughTag ?? 0;
         if (persistedReasoningWatermark > 0 && !compactionOff) {
             const tReplay = performance.now();
-            // Typed reasoning replay is canonical-Anthropic-only, matching the
-            // clearOldReasoning WRITE gate (transform-postprocess-phase.ts). The
-            // watermark can outlive a provider switch (anthropic → proxy), so
-            // gating the replay on the CURRENT provider prevents re-applying
-            // "[cleared]" reasoning text onto a non-canonical Claude proxy wire.
-            // Inline-thinking replay stays provider-independent — it strips
-            // literal <thinking> tags from text, never typed reasoning parts.
             const replayed = canUseEmptySentinels
                 ? replayClearedReasoning(
                       messages,
@@ -2013,19 +1656,8 @@ export function createTransform(deps: TransformDeps) {
             logTransformTiming(sessionId, "replayReasoningClearing", tReplay);
         }
 
-        // Re-apply persisted caveman compression on EVERY pass (defer too).
-        // tagMessages restores the pristine original from source_contents on
-        // every pass, so without this replay step compressed text would
-        // oscillate between compressed (post-execute) and original (defer),
-        // busting the provider prompt cache. Cheap when no tags carry
-        // caveman_depth > 0 (early exit). Only runs for primary sessions —
-        // matches the gate that lets applyCavemanCleanup deepen depth in the
         // first place.
         //
-        // We feed the targets-slice subset (already loaded above for
-        // applyFlushedStatuses) — replay only acts on tags whose
-        // tag_number is in `targets` anyway, so passing the wider list
-        // would just give it more rows to filter and discard.
         if (!reducedMode && !compactionOff && deps.cavemanTextCompression?.enabled) {
             const tCavemanReplay = performance.now();
             const replayedCaveman = replayCavemanCompression(
@@ -2041,9 +1673,6 @@ export function createTransform(deps: TransformDeps) {
         }
 
         const t4 = performance.now();
-        // `clearOldReasoning` replays `[cleared]` as native reasoning text for all
-        // providers. Only Anthropic may replace those shells with empty text
-        // sentinels; other providers can forward the empty part to the wire.
         const strippedClearedReasoning =
             canUseEmptySentinels && !compactionOff ? stripClearedReasoning(messages) : 0;
         logTransformTiming(
@@ -2053,13 +1682,8 @@ export function createTransform(deps: TransformDeps) {
             `strippedParts=${strippedClearedReasoning}`,
         );
 
-        // Watermark = highest dropped tag_number for this session. Backed by
-        // the partial index `idx_tags_dropped_session_tag_number` (migration
-        // v8) so SQLite resolves this with a single backward index seek
-        // instead of the full-array scan we used to do here.
         const watermark = getMaxDroppedTagNumber(db, sessionId);
 
-        // Reuse the early scheduler result — inputs haven't changed.
         const contextUsage = contextUsageEarly;
         const schedulerDecision = midTurnAdjustedSchedulerDecision;
         const rawGetNotifParams = deps.getNotificationParams;
@@ -2093,9 +1717,6 @@ export function createTransform(deps: TransformDeps) {
             getNotificationParams: rawGetNotifParams
                 ? () => rawGetNotifParams(sessionId)
                 : undefined,
-            // The compressor needs to know if this is a safe pass to run on.
-            // Scheduler "execute" passes are safe for compressor (they already bust cache
-            // via pending ops); snapshot-drain keeps same-pass compressor signals safe.
             safeForBackgroundCompression:
                 historianRunnable &&
                 (isCacheBusting || midTurnAdjustedSchedulerDecision === "execute"),
@@ -2104,15 +1725,10 @@ export function createTransform(deps: TransformDeps) {
             experimentalUserMemories: deps.experimentalUserMemories,
             experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
             historianTwoPass: deps.historianTwoPass,
-            // Issue #44: forward memory gating so the normal historian path
-            // (not just the recovery path above) honors memory.enabled and
             // memory.auto_promote.
             memoryEnabled: deps.memoryConfig?.enabled,
             autoPromote: deps.memoryConfig?.autoPromote,
             ensureProjectRegistered: deps.ensureProjectRegistered,
-            // See startRecoveryRun above for the full rationale —
-            // historian/recomp publication signals history rebuild +
-            // pending materialization, but NOT system-prompt adjuncts.
             onCompartmentStatePublished: (sid) => {
                 deferredHistoryRefreshSessions.add(sid);
                 deferredMaterializationSessions.add(sid);
@@ -2124,22 +1740,11 @@ export function createTransform(deps: TransformDeps) {
         sessionMeta = { ...sessionMeta, compartmentInProgress };
         logTransformTiming(sessionId, "compartmentPhase", tCompartmentPhase);
 
-        // Layer-B fallback (#264): the injection stayed degraded and no durable
-        // compartment boundary is visible, so there was no safe re-anchor splice.
-        // Queue a fresh materialization so the baseline is re-cut on the next
-        // bust instead of the session silently looping in degraded mode.
         if (pendingCompartmentInjection?.needsFreshMaterialization) {
             deps.pendingMaterializationSessions.add(sessionId);
             deferredMaterializationSessions.add(sessionId);
         }
 
-        // HARD-bust signals for the m[0]/m[1] materialization decision. These
-        // capture provider-side cache-eviction events (model switch, system-block
-        // change, tools-block change) plus the TTL idle window. A change in any
-        // means the Anthropic prompt cache was already dead, so folding m[1] into
-        // m[0] is "free". systemHash is the PERSISTED last-turn hash (system.transform
-        // runs AFTER this messages.transform), so a system change is detected on the
-        // next pass — the accepted one-pass lag.
         const hardModel = deps.liveModelBySession?.get(sessionId);
         const hardModelKey = hardModel ? `${hardModel.providerID}/${hardModel.modelID}` : "";
         const hardSystemHash =
@@ -2182,15 +1787,7 @@ export function createTransform(deps: TransformDeps) {
             sessionId,
             db,
             messages,
-            // P0 perf: pass active-only tags. The downstream consumers
-            // (applyHeuristicCleanup, nudger) both filter on
-            // status === "active" and short-circuit otherwise — feeding
-            // them active-only is identical behavior with much smaller
-            // input. applyPendingOperations is the only consumer that
-            // genuinely needs all statuses; it already handles a missing
-            // preload by lazy-loading via getTagsBySession() internally,
-            // and pending-op execution is the rare case (most passes have
-            // 0 pending ops and skip applyPendingOperations entirely).
+            // applyPendingOperations lazy-loads tags when no preload is provided.
             tags: activeTags,
             targets,
             reasoningByMessage,
@@ -2218,10 +1815,9 @@ export function createTransform(deps: TransformDeps) {
             canConsumeDeferredLate,
             sessionMeta,
             currentTurnId,
-            // Postprocess reads pendingMaterializationSessions to decide
-            // whether `/ctx-flush`-style materialization is queued, and
-            // drains it after heuristics actually run. NOT the history
-            // set — postprocess doesn't refresh `<session-history>`.
+            // Postprocess uses pendingMaterializationSessions to determine whether `/ctx-flush`-style materialization is queued.
+            // Postprocess drains pendingMaterializationSessions after heuristics run; it does not use the history-refresh set.
+            // Postprocess does not refresh `<session-history>`.
             pendingMaterializationSessions: deps.pendingMaterializationSessions,
             deferredHistoryRefreshSessions,
             deferredMaterializationSessions,
@@ -2234,30 +1830,23 @@ export function createTransform(deps: TransformDeps) {
             watermark,
             forceMaterializationPercentage,
             hasRecentReduceCall,
-            // Session-scoped (not launch) identity so note-nudge + auto-search
-            // target the resumed session's real project. See sessionProjectIdentity.
+            // Note-nudge and auto-search must use sessionProjectIdentity to target the resumed session's project.
             projectPath: sessionProjectIdentity,
             sessionDirectory,
             autoSearch: deps.autoSearch,
-            // Only forward caveman config for primary sessions. Subagents should
-            // never receive their own caveman compression because they have no
-            // equivalent recovery path and their context is already curated by
-            // the primary agent that spawned them.
+            // Subagents must not receive cavemanTextCompression because the spawning primary agent already curates their context.
             cavemanTextCompression: !reducedMode ? deps.cavemanTextCompression : undefined,
             smartDrops: deps.smartDrops === true,
-            // Pass the single resolved provider through to postprocess so every
-            // empty-sentinel gate and whole-message placeholder choice agrees for
-            // this transform pass, including cold DB-recovered passes.
+            // Postprocess receives resolvedProviderID so provider-dependent decisions remain consistent for the transform pass.
+            // resolvedProviderID keeps empty-sentinel gates and whole-message placeholder selection consistent.
+            // Cold DB-recovered passes receive resolvedProviderID.
             resolvedProviderID,
             passOutcome,
             historyRefreshSessions: deps.historyRefreshSessions,
             m0M1: {
-                // Memory identity ONLY (drives <project-memory> selection in
-                // materializeM0). Must stay undefined when memory.enabled=false —
-                // falling back to deps.projectPath here re-enabled memory injection
-                // despite the config being off (materializeM0 renders memory purely
-                // on projectPath presence). projectDirectory below independently
-                // drives docs/key-files/history, so dropping the fallback does not
+                // m0M1.projectPath must remain undefined when memory.enabled=false.
+                // materializeM0 must not fall back to deps.projectPath because any projectPath injects memory.
+                // projectDirectory independently drives docs, key files, and history.
                 // disable those.
                 projectPath: projectIdentity,
                 projectDirectory: sessionDirectory,
@@ -2270,15 +1859,13 @@ export function createTransform(deps: TransformDeps) {
             },
         });
         passOutcome.markFinalized();
-        // Compaction-off: the emergency/overflow machinery is fully disarmed
-        // (derived force-band tiered drop, absolute 95% fail-closed block, overflow-recovery latch).
-        // A persisted latch is cleared by the off-transition, never consumed
-        // here; overflow propagates to native compaction instead of blocking.
+        // compactionOff disables force-band drops, the 95% block, and the overflow-recovery latch.
+        // The off-transition clears the persisted overflow-recovery latch without consuming it.
+        // With compactionOff, overflow reaches native compaction instead of blocking.
         const finalWireTail = describeFinalWireTail(messages);
         let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
         if (!compactionOff) {
-            // Fresh-tokenize only in the emergency band. This estimate is telemetry,
-            // never an abort gate: provider-accurate accounting is deferred to the
+            // The code fresh-tokenizes only in the emergency band; the estimate is telemetry.
             // module-side implementation.
             const emergencyUsagePercentage = usagePercentageSynthetic
                 ? Math.max(95, contextUsage.percentage)
@@ -2307,9 +1894,8 @@ export function createTransform(deps: TransformDeps) {
                 sessionId,
                 currentModelKeyForRecovery,
             );
-            // A catalog or user-configured limit is useful for budgeting, but it cannot
-            // prove that this provider accepts the recovered wire shape. Only the limit
-            // parsed from this model's own overflow response may disarm recovery.
+            // A catalog or user-configured limit cannot prove that this provider accepts the recovered wire shape.
+            // An overflow response from the active model disarms recovery.
             const providerProvenLimitTokens =
                 typeof currentModelKeyForRecovery === "string" &&
                 currentModelKeyForRecovery.length > 0 &&
@@ -2340,7 +1926,7 @@ export function createTransform(deps: TransformDeps) {
                         "Cannot fail closed: OpenCode client is unavailable",
                     );
                 }
-                // The notice must finish before self-abort so recovery instructions survive interruption.
+                // The recovery notice must finish before self-abort so recovery instructions survive interruption.
                 let notification: Awaited<ReturnType<typeof sendIgnoredMessage>>;
                 try {
                     notification = await sendIgnoredMessage(
@@ -2371,8 +1957,7 @@ export function createTransform(deps: TransformDeps) {
                         cause: error,
                     });
                 }
-                // The abort prevents a fresh provider usage sample. Release the
-                // stale-sample latch so the retry can reclaim additional tools.
+                // The retry must clear the stale-sample latch because aborting prevents a fresh provider usage sample.
                 try {
                     clearEmergencyDropSample(db, sessionId);
                 } catch (error) {
@@ -2436,50 +2021,17 @@ export function createTransform(deps: TransformDeps) {
         }
         logTransformTiming(sessionId, "postTransformPhase", tPostProcess);
 
-        // Estimate the total token size of the transformed messages array so
-        // the sidebar / dashboard can attribute inputTokens between System
-        // (from system.transform), Tool Definitions (inferred as the
-        // remainder), and Conversation (actual messages minus injected
+        // The sidebar attributes inputTokens across System, Tool Definitions, and Conversation.
         // compartments/facts/memories).
         //
-        // Counts every token-bearing field across all part types Anthropic
-        // serializes: text, reasoning (signed thinking we still forward for
-        // the latest assistant), tool inputs, tool outputs, tool_result
-        // content. Previously only `text` parts were counted, which produced
-        // ~10x underestimates on sessions with long tool traces and pushed
-        // the delta into Tool Definitions. This value intentionally includes
-        // the injected <session-history> block — the display layer subtracts
-        // compartmentTokens/factTokens/memoryTokens to isolate real
+        // The token count includes text, reasoning, tool inputs, tool outputs, and tool_result content from every Anthropic message-part type.
         // user/assistant conversation.
-        // Split message content into two honest buckets for the sidebar:
-        //   conversationTokens = real user/assistant discussion
-        //                        (text, reasoning, images) — the part users
         //                        actually wrote/read
-        //   toolCallTokens     = tool call I/O inside messages
-        //                        (tool, tool_use, tool_result, tool-invocation)
-        //                        — actionable, can be compacted by ctx_reduce
-        // Tool DEFINITIONS (schemas OpenCode sends in the separate `tools`
-        // parameter) are not in messages — they surface as a residual at
-        // display time (inputTokens − system − messagesBlock − toolCalls).
         //
-        // Cached per message ID. Messages are append-only once streaming
-        // completes, so the token contribution of a completed message is
-        // stable across transform passes. Cleared on message.removed events
-        // (see hook-handlers.ts). On the rare mid-transform mutation (e.g.
-        // historian-driven drop), the cache will be ~slightly stale until
-        // the next cache-busting pass; acceptable drift for a display
         // estimate.
         const msgTokens = getMessageTokensCache(sessionId);
-        // Durable second tier: the tag store holds per-message real-token counts
-        // computed ONCE at tag-insert time and persisted, so a cold pass (empty
-        // in-process cache after restart) reads them instead of re-tokenizing the
-        // tail. Injected m[0]/m[1] blocks and synthetic-todowrite are never
-        // tagged, so they fall through to the live walk below and stay counted in
-        // conversation_tokens — preserving the display-layer subtraction contract
-        // (the RPC handler subtracts compartments/memories/docs/profile from this
-        // total to isolate real conversation). A message with any NULL-count tag
-        // (legacy, mid-backfill) is absent here this pass and live-tokenizes,
-        // converging to the stored path once the tagger backfills it.
+        // The tag store persists per-message token counts, allowing cold passes to avoid re-tokenizing tagged messages.
+        // A NULL-count tag requires live token estimation.
         let storedByMessage: Map<
             string,
             { conversation: number; toolCall: number; hasNull: boolean }
@@ -2519,17 +2071,13 @@ export function createTransform(deps: TransformDeps) {
         try {
             updateSessionMeta(db, sessionId, { conversationTokens, toolCallTokens });
         } catch (error) {
-            // Pure display/telemetry optimization — never fail transform on a
-            // BUSY/transient error here. Next pass will refresh the value.
+            // Token telemetry update failures must not fail the transform.
             const code = (error as { code?: string } | null)?.code;
             if (code !== "SQLITE_BUSY") {
                 sessionLog(sessionId, "conversation_tokens UPDATE failed:", error);
             }
         }
 
-        // The final-array walk runs inside runPostTransformPhase after its last
-        // byte mutation. This site only uses the persisted baseline to reset
-        // cadence and run the existing Channel-2 lease logic.
         const channelBaseline = deps.channel1StateBySession?.get(sessionId);
         if (ctxReduceCallable && !compactionOff && channelBaseline) {
             const measuredU = Math.min(
@@ -2589,18 +2137,6 @@ export function resolveHistoryBudgetTokens(
         return undefined;
     }
 
-    // Derive the budget from the model's STABLE context limit, resolved
-    // directly (models.dev + any detected-overflow override). The previous
-    // design back-derived the limit from live usage as inputTokens/percentage,
-    // which collapses to 0/0 on the FIRST transform pass after a restart
-    // (percentage=0, inputTokens=0). When a re-materialize was forced on that
-    // very pass (e.g. the m[1] cache was cleared by a migration), the budget
-    // fell through to the hard-coded 60K default — far below a large model's
-    // real history budget — and the decay renderer archived the oldest
-    // compartments to fit 60K, then stuck there via cache_hit replay. The
-    // resolved limit is available even at percentage=0 (recovered from the
-    // OpenCode DB), so it removes the hole. The live-usage back-derivation is
-    // kept only as a last-resort fallback if a limit couldn't be resolved.
     let contextLimit = resolvedContextLimit && resolvedContextLimit > 0 ? resolvedContextLimit : 0;
     if (contextLimit <= 0) {
         if (contextUsage.percentage <= 0) {

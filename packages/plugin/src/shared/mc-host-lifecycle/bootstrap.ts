@@ -1,9 +1,5 @@
 /**
- * Pre-native trust pipeline: platform gate, retained-bootstrap revalidation,
- * certified physical install-layout resolution, trust-index verification, and
- * capacity-preflighted no-follow staging. Nothing in this module executes a
- * byte — it only decides whether a trusted launcher object exists and stages
- * one when the certified package path allows it. Every failure is one closed
+ * This module verifies and stages trusted launchers but never executes them.
  * lifecycle reason.
  */
 
@@ -50,13 +46,9 @@ export class BootstrapError extends Error {
 }
 
 /**
- * The uid every ownership check in this module compares against. A host
- * without `process.getuid` cannot express file ownership, which is an
- * unsupported platform and not a property of any inspected file: comparing a
- * numeric `stat.uid` against a missing function yields `undefined` and would
- * misreport every correctly-owned object as foreign. Callers resolve the uid
- * before their first filesystem effect so such a host fails without leaving
- * a directory or a temp object behind.
+ * currentUid returns the uid required by every ownership check.
+ * Hosts without process.getuid cannot verify file ownership.
+ * Callers invoke currentUid before filesystem effects.
  */
 function currentUid(): number {
     if (typeof process.getuid !== "function") {
@@ -66,7 +58,7 @@ function currentUid(): number {
 }
 
 // ---------------------------------------------------------------------------
-// Platform gate (R24). Runs before any package byte is opened.
+// The platform gate runs before any package byte is opened.
 // ---------------------------------------------------------------------------
 
 export interface PlatformReaders {
@@ -76,7 +68,7 @@ export interface PlatformReaders {
     kernelRelease: () => string;
     /** glibc runtime version, e.g. `2.34`, or null when unverifiable. */
     glibcVersion: () => string | null;
-    /** True only when `/proc/self/fd` resolves on a real procfs. */
+    /** True when `readlinkSync(`/proc/self/fd/${fd}`)` returns a nonempty target. */
     procSelfFdUsable: () => boolean;
     /** macOS product version, e.g. `14.2`, or null when unverifiable. */
     macosProductVersion: () => string | null;
@@ -91,32 +83,19 @@ function detectGlibcVersion(): string | null {
             if (typeof version === "string" && version.length > 0) return version;
         }
     } catch {
-        // fall through to the conservative null below
     }
     return null;
 }
 
 /**
- * Whether this host can execute a retained payload through `/proc/self/fd`,
- * the Linux `procfs_self_fd_exec` capability the certified lane requires.
+ * `detectProcSelfFd` reports whether `/proc/self/fd/<fd>` resolves for a descriptor opened by this check.
  *
- * Exported so qualification evidence records the same fact this gate decides:
- * a smoke report that omits it, or derives it some other way, describes a host
- * the platform gate never evaluated.
  */
 export function detectProcSelfFd(): boolean {
-    // Probing `/proc/self/fd/0` would report the caller's *stdin state* rather
-    // than the procfs capability this gate is about: a process that closed fd 0
-    // has no `/proc/self/fd/0` entry, so readlink answers ENOENT on a fully
-    // usable procfs and every lifecycle command is refused as
-    // `unsupported_platform`. Open a descriptor this check owns and resolve
-    // that instead. `/` is used because it is the one path guaranteed to be
-    // openable wherever the gate can run at all.
+    // Probe a descriptor opened by this check because fd 0 reflects the caller's stdin state.
     let fd: number | null = null;
     try {
         fd = openSync("/", fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
-        // A real procfs resolves an open descriptor's link target; a masked or
-        // absent /proc throws here and the gate fails closed.
         return readlinkSync(`/proc/self/fd/${fd}`).length > 0;
     } catch {
         return false;
@@ -125,8 +104,7 @@ export function detectProcSelfFd(): boolean {
             try {
                 closeSync(fd);
             } catch {
-                // The probe descriptor's close is best-effort: the capability
-                // answer is already decided and a close error cannot change it.
+                // The probe descriptor's close is best-effort because a close error cannot change the already-decided capability answer.
             }
         }
     }
@@ -136,16 +114,12 @@ const MACOS_SYSTEM_VERSION_PLIST = "/System/Library/CoreServices/SystemVersion.p
 const MACOS_PRODUCT_VERSION_SHAPE = /^\d+(?:\.\d+)*$/;
 
 /**
- * Read the macOS `ProductVersion` (for example `14.5`) that the darwin arm of
- * {@link checkPlatform} compares against the contract's `os_min` floor.
+ * `checkPlatform` compares the macOS `ProductVersion` against the contract's `os_min` floor.
  *
- * The system plist is tried first because it is a plain file read with no
- * subprocess; `sw_vers` is the fallback for a host whose plist is unreadable
- * or in a shape this parser does not recognize. `os.release()` is deliberately
- * not consulted: it reports the Darwin kernel version (24.x), not the product
- * version the contract floor is expressed in. Any failure returns `null`,
- * which the caller treats as unverifiable and therefore unsupported, so an
- * unreadable system fails closed instead of assuming it meets the floor.
+ * The system plist avoids a subprocess; an unreadable or invalid plist falls back to `sw_vers`.
+ * `os.release()` reports the Darwin kernel version, not the product version used by `os_min`.
+ * Any detection failure returns `null`.
+ * `checkPlatform` treats a `null` version as unsupported.
  */
 function detectMacosProductVersion(): string | null {
     try {
@@ -154,7 +128,6 @@ function detectMacosProductVersion(): string | null {
         const version = match?.[1]?.trim();
         if (version !== undefined && MACOS_PRODUCT_VERSION_SHAPE.test(version)) return version;
     } catch {
-        // fall through to the sw_vers fallback below
     }
     try {
         const reported = execFileSync("/usr/bin/sw_vers", ["-productVersion"], {
@@ -168,10 +141,8 @@ function detectMacosProductVersion(): string | null {
     }
 }
 
-// The product version cannot change within a process, and checkPlatform runs
-// on every lifecycle command reached from request-driven demand-start; neither
-// the plist read nor the synchronous sw_vers spawn must repeat per demand.
-// `undefined` means "not yet detected"; a detected `null` is cached too, so a
+// Cache the detected product version to avoid repeated plist reads and `sw_vers` spawns.
+// `undefined` denotes an undetected version; `null` caches a failed detection.
 // host that fails detection does not retry the spawn on every command.
 let cachedMacosProductVersion: string | null | undefined;
 
@@ -188,8 +159,7 @@ export const defaultPlatformReaders: PlatformReaders = {
     kernelRelease: () => os.release(),
     glibcVersion: detectGlibcVersion,
     procSelfFdUsable: detectProcSelfFd,
-    // Only the darwin arm of `checkPlatform` calls this, so no non-macOS host
-    // ever pays the plist read or the `sw_vers` fallback.
+    // `checkPlatform`'s darwin branch alone pays the plist read or the `sw_vers` fallback.
     macosProductVersion: memoizedMacosProductVersion,
 };
 
@@ -212,11 +182,6 @@ export type PlatformGate =
     | { ok: false; reason: "unsupported_platform"; detail: string };
 
 /**
- * Enforce the exact release-contract target table: Linux x64 with kernel and
- * glibc at or above their floors plus usable procfs self-fd execution, or
- * macOS at or above its floor. Unknown, below-floor, and UNVERIFIABLE hosts
- * (a null glibc or macOS version) are all `unsupported_platform` — the gate
- * never guesses in favor of execution.
  */
 export function checkPlatform(readers: PlatformReaders = defaultPlatformReaders): PlatformGate {
     const rejected = (detail: string): PlatformGate => ({
@@ -264,7 +229,7 @@ export function checkPlatform(readers: PlatformReaders = defaultPlatformReaders)
 }
 
 // ---------------------------------------------------------------------------
-// Parent-owned payload trust index (KTD7/KTD18).
+// The parent owns the payload trust index.
 // ---------------------------------------------------------------------------
 
 export interface TrustIndexEntry {
@@ -284,13 +249,12 @@ export interface TrustIndex {
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
-/** Byte cap for the trust index; an oversize file is invalid, not truncated. */
+/** The loader rejects an oversize trust index instead of truncating it. */
 export const MAX_TRUST_INDEX_BYTES = 1024 * 1024;
 
 /**
- * Read at most one byte past the cap through the descriptor, so an oversize
- * file is caught from the bytes actually read rather than from metadata a
- * concurrent writer can have already invalidated.
+ * The descriptor read extends one byte past the cap to detect oversize content without trusting invalidatable metadata.
+ * A concurrent writer can invalidate `fstat` size metadata before the descriptor read.
  */
 function readTrustIndexText(fd: number, expectedBytes: number): string {
     const buffer = Buffer.alloc(MAX_TRUST_INDEX_BYTES + 1);
@@ -303,21 +267,16 @@ function readTrustIndexText(fd: number, expectedBytes: number): string {
     if (total > MAX_TRUST_INDEX_BYTES) {
         throw new BootstrapError("native_payload_invalid", "trust index exceeds the byte cap");
     }
-    // The validated `fstat` said the file was `expectedBytes` long. Reading a
-    // different count means it was rewritten between the stat and the read, so
-    // the bytes below do not belong to the metadata that was checked — a
-    // truncating rewrite in particular preserves dev/ino and would otherwise
-    // decode as a shorter, still-parseable document.
+    // A read count different from the `fstat`-validated `expectedBytes` indicates a rewrite between `fstat` and `read`.
+    // A truncating rewrite can preserve dev/ino yet decode as a shorter, parseable document.
     if (total !== expectedBytes) {
         throw new BootstrapError(
             "native_payload_invalid",
             "trust index changed size during the read",
         );
     }
-    // Strict, for the same reason the native-output path is: `toString("utf8")`
-    // substitutes U+FFFD for an invalid byte, and the resulting document can
-    // still pass every shape check below — letting byte-corrupt package metadata
-    // cross the trust boundary as a valid index.
+    // Fatal UTF-8 decoding rejects invalid bytes; `toString("utf8")` substitutes U+FFFD.
+    // `toString("utf8")` can substitute U+FFFD for invalid bytes, allowing byte-corrupt JSON to pass shape checks.
     try {
         return new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, total));
     } catch {
@@ -326,17 +285,12 @@ function readTrustIndexText(fd: number, expectedBytes: number): string {
 }
 
 /**
- * Strict decode of `release/mc-host-payload-index.json`. `null` means the
- * file is absent (payload staging then fails `native_payload_missing`);
+ * `null` means opening `indexPath` failed with `ENOENT`.
  * a present-but-invalid index is `native_payload_invalid`, never a fallback.
  *
- * Provenance is established from file shape before any byte is parsed: one
- * retained O_NOFOLLOW descriptor supplies the bytes, its metadata must show a
- * single-link regular file owned by this process with no group or other write
- * bit and within the byte cap, and the path identity is re-checked against
- * that descriptor after the read. A schema-valid document proves only that
- * someone wrote well-formed JSON, so a symlinked, foreign-owned, shared-link,
- * or group-writable index is rejected on shape and never reaches the parser.
+ * The loader reads and validates one descriptor so path replacement cannot separate the metadata checks from the bytes read.
+ * The loader requires a single-link regular file owned by the current UID with no group- or other-write bit.
+ * Schema validation does not establish the index's provenance.
  */
 export function loadTrustIndex(indexPath: string): TrustIndex | null {
     const uid = currentUid();
@@ -344,9 +298,8 @@ export function loadTrustIndex(indexPath: string): TrustIndex | null {
     try {
         fd = openSync(
             indexPath,
-            // O_NOFOLLOW so a symlink at this name fails the open instead of
-            // redirecting the read; O_NONBLOCK so a FIFO fails fstat instead
-            // of blocking the open until a writer appears.
+            // `O_NOFOLLOW` makes opening a symlink at this path fail rather than follow it.
+            // O_NONBLOCK prevents a FIFO open from blocking until a writer appears; the regular-file check rejects the descriptor afterward.
             fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
         );
     } catch (error) {
@@ -375,13 +328,8 @@ export function loadTrustIndex(indexPath: string): TrustIndex | null {
             throw new BootstrapError("native_payload_invalid", "trust index exceeds the byte cap");
         }
         text = readTrustIndexText(fd, before.size);
-        // Path-addressed, unlike every check above it, so it can fail on its
-        // own: the index may be unlinked, or an ancestor may lose search
-        // permission, after the descriptor was opened and read. Left raw, that
-        // errno escapes as a bare Error with no `reason` and breaks the module's
-        // contract that every failure is one closed lifecycle reason. An index
-        // that vanished mid-read is exactly the drift the comparison below
-        // exists to catch, so it earns the same verdict.
+        // `lstatSync(indexPath)` can fail after the descriptor read if the index is unlinked or an ancestor loses search permission.
+        // The loader rejects a vanished index because it cannot reconfirm the descriptor's path identity.
         let after: ReturnType<typeof lstatSync>;
         try {
             after = lstatSync(indexPath);
@@ -397,18 +345,9 @@ export function loadTrustIndex(indexPath: string): TrustIndex | null {
                 "trust index identity drifted during the read",
             );
         }
-        // dev/ino prove the *name* still points at the same file; they say
-        // nothing about its contents, because an in-place rewrite preserves
-        // both. The metadata validated before the read therefore describes one
-        // generation while `text` could carry another, and the read loops, so a
-        // short read could even splice two. `stageBootstrap` already compares
-        // size and mtime across its own read for exactly this reason; the index
-        // is npm-installed at 0o644, so unlike the retained bootstrap it cannot
-        // be required to be non-owner-writable instead.
+        // Matching `dev` and `ino` proves that `indexPath` still names the opened file, but not that its contents are unchanged.
         //
-        // Not airtight: a same-length rewrite inside one timestamp granule still
-        // evades this. A hard guarantee needs a content digest or a sealed
-        // object, which belongs to the native layer.
+        // A same-length rewrite within one timestamp granule evades the size-and-mtime check.
         const afterFd = fstatSync(fd);
         if (afterFd.size !== before.size || afterFd.mtimeMs !== before.mtimeMs) {
             throw new BootstrapError(
@@ -514,7 +453,6 @@ export function parseTrustIndex(parsed: unknown): TrustIndex {
 }
 
 // ---------------------------------------------------------------------------
-// Certified physical install layouts (KTD10).
 // ---------------------------------------------------------------------------
 
 const MAX_HOIST_PARENT_SEGMENTS = 8;
@@ -534,13 +472,12 @@ export type LayoutResolution =
 type EntryKind = "dir" | "symlink" | "absent" | "other" | "inaccessible";
 
 /**
- * Classify one candidate path by its own metadata. Only a genuine absence is
- * `absent`, because absence is the single kind that lets the hoist walk climb
- * past a candidate: EACCES on a parent directory, ELOOP on an intermediate
- * component, descriptor exhaustion, and I/O faults all mean a nearer candidate
- * may exist but cannot be certified, so reporting them as absence would let a
- * more distant ancestor package win. ENOTDIR is absence because a
- * non-directory ancestor cannot contain the candidate at all.
+ * The classifier returns `absent` only for genuine absence.
+ * Only absence permits the hoist walk to continue past a candidate.
+ * `EACCES` and `ELOOP` do not establish absence.
+ * Descriptor exhaustion and I/O faults mean a nearer candidate may exist but cannot be certified.
+ * Classifying those faults as absence would allow a more distant ancestor package to win.
+ * `ENOTDIR` is absence because a non-directory ancestor cannot contain the candidate.
  */
 function classifyEntry(entryPath: string): EntryKind {
     try {
@@ -555,18 +492,18 @@ function classifyEntry(entryPath: string): EntryKind {
 }
 
 /**
- * Resolve the exact payload package from the lexical declaring-parent root:
- * the nested `node_modules/<pkg>` path, a hoisted sibling `node_modules`
- * within eight lexical parent segments, one Bun package-manager symlink that
- * resolves under the SAME install's `node_modules/.bun/.../node_modules/`,
- * or an explicit external compiled-host root. No importer, cwd, global
- * store, or unrelated ancestor is ever consulted, so nothing here can
- * trigger an auto-install.
+ * The resolver derives the payload package from the lexical declaring-parent root.
+ * The resolver accepts nested and hoisted `node_modules/<pkg>` paths.
+ * The resolver searches at most eight lexical parent segments and accepts one Bun package-manager symlink.
+ * The Bun package-manager symlink must resolve under the same install's `node_modules/.bun/.../node_modules/`.
+ * The resolver also accepts an explicit external compiled-host root.
+ * The resolver never consults an importer, the cwd, a global store, or an unrelated ancestor.
+ * The resolver cannot trigger an auto-install.
  */
 export function resolvePayloadPackageDir(options: {
     declaringParentRoot: string;
     packageName: string;
-    /** Compiled-Bun external root; checked before lexical walking. */
+    /* */
     explicitExternalRoot?: string;
 }): LayoutResolution {
     const { declaringParentRoot, packageName } = options;
@@ -599,9 +536,8 @@ export function resolvePayloadPackageDir(options: {
         const candidate = path.join(nodeModules, ...segments);
         const kind = classifyEntry(candidate);
         if (kind === "dir") {
-            // A real directory that resolves outside this install is a foreign
-            // payload reached through a symlinked ancestor, not this install's.
-            // It is present, so it does not license climbing either — only
+            // A real directory that resolves outside this install is a foreign payload reached through a symlinked ancestor.
+            // A foreign payload does not permit climbing; only absence does.
             // absence does.
             if (!containedWithin(current, candidate)) {
                 return {
@@ -651,24 +587,22 @@ export function resolvePayloadPackageDir(options: {
 }
 
 /**
- * Prove `candidate` still resolves to somewhere inside `root`'s own tree.
+ * The resolver must prove that `candidate` resolves inside `root`'s tree.
  *
- * {@link classifyEntry} lstats only the final component, so by the time it
- * answers `"dir"` the kernel has already followed every ancestor: a
- * `node_modules`, scope directory, or `.bun` entry replaced by a symlink to a
- * different install yields a final component that looks like a real directory
- * belonging to this one. That defeats one level up the same cross-install
- * redirection the symlink branch rejects at the final component.
+ * A final-component `lstat` cannot detect symlinked ancestors.
+ * Before returning `"dir"`, the kernel has followed every ancestor.
+ * A symlinked `node_modules`, scope directory, or `.bun` entry can redirect resolution to another install.
+ * The final component can appear as a non-symlink directory after an ancestor redirects resolution.
+ * Ancestor-symlink redirection bypasses the final-component symlink check.
+ * The containment check prevents cross-install redirection through an ancestor symlink.
  *
- * Canonical *equality* would be the wrong test. macOS resolves `/var` to
- * `/private/var` and symlinked home directories are common, so requiring the
- * resolved path to equal the literal one would reject benign installs.
- * Containment is the property actually needed: wherever the declaring parent's
- * tree really lives, the payload must be inside it.
+ * Ancestor symlinks can make a resolved path differ from its literal path.
+ * Literal-path equality would reject installs whose paths resolve through ancestor symlinks.
+ * `candidate` must resolve within `root`'s realpath tree.
  *
- * A resolution failure is not containment. This is a check-then-use, so an
- * ancestor swapped afterwards is still not excluded — that needs the `*at`
- * syscalls Node does not expose, and belongs to the native layer.
+ * A `realpathSync` failure cannot establish containment.
+ * An ancestor replacement after these `realpathSync` calls can still redirect subsequent use.
+ * Node lacks the `*at` syscalls required to prevent ancestor replacement between resolution and use.
  */
 export function containedWithin(root: string, candidate: string): boolean {
     let realRoot: string;
@@ -679,13 +613,9 @@ export function containedWithin(root: string, candidate: string): boolean {
     } catch {
         return false;
     }
-    // Compared through `path.relative` rather than a string prefix. A prefix test
-    // has to append a separator to avoid matching a sibling whose name merely
-    // starts with the root's, and that breaks when the root already ends in one:
-    // for `/` the prefix becomes `//` and every real descendant fails, rejecting
-    // a valid root-level `node_modules` layout. `relative` handles the root,
-    // trailing separators, and `..` uniformly, and is the same boundary
-    // discipline `redactLifecyclePath` uses.
+    // `path.relative` distinguishes descendants from siblings without string-prefix edge cases.
+    // Do not use a separator-appended string prefix: `/` becomes `//` and rejects descendants.
+    // `path.relative` handles roots, trailing separators, and `..` uniformly.
     const relative = path.relative(realRoot, realCandidate);
     if (relative === "") return true;
     return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
@@ -711,22 +641,16 @@ function resolveBunLink(
     } catch {
         return null;
     }
-    // The store must belong to the install being walked. Without this the
-    // containment below is self-referential: a symlinked `node_modules` or
-    // `.bun` makes `bunStoreReal` the attacker's store, and every path under it
-    // then certifies as "the same install's" store.
+    // The Bun store must resolve under the install being walked; otherwise a symlinked `node_modules` or `.bun` can certify an attacker-controlled store.
     if (!containedWithin(walkRoot, bunStoreReal)) return null;
     const withinStore = resolved.startsWith(`${bunStoreReal}${path.sep}`);
-    // The suffix is anchored on a separator so only a real `node_modules`
-    // path component certifies: a bare suffix match also accepts a sibling
-    // directory whose name merely ends in `node_modules`.
+    // A bare suffix match accepts a sibling directory whose name merely ends in `node_modules`.
     const expectedSuffix = `${path.sep}${path.join("node_modules", ...segments)}`;
     if (!withinStore || !resolved.endsWith(expectedSuffix)) return null;
     return { ok: true, layout: "bun_physical_link", packageDir: resolved };
 }
 
 // ---------------------------------------------------------------------------
-// Capacity preflight (KTD22 / R46). Checked arithmetic via BigInt.
 // ---------------------------------------------------------------------------
 
 const RESERVE_FLOOR_BYTES = 256n * 1024n * 1024n;
@@ -737,9 +661,9 @@ export type CapacityVerdict =
     | { ok: false; reason: "insufficient_storage" | "native_payload_invalid"; detail: string };
 
 /**
- * `available >= required + max(256 MiB, ceil(required * 10%))` with checked
- * arithmetic: a negative, non-integral, or implausibly large requirement is
- * `native_payload_invalid`, and a true shortfall is `insufficient_storage`.
+ * `available` must be at least `required + max(256 MiB, ceil(required * 10%))`.
+ * A negative or greater-than-2^60 `required` value yields `native_payload_invalid`.
+ * A true capacity shortfall yields `insufficient_storage`.
  */
 export function checkCapacity(requiredBytes: bigint, availableBytes: bigint): CapacityVerdict {
     if (requiredBytes < 0n || requiredBytes > MAX_REASONABLE_REQUIRED) {
@@ -774,11 +698,10 @@ export function availableBytesFor(dirPath: string): bigint {
 }
 
 // ---------------------------------------------------------------------------
-// Retained-bootstrap revalidation and no-follow staging (KTD18 / R29-R31).
 // ---------------------------------------------------------------------------
 
 export interface RetainedBootstrap {
-    /** Open O_NOFOLLOW read descriptor for the verified launcher object. */
+    /** The launcher descriptor must use O_NOFOLLOW to reject a replacement symlink. */
     fd: number;
     path: string;
     sha256: string;
@@ -802,19 +725,14 @@ function invalid(detail: string): BootstrapError {
 }
 
 /**
- * Copy exactly `expectedBytes` from `sourceFd` to `outFd`, hashing as it goes,
- * and prove the source was neither longer nor shorter than that.
+ * The source must contain exactly `expectedBytes` bytes.
  *
- * The byte count is the one capacity was preflighted against. Following the
- * live EOF instead would let a source still being appended to drag the copy
- * past the reserve `checkCapacity` approved — without bound, since a writer
- * that never stops appending means `readSync` never returns 0 and staging
+ * A writer that continuously appends can prevent `readSync` from reaching EOF, so staging never returns.
  * never returns.
  *
- * The digest cannot stand in for either check: it is computed over whatever was
- * actually read, so a grown source yields a mismatch that reads as corruption
- * rather than as the concurrent mutation it is. Reaching EOF early is the same
- * event seen from the other side.
+ * A digest mismatch cannot distinguish concurrent source mutation from corruption because it covers only the bytes read.
+ * The staging code rejects growth because hashing the copied prefix cannot detect appended bytes.
+ * Early EOF indicates that the source shrank during staging.
  */
 export function copyExactBytes(
     sourceFd: number,
@@ -835,21 +753,16 @@ export function copyExactBytes(
         }
         position += read;
     }
-    // One readable byte past the preflighted size means the source grew while it
-    // was being staged, so the bytes just copied are a prefix of a file that no
-    // longer matches what was certified.
+    // The staging code rejects bytes beyond `expectedBytes` because the copied bytes are only a prefix of the changed source.
     if (readSync(sourceFd, buffer, 0, 1, position) !== 0) {
         throw invalid("launcher source grew during staging");
     }
 }
 
 /**
- * Complete revalidation of a retained digest-addressed bootstrap: owner-only
- * regular file, single link, owner-executable, and byte-for-byte digest
- * match through one retained O_NOFOLLOW descriptor whose identity is checked
- * against the path before AND after hashing. Any failure closes the
- * descriptor and throws; a failed retained object is never executed and
- * never causes fallback to a different generation.
+ * Revalidation uses one retained `O_NOFOLLOW` descriptor and verifies its identity before and after hashing.
+ * Revalidation uses one retained `O_NOFOLLOW` descriptor so the validated object is the object hashed.
+ * Revalidation closes the retained descriptor before throwing on any revalidation failure.
  */
 export function revalidateRetainedBootstrap(
     bootstrapPath: string,
@@ -861,17 +774,13 @@ export function revalidateRetainedBootstrap(
     try {
         fd = openSync(
             bootstrapPath,
-            // O_NONBLOCK so a FIFO at this name fails fstat instead of
-            // blocking the open until a writer appears; regular-file reads
+            // `O_NONBLOCK` lets `openSync` return for a FIFO so `fstatSync` can reject it.
+            // `O_NONBLOCK` does not affect regular-file reads.
             // are unaffected.
             fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
         );
     } catch (error) {
-        // Same line the launcher source and the trust index draw: only true
-        // absence is "missing". A retained object that is present but rejected
-        // by O_NOFOLLOW or by its mode is a tampered or damaged artifact, and
-        // reporting it as absent would both name a remedy that does not apply
-        // and discard the evidence that something replaced it.
+        // Only `ENOENT` and `ENOTDIR` may report a retained bootstrap as missing.
         const code = (error as NodeJS.ErrnoException).code;
         if (code === "ENOENT" || code === "ENOTDIR") {
             throw new BootstrapError("native_payload_missing", "retained bootstrap is absent");
@@ -886,23 +795,16 @@ export function revalidateRetainedBootstrap(
         if ((stat.mode & 0o077) !== 0)
             throw invalid("retained bootstrap is group/world accessible");
         if ((stat.mode & 0o100) === 0) throw invalid("retained bootstrap is not owner-executable");
-        // Staging writes 0o500, so a writable retained object did not come from
-        // this code path. Accepting one leaves the digest below describing bytes
-        // that can still change: nothing snapshots the inode between
-        // `sha256OfFd` and the exec of `/proc/self/fd/3`, and the post-read
-        // identity check compares dev/ino, which an in-place overwrite
+        // The code rejects owner-writable retained files because in-place writes can change bytes after hashing without changing inode identity.
+        // An in-place overwrite can change bytes between `sha256OfFd` and execution without changing `dev` or `ino`.
         // preserves.
         //
-        // This enforces the invariant staging already establishes rather than
-        // achieving immutability: the owner can always chmod the file back and
-        // rewrite it, so the digest-to-exec window is only truly closed by a
-        // sealed object, which needs the native layer.
+        // The mode check does not make the retained file immutable because its owner can restore write permission after hashing.
         if ((stat.mode & 0o200) !== 0) throw invalid("retained bootstrap is owner-writable");
         const digest = sha256OfFd(fd);
         if (digest !== expectedSha256) throw invalid("retained bootstrap digest mismatch");
-        // Same reasoning as the trust index: this is the one path-addressed stat
-        // in the sequence, so a bootstrap unlinked after its descriptor was read
-        // would otherwise escape as a raw errno with no lifecycle reason.
+        // The post-hash path-addressed `stat` detects replacement or removal of the retained bootstrap path.
+        // `lstatSync` failures report bootstrap identity reconfirmation failure instead of a raw errno.
         let after: ReturnType<typeof lstatSync>;
         try {
             after = lstatSync(bootstrapPath);
@@ -920,21 +822,15 @@ export function revalidateRetainedBootstrap(
 }
 
 /**
- * Open the staging destination through one retained descriptor and prove it is
- * an owner-only real directory. `O_NOFOLLOW` makes a symlink at `destDir` fail
- * the open instead of redirecting every path built beneath it, `O_DIRECTORY`
- * rejects a non-directory at the same name, and the owner and write-bit checks
- * reject an existing insecure directory — `mkdirSync` with a mode applies that
- * mode only when it creates the directory and never chmods one that is
+ * `O_NOFOLLOW` makes a symlink at `destDir` fail to open rather than redirecting paths beneath it.
+ * `O_DIRECTORY` rejects a non-directory at `destDir`.
  * already there.
  *
- * The proof binds to this descriptor. What it does NOT establish: Node exposes
- * no `openat`/`renameat`, so the temp create and the rename below still address
- * the destination by pathname and an attacker who can replace `destDir` or any
- * of its ancestors between this check and those operations is not excluded.
- * The identity re-check after the rename detects such a swap after the fact
- * rather than preventing it. Race-free staging requires component-wise
- * `openat(O_DIRECTORY|O_NOFOLLOW)` plus `renameat`, which lives in the native
+ * The directory descriptor does not protect later pathname-based operations from directory replacement.
+ * Staged creation and rename still address `destDir` by pathname.
+ * An attacker can replace `destDir` or an ancestor between descriptor validation and pathname-based operations.
+ * The post-rename identity check detects a directory swap but cannot prevent it.
+ * Race-free staging requires component-wise `openat(O_DIRECTORY|O_NOFOLLOW)` and `renameat`.
  * layer.
  */
 function openStagingDir(destDir: string, uid: number): number {
@@ -962,16 +858,12 @@ function openStagingDir(destDir: string, uid: number): number {
 }
 
 /**
- * Stage a package launcher into an owner-only digest-addressed bootstrap:
- * one O_NOFOLLOW source descriptor supplies both the hash and the copied
- * bytes (a hardlinked package-cache source is acceptable as bytes only),
- * output goes through an exclusive owner-only temp plus fsync plus atomic
- * rename, and the promoted object is completely revalidated before its
- * retained descriptor is returned. The destination is proved to be an
- * owner-only real directory through a retained descriptor before any output
- * exists, with the residual pathname race documented on
- * {@link openStagingDir}. Capacity is preflighted with the checked reserve
- * before the temp is created; post-preflight failures remove only the owned
+ * The function stages a package launcher as an owner-only, digest-addressed bootstrap.
+ * One `O_NOFOLLOW` source descriptor supplies both the hash and the copied bytes.
+ * A hardlinked package-cache source is accepted only as a byte source.
+ * The function completely revalidates the promoted object before returning its retained descriptor.
+ * The function validates `destDir` as an owner-only real directory through a retained descriptor before creating output.
+ * After preflight, failures remove only the owned temporary file.
  * temp.
  */
 export function stageBootstrap(options: {
@@ -982,8 +874,7 @@ export function stageBootstrap(options: {
 }): RetainedBootstrap {
     const { sourcePath, destDir, expectedSha256 } = options;
     if (!SHA256_HEX.test(expectedSha256)) throw invalid("expected digest is noncanonical");
-    // The uid is resolved before the first filesystem effect so a host that
-    // cannot report one fails without creating the destination or a temp.
+    // The function resolves the UID before filesystem effects so hosts that cannot report one create neither the destination nor a temporary file.
     const uid = currentUid();
     let sourceFd: number;
     try {
@@ -992,14 +883,9 @@ export function stageBootstrap(options: {
             fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
         );
     } catch (error) {
-        // Only true absence is "missing". A source that is present but cannot be
-        // opened safely — a symlink rejected by O_NOFOLLOW (ELOOP), an
-        // unreadable mode, an unsearchable parent — is an installed payload that
-        // cannot be trusted, which the contract calls `native_payload_invalid`
-        // with `reinstall_magic_context`. Reporting `install_native_payload`
-        // instead tells the operator to install what is already installed, and
-        // also lowers the reason's precedence. `loadTrustIndex` and
-        // `classifyEntry` already draw the line this way.
+        // Only `ENOENT` and `ENOTDIR` mean that the source is missing; safely unopenable sources are installed payload.
+        // A source rejected by `O_NOFOLLOW` with `ELOOP` is installed payload, not missing.
+        // Non-`ENOENT` and non-`ENOTDIR` source-open failures are `native_payload_invalid`.
         const code = (error as NodeJS.ErrnoException).code;
         if (code === "ENOENT" || code === "ENOTDIR") {
             throw new BootstrapError("native_payload_missing", "launcher source is absent");
@@ -1050,9 +936,7 @@ export function stageBootstrap(options: {
         const finalPath = path.join(destDir, expectedSha256);
         renameSync(tempPath, finalPath);
         tempPath = null;
-        // The retained descriptor is the identity the checks above certified,
-        // so comparing it against the path now reports a destination that was
-        // swapped while the pathname-addressed temp and rename ran.
+        // `destAfter` verifies that `destDir` still names the directory opened as `destFd`.
         const destAfter = lstatSync(destDir);
         if (destAfter.dev !== destBefore.dev || destAfter.ino !== destBefore.ino) {
             throw invalid("staging destination identity drifted during staging");
@@ -1060,14 +944,9 @@ export function stageBootstrap(options: {
         fsyncSync(destFd);
         return revalidateRetainedBootstrap(finalPath, expectedSha256);
     } catch (error) {
-        // This module's contract is that every failure is one closed lifecycle
-        // reason, but the syscalls above can still fail in ways no explicit
-        // check anticipates — a dangling-symlink `destDir` makes `mkdirSync`
-        // throw EEXIST before the no-follow open can reject it, and
-        // statfs/fsync/rename can fail for reasons of their own. Left raw,
-        // those escape as a bare `Error` with no `reason` and every caller
-        // branching on the closed union mishandles them. Storage exhaustion
-        // keeps its own reason; anything else is an untrusted payload.
+        // `BootstrapError` failures always carry a lifecycle reason.
+        // `mkdirSync(destDir, { recursive: true })` throws `EEXIST` for a dangling `destDir` before `openStagingDir` can reject it.
+        // Raw filesystem errors do not carry a lifecycle `reason`.
         if (error instanceof BootstrapError) throw error;
         const code = (error as { code?: string } | null)?.code;
         if (code === "ENOSPC" || code === "EDQUOT") {
@@ -1081,7 +960,6 @@ export function stageBootstrap(options: {
             try {
                 unlinkSync(tempPath);
             } catch {
-                // temp removal is best-effort; the exclusive name is unreachable
             }
         }
     }

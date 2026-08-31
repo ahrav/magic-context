@@ -125,7 +125,7 @@ describe("shadow embedding historical backfill", () => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                /* Ignore EBUSY on Windows */
+                /* */
             }
         }
         tempDirs.length = 0;
@@ -162,11 +162,10 @@ describe("shadow embedding historical backfill", () => {
             { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/shadow-rotate",
         );
-        // 150 > SHADOW_MAX_ITEMS_PER_TICK (64), so a single-transaction dump is
-        // impossible: the drain must span multiple bounded worker passes.
+        // 150 exceeds SHADOW_MAX_ITEMS_PER_TICK (64), so the drain requires multiple bounded worker passes.
         seedPrimaryCommits(db, projectIdentity, 150);
 
-        // Pre-rotation state: the corpus was already mirrored under identity A.
+        // The corpus is already mirrored under identity A.
         registerProjectShadowEmbedding(
             db,
             projectIdentity,
@@ -177,8 +176,8 @@ describe("shadow embedding historical backfill", () => {
         await flushShadowEmbeddingBacklog(projectIdentity);
         expect(countEmbeddedCommits(db, projectIdentity, shadowA)).toBe(150);
 
-        // Rotation: a new fingerprint registers a brand-new shadow identity. The
-        // historical corpus now lacks rows under it and must be re-embedded.
+        // A new fingerprint registers a new shadow identity.
+        // The historical corpus lacks rows under the new identity and must be re-embedded.
         registerProjectShadowEmbedding(
             db,
             projectIdentity,
@@ -196,12 +195,10 @@ describe("shadow embedding historical backfill", () => {
             remainingSeen.push(getShadowBackfillRemaining(db, projectIdentity).commit);
         });
 
-        // Drained to completion under the new identity...
         expect(countEmbeddedCommits(db, projectIdentity, shadowB)).toBe(150);
         expect(getShadowBackfillRemaining(db, projectIdentity).commit).toBe(0);
-        // ...incrementally (more than one bounded pass), never one big dump...
         expect(passes).toBeGreaterThanOrEqual(2);
-        // ...with the outstanding count monotonically falling to zero.
+        // The outstanding count falls monotonically to zero.
         expect(remainingSeen[remainingSeen.length - 1]).toBe(0);
         for (let i = 1; i < remainingSeen.length; i++) {
             expect(remainingSeen[i]).toBeLessThanOrEqual(
@@ -267,8 +264,7 @@ describe("shadow embedding historical backfill", () => {
         );
         seedPrimaryCommits(db, projectIdentity, 5);
 
-        // No prior shadow registration exists in-memory (e.g. the plugin was down
-        // when the fingerprint rotated), but historical primary rows do. Registering
+        // The process has no in-memory shadow registration, but the database has historical primary rows.
         // the current shadow identity must still detect the gap and backfill it.
         registerProjectShadowEmbedding(
             db,
@@ -306,8 +302,8 @@ describe("shadow embedding historical backfill", () => {
         await flushShadowEmbeddingBacklog(projectIdentity);
         expect(countEmbeddedCommits(db, projectIdentity, shadowModel)).toBe(5);
 
-        // Re-registering the SAME identity (a routine boot/config reload) must not
-        // re-arm a backfill: the corpus is already covered under it.
+        // Re-registering the same identity must not re-arm a backfill.
+        // The corpus is already covered under the same identity.
         let passes = 0;
         registerProjectShadowEmbedding(
             db,
@@ -336,8 +332,8 @@ describe("shadow embedding historical backfill", () => {
         );
         seedPrimaryCommits(db, projectIdentity, 5);
 
-        // A degraded config load latches the project after the trusted primary
-        // registration; the shadow backfill must respect that latch and not enqueue.
+        // A degraded config load latches the project after trusted primary registration.
+        // The shadow backfill must respect the degraded-load latch and not enqueue.
         markProjectLoadUntrusted(projectIdentity);
         registerProjectShadowEmbedding(
             db,
@@ -379,9 +375,9 @@ describe("shadow embedding historical backfill", () => {
         await flushShadowEmbeddingBacklog(projectIdentity);
         expect(countEmbeddedCommits(db, projectIdentity, shadowModel)).toBe(5);
 
-        // Simulate a process restart: in-memory registrations are gone but the DB
-        // (with the completed backfill) persists. Re-registering the same identity
-        // runs detection again and must find nothing missing → no enqueue.
+        // A process restart clears in-memory registrations but preserves the database.
+        // Re-registering the same identity reruns detection.
+        // Re-registering the same identity reruns detection, finds no missing rows, and does not enqueue.
         _resetProjectEmbeddingRegistryForTests();
         useFakeProviders();
         registerProjectEmbedding(
@@ -420,7 +416,6 @@ describe("shadow embedding historical backfill", () => {
         );
         seedPrimaryCommits(db, projectIdentity, 3);
 
-        // Mirror under identity A, then rotate to B and backfill it.
         registerProjectShadowEmbedding(
             db,
             projectIdentity,
@@ -440,8 +435,8 @@ describe("shadow embedding historical backfill", () => {
         expect(countEmbeddedCommits(db, projectIdentity, shadowA)).toBe(3);
         expect(countEmbeddedCommits(db, projectIdentity, shadowB)).toBe(3);
 
-        // Age the OLD shadow identity past the 14-day grace. The new identity is
-        // the live shadow registration and must stay protected.
+        // The old shadow identity has aged past the 14-day grace period.
+        // GC must keep the live shadow registration protected.
         db.prepare(
             "UPDATE embedding_identity_active SET last_active_at = ? WHERE project_path = ? AND model_id = ?",
         ).run(now - 15 * 24 * 60 * 60 * 1000, projectIdentity, shadowA);
@@ -475,7 +470,7 @@ describe("shadow lane writes through versioned synapse receipts", () => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                /* Ignore EBUSY on Windows */
+                /* */
             }
         }
     });

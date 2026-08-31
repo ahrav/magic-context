@@ -1,16 +1,10 @@
 //! TCP implementation of the frame channel: byte-stream mechanics stay here.
 //!
-//! Everything stream-shaped is owned by this module — fragmentation and
-//! coalescing across reads, the absolute frame deadline armed by the first
-//! received header byte, oversized-control body drains, short writes,
-//! serialized frame publication, and socket close. The generation engine
-//! above sees only complete frames and bounded events through
+//! This module owns stream fragmentation and coalescing across reads.
+//! The generation engine receives only complete frames and bounded events through [`crate::frame_channel`].
 //! [`crate::frame_channel`].
 //!
-//! Structural corruption (bad header, truncation, oversize body, illegal
-//! pure-header body) silently retires the generation without an `Error`
-//! frame; semantic rejection with trustworthy identity flows through the
-//! settlement path in `dispatch` instead (protocol §6.3).
+//! Bad headers, truncation, oversize bodies, and illegal pure-header bodies retire the generation without an `Error` frame.
 
 #[cfg(test)]
 use crate::wire::Flags;
@@ -28,20 +22,14 @@ use crate::frame_channel::{
 };
 use crate::wire::{ByteBudget, ByteCharge, MAX_CONTROL_BODY_LEN};
 
-/// Read-side buffering for coalesced small frames.
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 
-/// One connection's TCP frame channel, receive side. Constructed by
-/// [`TcpFrameChannel::start`], which also yields the cloneable sender and the
-/// serialized write task.
 pub(crate) struct TcpFrameChannel<R> {
     reader: BufReader<R>,
     frame_deadline: Duration,
     budget: ByteBudget,
     cancel: CancellationToken,
-    /// A rejected oversized-control declaration whose body bytes are still
-    /// on the stream: the next `recv` drains them under the rejected frame's
-    /// own absolute deadline before reading further (protocol §7.1).
+    /// After rejecting an oversized-control declaration, the next `recv` drains its body before reading another frame.
     pending_drain: Option<PendingDrain>,
     copies: CopyCounter,
 }
@@ -52,15 +40,11 @@ struct PendingDrain {
 }
 
 impl<R: AsyncRead + Send + Unpin> TcpFrameChannel<R> {
-    /// Builds the complete channel over an already-authenticated stream's
-    /// halves: the cloneable sender, this single-owner receiver, and the
-    /// write task the caller must spawn. The write task publishes queued
-    /// frames strictly in order and closes the socket's write side when it
-    /// exits; dropping the receiver closes the read side.
+    /// `start` returns a cloneable sender, a single-owner receiver, and a write task that the caller must spawn.
+    /// The write task publishes queued frames in order and closes the socket's write side on exit.
     ///
-    /// `generation` is the engine's retirement root: write failure or an
-    /// admission-deadline expiry cancels it. `read_cancel` bounds reads
-    /// (and drains) for the receive side.
+    /// Write failure or admission-deadline expiry cancels `generation`.
+    /// `read_cancel` bounds receive reads and drains.
     pub(crate) fn start<W>(
         read: R,
         write: W,
@@ -104,9 +88,7 @@ impl<R: AsyncRead + Send + Unpin> FrameReceiver for TcpFrameChannel<R> {
             .await
             .is_err()
             {
-                // Regardless of how the drain failed (EOF, deadline, I/O,
-                // cancellation), the engine's queued early terminal stays
-                // authoritative and must survive the close (protocol §7.1).
+                // A queued early terminal remains authoritative after drain failure from EOF, deadline, I/O failure, or cancellation.
                 return Err(ReadClose::RejectedDrainFailed);
             }
         }
@@ -131,20 +113,16 @@ impl<R: AsyncRead + Send + Unpin> FrameReceiver for TcpFrameChannel<R> {
     }
 }
 
-/// Outcome of reading one frame.
 enum ReadEvent {
     Frame(InboundFrame),
-    /// A channel-0 `Request` declared a body over the control cap. The body
-    /// has NOT been read; the caller reports the rejection and then drains
-    /// via [`drain_declared_body`] under `deadline` (protocol §7.1).
+    /// A channel-0 `Request` exceeding the control-body cap remains unread; the caller reports its rejection, then drains the declared body under `deadline`.
     OversizeControl {
         header: EnvelopeHeader,
         deadline: Instant,
     },
 }
 
-/// Reads one frame. Waiting for the first header byte is unbounded; once it
-/// arrives, the remaining header and body share one absolute deadline.
+/// Waiting for the first header byte is unbounded; once it arrives, the remaining header and body share one absolute deadline.
 async fn read_frame<R>(
     reader: &mut R,
     frame_deadline: Duration,
@@ -196,7 +174,7 @@ where
     validate_inbound_header(header)?;
 
     if header.ty == FrameType::Request && header.channel == 0 && header.len > MAX_CONTROL_BODY_LEN {
-        // The header alone proves the violation; never buffer the body
+        // The header alone proves the violation, so the receiver does not allocate a body buffer.
         // (protocol §7.1).
         return Ok(ReadEvent::OversizeControl { header, deadline });
     }
@@ -227,10 +205,8 @@ where
     )))
 }
 
-/// Discards the declared bytes of an early-rejected oversize control body
-/// without allocating it, preserving stream alignment. Failure here closes the
-/// generation as usual; the already-queued terminal stays authoritative.
-/// Discards a declared body the caller refused to buffer, realigning the stream.
+/// The drain discards the declared bytes of an early-rejected oversized control body.
+/// A drain failure closes the generation; the already-queued terminal remains authoritative.
 async fn drain_declared_body<R>(
     reader: &mut R,
     declared: u32,
@@ -245,7 +221,6 @@ where
         .map_err(drain_close)
 }
 
-/// Fills `buf`, classifying a short read as this layer sees it.
 async fn read_exact_deadline<R>(
     reader: &mut R,
     buf: &mut [u8],
@@ -260,7 +235,6 @@ where
         .map_err(frame_close)
 }
 
-/// Reads exactly `len` body bytes under the frame deadline.
 async fn read_body_deadline<R>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -276,8 +250,7 @@ where
         .map_err(frame_close)
 }
 
-/// A stop inside a frame: EOF and deadline both mean stream alignment is lost, so
-/// the generation closes without resynchronization (protocol section 6.3).
+/// EOF or deadline after a frame begins closes the generation without resynchronization.
 fn frame_close(stop: crate::frame_read::ReadStop) -> ReadClose {
     match stop {
         crate::frame_read::ReadStop::Cancelled => ReadClose::Cancelled,
@@ -289,7 +262,7 @@ fn frame_close(stop: crate::frame_read::ReadStop) -> ReadClose {
     }
 }
 
-/// Same classes, named for the drain so a failure says which phase lost alignment.
+/// `drain_close` preserves the read-close classifications while identifying drain failures.
 fn drain_close(stop: crate::frame_read::ReadStop) -> ReadClose {
     match stop {
         crate::frame_read::ReadStop::Eof => ReadClose::Corrupt("EOF while draining oversize body"),
@@ -300,16 +273,8 @@ fn drain_close(stop: crate::frame_read::ReadStop) -> ReadClose {
     }
 }
 
-/// The single serialized write task for one connection.
 ///
-/// Every frame's bytes reach the socket completely before any byte of the
-/// next. Partial writes are retried; an I/O failure or `write_deadline`
-/// expiry before the frame completes retires the generation (protocol §6.3).
-/// The deadline bounds how long one consumer can hold shared egress-budget
-/// charges: a peer that stops reading would otherwise pin its queued frames'
-/// charges forever and stall every other generation's emissions. Dropping
-/// every `FrameSender` closes the queue, which lets already queued terminals
-/// and `Goodbye` flush before the task exits.
+/// Expiry before the frame completes retires the generation.
 async fn write_frames<W>(mut stream: W, mut queue: SenderQueue, write_deadline: Duration)
 where
     W: AsyncWrite + Send + Unpin + 'static,
@@ -320,8 +285,7 @@ where
         let mut queued = tokio::select! {
             biased;
             () = discard.cancelled() => break,
-            // Finished: flush what is queued, then exit without waiting
-            // for senders an inert handler may still hold.
+            // The writer flushes queued frames, then exits without waiting for senders an inert handler may still hold.
             () = finish.cancelled() => match queue.try_recv() {
                 Ok(frame) => frame,
                 Err(_) => break,
@@ -331,8 +295,7 @@ where
                 None => break,
             },
         };
-        // `begin_publication` synchronizes cancellation with the possible-send
-        // transition before the first transport write.
+        // `begin_publication` synchronizes cancellation with the possible-send transition before the first transport write.
         if !queued.begin_publication() {
             continue;
         }
@@ -359,10 +322,7 @@ where
                 }
             }
         }
-        // The completion instant is taken inside the arm, the moment
-        // `write_all` returns — not after the result check — so a
-        // preemption between them cannot push `completed_at` past a peer
-        // answer that the bytes themselves caused.
+        // The write arm records completion when `write_all` returns so preemption before the result check cannot place `completed_at` after a peer response caused by the bytes.
         let result = tokio::select! {
             biased;
             () = discard.cancelled() => None,
@@ -397,14 +357,13 @@ where
         drop(tail);
         drop(charge);
     }
-    // Dropping the queue receiver here frees any still-queued frames and
+    // Dropping the queue receiver frees any still-queued frames.
     // their charges.
     queue.retired.cancel();
     let _ = stream.shutdown().await;
 }
 
-/// Spawns only the write half of a TCP channel over an arbitrary stream, for
-/// tests that drive the sender without a read side.
+/// Spawns only the write half of a TCP channel over an arbitrary stream for tests that drive the sender without a read side.
 #[cfg(test)]
 pub(crate) fn spawn_writer<W>(
     stream: W,
@@ -420,8 +379,7 @@ where
     (sender, task)
 }
 
-/// Contract-suite factory for the TCP adapter: connects a channel under test
-/// to an independent frame-level peer over an in-memory duplex stream.
+/// Contract-suite factory for the TCP adapter that connects a channel under test to an independent frame-level peer over an in-memory duplex stream.
 #[cfg(test)]
 pub(crate) struct TcpChannelFactory;
 
@@ -459,9 +417,9 @@ impl crate::frame_channel::contract_tests::ChannelFactory for TcpChannelFactory 
     }
 }
 
-/// Independent frame-level peer over the raw byte stream: encodes and
-/// decodes v2 frames itself so the channel under test is never used to
-/// verify its own output.
+/// An independent frame-level peer encodes and decodes v2 frames itself, so the channel under test never verifies its own output.
+/// An independent frame-level peer encodes and decodes v2 frames itself, so the channel under test never verifies its own output.
+/// An independent frame-level peer encodes and decodes v2 frames itself, so the channel under test never verifies its own output.
 #[cfg(test)]
 pub(crate) struct TcpPeer {
     stream: tokio::io::DuplexStream,
@@ -638,8 +596,8 @@ mod tests {
         // Idle wait is unbounded: nothing has been sent yet.
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert!(!read.is_finished());
-        // First byte starts the absolute deadline; trickling the rest of the
-        // header cannot extend it.
+        // The first byte starts the absolute deadline; trickling the remaining header bytes cannot extend it.
+        // The first byte starts the absolute deadline; trickling the remaining header bytes cannot extend it.
         client.write_all(&[10u8]).await.unwrap();
         tokio::time::sleep(Duration::from_secs(4)).await;
         client.write_all(&[0u8, 0u8]).await.unwrap();
@@ -705,8 +663,7 @@ mod tests {
     #[tokio::test]
     async fn body_over_interop_cap_closes_before_allocation() {
         let (mut client, mut server) = duplex(64);
-        // A one-byte budget would panic or hang on allocation if the reader
-        // tried to admit this body; rejection must come from the header alone.
+        // The reader must reject the body from its header before admission.
         let tiny_budget = ByteBudget::new(1);
         let cancel = CancellationToken::new();
         let header = header_bytes(MAX_BODY_LEN + 1, FrameType::Request as u8, 0, 7, 1, 1);
@@ -772,8 +729,8 @@ mod tests {
     #[tokio::test]
     async fn receiver_reports_rejection_then_drains_without_allocation_and_realigns() {
         let (mut client, server) = duplex(1 << 20);
-        // Budget far below the declared body: any attempt to admit or
-        // allocate the oversize body would hang on this budget, so a
+        // The reader cannot admit the declared body under the 1024-byte budget.
+        // Allocating the oversize body would block on the 1024-byte budget.
         // successful drain proves the bytes were discarded unbuffered.
         let tiny_budget = ByteBudget::new(1024);
         let mut channel = receiver_over(
@@ -819,7 +776,7 @@ mod tests {
 
         let declared = MAX_CONTROL_BODY_LEN + 9;
         let mut wire = header_bytes(declared, FrameType::Request as u8, 0, 0, 0, 8);
-        // Truncate the declared body so the drain hits EOF.
+        // The truncated declared body makes the drain hit EOF.
         wire.extend_from_slice(&[0xCD; 16]);
         client.write_all(&wire).await.unwrap();
         drop(client);
@@ -843,8 +800,6 @@ mod tests {
             CancellationToken::new(),
         );
 
-        // Frame A arrives byte by byte across every header and body
-        // boundary; frames B and C arrive coalesced in one write.
         let frame_a = encode_frame(
             FrameType::Request,
             response_flags(false, true),
@@ -1062,7 +1017,7 @@ mod tests {
     async fn stalled_consumer_write_retires_generation_and_frees_charges() {
         let budget = ByteBudget::new(crate::config::MIN_RESIDENT_BYTES);
         let baseline = budget.available();
-        // Tiny duplex: the frame cannot fully flush while the peer reads nothing.
+        // The 1-byte duplex prevents the frame from fully flushing while the peer reads nothing.
         let (server, client) = duplex(16);
         let generation = CancellationToken::new();
         let (handle, task) = spawn_writer(server, 2, generation.clone(), Duration::from_secs(5));
@@ -1090,7 +1045,7 @@ mod tests {
             .expect("queued");
         drop(handle);
         task.await.expect("writer task");
-        // The stalled write hit the deadline: generation retired, charge freed.
+        // A stalled write that reaches its deadline retires its generation and frees its charge.
         assert!(generation.is_cancelled());
         assert_eq!(budget.available(), baseline);
         drop(client);
@@ -1103,7 +1058,7 @@ mod tests {
         let (handle, task) = spawn_writer(server, 1, generation.clone(), Duration::from_secs(10));
         let frame = || outbound(vec![0; 1024]);
 
-        // The writer consumes the first frame and stalls on the tiny duplex;
+        // The writer consumes the first frame and stalls on the 1-byte duplex.
         // the second frame fills the single queue slot.
         handle.send(frame()).await.expect("first frame");
         handle.send(frame()).await.expect("second frame");

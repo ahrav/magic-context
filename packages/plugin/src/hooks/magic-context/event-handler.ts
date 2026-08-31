@@ -81,10 +81,7 @@ export interface EventHandlerDeps {
     contextUsageMap: Map<string, ContextUsageEntry>;
     compactionHandler: ReturnType<typeof createCompactionHandler>;
     /**
-     * Compaction-off mode (issue #266), boot-resolved. Overflow recovery is
-     * never armed in this mode (record the provider-reported limit only, so
-     * raw-usage math stays accurate) and Channel-2 delivery stays silent;
-     * the off-transition clears any persisted intent.
+     * Boot-resolved compaction-off mode records the provider limit without arming overflow recovery or Channel 2; disabling compaction clears persisted intent.
      */
     compactionOff?: boolean;
     onSessionCacheInvalidated?: (sessionId: string) => void;
@@ -99,27 +96,22 @@ export interface EventHandlerDeps {
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
     };
     tagger: Tagger;
-    // openDatabase() returns Database | null, but the hook only constructs these
-    // deps after it has already null-checked and disabled MC on storage failure,
-    // so by this point db is always a live handle.
+    // `db` is non-null because the hook disables MC when `openDatabase()` fails.
     db: import("../../shared/sqlite").Database;
     /** The in-process client OpenCode hands the plugin; Channel 2 delivers through it. */
     client?: unknown;
-    /** Channel 1 per-session metric baseline; read for the Channel 2 ceiling-nudge wording. */
+    /** Channel 2 reads the Channel 1 per-session metric baseline for ceiling-nudge wording. */
     channel1StateBySession?: Map<string, import("./ctx-reduce-nudge").Channel1State>;
-    /** Hold Rust module directives until the terminal `message.updated` event, just like TypeScript nudge directives, so both use the same host-side delivery path. */
+    /** The handler holds Rust module directives until terminal `message.updated` so Rust and TypeScript nudges use the same host-side delivery path. */
     channel2DirectiveTextBySession?: Map<string, string>;
     getNotificationParams?: (sessionId: string) => NotificationParams;
     /**
-     * Process-scoped set of Magic Context's own hidden child sessions, keyed by
-     * sessionId. Populated here at `session.created` when the child's title
-     * starts with `magic-context-`; read by the transform + system-prompt hooks
-     * to fully exempt these sessions from the MC pipeline.
+     * `internalChildSessions` tracks `magic-context-` child sessions so transform and system-prompt hooks exempt them from the MC pipeline.
      */
     internalChildSessions?: Set<string>;
 }
 
-/** Title prefix used by every Magic Context hidden child session. */
+/* */
 const INTERNAL_CHILD_TITLE_PREFIX = "magic-context-";
 
 function formatTokens(value: number): string {
@@ -136,23 +128,15 @@ function evictExpiredUsageEntries(contextUsageMap: Map<string, ContextUsageEntry
 }
 
 /**
- * Fire-and-forget Channel 2 ceiling-nudge delivery for an assistant step-boundary
- * event. Primary sessions keep their existing final-stop fallback; subagents are
- * delivered only while their run is still active. No-ops unless a `pending`
- * intent exists; reads the undropped-token count from the Channel 1 baseline for
- * the nudge wording.
+ * The handler delivers pending Channel 2 nudges at assistant step boundaries; primary sessions also fall back at final stop, while subagents deliver only during active runs.
  */
 async function deliverChannel2IfPending(deps: EventHandlerDeps, sessionId: string): Promise<void> {
     try {
-        // Channel 2 fires for primaries AND subagents. Delivery routes through the
-        // in-process client (input.client), which on OpenCode >= 1.17.7 coalesces
-        // the synthetic-user nudge into the in-flight runner; it no-ops unless a
-        // `pending` intent exists, a client is wired, and a subagent run is still
+        // Channel 2 delivers to primary sessions and subagents through `deps.client`.
         // active.
         const baseline = deps.channel1StateBySession?.get(sessionId);
         // A reduce after the persisted generation invalidates its U/T values.
-        // Hold the pending intent until a cache-busting pass rewalks the final
-        // rendered tail; delivery must never burn the cap from stale mass.
+        // `pending` remains set until a cache-busting pass rewalks the final rendered tail, preventing stale mass from consuming the cap.
         if (baseline?.reducedSinceRefresh) return;
         const delivered = await maybeDeliverChannel2(sessionId, {
             db: deps.db,
@@ -261,10 +245,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
-            // Flag our own hidden children (historian/dreamer/sidekick/
-            // memory-migration) by their `magic-context-` title prefix so the
-            // transform + system-prompt hooks can fully exempt them. In-memory
-            // only — these sessions never span a restart.
+            // The handler adds hidden sessions titled `magic-context-` to `internalChildSessions` so transform and system-prompt hooks exempt them; the set is not persisted across restarts.
             if (
                 deps.internalChildSessions &&
                 info.parentID.length > 0 &&
@@ -308,21 +289,9 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     reportedLimitProvenance: detection.reportedLimitProvenance,
                     error: errInfo.error,
                 });
-                // Subagents cannot recover from overflow themselves — the
-                // transform-side emergency path (`needs_emergency_recovery` →
-                // 95% → historian) is gated by `fullFeatureMode` and skips
-                // subagents anyway. Recording the flag would just leave
-                // orphan state that nothing ever consumes, and if the session
-                // were ever re-classified as a primary it would silently
-                // trigger unwarranted emergency recovery. The overflow error
-                // still propagates to OpenCode / the parent agent through the
-                // normal event pipeline; that's the right recovery surface.
                 const sessionMeta = getOrCreateSessionMeta(deps.db, errInfo.sessionID);
                 if (sessionMeta.isSubagent) {
-                    // Subagents can't run historian, so we skip the recovery
-                    // flag — but the reported limit is still useful data for
-                    // pressure math (consumed by resolveContextLimit via
-                    // getOverflowState). Record it without arming recovery.
+                    // Subagents skip recovery because they cannot run historian.
                     if (
                         typeof detection.reportedLimit === "number" &&
                         detection.reportedLimit > 0
@@ -343,12 +312,9 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 }
                 const existing = getOverflowState(deps.db, errInfo.sessionID);
                 if (deps.compactionOff) {
-                    // Compaction-off: never arm MC emergency recovery — the
-                    // latch machinery is gated off and the off-transition
-                    // clears any persisted latch. The provider-reported limit
-                    // is still useful for raw-usage math (the sidebar's only
-                    // numeric source in this mode), so record it without
-                    // arming, exactly like the subagent path above.
+                    // Compaction-off mode never arms MC emergency recovery.
+                    // Disabling compaction clears any persisted latch.
+                    // Disabling compaction clears any persisted latch.
                     if (
                         typeof detection.reportedLimit === "number" &&
                         detection.reportedLimit > 0
@@ -404,11 +370,11 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
-            // Invalidate this message's cached token contribution. The message
-            // content is finalized at this event — if a prior transform pass
-            // happened to cache partial/streaming content (or the message is
-            // being edited/retried), the next pass must recompute. We fall
-            // back to session-wide clear when the event lacks a message id.
+            // The handler recomputes cached token contributions at `message.updated`; streaming, edited, or retried messages may have stale cached content, and a missing message ID requires clearing the session cache.
+            // At terminal `message.updated`, recompute cached token contributions for partial, edited, or retried messages.
+            // Partial streaming content requires recomputing the cached token contribution after `message.updated`.
+            // Edited or retried messages require recomputing their cached token contribution.
+            // A missing message ID prevents per-message invalidation, so the handler clears the session cache.
             if (info.messageID) {
                 clearMessageTokensCache(info.sessionID, info.messageID);
                 invalidateTrueRawTokenCache({
@@ -426,12 +392,12 @@ export function createEventHandler(deps: EventHandlerDeps) {
 
             let messageHadOverflowError = false;
 
-            // Secondary overflow-detection path: OpenCode attaches overflow
-            // errors to the assistant message itself in addition to emitting
-            // session.error. Checking both ensures we catch the error no
-            // matter which event arrives first or fails to arrive at all.
-            // Same subagent skip as the session.error path — subagents have
-            // no emergency recovery machinery that can consume this flag.
+            // The handler checks both `session.error` and assistant-message errors because OpenCode may report overflow through either event; either event can arrive first or be absent.
+            // OpenCode may attach overflow errors to assistant messages as well as emit `session.error`.
+            // The handler checks both `session.error` and assistant-message errors because OpenCode may report overflow through either event.
+            // The handler checks `session.error` and assistant-message errors because either overflow event can arrive first or be absent.
+            // Subagents have no emergency recovery machinery that can consume the emergency-recovery flag.
+            // Subagents do not consume the emergency-recovery flag because they cannot run historian.
             if (info.error !== undefined && info.error !== null) {
                 const detection = detectOverflow(info.error);
                 if (detection.isOverflow) {
@@ -454,9 +420,6 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         const overflowModelKey = resolveModelKey(info.providerID, info.modelID);
                         const metaForOverflow = getOrCreateSessionMeta(deps.db, info.sessionID);
                         if (metaForOverflow.isSubagent) {
-                            // Still record the detected limit (useful for
-                            // pressure math), but don't arm recovery — see
-                            // session.error path above.
                             if (
                                 typeof detection.reportedLimit === "number" &&
                                 detection.reportedLimit > 0
@@ -474,8 +437,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                                 `overflow detected on subagent via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} — recorded limit only`,
                             );
                         } else if (deps.compactionOff) {
-                            // Compaction-off: record the limit only, never arm
-                            // recovery (mirrors the session.error path above).
+                            // Compaction-off mode records the limit without arming recovery.
                             if (
                                 typeof detection.reportedLimit === "number" &&
                                 detection.reportedLimit > 0
@@ -574,11 +536,11 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         (info.tokens?.input ?? 0) +
                         (info.tokens?.cache?.read ?? 0) +
                         (info.tokens?.cache?.write ?? 0);
-                    // Auth is provably live now (a request returned usage), so
-                    // re-warm the model-limit cache once per process to overwrite
-                    // any stale pre-auth limit (e.g. gpt-5.5 cached at the raw
-                    // 922k before the OAuth 272k downshift applied, #179). No-op
-                    // after the first successful warm.
+                    // A request that returns usage proves authentication is live; then re-warm the model-limit cache once to replace stale pre-auth limits.
+                    // The process re-warms the model-limit cache once after authentication to replace stale pre-auth limits.
+                    // After authentication, the process re-warms the model-limit cache once to replace stale pre-auth limits.
+                    // A stale pre-auth cache can retain the raw 922k limit instead of OAuth's 272k limit.
+                    // Subsequent successful warms are no-ops.
                     if (deps.client) {
                         await refreshModelLimitsAfterAuthOnce(
                             deps.client as Parameters<typeof refreshModelLimitsAfterAuthOnce>[0],
@@ -628,9 +590,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                                 `⚠️ Magic Context: OpenCode reports a context limit of ${formatTokens(contextLimit)} tokens for ${info.providerID}/${info.modelID} but you've successfully sent ${formatTokens(safeTokens)} tokens in this session — the cached limit looks wrong. Restart OpenCode if you suspect this is incorrect.`,
                                 deps.getNotificationParams?.(info.sessionID) ?? {},
                             );
-                            // The title guard can skip ignored-message posts until a
-                            // session is safely titled; keep the flag unset unless
-                            // the notification actually reached a user-visible surface.
+                            // `cacheAlertSent` remains unset unless a notification reaches a user-visible surface.
                             if (delivery === "sent") {
                                 updates.cacheAlertSent = true;
                             }
@@ -667,17 +627,6 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         );
                     }
 
-                    // NOTE: the historian trigger decision used to run here on
-                    // every message.updated event — but this handler has no
-                    // message array, so it re-read the session tail from
-                    // opencode.db per streaming delta (~186ms of synchronous
-                    // SQLite on a large session, freezing the event loop and
-                    // making parallel hooks like tool.definition measure
-                    // seconds). The decision moved into the transform
-                    // (transform.ts, before prepareCompartmentInjection), which
-                    // receives the post-marker tail in memory and runs once per
-                    // LLM request — the cadence at which the decision inputs
-                    // actually change. This handler keeps usage tracking only.
                 }
 
                 updateSessionMeta(deps.db, info.sessionID, updates);
@@ -685,21 +634,10 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 sessionLog(info.sessionID, "event message.updated persistence failed:", error);
             }
 
-            // Channel 2 ceiling nudge delivery. Fire on STEP boundaries — both
-            // mid-turn ("tool-calls") and turn-end ("stop") assistant events for
-            // primaries; the delivery helper rejects terminal subagent runs.
-            // Mid-turn delivery is the point of the channel: the reclaimable
-            // pile grows WHILE the agent works, and a queued user message is
-            // picked up by OpenCode's run loop at the next step boundary
-            // (runLoop re-reads the message table every iteration), so the
-            // agent gets warned while it can still act this turn — waiting for
-            // idle would deliver the warning after all the growth already
-            // happened. promptAsync is mid-turn-safe: the in-process client
-            // (input.client) coalesces into the in-flight run on OpenCode
-            // >= 1.17.7, never splicing mid-prefix. Fires for primaries and
-            // subagents alike, but a subagent must still have an active run; it
-            // no-ops unless a `pending` intent exists.
-            // Fire-and-forget, never blocking the event loop.
+            // The handler delivers mid-turn so the agent can act before additional reclaimable context accumulates.
+            // Reclaimable context can accumulate before the next assistant event.
+            // `deliverChannel2IfPending` delivers only to subagents with active runs.
+            // `deliverChannel2IfPending` no-ops unless a pending intent exists.
             if (
                 (info.finish === "stop" || info.finish === "tool-calls") &&
                 deps.client &&
@@ -745,7 +683,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     "event message.removed: invalidated tagger session cache",
                 );
 
-                // If the removed message is the compaction marker boundary, remove the marker
+                // A compaction marker is invalid when its boundary or summary message is removed.
                 const markerState = getPersistedCompactionMarkerState(deps.db, info.sessionID);
                 if (
                     markerState &&
@@ -759,8 +697,6 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     );
                 }
 
-                // Invalidate this message's cached token contribution so the
-                // next transform pass recomputes without stale data.
                 clearMessageTokensCache(info.sessionID, info.messageID);
                 invalidateTrueRawTokenCache({
                     sessionId: info.sessionID,
@@ -791,17 +727,13 @@ export function createEventHandler(deps: EventHandlerDeps) {
             } catch (error) {
                 sessionLog(sessionId, "event session.compacted handling failed:", error);
             }
-            // Native compaction may have deleted the boundary message — remove our marker
-            // to avoid stale/orphaned rows. The next historian run will re-inject if needed.
+            // When native compaction deletes the boundary message, remove the marker to prevent orphaned rows.
             try {
                 removeCompactionMarkerForSession(deps.db, sessionId);
             } catch (error) {
                 sessionLog(sessionId, "event session.compacted marker cleanup failed:", error);
             }
-            // Plan v6 §8: a user-driven OpenCode compaction makes any deferred
-            // pending marker stale (we no longer own that boundary). CAS-clear
-            // any pending blob and reset the degraded-cache counter so the
-            // next pass starts fresh.
+            // User-driven OpenCode compaction invalidates deferred pending markers because it replaces their boundary.
             try {
                 const pending = getPendingCompactionMarkerState(deps.db, sessionId);
                 if (pending) {
@@ -815,9 +747,8 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 );
             }
             resetDegradedCacheCount(sessionId);
-            // Compaction restructures messages (deletes/replaces some). Clear the
-            // per-message token cache for the whole session so the next transform
-            // pass recomputes against the new shape instead of serving stale counts.
+            // Clear the session's per-message token cache after compaction because compaction deletes or replaces messages.
+            // The next transform pass recomputes token counts from the compacted message set.
             clearMessageTokensCache(sessionId);
             invalidateTrueRawTokenCache({ sessionId, reason: "session.compacted" });
             deps.onSessionCacheInvalidated?.(sessionId);
@@ -832,14 +763,11 @@ export function createEventHandler(deps: EventHandlerDeps) {
 
             dropSlot(sessionId, "session.deleted");
             try {
-                // Commit the retry marker before any deletion work. clearSession removes
-                // it in the same transaction as the session data, so a BUSY/rollback
-                // leaves a durable retry for the next maintenance tick.
+                // Commit the retry marker before deletion; `clearSession` removes it with the session data, so a `BUSY` error or rollback leaves it for the next maintenance tick.
                 markSessionCleanupPending(deps.db, sessionId);
                 // Read and remove compaction marker BEFORE clearSession destroys session_meta.
-                // Plan v6: pending_compaction_marker_state lives on the same row, so
-                // clearSession's session_meta DELETE wipes it automatically — no
-                // separate CAS-clear needed here.
+                // `pending_compaction_marker_state` is stored in the `session_meta` row deleted by `clearSession`.
+                // Deleting `session_meta` with `clearSession` clears `pending_compaction_marker_state` without a separate CAS.
                 removeCompactionMarkerForSession(deps.db, sessionId);
                 clearSession(deps.db, sessionId);
             } catch (error) {

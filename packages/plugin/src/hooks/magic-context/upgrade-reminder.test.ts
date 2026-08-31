@@ -53,7 +53,7 @@ function insertStagedCompartment(
     ).run(sessionId, seq, endMessage, Date.now());
 }
 
-/** A fully-upgraded v2 compartment (legacy=0, all tiers populated). */
+/* */
 function insertV2Compartment(db: ReturnType<typeof openDatabase>, sessionId: string): void {
     db.prepare(
         `INSERT INTO compartments (session_id, sequence, title, content, p1, p2, p3, p4, importance, start_message, end_message, start_message_id, end_message_id, legacy, created_at)
@@ -85,7 +85,7 @@ function makeDeps(
             return "sent";
         },
         getNotificationParams: () => ({}),
-        // Default to non-TUI so existing assertions exercise the ignored-message path.
+        // isTuiConnected defaults to false so assertions use the ignored-message path.
         isTuiConnected: () => opts?.tuiConnected ?? false,
         pushTuiDialogAction: (sid, resume) => {
             opts?.dialogActions?.push(sid);
@@ -122,14 +122,9 @@ describe("E5 upgrade reminder", () => {
             "ses-tui",
         );
 
-        // TUI path: interactive dialog action enqueued, no transient ignored message.
         expect(dialogActions).toEqual(["ses-tui"]);
         expect(sent).toHaveLength(0);
-        // The TUI path does NOT durably stamp on mere display — the stamp is set
-        // only on an explicit Confirm/Cancel (via the dismiss-upgrade-reminder
-        // RPC). Stamping on display would trap a session the user closed before
-        // acting. The per-process guard prevents same-process
-        // spam; a new process re-shows until the user decides.
+        // TUI display leaves upgradeRemindedAt unset; dismiss-upgrade-reminder sets it after Confirm or Cancel so closing the dialog does not suppress future reminders.
         expect(getOrCreateSessionMeta(db, "ses-tui").upgradeRemindedAt).toBeNull();
     });
 
@@ -142,15 +137,14 @@ describe("E5 upgrade reminder", () => {
             makeDeps(db, [], { tuiConnected: true, dialogActions }),
             "ses-tui-interrupted",
         );
-        // Simulate close-before-acting: new process (in-memory guard cleared).
+        // Clearing the in-memory guard simulates a process restart before dismissal.
         __resetUpgradeReminderProcessGuard();
         await maybeSendUpgradeReminder(
             makeDeps(db, [], { tuiConnected: true, dialogActions }),
             "ses-tui-interrupted",
         );
 
-        // The display remains dismissible, but the shared delivery timestamp keeps
-        // a new process from immediately showing the same dialog again.
+        // The shared delivery timestamp keeps a reopened process from immediately showing the dismissible dialog.
         expect(dialogActions).toEqual(["ses-tui-interrupted"]);
     });
 
@@ -184,7 +178,7 @@ describe("E5 upgrade reminder", () => {
         const sent: string[] = [];
 
         await maybeSendUpgradeReminder(makeDeps(db, sent), "ses-legacy");
-        // Reset the in-process guard to simulate a restart — the durable cooldown must hold.
+        // Clearing the in-process guard simulates a restart; the durable cooldown still applies.
         __resetUpgradeReminderProcessGuard();
         await maybeSendUpgradeReminder(makeDeps(db, sent), "ses-legacy");
 
@@ -194,15 +188,14 @@ describe("E5 upgrade reminder", () => {
     it("RE-fires a resume prompt after an interrupted upgrade even with the stamp set", async () => {
         const db = openDatabase();
         insertLegacyCompartment(db, "ses-resume");
-        // Simulate: reminder already fired once (stamp set), upgrade started and
-        // staged 3 passes through message 120, then the user closed mid-run.
+        // The fixture simulates a stamped reminder and three staged passes through message 120 before the user closes the upgrade.
         updateSessionMeta(db, "ses-resume", { upgradeRemindedAt: Date.now() });
         insertStagedCompartment(db, "ses-resume", 0, 40);
         insertStagedCompartment(db, "ses-resume", 1, 80);
         insertStagedCompartment(db, "ses-resume", 2, 120);
         const sent: string[] = [];
 
-        // New process (in-memory guard cleared by beforeEach).
+        // beforeEach clears the in-memory guard to simulate a new process.
         await maybeSendUpgradeReminder(makeDeps(db, sent), "ses-resume");
 
         // Despite the durable stamp, the resume prompt fires (non-TUI text path).
@@ -245,21 +238,19 @@ describe("E5 upgrade reminder", () => {
 
     it("skips sessions with no legacy compartments and does NOT stamp", async () => {
         const db = openDatabase();
-        // No legacy compartment inserted.
         getOrCreateSessionMeta(db, "ses-clean");
         const sent: string[] = [];
 
         await maybeSendUpgradeReminder(makeDeps(db, sent), "ses-clean");
 
         expect(sent).toHaveLength(0);
-        // Not stamped — a future restored pre-v2 session could still need it.
+        // Restored pre-v2 sessions remain eligible for reminders.
         expect(getOrCreateSessionMeta(db, "ses-clean").upgradeRemindedAt).toBeNull();
     });
 
     it("transient Pi delivery uses the same cooldown without an explicit-dismissal stamp", async () => {
         // Pi delivers via ctx.ui.notify — a transient toast with no scrollback.
-        // It ignores the explicit-dismissal stamp, but persists the shared cooldown
-        // and cap so repeated process starts cannot produce an endless toast loop.
+        // Pi toast delivery ignores the explicit-dismissal stamp but persists the shared cooldown and cap to prevent repeated process starts from looping toasts.
         const db = openDatabase();
         insertLegacyCompartment(db, "ses-pi");
         const sent: string[] = [];
@@ -270,7 +261,7 @@ describe("E5 upgrade reminder", () => {
 
         await maybeSendUpgradeReminder(deps(), "ses-pi");
         expect(sent).toHaveLength(1);
-        // No durable stamp on a transient toast.
+        // A transient toast does not set a durable stamp.
         expect(getOrCreateSessionMeta(db, "ses-pi").upgradeRemindedAt).toBeNull();
 
         // New process (guard cleared) still respects the persisted cooldown.
@@ -280,8 +271,7 @@ describe("E5 upgrade reminder", () => {
     });
 
     it("transient delivery ignores a stale explicit-dismissal stamp", async () => {
-        // Pi session 019de471 was stamped by the buggy stamp-on-toast path. After
-        // the fix, that stale stamp must NOT gate transient delivery.
+        // A stale explicit-dismissal stamp does not suppress transient delivery.
         const db = openDatabase();
         insertLegacyCompartment(db, "ses-pi-stale");
         updateSessionMeta(db, "ses-pi-stale", { upgradeRemindedAt: Date.now() });
@@ -292,7 +282,7 @@ describe("E5 upgrade reminder", () => {
             "ses-pi-stale",
         );
 
-        // Fires despite the stale stamp (per-process guard governs, not the stamp).
+        // The transient toast fires despite the stale stamp; the per-process guard controls delivery.
         expect(sent).toHaveLength(1);
     });
 
@@ -335,11 +325,7 @@ describe("E5 upgrade reminder", () => {
     });
 
     it("does NOT show a resume prompt for a fully-upgraded session with orphan staging, and clears it", async () => {
-        // Regression: a session whose compartments are
-        // ALL v2 (legacy=0, tiers present) but which still carries leftover
-        // recomp_compartments staging from a superseded run must NOT trigger the
-        // "Resume the interrupted upgrade?" dialog. The master gate is "has legacy
-        // compartments", not "has staging rows".
+        // A session with only v2 compartments must not show a resume dialog because leftover recomp_compartments rows do not satisfy the legacy-compartment gate.
         const db = openDatabase();
         insertV2Compartment(db, "ses-done"); // fully upgraded
         insertStagedCompartment(db, "ses-done", 0, 40069); // orphan staging
@@ -353,17 +339,16 @@ describe("E5 upgrade reminder", () => {
             "ses-done",
         );
 
-        // No prompt of any kind.
         expect(sent).toHaveLength(0);
         expect(dialogActions).toHaveLength(0);
-        // Orphan staging garbage-collected so it can't mis-fire on a later restart.
+        // Garbage collection removes orphan staging so it cannot trigger a prompt after restart.
         expect(countStaging(db, "ses-done")).toBe(0);
         // Not stamped.
         expect(getOrCreateSessionMeta(db, "ses-done").upgradeRemindedAt).toBeNull();
     });
 
     it("STILL resumes a genuinely interrupted upgrade (legacy compartments remain + staging present)", async () => {
-        // Guard against over-correction: when legacy compartments DO remain, the
+        // Legacy compartments require a resume prompt even when staging exists.
         // resume prompt must still fire even with staging present.
         const db = openDatabase();
         insertLegacyCompartment(db, "ses-mid"); // still has legacy → needs upgrade
@@ -379,7 +364,7 @@ describe("E5 upgrade reminder", () => {
 
         expect(dialogActions).toEqual(["ses-mid"]);
         expect(resumeCaptures[0]?.resume).toMatchObject({ stagedCount: 1, stagedThrough: 200 });
-        // Staging preserved — the resume needs it.
+        // Resumption requires staging.
         expect(countStaging(db, "ses-mid")).toBe(1);
     });
 });

@@ -42,11 +42,11 @@ export interface RefreshPrimersArgs {
     language?: string;
     onProgress?: (processed: number) => void;
     /**
-     * Pi only: builds a RawMessageProvider for an arbitrary historical session id
-     * (JSONL), so the orientation seed read works on Pi-only installs where there
-     * is no opencode.db. OpenCode leaves this undefined — the seed read falls to
-     * the read-only opencode.db path. Returning null → closed-book fallback.
-     * May be async (Pi JSONL discovery is async); the returned provider's
+     * On Pi, `rawProviderFactory` builds a `RawMessageProvider` for an arbitrary historical session.
+     * Pi stores historical sessions as JSONL and has no `opencode.db`.
+     * OpenCode leaves `rawProviderFactory` undefined, so the seed read uses read-only `opencode.db`.
+     * `Returning null` selects the closed-book fallback.
+     * `rawProviderFactory` may be async because Pi JSONL discovery is async.
      * `readMessages()` itself is synchronous (wraps already-loaded entries).
      */
     rawProviderFactory?: (
@@ -60,12 +60,7 @@ export interface RefreshPrimersResult {
 }
 
 /**
- * Stale = empty/never-refreshed answer, OR re-observed since the last refresh.
- * PRIMARY SORT is `answerRefreshedAt ASC NULLS FIRST` (never-refreshed first,
- * then oldest-refreshed) — NOT `lastObservedAt`. A hot recurring primer is
- * re-observed (lastObservedAt bumped) on every recurrence; sorting by that would
- * keep it permanently top-of-list and starve quiet primers. Promotion recency
- * must not drive refresh priority.
+ * `lastObservedAt` is bumped on recurrence, so it cannot determine refresh priority: recurring primers would starve quiet primers.
  */
 function primersNeedingRefresh(primers: Primer[]): Primer[] {
     return primers
@@ -134,11 +129,9 @@ Return valid JSON only, no markdown fencing:
 }
 
 /**
- * Grounding gate: the investigation must have actually USED its tools. A run
- * that made zero tool calls is a pure paraphrase of the orientation — exactly
- * the "stale re-summary" failure the open-book redesign exists to prevent — so
- * its answer is NOT committed (keep-existing). Counts any tool call in the run
- * (robust against part-shape drift; reuses the battle-tested summary extractor).
+ * The gate rejects runs with no tool calls because they cannot ground an answer in current source.
+ * The gate preserves the existing answer when the run makes no tool calls.
+ * The gate counts every tool call so part-shape changes cannot bypass it.
  */
 function investigationToolCallCount(messages: unknown[]): number {
     if (!Array.isArray(messages)) return 0;
@@ -182,7 +175,7 @@ export async function refreshPrimers(args: RefreshPrimersArgs): Promise<RefreshP
             const primer = primers[i];
             const remainingMs = Math.max(0, args.deadline - Date.now());
             if (remainingMs <= 0) break;
-            // Fair per-primer slice so one deep primer can't zero out the rest.
+            // The per-primer slice reserves refresh capacity for other primers.
             const primersRemaining = primers.length - i;
             const sliceMs = Math.max(1, Math.floor(remainingMs / primersRemaining));
 
@@ -199,10 +192,8 @@ export async function refreshPrimers(args: RefreshPrimersArgs): Promise<RefreshP
 }
 
 /**
- * Investigate + refresh ONE primer in its OWN child session. Per-primer
  * try/finally guarantees the child is deleted even if a mid-loop deadline throw
- * fires (the old single outer-finally leaked the in-flight child). Returns true
- * if the answer was committed.
+ * `refreshPrimer` returns `true` if it commits the answer.
  */
 async function refreshOnePrimer(
     args: RefreshPrimersArgs,
@@ -210,9 +201,7 @@ async function refreshOnePrimer(
     sliceMs: number,
     signal: AbortSignal,
 ): Promise<boolean> {
-    // Build the orientation seed. On Pi, resolve a raw provider for the origin
-    // session (async JSONL discovery) BEFORE the synchronous seed scope; on
-    // OpenCode, the read falls to the read-only opencode.db path.
+    // On Pi, the refresh resolves a raw provider before opening the synchronous seed scope.
     const originSessionId = originSessionIdForPrimer(args, primer);
     let provider: RawMessageProvider | null = null;
     if (args.rawProviderFactory && originSessionId) {
@@ -291,8 +280,6 @@ async function refreshOnePrimer(
         const answer = run.validated.trim();
         if (!answer) return false;
 
-        // Grounding gate: a run that used no tools is a paraphrase, not an
-        // investigation — keep the existing answer rather than commit it.
         if (investigationToolCallCount(run.output) === 0) {
             log(
                 `[dreamer] refresh-primers: primer #${primer.id} answer not committed (no investigation tool calls)`,
@@ -313,8 +300,7 @@ async function refreshOnePrimer(
         recordInvocation(args, startedAt, { status: "failed", error });
         throw error;
     } finally {
-        // Primer seeds include raw historical user lines, so the child must not
-        // remain on disk after failures or debug-retention runs.
+        // The lookup returns the most-recent candidate's session id without rendering.
         if (agentSessionId) {
             await args.client.session
                 .delete({
@@ -329,7 +315,6 @@ async function refreshOnePrimer(
 }
 
 function originSessionIdForPrimer(args: RefreshPrimersArgs, primer: Primer): string | null {
-    // Cheap lookup: the most-recent candidate's session id, without rendering.
     const candidates = getPrimerCandidatesByIds(args.db, primer.sourceCandidateIds);
     const mostRecent = candidates
         .slice()

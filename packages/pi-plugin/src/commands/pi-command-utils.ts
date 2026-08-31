@@ -93,9 +93,6 @@ export const renderCtxStatusEntry: CtxStatusEntryRenderer = (
 };
 
 /**
- * Register the model-invisible status-entry renderer when the Pi runtime supports it.
- * Older Pi versions still persist status entries through appendEntry; they simply do
- * not render those entries in the TUI.
  */
 export function registerCtxStatusEntryRenderer(pi: PiMessageSender): boolean {
 	if (typeof pi.registerEntryRenderer !== "function") return false;
@@ -120,12 +117,8 @@ export function sendCtxStatusMessage(
 		details: details ?? content.details,
 	};
 
-	// Custom entries are persisted without entering model context. On older Pi
-	// versions they may be invisible in the TUI, but model safety takes priority.
 	if (typeof pi.appendEntry === "function") {
 		pi.appendEntry<CtxStatusEntryData>(CTX_STATUS_CUSTOM_TYPE, data);
 	}
-	// Minimal non-interactive API shims may omit appendEntry; logging remains the
-	// safe fallback and status text must never be routed through sendMessage.
 	sessionLog("pi-status", `${content.title}: ${content.text}`);
 }

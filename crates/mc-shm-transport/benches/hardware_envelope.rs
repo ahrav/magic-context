@@ -72,10 +72,7 @@ fn main() {
     }
 
     if args.iter().any(|arg| arg == "--designated-host") {
-        // The designated-host qualification campaign (manifest predicates,
-        // paired statistics, WINNER/HARDWARE_EQUIVALENT verdicts) is not
-        // implemented; refusing beats emitting unqualified-schedule
-        // evidence for a qualification request.
+        // Qualification requests emit no unqualified-schedule evidence.
         eprintln!("--designated-host refused: qualification campaign is not implemented");
         std::process::exit(2);
     }
@@ -86,9 +83,6 @@ fn main() {
     let executable = std::env::current_exe().unwrap();
     let mut attempts = Vec::new();
     for scheduling in ["hot", "cold"] {
-        // Fallback records carry the same canonical schedule label as child
-        // measurements, so grouping by `scheduling` never splits an arm
-        // between the CLI token and the canonical name.
         let canonical_scheduling = scheduling_name(match scheduling {
             "hot" => SchedulingMode::HotPinnedPoll,
             _ => SchedulingMode::ColdParkWake,
@@ -314,11 +308,6 @@ fn run_h0(iterations: u64) -> Result<(Duration, u64, u64, u64, u64, u64), &'stat
     Ok((start.elapsed(), 0, 0, 0, 0, checksum))
 }
 
-// Smoke-only ring shape: "smoke-unqualified" never names a qualified
-// candidate, so every record built from it stays `qualified: false`. It
-// deliberately diverges from the host's qualified profile (Fused workers,
-// depth 8, lease limit 8) — the caller thread drives both ends here and the
-// depth/lease limit of 32 keeps the smoke loop from stalling on backpressure.
 fn ring_profile(scheduling: SchedulingMode) -> Result<TargetProfile, &'static str> {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(

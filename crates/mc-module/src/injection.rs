@@ -1,12 +1,7 @@
-//! Synthetic-todowrite injection producer: canonical task-list-state normalization,
-//! the deterministic `mc_synthetic_todo_<hash>` call id, the byte-exact injected
-//! pair, and the bust-only freeze / defer-replay transition.
+//! The producer freezes replacements only after cache busts.
 //!
-//! The functions that build the deterministic call id and byte-exact injected pair, and
-//! the transition logic, are deliberately pure: the caller supplies the persisted task list
-//! state and the currently frozen synthetic unit. The capture helper mutates only the
-//! caller-owned [`mc_store::ModuleMeta`] so the change can be committed in the same pass
-//! as the cache-state transition.
+//! The builders and transition logic are pure: callers supply persisted task-list state and the frozen synthetic unit.
+//! The capture helper mutates only caller-owned [`mc_store::ModuleMeta`], allowing the same pass to commit it with the cache-state transition.
 
 #[cfg(test)]
 use crate::selection::SelMessageRole;
@@ -62,22 +57,20 @@ struct SyntheticState {
     time: SyntheticTime,
 }
 
-/// The CK-native synthetic todowrite pair produced from one normalized task-list state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntheticTodo {
-    /// Shared synthetic tool-call id used by both halves of the injected pair.
+    /// `call_id` identifies both messages in the injected pair.
     pub call_id: String,
-    /// Canonical task-list-state JSON that was hashed to produce [`Self::call_id`].
+    /// `state_json` is canonical task-list state whose hash produces [`Self::call_id`].
     pub state_json: String,
-    /// Frozen assistant-role CK ToolCall message.
+    /// `assistant_msg` is the frozen assistant-role CK ToolCall message.
     pub assistant_msg: CkWireMessage,
-    /// Frozen tool-role CK ToolResult message.
+    /// `tool_msg` is the frozen tool-role CK ToolResult message.
     pub tool_msg: CkWireMessage,
 }
 
 impl SyntheticTodo {
-    /// Attach the tail message id present when this task list was composed to produce
-    /// the persisted frozen pair.
+    /// `freeze_at` stores the tail message ID as the persisted frozen pair's anchor.
     pub fn freeze_at(self, anchor_mid: Option<String>) -> FrozenSyntheticTodoPair {
         FrozenSyntheticTodoPair {
             call_id: self.call_id,
@@ -90,23 +83,22 @@ impl SyntheticTodo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InjectionOutcome {
-    /// Keep replaying the currently frozen unit byte-for-byte.
+    /// `Keep` replays the currently frozen unit byte-for-byte.
     Keep,
-    /// Freeze this newly built unit and replay its bytes from now on.
+    /// `Replace` freezes the new unit and replays its bytes thereafter.
     Replace(Box<SyntheticTodo>),
-    /// Remove the currently frozen unit because the current task-list state no longer produces synthetic bytes.
+    /// `Clear` removes the frozen unit when the current task-list state produces no synthetic bytes.
     Clear,
-    /// No valid state exists, or no frozen unit exists for a no-op transition.
+    /// `None` indicates either invalid state or a no-op without a frozen unit.
     None,
 }
 
-/// Normalize raw `todowrite` todos JSON into the stable state string used for hashing.
+/// `normalize_todo_state_json` produces the stable hash input from raw `todowrite` JSON.
 ///
-/// The accepted input is a JSON array. Each item must be an object with string
-/// `content` and `status`; `priority` is optional and defaults to `"medium"`.
-/// Extra fields are stripped, and the output field order is always
-/// `content`, `status`, then `priority`. If any item is malformed, the whole
-/// state is rejected.
+/// `normalize_todo_state_json` accepts only JSON arrays of objects with string `content` and `status` fields.
+/// `priority` defaults to `"medium"` when absent.
+/// `normalize_todo_state_json` strips extra fields and emits `content`, `status`, and `priority` in that order.
+/// `normalize_todo_state_json` rejects the entire state when any item is malformed.
 pub fn normalize_todo_state_json(todos_json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(todos_json).ok()?;
     let todos = value.as_array()?;
@@ -117,19 +109,16 @@ pub fn normalize_todo_state_json(todos_json: &str) -> Option<String> {
     serde_json::to_string(&normalized).ok()
 }
 
-/// Compute the deterministic `mc_synthetic_todo_<sha256[:16]>` call id.
 pub fn synthetic_call_id(state_json: &str) -> String {
     let digest = Sha256::digest(state_json.as_bytes());
     let hex = format!("{digest:x}");
     format!("{}{}", SYNTHETIC_CALL_ID_PREFIX, &hex[..16])
 }
 
-/// Build the byte-complete synthetic todowrite pair for a normalized state JSON.
 ///
-/// Returns [`None`] when the state is invalid, empty, or every work item is terminal
-/// (`completed` or `cancelled`). Completed todos are excluded from the title's
-/// active count, while cancelled todos are still counted there, matching the
-/// real todowrite result title.
+/// The builder returns [`None`] for invalid, empty, or all-terminal states.
+/// `completed` todos do not contribute to the title's active count.
+/// `cancelled` todos contribute to the title's active count.
 pub fn build_synthetic_todo_pair(state_json: &str) -> Option<SyntheticTodo> {
     let todos = parse_todo_state(state_json)?;
     if todos.is_empty() || todos.iter().all(|todo| is_terminal_status(&todo.status)) {
@@ -191,18 +180,14 @@ pub fn build_synthetic_todo_pair(state_json: &str) -> Option<SyntheticTodo> {
     })
 }
 
-/// Return true when an id belongs to the synthetic-todowrite namespace.
 pub fn is_synthetic_todo_id(id: &str) -> bool {
     id.starts_with(SYNTHETIC_CALL_ID_PREFIX)
 }
 
-/// Capture the newest `todowrite` ToolCall from the visible tail into session metadata.
 ///
-/// Capture happens only on bust passes while the native tool is available. If no valid
-/// todowrite call is present, the previous metadata value is left intact because an older
-/// todowrite may already be saved in this session. An explicit empty or all-terminal todowrite
-/// is still captured so the next step can clear any frozen synthetic unit when the real task list
-/// state is terminal. A missing availability verdict fails open for legacy senders.
+/// `last_todo_state` remains unchanged when no valid `todowrite` call is visible, preserving a previously captured state.
+/// The capture helper records empty and all-terminal `todowrite` calls so the next transition can clear a frozen synthetic unit.
+/// `todo_tool_present == None` means the tool is available.
 pub fn capture_todo_state_on_bust(
     meta: &mut ModuleMeta,
     tail: &[SelItem],
@@ -221,11 +206,10 @@ pub fn capture_todo_state_on_bust(
     true
 }
 
-/// Compose the synthetic-task-list transition from [`ModuleMeta::last_todo_state`].
 ///
-/// The metadata is per-session durable state, so an aged-out todowrite continues to inject until
-/// another bust captures a new view. Defer passes ignore the metadata and replay the frozen unit
-/// verbatim. A frozen unavailable verdict makes the state effectively empty only on a bust.
+/// On bust passes, a valid nonterminal `last_todo_state` can inject after its source call leaves `tail`.
+/// A later bust captures visible state; defer passes replay the frozen unit without reading metadata.
+/// On bust passes, `todo_tool_present == Some(false)` treats a frozen pair as empty.
 pub fn advance_injection_from_meta(
     meta: &ModuleMeta,
     frozen: Option<&FrozenSyntheticTodoPair>,
@@ -240,12 +224,9 @@ pub fn advance_injection_from_meta(
     )
 }
 
-/// Return whether the next eligible bust would replace or clear the frozen task-list pair.
 ///
-/// This predicate computes only the normalized state and call id. It deliberately avoids building
-/// provider-visible tool messages before the pass classifier grants a bust. A visible real
-/// `todowrite` takes precedence over older state-sync metadata when the tool is available. An
-/// unavailable verdict reports only a pending clear for an existing pair; it never creates a bust.
+/// `todowrite` takes precedence over older state-sync metadata when the tool is available.
+/// `advance_injection` returns pending only when `frozen` is present.
 pub fn injection_pending_after_capture(
     meta: &ModuleMeta,
     tail: &[SelItem],
@@ -275,11 +256,9 @@ pub fn injection_pending_after_capture(
     }
 }
 
-/// Capture (if this is a bust pass and the native tool is available) before composing the
 /// synthetic-task-list transition.
 ///
-/// This ordering lets a first-ever todowrite be captured and injected in the same cache bust
-/// instead of lagging one pass behind.
+/// `advance_injection` captures before advancing so a first `todowrite` call injects on the same bust pass.
 pub fn advance_injection_after_capture(
     meta: &mut ModuleMeta,
     tail: &[SelItem],
@@ -291,12 +270,10 @@ pub fn advance_injection_after_capture(
     advance_injection_from_meta(meta, frozen, is_bust_pass, todo_tool_present)
 }
 
-/// Advance the frozen synthetic-task-list unit for one pass without mutating storage.
+/// `advance_injection` does not mutate storage.
 ///
-/// Bust passes may replace or clear the frozen unit. Defer passes never build from the current
-/// state and never clear: if a unit is already frozen they return [`InjectionOutcome::Keep`],
-/// otherwise there is no unit to replay. A frozen unavailable verdict is treated as an empty task list
-/// state on busts, while an absent verdict fails open for legacy senders.
+/// `advance_injection` treats `todo_tool_present == Some(false)` as an empty task list on bust passes.
+/// `advance_injection` treats `todo_tool_present == None` as available.
 pub fn advance_injection(
     persisted_state_json: Option<&str>,
     frozen: Option<&FrozenSyntheticTodoPair>,

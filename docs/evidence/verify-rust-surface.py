@@ -28,10 +28,9 @@ CRATES = (
     "subc-client-rs-0.3.0",
 )
 
-# (inventory row, source probe that must appear in that crate's src/). Probes
-# prefixed with "re:" are regular expressions (searched with re.DOTALL); the
-# rest are literal substrings. Every probe maps one-to-one onto an inventory
-# row, so the PRESENT/ABSENT count reconciles against the row totals.
+# Each tuple contains an inventory row and a source probe that must appear in the crate's src/.
+# Probes prefixed with `re:` are regular expressions searched with `re.DOTALL`.
+# All other probes are literal substrings. Each probe maps one-to-one to an inventory row.
 ITEMS: dict[str, tuple[tuple[str, str], ...]] = {
     "subc-protocol": (
         ("BindIdentity", "pub struct BindIdentity"),
@@ -59,11 +58,6 @@ ITEMS: dict[str, tuple[tuple[str, str], ...]] = {
         ("manifest::TrustTier", "pub enum TrustTier"),
         ("manifest::ProviderRole", "pub enum ProviderRole"),
         (
-            # Amended row: presence plus the test-demanded PartialEq derive
-            # (one row, one result). The regex tolerates attribute order,
-            # formatting, and CRLF differences in the published source, and
-            # skips any mix of attributes and `//`-style (incl. doc) comment
-            # lines between the derive and the enum keyword.
             "manifest::ConsumerRole (incl. PartialEq)",
             r"re:#\[derive\([^)]*\bPartialEq\b[^)]*\)\]\s*(?:#\[[^\]]*\]\s*|//[^\n]*\n\s*)*pub enum ConsumerRole",
         ),

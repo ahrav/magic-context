@@ -129,9 +129,6 @@ describe("fallback reasons", () => {
 
     test("the closed table decodes; anything else is rejected", () => {
         const offers = [tcpOffer(1)];
-        // Pinned to §7.7.3's two literals rather than derived from the exported
-        // array: a value the code accepts but the table omits is exactly the
-        // fail-open this guards, and iterating the array alone cannot see it.
         expect([...FALLBACK_REASONS]).toEqual(["unavailable", "capability_version_mismatch"]);
         for (const reason of FALLBACK_REASONS) {
             const body = `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"${reason}"}`;
@@ -340,9 +337,8 @@ describe("opaque value bounds", () => {
     });
 
     test("an own __proto__ key stays an own data property", () => {
-        // Assigning "__proto__" onto a normal object invokes the prototype
-        // setter: the subtree would vanish from JSON.stringify (bypassing
-        // the size bound) and mutate the object handed to the provider.
+        // Assigning "__proto__" to a normal object invokes the prototype setter.
+        // The prototype setter removes the assigned subtree from JSON.stringify, bypassing the size bound and mutating the provider input.
         const request = decodeNegotiateRequest(
             bytes(requestWithParameters('{"__proto__":{"polluted":true},"x":1}')),
         );
@@ -575,7 +571,7 @@ describe("encode-side validation", () => {
                 negotiationVersion: NEGOTIATION_VERSION,
                 offers: offersWith(parameters),
             });
-        // The decoder's exact bounds apply on the way out too.
+        // The encoder enforces the decoder's bounds.
         expectCode(() => encode({ x: "x".repeat(9000) }), "opaque_too_large");
         let deep: Record<string, unknown> = {};
         for (let level = 0; level < MAX_OPAQUE_DEPTH; level++) {
@@ -585,20 +581,16 @@ describe("encode-side validation", () => {
         for (const parameters of [[], 1, "x", null, true]) {
             expectCode(() => encode(parameters), "invalid_type");
         }
-        // JavaScript-only shapes are judged by their serialized form: a
-        // Date or a custom toJSON reaches the wire as whatever it
-        // serializes to, not as the nominal object.
+        // Date and custom toJSON values are validated as their serialized JSON values, not as nominal objects.
         expectCode(() => encode(new Date(0)), "invalid_type");
         expectCode(() => encode({ toJSON: () => "not-an-object" }), "invalid_type");
-        // A toJSON yielding undefined is an invalid opaque value, not an
+        // A toJSON result of undefined is an invalid opaque value, not an omitted field.
         // absent one.
         expectCode(() => encode({ toJSON: () => undefined }), "invalid_type");
-        // Lone surrogates survive JSON.stringify as escapes but the host's
-        // strict UTF-8 decoder rejects them; fail locally instead.
+        // Lone surrogates cause local encoding to fail.
         expectCode(() => encode({ s: "\uD800" }), "invalid_type");
         expectCode(() => encode({ "\uDC00": 1 }), "invalid_type");
-        // Integral numbers beyond the double-safe range are already rounded,
-        // so the advertised identifier is not the one the caller meant.
+        // Numbers above 9007199254740991 are rounded before encoding, so the advertised identifier can differ from the caller's value.
         const unsafeInteger = Number.MAX_SAFE_INTEGER + 1;
         expectCode(() => encode({ id: unsafeInteger }), "invalid_type");
         expectCode(() => encode({ nested: [{ id: unsafeInteger }] }), "invalid_type");
@@ -618,8 +610,7 @@ describe("encode-side validation", () => {
     });
 
     test("a stateful toJSON cannot emit a different shape than was validated", () => {
-        // checkOpaquePlain serializes once and the validated snapshot is
-        // what reaches the wire, so the second toJSON result never exists.
+        // checkOpaquePlain serializes once and sends the validated snapshot, so a second toJSON result cannot affect the wire value.
         let calls = 0;
         const sneaky = {
             toJSON: () => {
@@ -743,8 +734,7 @@ describe("shared-memory grant descriptor schema (layer b)", () => {
     });
 
     test("unsafe numeric representations are rejected across both layers", () => {
-        // Textual forms the envelope owns: non-finite exponents and
-        // integers beyond the double-safe range never reach layer b.
+        // The envelope rejects non-finite exponents and integers above 9007199254740991 before layer b receives them.
         expectCode(
             () => decodeNegotiateResponse(bytes(grantResponse('{"pid":1e999}')), SHM_OFFERS),
             "malformed_json",
@@ -757,7 +747,6 @@ describe("shared-memory grant descriptor schema (layer b)", () => {
                 ),
             "invalid_type",
         );
-        // Value shapes the grant schema owns.
         for (const pid of [2.5, -1, 0, -0, 4_294_967_296, Number.NaN, "1234"]) {
             expectGrantCode(
                 () => decodeShmGrant({ ...validGrantDescriptor(), pid }, GRANT_OPTIONS),

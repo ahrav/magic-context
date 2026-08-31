@@ -38,18 +38,18 @@ export interface Compartment {
     startMessageId: string;
     endMessageId: string;
     title: string;
-    /** v2: P1 tier text (fullest). Legacy rows: flat v1 content. Always present (NOT NULL). */
+    /* */
     content: string;
-    /** v2 paraphrase tiers (model B). NULL for legacy=1 rows. */
+    /* */
     p1: string | null;
     p2: string | null;
     p3: string | null;
     p4: string | null;
-    /** Decay-rate signal (1-100). Defaults to 50. */
+    /* */
     importance: number;
-    /** Comma-separated activity types (e.g. "design,feature"). NULL for legacy rows. */
+    /* */
     episodeType: string | null;
-    /** 1 = pre-v2 flat compartment (no tiers); 0 = v2 tiered. */
+    /* */
     legacy: number;
     createdAt: number;
 }
@@ -113,8 +113,6 @@ function isCompartmentRow(row: unknown): row is CompartmentRow {
         typeof candidate.end_message_id === "string" &&
         typeof candidate.title === "string" &&
         typeof candidate.content === "string" &&
-        // v2 tier columns are nullable (legacy rows store NULL). Tolerate absence
-        // so a row is never rejected just for missing/null tier metadata.
         isStringOrNullish(candidate.p1) &&
         isStringOrNullish(candidate.p2) &&
         isStringOrNullish(candidate.p3) &&
@@ -146,16 +144,16 @@ export interface CompartmentInput {
     startMessageId: string;
     endMessageId: string;
     title: string;
-    /** v2: P1 tier text. Legacy/compressor inserts: flat content. */
+    /* */
     content: string;
-    /** v2 paraphrase tiers (model B). Omitted/null for legacy or compressor inserts → stored NULL. */
+    /* */
     p1?: string | null;
     p2?: string | null;
     p3?: string | null;
     p4?: string | null;
-    /** Decay-rate signal (1-100). Omitted → stored 50. */
+    /* */
     importance?: number | null;
-    /** Comma-separated activity types. Omitted/null → stored NULL. */
+    /* */
     episodeType?: string | null;
 }
 
@@ -167,8 +165,6 @@ function insertCompartmentRows(
 ): void {
     const stmt = getInsertCompartmentStatement(db);
     for (const compartment of compartments) {
-        // A compartment is v2 (legacy=0) iff it carries at least the P1 tier.
-        // Compressor/legacy inserts pass no tiers → stored NULL + legacy=1.
         const hasTiers = typeof compartment.p1 === "string" && compartment.p1.length > 0;
         stmt.run(
             sessionId,
@@ -239,8 +235,6 @@ function toSessionFact(row: SessionFactRow): SessionFact {
 
 export function getCompartments(db: Database, sessionId: string): Compartment[] {
     const rows = db
-        // Audit note: SELECT * is intentional — compartments table is owned by this plugin, columns are
-        // validated by isCompartmentRow(), and all columns are needed for rendering and validation.
         .prepare("SELECT * FROM compartments WHERE session_id = ? ORDER BY sequence ASC")
         .all(sessionId)
         .filter(isCompartmentRow);
@@ -255,12 +249,6 @@ export function getLastCompartmentEndMessage(db: Database, sessionId: string): n
 }
 
 /**
- * The OpenCode message id at the boundary of the highest-sequence compartment —
- * i.e. the last raw message the compartment history (m[0]+m[1]) covers. Returns
- * null when there are no compartments or the latest one has no stored boundary
- * (legacy rows). Used to persist the m[1]-coverage boundary so a cold post-
- * restart pass trims the live tail to what the cached summary actually covers,
- * not to the latest compartment (which may be newer than the cached m[1]).
  */
 export function getLastCompartmentEndMessageId(db: Database, sessionId: string): string | null {
     const row = db
@@ -273,14 +261,7 @@ export function getLastCompartmentEndMessageId(db: Database, sessionId: string):
 }
 
 /**
- * Look up compartments whose stored `end_message_id` matches the given
- * OpenCode message id. Returns an ARRAY — schema only enforces
- * `UNIQUE(session_id, sequence)`, NOT `(session_id, end_message_id)`, so
- * a future bug could in principle leave two rows sharing a boundary. The
- * marker drain's `validatePendingTarget` treats `length > 1` as a schema
- * invariant violation and bails to stale-skip (plan v6 section 5).
  *
- * Normal path: exactly one match → caller treats it as the target row.
  */
 export function getCompartmentsByEndMessageId(
     db: Database,
@@ -309,9 +290,6 @@ export function replaceAllCompartments(
 }
 
 /**
- * Append new compartments without deleting existing ones.
- * Used by the incremental runner where existing compartments are preserved
- * and only new compartments for the latest chunk are added.
  */
 export function appendCompartments(
     db: Database,
@@ -326,9 +304,6 @@ export function appendCompartments(
 }
 
 /**
- * Replace session facts without touching compartments.
- * Facts are fully re-normalized by the historian on each pass,
- * so they always need a full replacement.
  */
 export function replaceSessionFacts(
     db: Database,
@@ -411,14 +386,13 @@ export function replaceAllCompartmentStateAndBumpDepth(
             try {
                 db.exec("ROLLBACK");
             } catch {
-                // Transaction may already be closed by SQLite after an error.
             }
         }
     }
 }
 
 export interface CompartmentDateRanges {
-    /** Map compartment id → `{ start: "YYYY-MM-DD", end: "YYYY-MM-DD" }` */
+    /* */
     byId: Map<number, { start: string; end: string }>;
 }
 
@@ -464,7 +438,6 @@ export function buildCompartmentBlock(
     return lines.join("\n").trimEnd();
 }
 
-// ── Recomp staging ──────────────────────────────────────────────────────────
 
 export interface RecompStaging {
     compartments: CompartmentInput[];
@@ -473,7 +446,7 @@ export interface RecompStaging {
     lastEndMessage: number;
 }
 
-/** Append one pass's results to the staging tables. */
+/* */
 export function saveRecompStagingPass(
     db: Database,
     sessionId: string,
@@ -483,7 +456,6 @@ export function saveRecompStagingPass(
 ): void {
     const now = Date.now();
     db.transaction(() => {
-        // Facts are replaced wholesale each pass (historian rewrites full fact list)
         db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
 
         const compartmentStmt = db.prepare(
@@ -520,7 +492,7 @@ export function saveRecompStagingPass(
     })();
 }
 
-/** Read existing staging data for resume. Returns null if no staging exists. */
+/* */
 export function getRecompStaging(db: Database, sessionId: string): RecompStaging | null {
     const compartmentRows = db
         .prepare("SELECT * FROM recomp_compartments WHERE session_id = ? ORDER BY sequence ASC")
@@ -561,7 +533,7 @@ export function getRecompStaging(db: Database, sessionId: string): RecompStaging
     };
 }
 
-/** Atomically promote staging → real tables, then clear staging. */
+/* */
 export function promoteRecompStaging(
     db: Database,
     sessionId: string,
@@ -602,7 +574,6 @@ export function promoteRecompStaging(
             finished = true;
             return null;
         }
-        // Replace real tables
         db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
 
@@ -623,37 +594,28 @@ export function promoteRecompStaging(
             try {
                 db.exec("ROLLBACK");
             } catch {
-                // Transaction may already be closed by SQLite after an error.
             }
         }
     }
 }
 
-/** Clear staging tables for a session (on cancel/abandon or after successful promote). */
+/* */
 export function clearRecompStaging(db: Database, sessionId: string): void {
     db.transaction(() => {
         db.prepare("DELETE FROM recomp_compartments WHERE session_id = ?").run(sessionId);
         db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
-        // Clear the partial-range marker so a future full recomp doesn't
-        // resume under a partial range. Best-effort — column may not exist
-        // in very old test DBs.
         try {
             db.prepare(
                 "UPDATE session_meta SET recomp_partial_range_start = 0, recomp_partial_range_end = 0 WHERE session_id = ?",
             ).run(sessionId);
         } catch {
-            // column missing in very old schemas — ignore
         }
     })();
 }
 
-// ── Partial recomp range marker ─────────────────────────────────────────────
 
 /**
- * Returns the stored partial recomp range for this session, or null when the
- * active staging (if any) is for a full recomp.
  *
- * A zero-valued row means "no partial range recorded" — either no staging or
  * full-recomp staging.
  */
 export function getRecompPartialRange(
@@ -676,8 +638,6 @@ export function getRecompPartialRange(
 }
 
 /**
- * Record the active partial recomp range. Must be called inside or alongside
- * saveRecompStagingPass so staging and range marker stay in sync.
  */
 export function setRecompPartialRange(
     db: Database,
@@ -686,8 +646,6 @@ export function setRecompPartialRange(
 ): void {
     const start = range ? range.start : 0;
     const end = range ? range.end : 0;
-    // Ensure the session_meta row exists so UPDATE takes effect. Mirrors the
-    // pattern used elsewhere in this module.
     db.prepare("INSERT OR IGNORE INTO session_meta (session_id) VALUES (?)").run(sessionId);
     db.prepare(
         "UPDATE session_meta SET recomp_partial_range_start = ?, recomp_partial_range_end = ? WHERE session_id = ?",

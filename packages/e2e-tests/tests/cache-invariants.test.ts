@@ -1,30 +1,17 @@
 /// <reference types="bun-types" />
 
 /**
- * Cache-invariant suite — the durable guard against prompt-cache regressions.
  *
- * Motivation: a stale-ctx_reduce strip regression shipped because the existing
- * cache-stability test only drove LOW-PRESSURE PURE-DEFER turns. The bug needed
- * three things that test never combined: conversation GROWTH + an EXECUTE pass
- * (to freeze drop state) + a SUBSEQUENT DEFER pass (where a volatile boundary
- * re-stripped a mid-prefix message). The wire byte-diff caught it in production;
- * nothing in CI did.
+ * A stale `ctx_reduce` strip requires growth, an EXECUTE pass that freezes drop state, and a subsequent DEFER pass.
  *
- * This suite drives the plugin into those exact states and asserts — using the
- * SAME bust definition the production diagnostic (analyze-cache-busts.ts) uses,
- * ported to `src/cache-analysis.ts` — that DEFER passes never bust the cached
- * prefix. A "bust" = a wire segment BEFORE the final cache_control breakpoint
- * changed between two consecutive requests (i.e. the plugin rewrote bytes that
- * were supposed to stay cached).
+ * DEFER passes must not change the cached prefix.
+ * `findBusts` uses the production diagnostic's bust definition.
+ * A bust is a change between consecutive requests to a wire segment before the final `cache_control` breakpoint.
  *
- * Invariant classes covered here (the replay class — the regression's family):
  *   A1  low-pressure pure-defer growth stays byte-stable
  *   A2  defer passes AFTER an execute pass + growth stay byte-stable
  *   A3  an aged ctx_reduce call never vanishes mid-prefix on a defer pass
- *       (the exact regression shape)
  *
- * The m[0]/m[1] taxonomy, supersede-delta, boundary, pressure, and restart
- * classes are layered on in sibling describe blocks as the suite grows.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -69,14 +56,12 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
 }
 
 /**
- * Parse the [N] ordinal range from a historian prompt's <new_messages> block.
  *
- * Ordinals are matched ONLY in the exact line-anchored form the historian
- * prompt emits — `[N] U:` / `[N] A:` at the start of a line. Matching any
- * bracketed digit in the prose would pick up stray `[0]`-shaped text (e.g. a
- * prompt that literally mentions `m[0]`), producing a 0-N compartment range
- * that fails the historian's "range maps to raw session lines 1-N" validation.
- * This bit a real test run — the `[N] U:` anchor is the robust contract.
+ * The historian accepts ordinals only as line-anchored `[N] U:` or `[N] A:` entries.
+ * Unanchored bracketed digits can match prose instead of session entries.
+ * Prose can contain stray bracketed digits such as `m[0]`.
+ * A stray `[0]` produces a 0-N compartment range.
+ * A 0-N compartment range fails the historian's raw-session-range validation.
  */
 function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
     const messages = (body.messages as Array<{ content: unknown }> | undefined) ?? [];
@@ -95,7 +80,7 @@ function findOrdinalRange(body: Record<string, unknown>): { start: number; end: 
     return null;
 }
 
-/** Route historian requests to a valid single-compartment response covering the chunk. */
+/* */
 function installHistorianMatcher(h: TestHarness): void {
     h.mock.addMatcher((body) => {
         if (!isHistorianRequest(body)) return null;
@@ -133,7 +118,7 @@ function installHistorianMatcher(h: TestHarness): void {
 
 const MODEL_LIMIT = 100_000;
 
-// Below execute_threshold (20% of 100k = 20k) → defer pass.
+// Usage below `execute_threshold` (20,000 tokens) causes a DEFER pass.
 const DEFER_USAGE: MockUsage = {
     input_tokens: 2_000,
     output_tokens: 20,
@@ -141,7 +126,7 @@ const DEFER_USAGE: MockUsage = {
     cache_read_input_tokens: 2_000,
 };
 
-// Above execute_threshold → the next pass is an execute pass.
+// Usage above `execute_threshold` causes the next pass to execute.
 const EXECUTE_USAGE: MockUsage = {
     input_tokens: 30_000,
     output_tokens: 20,
@@ -149,7 +134,6 @@ const EXECUTE_USAGE: MockUsage = {
     cache_read_input_tokens: 0,
 };
 
-// High enough to trip the historian trigger (threshold-relative pressure).
 const HISTORIAN_TRIGGER_USAGE: MockUsage = {
     input_tokens: 90_000,
     output_tokens: 20,
@@ -186,7 +170,7 @@ function setDefer(text: string): void {
     h.mock.setDefault({ text, usage: DEFER_USAGE });
 }
 
-/** Emit a single ctx_reduce tool call on the first main-agent request that exposes it. */
+/** The mock emits one `ctx_reduce` tool call on the first main-agent request that exposes `ctx_reduce`. */
 function emitCtxReduceOnce(drop: string): void {
     let emitted = false;
     h.mock.addMatcher((body) => {
@@ -248,27 +232,25 @@ describe("cache invariants — replay class", () => {
     describe("#given a conversation that crossed an execute pass (A2)", () => {
         describe("#when defer passes follow the execute pass with continued growth", () => {
             it("#then defer passes after the execute settle to a stable prefix", async () => {
-                //#given — warm up, then a high-usage turn so the NEXT pass executes
+                // A high-usage turn after warm-up makes the next transform execute.
                 const sessionId = await h.createSession();
                 setDefer("A2 warmup 1");
                 await h.sendPrompt(sessionId, "A2 turn 1: warmup.");
                 setDefer("A2 warmup 2");
                 await h.sendPrompt(sessionId, "A2 turn 2: warmup.");
 
-                // High usage marks the next transform as an execute pass.
                 h.mock.setDefault({ text: "A2 high usage", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "A2 turn 3: high usage triggers an execute pass.");
 
-                // Now several defer turns. The execute pass may legitimately bust
-                // once (drops/markers materialize); the invariant is that the
-                // DEFER passes that follow it are byte-stable.
+                // The execute pass busts once when drops and markers materialize.
+                // DEFER passes following the execute pass are byte-stable.
                 const firstDeferIndex = h.mock.requests().length;
                 for (let i = 4; i <= 8; i++) {
                     setDefer(`A2 defer reply ${i}`);
                     await h.sendPrompt(sessionId, `A2 turn ${i}: defer growth after execute.`);
                 }
 
-                //#then — analyze only the post-execute defer window
+                // `findBusts` evaluates only the post-execute DEFER window.
                 const deferRequests = mainAgentRequests(h.mock.requests().slice(firstDeferIndex));
                 expect(deferRequests.length).toBeGreaterThanOrEqual(4);
                 const busts = findBusts(deferRequests);
@@ -310,15 +292,13 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                     ? "#then the one-time renderer transition folds into m[0], then defer replay freezes"
                     : "#then m[0] stays empty/frozen (SOFT) — the compartment rides m[1], never folds into m[0]",
                 async () => {
-                    //#given — TypeScript materializes an empty m[0] before the
-                    // compartment exists. Rust follows the same setup but may consume
-                    // a renderer transition when the first compartment appears.
+                    // TypeScript materializes an empty m[0] before the compartment exists.
+                    // Rust consumes a renderer transition when the first compartment appears.
                     installHistorianMatcher(h);
                     const sessionId = await h.createSession();
 
-                    // Force an early execute pass so m[0] materializes EMPTY
-                    // (0 compartments yet). A high-usage turn marks the next pass as
-                    // execute; the pass after it does the empty materialization.
+                    // An early execute pass materializes EMPTY m[0] before any compartments exist.
+                    // The pass after the execute pass materializes empty m[0].
                     setDefer("B9 warm 1");
                     await h.sendPrompt(sessionId, "B9 turn 1: warmup.");
                     h.mock.setDefault({
@@ -336,7 +316,6 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                     );
                     expect(m0BaselineEmpty).toContain("<session-history></session-history>");
 
-                    // Build an eligible tail, then trigger and run the historian.
                     for (let i = 4; i <= 11; i++) {
                         setDefer(`B9 reply ${i}`);
                         await h.sendPrompt(sessionId, `B9 turn ${i}: durable content for compartment chunk ${i}. ${h.ballast(3_000)}`);
@@ -347,9 +326,6 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                     await h.sendPrompt(sessionId, "B9 turn 13: follow-up starts + awaits the historian publish.");
 
                     if (RUST_MODE) {
-                        // a5b7d61d moved Rust publication to the out-of-band Broca
-                        // stack. The next real turn surfaces the committed module state
-                        // on the provider wire instead of waiting for a synthetic request.
                         await waitForRustCompartment(sessionId);
                         setDefer("B9 surface published Rust compartment");
                         await h.sendPrompt(sessionId, "B9 turn 14: surface the published compartment.");
@@ -360,9 +336,8 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                         });
                     }
 
-                    //#then — TypeScript keeps the additive publication in the m[1]
-                    // delta lane. Rust first consumes the pending hard transition for
-                    // this newly detected renderer shape, then replays that result.
+                    // TypeScript keeps the additive publication in m[1].
+                    // Rust consumes the pending hard transition for the newly detected renderer shape before replaying it.
                     const requests = mainAgentRequests(h.mock.requests());
                     const surfaceReq = RUST_MODE
                         ? requests.at(-1)
@@ -371,9 +346,6 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                     const m1 = wireValueText(extractM1(surfaceReq!.body));
                     const m0 = wireValueText(extractM0(surfaceReq!.body));
                     if (RUST_MODE) {
-                        // 887696d9 gives each newly detected renderer shape one hard
-                        // transition. cc842547 stores the consumed marker per shape, so
-                        // this compartment cannot fold again or receive another replay identifier.
                         expect(m0).toContain("Hermetic Broca chunk");
                         expect(m0).not.toBe(m0BaselineEmpty!);
                         expect(m1).not.toContain("<new-compartments>");
@@ -397,17 +369,13 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                         RUST_MODE ? "B9 turn 16: defer replay again." : "B9 turn 15: defer replay again.",
                     );
 
-                    // From the surface request through every subsequent defer-only
-                    // replay, both message lanes must remain byte-identical. The existing
-                    // delta or transition result is reused rather than rendered again.
+                    // Both message lanes remain byte-identical from the surface request through every subsequent defer-only replay.
                     const after = mainAgentRequests(h.mock.requests()).slice(surfaceIdx);
                     const m1s = new Set(after.map((r) => wireValueText(extractM1(r.body))));
                     const m0s = new Set(after.map((r) => wireValueText(extractM0(r.body))));
                     expect(m1s.size).toBe(1);
                     expect(m0s.size).toBe(1);
 
-                    // Whole-wire no-bust is asserted only over the trailing defer
-                    // pair. The surface request may legitimately bust once.
                     const replayPair = mainAgentRequests(h.mock.requests()).slice(-2);
                     const busts = findBusts(replayPair);
                     if (busts.length > 0) {

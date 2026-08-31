@@ -1,39 +1,22 @@
-// Channel 2 delivery: the synthetic-user-message ceiling nudge.
 //
-// The transform records a cycle-capped `pending` intent in `session_meta`
-// (`channel2_nudge_state`) when its persisted rendered-tail predicate holds.
-// This module DELIVERS that
-// intent from the event handler (`message.updated`, both mid-turn
-// "tool-calls" and final "stop" events), because `promptAsync` must run on an
-// event boundary, not mid-transform. Primary sessions keep both delivery
-// points; subagents are gated to a live run so a final "stop" cannot start a
-// follow-up turn. Mid-turn delivery is deliberate: the
-// queued user message is picked up by OpenCode's run loop at the next step
-// boundary, warning the agent WHILE the reclaimable pile is growing instead
-// of after the turn already ballooned.
+// The context-reduction transform records a cycle-capped pending intent in session_meta.
+// The message.updated handler delivers pending intents on tool-calls and stop events.
+// The event handler invokes promptAsync because promptAsync requires an event boundary.
+// Subagents deliver only during a live run so a final stop event cannot start a follow-up turn.
+// Mid-turn delivery lets the active run consume the queued nudge at its next step boundary.
 //
-// Lease state machine (cross-process CAS): pending -> claimed(token) -> delivered.
-//   - claim `pending -> claimed` with a per-claim token before send (so two
-//     processes can't both send from the same pending row)
-//   - on confirmed success: token-CAS `claimed -> delivered` (current tail-reset
+// Cross-process CAS transitions nudge state from pending to claimed(token) to delivered.
+// Each sender claims pending state with a unique token before sending to prevent duplicate sends.
+// After confirmed delivery, only the claiming token can transition state from claimed to delivered.
 //     cycle consumed)
-//   - on send failure: revert `claimed -> pending` (don't burn the one ceiling
-//     nudge on a transient transport error)
-//   - after a successful send: never revert to pending, even if confirmation
-//     fails; the user message may already exist and re-arming duplicates it. If
-//     a stale lease was healed and another process re-delivered, the token-CAS
-//     misses and we leave that authoritative row alone instead of blindly
+// On send failure, revert claimed state to pending so transient transport failures preserve the nudge.
+// After a successful send, never revert the claim to pending because the user message may already exist.
+// If a healed stale lease was re-delivered by another process, preserve the authoritative row when token-CAS misses.
 //     overwriting it.
 //
-// Delivery transport is the in-process client OpenCode hands the plugin
-// (`input.client`). On OpenCode >= 1.17.7 that client routes through the live
-// listener runtime when one exists, so `promptAsync` joins the in-flight runner
-// mid-turn (the synthetic nudge is queued and the existing run picks it up at
-// its next step) instead of starting a SECOND runner that would persist a
-// duplicate assistant message. Earlier OpenCode had that duplicate-runner bug
-// for plugin-issued prompts (anomalyco/opencode#28202), so we used to build a
-// separate client aimed at the live HTTP listener + a reachability probe to
-// avoid it; that's fixed upstream now, so the separate client + probe are gone.
+// On OpenCode >= 1.17.7, `deps.client` routes prompts through the live listener runtime when one exists.
+// promptAsync joins the in-flight runner when a live listener runtime exists.
+// Routing through the live listener prevents a second runner from persisting a duplicate assistant message.
 
 import { randomUUID } from "node:crypto";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
@@ -58,12 +41,10 @@ import { isMidTurn } from "./read-session-db";
 export interface Channel2DeliveryDeps {
     db: Database;
     /**
-     * The in-process client OpenCode hands the plugin (`input.client`). Channel 2
-     * delivers the synthetic-user ceiling nudge through `client.session.promptAsync`.
-     * No-op when absent (e.g. a context with no client wired).
+     * Channel 2 sends synthetic ceiling nudges through client.session.promptAsync; delivery is a no-op when client is absent.
      */
     client?: unknown;
-    /** Persisted reclaimable/total tail tokens, typed deltas, and generation validity. */
+    /** `baseline` persists reclaimable and total tail tokens, typed deltas, and generation validity. */
     baseline?: Channel2PredicateBaseline;
     oldestReclaimableToolTags?: readonly ToolReclaimHint[];
     /** Module-owned directives are already predicate-validated; preserve their text verbatim. */
@@ -73,12 +54,7 @@ export interface Channel2DeliveryDeps {
 /**
  * Return whether a pending nudge may be delivered to this session.
  *
- * Primary sessions retain the existing behavior: their Channel-2 message is
- * delivered at the event boundary even when the assistant has just stopped.
- * OpenCode subagents are different because the same prompt API starts a new
- * turn once their run is terminal. Their live-run test therefore fails closed
- * when the terminal assistant message is visible, and it is repeated after
- * claiming so a completion racing the claim cannot turn into a new run.
+ * Primary sessions deliver their Channel-2 message at the event boundary even when the assistant has stopped.
  */
 function subagentRunIsActive(deps: Channel2DeliveryDeps, sessionId: string): boolean {
     try {
@@ -127,16 +103,14 @@ function releaseClaimWithoutDelivery(db: Database, sessionId: string, claimToken
 }
 
 /**
- * Attempt to deliver a pending Channel 2 ceiling nudge for `sessionId`. Safe to
- * call on every step-boundary `message.updated`: it no-ops unless a `pending`
- * intent exists and a client is wired. Returns true only when a delivery was
- * confirmed (intent moved to `delivered`).
+ * The handler runs on every step-boundary `message.updated` event and no-ops unless a `pending` intent exists and a client is wired.
+ * Return true only after the intent transitions to `delivered`.
+ * Return true only after the intent transitions to `delivered`.
  */
 export async function maybeDeliverChannel2(
     sessionId: string,
     deps: Channel2DeliveryDeps,
 ): Promise<boolean> {
-    // Cheap pre-check: only proceed if an intent is pending.
     let state: string;
     try {
         state = getChannel2NudgeState(deps.db, sessionId);
@@ -146,19 +120,18 @@ export async function maybeDeliverChannel2(
     if (state !== "pending") return false;
 
     // A terminal subagent must never be re-awakened by a stale pending intent.
-    // Primary sessions intentionally keep their existing step-boundary behavior.
     if (!subagentRunIsActive(deps, sessionId)) {
         clearPendingChannel2Intent(deps.db, sessionId);
         return false;
     }
 
-    // Revalidate before delivering. Between arming and this step boundary the
-    // agent may have reduced or appended enough typed mass to change the saved
-    // predicate. A module directive is already validated by the module, so its
-    // lease skips this TypeScript baseline check and preserves its text.
+    // Revalidate before delivery because typed mass can change between arming and the next step boundary.
+    // Revalidate before delivery because typed mass can change between arming and the next step boundary.
+    // A module directive bypasses this TypeScript baseline check and supplies its own text.
+    // A module directive bypasses the TypeScript baseline check and preserves its text.
     //
-    // An unavailable or generation-invalidated baseline holds `pending`; a known
-    // false predicate cancels it to the re-armable empty state.
+    // An unevaluable baseline leaves `pending`; an evaluated false predicate clears it to `""`.
+    // An evaluated false predicate clears `pending` to the re-armable empty state.
     const evaluation = evaluateChannel2(deps.baseline);
     if (deps.directiveText === undefined && !evaluation.evaluable) {
         return false;
@@ -171,7 +144,7 @@ export async function maybeDeliverChannel2(
                 `channel2 intent cleared pre-delivery (U ${evaluation.reclaimableTokens}, T ${evaluation.tailTokens} — trigger no longer holds; re-armable)`,
             );
         } catch {
-            // best-effort; if the CAS fails the next pass re-evaluates.
+            // A later `message.updated` event re-evaluates any intent that remains `pending`.
         }
         return false;
     }
@@ -180,16 +153,16 @@ export async function maybeDeliverChannel2(
     const client = deps.client;
     if (!client) return false;
 
-    // Claim the intent before sending so a sibling process can't send from the
-    // same pending row; the token makes confirm/revert refuse healed stale leases.
+    // Claim the pending intent before sending so a sibling process cannot send it concurrently.
+    // The token makes confirm and revert reject healed stale leases.
     const claimToken = randomUUID();
     if (!claimChannel2NudgeState(deps.db, sessionId, claimToken)) {
         return false;
     }
 
     // The assistant can finish after the pre-check but before this delivery
-    // attempt acquires its claim. Release the claim without sending if that
-    // happens; the token prevents a concurrent lease from being changed.
+    // If the assistant finishes after the pre-check and before the claim is acquired, release only the matching claim without sending.
+    // The claimToken prevents release from changing a concurrent claim.
     if (!subagentRunIsActive(deps, sessionId)) {
         releaseClaimWithoutDelivery(deps.db, sessionId, claimToken);
         return false;
@@ -197,22 +170,12 @@ export async function maybeDeliverChannel2(
 
     try {
         const promptContext = await resolvePromptContext(client, sessionId);
-        // Module directives carry their own validated wording; host-triggered
-        // reminders use the measured reclaimable tail after the predicate above.
+        // Module directives supply `directiveText`; host-triggered reminders use the measured reclaimable tail.
         const reminder =
             deps.directiveText ?? buildChannel2Reminder(effectiveU, deps.oldestReclaimableToolTags);
 
         const body: Record<string, unknown> = {
             noReply: false,
-            // synthetic: true — this is an agent-directed nudge, not a real user
-            // turn. It still drives the run loop and reaches the model (OpenCode
-            // serializes on !ignored && text!=="", and MessageV2.latest/the run
-            // loop ignore `synthetic`), but it (a) skips OpenCode's queued-message
-            // `<system-reminder>…Please address…` wrapper — which would otherwise
-            // double-wrap our reminder AND flip wrapped↔unwrapped as lastFinished
-            // advances, busting the prefix cache (issue #129 class) — and (b)
-            // drops out of the TUI user-message render. MUST NOT be paired with
-            // `ignored: true` (that would strip it from the model call).
             parts: [{ type: "text", text: reminder, synthetic: true }],
         };
         if (promptContext?.agent) body.agent = promptContext.agent;
@@ -237,16 +200,15 @@ export async function maybeDeliverChannel2(
             );
             return false;
         }
-        // resolvePromptContext yielded to the host. Re-check immediately before
-        // promptAsync: a child that completed while the claim was queued must
-        // leave its report as the last message, not start a follow-up turn.
+        // The code re-checks subagentRunIsActive immediately before promptAsync because resolvePromptContext can yield to the host.
+        // A child that completes while its claim is queued must leave its report as the last message rather than start a follow-up turn.
+        // A child that completes while its claim is queued must leave its report as the last message rather than start a follow-up turn.
         if (!subagentRunIsActive(deps, sessionId)) {
             releaseClaimWithoutDelivery(deps.db, sessionId, claimToken);
             return false;
         }
         await session.promptAsync({ path: { id: sessionId }, body });
     } catch (error) {
-        // Revert only when the send itself failed. Once promptAsync returns, the
         // synthetic user message may already exist; re-arming can duplicate it.
         try {
             const restored = casChannel2NudgeClaim(deps.db, sessionId, "pending", claimToken);
@@ -274,7 +236,7 @@ export async function maybeDeliverChannel2(
     }
 
     try {
-        // Confirmed: consume the current tail-reset cycle. The CAS result is
+        // A successful CAS consumes the current tail-reset cycle.
         // authoritative; a stolen/expired claim must not be treated as delivered.
         const confirmed = casChannel2NudgeClaim(deps.db, sessionId, "delivered", claimToken);
         if (confirmed) {
@@ -288,8 +250,7 @@ export async function maybeDeliverChannel2(
         );
         return false;
     } catch (error) {
-        // Post-send DB failure: do NOT revert to pending, because the send already
-        // happened and retrying risks a duplicate ceiling nudge.
+        // Do not revert to pending after a post-send DB failure: retrying could send a duplicate ceiling nudge.
         sessionLog(
             sessionId,
             "channel2 ceiling nudge sent but token-confirm failed; lease state left unchanged:",

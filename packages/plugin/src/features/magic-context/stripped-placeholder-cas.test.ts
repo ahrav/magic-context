@@ -66,14 +66,9 @@ describe("applyStrippedPlaceholderDelta (CAS)", () => {
     });
 
     it("merge semantics: a stale-read add does not undo a concurrent remove", () => {
-        // Simulate the race the CAS prevents: process A reads {a,b}, process B
-        // removes 'a' (set now {b}), then A applies its add-delta {add:c}. With a
-        // whole-set overwrite A would write {a,b,c} (resurrecting 'a'); with the
-        // delta CAS, A re-reads {b} and writes {b,c}.
+        // The CAS applies an add delta without restoring IDs removed after the caller read the set.
         setStrippedPlaceholderIds(db, ses, new Set(["a", "b"]));
-        // B's concurrent remove lands first:
         applyStrippedPlaceholderDelta(db, ses, { remove: ["a"] });
-        // A's delta is computed against a fresh read inside the helper:
         applyStrippedPlaceholderDelta(db, ses, { add: ["c"] });
         expect(getStrippedPlaceholderIds(db, ses)).toEqual(new Set(["b", "c"]));
     });

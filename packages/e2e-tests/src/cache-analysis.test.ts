@@ -12,13 +12,7 @@ import { MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES } from "../../plugin/src/hooks/
 import { HISTORIAN_SYSTEM_MARKER_FOR_DRIFT_TEST } from "./incident-pool/support/tool-loop";
 
 /**
- * Unit coverage for the cache-bust oracle itself.
  *
- * The oracle is the assertion engine the live cache-invariant e2e suite leans
- * on, so it must be proven against hand-crafted wire shapes first — especially
- * the exact "mid-prefix message vanishes + tail shifts" shape that the stale
- * ctx_reduce regression produced (a real bust that the old prefix-equality
- * loops would also have caught, but only by luck of message alignment).
  */
 
 const MC_SYSTEM = "## Magic Context\nyou are a long-term partner.";
@@ -29,13 +23,7 @@ function req(messages: Array<{ role: string; content: unknown; bp?: boolean }>) 
             system: MC_SYSTEM,
             messages: messages.map((m) => ({
                 role: m.role,
-                // Real OpenCode wire keeps a message's content shape stable across
-                // turns; only the cache_control marker moves. Render every message
-                // in the identical block-array form so a message looks the same
-                // whether it sits in the tail (with breakpoint) or the prefix
-                // (breakpoint moved on). The oracle strips cache_control before
-                // hashing, so the only difference between tail and prefix is the
-                // (stripped) marker — never the content shape.
+                // The fixture preserves content representations across requests.
                 content: m.bp
                     ? [{ type: "text", text: String(m.content), cache_control: { type: "ephemeral" } }]
                     : Array.isArray(m.content)
@@ -46,7 +34,7 @@ function req(messages: Array<{ role: string; content: unknown; bp?: boolean }>) 
     };
 }
 
-/** A user turn whose final message carries the moving cache_control breakpoint. */
+/* */
 function turn(prefix: Array<{ role: string; content: string }>, tail: string) {
     return req([...prefix.map((m) => ({ ...m })), { role: "user", content: tail, bp: true }]);
 }
@@ -55,15 +43,10 @@ describe("cache-bust oracle", () => {
     describe("#given a stable growing conversation", () => {
         describe("#when each request extends the tail past the moving breakpoint", () => {
             it("#then every pass after the base is STABLE with zero busts", () => {
-                //#given — model how adjacent real requests grow: the prior tail
-                // message keeps its exact bytes (its breakpoint moves on, which the
-                // oracle strips) and the new request appends one fresh tail message
-                // carrying the breakpoint. The cached prefix only extends forward.
                 const prefix: Array<{ role: string; content: string }> = [];
                 const requests = [];
                 for (let i = 1; i <= 4; i++) {
                     requests.push(turn(prefix, `turn ${i}`));
-                    // The just-sent tail becomes part of the unchanging prefix.
                     prefix.push({ role: "user", content: `turn ${i}` });
                 }
 
@@ -92,7 +75,6 @@ describe("cache-bust oracle", () => {
     describe("#given a mid-prefix message mutating in place", () => {
         describe("#when an earlier message's content changes between passes", () => {
             it("#then it is flagged BUST at that message, before the final breakpoint", () => {
-                //#given — message[1] content drifts while the tail breakpoint moves on
                 const before = turn(
                     [
                         { role: "user", content: "u1" },
@@ -122,9 +104,6 @@ describe("cache-bust oracle", () => {
     describe("#given the stale-ctx_reduce regression shape", () => {
         describe("#when a mid-prefix message is removed and the tail shifts up", () => {
             it("#then the oracle flags a BUST at the vanished position", () => {
-                //#given — pass 1 has the ctx_reduce tool_use at message[1]; pass 2 has
-                // it spliced out (sentinel filtered before wire), so message[1] becomes
-                // what used to be message[2] and the array is one shorter in the middle.
                 const withReduce = turn(
                     [
                         { role: "user", content: "keep me 0" },
@@ -137,7 +116,6 @@ describe("cache-bust oracle", () => {
                 const reduceGone = turn(
                     [
                         { role: "user", content: "keep me 0" },
-                        // message[1] (the ctx_reduce) vanished; everything shifts up
                         { role: "user", content: "keep me 2" },
                         { role: "assistant", content: "keep me 3" },
                     ],
@@ -147,8 +125,6 @@ describe("cache-bust oracle", () => {
                 //#when
                 const busts = findBusts([withReduce, reduceGone]);
 
-                //#then — first divergence at message[1] (the shift), well before the
-                // final breakpoint → real bust.
                 expect(busts).toHaveLength(1);
                 expect(busts[0].divergeSegmentId).toContain("message[1]");
             });
@@ -180,7 +156,7 @@ describe("cache-bust oracle", () => {
     describe("#given only the cache_control marker moves", () => {
         describe("#when content is identical but the breakpoint walks forward", () => {
             it("#then it is NOT a bust (marker movement is normalized out)", () => {
-                //#given — same two messages; breakpoint on msg[0] in pass 1, msg[1] in pass 2
+                // Pass 1 places the breakpoint on message[0]; pass 2 places it on message[1].
                 const a = {
                     body: {
                         system: MC_SYSTEM,
@@ -200,7 +176,7 @@ describe("cache-bust oracle", () => {
                     },
                 };
 
-                //#when / #then — marker movement stripped before hashing → SAME
+                // Hashing strips breakpoint-marker movement, so the requests are SAME.
                 expect(findBusts([a, b])).toHaveLength(0);
                 expect(analyzePasses([a, b])[1].verdict).toBe("SAME");
             });
@@ -284,14 +260,9 @@ describe("cache-bust oracle", () => {
     describe("#given the historian selector in the incident-pool tool loop", () => {
         describe("#when the shared production signature changes", () => {
             it("#then the narrower selector marker must still be contained by it", () => {
-                // Two predicates coexist on purpose: the broad hidden-agent
-                // filter here excludes every non-main-agent request, while the
-                // tool-loop selector answers only the historian, so collapsing
-                // them would make historian matchers reply to the dreamer,
-                // sidekick, and OpenCode's title/summary/compaction agents too.
-                // What must not drift is the identity text. Pin containment so
-                // editing the production opener fails here rather than silently
-                // leaving the selector matching nothing.
+                // The hidden-agent filter excludes non-main-agent requests; the tool-loop selector matches only historian requests.
+                // Collapsing the broad hidden-agent filter and the tool-loop selector would make historian matchers reply to the dreamer, sidekick, and OpenCode's title, summary, and compaction agents.
+                // The assertion fails when selector drift removes `HISTORIAN_SYSTEM_MARKER_FOR_DRIFT_TEST` from the production signature.
                 const historianSignature = MAGIC_CONTEXT_INTERNAL_AGENT_SIGNATURES.find(
                     (signature) => signature.includes("Historian"),
                 );

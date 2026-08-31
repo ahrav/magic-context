@@ -136,8 +136,7 @@ import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import { maybeSendUpgradeReminder } from "./upgrade-reminder";
 
 const DREAM_SCHEDULE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
-// NOTE: lastScheduleCheckMs is intentionally inside createMagicContextHook (not module scope)
-// so each hook instance has independent dream-schedule tracking across projects.
+// `createMagicContextHook` owns `lastScheduleCheckMs` so each hook instance tracks its dream schedule independently across projects.
 
 export interface MagicContextDeps {
     client: PluginContext["client"];
@@ -167,9 +166,9 @@ export interface MagicContextDeps {
             enabled: boolean;
             injection_budget_tokens: number;
             /** When true, historian/recomp auto-promote eligible session facts
-             *  to project memories. When false, promotion is skipped. Issue #44. */
+             * */
             auto_promote?: boolean;
-            /** Graduated from experimental.auto_search; now memory-scoped. */
+            /* */
             auto_search?: {
                 enabled: boolean;
                 score_threshold: number;
@@ -183,9 +182,8 @@ export interface MagicContextDeps {
         dreamer?: DreamerConfig;
         smart_notes?: { retina_handoff?: boolean };
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
-        /** Issue #53: per-agent system-prompt injection opt-out. Optional in
-         *  the inline type so legacy tests/callers don't have to construct it;
-         *  Zod's .default() guarantees it's present in real loaded configs. */
+        /** Optional because Zod `.default()` supplies it in loaded configs.
+         * */
         system_prompt_injection?: { enabled: boolean; skip_signatures: string[] };
         temporal_awareness?: boolean;
         caveman_text_compression?: {
@@ -194,23 +192,22 @@ export interface MagicContextDeps {
         };
         transform_mode?: ResolvedTransformMode;
         subc?: { connection_file: string };
-        /** Compaction-off mode gate (issue #266). Resolved ONCE here at the
-         *  session-hook construction boundary via isCompactionEnabled; the
-         *  resolved boolean is threaded to the transform phases. */
+        /** `createMagicContextHook` calls `isCompactionEnabled` once at construction and passes its result to transform phases.
+         * */
         compaction?: { enabled?: boolean };
         mural?: { enabled: boolean; model?: string };
     };
-    /** Registration-owned prompt-surface loader shared with the tool registry. */
+    /** Registration owns `promptSurfaceRuntime` and shares it with the tool registry. */
     promptSurfaceRuntime?: PromptSurfaceRuntime;
-    /** Test seam for the Rust authority adapter; production creates the subc client. */
+    /** `rustModeModuleClient` lets tests replace the Rust authority adapter; production creates the subc client. */
     rustModeModuleClient?: RustModeModuleClient;
-    /** Test and async-boot seam for supplying a database already opened by the caller. */
+    /** `openDatabaseForHook` lets tests and async boot supply an already-open database. */
     openDatabaseForHook?: () => Database | null;
 }
 
 function notifyMagicContextDisabled(client: PluginContext["client"], reason: string): void {
     const detail = reason.trim();
-    // Intentional: feature-detection cast for optional/experimental OpenCode tui.showToast API
+    // `tui.showToast` is optional in the experimental OpenCode API.
     const c = client as {
         tui?: {
             showToast?: (input: {
@@ -247,8 +244,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const contextUsageMap = new Map<string, { usage: ContextUsage; updatedAt: number }>();
     let db: Database;
     try {
-        // Clear any prior init-failure latch so a successful reopen (or a
-        // non-storage null like home-directory) does not leave a stale arm.
+        // A successful reopen or non-storage null clears the init-failure latch.
         clearHookInitFailure();
         const opened = deps.openDatabaseForHook ? deps.openDatabaseForHook() : openDatabase();
         if (!opened || !isDatabasePersisted(opened)) {
@@ -307,10 +303,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         return null;
     }
 
-    // Startup consistency check: reconcile any compaction markers whose state
-    // references rows that no longer exist in OpenCode's DB. This can happen
-    // if the plugin crashed between DB writes (context.db + opencode.db are
-    // separate stores with no cross-DB transaction) or if OpenCode's DB was
+    // Startup reconciles compaction markers that reference missing OpenCode DB rows after crashes between database writes.
     // modified externally.
     try {
         checkCompactionMarkerConsistency(db);
@@ -321,22 +314,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     let lastScheduleCheckMs = 0;
     let dreamQueueQuietScheduled = false;
 
-    // Derive historian chunk budget from the historian model's own context window.
-    // Historian is a single-shot summarizer, so its input is bounded by its OWN
-    // context, not the main session model's. Re-derived per historian invocation
-    // (matching RPC/TUI paths) so config/model changes take effect without
-    // restart, and so all trigger sources produce consistent chunk sizes.
+    // The historian derives chunk budget from its model's context window.
     const getHistorianChunkTokens = (): number =>
         deriveHistorianChunkTokens(resolveHistorianContextLimit(deps.config.historian?.model));
     const historianFallbackModels = resolveFallbackChain(deps.config.historian?.fallback_models);
 
-    // Three independent cache-busting signal sets, sourced from the
-    // process-scoped LiveSessionState so RPC handlers (TUI recomp) can
-    // share the same instances as the hook (server /ctx-recomp). When
-    // `liveSessionState` is omitted (test-only path), fall back to local
-    // sets — the production index.ts always provides one. See
-    // live-session-state.ts and hook-handlers.ts doc-comments for the
-    // full split rationale.
+    // `LiveSessionState` owns three independent cache-busting signal sets so RPC handlers and the hook share them; tests without it use local sets.
     const historyRefreshSessions =
         deps.liveSessionState?.historyRefreshSessions ?? new Set<string>();
     const deferredHistoryRefreshSessions =
@@ -348,9 +331,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const deferredMaterializationSessions =
         deps.liveSessionState?.deferredMaterializationSessions ?? new Set<string>();
 
-    // If the process exits after saving pending_compaction_marker_state, reload
-    // both deferred signal sets from that saved state. The next transform pass can
-    // then apply the pending marker exactly like the live publish path would.
+    // On restart, the hook reloads deferred signal sets from `pending_compaction_marker_state` so the next transform applies the pending marker.
     try {
         const sessionsWithPending = getSessionsWithPendingMarker(db);
         if (sessionsWithPending.length > 0) {
@@ -376,8 +357,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const sessionDirectoryBySession =
         deps.liveSessionState?.sessionDirectoryBySession ?? new Map<string, string>();
     const internalChildSessions = deps.liveSessionState?.internalChildSessions ?? new Set<string>();
-    // Recomp/upgrade progress map — shared with the RPC sidebar/status snapshot
-    // when liveSessionState is provided (production), local fallback in tests.
+    // The map stores recomp/upgrade progress shared with the RPC sidebar/status snapshot.
     const recompProgressBySession =
         deps.liveSessionState?.recompProgressBySession ??
         new Map<string, import("./compartment-runner-types").RecompProgress>();
@@ -387,24 +367,20 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             string,
             import("../../features/magic-context/dreamer/task-registry").DreamTaskProgress
         >();
-    // Channel 1 (ctx_reduce tool-output nudge) per-session metric baseline.
-    // Written at the end of each transform pass (post-drop), read in
-    // tool.execute.after. Only populated for primary sessions.
+    // The per-session metric baseline tracks Channel 1 (`ctx_reduce` tool-output nudges).
+    // The map is written after each transform pass and read by `tool.execute.after`; only primary sessions populate it.
     const channel1StateBySession =
         deps.liveSessionState?.channel1StateBySession ??
         new Map<string, import("./ctx-reduce-nudge").Channel1State>();
     const channel2DirectiveTextBySession = new Map<string, string>();
 
     /**
-     * Return the live provider/model for a session.
      *
-     * Prefers the in-memory `liveModelBySession` map populated by transform passes
-     * and `chat.message` hooks. When the map is empty (for example `/ctx-status`
-     * is invoked before any transform pass has run since restart), falls back to
-     * reading the last assistant message from OpenCode's SQLite DB and caches the
-     * result so subsequent calls in the same process don't hit the DB again.
+     * `resolveLiveModel` prefers entries in `liveModelBySession` populated by transform passes.
+     * `resolveLiveModel` falls back to the database when `/ctx-status` runs before a transform pass populates `liveModelBySession`.
+     * `resolveLiveModel` reads the last assistant model from OpenCode's SQLite DB when the map lacks a session.
+     * `resolveLiveModel` caches the database result so later calls in the process avoid another database read.
      *
-     * Returns undefined only for brand-new sessions with no assistant turn yet.
      */
     const resolveLiveModel = (
         sessionId: string,
@@ -440,23 +416,17 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const dreamerRunnable = isDreamerRunnable(deps.config);
     const dreamerConfig = dreamerRunnable ? deps.config.dreamer : undefined;
     const historianRunnable = isHistorianRunnable(deps.config);
-    // Compaction-off mode (issue #266), resolved once at this construction
-    // boundary and threaded to every phase as a boolean — internal phases
-    // never re-read the config path.
+    // `createMagicContextHook` resolves `compactionOff` once so phases receive a boolean without rereading configuration.
     const compactionOff = !isCompactionEnabled(deps.config);
 
-    // Shared context for the recomp/upgrade orchestrator. Both `/ctx-recomp` and
-    // `/ctx-session-upgrade` (command paths) build this so they run through the
-    // exact same runner as the RPC dialog paths — identical fallback, progress,
-    // and terminal state. `fallbackModelId` is resolved here with the OpenCode-DB
-    // recovery (resolveLiveModel) so the last-resort fallback model is known even
-    // when a command is invoked before the first transform pass populates the map.
+    // `/ctx-recomp`, `/ctx-session-upgrade`, and RPC dialogs share one recomp/upgrade context.
+    // The command and RPC dialog paths use one runner with the same fallback policy, progress state, and terminal state.
+    // `resolveLiveModel` resolves `fallbackModelId` with OpenCode database recovery.
+    // `resolveLiveModel` recovers the fallback model before a transform pass populates `liveModelBySession`.
     const buildManagedRecompCtx = (sessionId: string): ManagedRecompContext => ({
         client: deps.client,
         db,
-        // Pass the SAME map/set instances the hook uses so the orchestrator's
-        // writes (progress, session-dir cache, refresh signals) propagate to the
-        // shared live state — and the next transform pass + RPC sidebar see them.
+        // The orchestrator must share the hook's map and set instances so its writes reach the next transform pass and RPC sidebar.
         liveSessionState: {
             liveModelBySession,
             channel1StateBySession,
@@ -484,10 +454,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         })(),
         historianTwoPass: deps.config.historian?.two_pass === true,
-        // Option C privacy gate: behavioral observation candidates are collected
-        // during historian runs only when the user has SCHEDULED the
-        // review-user-memories task (schedule != ""). Replaces the v1
-        // user_memories.enabled flag that gated both collection and review.
+        // Historian runs collect behavioral observation candidates only when `review-user-memories.schedule !== ""`.
         userMemoriesEnabled: userMemoryCollectionEnabled(dreamerConfig),
         ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
         getNotificationParams: (sid) =>
@@ -528,8 +495,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             systemPromptRefreshSessions.has(sid) ||
             pendingMaterializationSessions.has(sid),
     });
-    // /ctx-embed start: backfill THIS session's compartment chunk embeddings,
-    // reusing the recomp progress surface (sidebar + status bar) with kind="embed".
+    // Embed backfills reuse the recompilation progress UI with kind="embed".
     const executeEmbedHistory = async (
         sessionId: string,
         options?: { signal?: AbortSignal; silent?: boolean },
@@ -538,9 +504,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             return "Memory is disabled for this project, so there is no semantic embedding to backfill.";
         }
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
-        // Idempotent start: if a drain is already running for this session, don't
-        // abort it and re-acquire — that races the just-released lease and returns
-        // "busy", killing the active run for nothing. Just report it's running.
+        // A start without a signal must not abort an active drain; reacquiring the active drain's lease can return "busy" and terminate the run.
         const active = embedRunStateBySession.get(sessionId);
         if (active && !active.signal.aborted && !options?.signal) {
             return "Embedding is already running for this session.";
@@ -583,9 +547,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 },
             });
         } finally {
-            // Always release the per-session controller, even if the drain threw
-            // (a release-time SQLite error, etc.) — otherwise a stale controller
-            // would make every later start return "already running".
+            // The drain must release the per-session controller after failures; otherwise later starts report "already running".
             if (embedRunStateBySession.get(sessionId) === controller) {
                 embedRunStateBySession.delete(sessionId);
             }
@@ -616,9 +578,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     "Embedding is already running for this project. Try again shortly.",
                 );
             case "aborted": {
-                // A drain only aborts via user pause (or session teardown). Render
-                // it as the neutral "skipped" terminal — NOT "done", which the
-                // sidebar shows as a green "✓ Embed complete" that wrongly reads as
+                // An aborted drain must render as "skipped", not "done", because the sidebar renders "done" as "✓ Embed complete".
                 // finished.
                 const cov = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
                 const msg = `Paused at ${cov.session.embedded}/${cov.session.total} compartments embedded.`;
@@ -679,12 +639,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         void (async () => {
             let completedDrainWithWork = false;
             try {
-                // Defer off the transform thread BEFORE any DB/config work.
-                // ensureProjectRegisteredFromOpenCodeDirectory is `async` but does
-                // its config load + stale-embedding wipe SYNCHRONOUSLY (no internal
-                // await), so awaiting it as the first statement would run that work
-                // on the transform's return path. A macrotask yield lets the
-                // transform return first, keeping the hot path clean.
+                // Registration synchronously loads configuration and wipes stale embeddings; yielding first keeps that work off the transform return path.
                 await new Promise((resolve) => setTimeout(resolve, 0));
                 await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
                 const sessionProjectIdentity = resolveProjectIdentityForSession(
@@ -732,8 +687,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const sidekickRunnable = isSidekickRunnable(deps.config);
     const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
-    // Build the same subc-backed client for the TS recovery arm. Constructing the
-    // transport is inert; it connects only if a marker actually needs draining.
+    // The subc-backed transport connects only when a marker requires draining.
     const authorityRecoveryModuleClient =
         deps.rustModeModuleClient ??
         (() => {
@@ -749,11 +703,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 authoritySeed: (args) => transport.authoritySeed(args),
                 authorityDrain: (args) => transport.authorityDrain(args),
                 mirrorPull: (args) => transport.mirrorPull(args),
-                // The claim lanes are optional on the interface but mandatory in
-                // rust transform mode: this object *is* `rustModeModuleClient`
-                // there. Omitting them makes every ctx_memory mutation fail its
-                // availability guard and leaves the mirror sync reporting
-                // `unavailable`, so the whole claim feature is inert.
+                // In Rust transform mode, rustModeModuleClient must include the claim lanes.
+                // Omitting the claim lanes makes every ctx_memory mutation fail its availability guard.
+                // When claim lanes are omitted, mirror sync reports "unavailable".
                 claimIntentStage: (args) => transport.claimIntentStage(args),
                 claimIntentInspect: (args) => transport.claimIntentInspect(args),
                 claimIntentAck: (args) => transport.claimIntentAck(args),
@@ -824,9 +776,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             if (!response.page.has_more || next === cursor) break;
         }
     };
-    // Chained process-globally per (store, domain): several plugin instances
-    // can share this database file, and interleaved pulls throw a cursor
-    // mismatch in applyMirrorPage.
+    // Chain pulls process-globally by (store, domain) because plugin instances can share a database and interleaved pulls cause applyMirrorPage cursor mismatches.
     const syncModuleDomain = (domain: "notes"): Promise<void> =>
         chainMirrorDomainSync(db, domain, () => runModuleDomainSync(domain));
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
@@ -900,8 +850,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               },
                           },
                       });
-                      // The module is authoritative, but context.db remains the local
-                      // read model for note nudges and dashboard/RPC consumers.
+                      // `rustModeModuleClient` is authoritative; `context.db` is the local read model for note nudges and dashboard/RPC consumers.
                       await syncModuleNotes();
                       return response;
                   },
@@ -993,20 +942,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       getModuleNoteEvaluationBridge(evaluationProjectPath)?.available() === true,
               }
             : undefined;
-    // Bridges are per resolved project, and sessions can resolve projects other
-    // than the plugin's launch directory (a /cd switch, multi-project hosts).
-    // Registration is therefore an idempotent ensure invoked for every project
-    // that reaches rust-mode preparation, not a one-shot at construction.
+    // Bridges are per resolved project because sessions can resolve projects other than the plugin's launch directory through /cd switches or multi-project hosts.
+    // Registration is an idempotent ensure for every project that reaches Rust-mode preparation.
     const evaluatorTransport = rustModeModuleClient
         ? new McHostModuleTransport(deps.config.subc?.connection_file)
         : undefined;
-    // Bridge keys this hook instance registered. Instance disposal must tear
-    // down only these: the registry is process-global and Desktop hosts several
-    // plugin instances in one process.
+    // Instance disposal must remove only bridge keys registered by this hook instance because the registry is process-global.
     const ownedBridgeProjects = new Set<string>();
-    // The bridge runs the same task as the scheduled evaluate-smart-notes
-    // sweep, so its LLM helpers follow the same model ladder (task override →
-    // dreamer model, with the configured fallback chain).
+    // The bridge uses the scheduled evaluate-smart-notes model ladder: task override, then dreamer model, then configured fallbacks.
     const evaluatorTaskConfig = dreamerConfig
         ? buildDreamTaskRuntimeConfigs(dreamerConfig).find(
               (config) => config.task === "evaluate-smart-notes",
@@ -1017,26 +960,19 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         bridgeProjectRoot: string,
     ): void => {
         if (!rustModeModuleClient?.mirrorPull || !evaluatorTransport) return;
-        // A disabled dreamer schedules no drains: an advertised evaluator with
-        // no drain path would accept conditioned notes that then sit pending
-        // forever. Without a registration the live-evaluator gate fails closed
-        // at write time instead.
+        // Without a drain path, conditioned notes remain pending forever.
+        // Without registration, the live-evaluator gate rejects conditioned writes.
         if (!dreamerRunnable) return;
-        // A disabled per-task schedule ("" = never due) disables evaluation the
-        // same way: the timer drain is unconditional once a bridge exists, so
-        // honoring the task disable means no registration — conditioned writes
-        // fail closed at write time, and no billable compile/fallback work runs.
+        // An empty per-task schedule means the task is never due, so do not register a bridge.
+        // A bridge's timer drain runs unconditionally.
+        // Skipping registration for a disabled task makes conditioned writes fail closed.
         if ((evaluatorTaskConfig?.schedule ?? "").trim() === "") return;
-        // Keyed by identity AND root: two worktrees of one repository share a
-        // project identity, and discarding the second bridge would evaluate
-        // its file-dependent conditions against the first checkout.
+        // Bridge keys include identity and root because worktrees share repository identity.
+        // A shared bridge evaluates file-dependent conditions in the first checkout.
         const bridgeKeyId = moduleNoteEvaluationBridgeKey(bridgeProjectPath, bridgeProjectRoot);
         const existingBridge = getModuleNoteEvaluationBridge(bridgeProjectPath, bridgeProjectRoot);
         if (existingBridge) {
-            // Another plugin instance already registered this exact bridge.
-            // Record shared ownership (once per instance) so that instance's
-            // disposal cannot tear down a bridge this one still routes
-            // conditioned writes and drains through.
+            // Each instance records ownership once so disposing one instance cannot remove a bridge another instance still uses.
             if (!ownedBridgeProjects.has(bridgeKeyId)) {
                 const retained = retainModuleNoteEvaluationBridge(
                     bridgeProjectPath,
@@ -1044,29 +980,26 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 );
                 if (retained) ownedBridgeProjects.add(retained);
             }
-            // The eager boot registration can run before authority preparation
-            // flips notes to MODULE and be rejected; preparation re-invokes
-            // this ensure, so retry the registration here instead of leaving
-            // conditioned writes refused until a timer drain recovers it.
+            // Boot registration can precede authority preparation and be rejected.
+            // The existing bridge retries registration so conditioned writes are not refused before the timer drain registers the bridge.
             void existingBridge.ensureRegistered?.().catch((error) => {
                 log(`[magic-context] evaluator registration retry failed: ${error}`);
             });
             return;
         }
-        // The module derives evaluator scope from the server-side route root,
-        // and filesystem capabilities resolve against the checkout, so both
-        // must use the prepared project's root — not the plugin launch
-        // directory — or the bridge registers against and drains the wrong
+        // The module derives evaluator scope from the server-side route root.
+        // Filesystem capabilities resolve against the checkout.
+        // The bridge uses the prepared project's root rather than the plugin launch directory.
+        // Otherwise, the bridge registers against and drains the wrong project's notes.
         // project's notes.
         const capabilityFactory = (signal: AbortSignal) =>
             createSmartNoteCapabilities({ projectRoot: bridgeProjectRoot, signal });
-        // Evaluator LLM children need a parent session so they nest in the
-        // picker and recordChildInvocation captures their token telemetry
-        // (both require a parent id). Resolved per claim: the bridge outlives
-        // any one session, so a memoized id would go stale. The SDK call has
-        // no abort plumbing, so it races the claim's signal and a hard
-        // timeout — a stalled lookup would otherwise pin the claim executor
-        // while lease renewals keep it alive and dispose() waits forever.
+        // Evaluator LLM children need a parent session for trace nesting.
+        // A parent ID nests evaluator children in the picker and lets recordChildInvocation capture their token telemetry.
+        // The bridge resolves the parent ID per claim because the bridge can outlive a session.
+        // deps.client.session.list lacks abort support, so the lookup races the claim signal and a 5-second timeout.
+        // A stalled lookup pins the claim executor.
+        // Lease renewals keep the claim alive, so dispose() waits for the stalled lookup.
         const resolveEvaluatorParentSession = async (
             signal: AbortSignal,
         ): Promise<string | undefined> => {
@@ -1122,10 +1055,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                         signal,
                     }),
             },
-            // No pre-reserved sandbox slot: each QuickJS execution serializes
-            // itself for exactly its own window. Wrapping these in a held
-            // reservation would keep the process-wide slot across the compile and
-            // fallback LLM round-trips, stalling every other project's sweep.
+            // Each QuickJS execution reserves a sandbox slot only for its own execution window.
+            // Holding a reservation spans more than the QuickJS execution window.
+            // A held reservation occupies the process-wide slot during compile and fallback LLM calls.
+            // A held reservation stalls other projects' sweeps during fallback LLM calls.
             executors: (snapshot, signal, deadline) => ({
                 compile: async () =>
                     compileSmartNoteCheck({
@@ -1181,22 +1114,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 const wakeReleased = workerPolicy.wakeOwned && !wakePresent;
                 workerPolicy.wakeOwned = wakePresent;
                 if (wakePresent) {
-                    // The wake plane owns standalone evaluations: claim no work
-                    // locally, but keep the registration and its policy live so
-                    // the module can apply the wake-owner veto and a failed
-                    // boot registration still recovers on the timer.
                     if (worker.registered) await worker.heartbeat();
                     else await worker.register(drainArgs.signal);
-                    // The remote evaluator still surfaces notes in the module;
-                    // pull the changefeed so nudges and the dashboard see them.
                     await syncModuleNotes();
                     return { claimed: 0, completed: 0, abandoned: 0, surfaced: 0, drained: true };
                 }
-                // Polls carry no policy fields, so after a present-to-absent
-                // wake transition the module still holds wake_owned=true and
-                // vetoes every poll until a heartbeat publishes the release.
-                // Publish it before polling; otherwise pending work waits out
-                // a full timer period.
                 if (wakeReleased && worker.registered) await worker.heartbeat();
                 const result = await worker.drainOnce(drainArgs);
                 await syncModuleNotes();
@@ -1205,8 +1127,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             dispose: () => worker.dispose(),
         });
         ownedBridgeProjects.add(bridgeKey);
-        // Register eagerly so conditioned ctx_note writes pass the
-        // live-evaluator gate before the first drain.
         void worker.register().catch((error) => {
             log(`[magic-context] evaluator registration failed: ${error}`);
         });
@@ -1265,8 +1185,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             ? {
                   enabled: deps.config.memory.enabled,
                   injectionBudgetTokens: deps.config.memory.injection_budget_tokens,
-                  // Issue #44: thread auto_promote through. Default true to
-                  // preserve historical behavior when the field is missing.
                   autoPromote: deps.config.memory.auto_promote ?? true,
               }
             : undefined,
@@ -1302,8 +1220,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historianTwoPass: deps.config.historian?.two_pass === true,
         liveModelBySession,
         sessionDirectoryBySession,
-        // Keep the resolved controls available to both renderers. Rust mode must receive
-        // an explicit false here rather than falling back to the module default.
         autoSearch: {
             enabled: deps.config.memory?.auto_search?.enabled ?? true,
             scoreThreshold: deps.config.memory?.auto_search?.score_threshold ?? 0.6,
@@ -1311,10 +1227,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             directory: deps.directory,
             ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
         },
-        // Age-tier caveman text compression is an opt-in primary-session pass.
-        // Subagents are excluded in transform.ts because their context is curated
-        // by the parent and they have no ctx_expand recovery path.
-        // Compaction-off: caveman is compaction machinery — never forwarded.
         cavemanTextCompression: compactionOff
             ? undefined
             : deps.config.caveman_text_compression?.enabled === true
@@ -1359,19 +1271,16 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         onRustWireInvalidated: (sessionId: string) => {
             transform.invalidateRustWireState(sessionId);
         },
-        // Clean up per-session state the system-prompt handler maintains so
-        // these module/closure-scope maps don't accumulate entries over the
-        // plugin's lifetime (Finding #3).
+        // plugin's lifetime.
         onSessionDeleted: (sessionId: string) => {
             dropSlot(sessionId, "session-deleted");
             transform.clearRustSession(sessionId);
             systemPromptHash.clearSession(sessionId);
-            // Prune every per-session map this hook closure owns. These
-            // accumulate one entry per session for the plugin process lifetime
-            // (which can span days/weeks across many sessions and subagents);
-            // without this, a long-lived process leaks memory steadily. Some
-            // maps are shared via liveSessionState — clearing on the terminal
-            // session.deleted event is correct since the session is gone.
+            // Session-deletion handling prunes per-session maps to release entries retained for the plugin process lifetime.
+            // Session-deletion handling prunes per-session maps to release entries retained for the plugin process lifetime.
+            // Session-deletion handling prunes per-session maps to release entries retained for the plugin process lifetime.
+            // The session.deleted handler clears shared liveSessionState maps because deleted sessions cannot use them.
+            // The session.deleted handler clears shared liveSessionState maps because deleted sessions cannot use them.
             lastHeuristicsTurnId.delete(sessionId);
             clearToolPermissionDenied(sessionId);
             commitSeenLastPass.delete(sessionId);
@@ -1409,14 +1318,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         }
         lastScheduleCheckMs = now;
 
-        // Dreamer v2: the per-task scheduler owns due-evaluation + keyed leases.
-        // This message-event-driven path is a secondary trigger to the process
-        // timer; both call the same idempotent scheduler (leases prevent overlap).
+        // The per-task scheduler owns due evaluation and keyed leases.
+        // Message events and the process timer invoke the same idempotent scheduler; keyed leases prevent overlap.
+        // Message events and the process timer invoke the same idempotent scheduler; keyed leases prevent overlap.
         const runtimeConfigs = buildDreamTaskRuntimeConfigs(dreaming, deps.config.language);
         const executor = createDreamTaskExecutor({
             client: deps.client,
-            // Run in the directory this hook instance owns, not a stale sibling
-            // checkout resolved from the shared git:<sha> identity map.
+            // The hook runs in its own directory, not a sibling checkout resolved from the shared git:<sha> identity map.
+            // The hook runs in its own directory, not a sibling checkout resolved from the shared git:<sha> identity map.
             sessionDirectory: deps.directory,
             openOpenCodeDb,
             retrospectiveRawProvider: (providerDb) =>
@@ -1428,11 +1337,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             language: deps.config.language,
             retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
             transformMode: deps.config.transform_mode,
-            // Scheduled/message-triggered runs must share the same direct
-            // authority.status transport as the transform path. The
-            // executor uses the live MODULE verdict, not transform state
-            // cached in a session, so a cold process cannot fall back to
-            // the guarded TypeScript child path.
+            // Scheduled and message-triggered runs use authority.status so cold processes read the live MODULE verdict instead of session-cached transform state or the guarded TypeScript child path.
             moduleClient: rustModeModuleClient,
             onProgress: (progress, completedTask) => {
                 if (progress) {
@@ -1464,12 +1369,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         rustModeModuleClient,
         projectRoot: deps.directory,
         projectPath,
-        // /ctx-approve and /ctx-enforce validate artifact IDs against the
-        // INVOKING session's project: a session resumed in (or moved to)
-        // another directory must not approve or execute artifacts for the
-        // launch project. Same per-call resolution as the ctx_memory tool.
-        // Artifact paths canonicalize against the identity-owning ROOT (the
-        // git root for a repo subdirectory), or in-repo paths read as escapes.
+        // /ctx-approve and /ctx-enforce resolve artifact IDs against the invoking session's project, preventing sessions moved to another directory from accessing launch-project artifacts.
+        // Artifact resolution canonicalizes paths against the identity-owning root so in-repo paths are not treated as escapes.
         resolveProjectForSession: (sessionId) => {
             const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
             return {
@@ -1481,36 +1382,25 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         },
         commitClusterTrigger: deps.config.commit_cluster_trigger,
         getLiveModelKey: (sessionId) => {
-            // Use DB fallback so /ctx-status shows the correct model-specific
-            // threshold even before the first transform pass has populated
-            // liveModelBySession after restart. Without this, the resolver
-            // falls back to the default threshold and displays a stale budget.
+            // The model resolver falls back to DB model data before the first transform after restart so /ctx-status uses the model-specific threshold rather than the default.
             const model = resolveLiveModel(sessionId);
             return model ? `${model.providerID}/${model.modelID}` : undefined;
         },
         getDreamerProgress: () => dreamerProgressByProject.get(projectPath) ?? null,
         getTailHygiene: (sessionId) => channel1StateBySession.get(sessionId),
         getContextLimit: (sessionId) => {
-            // Same DB fallback as getLiveModelKey — /ctx-status's "Resolved
-            // context limit" and history-budget math depend on the live model.
+            // The model resolver falls back to DB model data because /ctx-status's resolved context limit and history budget use the live model.
             const model = resolveLiveModel(sessionId);
             if (!model) return undefined;
             return resolveContextLimit(model.providerID, model.modelID);
         },
-        // /ctx-flush is a user-initiated full refresh: signal all three sets.
-        // History rebuild + system-prompt adjuncts + force materialize.
+        // /ctx-flush signals history rebuild, system-prompt adjuncts, and forced materialization.
         onFlush: (sessionId) => {
             historyRefreshSessions.add(sessionId);
             systemPromptRefreshSessions.add(sessionId);
             pendingMaterializationSessions.add(sessionId);
         },
-        // E3 (recomp) + /ctx-session-upgrade: both run through the SHARED
-        // orchestrator (runManagedRecomp / runManagedUpgrade) so the command
-        // paths get identical model fallback + live progress + terminal state as
-        // the RPC dialog paths. Previously the command path
-        // had fallback but no progress (sidebar stuck on stale "failed") while
-        // the RPC dialog had progress but no fallback (failed on empty primary
-        // model). One runner closes both gaps.
+        // runManagedRecomp and runManagedUpgrade give command paths the same model fallback, live progress, and terminal state as RPC dialog paths.
         executeWrapup: historianRunnable
             ? async (sessionId, options) =>
                   runManagedWrapup(buildManagedWrapupCtx(sessionId), sessionId, options)
@@ -1519,8 +1409,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             ? async (sessionId, options) =>
                   runManagedRecomp(buildManagedRecompCtx(sessionId), sessionId, options)
             : undefined,
-        // E3.2 — /ctx-session-upgrade: full recomp + once-per-project memory
-        // migration in one managed run. The command handler delivers the result.
+        // runManagedUpgrade performs a full recomp and once-per-project memory migration.
         runUpgrade: historianRunnable
             ? async (sessionId: string) =>
                   runManagedUpgrade(buildManagedRecompCtx(sessionId), sessionId)
@@ -1553,10 +1442,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             ? {
                   config: dreamerConfig,
                   projectPath,
-                  // Manual /ctx-dream → Dreamer v2 per-task scheduler. Runs in this
-                  // hook's own checkout (not a stale sibling worktree from the
-                  // shared git:<sha> identity map). The evaluate-smart-notes task
-                  // itself drains the module bridge, so the manual path needs no
+                  // Manual /ctx-dream runs Dreamer v2 tasks in the active checkout.
                   // separate drain.
                   runManual: (task) =>
                       runManualDream({
@@ -1580,9 +1466,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                   deps.config.memory?.injection_budget_tokens,
                               retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
                               transformMode: deps.config.transform_mode,
-                              // Manual /ctx-dream uses the same live authority
-                              // lookup and module transport as scheduled runs.
-                              // Do not rely on a transform-populated cache.
+                              // The /ctx-status handler must not rely on a transform-populated cache.
                               moduleClient: rustModeModuleClient,
                               onProgress: (progress, completedTask) => {
                                   if (progress) {
@@ -1605,24 +1489,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         db,
         protectedTags: deps.config.protected_tags,
         dreamerEnabled: dreamerRunnable,
-        // Gates ctx_memory guidance out of the prompt when memory is off (the
-        // ctx_memory TOOL is gated in tool-registry.ts on the same flag).
         memoryEnabled: deps.config.memory?.enabled !== false,
         language: deps.config.language,
         promptSurface: deps.config.prompt_surface,
         promptSurfaceRuntime: deps.promptSurfaceRuntime,
         resolveModel: resolveLiveModel,
-        // System-prompt-hash handler reads systemPromptRefreshSessions to
-        // decide whether to re-read disk-backed adjuncts (profile, key files,
-        // sticky date), and adds to all three sets when it
-        // detects a real prompt-content change.
         historyRefreshSessions,
         systemPromptRefreshSessions,
         pendingMaterializationSessions,
         lastHeuristicsTurnId,
-        // Issue #53: per-agent injection opt-out via config.
-        // Defensive defaults for tests/legacy callers that pre-date the
-        // schema field; Zod's .default() handles real loaded configs.
         injectionEnabled: deps.config.system_prompt_injection?.enabled ?? true,
         injectionSkipSignatures: deps.config.system_prompt_injection?.skip_signatures ?? [
             "<!-- magic-context: skip -->",
@@ -1630,8 +1505,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         internalChildSessions,
         experimentalUserMemories: userMemoryCollectionEnabled(deps.config.dreamer),
         experimentalTemporalAwareness: deps.config.temporal_awareness === true,
-        // Mirror the primary-session caveman opt-in so the agent knows older
-        // prose may be rewritten even when ctx_reduce is available.
         experimentalCavemanTextCompression: deps.config.caveman_text_compression?.enabled === true,
     });
     const systemPromptHashHandler = systemPromptHash.handler;
@@ -1659,8 +1532,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         "experimental.chat.messages.transform": transform,
         "experimental.chat.system.transform": systemPromptHashHandler,
         "experimental.text.complete": createTextCompleteHandler(),
-        // Instance disposal tears down only the evaluator bridges this hook
-        // registered; the registry is process-global across plugin instances.
         disposeNoteEvaluationBridges: () => disposeModuleNoteEvaluationBridges(ownedBridgeProjects),
         "chat.message": createChatMessageHook({
             db,
@@ -1671,8 +1542,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             systemPromptRefreshSessions,
             pendingMaterializationSessions,
             lastHeuristicsTurnId,
-            // E5 — only offer the upgrade reminder when historian can run (so
-            // /ctx-session-upgrade is actually actionable). Self-gates per session.
             upgradeReminder: historianRunnable
                 ? (sessionId: string) =>
                       maybeSendUpgradeReminder(
@@ -1748,8 +1617,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 }
 
 /**
- * Async boot entry point. Migration lock retries must yield between attempts,
- * while the hook itself remains synchronous once a database is available.
  */
 export async function createMagicContextHookAsync(
     deps: MagicContextDeps,

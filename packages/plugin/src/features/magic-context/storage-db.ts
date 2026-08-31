@@ -104,7 +104,7 @@ const PERMISSIONS_ENFORCEABLE = process.platform !== "win32";
 const defaultStoragePermissionFs = { chmodSync, mkdirSync };
 let storagePermissionFs = defaultStoragePermissionFs;
 
-/** Test seam: captures permission-changing calls without changing real fixture modes. */
+/** The overrides replace permission-changing filesystem calls without changing real fixture modes. */
 export function __setStoragePermissionFsForTests(
     overrides: Partial<typeof defaultStoragePermissionFs>,
 ): void {
@@ -116,9 +116,6 @@ export function __resetStoragePermissionFsForTests(): void {
 }
 
 /**
- * Create `dir` recursively. When private permissions are enabled, also create
- * and tighten it to owner-only 0o700. When an operator manages trusted-group
- * permissions, do not pass a mode or chmod an existing directory.
  */
 function ensureSecureStorageDir(dir: string): void {
     if (!shouldEnforcePrivateStoragePermissions()) {
@@ -162,16 +159,16 @@ export interface OpenDatabaseOptions {
     latestSupportedVersion?: number;
 }
 
-// Exported for the test-isolation guard test. Returns a PATH only — opens no DB —
-// so a regression assertion is safe even if the resolution is wrong.
+// Returns a path without opening a database.
+// Returns a path without opening a database.
 export function resolveDatabasePath(dbPathOverride?: string): { dbDir: string; dbPath: string } {
     if (dbPathOverride) {
         return { dbDir: dirname(dbPathOverride), dbPath: dbPathOverride };
     }
-    // Test-isolation guards (MAGIC_CONTEXT_TEST_DATA_DIR + the CWD-independent
-    // NODE_ENV backstop) both live in getMagicContextStorageDir(), so this
-    // resolver and every direct caller of that helper are covered by one
-    // implementation. See its doc comment for the incident history.
+    // getMagicContextStorageDir() applies test-isolation guards so every caller uses them.
+    // getMagicContextStorageDir() applies test-isolation guards so every caller uses them.
+    // getMagicContextStorageDir() applies test-isolation guards so every caller uses them.
+    // getMagicContextStorageDir() applies test-isolation guards so every caller uses them.
     const dbDir = getMagicContextStorageDir();
     return { dbDir, dbPath: join(dbDir, "context.db") };
 }
@@ -202,7 +199,7 @@ export function schemaVersionIsSupported(
     return getPersistedSchemaVersion(db) <= latestSupportedVersion;
 }
 
-/** Log the upstream-lane version so operators can compare it to this build's fence. */
+/** The log records the upstream-lane version for comparison with this build's fence. */
 export function formatSchemaFenceBootLog(
     persistedVersion: number,
     supportedVersion: number,
@@ -229,7 +226,7 @@ export type RpcDiscoveryUnreadableArm = "parse" | "io";
 export interface RpcServerDiscovery {
     state: "absent" | "stale" | "live" | "unreadable" | "inconclusive";
     serverPids: number[];
-    /** Per-PID labels captured while the discovery record was validated. */
+    /* */
     serverProcesses?: FailClosedBlockingProcess[];
     staleFiles: string[];
     /**
@@ -438,9 +435,9 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
         }
     }
 
-    // Remove stale evidence even when another record still proves that a server
-    // is live. Leaving reused-PID files behind expands the collision surface on
-    // every subsequent database-open guard pass.
+    // Reused-PID files expand the collision surface on later database-open guard passes.
+    // Reused-PID files expand the collision surface on later database-open guard passes.
+    // Reused-PID files expand the collision surface on later database-open guard passes.
     for (const staleFile of staleFiles) {
         try {
             rpcDiscoveryFs.unlinkSync(staleFile);
@@ -472,10 +469,6 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
     return { state: "stale", serverPids: [], staleFiles };
 }
 
-// Per-connection SQLite tuning, settable once at plugin init (before the first
-// openDatabase) so the 27 openDatabase call sites don't each need config
-// threading. Defaults match the config schema (64 MiB cache, mmap disabled) so
-// tests and early-init opens still get sane values.
 let sqlitePragmaConfig: { cacheSizeMb: number; mmapSizeMb: number } = {
     cacheSizeMb: 64,
     mmapSizeMb: 0,
@@ -486,34 +479,27 @@ export function setSqlitePragmaConfig(config: { cacheSizeMb: number; mmapSizeMb:
 }
 
 /**
- * Apply the tunable per-connection PRAGMAs (cache_size, mmap_size,
- * analysis_limit) from the current `sqlitePragmaConfig`. Idempotent and safe on
- * an already-open connection — cache_size/mmap_size take effect immediately —
- * so harnesses that open the DB before loading config (Pi) can call this once
- * config is available without reopening.
+ * cache_size and mmap_size take effect on an open connection.
  */
 export function applySqliteTuningPragmas(db: Database): void {
-    // cache_size negative value = KiB of page cache (e.g. -65536 = 64 MiB).
+    // A negative `cache_size` value specifies KiB of page cache; `-65536` specifies 64 MiB.
     // pi-lens-ignore: sql-injection
     db.exec(`PRAGMA cache_size=-${Math.round(sqlitePragmaConfig.cacheSizeMb * 1024)}`);
     // pi-lens-ignore: sql-injection
     db.exec(`PRAGMA mmap_size=${Math.round(sqlitePragmaConfig.mmapSizeMb * 1024 * 1024)}`);
-    // Bound any ANALYZE that a later PRAGMA optimize triggers on this connection.
+    // `analysis_limit=400` bounds ANALYZE work triggered by a later `PRAGMA optimize` on this connection.
     db.exec("PRAGMA analysis_limit=400");
 }
 
 /**
- * Run SQLite's self-gating planner-stats refresh. `analysis_limit=400` caps the
- * rows sampled per index so even a huge table can't cause a multi-second
- * ANALYZE; `optimize` then re-analyzes only tables whose row counts drifted
- * since the last ANALYZE (a no-op otherwise). Cheap to call periodically.
+ * analysis_limit=400 limits ANALYZE work to approximately 400 rows per index.
+ * PRAGMA optimize conditionally refreshes planner statistics.
  */
 export function runSqliteOptimize(db: Database): void {
     try {
         db.exec("PRAGMA analysis_limit=400");
         db.exec("PRAGMA optimize");
     } catch {
-        // Best-effort maintenance; never fail a caller over stats refresh.
     }
 }
 
@@ -546,20 +532,14 @@ export function assertSqliteConnectionContract(
 }
 
 function finishDatabaseOpen(db: Database, dbPath: string, explicitDbPath: boolean): Database {
-    // Recover any Channel-2 ceiling-nudge lease left at `claimed` by a crash
-    // mid-delivery (see healWedgedChannel2Claims). Fresh opens and later
-    // cached-handle reuses both run this TTL-scoped heal so long-lived
-    // processes eventually unwind stuck stale claims without a restart.
+    // Fresh opens recover claimed Channel-2 ceiling-nudge leases left by crashes.
+    // The TTL-scoped heal releases stale claims without a restart.
     healWedgedChannel2Claims(db);
-    // Wire the persistence-backed tool-definition measurement store and
-    // rehydrate the in-memory map from any prior writes. Doing this here
-    // (after migrations) means migration v9 has already created the
-    // `tool_definition_measurements` table, so loadToolDefinitionMeasurements
-    // never hits a missing-table failure path.
+    // Migration v9 creates `tool_definition_measurements` before `loadToolDefinitionMeasurements` runs.
     setToolDefinitionDatabase(db);
     loadToolDefinitionMeasurements(db);
-    // When enabled, tighten the DB + WAL/SHM sidecars now that WAL mode has
-    // created them. Externally managed trusted-group storage skips this entirely.
+    // `restrictDatabaseFilePermissions` runs after WAL mode creates the database, WAL, and SHM files.
+    // Externally managed trusted-group storage skips permission restriction.
     restrictDatabaseFilePermissions(dbPath);
     databases.set(dbPath, db);
     pathByDatabase.set(db, dbPath);
@@ -574,14 +554,13 @@ function finishDatabaseOpen(db: Database, dbPath: string, explicitDbPath: boolea
 const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
 
 /**
- * Boot heal for a wedged Channel-2 ceiling-nudge lease.
+ * The recovery releases claimed Channel-2 ceiling-nudge leases left by crashes.
  *
- * The delivery path CAS-claims `pending → claimed` before sending the synthetic
- * user message. A crash can strand that claim and consume the cycle, but a
- * sibling process can also be legitimately mid-send against the shared DB. The
- * claimed_at lease timestamp is the liveness boundary: only old/legacy claims are
- * reaped to the empty, re-armable state; fresh claims are left alone so boot
- * recovery never steals an in-flight delivery.
+ * The delivery path CAS-claims `pending → claimed` before sending the synthetic user message.
+ * A crash can strand a claimed delivery and consume its cycle.
+ * A `claimed_at` timestamp defines the liveness boundary for claims.
+ * Recovery resets reaped claims to the empty, re-armable state.
+ * Recovery reaps claimed rows with `claimed_at` NULL, 0, or at least `CHANNEL2_CLAIM_TTL_MS` old.
  */
 function healWedgedChannel2Claims(db: Database): void {
     try {
@@ -590,8 +569,7 @@ function healWedgedChannel2Claims(db: Database): void {
             "UPDATE session_meta SET channel2_nudge_state = '', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)",
         ).run(staleBefore);
     } catch {
-        // Columns may be missing on a very fresh DB before ensureColumn/migration
-        // adds them; fresh rows seed the state as '' so there is nothing to heal.
+        // `ensureColumn` and migrations add missing columns; fresh rows use `''` and require no healing.
     }
 }
 
@@ -603,10 +581,9 @@ function expectedDirectFormat(): ReturnType<typeof computeExpectedDirectFormat> 
 }
 
 /**
- * Serialize with any concurrent bootstrapper under BEGIN IMMEDIATE, recheck
- * the family, and create the registered direct format only if the family is
- * still pristine (KTD1, AE1). Every other family is left untouched; the
- * caller decides from the returned post-transaction classification.
+ * `BEGIN IMMEDIATE` serializes concurrent bootstrappers before the transaction rechecks the family.
+ * The transaction creates the registered direct format only when the family remains pristine.
+ * The transaction leaves every family except pristine KTD1 and AE1 families untouched.
  */
 function bootstrapUnderWriteLock(
     db: Database,
@@ -614,9 +591,8 @@ function bootstrapUnderWriteLock(
     expected: ReturnType<typeof computeExpectedDirectFormat>,
 ): FormatFamilyClassification {
     db.transaction(() => {
-        // The lock holder's own rollback journal is not a family artifact:
-        // BEGIN IMMEDIATE creates `-journal` on this very connection, and
-        // counting it would misread a pristine family as orphaned.
+        // The lock holder's rollback journal is excluded from family artifacts.
+        // Counting the lock holder's `-journal` would misclassify a pristine family as orphaned.
         const inspection = inspectDatabaseForClassification(db, dbPath);
         const recheck = classifyDatabaseFormatFamily(
             {
@@ -641,12 +617,11 @@ function bootstrapUnderWriteLock(
 }
 
 /**
- * Refuse a database carrying a persisted fence or marker epoch newer than this
- * binary reads, recording the fence-rejection latch. Returns true when refused.
+ * The gate refuses a database whose persisted fence or marker epoch exceeds this binary's readable version and records the fence-rejection latch.
  *
- * Every family reaches this check, accepted or not: the exact object inventory
- * proves shape, never vintage, so a database whose objects match this build can
- * still carry a fence only a newer binary understands.
+ * The opener inventories the exact objects in every family before accepting or rejecting it.
+ * Object inventory establishes shape, not format vintage.
+ * A database with this build's objects can carry a fence that only a newer binary understands.
  */
 function refuseNewerSchemaFence(
     db: Database,
@@ -659,11 +634,6 @@ function refuseNewerSchemaFence(
     } catch {
         // An unreadable version lane stays a plain format refusal.
     }
-    // The fence row is a constant pinned to the retired migration lane, so it
-    // only moves on a breaking format change. The marker's format epoch is the
-    // signal that actually distinguishes a database this build is too old to
-    // read from one it must refuse: reset guidance for the former would destroy
-    // a family a newer binary legitimately owns.
     const marker = readDirectFormatMarker(db);
     const persistedEpoch = marker.status === "present" ? marker.marker.formatEpoch : 0;
     if (persistedVersion <= latestSupportedVersion && persistedEpoch <= DIRECT_FORMAT_EPOCH) {
@@ -690,8 +660,8 @@ function recordFormatRefusal(
     const marker = readDirectFormatMarker(db);
     const persistedEpoch = marker.status === "present" ? marker.marker.formatEpoch : 0;
     lastFormatRefusal = { family: classification.family, reasons: classification.reasons };
-    // A digest-only mismatch at the same epoch cannot be direction-typed from a
-    // hash, so this must not assert the family is garbage.
+    // A digest-only mismatch at the same epoch cannot establish whether the database is older or newer.
+    // The classifier does not classify a same-epoch digest-only mismatch as garbage.
     const manifestOnly =
         marker.status === "present" &&
         persistedEpoch === DIRECT_FORMAT_EPOCH &&
@@ -705,16 +675,13 @@ function recordFormatRefusal(
 }
 
 /**
- * Direct-format open core (KTD1, R15, R17): prove a WAL-reset-safe SQLite
- * source off-path, classify the family, bootstrap only a truly pristine
- * family under BEGIN IMMEDIATE, refuse everything that is not the exact
- * current registered format, and enable + verify WAL only after the format
- * verdict. There is no migration lane: old databases are refused, never
+ * The opener bootstraps only a truly pristine family under BEGIN IMMEDIATE.
+ * The opener bootstraps a truly pristine family and refuses every other unsupported family.
+ * The opener enables and verifies WAL only after the format verdict.
+ * The opener refuses old databases rather than migrating them.
  * migrated.
  */
-// Inspect family artifacts before opening SQLite: open-time recovery can
-// consume an orphan WAL for an empty main file. The rules themselves live in
-// the format-epoch leaf module so the pre-open and post-open verdicts cannot
+// The opener inspects family artifacts before opening SQLite to prevent open-time recovery from modifying them.
 // drift.
 function refusePreOpenFamily(dbPath: string): DatabaseFormatRefusal | null {
     const verdict = classifyPreOpenFamily(dbPath, {
@@ -732,8 +699,7 @@ function openDirectDatabase(
     explicitDbPath: boolean,
     latestSupportedVersion: number,
 ): Database | null {
-    // The WAL-reset-safety gate runs before SQLite can recover a database,
-    // enable WAL, or write the direct format.
+    // The WAL-reset-safety gate runs before SQLite can recover a database, enable WAL, or write the direct format.
     const runtimeGate = probeSqliteRuntimeGate();
     if (!runtimeGate.ok) {
         lastRuntimeGateRefusal = runtimeGate;
@@ -752,9 +718,7 @@ function openDirectDatabase(
 
     const db = new Database(dbPath);
     try {
-        // busy_timeout must precede any file-level statement: two processes can
-        // cold-open the same family at once, and the loser must wait for the
-        // winner's bootstrap commit instead of throwing SQLITE_BUSY.
+        // The opener sets busy_timeout before file-level statements so a process that loses a concurrent cold-open waits for the winner's bootstrap commit instead of throwing SQLITE_BUSY.
         db.exec("PRAGMA busy_timeout=5000");
         db.exec("PRAGMA foreign_keys=ON");
         const expected = expectedDirectFormat();
@@ -770,10 +734,7 @@ function openDirectDatabase(
             closeQuietly(db);
             return null;
         }
-        // The fence is checked on the accepted path too, not only on refusal.
-        // Object-name identity cannot see a fence a newer binary moved without
-        // renaming anything, so skipping this here would leave the one family
-        // that reaches real queries as the only one never proving its vintage.
+        // A newer binary can move a fence without renaming an object, so object-name identity alone cannot prove the accepted family's vintage.
         if (refuseNewerSchemaFence(db, dbPath, latestSupportedVersion)) {
             closeQuietly(db);
             return null;
@@ -794,37 +755,9 @@ function openDirectDatabase(
 }
 
 /**
- * Open the persistent Magic Context SQLite database.
  *
- * Fails closed: if the database cannot be opened, it returns a recorded
- * refusal or throws a fatal open error.
- * Magic Context CANNOT silently fall back to an in-memory database, because:
- *   1. An in-memory DB has no project memories, no historian state, no
- *      tag persistence — features that depend on durable storage become
- *      silently broken instead of explicitly disabled.
- *   2. More importantly, an in-memory DB across process restarts effectively
- *      means "no Magic Context", but the plugin still tags messages and
- *      tries to drive transforms. On Pi/OpenCode this can let the full
- *      raw history reach the model and overflow the context window — the
- *      exact failure mode that broke a real test session.
  *
- * Three failure modes, all fail-closed:
- *   - **Runtime refusal** (the SQLite source cannot safely reset WAL): returns
- *     `null` before constructing a connection and records the gate report.
- *   - **Format refusal** (the on-disk family is neither the exact current
- *     direct format nor truly pristine, or it carries a newer format fence
- *     than this binary supports): returns `null` with the detail recorded in
- *     the refusal latches. Recovery is an explicit operator reset
- *     (`doctor reset-db`) or a binary update — never an in-place migration.
- *   - **Fatal open error** (ABI mismatch, unwritable path, corrupt file):
- *     throws. The thrown message carries the failure detail for surfacing.
  *
- * The return type is therefore `Database | null`, and callers MUST both
- * null-check the result AND be prepared for a throw (typically a try/catch that
- * also treats a null result as "storage unavailable"). On either outcome the
- * caller disables Magic Context for that run (server plugin: registers a
- * startup warning + skips the runtime; Pi plugin: logs warning + skips the
- * extension). There is NEVER a silent in-memory fallback.
  */
 export function openDatabase(): Database | null;
 export function openDatabase(dbPath: string): Database | null;
@@ -842,10 +775,6 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         if (!persistenceByDatabase.has(existing)) {
             persistenceByDatabase.set(existing, true);
         }
-        // Re-run the TTL-scoped lease heal on cache hits too. Long-lived
-        // processes keep this handle for hours, and a revert/confirm DB lock can
-        // leave a stale `claimed` lease behind until some later openDatabase()
-        // call. The heal is one idempotent UPDATE gated by claimed_at age.
         healWedgedChannel2Claims(existing);
         return existing;
     }
@@ -855,8 +784,6 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
     } catch (error) {
         const detail = getErrorMessage(error);
         log(`[magic-context] storage fatal: failed to open ${dbPath}: ${detail}`);
-        // No silent in-memory fallback — see comment above. Caller must
-        // catch and disable Magic Context for that run.
         throw new Error(
             `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
         );
@@ -864,9 +791,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
 }
 
 /**
- * Async boot variant of openDatabase. SQLite calls remain synchronous
- * (bootstrap contention resolves under the connection busy timeout), but
- * concurrent async openers of the same path share one in-flight open.
+ * SQLite calls are synchronous; a losing cold opener waits up to 5 seconds for the bootstrap commit, then SQLite can raise SQLITE_BUSY.
  */
 export async function openDatabaseAsync(
     dbPathOrOptions?: string | OpenDatabaseOptions,

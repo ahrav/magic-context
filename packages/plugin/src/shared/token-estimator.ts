@@ -1,11 +1,7 @@
 /**
- * Shared token estimation (KTD1 — search hard bounds).
  *
- * Extracted from `hooks/magic-context/read-session-formatting.ts` so feature
- * and tool code (search bounds, ctx_search rendering, auto-search hints) can
- * consume the same token-counting contract without depending on the transform
- * runtime hook module. The hook module re-exports these symbols, so existing
- * imports keep working.
+ * Feature and tool code use this token-counting contract without importing the transform runtime hook module.
+ * The hook module re-exports the token-counting symbols, preserving existing imports.
  */
 
 import { existsSync, readFileSync, realpathSync } from "node:fs";
@@ -14,10 +10,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-// Keep ai-tokenizer out of the eager module graph. Pi imports this module through
-// its system-prompt path during cold start, while token estimates are not needed
-// until the first real prompt is processed. Synchronous require preserves the
-// estimateTokens API and defers both package loads until that first non-empty call.
+// Synchronous `require` preserves the `estimateTokens` API and defers both package loads until the first non-empty call.
 type TokenizerLike = {
     encode: (text: string, allowedSpecial: string) => number[];
 };
@@ -28,17 +21,16 @@ const TOKENIZER_PACKAGE_DIRS = [
     ["@cortexkit", "pi-magic-context"],
 ] as const;
 let tokenizer: TokenizerLike | undefined;
-/** Gate on the synchronous bare-require path (`getTokenizer`), so estimate
- *  calls do not pay a failing `require` more than once per process. */
+/** `tokenizerLoadAttempted` prevents `getTokenizer` from retrying a failed bare `require`.
+ * */
 let tokenizerLoadAttempted = false;
-/** Gate on the async installed-package search path (`preloadTokenizer`). Kept
- *  separate from `tokenizerLoadAttempted`: a failed synchronous require must
- *  not stop the preload from finding the package on disk. */
+/** `tokenizerPreloadAttempted` gates `preloadTokenizer`'s asynchronous installed-package search.
+ * A failed synchronous `require` does not prevent `preloadTokenizer` from finding an installed package on disk.
+ * */
 let tokenizerPreloadAttempted = false;
-/** Set when a constructed tokenizer failed to encode. Once estimates have
- *  been produced heuristically after such a failure, no later load may swap
- *  the estimator back, or identical text would alternate between exact and
- *  approximate counts across cache/budget decisions. */
+/** `tokenizerPoisoned` is set when a constructed tokenizer fails to encode.
+ * After an encode failure produces heuristic estimates, later loads cannot replace the fallback estimator, preventing identical text from alternating between exact and approximate counts.
+ * */
 let tokenizerPoisoned = false;
 let tokenizerLoadPromise: Promise<boolean> | undefined;
 let tokenizerWarningSent = false;
@@ -50,8 +42,7 @@ function tokenizerPackageRoots(): string[] {
     const candidates: string[] = [];
     for (const root of roots) {
         for (const packageDir of TOKENIZER_PACKAGE_DIRS) {
-            // Prefer a dependency nested under the plugin over a conflicting
-            // version hoisted by the host application.
+            // `tokenizerPackageRoots` prefers the plugin-nested `ai-tokenizer` dependency to a conflicting host-hoisted version.
             candidates.push(
                 join(root, "node_modules", ...packageDir, "node_modules", "ai-tokenizer"),
             );
@@ -97,7 +88,6 @@ function findTokenizerImportPaths(): { tokenizerPath: string; encodingPath: stri
                 encodingPath: realpathSync(join(packageRoot, encodingTarget)),
             };
         } catch {
-            // Try the next npm layout; the caller warns if none is usable.
         }
     }
     return undefined;
@@ -116,8 +106,7 @@ function constructTokenizer(tokenizerModule: unknown, claudeEncoding: unknown): 
 }
 
 function loadTokenizer(): TokenizerLike {
-    // Non-literal specifiers keep Bun's bundler static analysis from folding the
-    // Claude vocabulary into the eager chunk.
+    // Non-literal specifiers prevent Bun's bundler from folding the Claude vocabulary into the eager chunk.
     const requireFromThisModule = createRequire(import.meta.url);
     return constructTokenizer(
         requireFromThisModule("ai-" + "tokenizer"),
@@ -195,13 +184,10 @@ export function estimateTokens(text: string): number {
     const activeTokenizer = getTokenizer();
     if (!activeTokenizer) return estimateTokensHeuristically(text);
     try {
-        // Encode with allowedSpecial="all" so literal special-token strings (e.g.
-        // `<EOT>` in tool output) are counted as text instead of throwing.
+        // `estimateTokens` uses `allowedSpecial="all"` so literal special-token strings do not throw.
         return activeTokenizer.encode(text, "all").length;
     } catch (error) {
-        // Estimation must not fail a prompt. Latch the deterministic fallback for
-        // the rest of this process so identical text does not alternate between
-        // exact and approximate counts as cache/budget decisions are made.
+        // `estimateTokens` must not fail a prompt; after an encode failure, it latches the deterministic fallback for the process.
         tokenizer = undefined;
         tokenizerLoadAttempted = true;
         tokenizerPoisoned = true;

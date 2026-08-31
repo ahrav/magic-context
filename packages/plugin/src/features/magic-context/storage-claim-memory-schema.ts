@@ -1,32 +1,19 @@
 /**
- * U2 direct-format claim-memory DDL (direct-claims-cutover plan: KTD3-KTD5,
- * KTD13; R1-R8, R19-R20): public claim identity, the project-memory claim
- * subtype (one-to-one append-only revision attributes plus an append-only
- * lifecycle ledger with one database-enforced head), the rebuildable
- * current-head dedup index, nonsemantic claim telemetry, cross-project
- * derivation lineage, lifetime operation receipts with durable effect
- * summaries, the receipt-grouped effect outbox, per-consumer checkpoints,
- * generation allocation, and outbox prune state.
+ * Each project-memory claim has one append-only revision-attributes row.
+ * The lifecycle ledger enforces exactly one database head per claim.
+ * The current-head index is rebuildable, and claim telemetry is nonsemantic.
+ * The outbox groups effects by receipt and stores checkpoints per consumer.
  *
- * Registered as the `claim-memory` component of the direct schema
- * (`storage-current-schema.ts`); never created by legacy migrations. The one
- * exception is `claim_project_generations`, whose DDL is byte-compatible
- * with the v84 migration's table so the v86 policy writers work against both
- * worlds — it is created through the separate
- * `createClaimProjectGenerationsSchema` so tests may overlay the rest of the
- * fragment onto a legacy database that already owns that table.
+ * The separate schema creator lets callers omit `claim_project_generations` when the database already owns that table.
  *
- * Dependency-light on purpose: type-only imports so the Node smoke scripts
- * can load this module under Node's type-stripping loader.
  *
- * Append-only contract: public IDs, revision attributes, lifecycle events,
- * derivations, and operation receipts reject every UPDATE and DELETE plus
- * key-colliding inserts. Receipts live for the whole database incarnation
- * (R20) — there is no receipt prune path at all. Outbox effects admit only
- * watermark-gated pruning under the `claim_outbox_prune_state` capability
- * (the v84 change-log pattern). `claim_memory_current_heads`,
- * `claim_usage_stats`, and `claim_outbox_consumer_checkpoints` are mutable
- * by design: rebuildable projection, nonsemantic telemetry, and durable
+ * Public IDs, revision attributes, lifecycle events, derivations, and operation receipts are append-only.
+ * Those tables reject UPDATE, DELETE, and inserts that collide on a key.
+ * Operation receipts persist for the database lifetime.
+ * No operation-receipt prune path exists.
+ * Outbox effects may be pruned only when `claim_outbox_prune_state` permits the watermark.
+ * `claim_memory_current_heads`, `claim_usage_stats`, and `claim_outbox_consumer_checkpoints` are mutable.
+ * Current heads are rebuildable projections, usage stats are nonsemantic telemetry, and consumer checkpoints are durable cursors.
  * consumer cursors.
  */
 
@@ -46,15 +33,15 @@ export const CLAIM_MEMORY_TABLES = [
     "claim_outbox_prune_state",
 ] as const;
 
-/** Lifecycle states of a project-memory claim (KTD4). */
+/* */
 export const CLAIM_MEMORY_LIFECYCLE_STATES = ["active", "archived", "retired"] as const;
 export type ClaimMemoryLifecycleState = (typeof CLAIM_MEMORY_LIFECYCLE_STATES)[number];
 
-/** Sharing dispositions carried on revision attributes (R3). */
+/* */
 export const CLAIM_MEMORY_SHARING = ["private", "shareable"] as const;
 export type ClaimMemorySharing = (typeof CLAIM_MEMORY_SHARING)[number];
 
-/** Semantic change kinds published on outbox effects (KTD5, KTD13). */
+/* */
 export const CLAIM_EFFECT_CHANGE_KINDS = [
     "upsert",
     "evidence",
@@ -65,12 +52,12 @@ export const CLAIM_EFFECT_CHANGE_KINDS = [
 ] as const;
 export type ClaimEffectChangeKind = (typeof CLAIM_EFFECT_CHANGE_KINDS)[number];
 
-/** Stored receipt outcomes (KTD5): applied effects, a stale claim-local
- * token, or a semantic no-op. All three persist for replay (R5-R6, R20). */
+/** Receipt outcomes record applied effects, a stale claim-local token, or a semantic no-op.
+ * All receipt outcomes persist for replay. */
 export const CLAIM_OPERATION_OUTCOMES = ["applied", "stale", "noop"] as const;
 export type ClaimOperationOutcome = (typeof CLAIM_OPERATION_OUTCOMES)[number];
 
-/** Cross-project derivation relations (R8, KTD10). */
+/* */
 export const CLAIM_DERIVATION_RELATIONS = ["copied_from", "moved_from"] as const;
 export type ClaimDerivationRelation = (typeof CLAIM_DERIVATION_RELATIONS)[number];
 
@@ -78,9 +65,7 @@ const sqlList = (values: readonly string[]): string =>
     values.map((value) => `'${value}'`).join(", ");
 
 /**
- * `claim_project_generations` with the exact v84 shape and guards, split out
- * so the registered component can create it on direct databases while a
- * legacy database (which already owns the v84 copy) can overlay only
+ * The separate schema creator lets callers omit `claim_project_generations` when the database already owns that table.
  * `createClaimMemorySchema`.
  */
 export function createClaimProjectGenerationsSchema(db: Database): void {
@@ -101,9 +86,8 @@ export function createClaimProjectGenerationsSchema(db: Database): void {
     `);
 }
 
-/** All claim-memory objects except `claim_project_generations`. */
+/* */
 export function createClaimMemorySchema(db: Database): void {
-    // Interpolation is a compile-time const allowlist, not caller input.
     // pi-lens-ignore: sql-injection
     db.exec(`
     -- Immutable opaque public identity for every project-memory claim (R2,
@@ -457,7 +441,7 @@ export function createClaimMemorySchema(db: Database): void {
     `);
 }
 
-/** Full claim-memory component creation (registered-component `create`). */
+/* */
 export function createClaimMemoryComponentSchema(db: Database): void {
     createClaimProjectGenerationsSchema(db);
     createClaimMemorySchema(db);

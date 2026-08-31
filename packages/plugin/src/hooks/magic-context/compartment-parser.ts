@@ -2,16 +2,16 @@ export interface ParsedCompartment {
     startMessage: number;
     endMessage: number;
     title: string;
-    /** v2: P1 tier text (mirror). v1/flat: the flat compartment body. */
+    /** content stores the P1 mirror in v2 and the flat compartment body in v1. */
     content: string;
-    /** v2 paraphrase tiers (model B). Undefined for v1/flat compartments. p4 may be "" (self-close). */
+    /** p1 through p4 store v2 paraphrase tiers; they are undefined for v1/flat compartments, and p4 may be "" for a self-closing tier. */
     p1?: string;
     p2?: string;
     p3?: string;
     p4?: string;
-    /** v2 decay-rate signal (1-100). Undefined for v1/flat. */
+    /** importance stores the v2 decay-rate signal and is undefined for v1/flat compartments. */
     importance?: number;
-    /** v2 comma-separated activity types. Undefined for v1/flat. */
+    /** episodeType stores comma-separated v2 activity types and is undefined for v1/flat compartments. */
     episodeType?: string;
 }
 
@@ -21,26 +21,21 @@ export interface ParsedFact {
 }
 
 /**
- * A historian-extracted event (v2). Two kinds today — `causal_incident` and
- * `trajectory_correction` — but parsed kind-agnostically: `kind` is the element
- * name and `fields` holds every child element verbatim. v2.0 STORES events
- * (E2 events table) but does NOT render them; parsing kind-agnostically means a
- * future event-kind or field addition needs no parser change.
+ * ParsedEvent stores the event element name and its child text fields.
+ * kind is the element name; fields maps child names to text content.
  */
 export interface ParsedEvent {
     kind: string;
-    /** 1-based compartment index the event anchors to (`at_compartment="N"`); null if absent/invalid. */
+    /** atCompartment stores the 1-based compartment index from `at_compartment="N"` and is null when the attribute is absent or invalid. */
     atCompartment: number | null;
-    /** child element name → text content (e.g. summary, before_strategy, evidence). */
+    /* */
     fields: Record<string, string>;
 }
 
 export interface ParsedPrimerCandidate {
     question: string;
-    /** 1-based index into the publish's emitted compartments
-     *  (`<primer at_compartment="N">`), matching the SAME convention as
-     *  `<events>` anchoring. Undefined for the legacy bullet form, in which case
-     *  emission falls back to the chunk span. */
+    /**
+     * Legacy bullet primers fall back to the chunk span at emission. */
     originCompartmentIndex?: number;
 }
 
@@ -53,21 +48,14 @@ export interface ParsedCompartmentOutput {
     primerCandidates: ParsedPrimerCandidate[];
 }
 
-// Open tag captured separately from body so attributes (start/end/title/
-// episode_type/importance) can appear in ANY order — LLM output is not
-// attribute-order-stable. Group 1 = full attribute string, group 2 = inner body.
+// COMPARTMENT_REGEX captures attributes separately so attribute order does not affect parsing.
 const COMPARTMENT_REGEX = /<compartment\s+([^>]*?)\s*>(.*?)<\/compartment>/gs;
-// Self-closing v2 compartments are invalid (a compartment must have ≥1 tier or
-// flat content), so we only match the paired form above.
 const ATTR_START_REGEX = /\bstart="(\d+)"/;
 const ATTR_END_REGEX = /\bend="(\d+)"/;
 const ATTR_TITLE_REGEX = /\btitle="([^"]*)"/;
 const ATTR_EPISODE_REGEX = /\bepisode_type="([^"]*)"/;
 const ATTR_IMPORTANCE_REGEX = /\bimportance="(\d+)"/;
-// Per-tier opener: matches `<p1>` / `<p1 >` (group 1 empty) or the self-close
-// `<p1/>` / `<p1 />` (group 1 = "/", P4 only → ""). The body that follows an
-// opener is bounded procedurally in extractTier rather than by an exact `</pN>`
-// close, because some models mismatch the closing digit (e.g. `<p1>…</p2>`).
+// Tier bodies end at any tier closing tag because the closing digit can differ from the opener's digit.
 function makeTierOpenRegex(n: number): RegExp {
     return new RegExp(`<p${n}\\s*(/?)>`);
 }
@@ -77,14 +65,9 @@ const TIER_OPEN_REGEXES = [
     makeTierOpenRegex(3),
     makeTierOpenRegex(4),
 ];
-// Any tier's closing tag (`</p1>`…`</p9>`) — used to bound an opened tier's body
-// regardless of whether the close digit matches the opener.
 const TIER_CLOSE_ANY_REGEX = /<\/p\d/;
-// Any tier's OPENING tag (`<p1>`…`<p9>`) — the over-capture guard: a tier body
-// must never swallow a following tier's opener.
+// TIER_OPEN_ANY_REGEX prevents a tier body from consuming a following tier opener.
 const TIER_OPEN_ANY_REGEX = /<p\d/;
-// v2 world taxonomy (5 categories). The historian emits only these; legacy 9-cat
-// names are accepted at the ctx_memory layer (E3 aliases), not here.
 const CATEGORY_BLOCK_REGEX =
     /<(PROJECT_RULES|ARCHITECTURE|CONSTRAINTS|CONFIG_VALUES|NAMING)>(.*?)<\/\1>/gs;
 const FACT_ITEM_REGEX = /^\s*\*\s*(.+)$/gm;
@@ -92,58 +75,41 @@ const UNPROCESSED_REGEX = /<unprocessed_from>(\d+)<\/unprocessed_from>/;
 const USER_OBSERVATIONS_REGEX = /<user_observations>(.*?)<\/user_observations>/s;
 const USER_OBS_ITEM_REGEX = /^\s*\*\s*(.+)$/gm;
 const PRIMER_CANDIDATES_REGEX = /<primer_candidates>(.*?)<\/primer_candidates>/s;
-// Preferred form: <primer at_compartment="N">question</primer>, where N is the
-// `start` ordinal of the origin compartment (reuses the ordinal the historian is
-// already emitting on each <compartment start="N">). The legacy bullet form
-// (*/-/1.) is still accepted and falls back to the chunk span at emission.
+// A primer uses `<primer at_compartment="N">question</primer>`, where N is the origin compartment's start ordinal.
+// Legacy primer bullets (`*`, `-`, or `1.`) fall back to the chunk span at emission.
 const PRIMER_ELEMENT_REGEX = /<primer\s+at_compartment="(\d+)"\s*>(.*?)<\/primer>/gs;
 const PRIMER_ITEM_REGEX = /^\s*(?:\*|-|\d+\.)\s*(.+)$/gm;
 
-// Events: scan the <events>…</events> block (if any) for event elements. Kinds
-// are parsed kind-agnostically — any element with an `at_compartment` attr is an
-// event whose child elements become `fields`. v2.0 stores events; rendering is
-// deferred (E2). Scoping to the <events> block prevents fact/compartment tags
-// from being mis-read as events.
+// Only elements inside `<events>` are events.
+// Children of `<events>` are parsed kind-agnostically; a child with `at_compartment` is an event.
+// Scoping to the `<events>` block prevents fact and compartment tags from being parsed as events.
 const FACTS_BLOCK_REGEX = /<facts>(.*?)<\/facts>/s;
 const EVENTS_BLOCK_REGEX = /<events>(.*?)<\/events>/s;
 const EVENT_ELEMENT_REGEX = /<([a-z_]+)\s+at_compartment="(\d+)"\s*>(.*?)<\/\1>/gs;
 const EVENT_FIELD_REGEX = /<([a-z_]+)\s*>(.*?)<\/\1>/gs;
 
 /**
- * Extract a single tier body from a compartment inner string.
  *
- * Lenient about the close: an opened `<pN>` is terminated by the NEXT closing
- * tier tag of ANY digit (`</p\d>`), because some models mismatch the close
- * (observed: `<p1>…</p2>`). If the model omitted the close entirely, the next
- * opening tier tag — or the end of the compartment — bounds the body instead.
+ * The parser terminates an opened `<pN>` at the next tier closing tag because models can mismatch closing digits.
+ * If the close tag is absent, the next opening tier tag or compartment end bounds the body.
  *
  * Returns:
- *  - string (possibly "") when the <pN> element is present ("" = self-close or empty)
- *  - undefined when the element is absent entirely
+ * The function returns a string, possibly `""`, when `<pN>` is present; `""` denotes a self-closing or empty element.
+ * The function returns `undefined` when `<pN>` is absent entirely.
  */
 function extractTier(inner: string, index: number): string | undefined {
     const openMatch = TIER_OPEN_REGEXES[index].exec(inner);
     if (!openMatch) return undefined;
-    // Self-close form (<p4/> or <p4 />) → empty tier.
     if (openMatch[1] === "/") return "";
     const rest = inner.slice(openMatch.index + openMatch[0].length);
-    // Bound the body at the next closing tier tag (any digit). When there is no
-    // close at all, run to the end of the compartment and let the guard below
-    // trim at the next opener if one is present.
     const closeAt = rest.search(TIER_CLOSE_ANY_REGEX);
     let body = closeAt === -1 ? rest : rest.slice(0, closeAt);
-    // Over-capture guard: never swallow a subsequent tier's opening tag into
-    // this tier's content. If an opener appears before the close, cut there.
     const openInside = body.search(TIER_OPEN_ANY_REGEX);
     if (openInside !== -1) body = body.slice(0, openInside);
     return unescapeXml(body.trim());
 }
 
 /**
- * Extract all four tier bodies from a compartment's inner markup using the
- * lenient closing rules above. Exposed for the v70 heal migration, which
- * re-parses flat `content` that the old strict parser stranded as legacy when a
- * model mismatched a tier's closing tag. Each tier is undefined when absent.
  */
 export function extractTiersFromInner(inner: string): {
     p1?: string;
@@ -182,7 +148,7 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
         const episodeType = episodeMatch ? unescapeXml(episodeMatch[1]) : undefined;
         const importance = importanceMatch ? parseInt(importanceMatch[1], 10) : undefined;
 
-        // v2 tiered shape: at least <p1> present.
+        // A v2 tiered compartment contains at least `<p1>`.
         const p1 = extractTier(inner, 0);
         if (typeof p1 === "string" && p1.length > 0) {
             const p2 = extractTier(inner, 1);
@@ -194,8 +160,8 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
                 title,
                 content: p1, // content mirrors P1 (fullest tier) for v2 rows
                 p1,
-                // Fall back denser→denser for any missing middle tier so storage
-                // always has 4 non-undefined tiers; p4 may legitimately be "".
+                // Missing middle tiers inherit the next denser tier's value.
+                // Tiered output always defines `p1` through `p4`; `p4` may be `""`.
                 p2: typeof p2 === "string" ? p2 : p1,
                 p3: typeof p3 === "string" ? p3 : typeof p2 === "string" ? p2 : p1,
                 p4: typeof p4 === "string" ? p4 : "",
@@ -205,7 +171,7 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
             continue;
         }
 
-        // v1/flat shape (compressor output, legacy, or historian that didn't emit tiers).
+        // Flat input lacks tier elements.
         const content = unescapeXml(inner.trim());
         if (content) {
             compartments.push({
@@ -219,19 +185,12 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
         }
     }
 
-    // Scope category extraction to the <facts> block. Category tags
-    // (PROJECT_RULES, ARCHITECTURE, …) can legitimately appear inside <events>
-    // field text or compartment bodies; scanning the whole response would
-    // misread those as promotable facts. When there is no <facts> block we fall
-    // back to scanning the full text for backward-compat with outputs that emit
-    // bare category blocks (older/transition shapes) — but only outside the
-    // events block, which we strip first to avoid the cross-read.
+    // The parser scopes category extraction to `<facts>` because category tags can occur in event fields and compartment bodies.
+    // Without `<facts>`, the parser removes `<events>` and `<compartment>` blocks before extracting categories.
+    // Bare category blocks are valid only outside <events> when <facts> is absent.
+    // The parser strips `<events>` before fallback category extraction to prevent event fields from being parsed as facts.
     const factsBlockMatch = text.match(FACTS_BLOCK_REGEX);
-    // When a <facts> block is present (the v2 norm), scope extraction to it.
-    // The fallback (legacy/transition outputs with bare category blocks) strips
-    // BOTH the events block AND every <compartment> body first — otherwise a
-    // category-shaped tag living inside a compartment's P1-P4 prose (or its
-    // attributes) would be misread as a promotable fact.
+    // Without `<facts>`, the parser strips `<events>` and `<compartment>` blocks before fallback extraction to exclude category-shaped tags in their prose or attributes.
     const factsScope = factsBlockMatch
         ? factsBlockMatch[1]
         : text
@@ -264,7 +223,7 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
     const primerMatch = text.match(PRIMER_CANDIDATES_REGEX);
     if (primerMatch) {
         const block = primerMatch[1];
-        // Preferred: <primer at_compartment="N">…</primer> with origin ordinal.
+        // Element-form candidates use `<primer at_compartment="N">…</primer>`, where `N` is the origin ordinal.
         let sawElement = false;
         for (const el of block.matchAll(PRIMER_ELEMENT_REGEX)) {
             sawElement = true;
@@ -276,8 +235,7 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
                 });
             }
         }
-        // Legacy bullet form (no origin tag) — only if no element form was used,
-        // so an element-form question isn't also captured as a bullet line.
+        // The parser reads bullet items only when the block contains no element-form candidates; bullets have no origin tag.
         if (!sawElement) {
             for (const itemMatch of block.matchAll(PRIMER_ITEM_REGEX)) {
                 const question = unescapeXml(itemMatch[1].trim());
@@ -294,10 +252,6 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
 }
 
 /**
- * Parse the optional <events> block. Each direct child element with an
- * `at_compartment` attribute is an event; its own child elements become
- * `fields`. Kind-agnostic so new event kinds/fields need no parser change.
- * Returns [] when there is no <events> block (the common case).
  */
 function parseEvents(text: string): ParsedEvent[] {
     const blockMatch = text.match(EVENTS_BLOCK_REGEX);

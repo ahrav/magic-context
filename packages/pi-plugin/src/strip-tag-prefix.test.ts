@@ -165,7 +165,7 @@ describe("stripTagPrefixFromAssistantMessage", () => {
 			expect((msg.content[1] as { type: string; text: string }).text).toBe(
 				"Real assistant text",
 			);
-			// Thinking part untouched (only text parts are scrubbed)
+			// stripTagPrefixFromAssistantMessage scrubs only text parts.
 			expect(
 				(msg.content[0] as { type: string; thinking: string }).thinking,
 			).toBe("§4§ pretend reasoning, not stripped");
@@ -187,10 +187,8 @@ describe("stripTagPrefixFromAssistantMessage", () => {
 		});
 
 		it("handles non-array content gracefully", () => {
-			// Pi user messages can have content: string (legacy shape)
 			const msg = { role: "assistant", content: "§4§ legacy string" };
 			expect(stripTagPrefixFromAssistantMessage(msg)).toBe(false);
-			// String content unchanged (we don't touch legacy string-shape on assistants)
 			expect(msg.content).toBe("§4§ legacy string");
 		});
 	});

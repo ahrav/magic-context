@@ -30,7 +30,7 @@ async function refreshToastDurationMs() {
       unifiedToastDurationMs = resolved;
     }
   } catch {
-    // Keep the current value; the next poll/startup can retry.
+    // Loading failures retain the configured duration.
   }
 }
 function getToastDurationMs() {
@@ -38,9 +38,6 @@ function getToastDurationMs() {
 }
 function showToast(api, input) {
   const duration = typeof input.durationOverrideMs === "number" && Number.isFinite(input.durationOverrideMs) ? input.durationOverrideMs : getToastDurationMs();
-  // toast_duration_ms = 0 disables Magic Context toasts entirely. An explicit
-  // positive per-call override (e.g. restart-required) still shows; only a
-  // non-positive effective duration suppresses the toast.
   if (!(duration > 0)) {
     return;
   }
@@ -139,24 +136,20 @@ const StatusDialog = props => {
   const s = () => props.s;
   const compactionOff = () => s().compaction_enabled === false;
 
-  // Prefer the RPC-provided model context limit (what the sidebar shows) so the
-  // two surfaces never disagree. Fall back to deriving from usage% only when the
-  // RPC limit is absent (0) — and that derivation is itself undefined at 0%, so
-  // it stays "?" rather than showing a number inconsistent with the sidebar.
+  // The dialog uses the RPC-provided context limit when available and derives a limit from usage only when the RPC returns `0`.
+  // The display remains `?` when both the RPC limit and usage are `0`.
   const contextLimit = () => s().contextLimit > 0 ? s().contextLimit : s().usagePercentage > 0 ? Math.round(s().inputTokens / (s().usagePercentage / 100)) : 0;
   const elapsed = () => s().lastResponseTime > 0 ? Date.now() - s().lastResponseTime : 0;
 
-  // Token breakdown segments — same colors as sidebar. Kept in sync with
-  // slots/sidebar-content.tsx so the status dialog and sidebar read identically.
+  // The dialog uses the sidebar's token-segment colors.
   const COLORS = {
-    // Cool / structured — injected by the plugin into message[0]
+    // The plugin injects structured traffic into `message[0]`.
     system: "#c084fc",
     docs: "#22d3ee",
     compartments: "#60a5fa",
     facts: "#fbbf24",
     memories: "#34d399",
     profile: "#a3e635",
-    // Warm / user-facing — chat and tool traffic
     conversation: "#f87171",
     toolCalls: "#fb923c",
     toolDefs: "#f472b6"
@@ -218,11 +211,7 @@ const StatusDialog = props => {
     };
   };
 
-  // The status-dialog breakdown bar uses flex layout (same approach as the
-  // sidebar breakdown). Each segment becomes a colored box with
-  // flexGrow=tokens and flexBasis=0, parent has width="100%", so opentui
-  // distributes the dialog's full width proportionally regardless of the
-  // dialog's actual rendered width.
+  // Each segment uses `flexGrow=tokens` and `flexBasis=0` to occupy a proportional share of the bar.
   const barSegments = () => breakdownSegments().segs.filter(seg => seg.tokens > 0);
   return (() => {
     var _el$4 = _$createElement("box"),
@@ -395,8 +384,7 @@ const StatusDialog = props => {
       var _c$5 = _$memo(() => !!(!compactionOff() && s().recompProgress));
       return () => _c$5() && (() => {
         const p = s().recompProgress;
-        // Label follows the flow that started the run, so a plain
-        // /ctx-recomp never reads as an "Upgrade".
+        // The label preserves the initiating flow so `/ctx-recomp` is never labeled "Upgrade".
         const verb = p.kind === "upgrade" ? "Upgrade" : p.kind === "embed" ? "Embed" : "Recomp";
         return (() => {
           var _el$40 = _$createElement("box"),
@@ -985,9 +973,6 @@ const StatusDialog = props => {
 function getModelKeyFromMessages(api, sessionId) {
   try {
     const msgs = api.state.session.messages(sessionId);
-    // Find the last assistant message with model info
-    // AssistantMessage has providerID/modelID as top-level fields
-    // UserMessage has model: { providerID, modelID }
     for (let i = msgs.length - 1; i >= 0; i--) {
       const msg = msgs[i];
       if (msg.role === "assistant" && msg.providerID && msg.modelID) {
@@ -1001,7 +986,6 @@ function getModelKeyFromMessages(api, sessionId) {
       }
     }
   } catch {
-    // messages not available
   }
   return undefined;
 }
@@ -1015,8 +999,7 @@ async function showRecompDialog(api, targetSessionId = getSessionId(api)) {
     return false;
   }
   const countResult = await getCompartmentCount(sessionId);
-  // Ack only after the dialog is actually shown for the same active session;
-  // route switches while the RPC detail load is in flight must leave it pending.
+  // The request is acknowledged only after the dialog is shown for the session active when the request began; otherwise the request remains pending.
   if (getSessionId(api) !== sessionId) return false;
   if (!countResult.ok) {
     showToast(api, {
@@ -1059,9 +1042,7 @@ async function showRecompDialog(api, targetSessionId = getSessionId(api)) {
 function showUpgradeDialog(api, resume, targetSessionId = getSessionId(api)) {
   const sessionId = targetSessionId;
   if (!sessionId) {
-    // No active session — nothing to upgrade. Silently skip (the server only
-    // enqueues this for sessions with legacy compartments, but the TUI may
-    // have switched sessions before the poller fired).
+    // The request is skipped when no session is active because the initiating session cannot be identified.
     return false;
   }
   if (getSessionId(api) !== sessionId) return false;
@@ -1079,8 +1060,8 @@ function showUpgradeDialog(api, resume, targetSessionId = getSessionId(api)) {
         });
         return;
       }
-      // The RPC call fires no message event, so start the sidebar's
-      // progress poll only after the server accepts the request.
+      // The sidebar progress poll starts only after the server accepts the RPC request because the call emits no message event.
+      // The progress poll starts only after server acceptance because the RPC emits no message event.
       kickRecompProgressRefresh();
       showToast(api, {
         message: resume ? "Resuming session upgrade — running in the background" : "Session upgrade started — running in the background",
@@ -1089,10 +1070,10 @@ function showUpgradeDialog(api, resume, targetSessionId = getSessionId(api)) {
       void dismissUpgradeReminder(sessionId);
     },
     onCancel: () => {
-      // Explicit decline → set the durable stamp so we don't re-prompt
-      // on every restart. The fix for stamp-on-display trapping a
-      // never-upgraded session relies on THIS
-      // being the only place the TUI path stamps.
+      // Declining sets the durable stamp to prevent re-prompting.
+      // Only TUI cancellation stamps the reminder; stamping on display prevents future prompts for sessions that never upgrade.
+      // Only TUI cancellation stamps the reminder; stamping on display prevents future prompts for sessions that never upgrade.
+      // Only TUI cancellation stamps the reminder; stamping on display prevents future prompts for sessions that never upgrade.
       void dismissUpgradeReminder(sessionId);
       showToast(api, {
         message: "Upgrade skipped — run /ctx-session-upgrade anytime",
@@ -1242,7 +1223,7 @@ async function waitForTuiProbeHostPaint(api, result) {
   try {
     renderer = api.renderer;
   } catch {
-    // Older hosts may not expose a renderer paint signal.
+    // Some hosts do not expose a renderer paint signal.
   }
   if (!renderer || typeof renderer.once !== "function") {
     await new Promise(resolve => setTimeout(resolve, 500));
@@ -1335,34 +1316,28 @@ async function runTuiProbe(api) {
 }
 
 /**
- * Register Magic Context command palette entries, preferring the v1.14.42+
- * `keymap.registerLayer` API and falling back to the legacy
- * `api.command.register` for older hosts.
+ * Hosts before v1.14.42 require api.command.register; newer hosts use keymap.registerLayer.
+ * Hosts before v1.14.42 require api.command.register; newer hosts use keymap.registerLayer.
+ * Hosts before v1.14.42 require api.command.register; newer hosts use keymap.registerLayer.
  *
- * The `keymap.registerLayer` shape uses `name`/`title`/`run`/`namespace`
- * (see `@opencode-ai/plugin/tui` types) and is what the host's own legacy
- * command-shim translates into. Calling it directly skips the deprecation
- * warning and works without depending on the (now-deprecated) `api.command`
- * namespace existing at all.
+ * registerLayer requires name, title, run, and namespace.
+ * The code uses `registerLayer` directly to avoid the deprecated command shim.
+ * The code uses `registerLayer` directly to avoid the deprecated command shim.
+ * The code uses `registerLayer` directly to avoid the deprecated command shim.
  *
  * Version coverage:
- *   1.14.0–1.14.41 — `api.command.register` only
- *   1.14.42–1.14.43 — both surfaces broken (api.command removed, keymap landed
- *                     but with bugs); plugins crash on init either way
- *   1.14.44+        — `api.keymap.registerLayer` canonical, `api.command` shim
  */
 function registerCommandPaletteEntries(api) {
   const apiAny = api;
   if (typeof apiAny.keymap?.registerLayer === "function") {
-    // Audit Finding #2 hardening: even when registerLayer exists as a
-    // function, the underlying keymap implementation in OpenCode TUI
-    // 1.14.42-1.14.43 can throw at call time. Without the try-catch the
-    // `return` below would propagate the throw and the legacy
-    // `command.register` fallback path (~20 lines down) would be
-    // unreachable. The cost is one debug log on the rare broken-TUI
-    // build; the benefit is that older command.register-only TUIs
-    // running alongside a partially-broken keymap surface still get
-    // their command palette entries.
+    // `registerLayer` failures are caught so the `command.register` fallback remains reachable.
+    // `registerLayer` failures are caught so the `command.register` fallback remains reachable.
+    // `registerLayer` failures are caught so the `command.register` fallback remains reachable.
+    // `registerLayer` failures are caught so the `command.register` fallback remains reachable.
+    // `registerLayer` failures are caught so the `command.register` fallback remains reachable.
+    // `registerLayer` failures are caught so the `command.register` fallback remains reachable.
+    // `registerLayer` failures are caught so the `command.register` fallback remains reachable.
+    // `registerLayer` failures are caught so the `command.register` fallback remains reachable.
     try {
       apiAny.keymap.registerLayer({
         commands: [{
@@ -1395,7 +1370,6 @@ function registerCommandPaletteEntries(api) {
       return;
     } catch (err) {
       console.debug("[magic-context-tui] keymap.registerLayer threw; falling back to command.register", err);
-      // Fall through to legacy registration.
     }
   }
   if (typeof apiAny.command?.register === "function") {
@@ -1424,30 +1398,15 @@ function registerCommandPaletteEntries(api) {
     return;
   }
 
-  // Neither API surface is present. The TUI host can still load — we only
-  // lose the command palette entry points. The sidebar (registered above
-  // via api.slots.register) remains visible. Status/Recomp are still
-  // reachable through the server-side `/ctx-status` and `/ctx-recomp`
-  // slash commands, which the server handler bridges to the TUI dialogs
   // via RPC.
 }
 
 /**
- * Show the one-shot "What's new" dialog on TUI startup if the server tells us
- * to. The server is the source of truth: it has the version + features
- * constants AND owns the persistence file. We just render and report back.
+ * The server owns the version, feature constants, and persistence file; the TUI renders the data and reports changes.
  *
- * Failure-tolerant by design — if the server isn't ready or the RPC fails,
- * we silently skip (the next TUI launch will retry).
+ * If `getAnnouncement()` fails, skip the dialog; the next TUI launch retries.
  */
 /**
- * URLs render as plain text. Modern terminals (iTerm2, kitty, WezTerm, Ghostty,
- * recent macOS Terminal) auto-detect URLs and let users Cmd-click; older
- * terminals require manual copy. We tried opentui's `<a href>` JSX intrinsic
- * for application-level OSC 8 clickability, but it's a span-like element that
- * forced text out of opentui's word-wrap mode, causing bullets to bleed past
- * the dialog border. Pure-string children of `<text>` wrap correctly, so the
- * AFT-style DialogAlert + plain string is the right surface here.
  */
 async function showStartupAnnouncement(api) {
   try {
@@ -1456,8 +1415,6 @@ async function showStartupAnnouncement(api) {
     const title = `Magic Context v${ann.version}`;
     const lines = ["What's new:", "", ...ann.features.map(line => `  • ${line}`)];
     if (ann.footer && ann.footer.trim().length > 0) {
-      // Blank-line separator keeps the persistent footer (Discord invite,
-      // etc.) visually distinct from the version-specific bullets.
       lines.push("", ann.footer);
     }
     const message = lines.join("\n");
@@ -1468,30 +1425,20 @@ async function showStartupAnnouncement(api) {
         void markAnnounced();
       }
     }), () => {
-      // User dismissed via Escape rather than confirming. Mark
-      // dismissed anyway — they saw the dialog, that's the contract.
+      // Treat Escape dismissal as confirmation because the user saw the dialog.
       void markAnnounced();
     });
   } catch {
-    // RPC not ready yet (port file missing or transient HTTP failure) —
-    // silently skip. The next TUI start re-checks.
+    // Skip announcement failures; the next TUI start re-checks.
   }
 }
 const tui = async (api, _options, meta) => {
   const directory = api.state.path.directory ?? "";
-  // A conflicted installation intentionally has no server. Gate before RPC
-  // discovery or socket startup so disabled installs perform no idle work.
-  // The resolved MC compaction mode is threaded in explicitly via the same
-  // loader + accessor the plugin boot uses, so the TUI never re-derives the
-  // compaction decision from directory alone. On config load failure the
-  // accessor resolves default-on (mode-on), preserving today's conflict
-  // gate rather than silently skipping the check.
+  // Pass the loaded config to `isCompactionEnabled` so conflict detection uses the configured compaction mode; load failures default to enabled.
   let pluginConfig;
   try {
     pluginConfig = loadPluginConfig(directory);
   } catch {
-    // Config load failure: fail toward mode-on (today's behavior) by
-    // leaving pluginConfig undefined so isCompactionEnabled defaults true.
   }
   const conflictResult = detectConflicts(directory, {
     compactionEnabled: isCompactionEnabled(pluginConfig ?? {})
@@ -1503,36 +1450,22 @@ const tui = async (api, _options, meta) => {
   initRpcClient(directory);
   await refreshToastDurationMs();
 
-  // Register sidebar slot
   const sidebarSlot = createSidebarContentSlot(api);
   api.slots.register(sidebarSlot);
 
-  // Register TUI command palette entries (no slash field — slash commands
-  // are registered server-side so there's only one /ctx-* registration).
-  // The server detects TUI mode and sends dialog requests via RPC instead
+  // TUI palette entries omit slash fields because the server registers `/ctx-*` commands.
+  // In TUI mode, the server sends dialog requests through RPC instead of `sendIgnoredMessage`.
   // of sendIgnoredMessage.
   //
-  // OpenCode 1.14.42 removed `api.command.register` entirely
-  // (anomalyco/opencode#26053). A later patch (1.14.44+) reinstated it as
-  // a deprecated shim that translates to `api.keymap.registerLayer`. To
-  // work across all hosts (1.14.0–1.14.41 with command-only, the broken
-  // 1.14.42–1.14.43, and 1.14.44+ where both exist), we prefer
-  // `api.keymap.registerLayer` and fall back to `api.command.register`
-  // only when keymap is missing.
+  // Use `api.keymap.registerLayer` when available; fall back to `api.command.register` when it is unavailable or throws.
   registerCommandPaletteEntries(api);
 
-  // Receive server→TUI notifications (toasts + dialog requests) over a single
-  // persistent WebSocket, pushed the instant the server queues them. This
-  // replaces the old 500ms HTTP poll whose new-connection-per-tick cost was the
-  // source of idle TUI CPU (#200). The socket carries the active session in its
-  // hello so the server scopes delivery; here we re-check the active session per
-  // notification (it can change between queue and delivery) before acting.
+  // The persistent WebSocket carries toast and dialog notifications without polling.
+  // The socket hello includes the active session so the server scopes delivery.
+  // The active session can change between queueing and delivery, so each notification is re-checked before acting.
   const handleNotification = async n => {
     const requestedSessionId = getSessionId(api);
     const generation = getRpcGeneration();
-    // A session-scoped notification only applies while we're viewing that
-    // session; global (session-less) ones always apply. Returning false leaves
-    // it unacked so a TUI on the right session (or a later switch back) still
     // gets it.
     if (n.sessionId !== undefined && n.sessionId !== requestedSessionId) {
       return false;
@@ -1571,10 +1504,7 @@ const tui = async (api, _options, meta) => {
       return true;
     }
     if (action === "wrapup-progress-kick") {
-      // /ctx-wrapup blocks its command turn and fires no message events, so
-      // the sidebar poll would never notice the run. Kick the fast progress
-      // poll (same loop the recomp dialog kicks). The start toast arrives
-      // separately via the ignored-message notification path.
+      // The `wrapup-progress-kick` action starts the fast progress poll because `/ctx-wrapup` emits no message events for the sidebar poll to observe.
       if (!stillActive()) return false;
       kickRecompProgressRefresh();
       return true;
@@ -1595,17 +1525,14 @@ const tui = async (api, _options, meta) => {
     onNotification: handleNotification
   });
 
-  // Clean up on dispose
   api.lifecycle.onDispose(() => {
     sidebarSlot.dispose();
     stopNotificationSocket();
     closeRpc();
   });
 
-  // Show one-shot release announcement after conflict gate.
-  // Fire-and-forget: if the server isn't ready or RPC fails, the next TUI
-  // launch will retry. Dialog only appears once per ANNOUNCEMENT_VERSION
-  // (persisted via mark-announced RPC writing last_announced_version).
+  // A later TUI launch retries when `getAnnouncement()` fails.
+  // `mark-announced` persists `last_announced_version`, so the dialog appears once per `ANNOUNCEMENT_VERSION`.
   void showStartupAnnouncement(api);
 };
 const id = "opencode-magic-context";

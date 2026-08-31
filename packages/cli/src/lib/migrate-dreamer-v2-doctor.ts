@@ -1,15 +1,11 @@
 /**
- * On-disk Dreamer v2 migration for doctor (mirrors the plugin's in-memory
- * migrateDreamerV2). Converts the legacy v1 dreamer shape (window schedule, tasks
- * ARRAY, user_memories/pin_key_files blocks, task_timeout_minutes,
- * max_runtime_minutes) into the v2 per-task `tasks` RECORD.
+ * Doctor migrates on-disk Dreamer v1 configs to v2, matching the plugin's in-memory migration.
+ * The migration converts legacy v1 Dreamer config to v2 per-task `tasks` records.
  *
- * Operates in place on a comment-json-parsed config object. Returns true when it
- * mutated `mcConfig.dreamer`. Idempotent: a no-op when `tasks` is already an
- * object (v2) or when no legacy keys are present.
+ * The migration mutates the comment-json-parsed config object in place.
+ * The migration is a no-op when `tasks` is an object or no legacy keys exist.
  *
- * Run AFTER the experimental→dreamer migration so a relocated
- * dreamer.user_memories / dreamer.pin_key_files is folded into the tasks record.
+ * The migration must run after `experimental`→`dreamer` so relocated `dreamer.user_memories` and `dreamer.pin_key_files` enter `tasks`.
  */
 
 const OLD_VERIFY_TASK = "verify";
@@ -76,15 +72,13 @@ function withoutBroadInterval(entry: Record<string, unknown>): Record<string, un
     return rest;
 }
 
-/** In-place surgical reconcile of an already-v2 tasks-object (no legacy keys):
- *  add `verify-broad` coupled to verify's enabled state + strip
- *  `broad_interval_days`. Returns true iff it mutated `dreamer.tasks`. */
+/** `reconcileV2TasksObjectForDoctor` updates v2 `tasks` objects with no legacy keys in place.
+ * `reconcileV2TasksObjectForDoctor` returns true only when it changes `tasksObject`. */
 function reconcileV2TasksObjectForDoctor(tasksObject: Record<string, unknown>): boolean {
     const hasVerifyBroad = "verify-broad" in tasksObject;
     const hasBroadIntervalAnywhere = Object.values(tasksObject).some(
         (v) => asObject(v) && "broad_interval_days" in (v as Record<string, unknown>),
     );
-    // key-files was removed (feature moved to AFT); strip any stale task entry.
     const hasStaleKeyFiles = "key-files" in tasksObject;
     if (hasVerifyBroad && !hasBroadIntervalAnywhere && !hasStaleKeyFiles) return false;
 
@@ -120,10 +114,8 @@ export function migrateDreamerV2ForDoctor(mcConfig: Record<string, unknown>): bo
             "task_timeout_minutes" in dreamer ||
             "max_runtime_minutes" in dreamer;
         if (!hasLegacyOutsideTasks) {
-            // Already a v2 tasks-object, no legacy keys → only a SURGICAL on-disk
-            // touch-up: add `verify-broad` (coupled to verify's enabled state) and
-            // strip the dead `broad_interval_days`. Mirrors migrateDreamerV2's
-            // reconcileV2TasksObject. Returns true iff it changed the file.
+            // When missing, `verify-broad` uses the default weekly schedule only when `verify.schedule` is nonempty.
+            // The migration returns true only when it mutates `mcConfig.dreamer`.
             return reconcileV2TasksObjectForDoctor(tasksObject);
         }
     }
@@ -185,7 +177,7 @@ export function migrateDreamerV2ForDoctor(mcConfig: Record<string, unknown>): bo
             });
         }
 
-        // The old internal broad cadence becomes its own task.
+        // Reconciliation removes `broad_interval_days` from every task and adds missing `verify-broad`.
         if (!tasks["verify-broad"]) {
             const verifyEnabled =
                 typeof tasks.verify?.schedule === "string" && tasks.verify.schedule.trim() !== "";
@@ -264,10 +256,8 @@ export function migrateDreamerV2ForDoctor(mcConfig: Record<string, unknown>): bo
         });
     }
 
-    // key-files was removed (the feature moved to AFT's dreamer): any legacy
-    // pin_key_files block is dropped below with the other retired keys.
+    // `pin_key_files` enters `tasks` during the v1-to-v2 migration.
 
-    // Mutate in place: drop retired keys, keep agent-config keys, add tasks.
     delete dreamer.schedule;
     delete dreamer.task_timeout_minutes;
     delete dreamer.max_runtime_minutes;

@@ -64,7 +64,6 @@ export class OpenCodeAdapter implements HarnessAdapter {
         try {
             const exists = paths.opencodeConfigFormat !== "none";
             if (!exists) {
-                // Brand-new opencode.jsonc with our plugin entry.
                 const initial = {
                     $schema: "https://opencode.ai/config.json",
                     plugin: [PLUGIN_ENTRY],
@@ -96,9 +95,6 @@ export class OpenCodeAdapter implements HarnessAdapter {
 
             // Local dev-path entries are recognized so we don't double-add
             // an @latest entry on top, but they are NEVER replaced by setup.
-            // Replacing a developer worktree path with the npm package would
-            // silently swap their local plugin instance for the published
-            // one — a surprising behavior change setup must avoid.
             if (existingIdx === -1 && existingDevIdx === -1) {
                 plugin.push(PLUGIN_ENTRY);
                 cfg.plugin = plugin;
@@ -121,7 +117,6 @@ export class OpenCodeAdapter implements HarnessAdapter {
                 };
             }
 
-            // Already present as an npm entry — check whether it's pinned to an old version.
             const current = plugin[existingIdx];
             if (typeof current === "string" && current !== PLUGIN_ENTRY) {
                 plugin[existingIdx] = PLUGIN_ENTRY;
@@ -219,7 +214,6 @@ export class OpenCodeAdapter implements HarnessAdapter {
     }
 
     getInstalledPluginVersion(): string | null {
-        // Look in OpenCode's plugin cache for the installed package version.
         for (const candidate of getOpenCodePluginPackageJsonPaths()) {
             if (!existsSync(candidate)) continue;
             try {
@@ -289,18 +283,15 @@ export function isDevPathPluginEntry(entry: unknown): boolean {
 }
 
 /**
- * Match a plugin array entry against a package name. Plugin entries can be:
- *   - a string: "@cortexkit/opencode-magic-context@latest" or "@cortexkit/opencode-magic-context"
- *   - a tuple: ["@cortexkit/opencode-magic-context@latest", { ... options }]
- *   - a file URL: "file:///path/to/local/dev/checkout"
+ * OpenCode accepts string plugin entries with or without the `@latest` suffix.
+ * OpenCode accepts tuple plugin entries whose first element is the package specifier.
+ * OpenCode accepts `file://` URLs for local development checkouts.
  *
- * For matching purposes we strip everything after `@` (after the first `@org/pkg`
- * segment) so versioned and unversioned entries are equivalent.
+ * Package specifiers may include a version suffix.
  *
  * Returns false for `file://` entries so dev paths are not classified as
  * "the published plugin". Use `isDevPathPluginEntry` for that detection.
  *
- * Exported for reuse across setup and doctor flows.
  */
 export function matchesPluginEntry(entry: unknown, pkgName: string): boolean {
     let candidate: string | null = null;
@@ -308,7 +299,7 @@ export function matchesPluginEntry(entry: unknown, pkgName: string): boolean {
     else if (Array.isArray(entry) && typeof entry[0] === "string") candidate = entry[0];
     if (!candidate) return false;
     if (candidate.startsWith("file://")) return false;
-    // Strip version tag: "@cortexkit/foo@latest" → "@cortexkit/foo"
+    // The matcher uses the final `@` so scoped package names retain their scope.
     const at = candidate.lastIndexOf("@");
     const head = at > 0 ? candidate.slice(0, at) : candidate;
     return head === pkgName;

@@ -42,18 +42,14 @@ export function applyHeuristicCleanup(
     config: {
         protectedTags: number;
         /**
-         * Tiered target-headroom emergency drop. Provided only on the the derived force band
-         * force-materialize (cache-busting) pass; undefined on routine execute
-         * passes (Phase 2 removed routine age-based tool drops entirely). When
-         * present, the emergency drop runs before dedup/injection-strip.
+         * Routine execute passes do not drop tools by age.
          */
         emergency?: {
             currentTotalInputTokens: number;
             ceilingTokens: number;
         };
         /**
-         * Age-tier caveman text compression settings. Caller is responsible
-         * for forwarding this only for primary sessions where caveman is enabled.
+         * `caveman` configures age-tier Caveman text compression.
          */
         caveman?: CavemanCleanupConfig;
     },
@@ -67,17 +63,10 @@ export function applyHeuristicCleanup(
     compressedTextTags: number;
     mutatedTextTags: number;
 } {
-    // All work in this function short-circuits on `tag.status !== "active"`,
-    // so callers can pass active-only tags without behavior change. When no
-    // preload is provided we now load active-only directly (the partial
-    // index makes this O(active rows) instead of O(all rows)).
     const tags = preloadedTags ?? getActiveTagsBySession(db, sessionId);
-    // `maxTag` must reflect the true session max (including dropped/compacted
-    // rows) so the protected-cutoff window stays anchored to the most recent
-    // tag regardless of status. Previous code computed this from `tags`,
-    // which was correct only when `tags` was the full set; we now look up
-    // the authoritative max via an O(log N) backward index seek so the
-    // contract holds whether `tags` is full or active-only.
+    // `maxTag` must include dropped and compacted rows so the protected cutoff anchors to the newest tag.
+    // `tags` can omit dropped or compacted rows.
+    // `getMaxTagNumberBySession` preserves the protected-cutoff invariant when `tags` is full or active-only.
     const maxTag = getMaxTagNumberBySession(db, sessionId);
     const protectedCutoff = maxTag - config.protectedTags;
 
@@ -87,26 +76,18 @@ export function applyHeuristicCleanup(
     let deduplicatedTools = 0;
     let droppedInjections = 0;
 
-    // ── Tiered target-headroom emergency drop (Phase 2) ──
-    // Replaces the old need-blind routine age-drop + `dropAllTools` nuke. Runs
-    // only when the caller supplies `emergency` (i.e. the derived force band force-materialize
-    // cache-busting pass). Selection is pure (`planEmergencyDrop`); we apply the
-    // returned plan and advance the persisted watermark so each tag drops once.
+    // The persisted watermark prevents an emergency pass from dropping the same tag twice.
     if (config.emergency) {
         const emergency = config.emergency;
         const priorInputSample = getEmergencyInputSample(db, sessionId);
-        // Plan ONLY over tags that are in the live window AND would ACTUALLY
-        // reclaim bytes (canDrop excludes absent/incomplete entries that drop()
-        // would no-op on). This keeps the floor math equal to the on-wire tail
-        // and guarantees every selected tag reclaims — no phantom tag counted as
-        // reclaimed (which makes the plan stop early and under-evict).
+        // `planEmergencyDrop` considers only tool tags whose `canDrop()` can reclaim bytes.
+        // `floorTags` includes every active tag so floor accounting includes conversation and reasoning tail.
+        // `planEmergencyDrop` counts only tags that can reclaim bytes, so every selected tag reclaims bytes.
+        // Counting a non-reclaiming tag as reclaimed makes `planEmergencyDrop` stop early and under-evict.
         const droppableTags = tags.filter(
             (t) =>
                 t.status === "active" && t.type === "tool" && targets.get(t.tagNumber)?.canDrop?.(),
         );
-        // Floor accounting needs the FULL active live-window set (all types) —
-        // narrowing it to the droppable subset folds real conversation/
-        // reasoning tail into the "irreducible prefix" and under-evicts.
         const activeTags = tags.filter((t) => t.status === "active");
         const plan = planEmergencyDrop({
             tags: droppableTags as readonly EmergencyDropTag[],
@@ -154,13 +135,11 @@ export function applyHeuristicCleanup(
         } else {
             sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
         }
-        // Record every acting emergency sample, including a pass where the selector
-        // found no eligible target. This prevents repeated cache busts on stale input.
+        // The emergency path records every input sample, even without eligible targets, to prevent repeated cache busts on stale input.
         setEmergencyDropSample(db, sessionId, emergency.currentTotalInputTokens);
     }
 
     db.transaction(() => {
-        // Strip or drop system injections (task-list continuation, skill reminders, etc.)
         for (const tag of tags) {
             if (tag.status !== "active") continue;
             if (tag.tagNumber > protectedCutoff) continue;
@@ -199,18 +178,10 @@ export function applyHeuristicCleanup(
         }
     })();
 
-    // Deduplication: auto-drop older identical tool calls (same tool + same params)
+    // Deduplication drops older tool calls with the same tool and params.
     //
-    // v3.3.1 Layer C — plan §5 + Finding 1:
-    //   - Both the tag-side index AND the fingerprint-side map key on
-    //     composite key `<ownerMsgId>\x00<callId>` so cross-owner pairs
-    //     don't collapse into one bucket on lookup.
-    //   - The fingerprint VALUE includes ownerMsgId too. Without it, two
-    //     assistant turns with same `(toolName, args)` from different
-    //     owners would share a fingerprint bucket and be merged. With
-    //     it, cross-owner pairs are correctly NOT merged (semantically
-    //     distinct invocations). Within-same-owner duplicates still
-    //     dedup as expected.
+    // Both indexes use `<ownerMsgId>\x00<callId>` to prevent cross-owner lookup collisions.
+    // Fingerprints include `ownerMsgId` so identical calls from different owners remain distinct.
     const allMessages = Array.from(messageTagNumbers.keys());
     const toolFingerprints = buildToolFingerprints(allMessages);
     if (toolFingerprints.size > 0) {
@@ -224,7 +195,6 @@ export function applyHeuristicCleanup(
             }
         }
 
-        // Group tags by fingerprint
         const fingerprintGroups = new Map<string, TagEntry[]>();
         for (const [compositeKey, fingerprint] of toolFingerprints) {
             const tag = tagsByCompositeKey.get(compositeKey);
@@ -234,17 +204,14 @@ export function applyHeuristicCleanup(
             fingerprintGroups.set(fingerprint, group);
         }
 
-        // For each group with duplicates, drop all but the newest
         db.transaction(() => {
             for (const [, group] of fingerprintGroups) {
                 if (group.length <= 1) continue;
                 group.sort((a, b) => a.tagNumber - b.tagNumber);
-                // Keep the newest (last), drop the rest
                 for (let i = 0; i < group.length - 1; i++) {
                     const tag = group[i];
                     const target = targets.get(tag.tagNumber);
-                    // Deduplication remains a full drop; only the emergency newest-window
-                    // arm preserves skeleton bytes.
+                    // Deduplication always fully drops tags; only the emergency newest-window path preserves skeleton bytes.
                     const result = target?.drop?.() ?? "absent";
                     if (result === "incomplete") continue;
                     updateTagDropMode(db, sessionId, tag.tagNumber, "full");
@@ -264,10 +231,7 @@ export function applyHeuristicCleanup(
         );
     }
 
-    // Age-tier caveman text compression. Runs LAST so tool drops and
-    // injection stripping above can shrink the message set before we pick
-    // text tags to compress. Caller guarantees config.caveman is provided
-    // only for primary sessions where caveman is enabled; we still defensively
+    // Caveman compression runs after tool dropping and injection stripping so those steps reduce its candidates.
     // check enabled.
     let compressedTextTags = 0;
     let mutatedTextTags = 0;
@@ -298,7 +262,6 @@ export function applyHeuristicCleanup(
 function extractToolInfo(
     part: Record<string, unknown>,
 ): { toolName: string; args: unknown } | null {
-    // OpenCode format: { type: "tool", tool: "name", callID: "...", state: { input: {...}, output: "..." } }
     if (part.type === "tool" && typeof part.tool === "string" && DEDUP_SAFE_TOOLS.has(part.tool)) {
         const state =
             typeof part.state === "object" && part.state !== null
@@ -306,7 +269,6 @@ function extractToolInfo(
                 : {};
         return { toolName: part.tool, args: state.input ?? {} };
     }
-    // Tool-invocation format: { type: "tool-invocation", toolName: "name", args: {...} }
     if (
         part.type === "tool-invocation" &&
         typeof part.toolName === "string" &&
@@ -314,7 +276,6 @@ function extractToolInfo(
     ) {
         return { toolName: part.toolName, args: part.args ?? {} };
     }
-    // Tool-use format: { type: "tool_use", name: "name", input: {...} }
     if (
         part.type === "tool_use" &&
         typeof part.name === "string" &&
@@ -326,13 +287,6 @@ function extractToolInfo(
 }
 
 /**
- * v3.3.1 Layer C — plan §5: build a per-(owner, callId) fingerprint
- * map. Both key (composite `<ownerMsgId>\x00<callId>`) and value
- * (`<ownerMsgId>:<toolName>:<args>`) include the owner so cross-owner
- * pairs with same `(toolName, args)` produce DISTINCT fingerprints
- * and are NOT merged by the dedup pass. Within-same-owner duplicates
- * still group correctly because their owner is identical and the
- * callId differs (Pi parallel-tool-calls).
  */
 function buildToolFingerprints(messages: MessageLike[]): Map<string, string> {
     const fingerprints = new Map<string, string>();
@@ -347,12 +301,10 @@ function buildToolFingerprints(messages: MessageLike[]): Map<string, string> {
             const callId = extractCallId(record);
             if (!callId) continue;
             try {
-                // Owner in BOTH key AND value (Finding 1 in plan v3.3.1).
                 const fingerprint = `${ownerMsgId}:${info.toolName}:${JSON.stringify(info.args)}`;
                 const compositeKey = `${ownerMsgId}\x00${callId}`;
                 fingerprints.set(compositeKey, fingerprint);
             } catch {
-                // Skip if args can't be stringified
             }
         }
     }
@@ -360,11 +312,8 @@ function buildToolFingerprints(messages: MessageLike[]): Map<string, string> {
 }
 
 function extractCallId(part: Record<string, unknown>): string | null {
-    // OpenCode format: { type: "tool", callID: "call_xxx" }
     if (part.type === "tool" && typeof part.callID === "string") return part.callID;
-    // tool-invocation format: { type: "tool-invocation", callID: "call_xxx" }
     if (part.type === "tool-invocation" && typeof part.callID === "string") return part.callID;
-    // tool_use format: { type: "tool_use", id: "call_xxx" }
     if (part.type === "tool_use" && typeof part.id === "string") return part.id;
     return null;
 }

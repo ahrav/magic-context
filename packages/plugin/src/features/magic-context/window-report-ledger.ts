@@ -11,23 +11,12 @@ const ROTATED_WINDOW_REPORTS_FILE = `${WINDOW_REPORTS_FILE}.1`;
 export const WINDOW_REPORTS_ROTATION_BYTES = 16 * 1024 * 1024;
 
 /**
- * Fusiform's full-catalog dual-detector admit sweep (pm_d3e23fcd:
- * 125 providers / 5,680 models whose catalogs carry other vendors' models).
- * An ADMIT list, not a classification — membership warrants
- * `path_may_forward: true` at capture; absence clears nobody (a provider
- * using an id convention neither detector knows is silently missing here),
- * which is why the emitter never writes `false`: the report schema pins
- * absent = unknown routing (refuses promotion, same as true), while an
- * explicit false would PERMIT promotion — a claim this set structurally
+ * `FORWARDING_PROVIDER_IDS` is an admit list, not a classification.
+ * `FORWARDING_PROVIDER_IDS` membership permits only `path_may_forward: true`.
+ * Omitting `path_may_forward` leaves routing unknown and refuses promotion.
+ * `false` would permit promotion, but `FORWARDING_PROVIDER_IDS` cannot establish that a path does not forward.
  * cannot support.
  *
- * `ollama-cloud` is deliberately EXCLUDED: the detectors admit it (it
- * carries glm/deepseek/kimi weights) but it imposes its OWN wall from its
- * own serving stack — and this field marks whose-wall-might-fire, not
- * who-carries-whose-models. Other own-wall gateways may hide in this list;
- * only per-cell evidence distinguishes them, and Fusiform's adjudicator
- * refuses promotion for every admitted provider regardless, so a wrong
- * `true` here degrades toward refusal, never toward a wrong mint.
  */
 export const FORWARDING_PROVIDER_IDS: ReadonlySet<string> = new Set([
     "302ai",
@@ -171,14 +160,11 @@ export interface WindowReport {
     largest_success?: number;
     largest_success_units?: "estimate";
     /**
-     * Emitted ONLY as `true` (provider is a known forwarder) or omitted
-     * (unknown routing — refuses promotion by the schema's absent rule).
-     * Never `false`: this reporter has no evidence basis for asserting a
-     * path cannot forward, and explicit false is the one value that would
-     * permit promoting a measured report at a forwarded key.
+     * Omitting `path_may_forward` leaves routing unknown and refuses promotion.
+     * This reporter never emits `false` because it cannot establish that a path does not forward.
      */
     path_may_forward?: true;
-    /** Observed routing evidence only; never inferred from provider configuration. */
+    /** `served_by_hint` uses only observed evidence, never provider configuration. */
     served_by_hint?: string;
 }
 

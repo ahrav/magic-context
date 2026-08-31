@@ -74,39 +74,33 @@ const SEMANTIC_WEIGHT = 0.7;
 const FTS_WEIGHT = 0.3;
 const SINGLE_SOURCE_PENALTY = 0.8;
 const RESULT_PREVIEW_LIMIT = 220;
-/** Source boost multipliers for unified ranking.
+/**
  *
- * Memories are curated, hand-written summaries — strongest signal.
- * Git commits are terse human-written descriptions — high signal.
- * Messages are raw history that survived compression — boosted above baseline
- * (1.15 in this release, up from 1.0) because by definition these are the
- * specific details the historian didn't preserve as memories or compartments,
- * which is exactly what ctx_search is most useful for. */
+ * */
 const MEMORY_SOURCE_BOOST = 1.3;
 const MESSAGE_SOURCE_BOOST = 1.15;
 const GIT_COMMIT_SOURCE_BOOST = 1.2;
 const PRIMER_SOURCE_BOOST = 1.25;
 const ANTI_MEMORY_SEMANTIC_THRESHOLD = 0.7;
-/** Ceiling on candidate texts sent to the embedding provider per search.
- *  Anti-memory passage vectors are computed live (nothing persists them),
- *  and this lane runs on the per-user-prompt auto-search path, so the batch
- *  must not scale with the record population. Lexically matched candidates
- *  keep priority; the remainder of the budget goes to the newest records. */
+/** Each search sends at most 32 candidate texts to the embedding provider.
+ * The search computes anti-memory passage vectors live and does not persist them.
+ * Anti-memory semantic search runs on each user-prompt auto-search path.
+ * Candidate selection must not scale with record population.
+ * Lexically matched candidates take priority; newest records fill the remaining budget. */
 const ANTI_MEMORY_MAX_SEMANTIC_CANDIDATES = 32;
-/** Ceiling on the bytes of one anti-memory passage handed to the embedding
- *  provider and scanned for lexical overlap. Payload fields are normalized but
- *  not length-limited at write time, so without this a single oversized record
- *  could exceed the provider's input budget or spend the whole per-prompt
- *  deadline. Paired with the candidate ceiling above, it bounds a batch. */
+/** Each anti-memory passage is limited to 2048 bytes before embedding and lexical-overlap scanning.
+ * The write path normalizes payload fields without limiting their length.
+ * Without a passage-length cap, one oversized record could exceed the provider input budget or consume the per-prompt deadline.
+ * The 32-candidate and 2048-byte ceilings bound each batch. */
 const ANTI_MEMORY_MAX_PASSAGE_BYTES = 2048;
 
 interface MessageSearchRow {
     messageOrdinal?: number | string;
     messageId?: string;
     role?: string;
-    /** Bounded FTS snippet (R34) — never the full message body. */
+    /** The FTS query returns a bounded snippet, never the full message body. */
     fragment?: string;
-    /** `verbatim0..N` full-body probe-containment flags (KTD2). */
+    /** `verbatim0..N` flags test full-body probe containment. */
     [verbatimFlag: string]: unknown;
 }
 
@@ -125,20 +119,19 @@ const messageSearchStatementsWithCutoff = new WeakMap<Database, PreparedStatemen
 const batchedMessageSearchStatements = new WeakMap<Database, Map<string, PreparedStatement>>();
 const batchedFtsCountStatements = new WeakMap<Database, Map<string, PreparedStatement>>();
 
-/** R34 fragment bound: at most this many FTS tokens per message hit. */
+/* */
 const MESSAGE_FRAGMENT_TOKENS = 32;
 const MESSAGE_FRAGMENT_START_MARKER = "<<";
 const MESSAGE_FRAGMENT_END_MARKER = ">>";
 const MESSAGE_FRAGMENT_OMISSION = " ... ";
 /** `content` is column 4 of message_history_fts (session_id, message_ordinal, message_id, role, content). */
 const MESSAGE_FRAGMENT_COLUMN = 4;
-/** Identical snippet parameters for the single and batched statements (KTD2). */
+/* */
 const MESSAGE_FRAGMENT_SQL = `snippet(message_history_fts, ${MESSAGE_FRAGMENT_COLUMN}, '${MESSAGE_FRAGMENT_START_MARKER}', '${MESSAGE_FRAGMENT_END_MARKER}', '${MESSAGE_FRAGMENT_OMISSION}', ${MESSAGE_FRAGMENT_TOKENS}) AS fragment`;
 
-/** Per-probe full-body containment flags, so a verbatim bonus survives even when
- *  the probe falls outside the returned fragment (AE2). SQLite `lower()` folds
- *  ASCII only; probes are ASCII identifier shapes by construction
- *  (`extractLiteralProbes`), and the JS-side probe is lowercased by the caller. */
+/** Per-probe full-body containment flags preserve the verbatim bonus when a probe falls outside the returned fragment.
+ * SQLite `lower()` folds ASCII only; `extractLiteralProbes` produces ASCII identifier-shape probes, and the caller lowercases each probe.
+ * */
 function verbatimFlagSql(probeCount: number): string {
     return Array.from(
         { length: probeCount },
@@ -159,7 +152,7 @@ export interface UnifiedSearchOptions {
     limit?: number;
     memoryEnabled?: boolean;
     embeddingEnabled?: boolean;
-    /** Deprecated: message search no longer reads raw messages on the hot path. */
+    /** Message search does not read raw messages on the hot path. */
     readMessages?: (sessionId: string) => unknown[];
     embedQuery?: (
         text: string,
@@ -172,45 +165,43 @@ export interface UnifiedSearchOptions {
         purpose?: EmbeddingPurpose,
     ) => Promise<(Float32Array | null)[]>;
     isEmbeddingRuntimeEnabled?: () => boolean;
-    /** Only return message-history hits with ordinal ≤ this value (e.g. last compartment end). -1 or omit to search all. */
+    /** The search returns only hits with ordinal ≤ this value; -1 or omission searches all messages. */
     maxMessageOrdinal?: number;
-    /** Include indexed git commits in the result set. Default false — the
-     *  feature is gated behind experimental.git_commit_indexing config. */
+    /** When enabled, the search includes indexed git commits; the default is false.
+     * The `experimental.git_commit_indexing` configuration gates git-commit search. */
     gitCommitsEnabled?: boolean;
-    /** Restrict results to these sources. Omit or pass undefined to search all
-     *  enabled sources. Empty array is treated as "no sources enabled" → [].
-     *  Facts are NOT a source — they're already always rendered in the
-     *  <session-history> block injected into message[0]. */
+    /**
+     * An undefined source list searches all enabled sources; an empty list returns `[]`.
+     * The system renders facts in `message[0]` inside `<session-history>` instead of returning them as search results.
+     * */
     sources?: SearchSource[];
     /** Abort signal — if provided, cancels in-flight embedding requests
-     *  (and any downstream HTTP calls) when the caller gives up. Used by
-     *  transform-hot-path callers like auto-search whose own 3s timeout
-     *  needs to cancel the 30s embedding fetch. */
+     * The signal also cancels downstream HTTP calls when the caller aborts.
+     * `auto-search` uses a 3s timeout and must cancel the 30s embedding fetch.
+     * */
     signal?: AbortSignal;
-    /** When true (default), increment retrieval_count on memory hits. Explicit
-     *  `ctx_search` tool calls from the agent SHOULD count — the agent asked
-     *  for the memory, saw it, and used it. Plugin-internal automatic surfacing
-     *  (e.g. auto-search hints appended to every user prompt) should NOT count
-     *  because the agent may never actually consume the hint, and even if they
-     *  do, automatic surfacing doesn't indicate usefulness. Mis-counting drives
-     *  spurious retrieval-count-based memory promotion decisions. */
+    /** Memory hits increment `retrieval_count` by default.
+     * Explicit `ctx_search` calls count because the agent requested the memory.
+     * Automatic surfacing must not increment retrieval_count.
+     * An agent may never consume an automatically surfaced hint.
+     * Automatic surfacing does not indicate usefulness.
+     * Automatic surfacing must not drive retrieval-count-based memory promotion. */
     countRetrievals?: boolean;
-    /** When true, run multi-probe message search: extract literal symbol/command/
-     *  path probes from the query and query each one separately (RRF-fused) so a
-     *  message containing the exact literal but not the query's other tokens is
-     *  still recalled. Default false — only explicit `ctx_search` tool calls opt
-     *  in; the auto-search hot path stays single-probe to protect its latency
-     *  budget. NL queries with no extractable probes are unaffected either way. */
+    /** Enabled message search extracts literal symbol, command, and path probes.
+     * Search RRF-fuses results from each literal symbol, command, and path probe.
+     * Multi-probe search can recall a message that matches one literal but none of the query's other tokens.
+     * Defaults to false; only explicit `ctx_search` calls enable multi-probe search.
+     * Auto-search remains single-probe to meet its latency budget.
+     * NL queries with no extractable probes are unaffected by `explicitSearch`. */
     explicitSearch?: boolean;
     /** Disables production search metrics while running an offline shadow quality comparison. */
     measurementDisabled?: boolean;
     embeddingModelIdOverride?: string;
     chunkModelIdOverride?: string;
-    /** When `trace` is absent, search performs no tracing. When present,
-     *  tracing does not change results, SQL, side effects, ordering, or
+    /** Without `trace`, search performs no tracing; tracing does not change results, SQL, side effects, ordering, or errors.
      *  errors. */
     trace?: SearchTraceOptions;
-    /** `candidateDepth` sets the per-lane candidate count; `limit` controls
+    /** `candidateDepth` sets the per-lane candidate count; `limit` sets the returned-result count.
      *  returned results. */
     candidateDepth?: number;
     memoryPolicySurface?: "auto_search" | "explicit_search";
@@ -378,12 +369,8 @@ function getMessageSearchStatement(db: Database): PreparedStatement {
 }
 
 /**
- * Cutoff-aware variant: filters `message_ordinal <= cutoff` IN SQL, BEFORE the
- * LIMIT. The JS-side post-filter in runMessageFtsQuery applies the cutoff AFTER
- * fetching `LIMIT` rows, so when the top-ranked rows are all live-tail (above the
- * cutoff) they're fetched-then-discarded and older eligible hits below the limit
- * are never seen — explicit ctx_search could then return nothing. Pushing the
- * predicate into SQL makes LIMIT count only already-eligible rows.
+ * TODO: Apply `message_ordinal <= cutoff` in SQL before `LIMIT`.
+ * `runMessageFtsQuery` applies the cutoff after LIMIT, which can discard all fetched rows despite older eligible hits.
  */
 function getMessageSearchStatementWithCutoff(db: Database): PreparedStatement {
     let stmt = messageSearchStatementsWithCutoff.get(db);
@@ -424,7 +411,7 @@ function getBatchedFtsCountStatement(
     return statement;
 }
 
-/** Read all per-probe document frequencies in one SQLite statement. */
+/* */
 function countSessionFtsMatchesBatch(
     db: Database,
     sessionId: string,
@@ -454,7 +441,7 @@ function countSessionFtsMatchesBatch(
         }
         return counts;
     } catch {
-        // Malformed FTS syntax that survived sanitization is non-discriminative.
+        // `runMessageFtsQuery` treats FTS query failures as non-discriminative.
         return Array.from({ length: ftsQueries.length }, () => 0);
     }
 }
@@ -472,15 +459,10 @@ function getMessageOrdinal(value: number | string | undefined): number | null {
     return null;
 }
 
-/** Linear decay message scoring.
+/**
  *
- * The old formula (1 / (rank+1)) collapsed quickly: rank-0 = 1.0, rank-1 = 0.5,
- * rank-2 = 0.33, rank-5 = 0.17. In practice only the #1 message hit could
- * compete with boosted memories, so all secondary message matches got buried.
  *
- * Linear decay (1 - rank/limit) keeps signal across the returned window:
- * rank-0 = 1.0, rank-1 = 0.9, rank-2 = 0.8, rank-9 = 0.1. Combined with the
- * bumped MESSAGE_SOURCE_BOOST this lets raw-history hits actually compete. */
+ * */
 function linearDecayScore(rank: number, total: number): number {
     if (total <= 0) return 0;
     return Math.max(0, 1 - rank / total);
@@ -490,14 +472,14 @@ interface NormalizedMessageRow {
     messageOrdinal: number;
     messageId: string;
     role: string;
-    /** Bounded FTS fragment (R34), not the full body. */
+    /** The result contains a bounded FTS fragment, not the full body. */
     fragment: string;
-    /** Full-body verbatim containment per sanitized probe, parallel to the
-     *  probe list passed to the query (empty on the single-query path). */
+    /**
+     * */
     verbatim: boolean[];
 }
 
-/** Convert one FTS row into the validated shape consumed by message ranking. */
+/* */
 function normalizeMessageSearchRow(
     row: MessageSearchRow,
     cutoff: number | null,
@@ -512,7 +494,6 @@ function normalizeMessageSearchRow(
     ) {
         return null;
     }
-    // Defense-in-depth: every SQL path applies the cutoff before LIMIT.
     if (cutoff !== null && messageOrdinal > cutoff) return null;
     return {
         messageOrdinal,
@@ -525,8 +506,8 @@ function normalizeMessageSearchRow(
     };
 }
 
-/** Run one FTS query and return ordinal-cutoff-filtered, validated rows in
- * bm25 rank order. `ftsQuery` must already be sanitized. */
+/** `runMessageFtsQuery` returns ordinal-cutoff-filtered, validated rows in BM25 rank order.
+ * `ftsQuery` must be sanitized before `runMessageFtsQuery` receives it. */
 function runMessageFtsQuery(
     db: Database,
     sessionId: string,
@@ -535,8 +516,7 @@ function runMessageFtsQuery(
     cutoff: number | null,
 ): NormalizedMessageRow[] {
     if (ftsQuery.length === 0) return [];
-    // Apply the ordinal cutoff IN SQL (before LIMIT) so live-tail matches can't
-    // crowd out older eligible hits; null cutoff keeps the original statement.
+    // A `null` cutoff keeps the original SQL statement.
     const rows = (
         cutoff !== null
             ? getMessageSearchStatementWithCutoff(db).all(sessionId, ftsQuery, cutoff, fetchLimit)
@@ -589,8 +569,8 @@ function getBatchedMessageSearchStatement(
     return statement;
 }
 
-/** Run all base/probe result queries as one compound SQLite statement.
- *  `lowercasedProbes` drive the KTD2 full-body verbatim flags. */
+/**
+ * */
 function runMessageFtsQueriesBatch(
     db: Database,
     sessionId: string,
@@ -602,8 +582,6 @@ function runMessageFtsQueriesBatch(
     if (ftsQueries.length === 0) return [];
     const bindings: unknown[] = [];
     for (const query of ftsQueries) {
-        // Parameter order follows appearance in the SQL text: the select-list
-        // verbatim flags bind before the WHERE clause and LIMIT.
         bindings.push(...lowercasedProbes);
         bindings.push(sessionId, query);
         if (cutoff !== null) bindings.push(cutoff);
@@ -630,26 +608,13 @@ function runMessageFtsQueriesBatch(
     return result;
 }
 
-// Reciprocal-rank-fusion constant. 60 is the canonical RRF k; it dampens the
-// reward gap between rank-0 and rank-1 so a candidate that appears in several
-// probe lists outranks one that tops a single list.
+// `RRF_K = 60` reduces the difference between adjacent rank contributions.
 const RRF_K = 60;
-// Verbatim containment is worth one extra rank-0 list appearance — the same
-// 1/RRF_K currency as the fused lists. The previous flat +0.5 bonus lived 30×
-// above the RRF scale (max list contribution is 1/60 ≈ 0.017), so every
-// verbatim hit saturated; after divide-by-max normalization all scores
-// flattened into a ~0.95–1.0 band, and at the unified layer those ~1.0 scores
-// × MESSAGE_SOURCE_BOOST crowded every memory hit out of the result set.
+// `verbatim` adds one rank-0 list contribution to the RRF score.
 const VERBATIM_RANK_BONUS = 1 / RRF_K;
-// Probe discrimination weighting: a probe matching a large share of the
-// session's corpus (common acronyms, generic identifiers) carries near-zero
-// signal — bm25 over a single common term is nearly flat, so its ranked list
-// is noise. Weight each probe list (and its verbatim bonus) by a smooth
-// document-frequency falloff: w = 1 / (1 + IDF_FALLOFF · df/N).
-// df/N = 0.1% → 0.91, 1% → 0.50, 2% → 0.33, 10% → 0.09.
 const IDF_FALLOFF = 100;
 
-/** Smooth document-frequency weight for one probe within a session corpus. */
+/* */
 function probeDiscriminationWeight(df: number, corpusSize: number): number {
     if (corpusSize <= 0 || df <= 0) return 1;
     return 1 / (1 + (IDF_FALLOFF * df) / corpusSize);
@@ -660,16 +625,15 @@ function searchMessages(args: {
     sessionId: string;
     query: string;
     limit: number;
-    /** Only return messages with ordinal ≤ this value. Omit or -1 to search all indexed messages. */
+    /** `cutoff` limits results to messages with ordinal ≤ `cutoff`; omit `cutoff` to search all indexed messages. */
     maxOrdinal?: number;
-    /** Literal probes to additionally query (multi-probe recall). Empty = the
-     * original single-query behavior (unchanged for NL queries / hot path). */
+    /**
+     * An empty probe list uses the single-query path. */
     probes?: string[];
 }): MessageSearchResult[] {
     const cutoff = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.maxOrdinal : null;
-    // Overfetch covers post-cutoff attrition, but each FTS branch's LIMIT
-    // binding stays within the shared lane ceiling regardless of the caller's
-    // (already tier-multiplied) limit.
+    // Overfetch compensates for candidates removed after cutoff filtering.
+    // limit.
     const fetchLimit =
         args.maxOrdinal != null && args.maxOrdinal >= 0
             ? Math.min(args.limit * 3, MAX_LANE_CANDIDATES)
@@ -678,8 +642,6 @@ function searchMessages(args: {
     const baseQuery = sanitizeFtsQuery(args.query.trim());
     const probes = args.probes ?? [];
 
-    // No probes → original single-query path, byte-identical scoring. This is
-    // the hot path (auto-search) and every plain natural-language query.
     if (probes.length === 0) {
         const filtered = runMessageFtsQuery(
             args.db,
@@ -698,9 +660,7 @@ function searchMessages(args: {
         }));
     }
 
-    // Multi-probe: run the full query plus every literal probe as separate FTS
-    // rankings, but batch each phase into one compound SQLite statement. This
-    // preserves independent bm25 ranks while avoiding statement amplification.
+    // Each query retains its independent bm25 rank.
     const sanitizedProbes = probes
         .map((probe) => ({ probe, query: sanitizeFtsQuery(probe) }))
         .filter((entry) => entry.query.length > 0);
@@ -729,7 +689,6 @@ function searchMessages(args: {
     if (baseQuery.length > 0) {
         queryLists.push({
             rows: rowsByQuery[queryIndex] ?? [],
-            // The full query is AND-joined and inherently discriminative.
             weight: 1,
         });
         queryIndex += 1;
@@ -755,12 +714,11 @@ function searchMessages(args: {
         });
     }
 
-    // Verbatim boost: a message that literally contains a probe is exactly what
-    // a symbol/command lookup wants surfaced first. Worth one rank-0 appearance
-    // of the BEST (most discriminative) matching probe — rank-domain currency,
-    // so it reorders within the band instead of saturating the scale.
+    // A literal probe match receives one rank-0 RRF contribution.
+    // A verbatim match uses the highest weight among matching probes.
+    // The verbatim contribution reorders matches within the score band instead of saturating it.
     // Flags cover sanitized probes only: an unsanitized probe carries weight 0
-    // and can never win.
+    // An unsanitized probe has weight 0 and cannot win the verbatim-match tie-break.
     for (const entry of fused.values()) {
         let best = 0;
         entry.row.verbatim.forEach((matched, probeIndex) => {
@@ -780,10 +738,8 @@ function searchMessages(args: {
         )
         .slice(0, args.limit);
 
-    // Map fused RRF scores into the same linear 0..1 band the single-query path
-    // emits (linearDecayScore), so the unified ranker sees comparable scales
-    // from both message paths and source boosts behave consistently. Rank is
-    // what RRF actually determines; the band keeps cross-source comparability.
+    // Fused RRF scores use the single-query path's linear 0..1 band.
+    // The mapping makes scores from both message paths comparable and keeps source boosts consistent.
     return ranked.map((entry, rank) => ({
         source: "message" as const,
         content: previewText(entry.row.fragment),
@@ -840,16 +796,8 @@ async function searchAntiMemories(args: {
         args.db,
         workspace.isWorkspaced ? workspace.ownIdentities : [args.projectPath],
     );
-    // Bounded candidate listing first: hydrating current state for the whole
-    // project claim set just to keep the anti-memory category would make this
-    // per-prompt lane O(all active claims). The id list is capped like every
-    // sibling lane and scopes the provider read below to anti-memory claims.
+    // The capped ID list limits the provider read to anti-memory claims.
     //
-    // Listed from the caller's own projects, not the expanded workspace set.
-    // Anti-memory records are written `sharing: "private"`, so a co-member's
-    // warning can never clear the authorization step below — including it here
-    // would let newer foreign rows consume the ceiling and then be dropped,
-    // hiding the caller's own warnings behind claims they can never see.
     const candidateIds = listActiveAntiMemoryPublicIds(
         args.db,
         ownProjectIds,
@@ -857,16 +805,8 @@ async function searchAntiMemories(args: {
         Date.now(),
     );
     if (candidateIds.length === 0) return [];
-    // One closure = one authorization/surface/lifecycle setting, shared by the
-    // hydration read and the post-embedding recheck below, so the two reads
-    // cannot drift: the provider stays the single authority on visibility.
+    // The shared closure keeps both reads' authorization, surface, and lifecycle settings identical.
     //
-    // `stale` is a routine outcome, not a failure: the provider reports it when
-    // a project, policy, or workspace generation moves during hydration, which
-    // any concurrent claim write can cause. Giving up on the first one would
-    // drop the whole warning lane for an unrelated write, so it is retried once
-    // against the new snapshot — the same two-attempt shape the locator lane
-    // uses. Persisting past that returns null and the caller fails closed.
     const readAntiMemoryState = (publicClaimIds: readonly string[]) => {
         for (let attempt = 0; attempt < 2; attempt += 1) {
             const result = readProjectMemoryCurrentState(args.db, {
@@ -887,14 +827,7 @@ async function searchAntiMemories(args: {
         }
         return null;
     };
-    // The state read uses the explicit-search surface (the only surface whose
-    // candidate query includes anti-memory), so the automatic-surface policy
-    // gates are applied here. A projection written under a newer policy version
-    // fails closed — its stored bits are not trustworthy — and anything below
-    // the automatic eligibility bar (effective VERIFIED+ with a present,
-    // supported policy subject) must not be auto-injected into user prompts.
-    // Dispositions are re-checked from the authoritative facts because the
-    // projection can lag a policy-unaware writer.
+    // The reader rejects projections with `policyVersion > CLAIM_POLICY_VERSION` because their policy bits are untrusted.
     const eligibleForSurface = (item: ProjectMemoryClaimSnapshot): boolean => {
         if (args.surface !== "auto_search") return true;
         if (item.policy.policyVersion > CLAIM_POLICY_VERSION) return false;
@@ -922,21 +855,13 @@ async function searchAntiMemories(args: {
         if (!eligibleForSurface(item)) continue;
         const record = records.get(item.publicClaimId);
         if (record === undefined) continue;
-        // Match against payload values only. The rendered `record.content`
-        // carries constant field labels ("Rejected strategy", "Root cause",
-        // …) whose tokens would let unrelated prompts match every record.
+        // Payload matching excludes constant `record.content` labels because those labels match unrelated prompts.
         //
-        // `nonApplicableWhen` is deliberately absent: it records the exception
-        // where the rejection does NOT hold, and it is not rendered in the
-        // warning. Matching on it would retrieve the warning for exactly the
-        // prompt it disclaims and then show text asserting the opposite. It
-        // belongs in an exclusion test, which does not exist yet.
+        // Exclusion matching ignores `nonApplicableWhen` because it states when the rejection does not hold.
+        // TODO: Add exclusion matching for `nonApplicableWhen`.
         //
-        // Payload fields carry no write-side length limit, so the assembled
-        // text is capped: it feeds both the token scan below and a live
-        // provider batch, and one oversized record must not be able to blow the
-        // embedding request or the per-prompt time budget. Field order puts the
-        // load-bearing values first, so truncation drops context, not identity.
+        // The search caps assembled text because payload fields have no write-side length limit.
+        // The assembly places identity fields before context fields so truncation preserves identity.
         const text = truncateUtf8Bytes(
             [
                 record.payload.trigger,
@@ -980,11 +905,9 @@ async function searchAntiMemories(args: {
         candidates.push({ result, text, lexicalScore });
     }
 
-    // The embedding batch is a live provider call on the per-prompt path, so
-    // it is capped independently of the candidate ceiling: lexically matched
-    // candidates first (strongest score first), then the newest remaining
-    // records. State items arrive ordered by ascending claim id, so a higher
-    // candidate index means a newer record.
+    // The search caps the live per-prompt embedding batch independently of the candidate ceiling.
+    // The embedding batch prioritizes lexically matched candidates by descending score, then remaining candidates from newest to oldest.
+    // Ascending claim-ID order makes higher candidate indexes identify newer records.
     const semanticQueryEmbedding = args.surface === "auto_search" ? args.queryEmbedding : null;
     const embedIndices =
         semanticQueryEmbedding && candidates.length > 0
@@ -1033,10 +956,7 @@ async function searchAntiMemories(args: {
         const semanticWins = semanticMatch && semanticScore > (candidate.lexicalScore ?? 0);
         ranked.push({
             ...candidate.result,
-            // A cosine score below the threshold is noise, not evidence. Folding
-            // it into the score through `Math.max` would let an unrelated
-            // passage outrank a genuine lexical hit while still reporting
-            // `matchType: "lexical"`, so only a threshold-clearing score ranks.
+            // Only cosine scores at or above the threshold affect ranking.
             score: semanticMatch
                 ? Math.max(candidate.lexicalScore ?? 0, semanticScore)
                 : (candidate.lexicalScore ?? 0),
@@ -1049,29 +969,23 @@ async function searchAntiMemories(args: {
                 right.score - left.score || left.publicClaimId.localeCompare(right.publicClaimId),
         )
         .slice(0, args.limit);
-    // Revalidate before publishing, on every path. The awaited passage
-    // embedding opens the widest window — a live provider call that can take
-    // seconds, during which another process can retire, revise, expire, or
-    // quarantine a warning — but it is not the only one: the state read and the
-    // record read are separate autocommit statements, so even the lexical path
-    // publishes bytes assembled across two snapshots. The provider proves
-    // visibility at publication time, the same rule the locator lane applies.
+    // The awaited passage-embedding call extends the revalidation window.
+    // During the provider call, another process can retire, revise, expire, or quarantine a warning.
+    // The state read and record read use separate autocommit statements, so lexical results can combine two snapshots.
+    // The provider verifies visibility at publication time, matching the locator lane.
     if (published.length === 0) return published;
     const current = readAntiMemoryState(published.map((result) => result.publicClaimId));
     if (current === null) return [];
     const currentById = new Map(current.map((item) => [item.publicClaimId, item]));
     return published.filter((result) => {
         const item = currentById.get(result.publicClaimId);
-        // Absent means archived, expired, or no longer visible; a moved locator
-        // or digest means the payload copied above is pre-transition content.
+        // An absent revalidation record means the warning is archived, expired, or no longer visible.
+        // A moved locator or digest means the copied payload predates the transition.
         if (item === undefined) return false;
         if (item.revisionLocator !== result.revisionLocator) return false;
         if (item.contentDigest !== result.contentDigest) return false;
-        // A disposition landing between the two reads changes the label without
-        // touching the revision, so the label is the only signal that a warning
-        // went stale, disputed, or superseded under an explicit search — where
-        // the surface policy below deliberately does not gate on dispositions.
-        // Publishing the pre-transition copy would render it as unqualified.
+        // A disposition between the reads can change only the label; the label therefore detects stale, disputed, or superseded warnings in explicit search.
+        // Publishing the pre-transition copy would omit its stale, disputed, or superseded label.
         if ((item.explicitLabel ?? undefined) !== result.policyLabel) return false;
         return eligibleForSurface(item);
     });
@@ -1117,23 +1031,15 @@ function rankNotesForNeedle(notes: readonly Note[], needle: string): RankedNoteM
     });
 }
 
-/** FTS5's trigram tokenizer cannot represent an atom shorter than this. */
+/** FTS5's trigram tokenizer cannot represent atoms shorter than three characters. */
 const NOTE_FTS_MIN_ATOM_LENGTH = 3;
 
 /**
- * The OR-joined trigram query covering the atoms `rankNotesForNeedle` scores:
- * the whole needle (its exact-substring test) and each keyword token (its
- * coverage test). Substring matching makes the result a superset of the
- * scored matches for every representable atom, so pruning cannot drop a note
- * the scorer would keep through those atoms.
+ * The OR-joined trigram query includes the whole needle for exact-substring scoring and each keyword token for coverage scoring.
+ * The query includes the needle and keyword tokens so FTS pruning preserves candidates that scoring can match.
  *
- * Atoms below the trigram minimum are dropped from the query rather than
- * disabling it: "how to deploy sentinel" must still select older notes
- * containing "deploy sentinel" even though "to" cannot be represented. The
- * only recall cost is a note matching NOTHING but unrepresentable short
- * tokens — the weakest possible hit — which is reachable only through the
- * recency window. Returns null when no atom is representable (the caller
- * falls back to that window), and "" for an empty needle, which the scorer
+ * The query retains representable atoms when shorter atoms are unrepresentable.
+ * The caller falls back to the recency window when no atom is representable.
  * never matches.
  */
 function noteFtsQueryForNeedle(needle: string): string | null {
@@ -1146,8 +1052,8 @@ function noteFtsQueryForNeedle(needle: string): string | null {
     return atoms.map((atom) => `"${atom.replace(/"/g, '""')}"`).join(" OR ");
 }
 
-/** The fused pool caps at MAX_LANE_CANDIDATES so scoring work stays bounded
- *  even when many needles each fill their branch. */
+/** loadNoteSearchCorpus caps the fused pool at MAX_LANE_CANDIDATES to bound scoring work.
+ * */
 function loadNoteSearchCorpus(args: {
     db: Database;
     sessionId: string;
@@ -1188,13 +1094,7 @@ function loadNoteSearchCorpus(args: {
 }
 
 /**
- * Corpus-wide document frequency per probe for discrimination weighting. The
- * candidate pool is capped at MAX_LANE_CANDIDATES, so counting a probe's
- * matches inside the pool would clamp df at the cap while the weight's
- * denominator stays corpus-wide — inflating a non-discriminative probe's
- * weight by up to corpus/cap. Probes without an indexed count (unrepresentable
- * atom, absent projection, malformed query) are omitted; the caller falls
- * back to its pool-derived count for those.
+ * Probe discrimination uses corpus-wide document frequency.
  */
 function noteProbeDocumentFrequencies(args: {
     db: Database;
@@ -1236,8 +1136,6 @@ function searchNotes(args: {
     }
 
     const probes = args.probes ?? [];
-    // Probe discrimination weighs a probe against the whole scoped corpus, so the
-    // denominator comes from an indexed count rather than the hydrated rows.
     const corpusSize = countSearchableNotes(args.db, {
         sessionId: args.sessionId,
         projectPath: args.projectPath,
@@ -1404,14 +1302,9 @@ function searchCompartmentChunks(args: {
         }));
 }
 
-/** Assign each message ordinal to its containing compartment with one ordered
- *  interval sweep instead of scanning every compartment range per message.
+/**
  *
- *  Assignment order and fusion order are deliberately separate (KTD5): the sweep
- *  walks ordinal-sorted copies, while overlap ties are still resolved by the
- *  compartment's original semantic rank, so a boundary message lands in the
- *  earliest-ranked containing compartment exactly as a rank-ordered scan did.
- *  Returned map keys are the caller's message array indexes. */
+ * */
 export function assignMessagesToCompartments(
     messages: readonly MessageSearchResult[],
     compartments: readonly CompartmentSearchResult[],
@@ -1435,9 +1328,6 @@ export function assignMessagesToCompartments(
                 left.index - right.index,
         );
 
-    // Ranges whose start is already reached and whose end has not been passed.
-    // Messages advance monotonically, so a range dropped here can never contain
-    // a later ordinal.
     let active: Array<{ compartment: CompartmentSearchResult; rank: number }> = [];
     let cursor = 0;
     for (const { message, index } of ordered) {
@@ -1458,8 +1348,8 @@ export function assignMessagesToCompartments(
     return assignment;
 }
 
-/** Exported for the KTD1 characterization tests, which differential-check the
- *  interval sweep against a local reference of the former per-message scan. */
+/**
+ * */
 export function mergeMessageAndCompartmentResults(args: {
     messages: MessageSearchResult[];
     compartments: CompartmentSearchResult[];
@@ -1584,7 +1474,6 @@ function compareUnifiedResults(left: UnifiedSearchResult, right: UnifiedSearchRe
     }
 
     if (left.source === "git_commit" && right.source === "git_commit") {
-        // Newer commits win ties.
         return right.committedAtMs - left.committedAtMs;
     }
 
@@ -1617,9 +1506,8 @@ function searchGitCommits(args: {
     projectPath: string;
     query: string;
     limit: number;
-    /** Pre-computed query embedding (or null if embedding is disabled / failed).
-     *  unifiedSearch embeds once and passes the same vector here and to
-     *  searchMemories — never embed twice for one query. */
+    /**
+     * */
     queryEmbedding: Float32Array | null;
     queryModelId?: string | null;
     onVectorLoad?: VectorLoadObserver;
@@ -1653,8 +1541,6 @@ function searchPrimers(args: {
     stages?: HybridLaneStageMarks;
 }): PrimerSearchResult[] {
     if (args.limit <= 0) return [];
-    // Vector phase covers the primer decode plus cosine scoring: the decoded
-    // bytes reported through onVectorLoad are exactly this phase's work.
     args.stages?.vectorStart();
     const primers = getActivePrimers(args.db, args.projectPath, args.onVectorLoad);
     const semanticScores = new Map<number, number>();
@@ -1728,9 +1614,6 @@ function searchPrimers(args: {
 
 function resolveSources(sources: SearchSource[] | undefined): Set<SearchSource> {
     if (sources === undefined) {
-        // Default: search all recall sources. Facts are deliberately NOT a
-        // source — they're always rendered in <session-history> so searching
-        // them returns content the agent already sees.
         return new Set<SearchSource>(["memory", "message", "git_commit", "primer", "note"]);
     }
     const set = new Set<SearchSource>();
@@ -1749,10 +1632,6 @@ function resolveSources(sources: SearchSource[] | undefined): Set<SearchSource> 
 }
 
 /**
- * Parse a whole-query exact-locator list: every whitespace-separated token
- * must be a public claim ID (`mcm_<32hex>`) or a full revision locator
- * (`mcm_<32hex>/r<n>/<sha256>`). Returns null for anything else so ordinary
- * text queries fall through to the normal lanes.
  */
 export function parseLocatorShapedQuery(query: string): string[] | null {
     const tokens = query
@@ -1774,25 +1653,15 @@ export function parseLocatorShapedQuery(query: string): string[] | null {
 }
 
 /**
- * Exact claim/revision-locator lookup through the current-state provider —
- * the only search path that serves project-memory claims while the retrieval
- * projection is inactive. A revision locator resolves to the claim's CURRENT
- * visible revision. Workspace authorization applies before the limit: a
- * foreign member's claim is visible only when shareable in a shared
- * category, and a nonmember cannot distinguish hidden from missing. Results
- * are revalidated through the same provider after telemetry and immediately
- * before publication, so a claim hidden or revised once the provider's
- * snapshot closed is dropped rather than served. Returns null when nothing
- * resolved so callers fall through to the normal lanes.
  */
 export function resolveClaimsByLocatorsForSearch(args: {
     db: Database;
     projectPath: string;
     locators: readonly string[];
     limit: number;
-    /** Revision locators already rendered in the injected baseline. */
+    /* */
     visibleRevisionLocators?: ReadonlySet<string> | null;
-    /** Bump claim retrieval telemetry (explicit agent lookups). */
+    /* */
     countRetrievals?: boolean;
 }): Array<MemorySearchResult | AntiMemorySearchResult> | null {
     if (args.locators.length === 0) return null;
@@ -1819,11 +1688,6 @@ export function resolveClaimsByLocatorsForSearch(args: {
             workspace.isWorkspaced ? workspace.ownIdentities : [args.projectPath],
         ),
     );
-    // One closure = one authorization/surface/lifecycle setting, used by both
-    // the hydration read and the pre-publication recheck below. The two reads
-    // must not be able to drift: the provider is the single authority that
-    // decides visibility, so the recheck asks it the same question rather than
-    // reimplementing the policy filter.
     const readVisibleClaims = (): ProjectMemoryClaimSnapshot[] | null => {
         for (let attempt = 0; attempt < 2; attempt += 1) {
             const result = readProjectMemoryCurrentState(args.db, {
@@ -1834,9 +1698,6 @@ export function resolveClaimsByLocatorsForSearch(args: {
                     sharedCategories: workspace.shareCategories ?? [],
                 },
                 workspaceEpoch: computeWorkspaceEpochFingerprint(args.db, workspace.identities),
-                // Named so the provider recomputes the fingerprint at
-                // publication time; without them it echoes the value above into
-                // both snapshot vectors and a revocation in flight goes
                 // undetected.
                 workspaceIdentities: workspace.identities,
                 surface: "explicit_search",
@@ -1910,23 +1771,19 @@ export function resolveClaimsByLocatorsForSearch(args: {
             kind: "retrieved",
         });
     }
-    // Revalidate through the provider before publishing. The provider proves
-    // visibility inside its own snapshot and then CLOSES it, so every byte
-    // above was read from state that is already historical here: one
-    // connection is cached per path per process, and under WAL another process
-    // can take the writer lock, let this process read old committed state, and
-    // commit a quarantine, rejection, or revision before this call returns.
-    // The telemetry write widens that window — `BEGIN IMMEDIATE` blocks for up
-    // to `busy_timeout` behind that writer — but it does not create it, so the
-    // recheck runs even when `countRetrievals === false`: publication safety
-    // must not depend on whether a counter is enabled.
+    // The provider closes its snapshot before revalidation.
+    // The initial read may be stale at revalidation.
+    // Under WAL, another process can write while this process reads old committed state.
+    // Another process can commit a quarantine, rejection, or revision before this call returns.
+    // Telemetry can delay revalidation by up to `busy_timeout`.
+    // The telemetry write does not create the stale-read window.
+    // The provider revalidates even when `countRetrievals === false`.
     const current = readVisibleClaims();
     if (current === null) return null;
     const currentByClaimId = new Map(current.map((item) => [item.publicClaimId, item]));
-    // Publish a result only when every field copied out of the snapshot still
-    // matches. Absent means hidden or gone; a moved locator, digest, content,
-    // category, or evidence label means the claim transitioned under us and
-    // the copy above is pre-transition content.
+    // Revalidation publishes a result only when every field copied from the snapshot still matches.
+    // A missing current claim is either hidden or deleted.
+    // The initial copy can predate a quarantine, rejection, or revision.
     const confirmed = ordered.filter((result) => {
         const item = currentByClaimId.get(result.publicClaimId);
         if (item === undefined) return false;
@@ -1937,20 +1794,18 @@ export function resolveClaimsByLocatorsForSearch(args: {
         ) {
             return false;
         }
-        // An anti-memory result carries payload fields, not `content`/`category`,
-        // so the equality checks above cannot cover it. The read spans
-        // `["active", "archived"]` and archiving moves neither the locator nor
-        // the digest, so the lifecycle and category gates hydration applied are
-        // re-applied here instead; otherwise a warning archived under us is
+        // An anti-memory result carries payload fields instead of `content` and `category`.
+        // The preceding equality checks do not cover anti-memory payload fields.
+        // Revalidation reapplies hydration's lifecycle and category gates.
+        // Otherwise, revalidation can publish a warning archived after hydration.
         // still published.
         if (result.source === "anti_memory") {
             return item.category === ANTI_MEMORY_CATEGORY && item.lifecycleState === "active";
         }
         return item.content === result.content && item.category === result.category;
     });
-    // Dropping is the same observable outcome as never resolving: `null` is
-    // exactly what a missing or foreign-hidden locator returns, so a caller
-    // cannot distinguish "this claim went hidden" from "no such claim".
+    // `null` also represents a missing or foreign-hidden locator.
+    // Callers cannot distinguish a hidden claim from a missing claim.
     if (confirmed.length === 0) return null;
     return confirmed;
 }
@@ -1968,10 +1823,7 @@ export async function unifiedSearch(
     }
     const trimmedQuery = prepared.query;
     const measurementStartedAt = Date.now();
-    // The trace root precedes depth validation, and both precede the
-    // empty-query short-circuit: an invalid candidateDepth must throw for
-    // every input, and a supplied sink must see one root span per call —
-    // including the call that throws.
+    // For calls that reach trace creation, a supplied sink receives one root span.
     const trace = options.trace ? createSearchTraceRecorder(options.trace) : null;
     const rootSpan = trace?.begin("root", "unified") ?? null;
     let candidateDepth: number | null;
@@ -2024,10 +1876,8 @@ async function executeUnifiedSearch(args: {
     const tierLimit =
         args.candidateDepth ??
         Math.min(Math.max(limit * 3, DEFAULT_SEARCH_RESULT_LIMIT), MAX_LANE_CANDIDATES);
-    // requestedK and effectiveK are emitted from this one variable, so the
-    // candidate-depth assertion over these counters checks plumbing
-    // identity only; it cannot see a lane that internally clamped its
-    // executed bound. Surfacing per-lane executed bounds is future work.
+    // `requestedK` and `effectiveK` share one value, so their equality cannot detect per-lane clamping.
+    // TODO: Expose per-lane executed bounds to detect internal clamping.
     const laneDepth = { requestedK: tierLimit, effectiveK: tierLimit };
 
     const filterSpan = trace?.begin("filter_construction", "unified", { parent: rootId }) ?? null;
@@ -2045,28 +1895,12 @@ async function executeUnifiedSearch(args: {
     const runAntiMemories = activeSources.has("memory") && memoryFeatureEnabled;
     const runCompartmentChunks = runMessages && memoryFeatureEnabled && embeddingEnabled;
     filterSpan?.end("ok");
-    // Downstream chain roots depend on the filter span so criticalPathMs
-    // includes filtering cost. Workspace resolution is also filter work,
-    // but its synchronous SQLite reads must not run before the embed fetch
-    // is dispatched; it gets its own span after the dispatch below.
+    // The filter span encloses downstream chain roots, so `criticalPathMs` includes filtering cost.
+    // Workspace resolution is filter work.
+    // The search starts embedding before workspace resolution because SQLite reads are synchronous.
     const filterDeps = filterSpan ? [filterSpan.id] : [];
 
-    // Embed the query ONCE at the top — both memory and git-commit searches
-    // need the same vector. Previously each search called `embedQuery`
-    // independently, producing two parallel HTTP requests for the same
-    // input text (visible in LMStudio logs as duplicate `/v1/embeddings`
-    // entries) which serialized at the model and doubled latency on
-    // single-GPU embedding endpoints.
     //
-    // We start the embed BEFORE running the synchronous `searchMessages`
-    // path. JavaScript evaluates `Promise.all` arguments left-to-right, so
-    // any synchronous call inside an arg expression blocks the event loop
-    // and prevents in-flight `fetch()` work from being processed by the
-    // runtime — even though the request was technically dispatched. On
-    // long sessions `searchMessages` can do seconds of indexing work
-    // (`ensureMessagesIndexed` walks raw OpenCode session history); doing
-    // that BEFORE the embed call meant the embed fetch couldn't start
-    // until indexing finished.
     const antiMemorySemanticEnabled =
         runAntiMemories && (options.memoryPolicySurface ?? "explicit_search") === "auto_search";
     const needsEmbedding =
@@ -2098,20 +1932,10 @@ async function executeUnifiedSearch(args: {
               )
             : Promise.resolve(null);
 
-    // Yield to the event loop so the embed fetch's request gets a chance
-    // to be dispatched at the runtime level before we run any synchronous
-    // work. This is the crucial line that unblocks the auto-search 3-second
-    // delay observed in production: without it, `searchMessages` runs
-    // before the embed fetch is processed, and the embedding HTTP request
-    // doesn't actually leave the process until we await later.
     await Promise.resolve();
 
-    // Run the synchronous message-FTS SELECT now that the embed fetch is
-    // in flight. Message indexing is event-driven and never runs here;
-    // unreconciled sessions simply return no message hits until the async
-    // first-touch reconciliation finishes.
-    // Multi-probe recall is opt-in for explicit searches only. NL queries
-    // yield no probes, so this is a no-op for them regardless of the flag.
+    // Message indexing is event-driven and does not run during search.
+    // Unreconciled sessions return no message hits until asynchronous first-touch reconciliation finishes.
     const messageProbes = options.explicitSearch ? extractLiteralProbes(trimmedQuery) : [];
     const messageSpan =
         trace && runMessages
@@ -2129,8 +1953,7 @@ async function executeUnifiedSearch(args: {
         : [];
     messageSpan?.end("ok", { candidatesOut: messageResults.length, ...laneDepth });
 
-    // Wait for the single embed call (if any) and then run the two
-    // embedding-dependent searches in parallel using the same vector.
+    // The embedding-dependent searches share one query vector and run in parallel after embedding completes.
     const capturedQuery = await queryEmbeddingPromise;
     const generationSpan =
         trace?.begin("generation_lookup", "query", {
@@ -2159,10 +1982,7 @@ async function executeUnifiedSearch(args: {
         ? (queryContract?.vector ?? (capturedQuery instanceof Float32Array ? capturedQuery : null))
         : null;
     generationSpan?.end("ok");
-    // Every semantic lane consumes the generation-gated vector, so a vector
-    // scan's causal edge runs through generation_lookup rather than jumping
-    // straight to query inference; otherwise the critical path drops the
-    // generation check from the semantic pipeline.
+    // Generation-gated vectors keep `generation_lookup` on semantic scans' critical path.
     const semanticDeps = generationSpan ? [generationSpan.id] : embedSpan ? [embedSpan.id] : [];
     const embeddingModelId =
         queryContract?.modelId ?? options.embeddingModelIdOverride ?? embeddingSnapshot?.modelId;
@@ -2235,9 +2055,9 @@ async function executeUnifiedSearch(args: {
         candidatesOut: compartmentResults.length,
         ...laneDepth,
     });
-    // The message fusion stage only runs when a feeding lane ran; a span
-    // with status "ok" for a disabled stage would misreport zero-cost work
-    // as executed, so absent stages emit the explicit marker instead.
+    // Disabled message fusion emits `notApplicable` instead of `ok` to avoid reporting zero-cost work as executed.
+    // Disabled message fusion emits `notApplicable` instead of `ok` to avoid reporting zero-cost work as executed.
+    // Disabled message fusion emits `notApplicable` instead of `ok` to avoid reporting zero-cost work as executed.
     const messageFusionRan = runMessages || runCompartmentChunks;
     const messageFusionSpan =
         trace && messageFusionRan
@@ -2262,11 +2082,9 @@ async function executeUnifiedSearch(args: {
 
     if (messageFusionSpan) laneSpanIds.push(messageFusionSpan.id);
 
-    // Hybrid lanes (git-commit, primer) decompose into lexical_scan,
-    // vector_scan, and fusion spans through stage marks the lane functions
-    // fire at their phase boundaries, joined by an explicit fusion
-    // dependency — one undifferentiated lane span would report lexical-only
-    // execution as vector time and hide the hybrid pipeline's structure.
+    // The `fusion` span depends on the scan spans to preserve phase ordering.
+    // A single lane span would report lexical-only execution as vector time.
+    // A single lane span would report lexical-only execution as vector time and hide the hybrid pipeline structure.
     const runVectorLane = <T>(
         lane: "git_commit" | "primer",
         run: (
@@ -2286,11 +2104,10 @@ async function executeUnifiedSearch(args: {
             lexicalStart: () => {
                 spans.lexical = recorder.begin("lexical_scan", lane, {
                     parent: rootId,
-                    // Sequential phase chaining: the lane implementations
-                    // run their phases one after another on one thread, so
-                    // whichever phase starts second causally waited on the
-                    // first — without the edge the critical path takes
-                    // max(lexical, vector) instead of their sum.
+                    // Lane implementations run lexical and vector phases sequentially, so the second phase depends on the first.
+                    // Lane implementations run lexical and vector phases sequentially, so the second phase depends on the first.
+                    // Lane implementations run lexical and vector phases sequentially, so the second phase depends on the first.
+                    // Without the phase dependency, the critical path uses `max(lexical, vector)` rather than their sum.
                     dependsOn: [...filterDeps, ...(spans.vector ? [spans.vector.id] : [])],
                 });
             },

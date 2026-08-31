@@ -1,19 +1,12 @@
 /**
- * Shared project-identity discovery and terminal-chain resolution.
  *
- * One algorithm serves three consumers so they cannot drift: the v82 migration
- * seeds `projects`/`project_aliases` from it, workspace expansion resolves
- * historical aliases through it, and runtime identity merges flatten both the
- * legacy `v22_identity_rekey_map` and the numeric registry through it.
  *
- * Dependency-light on purpose: type-only imports keep this module loadable by
- * the Node SQLite smoke script, whose loader cannot resolve extensionless
  * runtime imports.
  */
 
 import type { Database } from "../../shared/sqlite";
 
-/** Non-derived columns that carry project identity strings across legacy tables. */
+/* */
 const IDENTITY_COLUMNS: ReadonlySet<string> = new Set(["project_path", "project_identity"]);
 
 const DERIVED_TABLE_SUFFIXES = [
@@ -50,7 +43,7 @@ function isDerivedTable(tableName: string, sql: string | null): boolean {
     );
 }
 
-/** Every table carrying a project identity column, flagged when search-derived. */
+/* */
 export function discoverIdentityTables(db: Database): IdentityTableInfo[] {
     const rows = db
         .prepare(
@@ -77,8 +70,6 @@ export function discoverIdentityTables(db: Database): IdentityTableInfo[] {
 }
 
 /**
- * Canonical identities are `git:<root-commit>` or `dir:<hash>`. Raw filesystem
- * paths are not canonical and stay in the v22 repair path until rekeyed.
  */
 export function isCanonicalProjectIdentity(identity: string): boolean {
     return (
@@ -100,7 +91,7 @@ function boundedIdentityList(identities: Iterable<string>, limit = 5): string {
     return `${shown.join(", ")}${suffix}`;
 }
 
-/** The legacy old→new identity map, empty when the table does not exist. */
+/* */
 function readIdentityRekeyMap(db: Database): Map<string, string> {
     const map = new Map<string, string>();
     if (!tableExists(db, "v22_identity_rekey_map")) return map;
@@ -117,8 +108,7 @@ function readIdentityRekeyMap(db: Database): Map<string, string> {
 }
 
 /**
- * Walk a rekey chain to its terminal identity. A cycle aborts with a bounded
- * diagnostic instead of seeding split or looping authoritative history.
+ * A cyclic rekey chain aborts resolution with a bounded diagnostic to avoid seeding split or looping authoritative history.
  */
 export function resolveTerminalIdentity(
     rekeyMap: ReadonlyMap<string, string>,
@@ -140,15 +130,8 @@ export function resolveTerminalIdentity(
 }
 
 /**
- * Append-only audit/ledger tables excluded from project seeding. Identities
- * recorded here necessarily co-existed with rows in live tables when written,
- * so they cannot be the sole legitimate holder of a live identity — but they
- * retain identities long after the live rows are gone, and they are the
- * largest tables in aged databases. Skipping them keeps the v82 startup scan
- * proportional to live state and avoids minting permanent `projects` rows
- * (aliases are ON DELETE RESTRICT) for long-dead history. Rekey-map chains
- * that reference these identities still produce aliases. Identity merges
- * still rewrite these tables; only seeding skips them.
+ * Project seeding skips append-only audit and ledger tables because retained dead identities would create `projects` rows that `project_aliases` prevent deleting. Rekey aliases and identity merges still process those tables.
+ * Identity merges rewrite audit and ledger tables; only project seeding skips them.
  */
 const SEED_EXCLUDED_AUDIT_TABLES: ReadonlySet<string> = new Set([
     "m0_mutation_log",
@@ -160,24 +143,19 @@ const SEED_EXCLUDED_AUDIT_TABLES: ReadonlySet<string> = new Set([
 ]);
 
 export interface ProjectIdentitySeed {
-    /** Sorted canonical identities that become `projects` rows. */
+    /* */
     terminals: string[];
-    /** Every identity (self and historical) mapped to its terminal. */
+    /* */
     aliasTargets: Map<string, string>;
     /**
-     * Bounded diagnostics for identities whose rekey chain is cyclic. Cycles
-     * are legacy repair-path corruption (old merge flows upserted `old→new`
-     * with no acyclicity check); they skip registration instead of failing
-     * the owning migration, matching the tolerant read path in
+     * Cyclic rekey chains skip registration so the owning migration continues.
      * `collectAliasesForTargets`.
      */
     skippedCycles: string[];
 }
 
 /**
- * Collect every observed canonical identity plus every rekey-map key, resolve
- * each through the terminal-chain algorithm, and produce the seed set. Chains
- * that terminate at a non-canonical identity are left to the v22 repair path;
+ * Chains terminating at a non-canonical identity remain in the v22 repair path.
  * cyclic chains are skipped and reported rather than aborting the migration.
  */
 export function resolveProjectIdentitySeed(db: Database): ProjectIdentitySeed {
@@ -233,8 +211,7 @@ export function resolveProjectIdentitySeed(db: Database): ProjectIdentitySeed {
 }
 
 /**
- * Insert the seed rows. No OR IGNORE: an unexpected collision must abort the
- * owning migration rather than silently splitting authoritative history.
+ * Do not use OR IGNORE: unexpected collisions must abort the owning migration rather than split authoritative history.
  */
 export function seedProjectRegistry(db: Database, seed: ProjectIdentitySeed, now: number): void {
     const insertProject = db.prepare(
@@ -261,9 +238,7 @@ export function seedProjectRegistry(db: Database, seed: ProjectIdentitySeed, now
 }
 
 /**
- * Resolve every historical alias of the given canonical identities, walking
- * multi-hop rekey chains and the numeric registry. Corrupt cycles skip their
- * chain instead of failing the read path.
+ * Corrupt cycles are skipped rather than failing reads.
  */
 export function collectAliasesForTargets(
     db: Database,
@@ -281,7 +256,6 @@ export function collectAliasesForTargets(
                 result.set(oldIdentity, terminal);
             }
         } catch {
-            // A cycle is repair-path corruption; reads stay usable without it.
         }
     }
 
@@ -304,7 +278,7 @@ export function collectAliasesForTargets(
     return result;
 }
 
-/** Numeric project ID for a canonical or historical identity, when registered. */
+/** The returned value is the numeric project ID for a registered canonical or historical identity. */
 function resolveRegistryProjectId(db: Database, identity: string): number | null {
     if (!tableExists(db, "project_aliases")) return null;
     const row = db
@@ -314,10 +288,10 @@ function resolveRegistryProjectId(db: Database, identity: string): number | null
 }
 
 /**
- * Keep the numeric registry atomic with a runtime identity merge. Must run
- * inside the caller's immediate write transaction so a competing authoritative
- * child insert either precedes the checked failure or follows a completed safe
- * merge. Throwing rolls back the whole merge, leaving both registries intact.
+ * The caller must hold an immediate write transaction while merging runtime identities.
+ * The immediate write transaction serializes competing authoritative child inserts with the merge.
+ * The immediate write transaction prevents competing authoritative child inserts until the transaction ends.
+ * The caller must roll back the transaction when merge validation throws.
  */
 export function applyIdentityMergeToProjectRegistry(
     db: Database,
@@ -327,7 +301,6 @@ export function applyIdentityMergeToProjectRegistry(
 ): void {
     if (!tableExists(db, "projects")) return;
 
-    // Flatten chains so one-hop legacy consumers converge with the registry.
     if (tableExists(db, "v22_identity_rekey_map")) {
         db.prepare(
             "UPDATE v22_identity_rekey_map SET new_project_path = ?, rekeyed_at = ? WHERE new_project_path = ?",
@@ -346,9 +319,8 @@ export function applyIdentityMergeToProjectRegistry(
     if (sourceId === targetId) return;
 
     // A registered historical alias may not be merged away from its project:
-    // repointing it would rename or absorb the whole project while sibling
-    // rekey-map rows keep resolving to the old terminal, splitting one
-    // registered history into two on any later re-seed.
+    // Repointing a registered historical alias would rename or absorb its project.
+    // Sibling rekey-map rows continue resolving to the old terminal, so repointing the alias would split registered history on reseed.
     const sourceCanonical = db
         .prepare("SELECT canonical_identity AS canonical FROM projects WHERE id = ?")
         .get(sourceId) as { canonical: string };
@@ -359,10 +331,9 @@ export function applyIdentityMergeToProjectRegistry(
     }
 
     if (targetId === null) {
-        // In-place adoption renames the source project's canonical identity on
-        // the same numeric row; owned episodes/claims keep their project_id,
-        // so this stays legal even when the source owns authoritative history
-        // (the routine dir:<hash> → git:<sha> rekey after `git init`).
+        // In-place adoption renames the source project's canonical identity on its existing numeric row.
+        // Owned episodes and claims retain their project_id during in-place adoption.
+        // In-place adoption remains legal when the source owns authoritative history because it preserves project_id.
         if (!isCanonicalProjectIdentity(toIdentity)) {
             throw new Error(
                 `Refusing identity merge: target ${boundedIdentityList([toIdentity])} is not a canonical git:/dir: identity, and source ${boundedIdentityList([fromIdentity])} is registered in the project registry.`,
@@ -379,7 +350,7 @@ export function applyIdentityMergeToProjectRegistry(
     }
 
     // Only a true two-project merge would repoint children across numeric ids;
-    // that is unsupported while the source owns authoritative history.
+    // Two-project merges are unsupported while the source owns authoritative history.
     const ownsChildren = db
         .prepare(
             `SELECT EXISTS (SELECT 1 FROM episodes WHERE project_id = ?)
@@ -397,11 +368,6 @@ export function applyIdentityMergeToProjectRegistry(
         sourceId,
     );
 
-    // Git anchors and generation counters are append-only, project-scoped,
-    // and reference projects(id) ON DELETE RESTRICT. A source that owns such
-    // rows keeps its projects row as an inert tombstone: every alias now
-    // resolves to the target, so no identity routes new work to the retired
-    // numeric id. A source with no claim-graph rows is deleted outright.
     const ownsClaimGraphRows =
         (
             db

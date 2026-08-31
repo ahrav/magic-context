@@ -304,7 +304,6 @@ describe("unifiedSearch", () => {
             matchType: "exact",
         });
 
-        // A human-rejected disposition hides the record from every surface.
         const target = db
             .prepare(
                 `SELECT claims.current_revision_id AS revisionId, claims.project_id AS projectId
@@ -550,8 +549,6 @@ describe("unifiedSearch", () => {
         const anti = seedAntiMemory(db, project, "stale-read");
         const realRead = claimCurrentState.readProjectMemoryCurrentState;
         let reads = 0;
-        // `stale` is what the provider reports when a generation moves during
-        // hydration, which any concurrent claim write can cause.
         const spy = spyOn(claimCurrentState, "readProjectMemoryCurrentState").mockImplementation(
             (database, request) => {
                 reads += 1;
@@ -591,8 +588,6 @@ describe("unifiedSearch", () => {
             nonApplicableWhen: "the deployment is a single ephemeral preview box",
         });
 
-        // The warning is not rendered with its exception, so retrieving it for
-        // the prompt that states the exception would assert the opposite of the
         // stored guidance.
         expect(
             await unifiedSearch(
@@ -669,9 +664,6 @@ describe("unifiedSearch", () => {
         expect(lexicalOnly).toHaveLength(1);
         const lexicalScore = lexicalOnly[0].score;
 
-        // Cosine 0.65 sits below ANTI_MEMORY_SEMANTIC_THRESHOLD but above the
-        // lexical score, so folding it in would rank this warning on similarity
-        // the lane already judged too weak to count as a match.
         queryEmbedding = new Float32Array([1, 0]);
         const automatic = await unifiedSearch(db, "session-anti", project, query, {
             sources: ["memory"],
@@ -702,9 +694,6 @@ describe("unifiedSearch", () => {
             memoryPolicySurface: "auto_search",
             embedQuery,
             embedPassages: async (texts) => {
-                // A concurrent writer demotes the warning while this provider
-                // call is outstanding, so every candidate hydrated before the
-                // await is now pre-transition content.
                 const revision = db
                     .prepare(
                         `SELECT revisions.id AS id FROM claim_public_ids public
@@ -892,10 +881,7 @@ describe("unifiedSearch", () => {
     });
 
     it("maxMessageOrdinal=0 excludes every message (no compartment yet → whole tail is live)", async () => {
-        // Issue #131: before the historian first runs there are no compartments,
-        // so the ctx_search tool passes a cutoff of 0. Ordinals are 1-based, so a
-        // 0 cutoff must exclude EVERY indexed message — none have scrolled out of
-        // the live context the agent already sees (incl. the current prompt).
+        // Before compartments exist, `ctx_search` uses a cutoff of 0.
         queryEmbedding = new Float32Array([1, 0]);
 
         rawMessagesBySession.set("ses-1", [
@@ -1122,7 +1108,6 @@ describe("unifiedSearch", () => {
         ]);
         ensureMessagesIndexed(db, "ses-sources", readMessages);
 
-        // Memory-only filter — message hit must be excluded.
         const memoryOnly = await unifiedSearch(
             db,
             "ses-sources",
@@ -1137,11 +1122,8 @@ describe("unifiedSearch", () => {
                 sources: ["memory"],
             },
         );
-        // The memory source stays selectable but serves nothing until the
-        // retrieval projection activates.
         expect(memoryOnly).toHaveLength(0);
 
-        // Message-only filter — memory hit must be excluded.
         const messageOnly = await unifiedSearch(
             db,
             "ses-sources",
@@ -1222,21 +1204,13 @@ describe("unifiedSearch", () => {
                 r.source === "message",
         );
         expect(messages.length).toBeGreaterThanOrEqual(3);
-        // With 1/(rank+1), rank-2 would be 0.33. Linear decay over a
-        // filtered length of 3 produces 1.0, 0.667, 0.333. Either way rank-1
-        // (index 1) should still be comfortably above the old rank-2 value.
         expect(messages[0].score).toBeGreaterThan(0.9);
         expect(messages[1].score).toBeGreaterThan(0.5);
-        // Rank-2 of 3 is the last hit — linear decay gives 1/3 ≈ 0.333 and
-        // we don't want it to collapse to near-zero like the old formula's
         // rank-5 did.
         expect(messages[2].score).toBeGreaterThan(0.2);
     });
 
     it("explicitSearch recalls a literal-symbol message the AND-joined NL query misses", async () => {
-        // The target message contains the symbol `/ctx-status` but NOT the
-        // other words of the natural-language query. With FTS implicit-AND,
-        // the full query can't match it. The literal probe must recover it.
         rawMessagesBySession.set("ses-probe", [
             {
                 ordinal: 1,
@@ -1256,8 +1230,8 @@ describe("unifiedSearch", () => {
         const nlQuery = "why did the inflated tool calls breakdown happen in ctx-status";
 
         // Without explicitSearch: the AND-joined query fails to surface m1
-        // (it lacks "why/did/inflated/happen"). Tokenization splits ctx-status
-        // → ctx + status, so the literal still doesn't rescue it under AND.
+        // `ctx-status` tokenizes as `ctx` and `status`.
+        // `ctx-status` tokenizes as `ctx` and `status`, so the literal does not rescue it under AND.
         const baseline = await unifiedSearch(db, "ses-probe", "/repo/probe", nlQuery, {
             memoryEnabled: false,
             embeddingEnabled: false,
@@ -1268,8 +1242,7 @@ describe("unifiedSearch", () => {
         });
         expect(baseline.some((r) => r.source === "message" && r.messageId === "m1")).toBe(false);
 
-        // With explicitSearch: the `ctx-status` probe runs as its own query and
-        // recalls m1, and the verbatim boost ranks it first.
+        // The query recalls m1, and the verbatim boost ranks m1 first.
         const probed = await unifiedSearch(db, "ses-probe", "/repo/probe", nlQuery, {
             memoryEnabled: false,
             embeddingEnabled: false,
@@ -1334,10 +1307,7 @@ describe("unifiedSearch", () => {
     });
 
     it("multi-probe scores decay linearly instead of flattening into a ~1.0 band", async () => {
-        // Regression: the flat +0.5 verbatim bonus sat 30× above the RRF scale,
-        // so after divide-by-max normalization every probe-matching message
-        // scored ~1.0 and (×MESSAGE_SOURCE_BOOST) crowded memories out of the
-        // unified results. Scores must now follow the linear rank band.
+        // A linear rank band prevents probe-matching messages from crowding memories out of unified results.
         const msgs = Array.from({ length: 8 }, (_, i) => ({
             ordinal: i + 1,
             id: `mm${i}`,
@@ -1363,8 +1333,6 @@ describe("unifiedSearch", () => {
         });
         const messages = results.filter((r) => r.source === "message");
         expect(messages.length).toBeGreaterThanOrEqual(4);
-        // Top hit caps the band; the rest must spread DOWN the linear band, not
-        // cluster at ~1.0. With the old flat bonus all of these were ≥0.95.
         expect(messages[0].score).toBeGreaterThan(0.9);
         const second = messages[1].score;
         const last = messages[messages.length - 1].score;
@@ -1373,8 +1341,7 @@ describe("unifiedSearch", () => {
     });
 
     it("a discriminative probe outranks a corpus-flooding probe", async () => {
-        // "AFT"-class regression: a probe matching a large share of the corpus
-        // carries near-zero signal and must not drown the rare probe's hit.
+        // A probe matching a large share of the corpus carries near-zero signal and must not drown the rare probe's hit.
         const flood = Array.from({ length: 30 }, (_, i) => ({
             ordinal: i + 1,
             id: `f${i}`,
@@ -1411,8 +1378,7 @@ describe("unifiedSearch", () => {
             },
         );
         const messages = results.filter((r) => r.source === "message");
-        // The rare-probe message must win over the 30 flood messages that only
-        // match the common probe.
+        // The query must not match the common probe.
         expect(messages[0]?.messageId).toBe("rare-hit");
     });
 
@@ -1515,14 +1481,10 @@ describe("unifiedSearch", () => {
     });
 
     /**
-     * Regression for the duplicate-embed bug observed in production LMStudio
-     * logs: when both memory and git-commit search ran in parallel, EACH
-     * branch independently called `embedQuery(trimmedQuery)`, producing two
-     * identical HTTP requests for the same input text. On a single-GPU
-     * embedding endpoint these serialized at the model and doubled latency.
+     * unifiedSearch embeds each query once and shares its vector between memory and git-commit searches.
      *
-     * unifiedSearch must embed the query exactly once at the top, then pass
-     * the same vector to both consumers.
+     * `unifiedSearch` embeds the query once and passes the vector to memory and git-commit searches.
+     * `unifiedSearch` embeds the query once and shares its vector between memory and git-commit searches.
      */
     it("embeds the query exactly once for the git-commit lane", async () => {
         queryEmbedding = new Float32Array([1, 0]);
@@ -1531,17 +1493,14 @@ describe("unifiedSearch", () => {
             limit: 5,
             memoryEnabled: true,
             embeddingEnabled: true,
-            // Enable git-commits even though we have no commits indexed —
-            // searchGitCommits used to call embedQuery anyway, which is the
-            // exact behavior we're regressing against.
+            // Git-commit search remains enabled with no indexed commits.
             gitCommitsEnabled: true,
             readMessages,
             embedQuery,
             isEmbeddingRuntimeEnabled,
         });
 
-        // Even with two embed-needing branches active, the query is embedded
-        // exactly once. Pre-fix this would have been 2.
+        // `unifiedSearch` embeds the query once when two embedding-dependent branches are active.
         expect(embeddingQueries).toEqual(["shared embed query"]);
     });
 
@@ -1753,8 +1712,7 @@ describe("unifiedSearch hard bounds (R34, R37)", () => {
             expect(typeof binding).toBe("number");
             expect(binding as number).toBeLessThanOrEqual(150);
         }
-        // Row counts catch a lane whose mutant drops the LIMIT clause and so
-        // escapes the binding filter above.
+        // Each query branch must retain its LIMIT before binding filtering.
         const messageFetches = counting.executions.filter((execution) =>
             execution.sql.includes("message_history_fts"),
         );
@@ -1807,13 +1765,12 @@ describe("unifiedSearch hard bounds (R34, R37)", () => {
         );
         expect(batched.length).toBeGreaterThan(0);
         for (const execution of batched) {
-            // Binding values of 100+ are branch LIMITs; the only other numeric
-            // binding is the ordinal cutoff of 25.
+            // `100` and larger bindings are branch LIMITs; the ordinal cutoff binding is `25`.
             const limits = execution.bindings.filter(
                 (binding): binding is number => typeof binding === "number" && binding >= 100,
             );
-            // The query uses one base term and five probes, so six branches
-            // capped at 150 return at most 900 rows.
+            // The query uses one base term and five probes, producing six branches capped at 150 rows each.
+            // The six branches cap results at 150 rows each, returning at most 900 rows.
             expect(limits).toEqual([150, 150, 150, 150, 150, 150]);
             expect(execution.rowCount).toBeLessThanOrEqual(900);
         }
@@ -1922,7 +1879,6 @@ describe("query-purpose provider boundary (U30)", () => {
             },
         );
 
-        // No exception surfaced and no memory-lane hit exists on this path.
         expect(results.filter((result) => result.source === "memory")).toHaveLength(0);
     });
 });
@@ -1959,18 +1915,14 @@ describe("parseIdShapedQuery", () => {
 });
 
 // ---------------------------------------------------------------------------
-// U1 — frozen ranking projection (KTD1).
 //
-// The hot-path fixes in this task must not move a single rank. These fixtures
-// record source, stable result identity, score, match type, and order for both
-// the automatic single-query path and the explicit multi-probe path over one
-// fixed mixed-source corpus. Content is asserted separately because R34
-// deliberately replaces full message bodies with bounded FTS fragments.
+// Both paths preserve source, stable result identity, score, match type, and order.
+// Content is asserted separately because message results contain bounded FTS fragments rather than full bodies.
 // ---------------------------------------------------------------------------
 
 const FIXTURE_PROJECT = "git:projection-fixture";
 const FIXTURE_SESSION = "ses-projection-fixture";
-/** Fixed clock so note createdAt ties (and their id tie-break) are deterministic. */
+/** FIXTURE_NOTE_CREATED_AT makes note createdAt ties and their id tie-break deterministic. */
 const FIXTURE_NOTE_CREATED_AT = Date.UTC(2026, 1, 1);
 
 interface ProjectionRow {
@@ -2084,7 +2036,7 @@ function seedProjectionCorpus(db: Database): {
         content: "Queue drain backpressure ordering matters for the retry budget.",
         anchorOrdinal: 3,
     });
-    // Force a createdAt tie so the note id tie-break is actually exercised.
+    // The fixture creates a createdAt tie so the note id tie-break is exercised.
     db.prepare("UPDATE notes SET created_at = ?, updated_at = ? WHERE id IN (?, ?)").run(
         FIXTURE_NOTE_CREATED_AT,
         FIXTURE_NOTE_CREATED_AT,
@@ -2237,7 +2189,6 @@ describe("search ranking projection (KTD1 characterization)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// U2 — bounded message fragments (R34) and the compartment interval sweep (R37).
 // ---------------------------------------------------------------------------
 
 const FRAGMENT_TOKEN_LIMIT = 32;
@@ -2295,8 +2246,7 @@ describe("message search fragments (R34)", () => {
     });
 
     it("keeps the verbatim bonus for a probe that falls outside the fragment", async () => {
-        // "earlyMarker" sits at the start of a long body and "sentinelToken" at
-        // its end, farther apart than one fragment can span.
+        // "earlyMarker" and "sentinelToken" are farther apart than one fragment can span.
         const body = `earlyMarker begins the story. ${"filler words about queues and caches. ".repeat(60)} closing with sentinelToken here.`;
         rawMessagesBySession.set("ses-verbatim", [
             {
@@ -2344,8 +2294,7 @@ describe("message search fragments (R34)", () => {
             { source: "message", id: "message:verbatim-2", score: 0.6666666666666667 },
             { source: "message", id: "message:verbatim-3", score: 0.33333333333333337 },
         ]);
-        // The winner's fragment cannot span both probes, yet its full-body
-        // containment of both still decides the top rank.
+        // The winner's fragment cannot span both probes, but full-body containment of both still determines the top rank.
         const winner = results[0];
         expect(winner.content).toContain("<<sentinelToken>>");
         expect(winner.content).not.toContain("earlyMarker");
@@ -2461,7 +2410,7 @@ describe("compartment interval sweep (R37)", () => {
         matchType: "semantic",
     });
 
-    /** The former per-message scan, kept as a differential reference. */
+    /** The per-message scan provides a differential reference. */
     function referenceAssignment(
         messages: readonly MessageSearchResult[],
         compartments: readonly CompartmentSearchResult[],
@@ -2564,8 +2513,6 @@ describe("compartment interval sweep (R37)", () => {
     });
 
     it("prefers the earliest semantic-ranked compartment for overlaps and shared endpoints", () => {
-        // Compartment 2 is ranked first (higher score) but starts later; the
-        // shared endpoint 10 belongs to whichever range ranks first.
         const compartments = [
             compartment(2, 10, 20, 0.95),
             compartment(1, 1, 10, 0.9),
@@ -2620,14 +2567,14 @@ describe("compartment interval sweep (R37)", () => {
 
         const swept = assignMessagesToCompartments(messages, watched);
         expect(swept.size).toBeGreaterThan(0);
-        // A per-message scan costs at least one boundary read per (message, range)
-        // pair; the sweep stays far below that product.
+        // The test appends a quarantine disposition to simulate a concurrent writer hiding the claim.
+        // The sweep avoids the per-message scan's boundary read for each message-range pair.
         expect(ordinalReads).toBeLessThan(messages.length * compartments.length);
     });
 });
 
 // ---------------------------------------------------------------------------
-// U3 — exact memory-ID resolution through an indexed visibility query (R35).
+// The test writes the disposition directly to place the transition at an exact point.
 // ---------------------------------------------------------------------------
 
 describe("resolveClaimsByLocatorsForSearch", () => {
@@ -2792,11 +2739,8 @@ describe("resolveClaimsByLocatorsForSearch", () => {
     });
 
     /**
-     * Hide a claim the way a concurrent writer would: append the quarantine
-     * disposition the visibility reducer treats as uniform absence. Written
-     * directly, like the neighbouring evidence-label test, so the simulated
-     * transition lands at an exact point in this lane rather than depending on
-     * an operations-layer schedule.
+     * The test appends the quarantine disposition that the visibility reducer treats as uniform absence to simulate a concurrent writer hiding the claim.
+     * The direct write places the simulated transition before the tested search returns without relying on an operations-layer schedule.
      */
     function quarantineClaim(database: Database, publicClaimId: string): void {
         const ref = database
@@ -2817,13 +2761,9 @@ describe("resolveClaimsByLocatorsForSearch", () => {
     }
 
     /**
-     * Drive the cross-process interleave deterministically: let the provider's
-     * first read complete and close its snapshot, then commit the transition
-     * before this lane returns. This stands in for another process taking the
-     * writer lock while this one waits on the telemetry `BEGIN IMMEDIATE`; it
-     * does NOT prove anything about real lock scheduling or `busy_timeout`
-     * behaviour, only that a transition committed after the provider's
-     * snapshot closed cannot be published.
+     * The test commits the transition after the provider's first read returns.
+     * The controlled interleave does not prove real lock-scheduling behavior.
+     * The transition commits after the provider's first read returns and before the tested search returns.
      */
     function hideAfterFirstProviderRead(publicClaimIds: readonly string[]): {
         restore: () => void;
@@ -2861,11 +2801,9 @@ describe("resolveClaimsByLocatorsForSearch", () => {
                 limit: 10,
             });
 
-            // Indistinguishable from "no such locator": the same null fallback
-            // a missing or foreign-hidden claim returns.
+            // A hidden claim returns the null fallback.
             expect(resolved).toBeNull();
-            // Two provider reads: the hydration read plus the pre-publication
-            // recheck. One read would mean the recheck was skipped.
+            // One provider read means the pre-publication visibility recheck was skipped.
             expect(hook.reads()).toBe(2);
         } finally {
             hook.restore();
@@ -2998,7 +2936,6 @@ describe("parseLocatorShapedQuery", () => {
 });
 
 // ---------------------------------------------------------------------------
-// U4 — note candidate pruning through the FTS projection (R36).
 // ---------------------------------------------------------------------------
 
 const NOTE_SESSION = "ses-note-fts";
@@ -3084,13 +3021,11 @@ describe("note candidate pruning (R36)", () => {
         expect(results.map((result) => (result.source === "note" ? result.noteId : -1))).toEqual([
             seeded.matching.id,
         ]);
-        // Candidate selection runs against the projection, and hydration asks for
-        // only the candidate rowids.
+        // Candidate selection uses the projection; hydration reads only candidate rowids.
         expect(counter.count("notes_fts")).toBeGreaterThan(0);
         const hydrations = counter.matching(/CROSS JOIN notes ON notes\.id = requested\.value/);
         expect(hydrations).toHaveLength(1);
         expect(hydrations[0].rowCount).toBe(1);
-        // The former per-query scoped scan is gone.
         expect(counter.matching(/SELECT \* FROM notes WHERE/).length).toBe(0);
     });
 
@@ -3111,9 +3046,9 @@ describe("note candidate pruning (R36)", () => {
     });
 
     it("finds old notes through queries carrying an unrepresentable short token", async () => {
-        // "to" is below the trigram minimum. The query must still select on
-        // its representable atoms instead of degrading to the recency window,
-        // or any note older than the newest MAX_LANE_CANDIDATES is unfindable.
+        // A query containing the two-character term "to" must select on representable atoms.
+        // Queries must select on representable atoms instead of falling back to the recency window.
+        // Otherwise, notes older than the newest `MAX_LANE_CANDIDATES` are unfindable.
         const matching = addNote(db, "session", {
             sessionId: NOTE_SESSION,
             content: "Deploy sentinel rollout checklist for the gateway.",
@@ -3169,8 +3104,7 @@ describe("note candidate pruning (R36)", () => {
             noteSearchOptions(true),
         );
 
-        // Probe document frequencies count over the whole eligible corpus via
-        // the projection — not the capped candidate pool.
+        // Probe document frequencies count the whole eligible corpus through the projection, not the capped candidate pool.
         const probeCounts = counter.matching(/queryIndex/);
         expect(probeCounts.length).toBeGreaterThan(0);
         expect(probeCounts[0].sql).toContain("COUNT(*)");
@@ -3191,8 +3125,8 @@ describe("note candidate pruning (R36)", () => {
         expect(pool).not.toBeNull();
         expect(pool).toHaveLength(150);
 
-        // The df numerator must not clamp at the pool cap, or a common probe
-        // regains up to corpus/cap of the weight the IDF falloff removes.
+        // The document-frequency numerator must not clamp at the pool cap.
+        // Clamping at the pool cap inflates IDF for probes whose document frequency exceeds the cap.
         const counts = countNoteFtsMatchesBatch(db, ['"telemetry"'], scope);
         expect(counts).toEqual([total]);
     });
@@ -3216,7 +3150,7 @@ describe("note candidate pruning (R36)", () => {
         expect(results.map((result) => (result.source === "note" ? result.noteId : -1))).toContain(
             short.id,
         );
-        // A two-character atom is unrepresentable, so the characterized scan runs.
+        // A two-character atom is unrepresentable, so the query uses the scan path.
         expect(counter.matching(/SELECT \* FROM notes WHERE/).length).toBeGreaterThan(0);
         expect(counter.matching(/CROSS JOIN notes ON notes\.id = requested\.value/).length).toBe(0);
     });
@@ -3300,7 +3234,7 @@ describe("note candidate pruning (R36)", () => {
 
         expect(await visible()).toEqual([seeded.ready.id]);
 
-        // Moving the note out of project scope leaves its text projected but makes
+        // Out-of-project notes remain in the text projection, but scope joins exclude them before the candidate `LIMIT`.
         // it ineligible.
         db.prepare("UPDATE notes SET project_path = ? WHERE id = ?").run(
             "git:elsewhere",
@@ -3369,7 +3303,6 @@ describe("note candidate pruning (R36)", () => {
         expect(results.map((result) => (result.source === "note" ? result.noteId : -1))).toEqual([
             eligible.id,
         ]);
-        // Scope joins before the candidate statement's LIMIT.
         const candidateSelects = counter.matching(/JOIN notes ON notes\.id = notes_fts\.rowid/);
         expect(candidateSelects).toHaveLength(1);
         expect(candidateSelects[0].sql).toContain("notes.session_id");
@@ -3383,8 +3316,7 @@ describe("note candidate pruning (R36)", () => {
                 content: `Eligible saturation note number ${index} for the drain design.`,
             });
         }
-        // Repeating the term makes this note rank above the near-identical
-        // filler, so the capped pool must include it.
+        // Repeating the term ranks this note above the near-identical filler, so the capped pool includes it.
         const best = addNote(db, "session", {
             sessionId: NOTE_SESSION,
             content: "Saturation saturation saturation deep-dive with saturation follow-ups.",

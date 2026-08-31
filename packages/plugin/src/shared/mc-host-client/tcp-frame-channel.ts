@@ -1,14 +1,12 @@
 /**
- * TCP implementation of the complete-frame channel boundary (KTD7).
  *
- * `TcpFrameChannel` owns the `node:net` socket, dial, the auth byte-I/O
- * adaptation over the pure handshake, auth-leftover transfer, the
- * incremental frame reader (fragmentation, coalescing, first-header-byte
- * frame deadlines), the single bounded FIFO writer with reserved control
- * capacity, inbound admission backpressure (socket pause/resume against
- * the shared byte budget), and socket teardown. It never imports the
- * generation engine: frames, failures, and diagnostics flow out through
- * the handlers wired at construction.
+ * `TcpFrameChannel` owns the socket, dialing, and auth byte-I/O adaptation.
+ * `TcpFrameChannel` transfers auth leftovers from the handshake to frame parsing.
+ * The incremental reader handles fragmentation and coalescing.
+ * The reader starts each frame deadline at its first header byte.
+ * `TcpFrameChannel` pauses and resumes the socket to enforce the shared byte budget.
+ * `TcpFrameChannel` never imports the generation engine.
+ * `TcpFrameChannel` emits frames, failures, and diagnostics through its handlers.
  */
 
 import { Socket } from "node:net";
@@ -51,15 +49,13 @@ import {
     PROTOCOL_VERSION,
 } from "./protocol";
 
-/** Idle header wait is unbounded; this bounds one frame once its first header byte arrives. */
+/** `DEFAULT_FRAME_DEADLINE_MS` bounds a frame after its first header byte arrives; idle header waits are unbounded. */
 const DEFAULT_FRAME_DEADLINE_MS = 30_000;
 const DEFAULT_MAX_QUEUED_FRAMES = 256;
-/** Reserved writer slots for pure-header Pong/Cancel/Goodbye cleanup frames. */
+/** `DEFAULT_CONTROL_RESERVE_FRAMES` reserves writer slots for pure-header Pong, Cancel, and Goodbye frames. */
 const DEFAULT_CONTROL_RESERVE_FRAMES = 32;
 /**
- * Hard cap on pre-handshake buffering. Auth messages are a `u32` length plus
- * at most 4,096 bytes each, so a legal exchange never approaches this; the
- * aggregate memory cap only covers frame bodies and cannot bound this phase.
+ * Auth messages are a `u32` length plus at most 4,096 bytes each; this 65,536-byte cap limits pre-handshake buffering because the aggregate memory cap excludes that phase.
  */
 const MAX_AUTH_BUFFERED_BYTES = 65_536;
 const EMPTY_BODY = new Uint8Array(0);
@@ -68,33 +64,29 @@ export interface TcpFrameChannelOptions {
     host: string;
     port: number;
     /**
-     * Validated connection-file credentials. `daemonVer` is the file's
-     * `daemon_ver`, which the handshake requires the peer to report back
-     * (wire doc Section 5.2).
+     * The handshake requires the peer to report `credentials.daemonVer`.
      */
     credentials: AuthCredentials;
     /**
-     * Shared aggregate byte budget (KTD7). The channel registers itself as
-     * the budget's release observer so paused inbound admission and flush
-     * waiters re-check whenever any owner releases bytes.
+     * Shared aggregate byte budget. The channel registers as the budget's release observer so paused inbound admission and flush waiters re-check when any owner releases bytes.
      */
     budget: ByteBudget;
-    /** Frame deadline starting at the FIRST header byte (wire doc 6.3). */
+    /** `frameDeadlineMs` starts when the first header byte arrives. */
     frameDeadlineMs?: number;
-    /** Injectable body cap for scaled tests; defaults to the exact 64 MiB limit. */
+    /** `maxBodyLen` overrides the 64 MiB body limit for scaled tests. */
     maxBodyLen?: number;
     maxQueuedFrames?: number;
     maxQueuedBytes?: number;
     controlReserveFrames?: number;
-    /** Test/profile seam for segmented direct producer reservations. */
+    /** `producerSpanBytes` configures segmented direct-producer reservations for tests and profiles. */
     producerSpanBytes?: number;
-    /** Nonce source passthrough to the pure auth handshake. */
+    /* */
     generateNonce?: (length: number) => Uint8Array;
     handlers: FrameChannelHandlers;
 }
 
 interface QueuedItem {
-    /** Header buffer, then optionally the body buffer; written in order. */
+    /** The writer writes each item's header before its optional body. */
     buffers: Buffer[];
     bytes: number;
     control: boolean;
@@ -119,10 +111,10 @@ function metaFromHeader(header: EnvelopeHeader): FrameMeta {
 }
 
 /**
- * The sole socket, framing, writer-queue, and transport-timer owner for one
- * connection generation. Construct with wired handlers, `start()` exactly
- * once to dial and authenticate, then `beginFrames()` to transfer auth
- * leftover bytes and begin frame delivery.
+ * `TcpFrameChannel` solely owns one connection's socket, framing, writer queue, and transport timers.
+ * The caller must invoke `start()` exactly once after wiring the handlers.
+ * The caller must invoke `beginFrames()` after authentication to transfer auth leftovers.
+ * `beginFrames()` transfers auth leftovers before frame delivery.
  */
 export class TcpFrameChannel implements FrameChannel {
     private readonly socket: Socket;
@@ -146,7 +138,7 @@ export class TcpFrameChannel implements FrameChannel {
     private readonly timers = new Set<ReturnType<typeof setTimeout>>();
     private connectWaiter: { resolve: () => void; reject: (error: unknown) => void } | null = null;
 
-    // Auth-phase byte buffering (the socket adapted to the pure AuthByteIo).
+    // `TcpFrameChannel` buffers auth-phase bytes while adapting the socket to `AuthByteIo`.
     private authChunks: Buffer[] = [];
     private authOffset = 0;
     private authBuffered = 0;
@@ -156,7 +148,6 @@ export class TcpFrameChannel implements FrameChannel {
         reject: (error: unknown) => void;
     } | null = null;
 
-    // Incremental frame reader.
     private inbox: Buffer[] = [];
     private inboxOffset = 0;
     private inboxBuffered = 0;
@@ -170,7 +161,6 @@ export class TcpFrameChannel implements FrameChannel {
     private frameTimer: ReturnType<typeof setTimeout> | null = null;
     private readPaused = false;
 
-    // Single bounded FIFO writer.
     private queue: QueuedItem[] = [];
     private readonly flushWaiters: {
         resolve: () => void;
@@ -185,7 +175,6 @@ export class TcpFrameChannel implements FrameChannel {
     private awaitingDrain = false;
     private currentItem: { item: QueuedItem; index: number } | null = null;
 
-    // Byte charges this channel currently holds against the shared budget.
     private readerHeld = 0;
     private queueHeld = 0;
     private quarantinedBytes = 0;
@@ -214,9 +203,6 @@ export class TcpFrameChannel implements FrameChannel {
         // Every lifecycle listener is attached before connect() is invoked.
         this.socket.on("data", (chunk: Buffer) => this.onData(chunk));
         this.socket.on("end", () => {
-            // Stream end while a frame is partially received (header or body
-            // bytes pending) is a truncated-frame failure, distinct from a
-            // clean close at a frame boundary.
             const midFrame =
                 this.headerFilled > 0 || this.bodyHeader !== null || this.deferredHeader !== null;
             this.fail(
@@ -243,11 +229,6 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     /**
-     * Single-flight dial plus authentication under `deadline`. The proven
-     * identity lands in {@link authenticated} rather than the resolution
-     * value, so identity is readable only from the channel that proved it.
-     * Leftover post-auth bytes stay buffered until `beginFrames()`, so the
-     * owner can finish its own setup checks before any frame dispatches.
      */
     async start(deadline: Deadline): Promise<void> {
         if (this.startState !== "idle") {
@@ -266,15 +247,13 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     /**
-     * Peer identity the handshake proved, or null until `start()` resolves.
-     * The daemon version here equals the connection-file `daemon_ver` the
-     * credentials carried; the handshake admits no other value.
+     * `authenticated` returns null until `start()` resolves, then returns the handshake-proved peer identity.
      */
     get authenticated(): AuthResult | null {
         return this.authResult;
     }
 
-    /** Transfer auth-leftover bytes into the frame reader and begin delivery. */
+    /* */
     beginFrames(): void {
         if (this.closed || this.phase === "frames") return;
         this.phase = "frames";
@@ -364,10 +343,6 @@ export class TcpFrameChannel implements FrameChannel {
         this.reservedDataBytes += reservedBytes;
         this.chargeQueue(reservedBytes);
         let held = true;
-        // The compatibility-copy charge taken in prepareCommit, until a
-        // publish transfers its ownership to the queued item. Releasing it
-        // with the reservation keeps commit failures between prepareCommit
-        // and publish (alias detachment) from stranding the charge.
         let copyCharge = 0;
         let producer: BoundedFrameProducer | undefined;
         const release = (): void => {
@@ -398,12 +373,6 @@ export class TcpFrameChannel implements FrameChannel {
                 (segments, exactLength) => {
                     const fullHeader: EnvelopeHeader = { ...header, len: exactLength };
                     const headerBytes = Buffer.from(encodeHeader(fullHeader));
-                    // The compatibility copy is double-resident with the
-                    // reserved spans until publication detaches them, so it
-                    // takes its own charge and shows up in memoryUsed and
-                    // memoryPeak. No cap refusal here: a successful reserve
-                    // guarantees commit (the producer contract), and the
-                    // overshoot is bounded to one frame body.
                     if (exactLength > 0) {
                         this.chargeQueue(exactLength);
                         copyCharge = exactLength;
@@ -435,8 +404,6 @@ export class TcpFrameChannel implements FrameChannel {
                     return {
                         publish: () => {
                             if (!held || this.closed) {
-                                // release() also returns the copy charge
-                                // still owned by the reservation.
                                 release();
                                 throw new McHostCallError(
                                     "not_sent",
@@ -448,10 +415,6 @@ export class TcpFrameChannel implements FrameChannel {
                             if (producer) this.producerReservations.delete(producer);
                             this.reservedDataFrames--;
                             this.reservedDataBytes -= reservedBytes;
-                            // Commit detached the span buffers, so their whole
-                            // charge (capacity) releases here; the copy's own
-                            // charge plus the retained header now cover the
-                            // queued item until the socket drains it.
                             if (capacity > 0) this.releaseQueue(capacity);
                             copyCharge = 0;
                             this.enqueueReservedItem(item);
@@ -474,8 +437,6 @@ export class TcpFrameChannel implements FrameChannel {
             throw new McHostCallError("not_sent", "frame channel is closed", "channel_closed");
         }
         if (frame.header.len !== frame.body.length) {
-            // A mismatched declaration would desynchronize the peer's frame
-            // parser and corrupt every later frame on the connection.
             throw new RangeError(
                 `frame header.len (${frame.header.len}) does not match body length (${frame.body.length})`,
             );
@@ -502,8 +463,7 @@ export class TcpFrameChannel implements FrameChannel {
         if (!Number.isSafeInteger(header.len) || header.len < 0 || header.len > this.maxBodyLen) {
             throw new RangeError("frame body length is outside transport bounds");
         }
-        // Encoding validates every header field before any state changes,
-        // so a rejected frame can never burn a correlation upstream.
+        // Encoding validates every header field before state changes.
         const headerBytes = Buffer.from(encodeHeader(header));
         const totalBytes = HEADER_LEN + header.len;
         if (
@@ -573,10 +533,9 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     /**
-     * Resolve once every queued frame byte has been handed to the socket and
-     * every write callback fired, the channel closes, or `deadline` expires
-     * — a bounded, best-effort primitive for the owner's graceful finish.
-     * Never blocks close.
+     * The flush operation resolves after every queued frame byte reaches the socket and every write callback fires.
+     * The flush operation also resolves when the channel closes or `deadline` expires.
+     * The flush operation never blocks channel close.
      */
     flush(deadline: Deadline): Promise<void> {
         if (this.closed || this.writerIdle()) return Promise.resolve();
@@ -594,17 +553,15 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     /**
-     * Idempotent owner close (abortive discard): drops queued frames, clears
-     * every transport timer, rejects in-flight dial/auth waits, resolves
-     * flush waiters, freezes the shared budget, and destroys the socket.
-     * Never fires `onClosed`.
+     * Owner close is idempotent and abortively discards queued frames.
+     * Owner close clears transport timers and rejects in-flight dial and authentication waits.
+     * Owner close never fires `onClosed`.
      */
     close(error?: unknown): void {
         this.teardown(error);
     }
 
     // ------------------------------------------------------------------
-    // Failure and teardown.
     // ------------------------------------------------------------------
 
     private fail(reason: FrameChannelCloseReason, error: unknown): void {
@@ -670,7 +627,6 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     // ------------------------------------------------------------------
-    // Setup: dial + auth byte-I/O adaptation.
     // ------------------------------------------------------------------
 
     private waitForConnect(): Promise<void> {
@@ -753,7 +709,6 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     // ------------------------------------------------------------------
-    // Incremental frame reader.
     // ------------------------------------------------------------------
 
     private onData(chunk: Buffer): void {
@@ -798,9 +753,6 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     /**
-     * Parse coalesced/fragmented bytes incrementally. Admission blocks (a
-     * deferred header) halt the loop before body allocation, so a deferral
-     * can never re-enter delivery; `maybeResumeAdmission` restarts it.
      */
     private processInbox(): void {
         while (!this.closed && this.deferredHeader === null) {
@@ -821,8 +773,6 @@ export class TcpFrameChannel implements FrameChannel {
             }
             if (this.inboxBuffered === 0) return;
             if (this.headerFilled === 0 && this.frameTimer === null) {
-                // The frame deadline starts at the FIRST header byte; the
-                // idle wait before it is unbounded (wire doc 6.3).
                 this.frameTimer = this.armTimer(this.frameDeadlineMs, () =>
                     this.fail(
                         "frame_deadline",
@@ -887,9 +837,6 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     /**
-     * Aggregate-budget admission for one declared body, checked BEFORE
-     * allocation. When the body does not fit, the socket pauses and the
-     * header defers until pressure clears (KTD7).
      */
     private admitBody(header: EnvelopeHeader): boolean {
         if (this.budget.wouldExceed(header.len)) {
@@ -939,9 +886,6 @@ export class TcpFrameChannel implements FrameChannel {
                 this.handlers.onLeaseReleased?.();
             },
             this.copyCounter,
-            // TCP receive buffers are never recycled. Releasing the reader
-            // charge and dropping the lease is sufficient; retained aliases
-            // own their ArrayBuffer and cannot observe reused storage.
             () => "released",
         );
         this.receiveLeases.add(lease);
@@ -949,7 +893,6 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     // ------------------------------------------------------------------
-    // Single bounded FIFO writer.
     // ------------------------------------------------------------------
 
     private enqueueReservedItem(item: QueuedItem): void {
@@ -986,10 +929,6 @@ export class TcpFrameChannel implements FrameChannel {
     }
 
     /**
-     * The one logical writer: every byte of one frame reaches the socket
-     * before any byte of another frame. A `false` return from
-     * `socket.write()` parks the pump on `'drain'`; the interrupted frame's
-     * remaining buffers continue before any other frame.
      */
     private pump(): void {
         if (this.pumping) return;
@@ -1005,13 +944,10 @@ export class TcpFrameChannel implements FrameChannel {
                         this.dataFramesQueued--;
                         this.dataBytesQueued -= item.bytes;
                     }
-                    // KTD4 possible-send boundary: published immediately
-                    // before socket.write() is invoked for its bytes.
                     if (item.hooks?.onPublish) {
                         try {
                             item.hooks.onPublish();
                         } catch {
-                            // Hook exceptions must not affect the writer.
                         }
                     }
                     this.currentItem = { item, index: 0 };
@@ -1042,7 +978,6 @@ export class TcpFrameChannel implements FrameChannel {
                     try {
                         current.item.hooks.onComplete();
                     } catch {
-                        // Hook exceptions must not affect the writer.
                     }
                 }
                 this.emitDiagnostic("write_complete", current.item.meta);
@@ -1050,10 +985,6 @@ export class TcpFrameChannel implements FrameChannel {
             }
         } finally {
             this.pumping = false;
-            // A write callback that fires before `currentItem` is cleared
-            // sees `writerIdle() === false` and skips the waiters; re-check
-            // now that the writer state is final so `flush()` callers cannot
-            // hang until their deadline. No-op unless the writer is idle.
             this.settleFlushWaiters();
         }
     }
@@ -1076,12 +1007,10 @@ export class TcpFrameChannel implements FrameChannel {
         try {
             hook(type, meta);
         } catch {
-            // Observer exceptions must never affect transport work.
         }
     }
 
     // ------------------------------------------------------------------
-    // Shared-budget charges held by this channel.
     // ------------------------------------------------------------------
 
     private chargeReader(bytes: number): void {

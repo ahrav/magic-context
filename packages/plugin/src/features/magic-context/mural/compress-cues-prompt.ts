@@ -1,23 +1,8 @@
 /**
- * compress-cues prompt + manifest parser (non-agentic single-shot transform).
  *
- * Replaces the single-shot mural AUTHOR flow. The old author did selection,
- * room grouping, ranking, AND cue compression in one LLM call — three of those
- * four jobs are deterministic and were being re-done (badly) by the model every
- * week. This task keeps ONLY the genuinely-generative job: compress one memory's
- * content into a terse pidgin cue. Selection (overflow complement) and packing
- * (rank-ordered budget trim) are deterministic and live in resolveMural /
  * renderMural.
  *
- * Pattern mirrors classify-memories: the host renders ONE prompt per chunk, a
- * zero-tool agent emits ONE XML manifest, and the host parses fail-closed and
- * applies COLUMN-ONLY writes (mural_cue). No per-memory tool calls.
  *
- * The cue grammar is adapted from the retired MURAL_AUTHORING_PROMPT: pidgin
- * anchors, symbol vocabulary, per-importance budget, prohibition polarity,
- * verbatim identifiers, XML-escaping. What is dropped: room names, merges,
- * selection, ranking, and the <mural>/<room> scaffolding — none of which the
- * model should decide anymore.
  */
 
 import { extractCompleteManifestBody } from "../dreamer/manifest-parser";
@@ -29,9 +14,8 @@ export interface CompressCuesPromptMemory {
     content: string;
 }
 
-/** Per-cue hard budget in codepoints. Importance >= 70 gets more room because
- *  load-bearing rules carry more that must survive compression; everything else
- *  is held tighter. Mirrors the retired author budgets. */
+/**
+ * */
 export const CUE_BUDGET_HIGH = 90;
 export const CUE_BUDGET_LOW = 50;
 
@@ -70,9 +54,8 @@ function renderPool(memories: CompressCuesPromptMemory[]): string {
         .join("\n\n");
 }
 
-/** Build the compress-cues prompt for one chunk. The category and importance are
- *  copied into the pool line so the model applies the right budget and polarity,
- *  but it never re-decides them — those are source facts. */
+/**
+ * */
 export function buildCompressCuesPrompt(args: {
     projectPath: string;
     memories: CompressCuesPromptMemory[];
@@ -101,11 +84,6 @@ function unescapeXml(value: string): string {
 }
 
 /**
- * Parse the agent's complete `<cues>` manifest, fail-closed on a missing/
- * truncated root (a length-capped reply must never apply a partial prefix of
- * cues). Per-cue VALIDATION happens on the write path, not here — a single bad
- * cue must not reject the whole chunk, so the parser only extracts id+text and
- * the caller decides which cues to keep.
  */
 export function parseCuesManifest(text: string): ParsedCue[] {
     const body = extractCompleteManifestBody(text, "cues");

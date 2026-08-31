@@ -1,9 +1,6 @@
-//! One authenticated connection generation: admission, per-generation state,
-//! the frame read loop, and consumer liveness.
+//! This module runs one authenticated connection generation.
 //!
-//! A generation owns its correlation watermark, membership lookups, pending
-//! correlation index, ping namespace, and writer — but never a route's
-//! cleanup, which stays with the global registry (plan KTD5).
+//! Each generation owns its correlation watermark, membership lookups, pending correlation index, ping namespace, and writer; the global registry owns route cleanup.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -40,38 +37,22 @@ use crate::transport_provider::{
 };
 use crate::wire::{encode_owned_frame, pure_header_flags, response_flags, FrameId};
 
-/// Key of one pending consumer request: (channel, epoch, correlation).
-/// Direction is implied — this map holds only consumer-originated requests;
-/// host Pings live in their own namespace (protocol §8.3, V43).
+/// The pending-request map contains only consumer-originated requests; host Pings use a separate namespace.
 pub type PendingKey = (u16, u32, u64);
 
-/// Concurrent off-reader `server_busy` rejection emissions per generation.
-/// Small: rejections only queue this deep when global pending capacity is
-/// exhausted AND egress is contended. Past the bound the generation is
-/// retired (token cancelled, writer discarded) rather than stalling the sole
-/// reader on contended egress, which is what this bound exists to prevent.
+/// Off-reader rejections reach this bound only when global pending capacity is exhausted and egress is contended.
 const MAX_INFLIGHT_BUSY_REJECTS: usize = 32;
 
-/// One outstanding host Ping.
 ///
-/// Acceptance is decided by comparing WHEN the Pong was observed against WHEN
-/// the Ping's write COMPLETED — never by which side won the `pings` mutex.
-/// The writer captures `completed_at` the instant `write_all` returns, before
-/// taking any lock, so:
+/// The reader accepts a Pong only when it observes the Pong at or after the Ping's `written_at`.
+/// The writer sets `written_at` immediately after `write_all` returns.
 ///
-/// * a Pong observed at-or-after `completed_at` is accepted even if the read
-///   loop won the mutex race or the writer task was preempted for longer than
-///   a round trip (the bytes were demonstrably on the wire); and
-/// * a Pong observed before `completed_at` is a pre-answer for a Ping whose
-///   bytes did not yet exist, so it is discarded and the probe still demands
-///   a real answer.
+/// The reader accepts a Pong observed at or after `written_at` even if it locks `pings` before the writer.
+/// The reader discards a Pong observed before `written_at` because the Ping write had not completed.
 ///
-/// Comparing against write START (rather than completion) would admit
-/// pre-answers; requiring the mutex transition to precede the Pong would drop
-/// legitimate ones. The residual case — a peer that received the bytes but
-/// answers without reading them — is indistinguishable from a real answer to
-/// any observer, and is still caught by the writer's per-frame stall deadline
-/// once that peer stops draining its socket.
+/// Comparing against write start would admit pre-answers; requiring a mutex transition before the Pong would drop legitimate answers.
+/// A peer can answer after receiving the bytes without reading them; no observer can distinguish that answer from a real answer.
+/// The writer's per-frame stall deadline catches a peer that stops draining its socket.
 pub struct PingProbe {
     pub flags: u8,
     pub sent: Instant,
@@ -84,61 +65,46 @@ pub struct PendingEntry {
     pub settlement: Arc<crate::dispatch::Settlement>,
 }
 
-/// A running liveness loop and the token that stops only it, so a grant can
-/// stop and join bootstrap Pings without retiring the rest of the
+/// The liveness handle stops and joins the bootstrap Ping task without retiring the generation.
 /// generation.
 pub struct LivenessHandle {
     pub stop: CancellationToken,
     pub task: tokio::task::JoinHandle<()>,
 }
 
-/// Generation-owned state shared with the registry and dispatch tasks.
 pub struct GenerationCore {
     pub id: u64,
-    /// Cancelling retires the generation: reads stop, admitted work settles as
-    /// cancelled, emits fail closed.
+    /// Cancellation retires the generation: reads stop, admitted work settles as cancelled, and the generation emits fail closed.
     pub token: CancellationToken,
-    /// Stops the read side and generation-local frame producers without
-    /// retiring the writer needed to flush already-started terminals.
+    /// `read_cancel` stops the read side and generation-local frame producers but leaves the writer running to flush already-started terminals.
     pub read_cancel: CancellationToken,
-    /// Read-loop work that can enqueue frames independently of route drains.
+    /// `read_tasks` contains read-loop tasks that can enqueue frames independently of route drains.
     /// Shutdown closes and joins this set before queuing connection Goodbye.
     pub read_tasks: TaskTracker,
-    /// Releases the connection owner after shutdown has queued Goodbye, so it
-    /// cannot tear down the writer while the producer fence is draining.
+    /// The connection owner is released after shutdown queues Goodbye so it cannot tear down the writer while the producer fence drains.
     pub shutdown_complete: CancellationToken,
     pub writer: FrameSender,
-    /// channel -> epoch for routes this generation may dispatch on. Lookup
-    /// only; the registry owns insertion at bind and removal at close.
+    /// The generation's route map only looks up routes; the registry inserts routes at bind and removes them at close.
     pub membership: Mutex<HashMap<u16, u32>>,
     pub pending: Mutex<HashMap<PendingKey, PendingEntry>>,
-    /// Outstanding host-originated Pings: correlation -> (flags byte, sent at).
+    /// The `pings` map stores outstanding host-originated Pings by correlation with their flags and send time.
     pub pings: Mutex<HashMap<u64, PingProbe>>,
-    /// Bounds concurrent off-reader `server_busy` rejection emissions so a
-    /// client flooding control frames past global capacity cannot grow
-    /// unbounded tasks through them.
+    /// This bound prevents a client that floods control frames past global capacity from creating unbounded `server_busy` rejection-emission tasks.
     pub busy_rejects: Arc<tokio::sync::Semaphore>,
     pub next_ping_corr: std::sync::atomic::AtomicU64,
-    /// The generation's liveness loop, if one runs. Taken by the grant path
-    /// to stop and join it before publishing a selection.
+    /// The grant path takes the liveness handle to stop and join the liveness loop before publishing a selection.
     pub liveness: Mutex<Option<LivenessHandle>>,
 }
 
-/// Runs one accepted socket to completion: authenticate, promote into
-/// authenticated capacity, then serve frames until retirement.
 ///
-/// `handshake_permit` is held from before the first byte is read; it releases
-/// on every exit path once authenticated capacity is acquired or the socket
-/// dies (protocol §5.1).
+/// `handshake_permit` releases when authenticated capacity is acquired or the socket closes.
 ///
-/// This task is the connection's setup owner: it holds the authenticated
-/// connection permit for the whole setup (bounding prepared candidates by
-/// `max_connections`), owns the bootstrap and candidate cancellation roots,
-/// keeps the generation visible to shutdown through the connection registry,
-/// and reaps the unpromoted candidate and its I/O task. A TCP selection
-/// (explicit or by omission) keeps serving the bootstrap channel directly; a
-/// committed grant retires the bootstrap and serves the promoted candidate
-/// with a fresh generation whose application correlations start at 3.
+/// Holding the permit throughout setup bounds prepared candidates by `max_connections`.
+/// `run_connection` owns the bootstrap and candidate cancellation roots.
+/// `run_connection` reaps an unpromoted candidate and its I/O task.
+/// An explicit or omitted TCP selection continues serving the bootstrap channel.
+/// A committed grant retires the bootstrap and serves the promoted candidate.
+/// The promoted candidate uses a fresh generation whose application correlations start at 3.
 pub async fn run_connection<H: McHostHandler>(
     shared: Arc<HostShared<H>>,
     mut stream: TcpStream,
@@ -153,25 +119,23 @@ pub async fn run_connection<H: McHostHandler>(
         shared.timing.auth_deadline,
     )
     .await;
-    // `role` is unverified reporting metadata; every valid proof gets identical
-    // admission regardless of it (protocol §5.2).
+    // `role` is unverified reporting metadata.
+    // `role` does not affect admission for a valid proof.
     if auth.is_err() {
         return;
     }
 
-    // Authentication promotion linearizes here: authenticated capacity is
-    // acquired before the generation becomes visible anywhere, and only then
-    // is the handshake slot released (plan KTD10).
+    // Authenticated capacity is acquired before the generation is published.
     let Ok(connection_permit) = shared.connection_permits.clone().try_acquire_owned() else {
         return;
     };
     drop(handshake_permit);
     let _connection_permit = connection_permit;
 
-    // Generation tokens are independent roots rather than children of the
-    // shutdown token. Admission stops when `shutdown` fires, but the drain must
-    // still emit terminals and a Goodbye on a live generation, so only
-    // `shutdown_sequence` may retire these — in protocol order.
+    // Generation tokens are independent roots.
+    // When `shutdown` fires, admission stops, but draining keeps the generation live to emit terminals and `Goodbye`.
+    // Only `shutdown_sequence` may retire generation tokens.
+    // `shutdown_sequence` retires generation tokens in protocol order.
     let gen_token = CancellationToken::new();
     let read_cancel = gen_token.child_token();
     let (read_half, write_half) = stream.into_split();
@@ -224,8 +188,7 @@ pub async fn run_connection<H: McHostHandler>(
             .await;
         }
         None => {
-            // The candidate never promoted: reap it here so the setup owner
-            // — not the provider — is what guarantees resource release.
+            // Reaping the unpromoted candidate in the setup owner guarantees its resource release.
             handoff.sender.discard();
             handoff.root.cancel();
             if let Some(io) = io_task {
@@ -257,9 +220,8 @@ fn new_generation<H: McHostHandler>(
     })
 }
 
-/// Serves one finalized frame channel to retirement: register, read, drain,
-/// close. Returns the candidate handoff if the read loop granted one, so the
-/// caller can promote or reap it after this channel is fully torn down.
+/// `serve_generation` returns a candidate handoff only after the finalized channel is torn down.
+/// The caller promotes or reaps the candidate after channel teardown.
 async fn serve_generation<H: McHostHandler, C: FrameReceiver>(
     shared: &Arc<HostShared<H>>,
     gen: Arc<GenerationCore>,
@@ -267,21 +229,20 @@ async fn serve_generation<H: McHostHandler, C: FrameReceiver>(
     mut io_task: AbortOnDropHandle<()>,
     mut setup: ConnectionSetup,
 ) -> Option<Arc<CandidateHandoff>> {
-    // Retained past `gen`: the writer must be told to stop even when a
-    // handler still holds a sender clone through a retained RequestCtx.
+    // The writer requires an explicit stop signal after `gen` is dropped.
+    // A handler can retain a sender clone through `RequestCtx` after `gen` is dropped.
     let writer_finish = gen.writer.clone();
-    // Register the read loop before publishing the generation. Its tracker
-    // token prevents shutdown from observing an empty producer set between
-    // insertion and the first read-loop poll.
+    // The read loop registers before the generation is published.
+    // The read loop's tracker token prevents shutdown from observing an empty producer set.
+    // The tracker token covers the interval between generation insertion and the first read-loop poll.
     let read_task = gen
         .read_tasks
         .track_future(read_loop(shared, &gen, channel, &mut setup));
     {
         let mut connections = shared.connections.lock().expect("connections lock");
-        // The token check closes the window between a committed
-        // `host.shutdown` (which cancels the token) and the shutdown
-        // sequence storing `draining`: a socket accepted just before the
-        // commit must not register a new generation after it.
+        // Checking the shutdown token prevents registration after `host.shutdown` commits.
+        // `host.shutdown` cancels the token before the shutdown sequence stores `draining`.
+        // A socket accepted before `host.shutdown` commits must not register after that commit.
         if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
             return None;
         }
@@ -289,8 +250,8 @@ async fn serve_generation<H: McHostHandler, C: FrameReceiver>(
     }
 
     if let Some(policy) = shared.liveness.clone() {
-        // A child of `read_cancel` so retirement still stops the loop; the
-        // grant path cancels only this child to stop Pings alone.
+        // `liveness` is a child of `read_cancel`, so retirement still stops the loop;
+        // the grant path cancels only `liveness` to stop Pings.
         let stop = gen.read_cancel.child_token();
         let gen_ping = Arc::clone(&gen);
         let task = shared.spawn_tracked(gen.read_tasks.track_future(liveness_loop(
@@ -304,37 +265,27 @@ async fn serve_generation<H: McHostHandler, C: FrameReceiver>(
     let read_exit = read_task.await;
     gen.read_cancel.cancel();
     match read_exit {
-        // Graceful shutdown stopped the reader directly: everything keeps
-        // draining in protocol order. A cancellation INHERITED from the
-        // generation token (liveness invalidation, emission failure) is a
-        // retirement, not a drain — fall through to the silent close.
+        // the generation continues draining in protocol order.
+        // A cancelled `gen.token` indicates retirement rather than draining, so the code falls through to the silent close.
         ReadExit::HostCancelled if !gen.token.is_cancelled() => {}
-        // Oversized-control drain failure: wait for exactly the promised
-        // authoritative terminal to reach the socket (protocol §7.1) — the
-        // emission self-bounds via its admission and write deadlines, and a
-        // failed emission drops the sender — then retire silently like every
-        // other peer exit, discarding whatever else is queued.
+        // For `PeerKeepQueue`, wait for the promised terminal before retiring.
         ReadExit::PeerKeepQueue(terminal_written) => {
             let _ = terminal_written.await;
             gen.token.cancel();
             gen.writer.discard();
         }
-        // Peer-initiated or error retirement closes silently — even while
-        // the host is draining: cancelling the generation token makes queued
-        // off-reader emissions fail closed, and discarding the writer drops
-        // frames already queued, so a client that sent a corrupt frame never
-        // receives terminals or a Goodbye after the close decision
+        // Peer-driven retirement closes silently.
+        // Cancelling `gen.token` prevents off-reader emissions from succeeding.
+        // Discarding `gen.writer` drops queued frames.
+        // After a corrupt frame, the client receives no terminal or Goodbye.
         // (protocol §6.3).
         ReadExit::HostCancelled | ReadExit::Peer => {
             gen.token.cancel();
             gen.writer.discard();
         }
     }
-    // Mark generation-owned routes closing BEFORE waiting for in-flight
-    // binds: the route.open wrappers below run inside `read_tasks`, and a
-    // bind completing during that wait must observe `close_requested`
-    // (finishing through CloseWins) instead of installing a route onto a
-    // generation that is about to retire.
+    // `begin_close_generation` makes in-flight binds finish through `CloseWins` instead of installing routes on a retiring generation.
+    // `read_tasks` keeps `route.open` wrappers alive until shutdown waits for them.
     let begun_closes = shared.registry.begin_close_generation(gen.id);
     gen.read_tasks.close();
     gen.read_tasks.wait().await;
@@ -343,55 +294,41 @@ async fn serve_generation<H: McHostHandler, C: FrameReceiver>(
     }
 
     close_generation(shared, &gen, begun_closes).await;
-    // The candidate driver (tracked in `read_tasks`, so already joined) is
-    // the only writer of the promotion slot; taking the handoff after the
-    // wait is what makes the transfer race-free.
+    // The candidate driver is the only writer of the promotion slot.
+    // `read_tasks.wait()` makes the handoff transfer race-free.
     let handoff = setup.handoff.take();
     drop(gen);
-    // Every legitimate producer is done (read tasks joined, routes closed,
-    // generation dropped); any surviving sender is an inert handler-held
-    // clone, so close the queue explicitly rather than waiting for it.
+    // `writer_finish.finish()` is required because handler-held sender clones are inert.
     writer_finish.finish();
     // The writer drains queued terminals and Goodbye after the handles drop.
-    // Its own per-frame stall deadline (`frame_deadline`, enforced inside the
-    // writer task) already bounds this join, so no extra budget applies here:
-    // the old `route_close_budget` cap could abort a drain that graceful
-    // shutdown promised to flush, while a stalled peer still cannot hold the
-    // join beyond the writer's self-retirement.
+    // The writer enforces `frame_deadline` for each frame.
+    // No additional deadline applies to the writer-task join.
+    // A stalled peer cannot delay the join beyond the writer's self-retirement.
     let _ = (&mut io_task).await;
     handoff
 }
 
-/// Why the read side of a connection stopped. Only a host-cancelled read may
-/// keep the writer draining: every peer-driven exit (EOF, corruption, peer
-/// Goodbye, protocol violation) retires silently, even mid-shutdown.
-/// `PeerKeepQueue` marks the one exception: an oversized-control drain
-/// failure whose early terminal is authoritative for its correlation
-/// (protocol §7.1) and must flush despite the otherwise-silent close.
+/// Only `HostCancelled` may keep the writer draining.
+/// `Peer` retires silently; `PeerKeepQueue` flushes its authoritative early terminal before retirement.
+/// `PeerKeepQueue` permits its authoritative early terminal to flush before the writer discards the remaining queue.
+/// The early terminal is authoritative for its correlation.
 enum ReadExit {
     HostCancelled,
     Peer,
-    /// An oversized-control drain failure whose early terminal is
-    /// authoritative for its correlation (protocol §7.1): the receiver fires
-    /// when exactly that frame is on the socket, letting the close fence the
-    /// one promised frame and then discard everything else.
+    /// The receiver completes only after the authoritative terminal reaches the socket.
     PeerKeepQueue(tokio::sync::oneshot::Receiver<()>),
 }
 
-/// Serves validated frames until close. Returning retires the generation.
+/// Returning retires the generation.
 async fn read_loop<H: McHostHandler, C: FrameReceiver>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
     mut channel: C,
     setup: &mut ConnectionSetup,
 ) -> ReadExit {
-    // Highest consumer Request correlation seen; any non-increasing Request
-    // closes the generation before dispatch (protocol §8.3, V44). A promoted
-    // candidate starts at 2 so application correlations begin at 3 (§7.7.4).
+    // `read_loop` rejects Requests with correlations less than or equal to `watermark` before dispatch; promoted candidates initialize `watermark` to 2 so application correlations start at 3 (protocol §8.3, V44; §7.7.4).
     let mut watermark: u64 = setup.initial_watermark;
-    // Written-signal of the most recent rejected-frame terminal: if the
-    // transport's realignment then fails, the close fences exactly that
-    // authoritative frame (protocol §7.1).
+    // `read_loop` retains the most recent rejected-frame terminal's written signal so failed realignment fences that authoritative frame (protocol §7.1).
     let mut reject_written: Option<tokio::sync::oneshot::Receiver<()>> = None;
 
     loop {
@@ -399,10 +336,7 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
             Ok(event) => event,
             Err(ReadClose::Cancelled) => return ReadExit::HostCancelled,
             Err(ReadClose::RejectedDrainFailed) => {
-                // The queued early terminal is authoritative for its
-                // correlation even when the declared body then fails
-                // (protocol §7.1): the close stays silent otherwise, but
-                // that one frame must survive to flush.
+                // `read_loop` preserves the queued early terminal when declared-body drain fails because its correlation remains authoritative (protocol §7.1).
                 return match reject_written.take() {
                     Some(terminal_rx) => ReadExit::PeerKeepQueue(terminal_rx),
                     None => ReadExit::Peer,
@@ -416,12 +350,8 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
 
         match event {
             InboundEvent::Rejected(RejectedFrame { corr }) => {
-                // The correlation is trustworthy from the header alone; the
-                // early terminal is authoritative even if the transport's
-                // drain then fails (protocol §7.1). The watermark still
-                // applies first. Emitted off-reader (bounded) like the other
-                // no-permit rejections so contended egress cannot block this
-                // reader from a queued Pong while the declared body waits to
+                // `read_loop` uses `RejectedFrame.corr` because the header provides a trustworthy correlation even when declared-body drain fails (protocol §7.1).
+                // `read_loop` emits no-permit rejections off-reader so contended egress cannot block queued Pongs during declared-body drain.
                 // be drained.
                 if corr <= watermark {
                     return ReadExit::Peer;
@@ -430,16 +360,9 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                 if !transport_ready(setup) {
                     return ReadExit::Peer;
                 }
-                // Off-reader like the other rejections (contended egress
-                // must not block this reader from a queued Pong), but with a
-                // written-signal: if the transport's body drain on the next
-                // `recv` fails, the close fences exactly this authoritative
-                // frame (protocol §7.1). Rejected frames consume no pending
-                // permit, so the per-generation rejection semaphore is what
-                // bounds these emissions. Acquired BEFORE spawning: past the
-                // bound a peer streaming oversize bodies would otherwise
-                // accumulate tasks, oneshots, and captured Arcs, so
-                // exhaustion retires instead.
+                // `read_loop` retains a written signal so body-drain failure on the next `recv` fences the authoritative terminal (protocol §7.1).
+                // `read_loop` acquires `busy_rejects` before spawning so exhausted capacity retires the generation instead of accumulating tasks, oneshots, and captured `Arc`s.
+                // `read_loop` uses the per-generation rejection semaphore because rejected frames consume no pending permit.
                 let Ok(reject_permit) = gen.busy_rejects.clone().try_acquire_owned() else {
                     gen.token.cancel();
                     gen.writer.discard();
@@ -487,8 +410,7 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                         }
                     }
                     FrameType::Cancel => {
-                        // Structural shape: current nonzero route, nonzero
-                        // correlation (protocol §6.2 table).
+                        // Valid frames require the current route and a nonzero correlation (protocol §6.2 table).
                         if header.channel == 0 || header.epoch == 0 || header.corr == 0 {
                             return ReadExit::Peer;
                         }
@@ -504,17 +426,14 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                         let now = Instant::now();
                         let mut pings = gen.pings.lock().expect("pings lock");
                         match pings.get_mut(&header.corr) {
-                            // The echo must match what we sent exactly
-                            // (protocol V35). A matching Pong for a probe the
-                            // writer has not yet confirmed written is retained
-                            // for the write-completion hook to reconcile.
+                            // The `Pong` payload must exactly match the sent `Ping` payload.
+                            // The connection retains a matching Pong until the writer confirms that its probe was written.
                             Some(probe) if probe.flags == header.flags.0 => {
                                 match probe.written_at {
-                                    // Completion recorded: `sent` is the
-                                    // completion instant, so the deadline
-                                    // applies here. Scheduler delay must not
-                                    // extend it — a late Pong leaves the
-                                    // probe for expiry.
+                                    // After write completion, `sent` is the completion instant.
+                                    // The Pong deadline starts at the write-completion instant.
+                                    // Scheduler delay does not extend the Pong deadline.
+                                    // A Pong received after the deadline leaves the probe for expiry.
                                     Some(_) => {
                                         let in_deadline =
                                             shared.liveness.as_ref().is_none_or(|p| {
@@ -524,13 +443,11 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                                             pings.remove(&header.corr);
                                         }
                                     }
-                                    // Completion unknown: `sent` is only the
-                                    // provisional enqueue instant, so no
-                                    // deadline can be evaluated yet (a Ping
-                                    // queued behind large frames would
-                                    // otherwise have its answer rejected
-                                    // before it was even written). Park the
-                                    // arrival; the hook decides against the
+                                    // Before write completion, `sent` is only the enqueue instant.
+                                    // The Pong deadline cannot be evaluated before write completion.
+                                    // A Ping queued behind large frames can receive a Pong before it is written.
+                                    // A Pong received before write completion must not be rejected as late.
+                                    // The write-completion hook evaluates stored Pongs against the completion instant.
                                     // completion instant.
                                     None => probe.answered_at = Some(now),
                                 }
@@ -543,7 +460,7 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                             if header.corr != 0 {
                                 return ReadExit::Peer;
                             }
-                            // Orderly connection close (protocol §9.4).
+                            // A channel-0 `Goodbye` closes the connection (protocol §9.4).
                             return ReadExit::Peer;
                         }
                         if header.epoch == 0 || header.corr != 0 {
@@ -552,22 +469,19 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                         if !transport_ready(setup) {
                             return ReadExit::Peer;
                         }
-                        // The Closing transition is synchronous, so any later
-                        // frame on this route observes `unknown_channel`; the
-                        // drain and route-gone callback run on a tracked task
-                        // because awaiting them here would stall every other
-                        // frame on this connection — including Pong replies,
-                        // which missed-Pong invalidation would misread as a
+                        // The synchronous Closing transition makes later frames on the route observe `unknown_channel`.
+                        // Awaiting the drain here would stall all other connection frames.
+                        // Stalling the connection would delay Pong replies.
+                        // Missed-Pong invalidation would interpret delayed Pong replies as a dead peer.
                         // dead peer.
                         let handle = crate::handler::RouteHandle {
                             channel: header.channel,
                             epoch: header.epoch,
                         };
                         let decision = shared.registry.begin_close_owned(handle, gen.id);
-                        // Duplicate, stale, or mid-bind Goodbyes carry no
-                        // cleanup work; spawning for them would let a client
-                        // pipeline unbounded no-op tasks past the pure-header
-                        // frames' zero capacity cost.
+                        // Duplicate, stale, and mid-bind Goodbyes require no cleanup.
+                        // Spawning for duplicate, stale, or mid-bind Goodbyes would allow client-pipelined no-op tasks.
+                        // Clients could pipeline unbounded no-op tasks because pure-header frames have zero capacity cost.
                         if matches!(decision, CloseDecision::Owner { .. }) {
                             let shared_task = Arc::clone(shared);
                             shared.spawn_tracked(gen.read_tasks.track_future(async move {
@@ -581,9 +495,8 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                         }
                     }
                     // Consumer-originated role violations close the generation
-                    // rather than extend the profile (protocol §6.2). Ping is
-                    // host-to-consumer only; a consumer Ping would demand an
-                    // implicit host-Pong extension, so it closes too.
+                    // `Ping` is host-to-consumer only (protocol §6.2).
+                    // A consumer `Ping` closes the generation because handling it requires an implicit host `Pong` extension.
                     FrameType::Response
                     | FrameType::StreamData
                     | FrameType::StreamEnd
@@ -598,10 +511,7 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
     }
 }
 
-/// Runs `decode` over the frame's body as one contiguous byte slice. TCP
-/// frames arrive contiguous; a ring backend delivers a body as two spans
-/// when it wraps the arena end, so that shape flattens through the explicit
-/// copying adapter first. Only decoded values leave the lease scope.
+/// `decode` receives each body as one contiguous byte slice; wrapped ring-buffer bodies are copied first, and decoded values do not escape the lease scope.
 fn decode_contiguous<T>(
     frame: &crate::frame_channel::InboundFrame,
     decode: impl FnOnce(&[u8]) -> T,
@@ -630,8 +540,7 @@ async fn handle_control<H: McHostHandler>(
     action: ControlAction,
     setup: &mut ConnectionSetup,
 ) -> ControlFlow {
-    // Negotiation bypasses pending-request admission because it is setup
-    // traffic: exhausted global capacity must not turn a negotiation into a
+    // Exhausted global capacity must not turn setup negotiation into a `server_busy` terminal.
     // `server_busy` terminal.
     let action = match action {
         ControlAction::TransportNegotiate(decoded) => {
@@ -646,16 +555,10 @@ async fn handle_control<H: McHostHandler>(
         return ControlFlow::Close(ReadExit::Peer);
     }
 
-    // Every channel-0 request — including semantic rejections — is one
-    // consumer request against the global unsettled bound; at capacity the
-    // no-dispatch `server_busy` terminal takes precedence over the semantic
-    // error (protocol §8.3).
+    // Every channel-0 request, including semantic rejections, consumes one global unsettled-request permit.
+    // At capacity, the no-dispatch `server_busy` terminal takes precedence over semantic errors (protocol §8.3).
     //
-    // A reserved-class target's `route.open` draws on ITS pool, matching
-    // routed dispatch: charging route establishment to the general pool
-    // would make the carve-out unreachable under exactly the general-load
-    // saturation it exists to survive — the reserved permits would sit idle
-    // while the module could not open the route needed to use them.
+    // Reserved `route.open` uses the reserved pool so it remains possible when the general pool is full.
     let pending_pool = match &action {
         ControlAction::RouteOpen { target, .. }
             if shared.targets.class_of(&target.module_id)
@@ -679,9 +582,8 @@ async fn handle_control<H: McHostHandler>(
 
     match action {
         ControlAction::Reject { code, message } => {
-            // Emission can wait on shared egress budget; queue it off the
-            // read loop so a contended budget cannot stall Pong reads into a
-            // liveness false-kill. Bounded: the permit was acquired above.
+            // The read loop queues emission because egress-budget acquisition can block.
+            // The acquired permit bounds queued emissions.
             let shared_task = Arc::clone(shared);
             let gen_task = Arc::clone(gen);
             shared.spawn_tracked(gen.read_tasks.track_future(async move {
@@ -697,9 +599,7 @@ async fn handle_control<H: McHostHandler>(
             }));
         }
         ControlAction::CatalogList { module_id_filter } => {
-            // Catalog stays serviceable during drain (protocol §12 step 1
-            // freezes routes and dispatch, not control reads). Emitted off
-            // the read loop for the same liveness reason as rejections.
+            // The read loop queues the catalog response because egress-budget acquisition can block.
             let shared_task = Arc::clone(shared);
             let gen_task = Arc::clone(gen);
             shared.spawn_tracked(gen.read_tasks.track_future(async move {
@@ -751,10 +651,9 @@ async fn handle_control<H: McHostHandler>(
             }));
         }
         ControlAction::RouteOpen { target, identity } => {
-            // Bind callbacks may be slow; never stall the read loop on them.
-            // Abort-exempt: this wrapper owns its route's cleanup (rejected
-            // or close-raced binds still get exactly-once route-gone), so the
-            // forced shutdown path must let it finish; every await inside is
+            // The read loop must not wait for bind callbacks because they may be slow.
+            // The wrapper must be abort-exempt because it owns its route's cleanup.
+            // Rejected or close-raced binds must emit `route-gone` exactly once.
             // self-bounded.
             let shared_task = Arc::clone(shared);
             let gen_task = Arc::clone(gen);
@@ -770,25 +669,21 @@ async fn handle_control<H: McHostHandler>(
     ControlFlow::Continue
 }
 
-/// What the setup-aware control path tells the read loop to do next.
 enum ControlFlow {
     Continue,
     Close(ReadExit),
 }
 
-/// Transport-setup state for one served channel (protocol §7.7.5).
+/// `ConnectionSetup` stores transport-setup state for one served channel (protocol §7.7.5).
 /// `Retired` has no variant: it is the read loop returning a [`ReadExit`].
-/// The candidate-side stages (`CandidatePrepared`, `Activating`,
-/// `AwaitingCommit`) are the sequential control flow of
-/// [`run_candidate_setup`]; the bootstrap observes them all as
+/// `CandidatePrepared`, `Activating`, and `AwaitingCommit` occur in that order in `run_candidate_setup`.
 /// [`TransportState::CandidateSetup`].
 enum TransportState {
     BootstrapTcp,
     TcpCommitted,
-    /// A candidate is being activated; the bootstrap accepts no further
     /// requests.
     CandidateSetup,
-    /// Serving a promoted candidate; selection is sticky until retirement.
+    /// `ProviderActive` serves a promoted candidate; selection remains sticky until retirement.
     ProviderActive,
 }
 
@@ -807,8 +702,7 @@ impl ConnectionSetup {
         }
     }
 
-    /// Correlations 1 and 2 were consumed by activation and commit, so the
-    /// first application request on a promoted candidate is 3 (§7.7.4).
+    /// The first application request on a promoted candidate has sequence number 3 (§7.7.4).
     fn provider_active() -> Self {
         Self {
             state: TransportState::ProviderActive,
@@ -818,9 +712,9 @@ impl ConnectionSetup {
     }
 }
 
-/// Shared handle for one prepared candidate: the sender and cancellation
-/// roots both the driver and the setup owner can reach, plus the promotion
-/// slot the driver fills after the commit response reaches local completion.
+/// The sender and cancellation token share one prepared-candidate handle.
+/// Both the driver and setup owner can reach the cancellation roots.
+/// The driver fills `promoted` after the commit response completes locally.
 pub(crate) struct CandidateHandoff {
     sender: FrameSender,
     root: CancellationToken,
@@ -849,12 +743,12 @@ async fn handle_negotiate<H: McHostHandler>(
     let request = match decoded {
         Ok(request) => request,
         Err(_) => {
-            // §7.7.1: the documented terminal, then retirement. The close
-            // fences exactly this authoritative frame, like the
-            // oversized-control path. Liveness stops first: the generation
-            // is closing with exactly this frame, and a missed-Pong
-            // invalidation during the bounded egress wait below would
-            // cancel the generation and abort the terminal the contract
+            // `handle_negotiate` sends the terminal response before retiring the generation.
+            // `ReadExit::PeerKeepQueue` waits for the authoritative rejection to enter the egress queue before closing.
+            // The malformed-negotiation path stops liveness before waiting for terminal egress.
+            // A missed Pong during terminal egress would invalidate the closing generation.
+            // Terminal egress waits only for the bounded egress budget.
+            // Generation cancellation would abort the required terminal response.
             // requires.
             let liveness = gen.liveness.lock().expect("liveness lock").take();
             if let Some(handle) = liveness {
@@ -874,9 +768,6 @@ async fn handle_negotiate<H: McHostHandler>(
             return ControlFlow::Close(ReadExit::PeerKeepQueue(terminal_rx));
         }
     };
-    // Fallback always names the exact offered tcp entry (§7.7.3); with tcp
-    // offered only at versions this host does not speak, no offered entry is
-    // serveable and the setup fails closed.
     if !request.offers.iter().any(|offer| {
         offer.transport == TRANSPORT_TCP && offer.capability_version == TCP_CAPABILITY_VERSION
     }) {
@@ -895,15 +786,13 @@ async fn handle_negotiate<H: McHostHandler>(
             }
             continue;
         }
-        // Provider identity is `(transport, capability_version)`: a
-        // name-only lookup would hide a serveable provider behind a
-        // mismatched sibling at the same name.
+        // Lookup must include `capability_version` so a mismatched sibling cannot hide a serveable provider.
         match shared
             .providers
             .find(&offer.transport, offer.capability_version)
         {
             Some(provider) => {
-                // A panicking preflight fails toward static omission: reasonless TCP and no client probe (KTD6).
+                // `preflight` panics are treated as `StaticallyOmitted`.
                 let eligibility = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::panic_boundary::redact_sync(|| {
                         provider.preflight(offer.parameters.as_ref())
@@ -928,28 +817,20 @@ async fn handle_negotiate<H: McHostHandler>(
                         )
                         .await;
                     }
-                    // Exact `unavailable` is reserved for an installed, statically eligible provider's dynamic readiness or admission pressure (KTD6).
                     PreflightEligibility::DynamicallyUnavailable => {
                         dynamically_unavailable = true;
                     }
                     PreflightEligibility::StaticallyOmitted => {}
                 }
             }
-            // Known transport at another version: name the real cause
-            // (§7.7.3) rather than reporting it as unavailable.
+            // `capability_version_mismatch` reports a known transport offered at an unsupported version.
             None if shared.providers.serves_transport(&offer.transport) => {
                 capability_mismatch = true;
             }
-            // Permanent absence selects reasonless TCP, never `unavailable`, so a client cannot probe for a provider that cannot appear (KTD6).
             None => {}
         }
     }
-    // `unavailable` outranks `capability_version_mismatch` across the
-    // evaluated offers: it is the only reason that authorizes a client
-    // re-upgrade probe (§7.7.3), and a dynamically unavailable eligible
-    // offer is transient — a later probe can succeed. Reporting a static
-    // mismatch from a lower-preference sibling would permanently suppress
-    // recovery of the unavailable transport.
+    // `unavailable` takes precedence over `capability_version_mismatch` among evaluated offers.
     let reason = if dynamically_unavailable {
         Some(FallbackReason::Unavailable)
     } else if capability_mismatch {
@@ -974,10 +855,6 @@ async fn respond_tcp<H: McHostHandler>(
         TCP_CAPABILITY_VERSION,
     )
     .expect("a tcp selection always encodes");
-    // Emission can wait on the shared egress budget; queue it off the read
-    // loop so a contended budget cannot stall Pong reads into a liveness
-    // false-kill. Bounded without a pending permit: the setup state machine
-    // admits at most two TCP negotiation responses per generation.
     let shared_task = Arc::clone(shared);
     let gen_task = Arc::clone(gen);
     shared.spawn_tracked(gen.read_tasks.track_future(async move {
@@ -1013,21 +890,7 @@ async fn grant_candidate<H: McHostHandler>(
         shared.timing.frame_deadline,
         offer_parameters,
     );
-    // The setup deadline exists before any provider code runs, and the
-    // KTD9 attachment gate inside `prepare` executes on the registry's one
-    // dedicated worker thread: a provider that stalls cannot pin the read
-    // loop, hold the connection permit past the configured setup budget,
-    // or occupy a fresh blocking-pool worker per reconnect. On timeout the
-    // job's eventual result is dropped, releasing the candidate.
     let deadline = Instant::now() + shared.timing.transport_setup_deadline;
-    // KTD4 order: bootstrap liveness is stopped AND joined before the
-    // selection is published — no bootstrap Ping can race the client onto
-    // two live channels. It stops HERE, before the preparation wait,
-    // because that wait blocks this generation's sole read loop: a
-    // `prepare` slower than `ping_interval + pong_deadline` would
-    // otherwise leave a timely Pong unread and let liveness invalidate a
-    // healthy generation. Every path past this point either publishes the
-    // selection or closes the generation, so no bootstrap needs probing
     // again.
     let liveness = gen.liveness.lock().expect("liveness lock").take();
     if let Some(handle) = liveness {
@@ -1035,8 +898,6 @@ async fn grant_candidate<H: McHostHandler>(
         let _ = handle.task.await;
     }
     let reply = shared.providers.prepare_on_worker(provider, ctx);
-    // A provider failure — including a stalled gate — is not fallback
-    // evidence (§7.7.3): the setup fails closed with no same-generation
     // TCP continuation.
     let PreparedCandidate {
         descriptor,
@@ -1066,8 +927,6 @@ async fn grant_candidate<H: McHostHandler>(
         TCP_CAPABILITY_VERSION,
     ) {
         Ok(body) => body,
-        // An out-of-bounds provider descriptor fails closed before any
-        // candidate task exists; dropping the candidate releases its
         // resources.
         Err(_) => return ControlFlow::Close(ReadExit::Peer),
     };
@@ -1089,8 +948,6 @@ async fn grant_candidate<H: McHostHandler>(
     let shared_task = Arc::clone(shared);
     let gen_task = Arc::clone(gen);
     let handoff_task = Arc::clone(&handoff);
-    // Tracked in `read_tasks` so both connection teardown and shutdown wait
-    // for the driver before reading the promotion slot.
     shared.spawn_tracked(gen.read_tasks.track_future(run_candidate_setup(
         shared_task,
         gen_task,
@@ -1102,8 +959,6 @@ async fn grant_candidate<H: McHostHandler>(
     )));
     setup.state = TransportState::CandidateSetup;
     setup.handoff = Some(handoff);
-    // Publishing the selection is the last step. A failed emission retires
-    // the bootstrap; the driver observes `read_cancel` and reaps the
     // candidate.
     if emit_frame(
         &shared.egress_budget,
@@ -1121,12 +976,6 @@ async fn grant_candidate<H: McHostHandler>(
     ControlFlow::Continue
 }
 
-/// Drives one candidate's activation (correlation 1) and commit
-/// (correlation 2) exchanges (protocol §7.7.4). Success stores the receiver
-/// in the promotion slot and retires the bootstrap without touching the
-/// candidate; every other outcome — wrong token, wrong correlation, an
-/// application frame before commit, deadline expiry, channel loss, bootstrap
-/// retirement — retires both channels with no TCP continuation.
 async fn run_candidate_setup<H: McHostHandler>(
     shared: Arc<HostShared<H>>,
     bootstrap: Arc<GenerationCore>,
@@ -1153,12 +1002,6 @@ async fn run_candidate_setup<H: McHostHandler>(
 
         let frame = expect_candidate_request(&mut receiver, COMMIT_CORRELATION).await?;
         decode_candidate_commit(frame)?;
-        // Promotion is gated on this exact frame's local completion — not
-        // queue admission, not an aggregate flush (KTD4). The receiver is
-        // deliberately NOT polled while waiting: an un-promoted host never
-        // consumes candidate frames, so a request pipelined ahead of the
-        // commit response stays buffered and is observed only by the
-        // promoted generation, where every setup invariant already holds.
         let (written_tx, written_rx) = tokio::sync::oneshot::channel();
         send_candidate_response(
             &shared,
@@ -1172,19 +1015,12 @@ async fn run_candidate_setup<H: McHostHandler>(
     };
     let outcome = tokio::select! {
         biased;
-        // A completed exchange must win over a simultaneous bootstrap
-        // retirement: after the commit response reaches local completion
-        // the client may promote and retire the bootstrap before this task
-        // is polled again, and that healthy grant must not be discarded.
         outcome = timeout_at(deadline, exchange) => outcome.unwrap_or(Err(())),
-        // Bootstrap retirement (including host shutdown) reaps a candidate
-        // whose exchange is still pending.
         () = bootstrap.read_cancel.cancelled() => Err(()),
     };
     match outcome {
         Ok(()) => {
             *handoff.promoted.lock().expect("candidate promotion lock") = Some(receiver);
-            // Atomic transfer: retire the bootstrap without touching the
             // candidate.
             bootstrap.token.cancel();
             bootstrap.writer.discard();
@@ -1222,9 +1058,6 @@ async fn expect_candidate_request(
         {
             Ok(frame)
         }
-        // Anything else — a wrong correlation, a nonzero epoch, an
-        // application frame before commit, a rejected oversize declaration,
-        // or channel loss — fails the whole setup (§7.7.4).
         _ => Err(()),
     }
 }
@@ -1272,8 +1105,6 @@ async fn send_candidate_response<H: McHostHandler>(
         .map_err(|_| ())
 }
 
-/// Clones a startup-cached catalog only after its encoded size is charged,
-/// then transfers that charge unchanged to the connection writer.
 async fn emit_catalog_response(
     budget: &crate::wire::ByteBudget,
     gen: &GenerationCore,
@@ -1318,8 +1149,6 @@ async fn reserve_catalog_frame(
         return Err(());
     }
 
-    // Capacity includes the eventual header, so encoding does not need a
-    // second allocation while the cached bytes are copied.
     let mut owned_body = Vec::with_capacity(frame_bytes);
     owned_body.extend_from_slice(body);
     let bytes = encode_owned_frame(
@@ -1338,10 +1167,6 @@ async fn reserve_catalog_frame(
     })
 }
 
-/// Host-side Ping issuance. The correlation namespace is host-owned and
-/// independent of consumer correlations (protocol §8.3): a Ping correlation
-/// numerically equal to a pending consumer correlation cannot cross-settle
-/// because Pongs only match this map.
 async fn liveness_loop(
     gen: Arc<GenerationCore>,
     policy: crate::config::LivenessPolicy,
@@ -1349,10 +1174,7 @@ async fn liveness_loop(
 ) {
     let mut next_ping_at = Instant::now() + policy.ping_interval;
     loop {
-        // Wake at the sooner of the next Ping tick and the earliest
-        // outstanding Pong deadline: the deadline wake honors
-        // `pong_deadline` exactly, and the tick wake notices an answered
-        // Pong so the next Ping is not delayed until the old deadline.
+        // The loop wakes at the earlier of the next Ping tick and the earliest outstanding Pong deadline to avoid delaying the next Ping after an answered Pong.
         let wake_at = {
             let pings = gen.pings.lock().expect("pings lock");
             pings
@@ -1382,24 +1204,19 @@ async fn liveness_loop(
             if expired {
                 pings.clear();
             } else if !pings.is_empty() {
-                // An unexpired Ping is outstanding; no new Ping is added
-                // beside it. Advance the tick so the next wake makes
-                // progress — re-arming a past tick would spin this task
-                // until the Pong arrived or its deadline expired.
+                // When a Ping is unexpired, the loop adds no Ping and advances `next_ping_at`; otherwise a past tick would spin until the Pong arrives or its deadline expires.
                 next_ping_at = now + policy.ping_interval;
                 continue;
             }
         }
         if now < next_ping_at {
-            // Woke for a Pong deadline that was answered in time; the next
-            // Ping still waits for its tick.
+            // After an on-time Pong wakes the loop at its former deadline, the next Ping waits for `next_ping_at`.
             continue;
         }
         next_ping_at = now + policy.ping_interval;
         let corr = gen.next_ping_corr.fetch_add(1, Ordering::SeqCst);
         let flags = pure_header_flags();
-        // The entry must exist before the Ping can reach the wire, or the
-        // read loop would drop a fast Pong as unmatched.
+        // `gen.pings` must contain the correlation before the Ping reaches the wire; otherwise the read loop drops a fast Pong as unmatched.
         gen.pings.lock().expect("pings lock").insert(
             corr,
             PingProbe {
@@ -1417,27 +1234,20 @@ async fn liveness_loop(
         )
         .expect("header-only Ping always encodes");
         let (written_tx, written_rx) = tokio::sync::oneshot::channel();
-        // The hook runs inside the writer task at write completion, so the
-        // probe is answerable the instant the Ping can reach the peer — an
-        // async notification would leave a gap where a fast (or adversarial
-        // pre-answering) Pong races the flag update.
+        // The hook runs in the writer task at write completion, so the probe is answerable when the Ping can reach the peer.
+        // An async notification could let a Pong arrive before the hook records completion.
         let gen_probe = Arc::clone(&gen);
         let pong_deadline = policy.pong_deadline;
         let written_hook = Box::new(move |completed_at: Instant| {
             let mut pings = gen_probe.pings.lock().expect("pings lock");
             if let Some(probe) = pings.get_mut(&corr) {
                 match probe.answered_at {
-                    // A Pong the read loop parked while completion was
-                    // unrecorded: accept it only if it followed the bytes and
-                    // landed inside the deadline measured from completion.
                     Some(answered_at)
                         if answered_at >= completed_at
                             && answered_at.duration_since(completed_at) < pong_deadline =>
                     {
                         pings.remove(&corr);
                     }
-                    // No answer yet, or a pre-answer: arm the deadline from
-                    // completion so the peer owes a real Pong.
                     _ => {
                         probe.answered_at = None;
                         probe.sent = completed_at;
@@ -1462,14 +1272,11 @@ async fn liveness_loop(
         if sent.is_err() {
             return;
         }
-        // Wait for write completion before arming expiry: the hook above
-        // already anchored the deadline and flipped `written` inside the
-        // writer task; this await only paces the loop.
+        // The writer hook anchors expiry; waiting on `written_rx` only paces the loop.
         tokio::select! {
             () = stop.cancelled() => return,
             written = written_rx => {
                 if written.is_err() {
-                    // Writer retired before the Ping reached the socket.
                     return;
                 }
             }

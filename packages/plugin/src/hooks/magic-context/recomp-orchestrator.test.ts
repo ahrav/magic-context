@@ -96,7 +96,7 @@ describe("runManagedUpgrade — already-upgraded guard", () => {
         const db = openDatabase();
         const dir = "/tmp/recomp-orch-noop";
 
-        // Seed a v2 (legacy=0) compartment.
+        // A `legacy: 0` compartment exercises the no-legacy guard.
         appendCompartments(db, "ses-up", [
             {
                 sequence: 0,
@@ -116,10 +116,8 @@ describe("runManagedUpgrade — already-upgraded guard", () => {
 
         expect(message).toContain("Already Up To Date");
         expect(isRecompFailure(message)).toBe(false);
-        // Progress terminal recorded as a (clearing) "done", not "failed".
         const prog = ctx.liveSessionState.recompProgressBySession.get("ses-up");
-        // "done" auto-clears after a grace period; allow either still-present done
-        // or already-cleared — but it must never be "failed".
+        // A `done` phase may auto-clear after its grace period; it must never become `failed`.
         expect(prog?.phase === "done" || prog === undefined).toBe(true);
     });
 
@@ -137,12 +135,7 @@ describe("runManagedUpgrade — already-upgraded guard", () => {
 });
 
 describe("runManagedRecomp clears stale emergency recovery", () => {
-    // A successful recomp resolves the overflow that may have armed
-    // needs_emergency_recovery; runManagedRecomp must clear it on the "done"
-    // terminal phase ONLY (not on skipped/failed), so the flag stops force-
-    // bumping pressure to 95% every later pass once the session is small again.
-    // The full behavioral path needs a live historian client; this guard pins
-    // the clear-on-done wiring against a silent revert.
+    // runManagedRecomp clears `needs_emergency_recovery` only when the terminal phase is `"done"`, not `"skipped"` or `"failed"`.
     const SRC = readFileSync(join(import.meta.dir, "recomp-orchestrator.ts"), "utf8");
 
     it("clears the flag only in the done terminal phase", () => {
@@ -163,13 +156,11 @@ describe("recomp message helpers", () => {
     });
 
     it("isRecompComplete requires a positive — Complete heading (Partial is NOT complete)", () => {
-        // The upgrade gate uses isRecompComplete, not !isRecompFailure, because a
-        // published "— Partial" rebuilt only a prefix: published===true and it is
-        // NOT a Failed/Skipped heading, so !isRecompFailure would wrongly let it
-        // run migration + declare "Complete" while tierless legacy rows remain.
+        // A `"— Partial"` result rebuilt only a prefix, so the upgrade gate requires `isRecompComplete` rather than `!isRecompFailure`.
+        // Because `"— Partial"` is neither `"— Failed"` nor `"— Skipped"`, `!isRecompFailure` would treat it as successful.
+        // Treating a partial result as successful would run migration and report `"Complete"` while tierless legacy rows remain.
         expect(isRecompComplete("## Magic Recomp — Complete\n\nRebuilt 5")).toBe(true);
         expect(isRecompComplete("## Session Upgrade — Complete")).toBe(true);
-        // The bug: Partial is published + not a failure, but must NOT be complete.
         expect(isRecompComplete("## Magic Recomp — Partial\n\nRemaining 40-99 not rebuilt")).toBe(
             false,
         );
@@ -180,10 +171,7 @@ describe("recomp message helpers", () => {
     });
 
     it("treats the lease/activeRuns skip messages as failures (— Skipped suffix)", () => {
-        // These no-op messages must NOT let the upgrade proceed to migration /
-        // declare "complete" — the recomp wrote nothing.
-        // Belt: the message heading now carries "— Skipped"; suspenders: the
-        // orchestrator also gates on the `published:false` flag.
+        // No-op messages must not allow the upgrade to run migration or report `"complete"`.
         expect(
             isRecompFailure(
                 "## Magic Recomp — Skipped\n\nHistorian is already running for this session. Wait for it to finish, then try `/ctx-recomp` again.",
@@ -197,14 +185,14 @@ describe("recomp message helpers", () => {
     });
 
     it("isRecompSkip distinguishes a transient lease-busy skip from a hard failure", () => {
-        // A skip is the lease/already-running no-op — transient, retry succeeds.
-        // It must be reported as "skipped" (neutral, auto-clears), NOT red "failed".
+        // A skip reports a lease-busy or already-running no-op.
+        // A lease-busy or already-running no-op must report `"skipped"`, not `"failed"`, so the progress entry auto-clears.
         expect(
             isRecompSkip(
                 "## Magic Recomp — Skipped\n\nHistorian is already running for this session. Wait for it to finish, then try `/ctx-recomp` again.",
             ),
         ).toBe(true);
-        // Suffix-less lease/already-running no-op (no "— Skipped" heading).
+        // A lease-busy or already-running no-op has no `"— Skipped"` heading.
         expect(isRecompSkip("## Magic Recomp\n\nHistorian is already running…")).toBe(true);
         expect(
             isRecompSkip(
@@ -227,8 +215,7 @@ describe("recomp message helpers", () => {
     });
 
     it("contextualizeUpgradeReason rewrites /ctx-recomp -> /ctx-session-upgrade", () => {
-        // Upgrade flow must not surface shared recomp skip text verbatim because
-        // it directs the user to `/ctx-recomp`, the wrong command for this flow.
+        // The upgrade flow must not surface shared recomp skip text verbatim because it directs users to `/ctx-recomp`, which is not this flow's command.
         const out = contextualizeUpgradeReason(
             "Historian returned no usable compartments. Try `/ctx-recomp` again.",
         );

@@ -4,24 +4,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::arena::{ArenaSpan, MAX_FRAME_BYTES};
 
-/// Shared descriptor schema version.
 pub const DESCRIPTOR_SCHEMA_VERSION: u16 = 1;
-/// Frozen wire-v2 header length.
+/// Wire v2 fixes the header at 21 bytes.
 pub const WIRE_V2_HEADER_BYTES: usize = 21;
-/// Maximum shared spans in one complete-frame descriptor.
+/// A complete-frame descriptor contains at most two shared spans.
 pub const MAX_SPANS: usize = 2;
 
-/// Backend selected before admission.
+/// Admission requires a preselected backend.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendId {
-    /// Custom descriptor ring.
+    /// Ring uses a custom descriptor ring.
     Ring,
-    /// iceoryx2 0.9.3 publish-subscribe sample transport.
+    /// Iceoryx uses iceoryx2 0.9.3 publish-subscribe samples.
     Iceoryx,
 }
 
-/// Payload-arena layout selected before admission.
+/// Admission requires a preselected payload-arena layout.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLayout {
@@ -33,7 +32,7 @@ pub enum MemoryLayout {
     IceoryxSample,
 }
 
-/// Producer and receiver ownership selected before admission.
+/// Admission requires preselected producer and receiver ownership.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnershipMode {
@@ -47,7 +46,7 @@ pub enum OwnershipMode {
     Copied,
 }
 
-/// Worker scheduling selected before admission.
+/// Admission requires a preselected worker scheduling mode.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SchedulingMode {
@@ -57,31 +56,27 @@ pub enum SchedulingMode {
     ColdParkWake,
 }
 
-/// Frozen workload class used to select one profile.
+/// The descriptor freezes the workload class used to select one profile.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkloadClass {
-    /// Small request-response latency.
     SmallLatency,
     /// Large-frame throughput.
     LargeThroughput,
-    /// Mixed-size full-duplex traffic.
     MixedDuplex,
 }
 
-/// Runtime qualified by tournament evidence.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeKind {
-    /// Rust-only endpoint pair.
+    /// Rust supports only Rust endpoint pairs.
     Rust,
-    /// Node 24 through N-API 8.
+    /// Node24 supports Node 24 through N-API 8.
     Node24,
-    /// Bun through N-API 8.
+    /// Bun supports N-API 8.
     Bun,
 }
 
-/// Target operating system.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformKind {
@@ -91,13 +86,11 @@ pub enum PlatformKind {
     Macos,
 }
 
-/// Validated opaque hardware-profile identifier.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HardwareProfileId(String);
 
 impl HardwareProfileId {
-    /// Validates one manifest-owned identifier.
     pub fn new(value: impl Into<String>) -> Result<Self, DescriptorError> {
         let value = value.into();
         if value.is_empty()
@@ -111,7 +104,6 @@ impl HardwareProfileId {
         Ok(Self(value))
     }
 
-    /// Compares identifier without exposing it through formatting.
     pub fn matches(&self, value: &str) -> bool {
         self.0 == value
     }
@@ -123,7 +115,6 @@ impl fmt::Debug for HardwareProfileId {
     }
 }
 
-/// Immutable transport choices carried by an authenticated grant.
 #[derive(Clone, PartialEq, Eq)]
 pub struct TransportDescriptor {
     schema_version: u16,
@@ -138,7 +129,6 @@ pub struct TransportDescriptor {
 }
 
 impl TransportDescriptor {
-    /// Constructs a version-one immutable descriptor.
     #[allow(
         clippy::too_many_arguments,
         reason = "every immutable grant dimension is required"
@@ -206,7 +196,6 @@ impl TransportDescriptor {
         self.runtime
     }
 
-    /// Tests equality with expected hardware-profile identifier.
     pub fn hardware_matches(&self, expected: &str) -> bool {
         self.hardware.matches(expected)
     }
@@ -218,24 +207,22 @@ impl fmt::Debug for TransportDescriptor {
     }
 }
 
-/// Fresh per-candidate 128-bit identity.
+/// Each candidate receives a fresh 128-bit identity.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Incarnation([u8; 16]);
 
 impl Incarnation {
-    /// Draws an identity from the operating-system random source.
     pub fn random() -> Result<Self, DescriptorError> {
         let mut bytes = [0u8; 16];
         getrandom::getrandom(&mut bytes).map_err(|_| DescriptorError::RandomSourceUnavailable)?;
         Ok(Self(bytes))
     }
 
-    /// Builds an identity received over an authenticated setup channel.
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
 
-    /// Returns setup-channel representation. Never include it in diagnostics.
+    /// Diagnostics must not include the setup-channel representation.
     pub const fn into_bytes(self) -> [u8; 16] {
         self.0
     }
@@ -247,7 +234,7 @@ impl fmt::Debug for Incarnation {
     }
 }
 
-/// Completion identity qualified by incarnation, lane, and sequence.
+/// ReleaseIdentity qualifies a completion by incarnation, lane, and sequence.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ReleaseIdentity {
     incarnation: Incarnation,
@@ -256,7 +243,6 @@ pub struct ReleaseIdentity {
 }
 
 impl ReleaseIdentity {
-    /// Constructs a release identity. Sequence zero is rejected during validation.
     pub const fn new(incarnation: Incarnation, lane: u32, sequence: u64) -> Self {
         Self {
             incarnation,
@@ -265,17 +251,15 @@ impl ReleaseIdentity {
         }
     }
 
-    /// Incarnation used for exact completion matching.
+    /// ReleaseIdentity::incarnation returns the incarnation required for exact completion matching.
     pub const fn incarnation(self) -> Incarnation {
         self.incarnation
     }
 
-    /// Physical lane identifier.
     pub const fn lane(self) -> u32 {
         self.lane
     }
 
-    /// Non-wrapping sequence within incarnation.
     pub const fn sequence(self) -> u64 {
         self.sequence
     }
@@ -287,7 +271,7 @@ impl fmt::Debug for ReleaseIdentity {
     }
 }
 
-/// One untrusted complete-frame metadata snapshot.
+/// FrameDescriptor stores a complete metadata snapshot received from an untrusted source.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FrameDescriptor {
     schema_version: u16,
@@ -301,7 +285,6 @@ pub struct FrameDescriptor {
 }
 
 impl FrameDescriptor {
-    /// Builds a descriptor from one local metadata snapshot.
     #[allow(
         clippy::too_many_arguments,
         reason = "models fixed shared descriptor fields"
@@ -328,7 +311,6 @@ impl FrameDescriptor {
         }
     }
 
-    /// Validates snapshot against expected release identity and arena capacity.
     pub fn validate(
         self,
         expected: ReleaseIdentity,
@@ -439,7 +421,6 @@ impl fmt::Debug for FrameDescriptor {
     }
 }
 
-/// Validated local frame metadata.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedFrame {
     wire_header: [u8; WIRE_V2_HEADER_BYTES],
@@ -452,37 +433,30 @@ pub struct ValidatedFrame {
 }
 
 impl ValidatedFrame {
-    /// Frozen wire-v2 header.
     pub const fn wire_header(self) -> [u8; WIRE_V2_HEADER_BYTES] {
         self.wire_header
     }
 
-    /// Qualified release identity.
     pub const fn identity(self) -> ReleaseIdentity {
         self.identity
     }
 
-    /// Exact committed body length.
     pub const fn body_len(self) -> u64 {
         self.body_len
     }
 
-    /// Monotonic arena allocation start.
     pub const fn allocation_start(self) -> u64 {
         self.allocation_start
     }
 
-    /// Reserved bytes reclaimed on completion.
     pub const fn allocation_len(self) -> u64 {
         self.allocation_len
     }
 
-    /// Number of body spans.
     pub const fn span_count(self) -> u8 {
         self.span_count
     }
 
-    /// Returns one validated body span.
     pub fn span(self, index: usize) -> Option<ArenaSpan> {
         (index < usize::from(self.span_count)).then_some(self.spans[index])
     }
@@ -499,22 +473,15 @@ impl fmt::Debug for ValidatedFrame {
 pub struct DescriptorCounts {
     /// Reusable descriptors.
     pub free: u64,
-    /// Descriptor held by current producer reservation.
     pub producer_reserved: u64,
-    /// Published descriptors not acquired by receiver.
     pub published: u64,
-    /// Descriptor undergoing receiver validation.
     pub receiver_held: u64,
-    /// Descriptors visible through receive leases.
     pub receiver_leased: u64,
-    /// Released descriptors awaiting FIFO reclamation.
     pub release_pending: u64,
-    /// Descriptors permanently withheld after quarantine.
     pub quarantined: u64,
 }
 
 impl DescriptorCounts {
-    /// Checks exact descriptor conservation against configured depth.
     pub fn conserves(self, depth: u64) -> bool {
         [
             self.free,
@@ -531,38 +498,24 @@ impl DescriptorCounts {
     }
 }
 
-/// Descriptor validation or construction failure.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DescriptorError {
-    /// Operating-system random source failed.
     RandomSourceUnavailable,
-    /// Hardware-profile identifier is malformed.
     InvalidHardwareProfile,
-    /// Fixed structure is shorter than its declared layout.
     Truncated,
-    /// Descriptor schema is unsupported.
     UnsupportedSchema,
-    /// Release belongs to another incarnation.
     WrongIncarnation,
-    /// Release belongs to another lane.
     WrongLane,
-    /// Sequence is stale, duplicated, zero, or unexpected.
+    /// Sequence is zero or does not match the expected sequence.
     InvalidSequence,
-    /// Frame exceeds protocol maximum.
+    /// body_len exceeds MAX_FRAME_BYTES.
     FrameTooLarge,
-    /// Arena allocation metadata is invalid.
     InvalidAllocation,
-    /// Descriptor has invalid span count.
     InvalidSpanCount,
-    /// Span crosses arena bounds.
     OutOfBounds,
-    /// Offset or length arithmetic overflowed.
     Overflow,
-    /// Body span lengths do not equal committed length.
     LengthMismatch,
-    /// Wrapped-span metadata is inconsistent.
     InvalidWrapMetadata,
-    /// Wire header version or declared length disagrees with descriptor.
     WireHeaderMismatch,
 }
 

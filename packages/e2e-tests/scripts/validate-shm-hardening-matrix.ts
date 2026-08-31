@@ -39,7 +39,7 @@ export const ADAPTER_CATEGORIES = [
 ] as const;
 export type AdapterCategory = (typeof ADAPTER_CATEGORIES)[number];
 
-/** ADAPTER_INVENTORY maps each os/runtime/provider/profile tuple identity to covered adapter categories. */
+/* */
 export const ADAPTER_INVENTORY: Record<string, readonly AdapterCategory[]> = {};
 
 export interface MatrixValidation {
@@ -128,14 +128,12 @@ function validateTupleShape(
         isRecord(geometry) &&
         GEOMETRY_FIELDS.every((field) => isCount(geometry[field]))
     ) {
-        // One admitted duplex candidate charges both directions
-        // (mc-shm-transport ResourceCharges): descriptors and arena bytes
-        // double the per-direction geometry, a fused pair maps one region
-        // per direction, and frame delivery needs at least one receive
-        // lease per direction. Active caps below that floor declare a
-        // tuple no host could admit, so the matrix must not report it as
-        // executable coverage. pinned_workers has no floor: cold-park
-        // profiles pin zero workers.
+        // Duplex admission charges descriptors and arena bytes in both directions.
+        // A fused pair maps one region per direction.
+        // Frame delivery needs at least one receive lease per direction.
+        // Active caps below the duplex admission floor declare a tuple no host could admit.
+        // The matrix must not report a tuple that no host can admit as executable coverage.
+        // Cold-park profiles pin zero workers, so pinned_workers has no floor.
         const active = limits.active as Record<string, number>;
         const shape = geometry as Record<string, number>;
         const floors: readonly (readonly [string, number])[] = [
@@ -282,9 +280,7 @@ export function validateHardeningMatrix(
             );
         }
     }
-    // Reverse coverage: every platform with an active retained provider
-    // must be claimed, so retained coverage cannot be silently omitted
-    // from the active_platforms contract.
+    // The active_platforms contract must claim every platform with an active retained provider.
     const retainedActivePlatforms = new Set(
         section.retained_tuples
             .filter(

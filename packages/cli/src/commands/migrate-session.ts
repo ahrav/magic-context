@@ -1,23 +1,18 @@
 /**
- * `doctor migrate-session` — re-home ONE OpenCode session to a different
- * working directory / project, across BOTH databases.
+ * `doctor migrate-session` moves one OpenCode session to a different working directory or project across both databases.
  *
  * OpenCode (`opencode.db`):
- *   - UPDATE session SET project_id, directory, path, workspace_id=NULL.
- *   - The target project row must ALREADY exist (we never fabricate OpenCode
- *     rows): non-git target → the shared `global` project; git target → the
- *     repo's project row (open OpenCode in the dir once so it registers).
+ * The target OpenCode project row must exist; the migration never creates project rows.
+ * Non-Git targets use the shared `global` project; Git targets use the repository's registered project row.
+ * Users must open OpenCode in the Git target once to register its project row.
  *
- * Magic Context (`context.db`):
- *   - Session-scoped state (tags, compartments, session_meta) is keyed by
- *     session_id and follows automatically. We proactively re-stamp the
- *     project-stamped session rows (session_projects, compartment chunk
- *     embeddings) to the new identity and clear the cached m[0]/m[1] so the
- *     next load re-materializes under the new project.
- *   - Claims, evidence, receipts, lineage, and staged claim intents are durable
- *     project history. Session re-home never rewrites or copies them.
+ * Tags, compartments, and `session_meta` are keyed by `session_id` and follow automatically.
+ * The migration re-stamps `session_projects` and compartment chunk embeddings to the new identity.
+ * The migration clears cached `m[0]` and `m[1]` so the next load re-materializes under the new project.
+ * Claims, evidence, receipts, lineage, and staged claim intents are durable project history.
+ * Session re-home never rewrites or copies claims, evidence, receipts, lineage, or staged claim intents.
  *
- * V1 is OpenCode-only. Pi sessions are JSONL (a different re-home mechanism).
+ * Pi sessions use JSONL and require a different re-home mechanism.
  */
 
 import console from "node:console";
@@ -50,11 +45,11 @@ type DatabaseLike = Pick<DatabaseType, "prepare" | "close" | "exec">;
 export interface MigrateSessionDeps {
     opencodeDb: DatabaseLike;
     contextDb: DatabaseLike;
-    /** Resolve a directory to the Magic Context project identity (git:<sha> | dir:<hash>). */
+    /** `resolveIdentity` returns the Magic Context project identity (`git:<sha>` | `dir:<hash>`). */
     resolveIdentity: (directory: string) => string;
-    /** Whether `<dir>/.git` exists. */
+    /* */
     hasGitDir: (directory: string) => boolean;
-    /** Canonicalize a path (realpath). */
+    /* */
     realpath: (p: string) => string;
     now?: number;
 }
@@ -63,17 +58,17 @@ export interface MigrateSessionPlan {
     sessionId: string;
     currentDirectory: string | null;
     targetDirectory: string;
-    /** OpenCode project id the session will attach to. */
+    /* */
     ocProjectId: string;
     ocWorktree: string;
-    /** True when a dedicated per-worktree OpenCode project row was found;
-     *  false when we fell back to the shared `global` project. */
+    /** `ocProjectResolvedFromRow` is true when a dedicated per-worktree OpenCode project row exists.
+     * `ocProjectResolvedFromRow` is false when the migration uses the shared `global` project. */
     ocProjectResolvedFromRow: boolean;
     /** session.path = relative(worktree, directory). */
     sessionPath: string;
-    /** Magic Context identity the session is currently keyed under. */
+    /* */
     fromMcIdentity: string;
-    /** Magic Context identity the session will be keyed under after the move. */
+    /* */
     toMcIdentity: string;
     targetIsGit: boolean;
 }
@@ -100,9 +95,7 @@ function existingSessionColumns(db: DatabaseLike): Set<string> {
 
 function isModuleCacheStatePresent(status: unknown): boolean {
     if (!status || typeof status !== "object") return false;
-    // session.status is a read-only query. Its nullable row_version comes directly
-    // from mc_cache_state, so a number proves the module still owns this session's
-    // transform cache without asking the CLI to delete or rewrite module state.
+    // `session.status` reads `row_version` directly from `mc_cache_state`; a numeric value proves the module owns the session's transform cache without modifying module state.
     const rowVersion = (status as { row_version?: unknown }).row_version;
     return typeof rowVersion === "number";
 }
@@ -127,7 +120,7 @@ function drainCommandsForMarkers(
     ].join("; ");
 }
 
-/** Check the durable authority fences before a session move writes either database. */
+/** The migration checks durable authority fences before writing either database. */
 export async function assertMigrateSessionIsSafeToRehome(args: {
     plan: MigrateSessionPlan;
     contextDb: DatabaseType;
@@ -155,9 +148,9 @@ export async function assertMigrateSessionIsSafeToRehome(args: {
     try {
         sessionStatus = await args.module.sessionStatus({
             sessionId: args.plan.sessionId,
-            // A missing OpenCode directory cannot identify the old worktree, but
-            // session.status is read-only and scoped by session id, so the target
-            // root still lets us inspect the module's durable cache row.
+            // A missing OpenCode directory prevents identifying the old worktree. `session.status` remains read-only and session-scoped, so the target root can still inspect the module's durable cache row.
+            // `session.status` is read-only and session-scoped, so the target root can still inspect the module's durable cache row.
+            // The target project root can inspect the module's durable cache row through the read-only, session-scoped `session.status` query.
             projectRoot: args.plan.currentDirectory ?? args.plan.targetDirectory,
         });
     } catch (error) {
@@ -187,8 +180,7 @@ export async function assertMigrateSessionIsSafeToRehome(args: {
 }
 
 /**
- * Resolve everything the move needs and validate it WITHOUT writing. Throws a
- * clear, actionable error on any precondition failure.
+ * Dry runs resolve and validate the move without writing.
  */
 export function planMigrateSession(
     sessionId: string,
@@ -205,14 +197,7 @@ export function planMigrateSession(
     const targetDirectory = deps.realpath(rawTargetDirectory);
     const targetIsGit = deps.hasGitDir(targetDirectory);
 
-    // Resolve the OpenCode project the session will attach to from OpenCode's
-    // ACTUAL registration — we never fabricate project rows. A per-worktree row
-    // exists only for a repo OpenCode could derive a non-global id for (remote,
-    // cached repo id, or ≥1 commit); a plain dir AND an empty `git init` repo
-    // (no commits/remote) both resolve to the shared `global` project. So we
-    // look up the worktree row regardless of `.git` and fall back to `global`,
-    // rather than branching on `.git` existence (which would dead-end an
-    // init-without-commit repo: `.git` present but no project row).
+    // The migration uses the registered `global` row when no worktree row exists.
     const projectRow = deps.opencodeDb
         .prepare("SELECT id, worktree FROM project WHERE worktree = ?")
         .get(targetDirectory) as { id: string; worktree: string } | undefined;
@@ -237,12 +222,10 @@ export function planMigrateSession(
         ocWorktree = globalRow.worktree || "/";
     }
 
-    // session.path = path.relative(worktree, directory).
     const sessionPath = path.relative(ocWorktree, targetDirectory);
 
-    // The Magic Context identity this session is CURRENTLY keyed under is the
-    // authoritative session_projects row if present (what MC actually used),
-    // falling back to recomputing from the current directory.
+    // `fromMcIdentity` is the Magic Context identity that keys the session before migration.
+    // The authoritative `session_projects` row records the Magic Context identity used by the session.
     const ownershipRow = deps.contextDb
         .prepare(
             "SELECT project_path FROM session_projects WHERE session_id = ? AND harness = 'opencode'",
@@ -268,8 +251,7 @@ export function planMigrateSession(
 }
 
 /**
- * Apply the move. Each database is mutated inside its own transaction. Caller
- * is responsible for backups and for ensuring OpenCode is stopped.
+ * Each database mutation uses its own transaction; callers must back up data and stop OpenCode.
  */
 export function applyMigrateSession(
     plan: MigrateSessionPlan,
@@ -277,7 +259,7 @@ export function applyMigrateSession(
 ): MigrateSessionResult {
     const now = deps.now ?? Date.now();
 
-    // 1. OpenCode side — update only the columns that exist (schema-resilient).
+    // The OpenCode update includes only columns present in the installed schema.
     const cols = existingSessionColumns(deps.opencodeDb);
     const sets: string[] = ["directory = ?"];
     const params: Array<string | null> = [plan.targetDirectory];
@@ -293,18 +275,15 @@ export function applyMigrateSession(
         sets.push("workspace_id = ?");
         params.push(null);
     }
-    // The two databases are separate files, so a single ACID transaction across
-    // them is impossible. To avoid a split-brain (OpenCode moved, context.db not),
-    // capture the session's PRIOR column values now; if the (larger, second)
-    // context.db transaction fails, we compensate by restoring OpenCode to these
-    // values so the user is never left half-migrated.
+    // Because the databases are separate files, they cannot share an ACID transaction.
+    // Captured OpenCode values allow compensation if the context.db transaction fails.
+    // The prior-row snapshot lets compensation restore OpenCode after a context.db transaction failure.
+    // compensateOpenCode undoes the committed OpenCode update.
     const restoreCols = ["directory", ...sets.map((s) => s.split(" = ")[0]).slice(1)];
     const priorRow = deps.opencodeDb
         .prepare(`SELECT ${restoreCols.join(", ")} FROM session WHERE id = ?`)
         .get(plan.sessionId) as Record<string, string | null> | undefined;
-    // If the session row vanished between planning and applying (it shouldn't —
-    // the precondition is "OpenCode stopped"), refuse rather than mutate context
-    // for a session OpenCode no longer has and leave nothing to compensate with.
+    // Without the current OpenCode session row, context.db could change without OpenCode state available for compensation.
     if (!priorRow) {
         throw new Error(
             `Session ${plan.sessionId} not found in opencode.db — aborting (is OpenCode still running, or was the session deleted?).`,
@@ -321,7 +300,6 @@ export function applyMigrateSession(
         try {
             deps.opencodeDb.exec("ROLLBACK");
         } catch {
-            // ignore — nothing committed yet, the throw below is what matters
         }
         throw error;
     }
@@ -337,8 +315,7 @@ export function applyMigrateSession(
                 .run(...restoreParams, plan.sessionId);
             deps.opencodeDb.exec("COMMIT");
         } catch {
-            // Best-effort: the original error is what we rethrow. If even the
-            // compensation fails the user still has their pre-run backup.
+            // Compensation failures do not replace the original error.
             try {
                 deps.opencodeDb.exec("ROLLBACK");
             } catch {
@@ -347,17 +324,14 @@ export function applyMigrateSession(
         }
     };
 
-    // Magic Context re-stamps only session runtime.
     let chunkEmbeddingsRestamped = 0;
 
-    // BEGIN is INSIDE the try: if it throws (e.g. DB locked), OpenCode is already
-    // committed, so we must still compensate. `txBegan` gates the rollback so we
-    // never ROLLBACK a transaction that never started.
+    // If BEGIN IMMEDIATE fails after the OpenCode commit, the catch still compensates OpenCode.
+    // txBegan prevents context.db rollback before BEGIN IMMEDIATE succeeds.
     let txBegan = false;
     try {
         deps.contextDb.exec("BEGIN IMMEDIATE");
         txBegan = true;
-        // session_projects ownership → new identity (upsert).
         deps.contextDb
             .prepare(
                 `INSERT INTO session_projects (session_id, harness, project_path, updated_at)
@@ -375,7 +349,6 @@ export function applyMigrateSession(
             .run(plan.toMcIdentity, plan.sessionId) as { changes?: number };
         chunkEmbeddingsRestamped = chunkResult.changes ?? 0;
 
-        // Force m[0]/m[1] re-materialization under the new project on next load.
         deps.contextDb
             .prepare(
                 "UPDATE session_meta SET cached_m0_bytes = NULL, cached_m1_bytes = NULL WHERE session_id = ?",
@@ -384,18 +357,14 @@ export function applyMigrateSession(
 
         deps.contextDb.exec("COMMIT");
     } catch (error) {
-        // Roll back context.db only if a transaction actually began, and never let
-        // a failing ROLLBACK mask the original error OR skip compensation.
+        // A failing ROLLBACK must not mask the original error or prevent compensateOpenCode().
         if (txBegan) {
             try {
                 deps.contextDb.exec("ROLLBACK");
             } catch {
-                // ignore — compensation below is what keeps the two DBs consistent
             }
         }
-        // OpenCode was already committed; undo it so the two databases stay
-        // consistent (no split-brain). Runs for ANY post-OpenCode-commit failure,
-        // including a BEGIN that never started a transaction.
+        // compensateOpenCode() undoes the committed OpenCode change after a context.db failure.
         compensateOpenCode();
         throw error;
     }
@@ -407,7 +376,6 @@ export function applyMigrateSession(
     };
 }
 
-// ── CLI wrapper ─────────────────────────────────────────────────────────────
 
 function defaultOpenCodeDbPath(): string {
     return getOpenCodeDatabasePath();
@@ -462,9 +430,6 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
     const dryRun = args.includes("--dry-run");
     const skipConfirm = args.includes("--yes");
 
-    // Re-homing no longer moves or copies memory. Accepting and ignoring the
-    // retired flag would re-home the session while silently skipping the memory
-    // action the caller asked for, so automation still passing it must fail.
     if (args.some((arg) => arg === "--memories" || arg.startsWith("--memories="))) {
         console.error(
             "--memories is no longer supported: re-homing a session leaves claim history unchanged.",
@@ -516,14 +481,11 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
 
         contextSchemaVersionBefore = getPersistedSchemaVersion(contextDb as DatabaseType);
 
-        // The collision-merge path relies on foreign-key cascades when source
-        // memories are deleted. These pragmas must be enabled before planning or writing.
         try {
             opencodeDb.exec("PRAGMA busy_timeout=5000");
             contextDb.exec("PRAGMA foreign_keys=ON");
             contextDb.exec("PRAGMA busy_timeout=5000");
         } catch {
-            // Best-effort; the move's own transactions remain the final safety net.
         }
         const deps = realDeps(opencodeDb, contextDb);
         const plan = planMigrateSession(sessionId, expandedTo, deps);
@@ -561,11 +523,6 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
             "Session move plan",
         );
 
-        // A git working dir with no dedicated OpenCode project row means an
-        // empty/no-remote repo that OpenCode resolves to the shared `global`
-        // project. Attaching there is rarely what the user wants for a git
-        // project — warn and let them abort to make a commit / add a remote
-        // and open OpenCode once first.
         if (plan.targetIsGit && !plan.ocProjectResolvedFromRow) {
             promptIO.log.warn(
                 `${plan.targetDirectory} is a git repo, but OpenCode has no dedicated project for it ` +
@@ -611,8 +568,6 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
             return 1;
         }
 
-        // Checkpoint committed WAL pages, prove both files can be write-locked,
-        // and snapshot them through SQLite while the locks prevent new writers.
         opencodeDb.exec("PRAGMA wal_checkpoint(FULL)");
         contextDb.exec("PRAGMA wal_checkpoint(FULL)");
         opencodeDb.exec("BEGIN IMMEDIATE");

@@ -33,7 +33,7 @@ export function resolveContextWindowGeometry(
                 detectedLimitProvenance = overflow.detectedContextLimitProvenance;
             }
         } catch {
-            // Geometry resolution remains best-effort when session metadata is unavailable.
+            // The resolver ignores session metadata read failures and uses SDK geometry.
         }
     }
     return getSdkWindowGeometry(providerID, modelID, detected, {
@@ -45,10 +45,8 @@ export function resolveContextWindowGeometry(
 type CacheTtlConfig = string | Record<string, string>;
 
 /**
- * Resolve the effective context limit for a provider/model pair. By default
- * this returns the output-reserved safe input budget. `reservation: "none"`
- * preserves the same catalog, detected-limit, and fallback resolution while
- * exposing the unreserved window for native-usage display metrics only.
+ * With the default reservation, resolveContextLimit returns the output-reserved safe input budget.
+ * With `reservation: "none"`, resolveContextLimit preserves catalog, detected-limit, and fallback resolution.
  */
 export function resolveContextLimit(
     providerID: string | undefined,
@@ -70,12 +68,12 @@ export function resolveContextLimit(
                 detectedLimitProvenance = overflow.detectedContextLimitProvenance;
             }
         } catch {
-            // Reading session meta is best-effort — fall through to the catalog.
+            // The resolver falls through to the catalog when session metadata reads fail.
         }
     }
 
-    // Combined/unknown detections narrow the raw context before output
-    // reservation. Prompt-only detections enter the pre-carved input arm.
+    // Combined and unknown detections narrow the raw context before output reservation.
+    // Prompt-only detections enter the pre-carved input arm.
     const fromModelsDev =
         providerID && modelID
             ? getSdkContextLimit(providerID, modelID, detected, {
@@ -87,23 +85,17 @@ export function resolveContextLimit(
 }
 
 /**
- * Like resolveContextLimit, but returns a limit ONLY when it is TRUSTED for the
- * current model, rather than the generic 128K `DEFAULT_CONTEXT_LIMIT`.
+ * resolveTrustedContextLimit does not return the generic 128K `DEFAULT_CONTEXT_LIMIT`.
  *
- * Resolution precedence is:
- *   1. models.dev or a user provider override.
- *   2. A detected-overflow limit when it is smaller than the models.dev limit,
- *      or whenever models.dev has no entry.
- *   3. A sane persisted usage-reported limit when models.dev and overflow
- *      detection are both unavailable, but only when its observed model key
- *      matches the current model key.
+ * Trusted limits include models.dev entries and user provider overrides.
+ * A detected-overflow limit is trusted when it is smaller than the models.dev limit.
+ * A detected-overflow limit is trusted when models.dev has no entry.
+ * A persisted usage-reported limit is trusted only when models.dev and overflow detection are unavailable.
+ * The persisted usage-reported limit is trusted only when its observed model key matches the current model key.
  *
- * The history-budget resolver needs this distinction: deriving the decay budget
- * from a bare 128K guess for an UNKNOWN model would shrink history below what
- * the live-usage back-derivation would yield for a large-context model. So the
- * budget resolver only trusts a real, detected, or model-matched usage-reported
- * limit and otherwise falls back to live-usage. (resolveContextLimit itself must
- * keep returning 128K for pressure math, which needs a positive denominator.)
+ * For unknown models, history budgeting uses live usage instead of `DEFAULT_CONTEXT_LIMIT` so a 128K fallback cannot undersize large-context histories.
+ * The budget resolver trusts model limits, detected limits, and model-matched usage-reported limits; otherwise it uses live usage.
+ * resolveContextLimit returns `DEFAULT_CONTEXT_LIMIT` for pressure math because its denominator must be positive.
  */
 export function resolveTrustedContextLimit(
     providerID: string | undefined,
@@ -125,9 +117,9 @@ export function resolveTrustedContextLimit(
         }
     }
 
-    // Apply measured wire truth to the matching resolver arm. Comparing a
-    // combined detection against an already-reserved budget would double-count
-    // output, while a prompt-only detection must not reserve output again.
+    // The resolver applies combined detections before output reservation and prompt-only detections to the pre-carved input budget.
+    // Comparing a combined detection with an already-reserved budget would reserve output twice.
+    // A prompt-only detection must not reserve output again.
     const fromModelsDev =
         providerID && modelID
             ? getSdkContextLimit(providerID, modelID, detected, {
@@ -137,7 +129,7 @@ export function resolveTrustedContextLimit(
     if (typeof fromModelsDev === "number" && fromModelsDev > 0) return fromModelsDev;
     if (detected !== undefined) return detected;
 
-    // Usage reports are trusted only for the model that produced them. A
+    // Usage reports are trusted only for the model that produced them.
     // session-scoped limit from a previous model must not leak across a switch.
     if (modelKey && ctx?.db && ctx.sessionID) {
         try {
@@ -172,72 +164,59 @@ type ExecuteThresholdTokensConfig =
     | undefined;
 
 export interface ExecuteThresholdOptions {
-    /** Optional tokens-based threshold config. When matched for the given modelKey,
-     *  overrides the percentage-based threshold. */
+    /** `tokensConfig` overrides the percentage-based threshold when it matches `modelKey` and `context_limit` is valid.
+     * */
     tokensConfig?: ExecuteThresholdTokensConfig;
-    /** Required when `tokensConfig` is provided — used to convert tokens → percentage
-     *  and to clamp values above 90% × context_limit. */
+    /** `context_limit` is required with `tokensConfig` to convert tokens to a percentage.
+     * `context_limit` caps the execute threshold at 90% of the context limit. */
     contextLimit?: number;
-    /** Session ID for warn logs when clamping. If absent, warns to global log. */
+    /** `sessionID` directs clamping warnings to the session log; absent IDs use the global log. */
     sessionId?: string;
 }
 
 export type ExecuteThresholdMode = "percentage" | "tokens";
 
 export interface ExecuteThresholdDetail {
-    /** Effective execute threshold as a percentage (0–90). Downstream math keys off this. */
+    /** Downstream calculations use the effective execute threshold, constrained to 0–90%. */
     percentage: number;
-    /** Which source was authoritative: tokens config (when matched + valid context) or percentage. */
+    /** The authoritative source is tokens config when its modelKey matches and context is valid; otherwise it is percentage. */
     mode: ExecuteThresholdMode;
-    /** When mode is "tokens", the absolute token value after clamping (≤ 90% × contextLimit). */
+    /** In `tokens` mode, the value is the absolute token value clamped to 90% × `contextLimit`. */
     absoluteTokens?: number;
-    /** The config key that matched, if any (for display/debugging). `"default"` when default fallback. */
+    /** The returned source key is the matched config key, or `"default"` when the default fallback applies. */
     matchedKey?: string;
     /**
-     * True when the user's configured value exceeded the safe cap and was reduced.
-     * Tokens mode: configured tokens > 90% × contextLimit. Percentage mode:
-     * configured percentage > MAX_EXECUTE_THRESHOLD (90). Display surfaces read this
-     * to tell the user their value was clamped instead of silently ignoring it (#241).
-     * Only present (true) when a clamp actually happened; absent otherwise.
+     * The returned clamping flag is true when the configured value exceeds the safe cap and is reduced.
+     * In tokens mode, clamping occurs when configured tokens exceed 90% × `contextLimit`.
+     * In percentage mode, clamping occurs when the configured percentage exceeds `MAX_EXECUTE_THRESHOLD` (90).
+     * `clamped` reports that the configured value was reduced.
+     * `clamped` is present only when a clamp occurred; otherwise it is absent.
      */
     clamped?: boolean;
     /**
-     * The raw configured value before clamping — a token count in tokens mode, a
-     * percentage in percentage mode. Populated only alongside `clamped` so display
-     * surfaces can show the math (e.g. "190,000 > 90% of 128,000").
+     * `configuredValue` is the raw configured token count in tokens mode or percentage in percentage mode.
+     * `configuredValue` is present only when `clamped` is `true`.
      */
     configuredValue?: number;
 }
 
-// Module-level dedupe for clamp warnings. Key: `${sessionId}|${modelKey}|${tokenVal}|${cap}`.
-// The hot transform path may call resolveExecuteThreshold many times per second; without dedupe
-// an over-cap token config would spam the log file continuously until the user fixes it.
+// Clamp-warning deduplication is scoped by the session ID, model key, configured token value, and cap, with sentinels for missing session IDs and model keys.
 const clampWarnSeen = new Set<string>();
 
 /**
- * Return true iff `v` is a finite positive number. Schema normally forbids junk values, but
- * runtime callers may derive contextLimit from `inputTokens / (percentage/100)` (NaN when
- * percentage is 0) or accept externally-mutated configs. Guarding here keeps resolver
- * output deterministic and within bounds.
  */
 function isFinitePositive(v: unknown): v is number {
     return typeof v === "number" && Number.isFinite(v) && v > 0;
 }
 
 /**
- * Yield progressively-less-specific lookup keys for a given `provider/model`.
+ * `modelKeyLookupOrder` yields progressively less-specific lookup keys for each model key.
  *
- * OpenCode's `experimental.modes` feature derives model IDs like
- * `gpt-5.4-fast` from a base model `gpt-5.4`. Users may put EITHER the
- * derived key OR the base key in their per-model config. This generator
- * returns keys in specificity order so we pick the most specific match
- * the user actually wrote:
+ * Derived model IDs may append `-`-delimited segments to a base model ID.
+ * For example, `gpt-5.4-fast` derives from base model `gpt-5.4`.
+ * `modelKeyLookupOrder` returns keys from most to least specific so resolution selects the most specific match.
  *
  *   "openai/gpt-5.4-fast"  (exact)
- *   "gpt-5.4-fast"         (bare, derived)
- *   "openai/gpt-5.4"       (base, with provider)
- *   "gpt-5.4"              (base, bare)
- *   ...etc. stripping one "-segment" at a time
  */
 function* modelKeyLookupOrder(modelKey: string): Generator<string> {
     const slash = modelKey.indexOf("/");
@@ -257,12 +236,9 @@ function* modelKeyLookupOrder(modelKey: string): Generator<string> {
 }
 
 /**
- * Single source of truth for execute-threshold resolution. Returns the effective
- * percentage plus which config source was authoritative. Callers that only need
- * the percentage can use `resolveExecuteThreshold` (thin wrapper below); callers
- * that surface the mode to users (`/ctx-status`, TUI, RPC) must use this directly
- * to avoid the "progressive lookup drift" bug where two call sites disagree on
- * whether tokens mode is active.
+ * `resolveExecuteThresholdDetail` returns the effective percentage and authoritative config source.
+ * Callers that need only the percentage can use `resolveExecuteThreshold`.
+ * Callers that display `mode` must use `resolveExecuteThresholdDetail`.
  */
 export function resolveExecuteThresholdDetail(
     config: ExecuteThresholdConfig,
@@ -270,22 +246,15 @@ export function resolveExecuteThresholdDetail(
     fallback: number,
     options?: ExecuteThresholdOptions,
 ): ExecuteThresholdDetail {
-    // 1. Tokens-based resolution takes precedence when configured. Token values
-    //    only make sense against a known context_limit — callers must supply it.
-    //    Guard: tokensConfig must exist, contextLimit must be finite + positive.
-    //    Junk values (NaN, negatives, zero) silently fall through to percentage;
-    //    zod normally blocks them at config-load but runtime derivations (e.g.
-    //    inputTokens/percentage) can produce NaN that must not poison the resolver.
+    // Tokens-based resolution takes precedence for a matching token configuration with a finite positive `contextLimit`.
+    // Non-finite or non-positive token values and context limits fall through to percentage resolution.
     if (options?.tokensConfig && isFinitePositive(options.contextLimit)) {
         const contextLimit = options.contextLimit;
         const tokenMatch = resolveTokensMatchWithKey(options.tokensConfig, modelKey);
-        // Also guard the matched token value — must be a finite positive number.
         if (tokenMatch && isFinitePositive(tokenMatch.value)) {
             const cap = contextLimit * (MAX_EXECUTE_THRESHOLD / 100);
             const effectiveTokens = Math.min(tokenMatch.value, cap);
             if (effectiveTokens < tokenMatch.value) {
-                // Dedupe: only warn once per (session, modelKey, token value, cap) tuple.
-                // The hot transform path would otherwise spam the log until the user fixes config.
                 const dedupeKey = `${options.sessionId ?? "__global__"}|${modelKey ?? "__default__"}|${tokenMatch.value}|${cap}`;
                 if (!clampWarnSeen.has(dedupeKey)) {
                     clampWarnSeen.add(dedupeKey);
@@ -304,9 +273,7 @@ export function resolveExecuteThresholdDetail(
                 absoluteTokens: Math.floor(effectiveTokens),
                 matchedKey: tokenMatch.matchedKey,
             };
-            // effectiveTokens < requested means Math.min(value, cap) clamped the
-            // user's token budget down to MAX_EXECUTE_THRESHOLD × contextLimit. Record the original
-            // value so status surfaces can show "190000 > 90% of 128000" (#241).
+            // `configuredValue` retains `tokenMatch.value` when clamping.
             if (effectiveTokens < tokenMatch.value) {
                 detail.clamped = true;
                 detail.configuredValue = tokenMatch.value;
@@ -315,7 +282,6 @@ export function resolveExecuteThresholdDetail(
         }
     }
 
-    // 2. Fall through to percentage-based resolution.
     let resolved: number;
     let matchedKey: string | undefined;
 
@@ -343,14 +309,10 @@ export function resolveExecuteThresholdDetail(
         resolved = fallback;
     }
 
-    // Guard against non-finite/negative config values that could bypass schema.
     if (!Number.isFinite(resolved) || resolved < 0) {
         resolved = fallback;
     }
 
-    // Cap at 90% of the output-reserved safe window. The escalation band is
-    // derived from this effective threshold, so it remains strictly above normal
-    // execution and below the absolute 95% provider wall.
     const cappedPercentage = Math.min(resolved, MAX_EXECUTE_THRESHOLD);
     const percentageClamped = cappedPercentage < resolved;
     if (percentageClamped) {
@@ -370,8 +332,7 @@ export function resolveExecuteThresholdDetail(
         mode: "percentage",
         matchedKey,
     };
-    // A runtime-derived percentage above the 90% cap was reduced. Record the
-    // original so status surfaces can show "95% > 90%" alongside the value (#241).
+    // `configuredValue` retains the unclamped configured percentage.
     if (percentageClamped) {
         detail.clamped = true;
         detail.configuredValue = resolved;
@@ -380,8 +341,7 @@ export function resolveExecuteThresholdDetail(
 }
 
 /**
- * Backward-compatible wrapper around `resolveExecuteThresholdDetail`.
- * Use the detail version when you also need the mode or absolute token value.
+ * Callers needing `mode` or `absoluteTokens` must use `resolveExecuteThresholdDetail`.
  */
 export function resolveExecuteThreshold(
     config: ExecuteThresholdConfig,
@@ -392,7 +352,6 @@ export function resolveExecuteThreshold(
     return resolveExecuteThresholdDetail(config, modelKey, fallback, options).percentage;
 }
 
-// Variant of resolveTokensMatch that also returns which key matched, for mode display.
 function resolveTokensMatchWithKey(
     tokensConfig: ExecuteThresholdTokensConfig,
     modelKey: string | undefined,

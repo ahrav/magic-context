@@ -1,27 +1,22 @@
 /**
- * Loud fail-closed blocking when Magic Context cannot operate on a session the
- * user enabled it for (schema fence, storage open/migration failure).
+ * The fail-closed gate blocks user-enabled sessions when Magic Context cannot operate because of a schema fence or storage open/migration failure.
  *
- * Motivation: a schema-fence refusal used to unregister hooks and silently fall
- * through to native compaction — the user saw a 136%+ overflow with zero signal.
- * When blocking is armed, the harness transform throws an actionable error every
- * primary-session pass instead of degrading quietly.
+ * When blocking is armed, the harness transform throws an error on every primary-session pass.
  *
- * Transient SQLite contention (BUSY/LOCKED) is intentionally NOT handled here —
- * those stay fail-open pass-through in the outer transform wrappers.
+ * Outer transform wrappers pass through transient SQLite BUSY/LOCKED contention.
  */
 
 import type { ProcessKind } from "../../shared/rpc-utils";
 
 export const FAIL_CLOSED_DOCTOR_COMMAND = "npx @cortexkit/magic-context@latest doctor";
 
-/** How often a blocked transform pass re-attempts storage open (1 = every pass). */
+/** FAIL_CLOSED_REPROBE_EVERY_N sets the blocked-pass interval between storage-open retries; 1 retries every pass. */
 export const FAIL_CLOSED_REPROBE_EVERY_N = 5;
 
 export type FailClosedProcessKind = ProcessKind;
 
 export interface FailClosedBlockingProcess {
-    /** The detected kind of process holding the shared database. */
+    /** kind identifies the process holding the shared database. */
     kind?: FailClosedProcessKind;
     /** Legacy callers may still provide the old display label. */
     harness?: string;
@@ -55,13 +50,11 @@ export class FailClosedBlockingError extends Error {
     }
 }
 
-/** OpenCode native hidden agents that must never be blocked by the gate. */
+/** OpenCode native hidden agents bypass the gate. */
 const OPENCODE_INTERNAL_AGENT_NAMES = new Set(["title", "summary", "compaction"]);
 
 /**
- * Magic Context hidden-child agent ids (and stable prefixes). These sessions are
- * single-shot / bounded jobs that must keep running even when the primary
- * session is blocked — otherwise recovery work and background maintenance stall.
+ * Magic Context hidden-child jobs bypass blocking because blocking them stalls recovery and background maintenance.
  */
 function isMagicContextHiddenAgentName(agent: string): boolean {
     if (
@@ -161,9 +154,7 @@ export function isFailClosedBlockingError(error: unknown): error is FailClosedBl
 }
 
 /**
- * Whether this transform/context pass should skip the loud block.
- * Primary user sessions are never exempt; internal OpenCode agents, Magic
- * Context hidden children, and Pi subagent processes are.
+ * Primary user sessions are never exempt; internal OpenCode agents, Magic Context hidden children, and Pi subagent processes are exempt.
  */
 export function shouldBypassFailClosedBlock(input: {
     agent?: string | null;
@@ -197,10 +188,7 @@ export interface FailClosedController {
     isArmed(): boolean;
     getReason(): FailClosedReason | null;
     /**
-     * Enforce the gate for one transform/context pass.
-     * - No-op when unarmed, when blocking is disabled, or when the pass is exempt.
-     * - Periodically re-probes storage; clears and returns when reopen succeeds.
-     * - Otherwise throws {@link FailClosedBlockingError}.
+     * The controller periodically re-probes storage and clears blocking when reopening succeeds.
      */
     enforce(input: {
         blockingEnabled: boolean;
@@ -210,8 +198,7 @@ export interface FailClosedController {
 }
 
 /**
- * Process-local controller shared by the boot path (arms on deterministic
- * inoperability) and the per-turn transform (enforces / re-probes).
+ * The boot path arms the process-local controller on deterministic inoperability; the per-turn transform enforces and re-probes the controller.
  */
 export function createFailClosedController(options?: {
     reprobeEveryN?: number;
@@ -253,11 +240,11 @@ export function createFailClosedController(options?: {
                         return;
                     }
                 } catch {
-                    // Re-probe failed — keep blocking with the original reason.
+                    // The controller keeps blocking with the original reason after a failed re-probe.
                 }
             }
 
-            // Local capture: reason may be cleared by a concurrent heal path.
+            // A concurrent successful re-probe can clear the blocking reason while this re-probe awaits storage.
             const blockedReason = reason;
             if (!blockedReason) return;
             throw createFailClosedBlockingError(blockedReason);
@@ -265,7 +252,7 @@ export function createFailClosedController(options?: {
     };
 }
 
-/** Hook-init classification so boot can arm the gate only for storage failures. */
+/* */
 export type HookInitFailure =
     | { type: "storage"; reason: FailClosedReason }
     | { type: "no_project" };

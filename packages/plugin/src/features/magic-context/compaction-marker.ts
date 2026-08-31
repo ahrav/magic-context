@@ -1,30 +1,20 @@
 /**
- * Compaction Marker Injection
  *
- * Injects compaction boundaries into OpenCode's SQLite DB so that
- * `filterCompacted` stops at the historian boundary. After injection,
- * the transform hook receives only post-boundary messages instead
- * of the full session history.
+ * `injectCompactionMarker` injects compaction boundaries into OpenCode's SQLite database.
+ * `filterCompacted` stops at the historian boundary after injection.
  *
- * Always-on as of v0.21.4. Previously gated behind `compaction_markers`
- * config (default true since v0.9.0); the knob was removed because the
- * feature is required for sane transform performance.
  *
- * ## What gets injected (3 rows):
- * 1. A `compaction` part on the boundary user message
- * 2. A summary assistant message with `parentID` → boundary user message
- * 3. A text part on that summary message containing a static placeholder
+ * A marker contains a `compaction` part on its boundary user message.
+ * A marker contains a summary assistant message whose `parentID` equals the boundary user message's `id`.
+ * A marker contains a text part with a static placeholder on its summary message.
  *
- * The real `<session-history>` is injected by the transform pipeline via
- * inject-compartments.ts. The marker exists solely to make filterCompacted
- * stop at the boundary.
+ * The marker exists solely to make `filterCompacted` stop at the boundary.
  *
- * ## How OpenCode's filterCompacted works:
- * - Iterates newest→oldest
- * - Stops when it finds a user message that:
- *   (a) has a part with type: "compaction"
- *   (b) has a completed summary assistant response (summary: true, finish: "stop")
- *       whose parentID matches that user message's id
+ * The search iterates from newest to oldest.
+ * The search stops at the first user message with a `compaction` part and a qualifying summary response.
+ * The user message must contain a part with `type: "compaction"`.
+ * The user message must have a summary assistant response with `summary: true` and `finish: "stop"`.
+ * The summary response's `parentID` must equal the user message's `id`.
  */
 
 import { createHash } from "node:crypto";
@@ -35,7 +25,6 @@ import { log } from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 
-// ── ID Generation ────────────────────────────────────────────────
 
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const ID_PREFIX_HEX_LENGTH = 12;
@@ -53,10 +42,7 @@ function deterministicBase62(seed: string, length: number): string {
 }
 
 /**
- * Generate an OpenCode-compatible ascending ID.
  * Format: `prefix_[12-hex-chars][14-deterministic-base62]`.
- * The time prefix preserves OpenCode's lexicographic ordering, while the hash
- * suffix makes retries for the same marker identity converge on the same rows.
  */
 function generateId(
     prefix: string,
@@ -78,7 +64,6 @@ export function generatePartId(timestampMs: number, counter = 0n, identity = "")
     return generateId("prt", timestampMs, counter, identity);
 }
 
-// ── DB Access ────────────────────────────────────────────────────
 
 export function getOpenCodeDbPath(): string {
     return join(getDataDir(), "opencode", "opencode.db");
@@ -86,11 +71,9 @@ export function getOpenCodeDbPath(): string {
 
 let cachedWriteDb: { path: string; db: Database } | null = null;
 
-// Columns we INSERT into OpenCode's `message` and `part` tables. Kept in sync
-// with the INSERT statements in injectCompactionMarker() below. If OpenCode
-// ever renames/drops any of these columns, our INSERTs will fail at runtime —
-// the schema probe below detects that BEFORE we try to write, so we fail
-// cleanly instead of leaving half-written marker state in OpenCode's DB.
+// `REQUIRED_MESSAGE_COLUMNS` and `REQUIRED_PART_COLUMNS` list every column used by `injectCompactionMarker` INSERT statements.
+// The schema probe detects missing required columns before marker writes.
+// The pre-write probe prevents a missing column from causing partial marker state.
 const REQUIRED_MESSAGE_COLUMNS = ["id", "session_id", "time_created", "time_updated", "data"];
 const REQUIRED_PART_COLUMNS = [
     "id",
@@ -102,18 +85,11 @@ const REQUIRED_PART_COLUMNS = [
 ];
 
 /**
- * Cache of schema-compatibility probe results per DB path.
- * null = not yet probed, true = compatible, false = incompatible (bail).
  */
 let cachedSchemaCompatible: { path: string; compatible: boolean } | null = null;
 
 /**
- * Probe OpenCode's `message` and `part` tables to verify they have the exact
- * columns our INSERTs reference. OpenCode uses Drizzle migrations and has
- * already shipped several schema updates; any future rename or column drop
- * would make our write silently fail at runtime. Probing once per cached-db
- * lifetime (startup + process restart) keeps the hot path cost at zero after
- * the first call.
+ * Reject marker injection unless both tables contain every column used by its INSERTs.
  */
 function isOpenCodeSchemaCompatible(db: Database, dbPath: string): boolean {
     if (cachedSchemaCompatible?.path === dbPath) {
@@ -170,20 +146,12 @@ function getWritableOpenCodeDb(): Database {
             // ignore
         }
     }
-    // Fail with a diagnosable message instead of SQLite's bare `unable to open
-    // database file`, and NEVER create the file: the default open mode creates
-    // missing files, so on a machine without OpenCode (e.g. Pi-only installs)
-    // a stray `~/.local/share/opencode/` directory would get a junk empty
-    // opencode.db here and every later query would throw `no such table`.
-    // Callers on such installs must not reach this at all (harness-gated);
-    // this guard keeps the failure loud and side-effect-free if one does.
+    // Opening a missing path creates an empty database, whose later queries fail with `no such table`.
     if (!existsSync(dbPath)) {
         throw new Error(`OpenCode database not found at ${dbPath} (is OpenCode installed?)`);
     }
     const db = new Database(dbPath);
-    // busy_timeout BEFORE journal_mode=WAL: setting WAL can need the file lock, so
-    // with the timeout installed first a cold-open while OpenCode holds the lock
-    // waits up to 5s instead of throwing SQLITE_BUSY immediately.
+    // Set `busy_timeout` before `journal_mode=WAL` so a cold open waits up to 5 s when OpenCode holds the lock.
     db.exec("PRAGMA busy_timeout=5000");
     db.exec("PRAGMA journal_mode=WAL");
     cachedWriteDb = { path: dbPath, db };
@@ -199,12 +167,10 @@ export function closeCompactionMarkerDb(): void {
         }
         cachedWriteDb = null;
     }
-    // Reset the schema-probe cache too — next open may be a different process
-    // or a different opencode.db path (e.g. test isolation via XDG_DATA_HOME).
+    // Reset the schema-probe cache because the next open can use a different `opencode.db` path.
     cachedSchemaCompatible = null;
 }
 
-// ── Boundary User Message Resolution ─────────────────────────────
 
 export interface BoundaryUserMessage {
     id: string;
@@ -239,11 +205,9 @@ function getNonSummaryMessageSortKey(
 }
 
 /**
- * Find the nearest user message at or before the given end message id.
  * The boundary must be a user message for filterCompacted to work.
  *
- * Filters out compaction summary messages (summary=true, finish="stop")
- * so ordinals stay consistent with readRawSessionMessagesFromDb.
+ * Exclude compaction summaries (`summary=true`, `finish="stop"`) to keep ordinals consistent with `readRawSessionMessagesFromDb`.
  */
 export function findBoundaryUserMessage(
     sessionId: string,
@@ -251,18 +215,13 @@ export function findBoundaryUserMessage(
 ): BoundaryUserMessage | null {
     const db = getWritableOpenCodeDb();
 
-    // Resolve the target's canonical sort key first, using the same summary
-    // exclusion as readRawSessionMessagesFromDb. If the stored endMessageId is
-    // gone (or is itself one of our injected summaries), the pending/direct
-    // marker update is stale and must not move the boundary.
+    // Do not move the boundary when `endMessageId` is absent or identifies an injected summary.
+    // A missing target or injected summary makes the pending/direct marker update stale.
     const target = getNonSummaryMessageSortKey(sessionId, endMessageId);
     if (!target) return null;
 
-    // Match the raw-message reader's canonical ASC order
-    // (time_created ASC, id ASC). "At or before target" is therefore
-    // time_created < target.time_created OR the same timestamp with id <= target.id.
-    // Push role='user' into SQL so a long assistant/tool span before the target
-    // cannot exhaust a JS scan window and miss the prior user.
+    // Use `time_created ASC, id ASC` as the canonical order.
+    // Filtering `role = 'user'` in SQL prevents long assistant/tool spans from excluding the prior user message.
     const boundary = db
         .prepare(
             `SELECT id, time_created, data
@@ -302,18 +261,11 @@ export function compareOpenCodeMessagesByCanonicalOrder(
 }
 
 /**
- * Check whether an OpenCode message ID still exists for a given session.
  *
- * Used by plan v6's deferred marker drain to validate that a deferred
- * compaction-marker target hasn't been wiped by recomp / revert / partial
- * recomp between publication and the consuming pass. Errors propagate
- * (unlike the swallow-and-return-empty helpers in `read-session-db.ts`):
- * the marker-manager wraps this call in its own try/catch so missing or
- * locked OpenCode DBs become `retryable-failure` outcomes, not silent skips.
+ * Validate deferred compaction-marker targets before consumption because recompaction, reversion, or partial recompaction can delete them.
+ * `getOpenCodeMessageById` propagates OpenCode DB errors.
  *
- * Note: returns `{ id }` rather than a richer row shape because the only
- * thing the caller needs is existence. If a future caller needs role or
- * timestamps, widen the return type but keep the throw-on-failure contract.
+ * Returns `{ id }` because callers need only existence.
  */
 export function getOpenCodeMessageById(
     sessionId: string,
@@ -326,32 +278,30 @@ export function getOpenCodeMessageById(
     return row ?? null;
 }
 
-// ── Marker State ─────────────────────────────────────────────────
 
 interface CompactionMarkerState {
-    /** The user message ID that has the compaction part */
+    /* */
     boundaryMessageId: string;
-    /** The summary assistant message ID we injected */
+    /* */
     summaryMessageId: string;
-    /** The compaction part ID on the user message */
+    /* */
     compactionPartId: string;
-    /** The text part ID on the summary message */
+    /* */
     summaryPartId: string;
 }
 
-// ── Injection ────────────────────────────────────────────────────
 
 export interface InjectCompactionMarkerArgs {
     sessionId: string;
-    /** Raw ordinal of the last compartmentalized message */
+    /** The field stores the raw ordinal of the last compartmentalized message. */
     endOrdinal: number;
-    /** OpenCode message id of the last compartmentalized message */
+    /** The field stores the OpenCode message ID of the last compartmentalized message. */
     endMessageId: string;
-    /** Summary text for the compaction summary message (static placeholder) */
+    /* */
     summaryText: string;
-    /** Working directory for the session */
+    /* */
     directory: string;
-    /** Boundary resolved before removing the old marker (prevents null-boundary cache busts). */
+    /** Resolve the boundary before removing the old marker; removing it first can invalidate the cached boundary. */
     resolvedBoundary?: BoundaryUserMessage;
 }
 
@@ -403,8 +353,8 @@ function removeLegacyMarkerLineageRows(
         deleteSummary.run(args.sessionId, summaryMessageId);
     }
 
-    // A stale marker lineage can carry its own compaction part. Once the
-    // lineage is identified, retain only the deterministic boundary part.
+    // A stale marker lineage can contain its own compaction part.
+    // Delete other automatic compaction parts from the stale lineage boundary.
     db.prepare(
         `DELETE FROM part
          WHERE session_id = ?
@@ -416,16 +366,11 @@ function removeLegacyMarkerLineageRows(
 }
 
 /**
- * Inject a compaction marker into OpenCode's DB.
- * Returns the marker state if successful, null if boundary couldn't be found.
+ * Returns null when the schema is incompatible or no boundary exists.
  */
 export function injectCompactionMarker(
     args: InjectCompactionMarkerArgs,
 ): CompactionMarkerState | null {
-    // Verify OpenCode's schema still matches what our INSERTs expect BEFORE we
-    // try to write. If OpenCode shipped a breaking schema change, bail cleanly
-    // instead of half-writing marker state that'd leave the session's history
-    // in an inconsistent state.
     const db = getWritableOpenCodeDb();
     if (!isOpenCodeSchemaCompatible(db, getOpenCodeDbPath())) {
         return null;
@@ -439,8 +384,7 @@ export function injectCompactionMarker(
         );
         return null;
     }
-    // Use timestamps relative to the boundary so OpenCode's time/id ordering
-    // places the marker immediately after the boundary.
+    // OpenCode's time/id ordering places the marker immediately after the boundary when marker timestamps are relative to the boundary.
     const boundaryTime = boundary.timeCreated;
     const markerIdentity = `${args.sessionId}\0${args.endMessageId}`;
     const summaryMsgId = generateMessageId(
@@ -468,8 +412,7 @@ export function injectCompactionMarker(
 
     try {
         db.transaction(() => {
-            // A committed insert can outlive a failed context-state write. Remove
-            // any stale lineage in the transaction that writes the canonical rows.
+            // A committed insert can outlive a failed context-state write, so the canonical-row transaction removes stale lineage.
             removeLegacyMarkerLineageRows(db, {
                 sessionId: args.sessionId,
                 boundaryMessageId: boundary.id,
@@ -478,8 +421,7 @@ export function injectCompactionMarker(
                 compactionPartId,
             });
 
-            // Deterministic IDs make this transaction an upsert on retry. Rewriting
-            // the exact canonical row also repairs a partial or stale prior write.
+            // Deterministic IDs make retries upserts, and rewriting canonical rows repairs partial or stale writes.
             db.prepare(
                 `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
                  VALUES (?, ?, ?, ?, ?, ?)
@@ -545,38 +487,35 @@ export function injectCompactionMarker(
     }
 }
 
-// ── Foreign-marker scan (fork-orphan hygiene, #263) ─────────────
+// Foreign-marker scan
 
 /**
- * One compaction marker row-set found in opencode.db for a session.
  *
- * `summaryMessageIds` lists the completed summary assistant messages
- * (summary=true, finish="stop") parented to the boundary user message and
- * carrying magic-context's provider identity — i.e. the summaries THIS plugin
- * injected. OpenCode-native /compact summaries carry the real provider id and
- * are deliberately NOT listed, so callers can never delete a native compaction.
+ * `summaryMessageIds` contains completed assistant summaries with `summary=true` and `finish="stop"`.
+ * Each `summaryMessageIds` entry is parented to the boundary user message.
+ * `summaryMessageIds` includes only summaries with magic-context's provider identity.
+ * OpenCode-native `/compact` summaries use their real provider ID and are excluded.
+ * Excluding summaries without magic-context's provider ID prevents callers from deleting native compactions.
  */
 export interface SessionCompactionMarkerRows {
-    /** id of the `type:"compaction"` part on the boundary user message */
+    /** `compactionPartId` identifies the `type:"compaction"` part attached to the boundary user message. */
     compactionPartId: string;
-    /** the user message id the compaction part is attached to */
+    /* */
     boundaryMessageId: string;
-    /** magic-context-injected summary messages parented to the boundary */
+    /** `summaryMessageIds` identifies magic-context summaries parented to the boundary user message. */
     summaryMessageIds: string[];
 }
 
 /**
- * List every compaction marker present in opencode.db for a session.
  *
- * Used by the fork-orphan hygiene pass (#263): OpenCode's `/fork` copies the
- * parent session's message rows — including this plugin's compaction marker
- * rows — into the fork, while magic-context's durable marker state (context.db)
- * is NOT inherited (PARITY.md gap #25). The fork then owns marker rows its
- * state knows nothing about. This scan enumerates all markers so the caller can
- * diff them against the persisted state and repair the ones it does not own.
+ * OpenCode's `/fork` copies the parent session's message rows.
+ * OpenCode's `/fork` copies the parent session's compaction-marker rows into the fork.
+ * OpenCode's `/fork` does not copy magic-context's durable marker state from `context.db`.
+ * A fork can contain copied marker rows that its durable marker state does not contain.
+ * The scan enumerates all marker rows, including rows absent from durable marker state.
+ * The caller diffs scanned markers against persisted state and repairs markers absent from that state.
  *
- * Errors propagate to the caller (the hygiene pass treats any failure as
- * "skip this pass and retry later" — never as a fatal transform error).
+ * The hygiene pass retries scan failures later instead of treating them as fatal transform errors.
  */
 export function listSessionCompactionMarkers(sessionId: string): SessionCompactionMarkerRows[] {
     const db = getWritableOpenCodeDb();
@@ -615,21 +554,14 @@ export function listSessionCompactionMarkers(sessionId: string): SessionCompacti
 }
 
 /**
- * Remove one foreign (not owned by this session's durable state) compaction
- * marker from opencode.db: its compaction part, plus the magic-context summary
- * lineage parented to its boundary message.
  *
- * Deleting the compaction part alone is sufficient to make `filterCompacted`
- * stop ignoring our marker (it requires a compaction part to break), but the
- * summary rows are removed too so no stale "[Compacted by magic-context]"
- * message lingers in the fork's history.
+ * `filterCompacted` requires a compaction part to break, so deleting that part stops it from ignoring the marker.
+ * Deleting summary rows prevents stale `[Compacted by magic-context]` messages from remaining in fork history.
  *
- * `protectedSummaryMessageId` is the caller's OWN summary message id; it is
- * never deleted even if it happened to share the boundary (defensive — a
- * foreign boundary newer than ours should always differ).
+ * `protectedSummaryMessageId` identifies the caller-owned summary message that cleanup must retain.
  *
- * Returns false (without throwing) when the DELETE transaction fails, e.g.
- * SQLITE_BUSY; the caller retries on a later pass.
+ * Returns false instead of throwing when opening or executing the transaction fails.
+ * SQLITE_BUSY causes this function to return false.
  */
 export function removeForeignCompactionMarker(
     sessionId: string,
@@ -662,37 +594,32 @@ export function removeForeignCompactionMarker(
     }
 }
 
-// ── Removal ──────────────────────────────────────────────────────
 
 /**
- * Result of the compaction-off flip cleanup over one session's opencode.db
- * rows (issue #266). Counts are row-level so the transition can both gate
- * the flip notice ("cleared something") and prove idempotence (a second run
- * reports zero removed rows).
+ * The cleanup result covers one session's `opencode.db`.
+ * `removedRows` counts individual message and part rows.
  */
 export interface McOwnedMarkerCleanupResult {
     /**
-     * True only when cleanup completed without skipping an MC-owned lineage.
-     * False keeps the mode transition retryable instead of recording a
-     * successful flip while a marker can still hide history.
+     * The result is true only when cleanup skips no magic-context-owned lineage.
+     * A false `verified` leaves the mode transition retryable.
+     * A false `verified` prevents recording a successful flip while a marker can still hide history.
      */
     verified: boolean;
-    /** MC-owned marker lineages fully removed (compaction part + summary rows together). */
+    /** `removedLineages` counts MC-owned marker lineages whose compaction part and summary rows were all removed. */
     removedLineages: number;
-    /** Message + part rows deleted in total. */
+    /* */
     removedRows: number;
     /**
-     * Lineages deliberately LEFT in place because a surviving compaction part
-     * (or message-level compaction field) carries a `tail_start_id` that
-     * references a row the deletion would remove. A missing tail target makes
-     * OpenCode's tailIndex resolve to -1 and silently bypass its reorder, so
-     * the contract is retarget-or-retain, never blind-delete; this cleanup
+     * `retainedLineages` counts lineages retained when a surviving `tail_start_id` references a row deletion would remove.
+     * A missing `tail_start_id` target makes OpenCode's `tailIndex` resolve to `-1` and bypass reordering.
+     * The cleanup retains lineages it cannot retarget.
      * retains.
      */
     retainedLineages: number;
 }
 
-/** True when a parsed part/message data object carries a `tail_start_id` reference. */
+/* */
 function dataReferencesTailStart(data: unknown): string | null {
     if (typeof data !== "object" || data === null) return null;
     const record = data as Record<string, unknown>;
@@ -707,7 +634,7 @@ function dataReferencesTailStart(data: unknown): string | null {
     return null;
 }
 
-/** Match the exact payload written by injectCompactionMarker, not a missing native field. */
+/** `isMcCanonicalCompactionPartData` matches only the payload that `injectCompactionMarker` writes. */
 function isMcCanonicalCompactionPartData(data: unknown): boolean {
     if (typeof data !== "object" || data === null || Array.isArray(data)) return false;
     const record = data as Record<string, unknown>;
@@ -722,33 +649,18 @@ function isMcCanonicalCompactionPartData(data: unknown): boolean {
 }
 
 /**
- * Delete every Magic Context-owned compaction-marker lineage for a session
- * from opencode.db. This is the flip-off transition's primary mechanism
- * (issue #266 decision #7): with MC no longer injecting `<session-history>`,
- * a surviving MC marker would keep `filterCompacted` hiding pre-boundary
- * history with nothing to replace it — orphaned context. Deleting the MC
- * pairs lets OpenCode recompute filtering live from the surviving rows, as if
- * the MC markers never existed (peer-verified newest-completed-summary
- * semantics; older markers inside the retained tail do not define the
- * boundary). Native compaction rows are never matched: ownership keys on
- * MC-specific signatures (the `magic-context` provider identity on summary
- * messages, the exact MC marker summary text for legacy lineages, and the
- * MC canonical compaction-part shape) plus session identity.
+ * `removeMcOwnedCompactionMarkers` deletes MC-owned compaction-marker lineages unless preflight retains them.
+ * When MC stops injecting `<session-history>`, a surviving MC marker would hide pre-boundary history.
+ * Older markers inside the retained tail do not define the boundary.
+ * Native compaction rows are never matched; ownership requires session identity and MC-specific signatures.
  *
- * Deletion caveats honored (both binding from the OpenCode peer verification):
- *   1. The compaction part and its summary assistant rows are deleted TOGETHER
- *      in one transaction (summary parts cascade first). Deleting only the
- *      compaction part would strand the summary message in model history.
- *      The boundary USER message row itself is real user history and is never
- *      deleted — only the MC-injected compaction part attached to it.
- *   2. tail_start_id PREFLIGHT: before deleting, every SURVIVING compaction
- *      part (and message-level compaction field) is checked for a
- *      `tail_start_id` equal to any row about to be deleted. On a hit the
- *      lineage is RETAINED, never blind-deleted.
+ * The transaction atomically removes each compaction part with its summary lineage.
+ * Deleting only the compaction part would leave its summary message in model history.
+ * The boundary user message is real user history; cleanup deletes only its MC-injected compaction part.
+ * Preflight retains a lineage when a surviving compaction marker references a row that deletion would remove through `tail_start_id`.
  *
  * Idempotent: absent rows delete as a no-op (second run reports zeros).
- * Errors propagate — the transition treats them as retryable and reruns the
- * same logical cleanup on the next pass (delete-then-record protocol).
+ * Errors propagate.
  */
 export function removeMcOwnedCompactionMarkers(
     sessionId: string,
@@ -756,9 +668,7 @@ export function removeMcOwnedCompactionMarkers(
 ): McOwnedMarkerCleanupResult {
     const db = getWritableOpenCodeDb();
     if (!isOpenCodeSchemaCompatible(db, getOpenCodeDbPath())) {
-        // Schema drift: we cannot prove our DELETEs match the live schema, so
-        // leave every row in place. The marker stays inert-but-present; the
-        // next process (after an OpenCode/MC update) retries.
+        // Schema incompatibility leaves all rows in place because cleanup cannot verify its DELETE predicates.
         return {
             verified: false,
             removedLineages: 0,
@@ -767,12 +677,6 @@ export function removeMcOwnedCompactionMarkers(
         };
     }
 
-    // MC-owned summary assistant messages: canonical lineage carries the MC
-    // provider identity; supported LEGACY lineages (older builds) are
-    // recognized the same way removeLegacyMarkerLineageRows recognizes them —
-    // a completed summary parented to the boundary whose text part is exactly
-    // the MC marker placeholder. A native summary can never match either
-    // signature (native summaries carry the real provider id and text).
     const canonicalSummaries = db
         .prepare(
             `SELECT id, COALESCE(json_extract(data, '$.parentID'), '') AS parent_id
@@ -812,14 +716,12 @@ export function removeMcOwnedCompactionMarkers(
             summariesByBoundary.set(row.parent_id, set);
         } else {
             // A stranded MC summary whose boundary is gone is still MC-owned
-            // and still visible in model history — remove it too.
+            // Cleanup removes stranded MC summaries because they remain visible in model history.
             orphanSummaryIds.add(row.id);
         }
     }
 
-    // Every compaction part in the session, parsed once: the preflight must
-    // see surviving native parts, and ownership of a boundary's parts must be
-    // decided with the full picture.
+    // Preflight parses every session compaction part once so it sees surviving native parts and evaluates each boundary against all of its parts.
     const compactionParts = db
         .prepare(
             `SELECT id, message_id, data
@@ -850,9 +752,7 @@ export function removeMcOwnedCompactionMarkers(
         });
     }
 
-    // Message-level V2 compaction fields also carry tail_start_id; collect
-    // their references for the preflight as well (conservative: any reference
-    // into the deletion set retains the lineage).
+    // Preflight includes message-level V2 compaction `tail_start_id` references; any reference to a deletion target retains the lineage.
     const messageTailRefs = db
         .prepare(
             `SELECT id, data
@@ -894,18 +794,14 @@ export function removeMcOwnedCompactionMarkers(
     };
 
     for (const [boundaryMessageId, summaryIds] of summariesByBoundary) {
-        // MC-owned compaction parts on this boundary: the canonical MC shape
-        // is exactly {"type":"compaction","auto":true} — no tail_start_id.
-        // A compaction part carrying tail_start_id belongs to a native
-        // compaction and is never deleted.
+        // A compaction part with `tail_start_id` does not match the MC-owned signature and is retained.
         const boundaryParts = parsedParts.filter((part) => part.messageId === boundaryMessageId);
         const mcPartIds = boundaryParts
             .filter((part) => isMcCanonicalCompactionPartData(part.data))
             .map((part) => part.id);
 
-        // Preflight (deletion caveat 2): rows this lineage would delete. Parts
-        // are first-class tail targets too, so omitting them can strand a
-        // surviving native marker even when every deleted message is covered.
+        // The preflight includes every row this lineage would delete.
+        // Preflight detects surviving markers that reference deleted compaction-part IDs.
         const rowsToDelete = new Set<string>([...summaryIds, ...mcPartIds]);
         const survivingPartsReferenceDeletion = parsedParts.some(
             (part) =>
@@ -917,8 +813,7 @@ export function removeMcOwnedCompactionMarkers(
             messageTailStartIds.has(id),
         );
         if (survivingPartsReferenceDeletion || messageFieldReferencesDeletion) {
-            // Retarget-or-retain contract: retain rather than risk a dangling
-            // tail target (tailIndex=-1 silently bypasses OpenCode's reorder).
+            // Retain a lineage when deletion would leave a surviving part pointing at a deleted tail target.
             retainedLineages += 1;
             log(
                 `[magic-context] compaction-marker: flip-off cleanup RETAINED lineage at boundary ${boundaryMessageId} — a surviving tail_start_id references a row the deletion would remove`,
@@ -926,7 +821,6 @@ export function removeMcOwnedCompactionMarkers(
             continue;
         }
 
-        // Caveat 1: compaction part + summary rows deleted TOGETHER.
         const rows = db.transaction(() => {
             let changed = deleteSummaries(summaryIds);
             for (const partId of mcPartIds) {
@@ -941,7 +835,7 @@ export function removeMcOwnedCompactionMarkers(
     }
 
     if (orphanSummaryIds.size > 0) {
-        // No boundary to preflight against beyond the summaries themselves.
+        // Orphan summaries have no boundary to preflight.
         const rowsToDelete = new Set<string>(orphanSummaryIds);
         const survivingPartsReferenceDeletion = parsedParts.some(
             (part) => part.tailStartId !== null && rowsToDelete.has(part.tailStartId),
@@ -972,14 +866,11 @@ export function removeMcOwnedCompactionMarkers(
 }
 
 /**
- * Remove an existing compaction marker (all 3 rows).
- * Used when moving the boundary forward or on session cleanup.
  */
 export function removeCompactionMarker(state: CompactionMarkerState): boolean {
     try {
         const db = getWritableOpenCodeDb();
         db.transaction(() => {
-            // Delete in reverse order of dependencies
             db.prepare("DELETE FROM part WHERE id = ?").run(state.summaryPartId);
             db.prepare("DELETE FROM message WHERE id = ?").run(state.summaryMessageId);
             db.prepare("DELETE FROM part WHERE id = ?").run(state.compactionPartId);

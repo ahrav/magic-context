@@ -1,8 +1,7 @@
-//! Explicit shared-memory transport provider for qualified test profiles.
 //!
-//! Production configuration never installs this provider. One dedicated OS
-//! thread creates and owns both `!Send` ring endpoints. Host tasks exchange
-//! frame tickets and completion notifications with that thread.
+//! Production configuration never installs this provider.
+//! One dedicated OS thread creates and owns both `!Send` ring endpoints.
+//! The thread exchanges frame tickets and completion notifications through the ring endpoints.
 
 use std::fmt;
 #[cfg(target_os = "linux")]
@@ -43,11 +42,9 @@ use crate::transport_provider::{
 };
 use crate::wire::{ByteBudget, MAX_CONTROL_BODY_LEN};
 
-/// Explicit transport name used by the qualified provider.
 pub const SHM_TRANSPORT: &str = "shm";
-/// Capability version implemented by the qualified provider.
 pub const SHM_CAPABILITY_VERSION: u32 = 1;
-/// Only profile accepted by this pre-production provider.
+/// The provider accepts only `QUALIFIED_TEST_PROFILE`.
 pub const QUALIFIED_TEST_PROFILE: &str = "mc-host-test-ring-v1";
 
 const HARDWARE_PROFILE: &str = "mc-host-test-ring-v1";
@@ -56,13 +53,13 @@ const POLL_INTERVAL: Duration = Duration::from_micros(50);
 
 static NEXT_CANDIDATE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Test-only observer invoked after each successful frame publication with
-/// the published frame's type and channel. It receives no descriptors,
-/// payloads, or provider data.
+/// The test-only observer runs after each successful frame publication.
+/// The observer receives the published frame's type and channel.
+/// The observer receives no descriptors, payloads, or provider data.
 #[doc(hidden)]
 pub type PublishHook = Arc<dyn Fn(FrameType, u16) + Send + Sync>;
 
-/// Exact offer parameters required to select the test-only provider.
+/// Selection requires these exact offer parameters.
 pub fn qualified_test_parameters() -> serde_json::Value {
     serde_json::json!({
         "backend": "ring",
@@ -101,7 +98,7 @@ pub fn qualified_test_profile() -> TargetProfile {
     .expect("static shared-memory profile is valid")
 }
 
-/// Admission limits sufficient for one qualified candidate.
+/// These limits admit one qualified candidate.
 pub fn single_candidate_limits() -> ShmHostLimits {
     let charges = qualified_test_profile().charges();
     ShmHostLimits {
@@ -113,7 +110,7 @@ pub fn single_candidate_limits() -> ShmHostLimits {
     }
 }
 
-/// Explicit provider. Callers must install it through `TransportProviders`.
+/// Callers must install this provider through `TransportProviders`.
 pub struct ShmProvider {
     profile: Arc<TargetProfile>,
     admission: Arc<AdmissionController>,
@@ -125,9 +122,9 @@ pub struct ShmProvider {
     held_admission: Mutex<Option<Admission>>,
 }
 
-/// Recovery primitives for the thread-confined ring endpoint. The rings die
-/// with their endpoint thread, so a suspect close leaves alias state
-/// uncertain: cleanup isolates instead of reclaiming.
+/// Recovery confines ring endpoints to the endpoint thread.
+/// A suspect close leaves alias state uncertain because the endpoint thread drops the rings.
+/// Cleanup isolates suspect closes instead of reclaiming them.
 struct ShmRecoveryBackend {
     profile: Arc<TargetProfile>,
     admission: Arc<AdmissionController>,
@@ -141,8 +138,7 @@ impl RecoveryBackend for ShmRecoveryBackend {
     }
 
     fn probe(&self) -> bool {
-        // No shared state outlives the endpoint thread, so isolation alone
-        // proves the provider side is clean.
+        // The endpoint thread drops both ring endpoints before it exits.
         true
     }
 
@@ -152,7 +148,7 @@ impl RecoveryBackend for ShmRecoveryBackend {
 }
 
 impl ShmProvider {
-    /// Builds provider with explicit process-wide admission limits.
+    /// The provider uses explicit process-wide admission limits.
     pub fn for_qualified_test_profile(limits: ShmHostLimits) -> Self {
         let profile = Arc::new(qualified_test_profile());
         let admission = Arc::new(AdmissionController::new(limits));
@@ -175,17 +171,17 @@ impl ShmProvider {
         }
     }
 
-    /// Aggregate profile charge used by admission tests.
+    /// Admission tests use this aggregate profile charge.
     pub fn profile_charges(&self) -> ResourceCharges {
         self.profile.charges()
     }
 
-    /// Number of preparations that passed side-effect-free preflight.
+    /// The counter records preparations that pass side-effect-free preflight.
     pub fn preparation_count(&self) -> u64 {
         self.preparations.load(Ordering::Acquire)
     }
 
-    /// Returns redacted aggregate admission accounting.
+    /// The method returns redacted aggregate admission accounting.
     pub fn accounting(
         &self,
     ) -> Result<
@@ -195,21 +191,20 @@ impl ShmProvider {
         self.admission.snapshot()
     }
 
-    /// Test hook: next endpoint close retains non-worker commitments.
+    /// The hook makes the next endpoint close retain non-worker commitments.
     pub fn quarantine_next_close(&self) {
         self.quarantine_next_close.store(true, Ordering::Release);
     }
 
-    /// Test hook: install a publication observer for candidates prepared
-    /// after this call. The hook runs on the endpoint thread after the ring
+    /// The hook installs a publication observer for candidates prepared after the call.
+    /// The observer runs on the endpoint thread after publication.
     /// commit.
     #[doc(hidden)]
     pub fn set_publish_hook(&self, hook: PublishHook) {
         *self.publish_hook.lock().expect("publish hook lock") = Some(hook);
     }
 
-    /// Test hook: hold one profile's admission charges so preflight reports
-    /// exact dynamic unavailability.
+    /// The hook holds one profile's admission charges so preflight reports exact dynamic unavailability.
     #[doc(hidden)]
     pub fn hold_admission(&self) -> bool {
         let mut held = self.held_admission.lock().expect("held admission lock");
@@ -225,7 +220,6 @@ impl ShmProvider {
         }
     }
 
-    /// Test hook: end the admission hold.
     #[doc(hidden)]
     pub fn release_admission(&self) {
         if let Some(admission) = self
@@ -238,13 +232,13 @@ impl ShmProvider {
         }
     }
 
-    /// Provider offer readiness (R6): governs new offers only.
+    /// `readiness` governs new offers only.
     pub fn readiness(&self) -> ProviderReadiness {
         self.recovery.readiness()
     }
 
-    /// Number of recovery cleanup calls the controller dispatched. Preflight
-    /// must never move this counter (R6, seeded-defect detector).
+    /// The counter records recovery cleanup calls dispatched by the controller.
+    /// Preflight never increments this counter.
     pub fn recovery_cleanup_count(&self) -> u64 {
         self.recovery_cleanups.load(Ordering::Acquire)
     }
@@ -289,13 +283,10 @@ impl InjectedProvider for ShmProvider {
             return Err(ProviderFailure::Unavailable);
         }
         let candidate_id = NEXT_CANDIDATE_ID.fetch_add(1, Ordering::Relaxed);
-        // Readiness and admission are one atomic decision under the
-        // recovery lock: a suspect reported between a separate readiness
-        // check and the admission would otherwise let this preparation
-        // admit resources, create rings, and publish a grant into a
-        // recovery episode (KTD6: `Recovering` is unoffered). Custody of
-        // the exact admission charges moves into one lifecycle record
-        // before the candidate is exposed (KTD4).
+        // Readiness and admission are decided atomically under one lock.
+        // The recovery lock makes readiness and admission atomic: otherwise a suspect reported between separate checks could admit resources, create rings, and publish a grant while `Recovering` is unoffered.
+        // `Recovering` is unoffered.
+        // The lifecycle record receives the exact admission charges before exposing the candidate.
         let custody = self
             .recovery
             .admit_candidate_while_ready(candidate_id, &self.admission, &self.profile)
@@ -343,10 +334,7 @@ impl InjectedProvider for ShmProvider {
                 if initialized_tx.send(Ok(descriptor)).is_err() {
                     return;
                 }
-                // An endpoint panic is an unclean close: catching it here
-                // keeps this thread alive to take the quarantine branch
-                // below instead of letting `Admission`'s drop return the
-                // charges as clean capacity while ring mappings may still
+                // The endpoint thread catches panics and quarantines `Admission` charges while ring mappings may exist.
                 // exist.
                 let clean = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     runtime.block_on(run_endpoint(
@@ -364,9 +352,8 @@ impl InjectedProvider for ShmProvider {
                 if clean && !quarantine_next_close.swap(false, Ordering::AcqRel) {
                     let _ = custody.release();
                 } else {
-                    // Unclean close (or the forced test hook): the record
-                    // becomes a suspect and the recovery controller decides
-                    // between reclamation and isolation (KTD4).
+                    // The recovery controller marks unclean closes and forced test-hook closes as suspects.
+                    // The recovery controller decides whether to reclaim or isolate the suspect.
                     recovery.report_suspect(custody);
                 }
                 let _ = done_tx.send(());
@@ -487,14 +474,8 @@ async fn run_endpoint(
                 Ok(true) => received = true,
                 Ok(false) => {}
                 Err(close) => {
-                    // Cancellation and budget-timeout closes are ordinary
-                    // backpressure or retirement — the read side was told to
-                    // stop (or the inbound consumer is gone, or ingress is
-                    // saturated) and the local lease releases safely on drop
-                    // — so they must not quarantine the admission charges:
-                    // with single-candidate limits that would permanently
-                    // block every later shared-memory candidate. Only
-                    // structural faults are unclean.
+                    // `ReadClose::Cancelled` and `ReadClose::Overloaded` are clean closes.
+                    // Only `ReadClose::Cancelled` and `ReadClose::Overloaded` are clean.
                     let clean = matches!(close, ReadClose::Cancelled | ReadClose::Overloaded);
                     let _ = inbound.send(Err(close)).await;
                     queue.retired.cancel();
@@ -505,11 +486,7 @@ async fn run_endpoint(
         }
 
         let queued = if received {
-            // Directions alternate under sustained inbound traffic: each
-            // received frame is followed by at most one queued outbound
-            // frame, taken without waiting, so a peer that refills the
-            // inbound ring as slots release cannot starve responses, Pings,
-            // and close frames while host-to-peer capacity is free.
+            // `run_endpoint` sends at most one immediately queued outbound frame after each inbound frame so sustained inbound traffic cannot starve responses, pings, or closes while host-to-peer capacity is free.
             queue.try_recv().ok()
         } else if finishing {
             match queue.try_recv() {
@@ -584,14 +561,9 @@ async fn receive_one(
             return Err(ReadClose::Cancelled);
         }
         if StdInstant::now() >= deadline {
-            // The peer and transport are healthy; only the ingress budget is
-            // saturated. Overloaded retires the generation without branding
-            // it corrupt, so the admission charge releases cleanly.
             return Err(ReadClose::Overloaded);
         }
-        // The budget wait services queued outbound frames: a slow ingress
-        // drain holds only this receive, not the connection's sends, which
-        // would otherwise miss their deadlines behind it.
+        // `receive_one` publishes queued outbound frames while waiting for ingress budget.
         match queue.try_recv() {
             Ok(queued) => {
                 if publish_one(&rings.first, queued, frame_deadline, publish_hook).is_err() {
@@ -708,16 +680,12 @@ impl io::Write for ReservationWriter<'_, '_> {
     }
 }
 
-/// Thread-confined peer endpoint for integration tests.
 pub struct TestShmPeer {
-    /// Peer-to-host producer direction.
     pub to_host: Ring,
-    /// Host-to-peer consumer direction.
     pub from_host: Ring,
 }
 
 impl TestShmPeer {
-    /// Attaches descriptor received over authenticated bootstrap.
     #[cfg(target_os = "linux")]
     pub fn attach(descriptor: &serde_json::Value) -> Result<Self, TestPeerError> {
         let mut descriptor = descriptor.clone();
@@ -743,7 +711,6 @@ impl TestShmPeer {
         Ok(Self { to_host, from_host })
     }
 
-    /// Publishes one complete consumer frame.
     pub fn send(&self, header: EnvelopeHeader, body: &[u8]) -> Result<(), TestPeerError> {
         let mut reservation = self
             .to_host
@@ -758,7 +725,6 @@ impl TestShmPeer {
         Ok(())
     }
 
-    /// Waits for one complete host frame and records its completion.
     pub fn recv(&self, timeout: Duration) -> Result<(EnvelopeHeader, Vec<u8>), TestPeerError> {
         let deadline = StdInstant::now() + timeout;
         loop {
@@ -800,7 +766,6 @@ fn decode_hex<const N: usize>(text: &str) -> Result<[u8; N], TestPeerError> {
     Ok(bytes)
 }
 
-/// Redacted test-peer attachment or I/O failure.
 #[derive(Clone, Copy)]
 pub struct TestPeerError;
 

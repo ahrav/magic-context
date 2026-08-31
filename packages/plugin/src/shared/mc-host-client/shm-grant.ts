@@ -1,21 +1,11 @@
 /**
- * Strict shared-memory grant descriptor schema (U1, KTD2 layer b).
  *
- * The negotiation envelope (layer a, `transport-negotiation.ts`) delivers a
- * duplicate-free plain `descriptor` object. This module owns the second
- * layer: the exact provider shared-memory grant schema, bound to
- * `candidate_id`, validated BEFORE any fd access, mapping, prefault, or
- * native registry mutation can happen.
  *
- * Leaf module: no imports. Decoding is defensive against exotic value
- * shapes — every field is read exactly once into a local primitive
- * (accessor properties and Proxies cannot swap values between validation
- * and use), and any provider-thrown getter error is replaced by a bounded
- * error. Decode failures carry only a bounded code and a structural field
- * path; grant bytes, pids, fds, and identifiers never reach error messages.
+ * Decode failures expose only a bounded code and structural field path.
+ * Error messages never include grant bytes, PIDs, file descriptors, or identifiers.
  */
 
-/** Bounded grant decode failure taxonomy. */
+/* */
 export type ShmGrantErrorCode =
     | "invalid_type"
     | "missing_field"
@@ -29,8 +19,8 @@ export type ShmGrantErrorCode =
     | "stale_candidate";
 
 /**
- * One grant decode failure: a bounded code plus a structural field path
- * built only from documented field names. Peer-supplied bytes never appear
+ * ShmGrantError paths contain only fixed field names.
+ * ShmGrantError messages never include peer-supplied bytes.
  * here.
  */
 export class ShmGrantError extends Error {
@@ -43,7 +33,7 @@ export class ShmGrantError extends Error {
     }
 }
 
-/** The validated grant: local primitives only, safe to hand to native code. */
+/* */
 export interface ShmGrant {
     profile: string;
     pid: number;
@@ -55,26 +45,21 @@ export interface ShmGrant {
 }
 
 /**
- * Ring grant wire width (`RingGrant::encode` in
- * `crates/mc-shm-transport/src/backend/ring.rs`): 58 bytes, hex-encoded to
- * 116 lowercase ASCII characters by the host.
+ * Each grant string must contain exactly 116 lowercase hexadecimal ASCII characters.
  */
 const GRANT_HEX_LEN = 116;
 
-/** `LAYOUT_VERSION` in `backend/ring.rs`. */
+/* */
 const LAYOUT_VERSION = 2;
-/** Exact `mc-host-test-ring-v1` geometry (`shm_provider::qualified_test_profile`). */
+/* */
 const DESCRIPTOR_DEPTH = 8n;
 const ARENA_BYTES = 67_108_864n;
 const MAX_LEASES = 8n;
 /**
- * Absolute cap on the mapping size a grant may request: the exact arena
- * plus a generous 1 MiB metadata allowance. The native side re-derives the
- * exact total from the layout; this bound only stops an over-profile grant
- * from reaching fd access or a huge mmap at all.
+ * MAX_TOTAL_BYTES permits 1 MiB of metadata beyond ARENA_BYTES.
  */
 const MAX_TOTAL_BYTES = ARENA_BYTES + 1_048_576n;
-/** `DuplexRing::create` lane assignment: first (host_to_peer) 0, second 1. */
+/* */
 const HOST_TO_PEER_LANE = 0;
 const PEER_TO_HOST_LANE = 1;
 
@@ -91,8 +76,7 @@ const GRANT_FIELDS = [
 const GRANT_TEXT_RE = /^[0-9a-f]{116}$/;
 
 /**
- * Reads one property exactly once, replacing any getter/Proxy throw with a
- * bounded error so provider-authored failure text cannot escape.
+ * readOnce converts getter and Proxy exceptions to bounded errors so provider-authored text cannot escape.
  */
 function readOnce<T>(
     source: Record<string, unknown>,
@@ -110,9 +94,7 @@ function readOnce<T>(
 }
 
 /**
- * A strict integer field: a plain finite number with no fractional part,
- * never `-0`, within `[min, max]`. `NaN`, infinities, and values beyond
- * `Number.MAX_SAFE_INTEGER` all fail `Number.isSafeInteger`.
+ * integerParser accepts safe integers other than `-0` within `[min, max]`.
  */
 function integerParser(min: number, max: number): (value: unknown, path: string) => number {
     return (value, path) => {
@@ -125,23 +107,20 @@ function integerParser(min: number, max: number): (value: unknown, path: string)
     };
 }
 
-/** Exactly {@link GRANT_HEX_LEN} lowercase hexadecimal ASCII characters. */
+/* */
 function parseGrantText(value: unknown, path: string): string {
     if (typeof value !== "string") throw new ShmGrantError("invalid_type", path);
     if (!GRANT_TEXT_RE.test(value)) throw new ShmGrantError("malformed_grant", path);
     return value;
 }
 
-/** Decoded ring-grant metadata; incarnation stays internal to this module. */
+/** RingGrantFields keeps incarnation internal to this module. */
 interface RingGrantFields {
     incarnation: string;
 }
 
 /**
- * Decodes and validates one hex ring grant against the exact frozen
- * profile geometry and the expected lane. Field offsets mirror
- * `RingGrant::encode` (layout version 2). Pure: no fd, mapping, or native
- * call is reachable from here.
+ * `validateRingGrant` does not reach fd, mapping, or native operations.
  */
 function validateRingGrant(hex: string, expectedLane: number, path: string): RingGrantFields {
     const bytes = new Uint8Array(GRANT_HEX_LEN / 2);
@@ -173,31 +152,16 @@ function validateRingGrant(hex: string, expectedLane: number, path: string): Rin
     return { incarnation };
 }
 
-/** Decode options: the exact expected profile and replay high-water mark. */
+/* */
 export interface ShmGrantOptions {
     expectedProfile: string;
     /**
-     * Replay high-water mark from the last accepted grant: the issuing
-     * daemon incarnation's `pid` and the highest `candidate_id` attached
-     * from it. Candidate ids are monotonic within one host process
-     * (`shm_provider::NEXT_CANDIDATE_ID` is process-local and restarts at
-     * 1), so a grant from the same pid at or below the mark is a replayed
-     * or stale candidate, while a different pid is a fresh incarnation
-     * whose sequence starts over. A verbatim cross-incarnation replay
-     * carries the old pid and stays fenced here; a forged descriptor with
-     * a fresh pid is stopped downstream at attachment (KTD9: ring
-     * incarnation fencing plus fd validity), which this sequence check
      * never replaced.
      */
     previousCandidate?: { pid: number; candidateId: number };
 }
 
 /**
- * Decodes and fully validates one shared-memory grant descriptor into
- * local primitives. Closed field set, exact profile, strict integer
- * representations, exact ring geometry per lane, expected lane binding,
- * distinct backing objects across the duplex pair, and candidate
- * monotonicity — all before the caller may touch an fd.
  */
 export function decodeShmGrant(value: unknown, options: ShmGrantOptions): ShmGrant {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -222,8 +186,7 @@ export function decodeShmGrant(value: unknown, options: ShmGrantOptions): ShmGra
         }
     }
 
-    // Snapshot every field exactly once — parsed to a primitive at the
-    // read — before any validation-then-use gap an accessor or Proxy could
+    // Reading each field once prevents accessors and Proxies from changing a value between validation and use.
     // exploit.
     const source = value as Record<string, unknown>;
     const parseFd = integerParser(0, 0x7fff_ffff);
@@ -271,8 +234,7 @@ export function decodeShmGrant(value: unknown, options: ShmGrantOptions): ShmGra
         PEER_TO_HOST_LANE,
         "descriptor.peer_to_host_grant",
     );
-    // The duplex pair must name two distinct backing objects: equal fds,
-    // equal grants, or equal incarnations all alias one ring across both
+    // The duplex pair must name distinct backing objects; equal file descriptors, grants, or incarnations alias one ring across both lanes.
     // directions.
     if (
         hostToPeerFd === peerToHostFd ||

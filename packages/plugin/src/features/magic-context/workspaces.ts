@@ -362,7 +362,6 @@ export function bumpEpochsForWorkspaceMembers(
         try {
             db.exec("ROLLBACK");
         } catch {
-            // ignore rollback failures from an already-closed transaction
         }
         throw error;
     }
@@ -386,7 +385,6 @@ export function bumpEpochsForWorkspaceMemberSet(
         try {
             db.exec("ROLLBACK");
         } catch {
-            // ignore rollback failures from an already-closed transaction
         }
         throw error;
     }

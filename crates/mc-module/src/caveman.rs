@@ -1,9 +1,5 @@
-//! Deterministic caveman-style text compression.
 //!
-//! This is a byte-for-byte Rust port of
-//! `packages/plugin/src/hooks/magic-context/caveman.ts`. Keep the transformation
-//! order and ASCII word-boundary rules aligned with that source: the committed
-//! differential fixture is the compatibility contract.
+//! The differential fixture defines the compatibility contract.
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -583,7 +579,6 @@ fn normalize_whitespace(text: &str) -> String {
     output
 }
 
-/// Compress `text` using the same deterministic rules as the TypeScript oracle.
 pub fn compress(text: &str, level: CavemanLevel) -> String {
     if text.is_empty() {
         return text.to_string();

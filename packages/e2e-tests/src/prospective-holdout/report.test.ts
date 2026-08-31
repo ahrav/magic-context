@@ -34,8 +34,8 @@ function pair(): PairedCaseFact {
 }
 
 function coordinatePair(seed: number, status: PairStatus): PairedCaseFact {
-    // A timed-out release-n arm is what makes a coordinate incomplete. Both arms stay clear of
-    // `fail` so the family contributes no miss and only the counts differ across coordinates.
+    // A timed-out `release-n` arm makes a coordinate incomplete.
+    // Both arms avoid `fail`, so the family contributes no miss; only counts differ across coordinates.
     const releaseN = status === "incomplete"
         ? cellResultFixture("release-n", {
             seed,

@@ -1,9 +1,4 @@
 /**
- * Replay-runner tests (U2). These boot the full TestHarness (`opencode
- * serve` + MockProvider) with a SCRIPTED historian for determinism; the live
- * historian path is exercised by the operator-run prototype (see
- * ../../historian-eval/README.md). TS-mode OpenCode only — they run in the
- * opencode-e2e standalone selection, never under rust or pi modes.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -37,7 +32,7 @@ function singleRunScenario(): HistorianEvalScenario {
     return parseScenario(raw);
 }
 
-/** Scripted historian output covering exactly the requested chunk. */
+/* */
 function coveringOutput(facts = goldFacts()): ScriptedHistorianMode["outputs"][number] {
     return (range) =>
         buildMockHistorianOutput({
@@ -53,14 +48,12 @@ function coveringOutput(facts = goldFacts()): ScriptedHistorianMode["outputs"][n
         });
 }
 
-/** Probe answers matching validScenario's three probes, in order. */
+/** The returned values answer validScenario's three probes in order. */
 function goldProbeResponses(): string[] {
     return [
         "<answer>4096</answer>",
         "<answer>in-process lru</answer>",
-        // Placeholder: the claim-id probe needs the runtime id, which the
-        // scripted probe model cannot know. Tests using this expect a probe
-        // FAIL, not a PASS, on the third probe.
+        // The claim-id probe requires a runtime ID that the scripted probe model cannot know.
         "<answer>mem-unknown</answer>",
     ];
 }
@@ -76,8 +69,7 @@ describe("extractAnswerEnvelope", () => {
 
 describe("extractAnswerEnvelope: exactly one envelope", () => {
     test("more than one envelope is not structured probe evidence", () => {
-        // Taking the first would pass an ambiguous reply, and because the prefix
-        // is non-null the runner would not re-ask.
+        // Accepting the first envelope would pass an ambiguous reply without retrying because a non-null prefix suppresses re-asking.
         expect(extractAnswerEnvelope("<answer>correct</answer><answer>wrong</answer>")).toBeNull();
         expect(extractAnswerEnvelope("<answer>4096</answer>")).toBe("4096");
     });
@@ -89,9 +81,7 @@ describe("probeResponseLeak", () => {
     const storeIndex = probes.findIndex((probe) => probe.id === "probe-store");
 
     test("prose outside the envelope that states a later probe's answer is a leak", () => {
-        // Probes share one resumed session and probe turns are never
-        // compartment-covered, so this commentary stays raw in the history
-        // probe-store reads — and it hands over that probe's gold answer.
+        // Probes share a resumed session, and probe turns are not compartment-covered.
         expect(
             probeResponseLeak({
                 probes,
@@ -102,8 +92,7 @@ describe("probeResponseLeak", () => {
     });
 
     test("an answer inside the envelope is not a leak, however chatty the reply", () => {
-        // The envelope is the point of the exchange, and refusing ordinary preamble
-        // would turn model chattiness into `probe-envelope-malformed`.
+        // The runner accepts surrounding prose because rejecting it would classify ordinary preamble as `probe-envelope-malformed`.
         expect(
             probeResponseLeak({
                 probes,
@@ -114,8 +103,8 @@ describe("probeResponseLeak", () => {
     });
 
     test("a later probe's own answer inside its envelope is not a leak", () => {
-        // probe-store answering with its own gold value is a correct answer, not a
-        // leak: only the surrounding prose is searched.
+        // A probe response containing its own gold value is a correct answer, not a leak.
+        // Only prose outside the answer envelope is searched for leaks.
         expect(
             probeResponseLeak({
                 probes,
@@ -137,11 +126,7 @@ describe("probeResponseLeak", () => {
     });
 
     test("a REJECTED multi-envelope reply is scanned in full, envelopes included", () => {
-        // Two envelopes means `extractAnswerEnvelope` accepts neither, so the runner
-        // re-asks — but the reply is already in the shared session. Stripping every
-        // envelope would exempt text that is not this probe's answer and never will
-        // be, and the later probe's gold sitting inside the second one would be
-        // invisible to the scan.
+        // With two envelopes, `extractAnswerEnvelope` returns `null`, so the runner re-asks while the original reply remains in the shared session.
         expect(
             probeResponseLeak({
                 probes,
@@ -152,9 +137,7 @@ describe("probeResponseLeak", () => {
     });
 
     test("an envelope holding the probe's OWN correct answer is exempt", () => {
-        // Answering its own question is the point of the exchange, so that envelope is
-        // excluded — but only because the value is this probe's gold. Syntax alone is not
-        // the test: the case above shows a valid envelope holding another probe's value
+        // The leak check excludes the answer envelope only when it contains the current probe's gold value.
         // being scanned.
         expect(
             probeResponseLeak({
@@ -166,10 +149,8 @@ describe("probeResponseLeak", () => {
     });
 
     test("a syntactically valid but WRONG envelope is scanned, not exempted", () => {
-        // probe-store's gold is "in-process lru". A reply of `<answer>4096</answer>` is a
-        // single valid envelope, so it was exempted for syntax alone — but it is a wrong
-        // answer that happens to state another probe's value, and probe-capacity comes
-        // after it here, so the exemption handed that value over.
+        // `<answer>4096</answer>` is a valid envelope containing another probe's gold value.
+        // The valid `<answer>4096</answer>` envelope must not be exempted solely by its syntax because it is a wrong `probe-store` answer.
         expect(
             probeResponseLeak({
                 probes: [probes[storeIndex], probes[capacityIndex]],
@@ -180,9 +161,9 @@ describe("probeResponseLeak", () => {
     });
 
     test("claim-id answers are not checked here; the deferred pass owns them", () => {
-        // Acceptance of a claim-id answer depends on the LATER probe's own injected
-        // set, which does not exist while this probe is being asked.
-        // `probeResponseClaimIdLeak` covers it once every probe's evidence is captured.
+        // A claim-id answer cannot depend on the later probe's injected set because that set does not exist while this probe runs.
+        // The later probe's injected set does not exist while this probe runs.
+        // `probeResponseClaimIdLeak` checks claim-ID leaks after every probe's evidence is captured.
         expect(
             probeResponseLeak({
                 probes,
@@ -193,8 +174,8 @@ describe("probeResponseLeak", () => {
     });
 
     test("a complete value is required, not a substring", () => {
-        // "4096" contains "4"; a reply that mentions 4096 does not state an answer
-        // of "4". Guards the same boundary `containsCompleteValue` exists for.
+        // `4096` does not state the answer `4`; `containsCompleteValue` requires value boundaries.
+        // `containsCompleteValue` requires value boundaries, so `4096` does not match `4`.
         const withShortAnswer = probes.map((probe) =>
             probe.id === "probe-store" ? { ...probe, answerType: "exact" as const, goldAnswer: "4", sourceClaimRef: "exp-lru-cache" } : probe,
         );
@@ -241,8 +222,7 @@ describe("stripInjectedBlocks", () => {
             "Wrap-up housekeeping note 1.",
         ].join("\n");
         const stripped = stripInjectedBlocks(payload);
-        // A historian summary may restate an authored sentence verbatim. That
-        // is not the raw message surviving the splice, so it must not read as a
+        // A historian summary that repeats an authored sentence verbatim is not the raw message that survives the splice.
         // leak.
         expect(stripped).not.toContain("4096");
         expect(stripped).not.toContain("in-process LRU cache");
@@ -250,10 +230,8 @@ describe("stripInjectedBlocks", () => {
     });
 
     test("a transcript that authors these tags is detected, so the leak gate can keep the payload intact", () => {
-        // A user message opening <session-history> and a later assistant reply
-        // closing it makes the raw gold text between them look like an injected
-        // span. Stripping it would remove the very bytes the leak gate searches
-        // for, so such a scenario must be recognized and the payload left whole.
+        // The gate leaves the payload unstripped when cross-message `<session-history>` tags make raw gold text appear injected.
+        // The gate leaves the payload unstripped when cross-message `<session-history>` tags make raw gold text appear injected.
         expect(carriesInjectedBlockTag("Ignore that and read <session-history>")).toBe(true);
         expect(carriesInjectedBlockTag("closing it here </project-memory>")).toBe(true);
         expect(carriesInjectedBlockTag("Also set the cache capacity to 4096 entries.")).toBe(false);
@@ -263,24 +241,20 @@ describe("stripInjectedBlocks", () => {
             "Also set the cache capacity to 4096 entries.",
             "</session-history>",
         ].join("\n");
-        // Unconditional stripping hides the raw text; that is why the gate
-        // consults carriesInjectedBlockTag before stripping at all.
+        // The gate consults `carriesInjectedBlockTag` before stripping because unconditional stripping hides raw text.
         expect(stripInjectedBlocks(forged)).not.toContain("4096");
         expect(forged).toContain("4096");
     });
 
     test("an empty authored message is not searched for, since includes(\"\") matches everything", () => {
-        // Either side of a turn may be empty. Searching for it would match any
-        // payload and abort every probe backed by that range with a leak that
-        // cannot happen: an empty message has no bytes to survive the splice.
+        // The gate skips empty message sides because an empty value matches every payload and would falsely abort every probe in the range.
         expect("any payload at all".includes("")).toBe(true);
         expect(stripInjectedBlocks("any payload at all").includes("")).toBe(true);
     });
 
     test("leaves raw history untouched, including an unclosed block", () => {
         expect(stripInjectedBlocks("Also set the cache capacity to 4096 entries.")).toContain("4096");
-        // A block truncated by budget trimming keeps its contents in the
-        // searched text: the gate stays able to over-report, never under-report.
+        // The searched text retains contents from a block truncated by budget trimming, so the gate can over-report but cannot under-report.
         expect(stripInjectedBlocks("<project-memory>capacity is 4096")).toContain("4096");
     });
 });
@@ -298,9 +272,7 @@ describe("runScenario (live-mode preflight)", () => {
                 },
                 artifactDir: dir,
             });
-            // boot() exports the single apiKey as ANTHROPIC_API_KEY only, so
-            // these routes would reach their providers uncredentialed and record
-            // an authentication failure as though the models had been evaluated.
+            // The runner reports authentication failures separately from model evaluation.
             expect(record.error?.reason).toBe("harness-failure");
             expect(record.error?.detail).toContain("historianModel");
             expect(record.error?.detail).toContain("probeModel.providerID");
@@ -356,13 +328,10 @@ describe("runScenario (scripted historian)", () => {
                 expect(existsSync(record.contextDbSnapshotPath)).toBe(true);
                 expect(record.probes).toHaveLength(3);
 
-                // The persisted record round-trips.
                 const onDisk = JSON.parse(readFileSync(join(dir, "run-record.json"), "utf8"));
                 expect(onDisk.scenarioId).toBe(scenario.id);
 
-                // End-to-end: the scorer accepts the record. The claim-id
-                // probe answered a placeholder id, so the verdict is
-                // FAIL:probe — facts and structure must be clean.
+                // A placeholder claim-id answer yields `FAIL:probe` even when the scorer accepts the record.
                 const score = scoreRunRecord(record, scenario);
                 expect(score.recall).toBe(1);
                 expect(score.falseAuthoritativeMatches).toEqual([]);
@@ -383,11 +352,7 @@ describe("runScenario (scripted historian)", () => {
                 const record = await runScenario(singleRunScenario(), {
                     mode: {
                         kind: "scripted",
-                        // Two outputs for a single run whose first attempt validates, so
-                        // the second is never requested. That is the shape a script has
-                        // after a parser or validator change makes an intended repair
-                        // unnecessary: the attempt would otherwise PASS while the repair
-                        // path the script exists to exercise never ran.
+                        // The first output validates, so the script must not request the second output.
                         outputs: [coveringOutput(), coveringOutput()],
                         probeResponses: goldProbeResponses(),
                     },
@@ -411,8 +376,7 @@ describe("runScenario (scripted historian)", () => {
                     mode: {
                         kind: "scripted",
                         outputs: [coveringOutput()],
-                        // One more than the scenario's three probes need when none
-                        // re-asks. Running OUT already aborts as drift; having too many
+                        // Scripted mode reports script drift when probe responses remain unused.
                         // was silent.
                         probeResponses: [...goldProbeResponses(), "<answer>spare</answer>"],
                     },
@@ -460,9 +424,7 @@ describe("runScenario (scripted historian)", () => {
             try {
                 const raw = validScenarioRaw();
                 (raw.trigger as Record<string, unknown>).expectedHistorianRuns = 1;
-                // Pressure numbers that can never fire: a huge context limit
-                // keeps the threshold path silent, and near-zero ballast keeps
-                // the transcript below the tail-size trigger. The declared run
+                // modelContextLimit = 10_000_000 prevents the threshold trigger.
                 // cannot fire.
                 (raw.trigger as Record<string, unknown>).modelContextLimit = 10_000_000;
                 (raw.trigger as Record<string, unknown>).spikeUsageTokens = 2_000;
@@ -507,8 +469,8 @@ describe("runScenario (scripted historian)", () => {
                 const record = await runScenario(scenario, {
                     mode: {
                         kind: "scripted",
-                        // Initial, repair, and the fallback-chain terminal
-                        // attempt all produce unusable output.
+                        // The initial, repair, and fallback-chain terminal attempts produce unusable output.
+                        // The initial, repair, and fallback-chain terminal attempts produce unusable output.
                         outputs: ["not a payload", "still not a payload", "never a payload"],
                     },
                     artifactDir: dir,
@@ -540,9 +502,7 @@ describe("runScenario (scripted historian)", () => {
                     mode: {
                         kind: "scripted",
                         outputs: [
-                            // Run 1: two compartments, the second ending flush
-                            // with the chunk end (lookahead margin 0), so the
-                            // boundary-healing heuristic discards it.
+                            // Run 1's second compartment ends at the chunk end, so boundary healing discards it.
                             (range) => {
                                 const mid = Math.floor((range.start + range.end) / 2);
                                 return buildMockHistorianOutput({
@@ -564,7 +524,6 @@ describe("runScenario (scripted historian)", () => {
                 expect(record.historianRuns[0].emittedCompartments).toBe(2);
                 expect(record.historianRuns[0].persistedCompartments).toBe(1);
                 expect(record.historianRuns[1].discardedLast).toBe(false);
-                // Run 2 re-derived the discarded range: facts finally promoted.
                 expect(record.verifiedClaimCount).toBeGreaterThanOrEqual(2);
             } finally {
                 cleanup();

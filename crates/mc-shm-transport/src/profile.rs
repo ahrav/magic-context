@@ -9,7 +9,6 @@ use crate::descriptor::{
     SchedulingMode, TransportDescriptor, WorkloadClass, MAX_SPANS,
 };
 
-/// Producer arbitration topology.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProducerTopology {
     /// Caller owns one SPSC producer lane.
@@ -20,7 +19,6 @@ pub enum ProducerTopology {
     Arbitrated,
 }
 
-/// Worker ownership topology.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerTopology {
     /// Caller publishes and receives directly.
@@ -31,7 +29,6 @@ pub enum WorkerTopology {
     Fused,
 }
 
-/// Completion delivery topology.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionMode {
     /// Caller synchronously pulls completions.
@@ -42,25 +39,24 @@ pub enum CompletionMode {
     TsfnPromise,
 }
 
-/// Resource charges retained for one admitted duplex candidate.
+/// ResourceCharges retains charges for each admitted duplex candidate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceCharges {
-    /// Descriptors across both directions.
+    /// Each candidate charges descriptors across both directions.
     pub descriptors: u64,
-    /// Payload bytes across both directions.
+    /// Each candidate charges payload bytes across both directions.
     pub arena_bytes: u64,
-    /// Maximum spans in one frame.
+    /// The charge records the maximum spans in one frame.
     pub spans_per_frame: u64,
-    /// Receive leases across both directions.
+    /// Each candidate charges receive leases across both directions.
     pub leases: u64,
     /// Shared mappings.
     pub mappings: u64,
-    /// Dedicated workers for hot-active scheduling.
+    /// Hot-active scheduling charges dedicated workers.
     pub pinned_workers: u64,
 }
 
 impl ResourceCharges {
-    /// Empty resource commitment.
     pub const ZERO: Self = Self {
         descriptors: 0,
         arena_bytes: 0,
@@ -85,8 +81,7 @@ impl ResourceCharges {
         Some(Self {
             descriptors: self.descriptors.checked_sub(other.descriptors)?,
             arena_bytes: self.arena_bytes.checked_sub(other.arena_bytes)?,
-            // A maximum, not a sum: release paths recompute it from the
-            // per-admission span counts in `Accounting`.
+            // Release paths recompute `spans_per_frame` from per-admission counts because it is a maximum, not a sum.
             spans_per_frame: self.spans_per_frame,
             leases: self.leases.checked_sub(other.leases)?,
             mappings: self.mappings.checked_sub(other.mappings)?,
@@ -95,31 +90,28 @@ impl ResourceCharges {
     }
 }
 
-/// Inputs validated into an immutable target profile.
+/// ProfileConfig validates inputs into an immutable TargetProfile.
 pub struct ProfileConfig {
-    /// Immutable grant descriptor.
+    /// Grant descriptor.
     pub descriptor: TransportDescriptor,
-    /// Descriptor depth per direction.
+    /// The profile stores descriptor depth per direction.
     pub descriptor_depth: usize,
-    /// Payload bytes per direction.
+    /// The profile stores payload bytes per direction.
     pub arena_bytes: usize,
-    /// Maximum spans per complete frame.
+    /// The profile stores the maximum spans per complete frame.
     pub max_spans: usize,
-    /// Maximum outstanding receive leases per direction.
+    /// The profile stores the maximum outstanding receive leases per direction.
     pub max_leases: usize,
-    /// Shared mappings charged by candidate.
+    /// Each candidate charges shared mappings.
     pub mappings: usize,
-    /// Dedicated workers charged by hot profile.
+    /// The hot profile charges dedicated workers.
     pub pinned_workers: usize,
-    /// Producer ownership topology.
     pub producer_topology: ProducerTopology,
-    /// Worker ownership topology.
     pub worker_topology: WorkerTopology,
-    /// Completion delivery topology.
     pub completion_mode: CompletionMode,
 }
 
-/// Immutable admitted profile dimensions and bounds.
+/// TargetProfile stores immutable admitted dimensions and bounds.
 pub struct TargetProfile {
     descriptor: TransportDescriptor,
     descriptor_depth: usize,
@@ -133,7 +125,6 @@ pub struct TargetProfile {
 }
 
 impl TargetProfile {
-    /// Validates a profile before any candidate object is created.
     pub fn new(config: ProfileConfig) -> Result<Self, ProfileError> {
         if config.descriptor.schema_version() != crate::descriptor::DESCRIPTOR_SCHEMA_VERSION {
             return Err(ProfileError::UnsupportedSchema);
@@ -200,27 +191,25 @@ impl TargetProfile {
         })
     }
 
-    /// Immutable transport descriptor.
     pub const fn descriptor(&self) -> &TransportDescriptor {
         &self.descriptor
     }
 
-    /// Descriptor depth per direction.
+    /// The profile stores descriptor depth per direction.
     pub const fn descriptor_depth(&self) -> usize {
         self.descriptor_depth
     }
 
-    /// Arena bytes per direction.
+    /// The profile stores arena bytes per direction.
     pub const fn arena_bytes(&self) -> usize {
         self.arena_bytes
     }
 
-    /// Maximum spans per frame.
     pub const fn max_spans(&self) -> usize {
         self.max_spans
     }
 
-    /// Outstanding receive leases per direction.
+    /// The profile stores outstanding receive leases per direction.
     pub const fn max_leases(&self) -> usize {
         self.max_leases
     }
@@ -240,7 +229,7 @@ impl TargetProfile {
         self.completion_mode
     }
 
-    /// Host-wide admission charge.
+    /// The charge applies host-wide during admission.
     pub const fn charges(&self) -> ResourceCharges {
         self.charges
     }
@@ -252,14 +241,14 @@ impl fmt::Debug for TargetProfile {
     }
 }
 
-/// Explicit process-wide admission limits.
+/// Admission limits apply process-wide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostLimits {
-    /// Active plus quarantined descriptors.
+    /// The limit counts active and quarantined descriptors.
     pub descriptors: u64,
-    /// Active plus quarantined arena bytes.
+    /// The limit counts active and quarantined arena bytes.
     pub arena_bytes: u64,
-    /// Active plus quarantined receive leases.
+    /// The limit counts active and quarantined receive leases.
     pub leases: u64,
     /// Active plus quarantined mappings.
     pub mappings: u64,
@@ -272,7 +261,6 @@ pub struct HostLimits {
 pub struct VerifiedPhysicalCores(u64);
 
 impl VerifiedPhysicalCores {
-    /// Reads allowed logical CPUs and counts unique package/core pairs.
     #[cfg(target_os = "linux")]
     pub fn detect() -> Option<Self> {
         let allowed = allowed_linux_cpus()?;
@@ -294,13 +282,12 @@ impl VerifiedPhysicalCores {
         (!physical.is_empty()).then_some(Self(physical.len() as u64))
     }
 
-    /// macOS execution is qualified on a designated host; generic builds do not guess affinity.
+    /// Non-Linux builds do not guess affinity.
     #[cfg(not(target_os = "linux"))]
     pub const fn detect() -> Option<Self> {
         None
     }
 
-    /// Verified physical-core count.
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -378,7 +365,6 @@ pub struct AdmissionController {
 }
 
 impl AdmissionController {
-    /// Creates an empty controller with explicit ceilings.
     pub const fn new(limits: HostLimits) -> Self {
         Self {
             limits,
@@ -404,7 +390,6 @@ impl AdmissionController {
             .map(|_| ())
     }
 
-    /// Charges candidate before mappings or workers are created.
     pub fn admit(
         self: &Arc<Self>,
         profile: &TargetProfile,
@@ -518,7 +503,6 @@ enum AdmissionState {
     Quarantined,
 }
 
-/// RAII admission charge returned before candidate setup.
 #[must_use = "admission must remain alive while candidate resources exist"]
 pub struct Admission {
     controller: Arc<AdmissionController>,
@@ -567,12 +551,9 @@ impl fmt::Debug for QuarantineRecord {
     }
 }
 
-/// Invalid target profile.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProfileError {
-    /// Descriptor schema is unsupported.
     UnsupportedSchema,
-    /// Descriptor depth is zero.
     ZeroDescriptorDepth,
     /// Arena cannot hold one legal maximum frame.
     ArenaBelowMinimum,
@@ -586,7 +567,6 @@ pub enum ProfileError {
     InvalidWorkerCharge,
     /// Copied ownership controls cannot become target profiles.
     NonSelectableOwnership,
-    /// Resource charge arithmetic overflowed.
     ChargeOverflow,
 }
 
@@ -614,10 +594,8 @@ impl fmt::Display for ProfileError {
 
 impl std::error::Error for ProfileError {}
 
-/// Host-wide admission rejection.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionError {
-    /// Physical-core topology could not be verified.
     PhysicalCoresUnverified,
     /// Active workers exceed verified or configured physical cores.
     PhysicalCoreBudgetExceeded,
@@ -629,9 +607,8 @@ pub enum AdmissionError {
     LeaseLimit,
     /// Mapping commitment exceeds host limit.
     MappingLimit,
-    /// Resource charge arithmetic overflowed.
     ChargeOverflow,
-    /// Accounting lock was poisoned.
+    /// A prior panic poisoned the accounting lock.
     AccountingUnavailable,
 }
 
@@ -658,7 +635,6 @@ impl fmt::Display for AdmissionError {
 
 impl std::error::Error for AdmissionError {}
 
-/// Builds common selectable ring profile for tests and local tools.
 pub fn ring_profile(
     hardware: HardwareProfileId,
     scheduling: SchedulingMode,

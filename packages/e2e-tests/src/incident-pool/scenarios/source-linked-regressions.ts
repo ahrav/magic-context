@@ -1,18 +1,9 @@
 /**
- * Registered shared drivers for the promoted fixed regressions (U3):
  *
- *   - parity A1 — first-render tag stability on pure-defer growth
- *   - parity A3 — aged ctx_reduce prefix survival on defer growth
- *   - thinking-block green successor — Bug A/B/C of the Anthropic 400 family,
- *     scoped with `auto_search` disabled per the committed adjudication in
+ * Parity A1 verifies first-render tag stability during pure-defer growth.
+ * Parity A3 verifies aged `ctx_reduce` prefix survival during defer growth.
  *     `mutations/thinking-block-adjudication.md`
  *
- * Each regression is a driver returning serializable observations plus a PURE
- * verifier mapping observations to static check IDs and a behavioral verdict.
- * The original Bun suites (`tests/cache-invariants.test.ts`,
- * `tests/thinking-block-safety.test.ts`) remain thin green wrappers over these
- * exports, so one behavioral oracle serves both the ordinary green suite and
- * the incident registry.
  */
 
 import { detectRustPrerequisites } from "../../../scripts/check-rust-prerequisites";
@@ -51,7 +42,7 @@ function resultFromChecks(checks: RegressionCheck[]): RegressionResult {
     };
 }
 
-/** Failed-check IDs, for wrapper assertions and error messages. */
+/* */
 export function failedCheckIds(result: RegressionResult): string[] {
     return result.checks
         .filter((check) => !check.passed)
@@ -59,9 +50,6 @@ export function failedCheckIds(result: RegressionResult): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Parity A1/A3 — first-render tag stability (fixed Rust parity defects).
-// Assumes the wrapper harness uses a 100k model limit with a 20% execute
-// threshold, so this usage keeps every pass a pure defer pass.
 // ---------------------------------------------------------------------------
 
 const DEFER_USAGE = DEFAULT_SCRIPTED_TOOL_USAGE;
@@ -154,7 +142,7 @@ function messageBlocks(message: unknown): Array<Record<string, unknown>> {
     );
 }
 
-/** Require the emitted ctx_reduce use/result pair, not its tool declaration. */
+/** The check requires the emitted `ctx_reduce` use/result pair, not its tool declaration. */
 export function hasCtxReducePair(
     body: Record<string, unknown>,
     callId: string,
@@ -189,7 +177,7 @@ export function hasCtxReducePair(
     return false;
 }
 
-/** Emit a single ctx_reduce tool call on the first main-agent request that exposes it. */
+/* */
 function emitCtxReduceOnce(h: TestHarness, drop: string, callId: string): void {
     let emitted = false;
     h.mock.addMatcher((body) => {
@@ -244,7 +232,7 @@ export async function driveAgedCtxReduceSurvival(
         "A3 turn 2: this turn issues a ctx_reduce call.",
     );
 
-    // Age the ctx_reduce call past the protected window with pure-defer growth.
+    // Pure-defer growth ages the `ctx_reduce` call past the protected window.
     let sawReduceOnWire = false;
     for (let i = 3; i <= 8; i++) {
         h.mock.setDefault({ text: `A3 defer reply ${i}`, usage: DEFER_USAGE });
@@ -288,17 +276,10 @@ export function verifyAgedCtxReduceSurvival(
 }
 
 // ---------------------------------------------------------------------------
-// Thinking-block green successor (Anthropic 400 family, Bug A/B/C).
 // ---------------------------------------------------------------------------
 
 /**
- * Harness options for the thinking-block successor suite. `auto_search` is off
- * because Bug B asserts the dropped paste body is absent from ALL user text.
- * Dropped content intentionally stays searchable, so when the async FTS index
- * catches up in time the auto-search hint quotes an 80-char fragment of the
- * paste back into the next user message — a timing coin-flip that failed 3 of
- * 20 serial runs (see `mutations/thinking-block-adjudication.md`). This suite
- * tests thinking-block safety, not search recall.
+ * The suite disables `auto_search` because the dropped paste body must be absent from all user text.
  */
 export const THINKING_BLOCK_HARNESS_OPTIONS = {
     magicContextConfig: {
@@ -435,7 +416,7 @@ function emitThinkingCtxReduceOnce(h: TestHarness, tag: number): () => boolean {
     return () => emitted;
 }
 
-/** Resolve the public §N§ handle for a message containing `needle`. */
+/** The helper resolves the public §N§ handle for the message containing `needle`. */
 function tagForText(body: Record<string, unknown>, needle: string): number {
     for (const message of messagesOf(body)) {
         if (!Array.isArray(message.content)) continue;
@@ -530,8 +511,8 @@ export async function driveThinkingNudgeAnchor(
     const signedThinking = "Let me work through this carefully step by step.";
     const signature = "opaque-provider-signature-bug-a";
 
-    // Respond with thinking + text so the assistant carries a signed thinking
-    // block; ~46% of 50K keeps the nudge band (reinjectNudgeAtAnchor) live.
+    // The response includes thinking and text so the assistant carries a signed thinking block.
+    // A response at 46% of 50K keeps `reinjectNudgeAtAnchor` live.
     h.mock.setDefault({
         content: [
             { type: "thinking", thinking: signedThinking, signature },
@@ -618,8 +599,7 @@ export function verifyThinkingNudgeAnchor(
             passed: !observation.nudgeMarkerFound,
         },
         {
-            // PARITY.md defines Rust historical reasoning as CLEARED rather
-            // than signature-preserving, so absence is the safe Rust shape.
+            // Rust clears historical reasoning, so the Rust output omits the historical-reasoning signature.
             id: "check-thinking-a-signature-byte-stable",
             passed: observation.rustMode
                 ? observation.rustThinkingBlockCount === 0
@@ -627,12 +607,12 @@ export function verifyThinkingNudgeAnchor(
         },
         {
             id: "check-thinking-a-nonvacuous-inspection",
-            // Rust CLEARS historical reasoning, so zero signature-carrying
-            // assistants is the correct Rust shape and cannot be required. But
-            // the inspection loop skips every assistant in that mode, which
-            // makes the no-nudge and byte-stability checks pass for free when a
-            // regression drops the assistant messages outright. Requiring
-            // candidates to exist restores non-vacuity for both shapes.
+            // Rust clears historical reasoning, so the Rust output omits the historical-reasoning signature.
+            // Rust mode cannot require inspected signed assistants.
+            // Rust clears historical reasoning, so signed-assistant inspection is inapplicable.
+            // The checks require `assistantCandidates > 0` so dropping every assistant cannot pass the no-nudge and byte-stability checks vacuously.
+            // The checks require `assistantCandidates > 0` so dropping every assistant cannot pass the no-nudge and byte-stability checks vacuously.
+            // The checks require `assistantCandidates > 0` so dropping every assistant cannot pass the no-nudge and byte-stability checks vacuously.
             passed:
                 observation.mainRequestCount >= 3 &&
                 observation.assistantCandidates > 0 &&
@@ -710,8 +690,7 @@ export async function driveThinkingDroppedShell(
     const sessionId = await h.createSession();
     await h.sendPrompt(sessionId, "please explain how the drop logic works");
 
-    // A massive user paste that the scenario drops afterwards through its
-    // public §N§ handle, avoiding coupling either mode to its private store.
+    // The public §N§ handle avoids coupling either mode to its private store.
     const paste = `Here is a log of the failing session:\n${"ERROR: call_failed at line 42.\n".repeat(60)}`;
     await h.sendPrompt(sessionId, paste);
 
@@ -727,8 +706,8 @@ export async function driveThinkingDroppedShell(
     const pasteBodyAbsent = !allUserText.includes(
         "ERROR: call_failed at line 42.",
     );
-    // TS keeps the `[dropped §N§]` shell; Rust supersedes covered turns with
-    // one safe published history summary.
+    // TS preserves the `[dropped §N§]` shell; Rust replaces covered turns with one published history summary.
+    // Rust replaces covered turns with one published history summary.
     const shellPreserved = options.rustMode
         ? allUserText.includes("<session-history>")
         : /\[dropped \u00a7\d+\u00a7\]/.test(allUserText);
@@ -738,19 +717,14 @@ export async function driveThinkingDroppedShell(
     if (options.rustMode) {
         signedReplayIntact = thinkings.length === 0;
     } else {
-        // A surviving signed replay must be byte-exact, and at least one must
-        // survive. The original `||` over the signature set was satisfied by
-        // presence alone: the per-block comparisons ran only `for (const t of
-        // thinkings)`, so a signature that was present but corrupted failed
-        // while one that was absent was never examined at all.
+        // The check requires at least one byte-exact signed replay because this drop path retains one signed assistant message.
+        // The check inspects every expected signature because iterating only present blocks cannot detect an absent signature.
+        // Iterating only present blocks cannot detect an absent signature.
+        // Iterating only present blocks cannot detect an absent signature.
+        // Iterating only present blocks cannot detect an absent signature.
         //
-        // Requiring BOTH is the stronger reading, and the pool says it does not
-        // hold: this drop path retains one signed assistant message, so
-        // demanding both turns the adjudicated green baseline into a regression.
-        // That is an adjudication question — either the contract is "both
-        // survive" and this case is misfiled as green, or it is "a survivor is
-        // byte-intact", which is what this encodes — so it is raised in review
-        // rather than decided by tightening a green case into red.
+        // The check requires at least one byte-exact signed replay because this drop path retains one signed assistant message.
+        // The drop path retains one signed assistant message.
         const survivors = [
             { signature: sigA, thinking: signedThinkingA },
             { signature: sigB, thinking: signedThinkingB },
@@ -859,11 +833,10 @@ export async function driveThinkingImageSurvival(
 
     const sessionId = await h.createSession();
 
-    // Drive an OpenCode prompt carrying both text + a file part. The SdkClient
-    // helper is text-only, so call the raw client to include a file part.
+    // The request uses the raw client because SdkClient accepts only text prompts.
+    // The request uses the raw client because the text-only helper cannot include a file part.
     const sdk = await import("@opencode-ai/sdk");
-    // SAFETY: widen the client so the prompt body can include a file part;
-    // the server accepts it even though the published type omits it.
+    // The server accepts file parts although the published prompt type omits them.
     const rawClient = sdk.createOpencodeClient({
         baseUrl: h.opencode.url,
     }) as unknown as {
@@ -884,7 +857,7 @@ export async function driveThinkingImageSurvival(
         };
     };
 
-    // 1x1 transparent PNG data URL.
+    // The fixture uses a 1×1 transparent PNG data URL.
     const imageDataUrl =
         "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 
@@ -904,8 +877,7 @@ export async function driveThinkingImageSurvival(
         },
     });
 
-    // Drop only the text block via its public §N§ handle; the image is a
-    // sibling content block.
+    // The drop targets only the text block through its public §N§ handle because the image is a sibling content block.
     const userTextTag = tagForText(
         mainRequests(h).at(-1)!.body,
         "see this screenshot for the bug",
@@ -916,9 +888,7 @@ export async function driveThinkingImageSurvival(
 
     const allUserBlocks = blocksOfRole(body, "user");
     const imageBlocks = allUserBlocks.filter((b) => b.type === "image");
-    // Counting surviving blocks accepts a REPLACED image: corrupted media data,
-    // a rewritten MIME type, or a re-encoded source all leave one image block
-    // behind. Compare the surviving payload with the one that was sent.
+    // The test compares the surviving image payload with the sent payload because block counts cannot detect replacement, MIME rewrites, or re-encoding.
     const expectedImageBase64 = imageDataUrl.slice(
         imageDataUrl.indexOf(",") + 1,
     );
@@ -959,8 +929,7 @@ export async function driveThinkingImageSurvival(
 export function verifyThinkingImageSurvival(
     observation: ThinkingImageSurvivalObservation,
 ): RegressionResult {
-    // A published Rust history range owns every raw block it covers, so the
-    // summary legitimately supersedes both the text shell and the image.
+    // A Rust history range replaces the text shell and image for every raw block it covers.
     const covered = observation.coveredByRustHistory;
     return resultFromChecks([
         {
@@ -992,28 +961,23 @@ const SOURCE_LINKED_IMPLEMENTATION_FILES = [
     "packages/e2e-tests/src/harness.ts",
     "packages/e2e-tests/src/opencode-runner/spawn.ts",
     "packages/plugin/src/hooks/magic-context/hook-handlers.ts",
-    // The product transform pipeline these cases actually exercise: A1/A3 read
-    // the rendered prefix it emits, and the thinking variants depend on its
-    // replay, shell-drop, and image-preservation behavior. Hashing only the
-    // importing hook file would leave the digest unchanged when this behavior
+    // A1 and A3 read the rendered prefix emitted by `transform.ts`.
+    // `transform.ts` controls replay, shell dropping, and image preservation for the thinking variants.
+    // Include `transform.ts` in the digest; hashing only its importing hook misses transform behavior changes.
     // changes.
     "packages/plugin/src/hooks/magic-context/transform.ts",
     "packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts",
     "packages/plugin/src/hooks/magic-context/strip-content.ts",
-    // The bust oracle itself: `mainAgentRequests`, `findBusts`, and
-    // `formatBustReport` produce mainRequestCount and bustCount directly, so a
-    // change to bust detection alters these verdicts with both digests
+    // Include these helpers in the digest because they determine `mainRequestCount` and `bustCount`.
+    // `mainRequestCount` and `bustCount` can change when bust detection changes without the source-linked or selected-set digest changing.
     // unchanged.
     "packages/e2e-tests/src/cache-analysis.ts",
 ];
 
-// A1 and A3 declare `applicability.harness: "rust"`, so the prefix they judge is
-// produced by the Rust transform, not the TypeScript pipeline above: under
-// `MC_E2E_MODE=rust` the shared harness boots the direct host. Rust tag
-// activation, defer replay, and ctx_reduce retention all live in that file, so
-// without it either verdict can change while the implementation and selected-set
-// digests stay constant. The three thinking variants are canonically OpenCode and
-// keep the shared bundle.
+// `applicability.harness: "rust"` makes A1 and A3 judge the Rust transform's prefix.
+// Under `MC_E2E_MODE=rust`, the shared harness boots the direct host instead of the TypeScript pipeline.
+// `transform.rs` contains Rust tag activation, defer replay, and `ctx_reduce` retention.
+// Include `transform.rs` in the digest because either verdict can otherwise change without changing the selected-set digest.
 const RUST_CACHE_IMPLEMENTATION_FILES = [
     ...SOURCE_LINKED_IMPLEMENTATION_FILES,
     "crates/mc-module/src/transform.rs",

@@ -76,9 +76,6 @@ function summarizePairs(pairs: readonly PairedCaseFact[]): {
             `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
         )
     );
-    // A pair is per execution coordinate, so one case contributes several. Case ids are
-    // deduplicated because the report parser rejects a repeated id, while the pair counts
-    // stay per coordinate.
     const incompletePairs = sortedPairs.filter((pair) => pair.status === "incomplete");
     const incompleteCaseIds = [...new Set(incompletePairs.map((pair) => pair.caseId))];
     const families = [...new Set(sortedPairs.map((pair) => pair.familyId))];
@@ -249,9 +246,8 @@ export function parseProspectiveReport(raw: unknown): ProspectiveReport {
     if (body.scorecardPromotionAllowed && (!body.mandatoryEvidenceComplete || body.hardGateFailures.length > 0)) {
         fail("report.body.scorecardPromotionAllowed: cross-field-invalid");
     }
-    // Case ids are deduplicated while the counts are per coordinate, so the two cannot be
-    // related by subtraction. What must hold is that some case is named incomplete exactly
-    // when some coordinate is incomplete.
+    // `incompleteCaseIds.length` cannot be derived from `pairCount - completePairCount` because one `caseId` can have multiple pairs.
+    // A `caseId` belongs in `incompleteCaseIds` exactly when at least one of its pairs has status `"incomplete"`.
     if ((body.incompleteCaseIds.length > 0) !== (body.prospective.completePairCount < body.prospective.pairCount)) {
         fail("report.body.prospective: incomplete-count-mismatch");
     }
@@ -302,14 +298,6 @@ export function validateProspectiveReportEvidence(
     }
 }
 
-// A report is a snapshot of the analysis at the instant it was written, and the lifecycle
-// permits `reported -> invalidated` after that instant. An epoch invalidated later keeps the
-// promoting report artifact verbatim and repository validation still reports it, so
-// `decision` alone cannot witness that nothing has superseded it. Only these terminal states
-// carry a promoting report: `reported` is the state the report itself records, and
-// `graduated` is the one transition that follows it along the promoting path.
-// `insufficient-evidence` names a report whose decision cannot be `promote`, and every other
-// state either precedes the report or, like `invalidated`, supersedes it.
 const PROMOTABLE_LIFECYCLE_STATES: ReadonlySet<string> = new Set<LifecycleState>([
     "reported",
     "graduated",
@@ -320,10 +308,7 @@ export function releasePromotionAllowed(
     trustVerified: boolean,
     terminalLifecycleState: string,
 ): boolean {
-    // The state arrives as a plain string because repository validation surfaces it as
-    // `Record<string, string>`. Membership is checked against a closed allowlist so an
-    // unrecognized value - including a lifecycle state added later - refuses promotion
-    // instead of widening the gate.
+    // The closed allowlist rejects unknown lifecycle states to prevent them from widening promotion eligibility.
     return trustVerified
         && report.body.decision === "promote"
         && PROMOTABLE_LIFECYCLE_STATES.has(terminalLifecycleState);

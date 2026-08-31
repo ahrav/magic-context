@@ -9,11 +9,9 @@ import {
 } from "./embedding-local";
 import { computeNormalizedHash } from "./normalize-hash";
 
-// Part A of issue #128: classify the PERMANENT "native runtime not installed"
-// failure so the provider degrades once (one actionable log line) instead of
-// re-importing transformers and re-spamming the cryptic resolver error on every
-// embedding. The discriminator must catch the missing-package shapes WITHOUT
-// swallowing transient load errors (protobuf/EBUSY) or unrelated failures.
+// When the native runtime is missing, the provider degrades once and emits one log line.
+// The provider must not retry importing Transformers or repeat the resolver error for each embedding.
+// The discriminator must recognize missing-package errors without classifying transient or unrelated load errors as missing runtime.
 describe("isNativeRuntimeMissingError", () => {
     test("Bun resolver: Cannot find package 'onnxruntime-node'", () => {
         expect(
@@ -48,9 +46,6 @@ describe("isNativeRuntimeMissingError", () => {
     });
 
     test("a generic 'cannot find module' for some OTHER package is not our runtime", () => {
-        // Must mention onnxruntime-node specifically — a different missing module
-        // (e.g. a user mis-config) should surface its own error, not be masked as
-        // the runtime-missing degrade.
         const err = Object.assign(new Error("Cannot find package 'left-pad'"), {
             code: "ERR_MODULE_NOT_FOUND",
         });
@@ -63,9 +58,7 @@ describe("isNativeRuntimeMissingError", () => {
         expect(isNativeRuntimeMissingError("onnxruntime-node")).toBe(false);
     });
 
-    // #7: the package IS installed but its native binary fails to dlopen — e.g.
-    // Windows missing the VC++ runtime. The error names the binding file (path
-    // contains "onnxruntime") with code ERR_DLOPEN_FAILED, not "onnxruntime-node".
+    // A native binding load failure can use `ERR_DLOPEN_FAILED` and name `onnxruntime` rather than `onnxruntime-node`.
     test("ERR_DLOPEN_FAILED on the onnxruntime binding IS missing-runtime", () => {
         const err = Object.assign(
             new Error(
@@ -93,10 +86,9 @@ describe("isNativeRuntimeMissingError", () => {
     });
 });
 
-// Issue #259: the local embedding provider must thread a configured dtype into
-// the transformers.js pipeline AND fold it into the model identity so switching
-// dtype re-embeds rather than mixing vector spaces. The default (no dtype) must
-// produce the byte-identical identity as before this field existed.
+// The provider passes configured `dtype` to the Transformers.js pipeline and includes it in the model identity.
+// Changing `dtype` changes the identity, preventing mixed vector spaces.
+// No configured dtype preserves the provider-and-model identity.
 describe("LocalEmbeddingProvider dtype threading (#259)", () => {
     test("default constructor (no dtype) keeps the golden identity", () => {
         const provider = new LocalEmbeddingProvider();
@@ -125,7 +117,7 @@ describe("LocalEmbeddingProvider dtype threading (#259)", () => {
             "q8" as LocalEmbeddingDtype,
         );
         expect(q8.modelId).not.toBe(noDtype.modelId);
-        // And it must equal the identity computed with local_dtype folded in.
+        // The default local embedding identity equals the identity with `local_dtype` folded in.
         const expected = getEmbeddingProviderIdentity({
             provider: "local",
             model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
@@ -149,20 +141,16 @@ describe("LocalEmbeddingProvider dtype threading (#259)", () => {
     });
 });
 
-// A model's pooling and query instruction come from its own card; applying the
-// wrong ones still produces plausible vectors with quietly wrong rankings, so
-// the recipe is bound to the model id and exercised through the provider's real
-// embed paths here. `initialize()` returns early when a pipeline is already
-// present, which lets these tests inject a recording fake without a new seam.
+// A model's pooling and query instruction come from its own card.
+// Applying another model's pooling or query instruction changes the produced vectors.
 describe("local embedding recipes", () => {
     const BGE_MODEL = "Xenova/bge-small-en-v1.5";
     const BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
 
-    /** The identity string a local config produced before recipes existed:
-     *  provider + model only. Unlisted models must still hash to exactly this
-     *  (no global re-embed from shipping the recipe feature), while a
-     *  recipe-bound model must NOT — its recipe changes the produced vectors,
-     *  so vectors stored under the pre-recipe identity are a different space. */
+    /** An identity without a recipe contains only the provider and model.
+     * Unlisted models hash to the provider-and-model identity.
+     * A recipe-bound model needs a distinct identity because its recipe changes the produced vectors.
+     * */
     const preRecipeIdentity = (model: string): string =>
         `embedding-provider:${computeNormalizedHash(
             JSON.stringify({

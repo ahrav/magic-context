@@ -48,13 +48,13 @@ describe("migrateConfigFile (location migration)", () => {
             const target = join(dir, ".cortexkit", "magic-context.jsonc");
             const legacy = join(dir, "magic-context.jsonc");
             writeFileSync(legacy, '{"enabled":false}');
-            // A leftover lock dir from a crashed holder, aged past the stale
-            // threshold. The non-blocking lock removes it and re-attempts mkdir
-            // once (no busy-wait, no synchronous sleep), so migration proceeds
-            // and init is never frozen.
+            // The lock directory simulates a crashed holder.
+            // The lock directory's mtime exceeds CONFIG_LOCK_STALE_MS (4 s).
+            // The non-blocking lock retries mkdir once after removal.
+            // Migration proceeds without waiting for the lock.
             const lockDir = `${target}.lock`;
             mkdirSync(lockDir, { recursive: true });
-            // Backdate the lock dir's mtime well past CONFIG_LOCK_STALE_MS (4s).
+            // 60 s exceeds CONFIG_LOCK_STALE_MS (4 s).
             const old = Date.now() - 60_000;
             utimesSync(lockDir, new Date(old), new Date(old));
             const start = Date.now();
@@ -64,7 +64,6 @@ describe("migrateConfigFile (location migration)", () => {
                 legacySources: [src(legacy)],
             });
             const elapsed = Date.now() - start;
-            // Effectively instant — no timeout budget is ever waited.
             expect(elapsed).toBeLessThan(1_000);
             expect(r.migrated).toBe(true);
             expect(existsSync(target)).toBe(true);
@@ -79,10 +78,7 @@ describe("migrateConfigFile (location migration)", () => {
             const target = join(dir, ".cortexkit", "magic-context.jsonc");
             const legacy = join(dir, "magic-context.jsonc");
             writeFileSync(legacy, '{"enabled":false}');
-            // A FRESH lock dir (live holder, not stale): we must not block waiting
-            // for it — return immediately with migrated:false and leave the
-            // target absent (the loader read-legacy-on-conflict covers this run;
-            // the next init retries once the holder releases).
+            // A fresh lock represents a live holder, so migration skips this run without waiting.
             mkdirSync(`${target}.lock`, { recursive: true });
             const start = Date.now();
             const r = migrateConfigFile({
@@ -116,11 +112,10 @@ describe("migrateConfigFile (location migration)", () => {
 
             expect(r.migrated).toBe(true);
             expect(r.conflict).toBe(false);
-            // Content is at the target...
             expect(readFileSync(target, "utf8")).toContain("enabled");
-            // ...the legacy file is gone (idempotency comes from this)...
+            // Removing the legacy file makes migration idempotent.
             expect(existsSync(legacy)).toBe(false);
-            // ...and a human breadcrumb preserves the original below a header.
+            // The marker preserves the legacy content below a header.
             const marker = `${legacy}.MOVED_READPLEASE`;
             expect(existsSync(marker)).toBe(true);
             const markerText = readFileSync(marker, "utf8");
@@ -158,7 +153,6 @@ describe("migrateConfigFile (location migration)", () => {
         try {
             const target = join(dir, ".cortexkit", "magic-context.jsonc");
             mkdirSync(join(dir, ".cortexkit"), { recursive: true });
-            // Target = pretty-printed; legacy = compact + comment + reordered keys.
             writeFileSync(target, '{\n  "protected_tags": 5,\n  "cache_ttl": "1h"\n}\n');
             const legacy = join(dir, ".opencode", "magic-context.jsonc");
             mkdirSync(join(dir, ".opencode"), { recursive: true });
@@ -172,7 +166,6 @@ describe("migrateConfigFile (location migration)", () => {
 
             expect(r.migrated).toBe(false);
             expect(r.conflict).toBe(false);
-            // Target untouched (not overwritten), legacy moved aside.
             expect(readFileSync(target, "utf8")).toContain('"protected_tags": 5');
             expect(existsSync(legacy)).toBe(false);
             expect(existsSync(`${legacy}.MOVED_READPLEASE`)).toBe(true);
@@ -200,7 +193,7 @@ describe("migrateConfigFile (location migration)", () => {
             expect(r.conflict).toBe(true);
             expect(r.migrated).toBe(false);
             expect(r.warnings.join("\n")).toContain("already exists with different settings");
-            // BOTH left as-is for manual reconciliation — never auto-clobbered.
+            // Migration leaves both files unchanged for manual reconciliation.
             expect(readFileSync(target, "utf8")).toContain('"protected_tags": 5');
             expect(readFileSync(legacy, "utf8")).toContain('"protected_tags": 9');
             expect(existsSync(`${legacy}.MOVED_READPLEASE`)).toBe(false);
@@ -229,7 +222,7 @@ describe("migrateConfigFile (location migration)", () => {
             expect(r.conflict).toBe(true);
             expect(r.migrated).toBe(false);
             expect(existsSync(target)).toBe(false);
-            // Neither moved aside — user reconciles by hand.
+            // Migration leaves both files in place for manual reconciliation.
             expect(existsSync(a)).toBe(true);
             expect(existsSync(b)).toBe(true);
         } finally {
@@ -268,7 +261,6 @@ describe("resolveLegacyConfigSources", () => {
     it("includes the bare-root project source unique to Magic Context", () => {
         const sources = resolveLegacyConfigSources("/proj");
         const projectPaths = sources.project.map((s) => s.path);
-        // bare root + .opencode + .pi, each in {.jsonc,.json}
         expect(projectPaths).toContain("/proj/magic-context.jsonc");
         expect(projectPaths).toContain("/proj/magic-context.json");
         expect(projectPaths).toContain("/proj/.opencode/magic-context.jsonc");
@@ -287,10 +279,8 @@ describe("resolveLegacyConfigSources", () => {
     });
 
     it("never lists a user-scope config as a project source when the project dir is the CortexKit config home", () => {
-        // Regression: opencode opened with cwd = ~/.config/cortexkit made the
-        // bare-root project source `<root>/magic-context.jsonc` collide with the
-        // USER config, so the project migration ate the user config into
-        // `<root>/.cortexkit/` and left the user on schema defaults.
+        // Project migration must exclude the user config path when cwd is ~/.config/cortexkit.
+        // The bare-root project source must not resolve to the user config path.
         const prev = process.env.XDG_CONFIG_HOME;
         const home = tmp();
         try {
@@ -298,10 +288,9 @@ describe("resolveLegacyConfigSources", () => {
             const cortexkitHome = join(home, "cortexkit");
             const sources = resolveLegacyConfigSources(cortexkitHome);
             const projectPaths = sources.project.map((s) => s.path);
-            // The user config path must NOT be a project migration source.
             expect(projectPaths).not.toContain(join(cortexkitHome, "magic-context.jsonc"));
             expect(projectPaths).not.toContain(join(cortexkitHome, "magic-context.json"));
-            // The genuine project subdir sources are still present.
+            // Exclusion retains the .opencode and .pi project sources.
             expect(projectPaths).toContain(join(cortexkitHome, ".opencode", "magic-context.jsonc"));
             expect(projectPaths).toContain(join(cortexkitHome, ".pi", "magic-context.jsonc"));
         } finally {
@@ -312,8 +301,8 @@ describe("resolveLegacyConfigSources", () => {
     });
 
     it("never lists the OpenCode/Pi user legacy paths as project sources when the project dir is the user config dir", () => {
-        // Same collision class for a project opened directly in ~/.config/opencode
-        // (bare-root would resolve to the OpenCode user legacy config).
+        // When the project root is ~/.config/opencode, migration must exclude the bare-root legacy path.
+        // At ~/.config/opencode, the bare-root path resolves to the OpenCode user legacy config.
         const prev = process.env.XDG_CONFIG_HOME;
         const home = tmp();
         try {

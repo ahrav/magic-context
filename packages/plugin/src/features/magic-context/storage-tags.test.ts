@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";
@@ -145,7 +144,6 @@ describe("storage-tags", () => {
 
         it("#then skips trivially-small sized outputs below the token floor", () => {
             db = makeMemoryDatabase();
-            // tiny control-plane outputs (ctx_reduce/bash_status) below the floor
             insertTag(db, "ses-floor", "msg-1", "tool", 50, 1, 0, "ctx_reduce", 0, null, null, {
                 tokenCount: 40,
                 inputTokenCount: 0,
@@ -156,7 +154,6 @@ describe("storage-tags", () => {
                 inputTokenCount: 0,
                 reasoningTokenCount: 0,
             });
-            // a real, reclaimable bash output above the floor
             insertTag(db, "ses-floor", "msg-3", "tool", 9000, 3, 0, "bash", 0, null, null, {
                 tokenCount: 2300,
                 inputTokenCount: 0,
@@ -170,7 +167,6 @@ describe("storage-tags", () => {
 
         it("#then keeps tags with NO cached token count (cannot size → never hidden by the floor)", () => {
             db = makeMemoryDatabase();
-            // This insertTag call supplies only a byte size (no token counts), leaving token_count and input_token_count NULL.
             insertTag(db, "ses-null", "msg-1", "tool", 5000, 1, 0, "read");
 
             const hints = getOldestActiveUnprotectedToolTags(db, "ses-null", 0, 4);
@@ -383,11 +379,6 @@ describe("storage-tags", () => {
         });
     });
 
-    // P0 perf: targeted helpers for the hot transform path.
-    // Each test asserts a) the new helper returns an equivalent slice
-    // of getTagsBySession, b) it filters correctly when dropped/compacted
-    // tags exist alongside active ones, and c) it never silently
-    // mis-translates fields (status, type, dropMode, etc).
 
     describe("#given getActiveTagsBySession", () => {
         it("#when session has mixed statuses #then returns only active rows", () => {
@@ -491,8 +482,7 @@ describe("storage-tags", () => {
 
         it("#when list exceeds 900 entries #then chunks transparently", () => {
             db = makeMemoryDatabase();
-            // SQLite parameter limit is 999. Helper chunks at 900.
-            // Insert 1500 tags and request all 1500 numbers in one call.
+            // chunkNumbers uses chunks of 900 to stay below SQLite's 999-parameter limit.
             for (let i = 1; i <= 1500; i++) {
                 insertTag(db, "ses-1", `msg-${i}`, "message", 10, i);
             }
@@ -501,7 +491,6 @@ describe("storage-tags", () => {
             const slice = getTagsByNumbers(db, "ses-1", tagNumbers);
 
             expect(slice).toHaveLength(1500);
-            // Sanity: returned tag numbers exactly match the requested set.
             expect(new Set(slice.map((t) => t.tagNumber))).toEqual(new Set(tagNumbers));
         });
 
@@ -519,7 +508,6 @@ describe("storage-tags", () => {
                 targetNumbers.includes(t.tagNumber),
             );
 
-            // Order matches by ORDER BY tag_number ASC, id ASC in both.
             expect(fromHelper).toEqual(fromFull);
         });
     });
@@ -559,8 +547,6 @@ describe("storage-tags", () => {
 
             const rows = getDroppedTagsByNumbers(db, "ses-1", [1, 2, 3, 4, 5, 6]);
 
-            // This exact set makes the status predicate observable: removing
-            // `status = 'dropped'` leaks active tag 1 and compacted tag 6.
             expect(rows.map((tag) => tag.tagNumber)).toEqual([2, 3, 4, 5]);
             expect(rows.map((tag) => [tag.type, tag.dropMode])).toEqual([
                 ["message", "full"],
@@ -619,14 +605,12 @@ describe("storage-tags", () => {
 
         it("#when active and compacted tags have higher numbers #then they're ignored", () => {
             db = makeMemoryDatabase();
-            // tag_number 3 dropped, tag_number 5 active, tag_number 7 compacted
             const a = insertTag(db, "ses-1", "msg-a", "tool", 100, 3);
             insertTag(db, "ses-1", "msg-b", "message", 200, 5);
             const c = insertTag(db, "ses-1", "msg-c", "tool", 100, 7);
             updateTagStatus(db, "ses-1", a, "dropped");
             updateTagStatus(db, "ses-1", c, "compacted");
 
-            // The MAX over status='dropped' is 3, not 5 or 7.
             expect(getMaxDroppedTagNumber(db, "ses-1")).toBe(3);
         });
 
@@ -650,7 +634,6 @@ describe("storage-tags", () => {
             updateTagStatus(db, "ses-1", b, "dropped");
 
             const fromHelper = getMaxDroppedTagNumber(db, "ses-1");
-            // Reproduce the exact watermark loop the new helper replaces.
             let watermark = 0;
             for (const tag of getTagsBySession(db, "ses-1")) {
                 if (tag.status === "dropped" && tag.tagNumber > watermark) {
@@ -665,7 +648,6 @@ describe("storage-tags", () => {
     describe("#given Pi fallback-tag adoption", () => {
         it("#when a fallback tag matches by fingerprint #then migrates message_id keeping tag_number", () => {
             db = makeMemoryDatabase();
-            // Fallback-id tag (pass 1: in-flight message under pi-msg-*).
             insertTag(
                 db,
                 "ses-1",
@@ -692,10 +674,10 @@ describe("storage-tags", () => {
                 "real-entry-abc:p0",
             );
             expect(migrated).toBe(true);
-            // tag_number preserved; message_id migrated to the real id.
+            // adoptFallbackTagMessageId preserves tag_number and replaces message_id with the real ID.
             const tag = getTagById(db, "ses-1", 1);
             expect(tag?.messageId).toBe("real-entry-abc:p0");
-            // No longer adoptable (message_id is now a real id, not pi-msg-*).
+            // A tag with a real message_id is not adoptable.
             expect(findAdoptableFallbackTags(db, "ses-1", "FP-A")).toHaveLength(0);
         });
 
@@ -727,8 +709,7 @@ describe("storage-tags", () => {
                 null,
                 "DUP",
             );
-            // The lookup returns both; the adoption pre-pass applies its
-            // unique-base-id guard and skips when >1 distinct base id matches.
+            // The guard skips adoption when more than one distinct base ID matches.
             expect(findAdoptableFallbackTags(db, "ses-1", "DUP")).toHaveLength(2);
         });
 
@@ -747,8 +728,7 @@ describe("storage-tags", () => {
                 null,
                 "FP-R",
             );
-            // Old value in the WHERE clause doesn't match (sibling already
-            // migrated it) → changes === 0 → false.
+            // adoptFallbackTagMessageId returns false when its UPDATE matches no row.
             const migrated = adoptFallbackTagMessageId(
                 db,
                 "ses-1",
@@ -763,7 +743,6 @@ describe("storage-tags", () => {
         it("#when a real-id tag exists with a fingerprint #then it is never an adoption candidate", () => {
             db = makeMemoryDatabase();
             // A real-id tag that happens to carry a fingerprint must not match
-            // (only pi-msg-* shaped rows are adoptable).
             insertTag(db, "ses-1", "real-entry-x:p0", "message", 100, 1, 0, null, 0, null, "FP-X");
             expect(findAdoptableFallbackTags(db, "ses-1", "FP-X")).toHaveLength(0);
         });
@@ -796,7 +775,6 @@ describe("storage-tags", () => {
             insertToolTag(db, "ses-1", 2, 200);
             insertToolTag(db, "ses-1", 3, 300); // protected (top 2)
             insertToolTag(db, "ses-1", 4, 400); // protected (top 2)
-            // only tags 1 and 2 are reclaimable: 100 + 200 = 300
             expect(getActiveTagTokenAggregate(db, "ses-1", 2).toolOutput).toBe(300);
         });
 
@@ -804,7 +782,6 @@ describe("storage-tags", () => {
             db = makeMemoryDatabase();
             insertToolTag(db, "ses-1", 1, 100);
             insertToolTag(db, "ses-1", 2, 200);
-            // all 2 tags are within the protected window of 20 → reclaimable 0
             expect(getActiveTagTokenAggregate(db, "ses-1", 20).toolOutput).toBe(0);
         });
 
@@ -816,7 +793,7 @@ describe("storage-tags", () => {
             const agg = getActiveTagTokenAggregate(db, "ses-1", 2);
             // toolCall counts ALL tool output (+input) regardless of protection
             expect(agg.toolCall).toBe(600);
-            // but reclaimable toolOutput excludes the protected top-2
+            // Reclaimable toolOutput excludes the protected top-2 tags.
             expect(agg.toolOutput).toBe(100);
         });
     });

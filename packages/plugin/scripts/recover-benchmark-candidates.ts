@@ -1,20 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Recover historical benchmark query candidates from the measurement corpus.
  *
- * Query-only over one stable read snapshot per database (a read transaction
- * is held on both connections across all reads): joins measurement rows to
- * `session_projects` ownership in bounded keyset pages, reconstructs
- * candidate queries from OpenCode session history with the same helpers the
- * live paths use (one session hydrated at a time, its raw messages released
- * after candidate extraction), and accepts a plaintext only when exactly one
- * same-session candidate matches the stored normalized hash with one
- * unambiguous mode. Raw text and hashes stay in memory; the only outputs are
- * a privacy-gated draft and an allowlisted status/count report, written
- * atomically to an owner-only staging directory outside every source,
- * publication, and VCS tree. Recovery has no import edge to promotion.
  *
- * Usage: bun packages/plugin/scripts/recover-benchmark-candidates.ts
  */
 
 import {
@@ -98,27 +85,18 @@ export interface RecoveryDraft {
     records: DraftRecord[];
 }
 
-/** Candidate queries from one session's raw history, in message order,
- *  through the same extraction the live automatic and explicit paths use. */
+/**
+ * */
 export function collectSessionCandidates(
     messages: readonly RawMessage[],
     options: {
-        /** Message ids with persisted evidence that the automatic path ran
-         *  past its gates (a recorded hint/no-hint decision other than
-         *  stacked/too-short). When provided, only those messages yield
-         *  automatic candidates: configuration-dependent gates (auto-search
-         *  disabled, minPromptChars) cannot be re-derived from text alone,
-         *  and guessing records phantom automatic candidates. */
+        /**
+         * */
         autoSearchRanMessageIds?: ReadonlySet<string>;
     } = {},
 ): QueryCandidate[] {
     const candidates: QueryCandidate[] = [];
     for (const message of messages) {
-        // Same eligibility gates as the live automatic path: messages that
-        // are ignored/system-directive-only or already carry a stacked
-        // augmentation never ran auto-search in production, so recording
-        // them here could misclassify a same-text explicit measurement as
-        // mode-ambiguous or recover it under the wrong mode.
         if (
             message.role === "user" &&
             hasMeaningfulUserText(message.parts) &&
@@ -134,10 +112,6 @@ export function collectSessionCandidates(
                 if (auto.length > 0) candidates.push({ text: auto, mode: "automatic" });
             }
         }
-        // Tool calls are assistant turns. The paged history reader keeps a
-        // malformed-parent row as role "unknown" (the full reader dropped
-        // it), so gating on the role keeps paging from changing candidate
-        // semantics — and a ctx_search part under any other role is not a
         // production shape.
         if (message.role !== "assistant") continue;
         for (const part of message.parts) {
@@ -146,12 +120,6 @@ export function collectSessionCandidates(
             if (p.type !== "tool" || p.tool !== CTX_SEARCH_TOOL_NAME) continue;
             const state = p.state as Record<string, unknown> | null;
             if (!state || typeof state !== "object") continue;
-            // Only completed calls: pending, running, canceled, and errored
-            // parts never executed a search, so their input must not become
-            // an explicit candidate. A completed call whose output is an
-            // error string resolved before (or instead of) the measured
-            // search path — project-resolution and bounds failures return
-            // early with "Error: ..." — so it is no candidate either.
             if (state.status !== "completed") continue;
             if (typeof state.output === "string" && state.output.startsWith("Error:")) {
                 continue;
@@ -160,10 +128,6 @@ export function collectSessionCandidates(
             if (input === null || typeof input !== "object") continue;
             const preflight = extractCtxSearchQueryInput(input as CtxSearchArgs);
             if (preflight.ok && preflight.query.length > 0) {
-                // ID-shaped queries can short-circuit to direct memory
-                // lookup without ever reaching the measurement-producing
-                // search path; whether they measured is unknowable from
-                // history, so they are never candidates.
                 if (parseIdShapedQuery(preflight.query) !== null) continue;
                 candidates.push({ text: preflight.query, mode: "explicit" });
             }
@@ -195,25 +159,20 @@ const OWNERSHIP_STATUS = {
 } as const;
 
 /**
- * Pure matching core. `hashCandidate` is injectable only so tests can force
- * the defensive hash-collision arm; production always uses
+ * `hashCandidate` permits testing hash collisions; it defaults to `normalizedQueryHash`.
  * `normalizedQueryHash`.
  */
 export function recoverCandidates(args: {
     rows: readonly RecoveryInputRow[];
     candidatesBySession: ReadonlyMap<string, readonly QueryCandidate[]>;
-    /** Candidate hashes known beyond `candidatesBySession` (a streaming
-     *  caller passes the full union while supplying only row-referenced
-     *  candidates per session), so cross-session-only vs zero-match stays
-     *  exact under bounded retention. */
+    /** `knownHashes` distinguishes cross-session-only hashes from zero-match hashes when `candidatesBySession` is bounded.
+     * */
     knownHashes?: ReadonlySet<string>;
-    /** Substring deny list (home paths, operator codenames) rejected
-     *  wherever it appears in candidate text. The privacy scan itself is
-     *  host-independent, so author-host identity must be supplied here — at
-     *  authoring time — or it is never checked. */
+    /** `forbiddenTokens` rejects candidates containing any listed substring.
+     * */
     forbiddenTokens?: readonly string[];
-    /** Word-bounded deny list (usernames): rejects standalone occurrences
-     *  only, so a short username does not reject every word containing it. */
+    /**
+     * `forbiddenIdentifiers` rejects standalone, word-bounded occurrences so short identifiers do not match substrings. */
     forbiddenIdentifiers?: readonly string[];
     hashCandidate?: (text: string) => string;
 }): RecoveryOutcome {
@@ -226,9 +185,7 @@ export function recoverCandidates(args: {
             const hash = hashCandidate(candidate.text);
             allHashes.add(hash);
             const list = byHash.get(hash) ?? [];
-            // Dedupe on (text, mode): one text seen as both an automatic
-            // prompt and an explicit tool call keeps both entries, so mode
-            // provenance is classified instead of resolved by message order.
+            // Deduplication preserves entries with identical text and different modes so provenance does not depend on message order.
             if (
                 !list.some(
                     (existing) =>
@@ -266,8 +223,6 @@ export function recoverCandidates(args: {
         if (matches.length > 1) {
             const texts = new Set(matches.map((m) => m.text));
             if (texts.size === 1) {
-                // Identical text under differing modes: provenance selects
-                // the replay path, so guessing one is not allowlisted.
                 record(row.ordinal, "mode-ambiguous");
             } else if (matches.every((m) => normalizedCompare(m.text, matches[0].text))) {
                 record(row.ordinal, "normalized-collision");
@@ -302,10 +257,7 @@ export function recoverCandidates(args: {
 export class StagingError extends Error {}
 
 /**
- * Owner-only staging root outside every forbidden tree. Rejects roots whose
- * path traverses any symlink component (the realpath must equal the path as
- * given), roots not owned by the calling user, group/other-accessible modes,
- * and any root under a VCS worktree or a caller-named forbidden path.
+ * The staging root must be caller-owned and outside every forbidden tree.
  */
 export function ensureStagingRoot(root: string, forbiddenRoots: readonly string[]): string {
     if (!isAbsolute(root)) throw new StagingError("staging root must be absolute");
@@ -326,9 +278,8 @@ export function ensureStagingRoot(root: string, forbiddenRoots: readonly string[
         throw new StagingError("staging root must be owner-only");
     }
     if (hasGitAncestor(real)) throw new StagingError("staging root is inside a VCS tree");
-    // Component-aware containment with the platform separator: string-prefix
-    // checks with a literal "/" miss descendant/ancestor overlaps on
-    // Windows, where realpath returns backslash-separated paths.
+    // Containment checks must use the platform separator because `realpath` uses backslashes on Windows.
+    // Literal `/` containment checks miss descendant and ancestor overlaps on Windows.
     const contains = (parent: string, child: string): boolean => {
         const rel = relative(parent, child);
         return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
@@ -340,9 +291,8 @@ export function ensureStagingRoot(root: string, forbiddenRoots: readonly string[
         } catch {
             continue;
         }
-        // Both directions: a staging root BELOW a forbidden tree could leak
-        // drafts into it, and a staging root ABOVE one would let the stale-
-        // draft purge recursively delete the forbidden tree as an old entry.
+        // A staging root below a forbidden tree could leak drafts into that tree.
+        // A staging root above a forbidden tree lets stale-draft purging recursively delete that tree as an old entry.
         if (contains(forbiddenReal, real)) {
             throw new StagingError("staging root overlaps a forbidden tree");
         }
@@ -353,7 +303,7 @@ export function ensureStagingRoot(root: string, forbiddenRoots: readonly string[
     return real;
 }
 
-/** Exclusive temp file + rename; destination must not already exist. */
+/** The writer creates an exclusive temporary file and never overwrites an existing destination. */
 export function writeStagedFileAtomically(root: string, name: string, content: string): string {
     const destination = join(root, name);
     if (existsSync(destination) || lstatSync(root).isSymbolicLink()) {
@@ -363,9 +313,8 @@ export function writeStagedFileAtomically(root: string, name: string, content: s
     let fd: number | null = null;
     try {
         fd = openSync(temp, "wx", 0o600);
-        // writeSync can return short without throwing (signal interruption,
-        // filesystem pressure); publishing a truncated draft would silently
-        // lose records, so loop until every encoded byte is persisted.
+        // writeSync can return fewer bytes than requested without throwing.
+        // The writer loops until `writeSync` persists every encoded byte because `writeSync` can return a short write without throwing.
         const bytes = Buffer.from(content, "utf8");
         let written = 0;
         while (written < bytes.length) {
@@ -389,9 +338,8 @@ export function writeStagedFileAtomically(root: string, name: string, content: s
     return destination;
 }
 
-/** Delete recovery-owned staged entries (`run-*` directories and their
- *  legacy flat-file predecessors) older than the TTL. Anything else in the
- *  root is not ours to remove, even in an otherwise-valid staging root. */
+/** The purger deletes only recovery-owned `run-*` directories and legacy flat-file entries older than the TTL.
+ * Recovery never removes the staging root. */
 export function purgeStaleDrafts(root: string, nowMs: number, ttlMs = DRAFT_TTL_MS): void {
     let entries: string[];
     try {
@@ -403,9 +351,8 @@ export function purgeStaleDrafts(root: string, nowMs: number, ttlMs = DRAFT_TTL_
         const path = join(root, entry);
         try {
             const stat = lstatSync(path);
-            // Recovery-generated entries only: mkdtemp appends exactly six
-            // characters to the "run-" prefix and creates a directory, so a
-            // shared root's "run-notes.txt" or "run-production" is not ours.
+            // Recovery owns only directories whose names are `run-` followed by exactly six characters.
+            // `mkdtemp` creates a directory named `run-` plus exactly six characters.
             const isRunDir = /^run-[A-Za-z0-9]{6}$/.test(entry) && stat.isDirectory();
             const isLegacyDraft =
                 (entry === "draft.json" || entry === "report.json") && stat.isFile();
@@ -414,16 +361,15 @@ export function purgeStaleDrafts(root: string, nowMs: number, ttlMs = DRAFT_TTL_
                 rmSync(path, { force: true, recursive: true });
             }
         } catch {
-            /* raced with another purge */
+            /* */
         }
     }
 }
 
-/** Canonicalized so the symlink-alias staging check holds on platforms whose
- *  temp directory itself sits behind a symlink (macOS `/var` -> `/private/var`).
- *  Namespaced by effective UID: on a shared /tmp, one account's 0700 root
- *  would otherwise fail every other account's caller-ownership check (or be
- *  pre-created to deny recovery outright). */
+/** The staging path is canonicalized so symlink-alias checks work when macOS maps `/var` to `/private/var`.
+ * The default staging root includes the effective UID so callers sharing `/tmp` use separate roots.
+ * Without UID namespacing, one account's `0700` root would fail other accounts' caller-ownership checks.
+ * Without UID namespacing, another account could pre-create the shared root and prevent recovery. */
 export function defaultStagingRoot(): string {
     const owner = typeof process.getuid === "function" ? String(process.getuid()) : "user";
     return join(realpathSync.native(tmpdir()), `magic-context-benchmark-drafts-${owner}`);
@@ -435,7 +381,7 @@ const REQUIRED_TABLES: Record<string, readonly string[]> = {
     session_meta: ["session_id", "auto_search_hint_decisions"],
 };
 
-/** Validate schema and bounded row shapes before any reconstruction. */
+/** Malformed rows must not produce reconstructed records. */
 export function validateMeasurementSchema(db: Database): void {
     for (const [table, columns] of Object.entries(REQUIRED_TABLES)) {
         const present = db
@@ -469,12 +415,12 @@ export function boundedRowsOrThrow(
     });
 }
 
-/** Keyset page size for the measurement-corpus read. Bounds the per-query
- *  buffer; the read transaction held across pages keeps them one snapshot. */
+/**
+ * The read transaction spans all pages, so buffered rows come from one snapshot. */
 const MEASUREMENT_PAGE_SIZE = 5_000;
 
-/** Page size for raw session history. One long-lived session's messages and
- *  parts are unbounded by the measurement cap, so hydration pages too. */
+/**
+ * The hydrator pages messages and parts because one long-lived session can exceed the measurement cap. */
 const HISTORY_PAGE_SIZE = 200;
 
 interface HistoryPageKey {
@@ -483,11 +429,10 @@ interface HistoryPageKey {
 }
 
 /**
- * Keyset page of one session's raw messages, ordered like the shared
- * readers (time_created, id). LIMIT/OFFSET paging would re-skip the whole
- * preceding history per page — quadratic in exactly the long sessions
- * paging exists for — so the cursor is the ordering key itself. Candidate
- * extraction never consumes ordinals, so they are filled positionally.
+ * The message reader keyset-pages each session by `(time_created, id)`, matching the shared readers' order.
+ * The reader uses `(time_created, id)` keyset paging because LIMIT/OFFSET rescans preceding rows for every page.
+ * `LIMIT/OFFSET` would rescan all preceding messages for every page, making long sessions quadratic.
+ * Candidate extraction never consumes ordinals, so records fill them positionally.
  */
 function readHistoryPageByKey(
     db: Database,
@@ -495,11 +440,8 @@ function readHistoryPageByKey(
     afterKey: HistoryPageKey | null,
     limit: number,
 ): { messages: RawMessage[]; nextKey: HistoryPageKey | null } {
-    // Type predicates live in SQL so a returned page is well-formed by
-    // construction: filtering in JS after the fact would let a full page of
-    // malformed rows read as end-of-history while valid messages follow,
-    // and rows with non-numeric time_created cannot join a keyset
-    // comparison anyway. Malformed rows are skipped, matching the shared
+    // `SHAPE` filters invalidly typed rows in SQL so they cannot consume `LIMIT` slots before valid rows.
+    // `SHAPE` excludes nonnumeric `time_created` values because keyset comparison requires numeric values.
     // readers' behavior.
     const SHAPE = `typeof(id) = 'text' AND typeof(data) = 'text'
                      AND typeof(time_created) IN ('integer', 'real')`;
@@ -563,7 +505,7 @@ function readHistoryPageByKey(
                 info = parsed as Record<string, unknown>;
             }
         } catch {
-            /* malformed message row: candidates require a well-formed role */
+            /* */
         }
         messages.push({
             ordinal: index + 1,
@@ -583,7 +525,7 @@ export async function runRecovery(args: {
     historyDb: Database;
     stagingRoot: string;
     forbiddenRoots: readonly string[];
-    /** Passed through to the privacy gate on every recovered candidate. */
+    /* */
     forbiddenTokens?: readonly string[];
     forbiddenIdentifiers?: readonly string[];
     nowMs?: number;
@@ -594,18 +536,14 @@ export async function runRecovery(args: {
 
     validateMeasurementSchema(args.measurementDb);
 
-    // One read transaction per connection, held across every read on that
-    // connection, so concurrent plugin activity (corpus pruning, session
-    // purge) cannot shift rows between the corpus and history phases of one
-    // run. Read-only work: end with ROLLBACK, and never let transaction
-    // teardown mask the original error. Only connections whose BEGIN
-    // completed are rolled back — a failed second BEGIN must not leave the
-    // first connection holding an open transaction.
+    // Each connection holds one read transaction across the run, preventing concurrent pruning or purging from shifting rows between corpus and history reads.
+    // `endRead` rolls back read-only transactions without masking the original error.
+    // `began` contains only connections whose `BEGIN` succeeded; a failed second `BEGIN` leaves the first transaction open.
     const endRead = (db: Database) => {
         try {
             db.exec("ROLLBACK");
         } catch {
-            /* connection already closed or transaction never started */
+            /* */
         }
     };
     const began: Database[] = [];
@@ -616,10 +554,8 @@ export async function runRecovery(args: {
         for (const db of [args.measurementDb, args.historyDb]) {
             db.exec("BEGIN");
             began.push(db);
-            // Deferred BEGIN takes its snapshot on the FIRST READ, not at
-            // BEGIN. Pin both snapshots now, so history written during the
-            // (potentially long) measurement page scan cannot make the
-            // history phase see a different database state than the rows.
+            // A deferred `BEGIN` establishes its snapshot on the first read, not at `BEGIN`.
+            // The immediate reads establish both snapshots before later history writes.
             db.prepare("SELECT COUNT(*) AS n FROM sqlite_master").get();
         }
         rows = [];
@@ -634,10 +570,7 @@ export async function runRecovery(args: {
             afterId = page[page.length - 1].id;
         }
 
-        // Hashes each session's rows actually reference: candidate plaintext
-        // outside this set is released immediately after hashing, so retained
-        // text is bounded by the measurement rows (which the report already
-        // scales with), not by total session history.
+        // `rowHashesBySession` retains hashes referenced by measurement rows; other candidate plaintext is released after hashing.
         const rowHashesBySession = new Map<string, Set<string>>();
         for (const row of rows) {
             if (row.ownership !== "opencode") continue;
@@ -649,26 +582,14 @@ export async function runRecovery(args: {
             hashes.add(row.queryTextHash);
         }
 
-        // One session hydrated at a time; its raw messages and unreferenced
-        // candidate text are released as soon as the row-referenced subset is
-        // extracted. The retained hash union is intersected with the global
-        // measurement-row hash set: the cross-session check only ever asks
-        // about ROW hashes, so the intersection is exact while staying
-        // bounded by the measurement rows rather than by session history.
-        // A hash that exists only in sessions with no measurement rows
-        // reports zero-match, a deliberate bound — labeling it would require
-        // hydrating the entire history database for a diagnostic count that
-        // recovers nothing either way.
+        // The hydration loop processes one session at a time and retains only hashes in `globalRowHashes`.
+        // Hashes found only in sessions without measurement rows report zero-match because labeling them requires hydrating the entire history database.
         const globalRowHashes = new Set<string>();
         for (const hashes of rowHashesBySession.values()) {
             for (const hash of hashes) globalRowHashes.add(hash);
         }
         for (const [sessionId, rowHashes] of rowHashesBySession) {
-            // Persisted decision provenance: reasons recorded BEFORE the
-            // search gate (stacked, too-short) mean no automatic query ran;
-            // every other recorded decision means it did. Messages with no
-            // decision at all yield no automatic candidate — recovery
-            // requires evidence, not inference.
+            // A "hint" decision or a decision whose reason is neither "stacked" nor "too-short" marks the message as having run an automatic query.
             const ranIds = new Set<string>();
             for (const decision of getAutoSearchHintDecisions(args.measurementDb, sessionId)) {
                 if (
@@ -678,9 +599,7 @@ export async function runRecovery(args: {
                     ranIds.add(decision.messageId);
                 }
             }
-            // Candidate extraction is per-message, so history pages can be
-            // hashed and released one at a time; a single long-lived
-            // session never materializes in full.
+            // The loop processes each history page independently, so it never materializes a session's full history.
             const kept: QueryCandidate[] = [];
             const keptKeys = new Set<string>();
             let afterKey: HistoryPageKey | null = null;
@@ -698,9 +617,7 @@ export async function runRecovery(args: {
                     const hash = normalizedQueryHash(candidate.text);
                     if (globalRowHashes.has(hash)) allCandidateHashes.add(hash);
                     if (!rowHashes.has(hash)) continue;
-                    // Dedup on (text, mode) during paging, not only inside
-                    // the matcher: a prompt repeated across a long session
-                    // must not retain one copy per repetition.
+                    // The page loop retains one candidate per `(text, mode)` across pages.
                     const key = `${candidate.mode}\u0000${candidate.text}`;
                     if (keptKeys.has(key)) continue;
                     keptKeys.add(key);
@@ -721,10 +638,6 @@ export async function runRecovery(args: {
         forbiddenTokens: args.forbiddenTokens,
         forbiddenIdentifiers: args.forbiddenIdentifiers,
     });
-    // Each run stages into its own mkdtemp subdirectory (0o700), created only
-    // once there is something to write: re-running within the TTL never
-    // collides with a previous run's draft.json, failures never leave an
-    // empty run directory behind, and stale runs age out through the purge.
     const runDir = mkdtempSync(join(root, "run-"));
     let draftPath: string;
     let reportPath: string;
@@ -756,10 +669,6 @@ async function main(): Promise<void> {
     const measurementDb = new BunDatabase(measurementPath, { readonly: true });
     const historyDb = new BunDatabase(historyPath, { readonly: true });
     try {
-        // The privacy scan is host-independent by design; the author host's
-        // identity is checked here, at authoring time. The home path matches
-        // as a substring; the username matches as a bounded identifier so a
-        // short account name does not reject every word containing it.
         const { report, draftPath } = await runRecovery({
             measurementDb: measurementDb as unknown as Database,
             historyDb: historyDb as unknown as Database,
@@ -768,7 +677,6 @@ async function main(): Promise<void> {
             forbiddenTokens: [homedir()].filter((token) => token.length > 0),
             forbiddenIdentifiers: [userInfo().username].filter((token) => token.length > 0),
         });
-        // Allowlisted output only: status codes and counts, never text/ids.
         process.stdout.write(`${JSON.stringify(report.counts)}\ndraft: ${draftPath}\n`);
     } finally {
         measurementDb.close();

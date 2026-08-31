@@ -75,10 +75,8 @@ import {
     moduleWireBodyBytes,
 } from "./module-wire";
 
-/** Ceiling for a single live (non-seed) state_sync body. Well under the
- * transport frame limit; an epoch-driven replacement snapshot that exceeds
- * it escalates to the paged seed protocol instead of risking an oversized
- * frame that would permanently block the policy transition. */
+/**
+ * */
 const MODULE_LIVE_SYNC_MAX_BYTES = 8 * 1024 * 1024;
 
 import {
@@ -94,8 +92,8 @@ export interface ModuleWatermarks {
     last_todo_state_hash: string;
     project_memory_epoch: number;
     project_user_profile_version: number;
-    /** Fingerprint of the current workspace epoch, used to determine whether cached
-     * state-sync markers are still valid. */
+    /**
+     * */
     workspace_fingerprint?: string | null;
     reasoning_cleared_through_tag?: number;
 }
@@ -109,10 +107,10 @@ export type ModuleDropMode = "full" | "truncated" | "edit_marker";
 
 export interface ModuleDropSeed {
     block_id: string;
-    /** Paired result blocks for a tool tag; they use the module's drop kind. */
+    /* */
     related_block_ids?: string[];
     drop_mode: ModuleDropMode;
-    /** Canonical edit-marker input, when the source tool carries one. */
+    /* */
     payload?: string;
 }
 
@@ -128,7 +126,7 @@ export interface ModuleNoteNudgeAnchorSeed {
 
 export interface ModuleAutoSearchHintSeed {
     block_id: string;
-    /** Empty text is a durable no-hint decision. */
+    /* */
     hint_text: string;
 }
 
@@ -194,10 +192,9 @@ export interface ModuleStateSyncPayload {
         note_nudge_anchors?: ModuleNoteNudgeAnchorSeed[];
         auto_search_hint_decisions?: ModuleAutoSearchHintSeed[];
         auto_search_hint_skipped?: number;
-        /** True when auto_search_hint_decisions is the COMPLETE decision
-         * list for the session: the native store deletes stored hint blocks
-         * absent from the list (no backing decision the host can still
-         * validate — e.g. a pre-policy hint whose raw message is gone). */
+        /** True when auto_search_hint_decisions is the complete session decision list.
+         * The native store deletes hint blocks absent from the complete session decision list.
+         * */
         user_hints_replace_session?: boolean;
         todo_synthetic_anchor?: ModuleTodoSyntheticAnchorSeed | null;
         emergency_latches?: ModuleEmergencyLatchSeed;
@@ -277,10 +274,8 @@ export interface ModuleCompartmentMirrorResponse {
 }
 
 /**
- * The module owns its SQLite file, so TS cannot read rows directly. This narrow
- * reader is the seam for the module's future `session.status` compartment page.
- * It deliberately returns typed rows instead of pretending the TS database is
- * authoritative for module-published content.
+ * The module owns its SQLite file, so TS reads module-published rows through a narrow typed interface.
+ * Module-published content is authoritative.
  */
 export interface ModuleCompartmentReader {
     getCompartmentsAfter(
@@ -350,8 +345,7 @@ function compartmentMirrorSetChanged(
     ) {
         return true;
     }
-    // session.status reports max_sequence = after_sequence when the table is empty,
-    // so a wipe is invisible to the sequence cursor. A zero count is the set change.
+    // session.status reports max_sequence = after_sequence for an empty table, so a wipe is invisible to the sequence cursor; count = 0 signals the set change.
     if (
         published.compartment_count === 0 &&
         cursor.lastMaxSequence >= 0 &&
@@ -501,9 +495,7 @@ export async function mirrorModuleCompartments(args: {
     sessionId: string;
     reader: ModuleCompartmentReader;
 }): Promise<number> {
-    // A process-local cursor avoids re-reading the full authoritative set on every
-    // pass. The first call, a max_sequence regression, a sequence gap, or a set
-    // change the cursor cannot express still walks from -1.
+    // A process-local cursor avoids full authoritative-set reads; the first call, a max_sequence regression, a sequence gap, or an unrepresentable set change walks from -1.
     const cursor = compartmentMirrorCursors.get(args.sessionId);
     if (cursor !== undefined) {
         const published = await args.reader.getCompartmentsAfter(
@@ -544,16 +536,9 @@ function stableHash(value: string): string {
 }
 
 /**
- * The task-list state we report to the Rust module for a session.
  *
- * When the session's tools map filters the native todowrite tool out (frozen
- * "unavailable" verdict), we report an EMPTY state instead of the persisted
- * one. The module's existing content-change handling then drops the synthetic
- * task-list pair on its next cache-busting render. Reporting empty here (rather than
- * the stale persisted state) keeps a disabled tool from being replayed into the
- * module's wire content. The watermark hash is computed from this same value so
- * the flip to empty registers as a content change and actually triggers a
- * re-sync. A provisional verdict fails open and reports the real state.
+ * When the session tools map has a frozen "unavailable" verdict for todowrite, report an empty state so the module drops the synthetic task-list pair instead of replaying persisted state; hash the same value to trigger re-sync.
+ * A provisional verdict fails open and reports the real state.
  */
 function effectiveLastTodoState(
     sessionId: string,
@@ -619,7 +604,7 @@ export function loadModuleWatermarks(args: {
     db: ContextDatabase;
     sessionId: string;
     projectPath?: string;
-    /** Reuse the workspace resolved by the enclosing payload build. */
+    /* */
     workspace?: ModuleWorkspaceContext;
 }): ModuleWatermarks {
     const workspace = args.workspace ?? resolveModuleWorkspaceContext(args.db, args.projectPath);
@@ -674,9 +659,9 @@ function flatBlockIdForRawMessage(
 }
 
 /**
- * Compartment rows retain ordinals from the TS storage basis, which can include
- * synthetic summary rows. Resolve module boundaries from the summary-excluding
- * basis so the shared memo compares one canonical value everywhere.
+ * Compartment ordinals use the TS storage basis, which includes synthetic summary rows.
+ * Module boundaries use the summary-excluding ordinal basis.
+ * Use summary-excluding ordinals so `idOrdinalMemo` stores one canonical ordinal per message.
  */
 export function canonicalOrdinalForMessageId(args: {
     sessionId: string;
@@ -939,11 +924,6 @@ function buildAutoSearchHintSeeds(args: {
         const mapping = moduleRawBlockMappings(args.readRawById(value.messageId)).find(
             (candidate) => candidate.kind === "text",
         );
-        // Prefer the live raw mapping; fall back to the block id this
-        // decision was last seeded under. Without the fallback, a hint whose
-        // raw message can no longer be loaded would skip the eligibility
-        // gate below, and a quarantine/rejection/rewrite could never upsert
-        // the empty revocation over the module's stored hint row.
         const blockId = mapping ? `${value.messageId}#${mapping.blockIndex}` : value.nativeBlockId;
         if (!blockId) {
             skipped += 1;
@@ -956,8 +936,8 @@ function buildAutoSearchHintSeeds(args: {
         if (mapping && value.nativeBlockId !== blockId) {
             recordAutoSearchHintNativeBlockId(args.db, args.sessionId, value.messageId, blockId);
         }
-        // Anti-memory warnings seed the empty no-result shape because stored
-        // warning text never replays; fresh search is required.
+        // Anti-memory warnings seed the empty no-result shape because warning text never replays; a fresh search is required.
+        // Warning text never replays; a fresh search is required.
         const hintText =
             value.decision === "hint" &&
             autoSearchHintFragmentsStillEligible(args.db, value.memoryFragments)
@@ -983,8 +963,7 @@ function buildStripSeeds(args: { db: ContextDatabase; sessionId: string }): Modu
         const seed = { message_id: messageId, strip_kind: stripKind } satisfies ModuleStripSeed;
         byKey.set(`${stripKind}:${messageId}`, seed);
     };
-    // The placeholder table intentionally includes both dropped shells and internal
-    // notifications; both are whole-message neutralization decisions on the wire.
+    // The placeholder table includes both dropped shells and internal notifications; both are whole-message neutralization decisions on the wire.
     for (const messageId of getStrippedPlaceholderIds(args.db, args.sessionId)) {
         add(messageId, "placeholder");
     }
@@ -1059,14 +1038,7 @@ function readCompartmentsAfterSequence(
 }
 
 /**
- * Id-only coverage query for the explicit-delete lane: every foreign row the
- * workspace snapshot's visibility scope can see, in ANY status and ignoring
- * expiry — an archived or expired previously-mirrored row must still be
- * named for deletion. Own-identity rows are excluded (the replace scope
- * prunes those wholesale); own ALIASES not listed in `ownIdentities` count
- * as foreign here, which is correct because the replace scope does not
- * cover them either. Id-only so a large legacy history never hydrates
- * content just to compute deletions.
+ * Explicit-delete coverage includes every foreign ID visible to the workspace snapshot, regardless of status or expiry; previously mirrored archived or expired rows must be deleted. It excludes `ownIdentities` because replace scope prunes them, but includes own aliases absent from `ownIdentities` because replace scope does not. The ID-only query avoids hydrating legacy content to compute deletions.
  */
 function encodedSeedItemBytes(item: SeedItem): number {
     const encoded = JSON.stringify(item.value);
@@ -1235,9 +1207,8 @@ export function buildPagedModuleStateSyncPayloads(args: {
         watermarks: args.watermarks,
     });
 
-    // The envelope is fixed for all pages; use the largest safe sequence numbers so
-    // page estimates cannot undercount metadata. Empty arrays are left
-    // in this margin, making the estimate conservative by a few bytes per field.
+    // The envelope uses the largest safe sequence numbers on every page.
+    // Empty arrays increase each field's encoded size, so the estimate is conservative.
     const sizingEnvelope = makePayload({
         index: Number.MAX_SAFE_INTEGER,
         total: Number.MAX_SAFE_INTEGER,
@@ -1260,8 +1231,8 @@ export function buildPagedModuleStateSyncPayloads(args: {
     let currentEncodedBytes = 0;
     let currentItemCount = 0;
     for (const item of items) {
-        // Encode each item once for the linear packing estimate. The final page
-        // serialization below remains the sole exact wire-size assertion.
+        // The packer encodes each item once for a linear estimate; final serialization asserts the exact wire size.
+        // Final serialization is the only exact wire-size assertion.
         const itemBytes = encodedSeedItemBytes(item);
         const itemContribution = itemBytes + 1; // value bytes plus a conservative comma.
         const candidateBytes = envelopeMarginBytes + currentEncodedBytes + itemContribution;
@@ -1294,9 +1265,6 @@ export function buildPagedModuleStateSyncPayloads(args: {
             channel2NudgeState: args.channel2NudgeState,
             ...batch,
         });
-        // An estimate may choose a different split point than an exact wire-size
-        // check. This is safe because the module reassembler concatenates pages in
-        // order, preserving every item.
         if (
             moduleWireBodyBytes({ method: "state_sync", params: payload.params }) >
             MODULE_PAGE_MAX_BYTES
@@ -1368,9 +1336,6 @@ export async function buildModuleStateSyncPayload(args: {
     };
     const compartmentsChanged =
         args.force || currentWatermarks.compartment_sequence > acked.compartment_sequence;
-    // In a workspace, a FOREIGN member's policy transition changes only the
-    // workspace fingerprint (which hashes every member's epoch), never the
-    // root project's epoch, so fingerprint drift must reach the memory lane.
     const workspacePolicyDrift =
         workspace.workspace != null &&
         (currentWatermarks.workspace_fingerprint ?? null) !== (acked.workspace_fingerprint ?? null);
@@ -1416,10 +1381,6 @@ export async function buildModuleStateSyncPayload(args: {
         }
     }
 
-    // A policy transition (approval, verification, revocation) changes rows
-    // no compartment watermark can see. The root project's epoch carries
-    // that signal directly; workspace fingerprint drift covers foreign
-    // members' transitions. Hint seeds below replay on the same signal.
     const epochChanged =
         !args.force &&
         (currentWatermarks.project_memory_epoch !== acked.project_memory_epoch ||
@@ -1437,10 +1398,6 @@ export async function buildModuleStateSyncPayload(args: {
               text: anchor.text,
           }))
         : undefined;
-    // Hint seeds ride force seeds AND epoch-driven syncs: the native store
-    // upserts them, so a policy transition that revokes a hint's fragments
-    // (seeded below as the empty no-result shape) reaches the module on the
-    // same epoch bump that hides the memory, not only on the next reseed.
     const autoSearchHintSeedState =
         args.force || epochChanged
             ? buildAutoSearchHintSeeds({
@@ -1469,9 +1426,6 @@ export async function buildModuleStateSyncPayload(args: {
               last_execute_ordinal: Math.max(0, sessionMeta.toolReclaimWatermark),
           }
         : undefined;
-    // When starting a module from an existing session, include all TypeScript
-    // units already dropped before the first transform. Otherwise the transform
-    // reads older raw data and needs another cache invalidation to process them.
     const dropSeedState = args.force
         ? buildDropSeeds({ db: args.pass.db, sessionId: args.pass.sessionId, readRawById })
         : null;
@@ -1584,13 +1538,6 @@ export async function buildModuleStateSyncPayload(args: {
                 : {}),
             ...(autoSearchHintSeedState !== null
                 ? {
-                      // The decision list is COMPLETE whenever it was built
-                      // (force or epoch-driven): send it — even empty — with
-                      // replace semantics, so a stored native hint whose
-                      // decision can no longer be resolved (a migrated
-                      // tombstone with no raw block and no recorded id) is
-                      // deleted on the same epoch bump that revoked it,
-                      // not only on the next paged force sync.
                       auto_search_hint_decisions: autoSearchHintSeedState.seeds,
                       user_hints_replace_session: true,
                   }
@@ -1598,13 +1545,6 @@ export async function buildModuleStateSyncPayload(args: {
         },
         watermarks: currentWatermarks,
     };
-    // Any live payload can outgrow one frame: an epoch-driven replacement
-    // snapshot loads the full eligible set, and an incremental sync can
-    // accumulate arbitrarily many rows, mutations, and deletion ids while the
-    // module is unavailable. An oversized frame would fail identically on
-    // every retry and permanently stall the mirror, so escalate to the paged
-    // seed protocol instead — the caller retries the same sync with force,
-    // which routes through buildPagedModuleStateSyncPayloads above.
     if (
         moduleWireBodyBytes({ method: "state_sync", params: livePayload.params }) >
         MODULE_LIVE_SYNC_MAX_BYTES
@@ -1615,9 +1555,7 @@ export async function buildModuleStateSyncPayload(args: {
 }
 
 export const MODULE_CLAIM_MIRROR_CONSUMER = "rust-module-claim-mirror-v1";
-// Outbox consumer identity for the claim-effect lane. Checkpoint bookkeeping and
-// the delivered request body must name the same consumer, or checkpoints advance
-// under one identity while the module is told about another.
+// The delivered request body and checkpoint bookkeeping must name the outbox consumer identity for the claim-effect lane.
 export const MODULE_CLAIM_EFFECTS_CONSUMER = "rust-module-claims-v1";
 const CLAIM_MIRROR_MAX_GROUPS_PER_SYNC = 1_000;
 const CLAIM_MIRROR_CHANGE_KINDS: readonly ClaimMirrorChangeKind[] = [
@@ -1679,9 +1617,7 @@ export function buildAuthorizedClaimMirrorSnapshot(args: {
     nowMs?: number;
 }): ClaimMirrorSnapshot | null {
     for (let attempt = 0; attempt < 2; attempt += 1) {
-        // Resolved per attempt: a membership or sharing change invalidates the
-        // authorization set as well as the epoch, and only a fresh resolve can
-        // rebuild it. Reusing a captured context would make the retry fail the
+        // Each attempt resolves authorization anew because membership or sharing changes invalidate both the authorization set and the epoch.
         // same way.
         const workspace = resolveModuleWorkspaceContext(args.db, args.projectPath);
         const workspaceEpoch = computeWorkspaceEpochFingerprint(
@@ -1693,11 +1629,9 @@ export function buildAuthorizedClaimMirrorSnapshot(args: {
             ownIdentities: workspace.ownIdentities,
             sharedCategories: workspace.shareCategories ?? [],
             workspaceEpoch,
-            // Names the identities `workspaceEpoch` was derived from so the
-            // provider recomputes the fingerprint at publication time instead of
-            // echoing it back. Without this, a revocation landing between the
-            // resolve above and this read is undetectable, and a claim from a
-            // no-longer-authorized project reaches the module mirror.
+            // `workspaceIdentities` lets the provider recompute `workspaceEpoch` at publication time.
+            // Publication-time fingerprint recomputation detects revocations between workspace resolution and the provider read.
+            // Without publication-time fingerprint recomputation, claims from revoked projects can reach the module mirror.
             ...(workspace.expandedIdentities.length === 0
                 ? {}
                 : { workspaceIdentities: workspace.expandedIdentities }),
@@ -1936,11 +1870,9 @@ function suppressClaimMirror(
     error: unknown,
 ): ModuleClaimMirrorSyncResult {
     const reason = error instanceof Error ? error.message : String(error);
-    // Suppression persists until the lane recovers and the caller discards this
-    // result, so without this a suppressed mirror is invisible: Rust transforms
-    // render no project memories and report nothing. Logged on entry into
-    // suppression rather than on every pass, so a lane that cannot recover
-    // reports its reason once instead of per transform.
+    // Without an entry log, suppression is invisible: Rust transforms render no project memories and report nothing.
+    // An entry log makes suppression visible because Rust transforms otherwise render no project memories and report nothing.
+    // Logging on suppression entry reports an unrecoverable lane's reason once.
     if (state.claimMirrorSuppressed !== true) {
         sessionLog(
             sessionId,
@@ -2221,10 +2153,10 @@ export async function drainClaimEffectPrefix(args: {
     let deliveredEffects = 0;
     let lastEffectId = 0;
     let reachedReceipt = false;
-    // Projects the target mutation touches. Delivery order is per project, so a
-    // target only needs its own projects' unacknowledged prefix. Draining every
-    // project would make one mutation wait on unrelated history and, past
-    // `maxReceipts`, fail after the write already committed.
+    // The target mutation includes only touched projects because delivery order is per project.
+    // The target needs only its own projects' unacknowledged prefixes.
+    // Draining unrelated projects delays the target mutation behind unrelated history.
+    // The method fails after committing the write when receipts exceed `maxReceipts`.
     let scopedProjectIds: number[] | null = null;
 
     if (args.throughReceiptId !== undefined) {
@@ -2360,9 +2292,9 @@ export async function drainClaimEffectPrefix(args: {
 }
 
 export interface ModuleStateSyncClient {
-    /** Synchronously exposes capabilities cached for the transport's live connection generation. */
+    /** The capability accessor synchronously exposes capabilities cached for the transport's live connection generation. */
     getCachedStateSyncCapabilities?(): { state_sync_deltas?: boolean } | undefined;
-    /** Clears a capability snapshot when the module reports a restart-like signal. */
+    /* */
     invalidateStateSyncCapabilities?(): void;
     /** Capability probe is optional so older/test transports retain legacy wire semantics. */
     stateSyncCapabilities?(args: {
@@ -2448,9 +2380,6 @@ function readAuthoritySeqMismatch(error: unknown): number | null {
 }
 
 /**
- * Mode-neutral state synchronization: the same watermark-triggered assembly is
- * used by the mirror sender and the Rust authority path. Callers own retries and
- * lineage handling because shadow and authority have different failure policy.
  */
 export type ModuleStateSyncResult =
     | { status: "acked"; watermarks: ModuleWatermarks }
@@ -2472,9 +2401,6 @@ export async function syncModuleState(args: {
         pass: args.pass,
         projectRoot: args.projectRoot,
     });
-    // Captured from the completing batch of the most recent send, for the
-    // post-send policy revalidation below (the batch list itself is scoped
-    // to the try block).
     let completingBatchParams: unknown = null;
     const adoption = args.options?.authoritySeqAdoption ?? { used: false };
     const resolveStateSyncDeltas = async (afterGenerationChange = false): Promise<boolean> => {
@@ -2489,9 +2415,7 @@ export async function syncModuleState(args: {
                     })
                 ).state_sync_deltas;
             } catch {
-                // If the capability check fails, assume the module does not support
-                // state_sync_deltas and send the older payload format with its state-sync
-                // fields always present.
+                // On capability-detection failure, the client sends the legacy payload with all state-sync fields present.
                 capability = false;
             }
         }
@@ -2507,10 +2431,6 @@ export async function syncModuleState(args: {
         });
         if (payload === null) return { status: "no_change" };
         if (payload === "frame_budget") {
-            // The live snapshot exceeded the single-frame budget; the paged
-            // seed protocol carries the same replacement content in bounded
-            // pages. The force path never returns this sentinel, so the
-            // escalation cannot loop.
             if (force) throw new Error("module state sync frame_budget after escalation");
             force = true;
             continue;
@@ -2529,15 +2449,8 @@ export async function syncModuleState(args: {
             for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
                 const batch = batches[batchIndex];
                 if (batchIndex === batches.length - 1 && args.pass.projectPath) {
-                    // The snapshot's policy check ran at payload construction,
-                    // and awaited work (delta probes, earlier page sends) runs
-                    // between then and this completing send. An epoch bump in
-                    // that window means a policy or content transition landed
-                    // after the check — abort and rebuild from current state
-                    // rather than apply the stale snapshot to the native
-                    // store. The workspace fingerprint hashes EVERY member's
-                    // epoch, so a foreign member's transition (which does not
-                    // move the root project epoch) also forces the rebuild.
+                    // The sender rebuilds before the completing send when `project_memory_epoch` or any `workspace_fingerprint` epoch changes because awaited work can invalidate the snapshot's policy.
+                    // Awaited work can invalidate the snapshot's policy, so the sender rebuilds before the final batch when `project_memory_epoch` or any `workspace_fingerprint` epoch changes.
                     const params = batch.params as {
                         project_memory_epoch?: number;
                         acked_watermarks?: { workspace_fingerprint?: string | null };
@@ -2572,30 +2485,22 @@ export async function syncModuleState(args: {
                     generationSensitive: stateSyncDeltas,
                 });
                 if (isModuleTransportGenerationChangedResult(response)) {
-                    // The payload used the previous connection's capabilities. Re-probe the new
-                    // connection and rebuild before retrying because it may not support deltas.
                     stateSyncDeltas = await resolveStateSyncDeltas(true);
                     continue syncLoop;
                 }
             }
         } catch (error) {
             if (isHistorianCompartmentSyncBusy(error)) {
-                // Return a distinct retry result when the snapshot-owning historian rejects
-                // compartment updates, preserving any forced initialization seed obligation.
                 return { status: "retry_busy" };
             }
             const durableSeq = args.options?.authority ? readAuthoritySeqMismatch(error) : null;
             if (durableSeq === null || adoption.used) throw error;
             adoption.used = true;
             args.state.lastAckedSeq = durableSeq;
-            // A fresh authority process only knows its in-memory sequence. After adopting the
-            // durable sequence, discard sender watermarks and force a full rebuild because it
-            // cannot know which durable rows the sequence covers.
             args.state.lastAckedWatermarks = null;
             force = true;
             continue;
         }
-        // Revalidate after sends because state can change while they await; the module must not serve a row the current policy soft-hides.
         if (args.pass.projectPath && completingBatchParams !== null) {
             const params = completingBatchParams as {
                 project_memory_epoch?: number;

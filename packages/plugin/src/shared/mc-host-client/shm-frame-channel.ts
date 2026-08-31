@@ -44,10 +44,9 @@ export class ShmFrameChannel implements SetupFrameChannel {
         if (!options.nativeChannel && !options.descriptor) {
             throw new Error("shared-memory channel requires an attachment");
         }
-        // Attachment I/O (fd opens, grant validation, mappings) belongs in
-        // the deadline-raced start() phase per the provider contract, so a
-        // descriptor is only recorded here; a pre-attached channel carries
-        // no attachment I/O and is adopted directly.
+        // start() rejects attachment when the deadline has already expired.
+        // The constructor records a descriptor without attaching it.
+        // A pre-attached channel is adopted without attachment I/O.
         this.native = options.nativeChannel ?? null;
     }
 
@@ -76,11 +75,8 @@ export class ShmFrameChannel implements SetupFrameChannel {
     ): FrameSendTicket {
         if (this.closed) throw new McHostCallError("not_sent", "shared-memory channel closed");
         this.assertBodyBounds(body.byteLength);
-        // The native ring's fixed capacity is not the configured aggregate
-        // cap: admission consults the shared budget so an over-cap body is
-        // refused with `memory_cap`, exactly like the TCP channel. The
-        // charge covers the synchronous publication window and is returned
-        // once the ring owns the bytes.
+        // The native ring capacity does not enforce the aggregate memory cap.
+        // Admission uses the shared budget and rejects over-cap bodies with memory_cap.
         const reservedBytes = HEADER_LEN + body.byteLength;
         this.admitPublication(reservedBytes);
         try {
@@ -97,8 +93,8 @@ export class ShmFrameChannel implements SetupFrameChannel {
     ): BoundedFrameProducer {
         if (this.closed) throw new McHostCallError("not_sent", "shared-memory channel closed");
         this.assertBodyBounds(capacity);
-        // Reservations hold ring capacity across event-loop turns, so
-        // their budget charge is held until publication or abort.
+        // Reservations retain ring capacity across event-loop turns.
+        // Reservation charges remain held until publication or abort.
         const reservedBytes = HEADER_LEN + capacity;
         this.admitPublication(reservedBytes);
         let reservation: NativeProducerReservation;
@@ -130,7 +126,6 @@ export class ShmFrameChannel implements SetupFrameChannel {
                             try {
                                 hooks?.onPublish?.();
                             } catch {
-                                // Send hooks cannot change publication.
                             }
                         },
                     );
@@ -139,7 +134,6 @@ export class ShmFrameChannel implements SetupFrameChannel {
                     try {
                         hooks?.onComplete?.();
                     } catch {
-                        // Send hooks cannot change completion.
                     }
                     return { cancel: () => !published };
                 },
@@ -170,12 +164,11 @@ export class ShmFrameChannel implements SetupFrameChannel {
     }
 
     sendControl(header: EnvelopeHeader): void {
-        // Late control sends on a closed channel are silent no-ops per the
-        // FrameChannel contract; callers such as enqueueControlHeader do not
-        // catch, so a throw here would unwind frame dispatch or teardown.
+        // Closed-channel control sends are no-ops under the FrameChannel contract.
+        // FrameChannel requires closed-channel control sends to be no-ops; throwing would unwind frame dispatch or teardown.
         if (this.closed) return;
-        // Control frames stay uncharged, matching the TCP channel's
-        // never-cap-refused control path.
+        // Control frames are uncharged.
+        // Control frames are never refused by the memory cap.
         this.publishFrame(header, { byteLength: 0, fill: () => {} });
     }
 
@@ -195,9 +188,8 @@ export class ShmFrameChannel implements SetupFrameChannel {
             }
         }
         if (quarantineError !== undefined) {
-            // Alias state is uncertain: unmapping under a live view would
-            // trade a bounded leak for a use-after-free, so the native close
-            // is withheld and the quarantine is reported.
+            // When alias state is uncertain, native close is withheld to avoid unmapping a live view.
+            // Quarantined bytes are reported when alias state is uncertain.
             this.options.handlers.onClosed("quarantined", quarantineError);
             throw quarantineError;
         }
@@ -230,10 +222,9 @@ export class ShmFrameChannel implements SetupFrameChannel {
     }
 
     /**
-     * The configured frame limit and integer validity are enforced before
-     * any budget charge or native call: a non-safe length (`NaN`, negative,
-     * fractional) would poison `ByteBudget.used`, and the shared-memory
-     * path must reject the same over-limit bodies TCP rejects.
+     * NaN, negative, and fractional lengths are rejected before budget accounting.
+     * NaN would poison ByteBudget.used.
+     * Reject lengths outside the configured limit before budget accounting.
      */
     private assertBodyBounds(byteLength: number): void {
         if (
@@ -295,11 +286,10 @@ export class ShmFrameChannel implements SetupFrameChannel {
     private poll(): void {
         if (this.closed) return;
         try {
-            // Drains until the native side reports no progress. Consumer
-            // backpressure (retained leases at the ring's lease bound) is
-            // reported by `native.poll()` as `false`, not an error, so the
-            // drain pauses at the bound and the interval resumes delivery
-            // after a lease release; only genuine failures reach the catch.
+            // Retained leases at the ring lease bound stop native.poll() without an error.
+            // native.poll() returns false, rather than throwing, when retained leases reach the ring lease bound.
+            // The interval resumes delivery after a lease release.
+            // Only native.poll() failures reach the error handler.
             while (
                 this.attached().poll((nativeLease: NativeReceiveLease) => {
                     const header = decodeHeader(nativeLease.header);
@@ -334,9 +324,6 @@ export class ShmFrameChannel implements SetupFrameChannel {
             try {
                 this.close();
             } catch {
-                // close() rethrows on quarantined leases and has already
-                // reported that outcome; an interval callback has no caller
-                // to observe the throw, so it must not escape here.
             }
         }
     }

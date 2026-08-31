@@ -18,9 +18,7 @@ describe("Pi release root selection", () => {
                 activeCheckout: active,
             });
             ensurePluginAvailable(env, verified);
-            // Pi loads an extension through the `package.json` inside each configured
-            // package, so the entry has to be a directory whose manifest names the link
-            // to the release root's frozen entrypoint.
+            // Pi reads each configured package's `package.json`, so the plugin entry must be a directory with `pi.extensions` pointing to a symlink to the verified release entrypoint.
             expect(lstatSync(env.pluginDir).isDirectory()).toBe(true);
             expect(readlinkSync(join(env.pluginDir, "index.js"))).toBe(
                 join(release, "packages/pi-plugin/dist/index.js"),

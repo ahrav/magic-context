@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import {
@@ -52,8 +51,6 @@ describe("createChildSessionWithFence", () => {
         await createChildSessionWithFence(args);
         await createChildSessionWithFence(args);
 
-        // Removing the fence call makes this mock run twice, so the spawn guard
-        // is observed directly rather than inferred from a matching return value.
         expect(create).not.toHaveBeenCalled();
         expect(latchedFailures).toHaveLength(1);
         expect(latchedFailures[0]).toMatchObject({

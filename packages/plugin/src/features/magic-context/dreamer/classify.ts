@@ -49,34 +49,29 @@ const CLASSIFY_CHUNK_SIZE = 100;
 const CLASSIFY_MODULE_RUN_TIMEOUT_MS = 660_000;
 
 /**
- * Mirrors `MAX_CLASSIFY_PROMPT_BYTES` in `crates/mc-module/src/classify.rs`:
+ * `MAX_CLASSIFY_PROMPT_BYTES` mirrors `MAX_CLASSIFY_PROMPT_BYTES` in `crates/mc-module/src/classify.rs`.
  * `dreamer.run_task` refuses a longer `prompt_body` with `payload_too_large`
- * before any producer run. A rejected prompt is rebuilt identically on every
- * scheduled pass, so chunks must be bounded by rendered bytes as well as entry
- * count — a 100-entry bound alone lets content-heavy claims exceed the cap and
- * never classify on any run.
+ * Rejected prompts are rebuilt identically on every scheduled pass.
+ * Chunk construction bounds each chunk by rendered bytes and entry count.
+ * A 100-entry limit allows content-heavy claims to exceed the cap.
+ * Claims whose prompts exceed the cap never classify.
  */
 export const MAX_CLASSIFY_PROMPT_BYTES = 256 * 1024;
-/** Anchors are calibration aids, not work, so they get the smaller share of
- *  the cap — and they ride EVERY chunk's prompt, so they are bounded once. */
+/** Anchors calibrate classification rather than supply work, so the code assigns them a smaller prompt budget.
+ * Each chunk includes all anchors, so anchors use a shared 48 KiB budget. */
 const ANCHOR_PROMPT_BYTE_BUDGET = 48 * 1024;
-/** The pool's share: the cap minus the anchor budget, with headroom for the
- *  task template and guidance text that wrap both sections. */
+/** The chunk budget reserves 16 KiB for task-template and guidance text.
+ * Task-template and guidance text wrap the anchor and claim sections. */
 const CHUNK_PROMPT_BYTE_BUDGET = MAX_CLASSIFY_PROMPT_BYTES - ANCHOR_PROMPT_BYTE_BUDGET - 16 * 1024;
 /**
- * Upper bound on the fixed text `renderPool`/`renderAnchors` wrap around one
- * entry's variable fields: the bracket, separators, ` revision=`, ` digest=`,
- * the `(current: importance=... scope=... shareable=...)` tail, the newline
- * before the content, and the blank line between entries. The literals total 66
- * bytes and the values this estimate does not otherwise count (importance,
- * scope name, shareable) at most 17, so this leaves slack rather than
- * underestimating — an underestimate is what lets a chunk breach the cap.
+ * The fixed literals use 66 bytes.
+ * Importance, scope name, and shareable consume at most 17 bytes.
+ * The 128-byte reserve prevents chunks from exceeding the cap.
  */
 const PROMPT_ENTRY_TEMPLATE_BYTES = 128;
 
-/** A conservative bound on one claim's rendered prompt entry. Every variable
- *  field the renderer interpolates is counted, so the sum can only exceed what
- *  the prompt actually spends on this claim. */
+/**
+ * */
 function promptEntryBytes(claim: ProjectMemoryClaimSnapshot): number {
     return (
         Buffer.byteLength(claim.content, "utf8") +
@@ -89,29 +84,26 @@ function promptEntryBytes(claim: ProjectMemoryClaimSnapshot): number {
 }
 
 /**
- * The margin between the transport request budget and the `timeout_ms` handed
- * to the module, mirroring `CLASSIFY_CLEANUP_RESERVE` in
+ * The purge margin reserves 40 seconds for cleanup after the module timeout.
  * `crates/mc-module/src/classify.rs`.
  *
- * The module's deadline bounds its start, await, and re-drain windows, so its
- * last producer window closes at `timeout_ms`. The work after that is bounded
- * but not free: `purge_session` wraps `session.delete` plus `close` in the
- * producer's 30s request timeout, the host then reaps the Broca subprocess
- * group under its 5s SIGTERM-to-SIGKILL grace, and the ledger write and
- * response dispatch need slack on top. Equal budgets make the transport time
- * out first, and that cancel lands between the producer run and the purge:
- * nothing is recorded, no fallback model can complete, and the attempt's
- * billable run stays alive holding the memory-pool prompt.
+ * The module's producer window ends at `timeout_ms`.
+ * Cleanup continues after the producer window closes.
+ * `purge_session` can consume the producer's 30-second request timeout.
+ * Host reaping adds a 5-second SIGTERM-to-SIGKILL grace period.
+ * Ledger writes and response dispatch require additional timeout slack.
+ * Equal transport and module budgets let transport time out before cleanup.
+ * Transport cancellation can occur between the producer run and session purge.
+ * Cancellation between the producer run and purge records no result and prevents fallback completion.
  */
 const CLASSIFY_MODULE_PURGE_MARGIN_MS = 40_000;
 /**
- * A chunk slice below this floor cannot host a real module call: the purge
- * margin alone consumes 40s and a model needs minutes on top. Equal division
- * of the remaining deadline across many chunks can push every slice under the
- * margin, so flooring the slice runs the head of the pool with workable
- * budgets and defers the tail to the next pass — instead of handing later
- * chunks progressively larger slices while the head of a stable ordering is
- * skipped on every pass.
+ * The 40s purge margin plus a 120s model allowance sets the 160s minimum slice.
+ * Equal division can place every chunk below the minimum slice.
+ * The minimum slice processes head chunks before deferring tail chunks.
+ * The minimum slice defers tail chunks to the next pass.
+ * Without the minimum slice, later chunks receive progressively larger slices.
+ * Stable ordering would skip head chunks on every pass.
  */
 const CLASSIFY_MIN_CHUNK_SLICE_MS = CLASSIFY_MODULE_PURGE_MARGIN_MS + 120_000;
 
@@ -140,10 +132,10 @@ export interface ClassifyArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: string;
     fallbackModels?: readonly string[];
-    /** Ordered classify model chain (task override → dreamer default → fallbacks)
-     *  the module route sends verbatim; the TypeScript provider path keeps using
-     *  model/fallbackModels instead. The dreamer-level default reaches classify
-     *  only through this chain, so dropping it silently removes that rung. */
+    /** `modelChain` orders the task override, dreamer default, and fallbacks.
+     * The module route sends `modelChain` verbatim; the TypeScript path uses `model` and `fallbackModels`.
+     * The dreamer default reaches classify only through `modelChain`.
+     * Removing the dreamer default from `modelChain` removes that fallback. */
     modelChain?: readonly string[];
     moduleClient?: ClassifyModuleClient;
     moduleSessionId?: string;
@@ -174,16 +166,12 @@ function isModuleRoute(args: ClassifyArgs): boolean {
 }
 
 /**
- * The module route's model selection, resolved from `modelChain` alone.
  *
- * Module-backed classify cannot inherit the session's model the way the
- * non-module path does: `dreamer.run_task` requires an explicit canonical
- * `provider/model` chain and rejects a payload without one, and no canonical
- * string for the session default exists on this side of the boundary. So an
- * empty chain is a permanent configuration failure, and the message names every
- * key that can supply one. The wording stays outside `classifyFailure`'s
- * transient-retry vocabulary so the task advances to its next cron slot instead
- * of hot-retrying a config error.
+ * Module-backed classify cannot inherit the session model.
+ * `dreamer.run_task` requires an explicit canonical `provider/model` chain.
+ * The module route has no canonical string for the session default.
+ * An empty `modelChain` is a permanent configuration failure.
+ * An empty `modelChain` advances the task to its next cron slot instead of retrying immediately.
  */
 function moduleClassifyModelChain(args: ClassifyArgs): readonly string[] {
     const modelChain = args.modelChain ?? [];
@@ -238,12 +226,6 @@ function stratifiedAnchors(
 }
 
 /**
- * Split the pool into chunks bounded by BOTH entry count and rendered prompt
- * bytes. A claim whose own entry exceeds the whole byte budget cannot fit any
- * chunk however the pool is split, so it is reported separately rather than
- * put in a chunk that is guaranteed to be refused. An infinite budget degrades
- * to count-only chunking, which is what the TypeScript child path wants: it has
- * no `prompt_body` cap, and capping it would exclude claims a provider can
  * classify.
  */
 function chunkByCountAndBytes(
@@ -273,10 +255,6 @@ function chunkByCountAndBytes(
 }
 
 /**
- * Keep stratified anchors while they fit the anchor byte budget, skipping only
- * the individual anchors that do not fit so the remaining stratification
- * survives. Anchors are calibration aids: dropping some degrades calibration,
- * while keeping them all can push every chunk's prompt past the module's cap.
  */
 function boundAnchorsByBytes(
     anchors: readonly ProjectMemoryClaimSnapshot[],
@@ -299,20 +277,15 @@ function boundAnchorsByBytes(
 }
 
 /**
- * A claim too large for any chunk is skipped, and the skip is recorded as a
- * durable zero-effect rejection receipt rather than only logged.
  *
- * The alternatives are worse. Truncating the content would score bytes the
- * claim does not hold while the manifest binding still names the full
- * revision's digest, so the receipt would assert a classification of content
- * nobody classified. Sending it alone and letting the module refuse spends a
- * `payload_too_large` round-trip on every scheduled pass and, because a module
- * chunk failure is transient, fails the whole task into a hot retry loop.
+ * Truncating a claim would score bytes absent from the claim while the manifest binds the full revision digest.
+ * A receipt for truncated content would assert a classification that nobody performed.
+ * Sending an oversized claim alone triggers a `payload_too_large` module call on every scheduled pass.
+ * A chunking failure is transient and retries the entire task immediately.
  *
- * Skipping is the only option that lets the rest of the pool make progress,
- * but a silent skip is the defect this replaces: the receipt names the byte
- * overflow and the cap, so an operator can find the claim and shorten it
- * instead of watching it never classify.
+ * Skipping oversized claims lets the remaining pool make progress.
+ * The rejection receipt records the byte overflow and cap so an operator can find and shorten the claim.
+ * Shortening the claim below the byte cap lets a later pass classify it.
  */
 function recordOversizedClaims(
     args: ClassifyArgs,
@@ -377,10 +350,9 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
     };
     if (toClassify.length === 0) return result;
 
-    // Pre-flight the module route's model chain before any child session or
-    // module call. Thrown here it stays a permanent failure; thrown from inside
-    // the per-chunk try below it would be wrapped in DreamerModuleFailureError,
-    // whose transient=true would hot-retry a configuration error forever.
+    // Calling `moduleClassifyModelChain` before the per-chunk `try` preserves configuration errors as permanent failures.
+    // Errors thrown inside the per-chunk `try` become `DreamerModuleFailureError` failures.
+    // `DreamerModuleFailureError` sets `transient=true`, which would retry a configuration error indefinitely.
     if (moduleRoute) moduleClassifyModelChain(args);
 
     const { chunks, oversized } = chunkByCountAndBytes(
@@ -389,8 +361,7 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
     );
     if (oversized.length > 0) {
         recordOversizedClaims(args, oversized);
-        // Counting a claim that can never fit as remaining would keep every
-        // pass permanently incomplete and hot-retry forever.
+        // Excluding claims that cannot fit prevents `remaining` from keeping every pass incomplete and retrying forever.
         result.remaining -= oversized.length;
     }
 
@@ -406,9 +377,9 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
         for (let index = 0; index < chunks.length; index += 1) {
             const remainingMs = Math.max(0, args.deadline - Date.now());
             if (remainingMs <= 0) break;
-            // Floored so equal division across a long backlog cannot hand every
-            // chunk an unworkable slice; the tail defers to the next pass
-            // instead of the head starving on every pass.
+            // The floor prevents equal division from assigning every chunk insufficient time to complete.
+            // Later chunks defer to the next pass when the floored allocation cannot cover the backlog.
+            // Deferring later chunks prevents leading chunks from starving on every pass.
             const sliceMs = Math.min(
                 remainingMs,
                 Math.max(
@@ -424,10 +395,9 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
                 abortController.signal,
             );
             if (counts === null) {
-                // The slice could not reserve the module's cleanup margin, so
-                // the overall deadline is effectively spent and every later
-                // chunk would fare no better. Ending the pass keeps the stable
-                // pool ordering fair: the same chunks lead the next pass.
+                // Failure to reserve the cleanup margin leaves no workable deadline for later chunks.
+                // Ending the pass avoids attempting later chunks with the same exhausted deadline.
+                // The next pass starts with the same unclassified chunks.
                 log(
                     `[dreamer] classify: pass ended before chunk ${index + 1}/${chunks.length}; deadline cannot host another module call`,
                 );
@@ -450,10 +420,9 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
 }
 
 /**
- * One chunk's classification, or `null` when the module route's slice could not
- * reserve the cleanup margin — the chunk stays unbanked and is not a completed
- * invocation, so the caller ends the pass instead of skipping this chunk and
- * classifying later ones out of order.
+ * `null` means the module slice cannot reserve the cleanup margin.
+ * If the module cannot reserve the cleanup margin, the chunk remains unbanked.
+ * The caller ends the pass rather than classifying later chunks out of order.
  */
 async function classifyOneChunk(
     args: ClassifyArgs,
@@ -628,11 +597,10 @@ async function runClassifyThroughModule(
 ): Promise<string | null> {
     const membership = chunk.map((claim) => claim.publicClaimId).join(",");
     const modelChain = moduleClassifyModelChain(args);
-    // Both budgets below derive from this one capped remainder. Capping only
-    // the transport would let a long slice hand the module a deadline that
-    // outlives the transport and reopen the cancel-before-purge race, and a
-    // remainder at or below the margin leaves the module no workable budget at
-    // all — leaving the chunk unbanked keeps it eligible on the next slice.
+    // The transport deadline caps the module deadline to prevent cancellation before purge.
+    // A module deadline beyond the transport deadline reopens the cancel-before-purge race.
+    // A remainder at or below the cleanup margin leaves the module no workable budget.
+    // Leaving the chunk unbanked keeps it eligible for the next slice.
     const budgetMs = Math.min(
         CLASSIFY_MODULE_RUN_TIMEOUT_MS,
         Math.min(sliceDeadline, args.deadline) - Date.now(),
@@ -654,16 +622,7 @@ async function runClassifyThroughModule(
             authority_generation: args.moduleAuthorityGeneration,
             payload: {
                 prompt_body: prompt,
-                // `dreamer.run_task` rejects a classify payload without a
-                // non-empty canonical chain, so this is a required field, not a
-                // hint. It is the only path by which the dreamer-level default
-                // model reaches classify.
                 model_chain: [...modelChain],
-                // Strictly shorter than the transport budget below so the
-                // module's own deadline machinery — not a transport cancel that
-                // aborts the handler mid-cleanup — ends an over-budget run,
-                // records its outcome, and purges the attempt session. The guard
-                // above keeps this positive.
                 timeout_ms: budgetMs - CLASSIFY_MODULE_PURGE_MARGIN_MS,
                 items: chunk.map((claim) => ({
                     public_claim_id: claim.publicClaimId,
@@ -674,9 +633,6 @@ async function runClassifyThroughModule(
             },
         },
         signal,
-        // The module drives a full producer run (model call included) before
-        // replying, so this request carries the classify slice budget rather
-        // than the transport default.
         timeoutMs: budgetMs,
     });
     const result = (response as { result?: unknown } | null)?.result ?? response;

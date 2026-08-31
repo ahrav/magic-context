@@ -40,8 +40,6 @@ function validScenarioRaw(): Record<string, unknown> {
             {
                 task: "verify",
                 preconditions: {
-                    // The gate keeps a normal claim only when it has mapped
-                    // files, and only an explicit precondition seeds one.
                     mappings: claims.slice(0, 9).map((entry, index) => ({
                         claimId: entry.id,
                         files: [`src/file-${index + 1}.ts`],
@@ -175,8 +173,6 @@ describe("dreamer eval scenario contract", () => {
     test("map gold cannot pair independence with a file set", () => {
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ gold: { claims: Array<{ files: string[] }> } }>;
-            // A declared fixture path, so the independence pairing is what
-            // fails rather than the tracked-path check.
             tasks[1]!.gold.claims[9]!.files = ["src/file-1.ts"];
         }, "scenario.tasks[1].gold.claims[9].files: independent-has-files");
         expectDiagnostic((raw) => {
@@ -213,9 +209,6 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("an update whose anchors contradict each other is rejected", () => {
-        // Anchor scoring is a case-insensitive substring test, so a forbidden
-        // anchor contained in a required one demands content that both holds and
-        // omits the same text.
         for (const forbidden of ["bounded cache", "BOUNDED CACHE", "cache"]) {
             expectDiagnostic((raw) => {
                 const tasks = raw.tasks as Array<{
@@ -230,9 +223,6 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a file path no manifest can encode is rejected", () => {
-        // Production splits the `files` attribute on commas and trims each
-        // entry, so these paths decode as something other than what was
-        // authored and the gold set can never be reported back.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ gold: { claims: Array<{ expectedFiles: string[] }> } }>;
             tasks[0]!.gold.claims[0]!.expectedFiles = ["src/generated,a.ts"];
@@ -252,8 +242,6 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("gold file sets are restricted to declared fixture paths", () => {
-        // Production drops an untracked path and rejects the manifest when none
-        // survives, so gold naming one would score green for output the host
         // cannot apply.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ gold: { claims: Array<{ expectedFiles: string[] }> } }>;
@@ -263,8 +251,6 @@ describe("dreamer eval scenario contract", () => {
             const tasks = raw.tasks as Array<{ gold: { claims: Array<{ files: string[] }> } }>;
             tasks[1]!.gold.claims[0]!.files = ["src/./file-1.ts"];
         }, "scenario.tasks[1].gold.claims[0].files[0]: path-untracked");
-        // A claim may name a path another claim declares: that is how a fixture
-        // models a file that moved.
         const moved = validScenarioRaw();
         (moved.tasks as Array<{ gold: { claims: Array<{ expectedFiles: string[] }> } }>)[0]!.gold.claims[0]!.expectedFiles =
             ["src/file-2.ts"];
@@ -272,13 +258,8 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a mapping cannot name a path its claim does not declare", () => {
-        // The seeder applies a mapping only for a path the mapped claim itself
-        // declares and rejects anything else as fixture-drift. Unlike gold, this
-        // is per-claim: src/file-2.ts belongs to claim-2.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ preconditions: { mappings: Array<{ files: string[] }> } }>;
-            // Retarget claim-1's own mapping rather than replacing the array, so
-            // every in-scope claim stays mapped and the path rule is what fails.
             tasks[0]!.preconditions.mappings[0]!.files = ["src/file-2.ts"];
         }, "scenario.tasks[0].preconditions.mappings[0].files[0]: path-undeclared");
         const declared = validScenarioRaw();
@@ -288,9 +269,6 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a required update anchor cannot exceed the production content cap", () => {
-        // Passing content must contain the anchor as a substring, so it is at
-        // least as long as the anchor, and both the scorer and production reject
-        // an update body over the cap. No manifest can satisfy such gold.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{
                 gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
@@ -298,9 +276,6 @@ describe("dreamer eval scenario contract", () => {
             tasks[0]!.gold.claims[0]!.verdict = "update";
             tasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ["a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH + 1)];
         }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors[0]: anchor-exceeds-content-cap");
-        // Two anchors that cannot overlap need a body at least as long as their
-        // sum, so a pair at the cap is jointly impossible even though each passes
-        // on its own.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{
                 gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
@@ -311,8 +286,6 @@ describe("dreamer eval scenario contract", () => {
                 "b".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH),
             ];
         }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors: anchors-exceed-content-cap");
-        // A pair whose disjoint sum fits still parses, and so does one that only
-        // fits by overlapping — the bound is a proof of impossibility, not a
         // budget.
         const withinCap = validScenarioRaw();
         const tasks = withinCap.tasks as Array<{
@@ -338,15 +311,11 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("two claims cannot normalize to one stored claim", () => {
-        // Claim creation dedupes on (project, category, normalized content hash),
-        // so these collapse into one row and the seeder aborts on its public-id
         // cardinality check.
         expectDiagnostic((raw) => {
             const claims = (raw.pool as { claims: Array<{ content: string; category: string }> }).claims;
             claims[1]!.content = `  ${claims[0]!.content.toUpperCase()}  `;
         }, "scenario.pool.claims.content: duplicate");
-        // The identity includes the category, so the same content under a
-        // different category is two distinct claims.
         const distinctCategory = validScenarioRaw();
         const claims = (distinctCategory.pool as { claims: Array<{ content: string; category: string }> }).claims;
         claims[1]!.content = claims[0]!.content.toUpperCase();
@@ -355,9 +324,8 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a classify task cannot skip any claim", () => {
-        // Classify reads the hygiene surface, which returns every active row, and
-        // parsing already forces every claim hygiene-visible with a pool of at
-        // least ten, so the production gate always selects the whole pool.
+        // The parser requires at least ten hygiene-visible claims.
+        // The production gate selects every claim in pools of at least ten hygiene-visible claims.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{
                 expectedInScopeClaimIds: string[];
@@ -372,8 +340,8 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("the verify partition is derived from mappings and verified outcomes", () => {
-        // Declaring fixtureFiles does not seed a mapping, and the gate keeps a
-        // normal claim only when it has mapped files.
+        // fixtureFiles alone does not seed a mapping.
+        // The gate retains normal claims only when they have mapped files.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ preconditions: { mappings: unknown[] } }>;
             tasks[0]!.preconditions.mappings = tasks[0]!.preconditions.mappings.slice(1);
@@ -382,16 +350,16 @@ describe("dreamer eval scenario contract", () => {
             const tasks = raw.tasks as Array<{ preconditions: { mappings: Array<{ files: string[] }> } }>;
             tasks[0]!.preconditions.mappings[0]!.files = [];
         }, "scenario.tasks[0].expectedInScopeClaimIds: verify-scope-mismatch");
-        // A verified outcome makes the gate skip that claim, so leaving it in
-        // scope is the same mismatch.
+        // A verified outcome excludes the claim from the gate's scope.
+        // Keeping a verified claim in scope causes verify-scope-mismatch.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ preconditions: { verifications: unknown[] } }>;
             tasks[0]!.preconditions.verifications = [
                 { claimId: "claim-1", outcome: "verified", verifiedAt: 1_700_000_010_000 },
             ];
         }, "scenario.tasks[0].expectedInScopeClaimIds: verify-scope-mismatch");
-        // Any other outcome leaves `verifiedAt` at zero, so the claim stays in
-        // scope and the same scenario parses.
+        // Non-verified outcomes normalize verifiedAt to 0.
+        // Claims with non-verified outcomes remain in scope.
         const notVerified = validScenarioRaw();
         (notVerified.tasks as Array<{ preconditions: { verifications: unknown[] } }>)[0]!.preconditions.verifications =
             [{ claimId: "claim-1", outcome: "update", verifiedAt: 1_700_000_010_000 }];
@@ -399,8 +367,8 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a map task cannot skip a claim with no seeded baseline", () => {
-        // selectMapMemoryInputs always selects a claim with no baseline, and only
-        // a mapping precondition creates one.
+        // selectMapMemoryInputs always selects claims without baselines.
+        // Only mapping preconditions create baselines.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{
                 expectedInScopeClaimIds: string[];
@@ -415,8 +383,8 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a classify task cannot seed a disposition the hygiene surface hides", () => {
-        // A stale or flagged outcome sets the stale or disputed disposition, and
-        // maintenance_hygiene admits a claim only when both are clear.
+        // Stale outcomes set the stale disposition; flagged outcomes set the disputed disposition.
+        // maintenance_hygiene admits claims only when stale and disputed dispositions are clear.
         for (const outcome of ["stale", "flagged"]) {
             expectDiagnostic((raw) => {
                 const tasks = raw.tasks as Array<{ preconditions: { verifications: unknown[] } }>;
@@ -425,7 +393,7 @@ describe("dreamer eval scenario contract", () => {
                 ];
             }, "scenario.tasks[2].preconditions.verifications[0].outcome: classify-hidden-disposition");
         }
-        // The verification lane sees both, so a verify task may seed them.
+        // Verify tasks may seed stale and disputed dispositions because the verification lane reads both.
         const onVerify = validScenarioRaw();
         (onVerify.tasks as Array<{ preconditions: { verifications: unknown[] } }>)[0]!.preconditions.verifications = [
             { claimId: "claim-1", outcome: "stale", verifiedAt: 1_700_000_010_000 },
@@ -434,9 +402,9 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a required update anchor cannot hold the root closing tag", () => {
-        // Only the root tag is unsatisfiable: body extraction folds case, so every
-        // spelling truncates the body. The entry constructs are matched
-        // case-sensitively, so an inert spelling carries them.
+        // Only the root tag is unsatisfiable because body extraction matches it case-insensitively.
+        // Every root-tag spelling truncates the body.
+        // Case-sensitive entry-construct matching lets an inert spelling carry entry constructs.
         const inert = validScenarioRaw();
         const inertTasks = inert.tasks as Array<{
             gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
@@ -451,8 +419,8 @@ describe("dreamer eval scenario contract", () => {
         openerTasks[0]!.gold.claims[0]!.verdict = "update";
         openerTasks[0]!.gold.claims[0]!.requiredUpdateAnchors = ['<verified claim="ghost" files="x"/>'];
         expect(() => parseScenario(opener)).not.toThrow();
-        // The root extraction runs first and matches case-insensitively, so any
-        // spelling of the root close tag truncates the body.
+        // Root extraction runs first and matches root close tags case-insensitively.
+        // Any root close-tag spelling truncates the body.
         for (const anchor of ["facts</verify>more", "facts</VERIFY>more", "facts</Verify>more"]) {
             expectDiagnostic((raw) => {
                 const tasks = raw.tasks as Array<{
@@ -465,7 +433,6 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a fixture path cannot carry a NUL byte", () => {
-        // `writeFileSync` rejects it with a raw TypeError that escapes the typed
         // fixture-drift path.
         expectDiagnostic((raw) => {
             (raw.pool as { claims: Array<{ fixtureFiles: Array<{ path: string }> }> }).claims[0]!.fixtureFiles[0]!.path =
@@ -474,9 +441,6 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a verification timestamp must stay inside git's accepted date range", () => {
-        // git rejects a commit date past 2099-12-31T23:59:59Z in every input
-        // form, and `toISOString` throws past the maximum Date; both land before
-        // any typed seeder check.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ preconditions: { verifications: unknown[] } }>;
             tasks[0]!.preconditions.verifications = [
@@ -497,14 +461,14 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a map task cannot claim a mapped claim is in scope", () => {
-        // shouldRequeueIndependentMapping needs an empty sentinel, so a claim with
-        // mapped files can never be pulled back into map scope.
+        // shouldRequeueIndependentMapping requires an empty mapping sentinel.
+        // Claims with mapped files never return to map scope.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ preconditions: { mappings: unknown[] } }>;
             tasks[1]!.preconditions.mappings = [{ claimId: "claim-1", files: ["src/file-1.ts"] }];
         }, "scenario.tasks[1].expectedInScopeClaimIds[0]: map-scope-already-mapped");
-        // An empty mapping stays ambiguous: the requeue heuristic reads the
-        // claim's content and the repository, so either partition is admissible.
+        // An empty mapping remains ambiguous because requeue checks claim content and repository state; the claim may be in map scope or skipped scope.
+        // Requeue checks claim content and repository state, so either partition is admissible.
         const sentinel = validScenarioRaw();
         (sentinel.tasks as Array<{ preconditions: { mappings: unknown[] } }>)[1]!.preconditions.mappings = [
             { claimId: "claim-1", files: [] },
@@ -513,10 +477,8 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a verify task must declare the one result mode the seeder can produce", () => {
-        // The seeder always git-inits and commits, and calls the gate with
-        // forceBroad false: "broad" needs forceBroad, "non-git" is never
-        // returned at all, and "full" only appears when git change-times are
-        // unavailable — which the seeder itself treats as fixture drift.
+        // The gate returns full only when Git change times are unavailable.
+        // The seeder treats unavailable Git change times as fixture drift.
         for (const mode of ["full", "non-git", "broad", null]) {
             expectDiagnostic((raw) => {
                 (raw.tasks as Array<Record<string, unknown>>)[0]!.expectedResultMode = mode;
@@ -533,8 +495,8 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("a verification timestamp must leave room for the fixture commit", () => {
-        // The seeder derives the commit time as the earliest verification minus
-        // 2_000 ms and rejects a non-positive result as fixture-drift.
+        // The seeder sets the commit time to the earliest verification time minus 2,000 ms.
+        // The seeder rejects a non-positive commit time as fixture drift.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{ preconditions: { verifications: unknown[] } }>;
             tasks[0]!.preconditions.verifications = [
@@ -549,17 +511,13 @@ describe("dreamer eval scenario contract", () => {
     });
 
     test("classify gold cannot request shareable for content production forces private", () => {
-        // applyClassifications rewrites a reported `true` to false for this
-        // content, so the model's "true" would score PASS while the stored claim
-        // came out private.
+        // `applyClassifications` changes reported `shareable: true` to `false` for local-run endpoint content; otherwise the model scores PASS while the stored claim is private.
         expectDiagnostic((raw) => {
             const claims = (raw.pool as { claims: Array<{ content: string; sharing: string }> }).claims;
             claims[0]!.content = "The provider answers on 127.0.0.1:8080 during local runs.";
             claims[0]!.sharing = "private";
         }, "scenario.tasks[2].gold.claims[0].shareable: shareability-override");
-        // The override only fires on an explicitly reported `true`. A sensitive
-        // claim already stored shareable keeps that value when an entry omits the
-        // field, so this gold is achievable and must not be refused.
+        // Omitting the field preserves shareable on an already-shareable sensitive claim, so the expected gold remains achievable.
         const alreadyShareable = validScenarioRaw();
         const claims = (alreadyShareable.pool as { claims: Array<{ content: string; sharing: string }> }).claims;
         claims[0]!.content = "The provider answers on 127.0.0.1:8080 during local runs.";
@@ -568,13 +526,10 @@ describe("dreamer eval scenario contract", () => {
     });
 });
 
-// Storage identities the production predicates accept: `mcm_` plus 32 lowercase
-// hexadecimal characters, and a locator embedding that same id, a positive
-// revision, and a SHA-256 digest.
+// Production storage identities use `mcm_` plus 32 lowercase hexadecimal characters; locators embed that ID, a positive revision, and a SHA-256 digest.
 const CLAIM_ONE_ID = `mcm_${"1".repeat(32)}`;
 const CLAIM_TWO_ID = `mcm_${"2".repeat(32)}`;
-// The locator's third segment is the revision's content hash, so it is derived
-// rather than filled in.
+// The locator's third segment is the revision content hash.
 function locatorFor(publicClaimId: string, content: string): string {
     return `${publicClaimId}/r1/${sha256Utf8Hex(content)}`;
 }
@@ -583,8 +538,7 @@ const SNAPSHOT_CONTENT = "Distinct memory content";
 const CLAIM_ONE_LOCATOR = locatorFor(CLAIM_ONE_ID, SNAPSHOT_CONTENT);
 const CLAIM_TWO_LOCATOR = locatorFor(CLAIM_TWO_ID, SNAPSHOT_CONTENT);
 
-// A completed report has to carry the whole scenario pool, and the contract's
-// floor is ten claims.
+// Completed reports include the full scenario pool of at least 10 claims.
 function poolSnapshot(index: number): Record<string, unknown> {
     const publicClaimId = `mcm_${(index + 1).toString(16).padStart(2, "0").repeat(16)}`;
     const content = `Distinct memory content ${index + 1}`;
@@ -615,7 +569,7 @@ const VERIFY_EVIDENCE = {
     archived: [],
 };
 
-/** Bytes the production parsers read back as the evidence beside them. */
+/* */
 function rawVerify(evidence: typeof VERIFY_EVIDENCE): string {
     const lines = evidence.verified.map(
         (entry) => `<verified claim="${entry.publicClaimId}" files="${entry.files.join(",")}"/>`,
@@ -637,7 +591,7 @@ function rawClassify(evidence: Array<{ publicClaimId: string; scope: string }>):
     return `<classify>\n${lines.join("\n")}\n</classify>`;
 }
 
-/** The same capture with `overrides` folded into its first claim. */
+/* */
 function captureWithFirst(overrides: Record<string, unknown>): Array<Record<string, unknown>> {
     return POOL_CAPTURE.map((claim, index) => (index === 0 ? { ...claim, ...overrides } : claim));
 }
@@ -700,9 +654,7 @@ describe("dreamer eval report contract", () => {
     });
 
     test("parsed manifest evidence round-trips every scorer's shape", () => {
-        // Verify parses to one record of verdict lists; map and classify parse
-        // to one entry per claim, so a report that only accepted a record could
-        // not carry the evidence two of the three scorers produce.
+        // Verify emits one verdict-list record; map and classify emit one entry per claim, so a record-only report cannot contain evidence from two scorers.
         const mapShape = [{ publicClaimId: OBSERVED_ID, files: ["src/a.ts"], independent: false }];
         expect(
             parseRunReport({
@@ -714,8 +666,7 @@ describe("dreamer eval report contract", () => {
         ).toEqual(mapShape);
         const verifyShape = VERIFY_EVIDENCE;
         expect(parseRunReport({ ...baseReport, parsedManifest: verifyShape }).parsedManifest).toEqual(verifyShape);
-        // Absent evidence belongs to a run that failed before scoring, so the
-        // null case rides on an ERROR report; a PASS must carry both fields.
+        // A run without evidence failed before scoring, so null `rawManifest` and `parsedManifest` require an ERROR report; PASS requires both.
         expect(
             parseRunReport({ ...baseReport, status: "ERROR", reason: "harness-failure", parsedManifest: null })
                 .parsedManifest,
@@ -726,8 +677,6 @@ describe("dreamer eval report contract", () => {
         expect(() => parseRunReport({ ...baseReport, parsedManifest: "not-a-manifest" })).toThrow(
             /parsedManifest: object-required/,
         );
-        // A shape no scorer emits, and evidence naming a claim the run never
-        // observed, are both refused.
         expect(() => parseRunReport({ ...baseReport, parsedManifest: {} })).toThrow(
             /parsedManifest: fields-invalid/,
         );
@@ -774,8 +723,7 @@ describe("dreamer eval report contract", () => {
                 }),
             ).toThrow(new RegExp(`${field}.publicClaimId: duplicate`));
         }
-        // A single-claim capture is only legal for a run that failed before
-        // observing the pool, since a completed one must carry all ten.
+        // A one-claim capture is valid only for a run that failed before observing the full 10-claim pool.
         expect(
             parseRunReport({
                 ...baseReport,
@@ -801,14 +749,11 @@ describe("dreamer eval report contract", () => {
             files: ["src/a.ts"],
             verificationOutcome: null,
         };
-        // No task creates, deletes, or rekeys a claim, so an omitted or rebound
-        // identity is a corrupt before/after comparison rather than a real
+        // Tasks never create, delete, or rekey claims; omitted or rebound identities corrupt before/after comparisons.
         // observation.
-        // An omitted claim.
         expect(() => parseRunReport({ ...baseReport, poolAfter: POOL_CAPTURE.slice(1) })).toThrow(
             /poolAfter: identity-drift/,
         );
-        // A rebound public id on an otherwise identical claim.
         expect(() =>
             parseRunReport({
                 ...baseReport,
@@ -818,7 +763,6 @@ describe("dreamer eval report contract", () => {
                 }),
             }),
         ).toThrow(/poolAfter: identity-drift/);
-        // A result attributed to another claim entirely.
         expect(() =>
             parseRunReport({
                 ...baseReport,
@@ -831,7 +775,7 @@ describe("dreamer eval report contract", () => {
                 }),
             }),
         ).toThrow(/poolAfter: identity-drift/);
-        // Archival is a lifecycleState change on the same identity, so it is not
+        // Archival changes `lifecycleState` without changing claim identity.
         // drift.
         expect(
             parseRunReport({ ...baseReport, poolAfter: captureWithFirst({ lifecycleState: "archived" }) })
@@ -875,13 +819,12 @@ describe("dreamer eval report contract", () => {
         expect(() => parse({ revisionLocator: `${CLAIM_ONE_ID}/r0/${"a".repeat(64)}` })).toThrow(
             /revisionLocator: locator-invalid/,
         );
-        // The locator embeds the claim's own id, so one naming another claim is a
-        // mismatched pairing even though both halves are well formed.
+        // A locator must embed its own claim ID; a locator naming another claim is invalid.
+        // A revisionLocator whose claim ID differs from publicClaimId is rejected even when both IDs are valid.
         expect(() => parse({ revisionLocator: CLAIM_TWO_LOCATOR })).toThrow(
             /revisionLocator: locator-claim-mismatch/,
         );
-        // The digest is the revision's content hash, so one over other bytes
-        // describes a revision whose content is not the one recorded.
+        // A revisionLocator digest must match the revision content hash.
         expect(() => parse({ revisionLocator: `${OBSERVED_ID}/r1/${"c".repeat(64)}` })).toThrow(
             /revisionLocator: locator-digest-mismatch/,
         );
@@ -889,16 +832,14 @@ describe("dreamer eval report contract", () => {
     });
 
     test("a passing report must carry the evidence it was scored from", () => {
-        // A scorer reaches PASS only after a nonblank manifest validates and
-        // yields parsed evidence.
+        // A PASS report requires a nonblank rawManifest and parsedManifest.
         expect(() => parseRunReport({ ...baseReport, rawManifest: null })).toThrow(
             /parsedManifest: pass-requires-evidence/,
         );
         expect(() => parseRunReport({ ...baseReport, parsedManifest: null })).toThrow(
             /parsedManifest: pass-requires-evidence/,
         );
-        // Blank bytes are non-null but are exactly what every scorer rejects as
-        // ERROR:provider-failure, so they cannot back a PASS either.
+        // Blank rawManifest values cannot support PASS because scorers classify them as ERROR:provider-failure.
         expect(() => parseRunReport({ ...baseReport, rawManifest: "   " })).toThrow(
             /parsedManifest: pass-requires-evidence/,
         );
@@ -911,7 +852,7 @@ describe("dreamer eval report contract", () => {
                 parsedManifest: null,
             }).rawManifest,
         ).toBe("   ");
-        // An ERROR run may hold neither.
+        // An ERROR run may omit both `rawManifest` and `parsedManifest`.
         expect(
             parseRunReport({
                 ...baseReport,
@@ -924,9 +865,7 @@ describe("dreamer eval report contract", () => {
     });
 
     test("a failure reason must be one its task's scorer can produce", () => {
-        // The map scorer emits only wrong-independence, wrong-mapping, and
-        // invalid-output, so a map report claiming wrong-archival would carry
-        // run-fatal exit 2 for an outcome it could never reach.
+        // The map scorer permits only wrong-independence, wrong-mapping, and invalid-output.
         expect(() =>
             parseRunReport({
                 ...baseReport,
@@ -957,8 +896,7 @@ describe("dreamer eval report contract", () => {
     });
 
     test("a failing report must carry the evidence it was scored from", () => {
-        // precheck admits only a nonblank manifest, so every scorer failure has
-        // raw bytes; every reason but invalid-output also carries parsed evidence.
+        // All scorer failures require a nonblank rawManifest; only invalid-output may omit parsedManifest.
         const failing = { ...baseReport, status: "FAIL", reason: "wrong-verdict" };
         expect(() => parseRunReport({ ...failing, rawManifest: null })).toThrow(
             /rawManifest: fail-requires-evidence/,
@@ -966,8 +904,7 @@ describe("dreamer eval report contract", () => {
         expect(() => parseRunReport({ ...failing, rawManifest: "  " })).toThrow(
             /rawManifest: fail-requires-evidence/,
         );
-        // A post-parse ERROR has no such rule, so the binding rule is what refuses
-        // evidence with no bytes behind it.
+        // Reports cannot include parsedManifest without rawManifest.
         expect(() =>
             parseRunReport({
                 ...baseReport,
@@ -979,24 +916,18 @@ describe("dreamer eval report contract", () => {
         expect(() => parseRunReport({ ...failing, parsedManifest: null })).toThrow(
             /parsedManifest: fail-requires-evidence/,
         );
-        // invalid-output is raised when validation threw, so it has no parsed
-        // evidence to carry.
+        // An invalid-output report omits parsedManifest because validation failed before parsing.
         const rejected = { ...baseReport, status: "FAIL", reason: "invalid-output", rawManifest: "<verify>" };
         expect(parseRunReport({ ...rejected, parsedManifest: null }).parsedManifest).toBeNull();
-        // And it cannot carry evidence: the reason is raised before any parse
         // result exists.
         expect(() => parseRunReport(rejected)).toThrow(/parsedManifest: invalid-output-has-evidence/);
-        // Structurally parseable bytes beside invalid-output are legitimate: the
-        // reason also covers a manifest the validator rejected for not covering
-        // the expected ids, and reproducing that needs a set the report lacks.
+        // An invalid-output report may retain structurally parseable rawManifest when validation rejects its expected-ID coverage.
         expect(
             parseRunReport({ ...baseReport, status: "FAIL", reason: "invalid-output", parsedManifest: null }).reason,
         ).toBe("invalid-output");
     });
 
     test("evidence entries must carry the fields their scorer emits", () => {
-        // A map entry always has files and independence; verify's three lists each
-        // have their own field set; a classify entry needs at least one
         // classification field.
         expect(() =>
             parseRunReport({ ...baseReport, task: "map-memories", parsedManifest: [{ publicClaimId: OBSERVED_ID }] }),
@@ -1026,7 +957,6 @@ describe("dreamer eval report contract", () => {
                 ),
             }),
         ).toThrow(/parsedManifest\[0\]: classification-empty/);
-        // A partial classification is exactly what the parser produces.
         expect(
             parseRunReport({
                 ...baseReport,
@@ -1035,8 +965,7 @@ describe("dreamer eval report contract", () => {
                 parsedManifest: CLASSIFY_EVIDENCE,
             }).parsedManifest,
         ).toEqual(CLASSIFY_EVIDENCE);
-        // Classify validation demands exact id coverage, so evidence for a subset
-        // of the observed pool is an artifact no scorer produces.
+        // Classify validation requires evidence for every observed ID.
         expect(() =>
             parseRunReport({
                 ...baseReport,
@@ -1047,8 +976,7 @@ describe("dreamer eval report contract", () => {
     });
 
     test("an anchor's own edge whitespace costs a character on each side", () => {
-        // The parser trims the body, so whitespace at an anchor's edge survives
-        // only with a non-whitespace character outside it.
+        // The parser preserves anchor-edge whitespace only when a non-whitespace character remains outside the anchor.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{
                 gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
@@ -1058,7 +986,6 @@ describe("dreamer eval report contract", () => {
                 ` ${"a".repeat(VERIFY_UPDATE_CONTENT_MAX_LENGTH - 2)} `,
             ];
         }, "scenario.tasks[0].gold.claims[0].requiredUpdateAnchors[0]: anchor-exceeds-content-cap");
-        // Two characters shorter leaves room for the padding on both sides.
         const fits = validScenarioRaw();
         const tasks = fits.tasks as Array<{
             gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
@@ -1071,8 +998,7 @@ describe("dreamer eval report contract", () => {
     });
 
     test("a required anchor's capacity is measured before case folding", () => {
-        // `"İ".toLowerCase()` is two code units, so folding first would double the
-        // measured cost and refuse a body that actually fits.
+        // The parser measures the body before lowercasing: `"İ".toLowerCase()` has two code units, so lowercasing first rejects a body that fits.
         const expanding = validScenarioRaw();
         const tasks = expanding.tasks as Array<{
             gold: { claims: Array<{ verdict: string; requiredUpdateAnchors: string[] }> };
@@ -1083,12 +1009,10 @@ describe("dreamer eval report contract", () => {
     });
 
     test("parsed evidence must reproduce from the captured bytes", () => {
-        // The exploit this closes: bytes that carry no entries paired with a
-        // fabricated evidence array.
+        // `parsedManifest` must match the evidence parsed from `rawManifest`.
         expect(() =>
             parseRunReport({ ...baseReport, rawManifest: "<verify></verify>" }),
         ).toThrow(/parsedManifest: evidence-mismatch/);
-        // Evidence that differs in a field, not just in coverage.
         expect(() =>
             parseRunReport({
                 ...baseReport,
@@ -1098,11 +1022,11 @@ describe("dreamer eval report contract", () => {
                 },
             }),
         ).toThrow(/parsedManifest: evidence-mismatch/);
-        // Bytes the parser refuses cannot back evidence either.
+        // `parsedManifest` cannot supply evidence unless the parser accepts `rawManifest`.
         expect(() => parseRunReport({ ...baseReport, rawManifest: "<verify>" })).toThrow(
             /rawManifest: evidence-unparseable/,
         );
-        // Key order is not part of the comparison.
+        // The `parsedManifest` comparison ignores object key order.
         expect(
             parseRunReport({
                 ...baseReport,
@@ -1121,7 +1045,7 @@ describe("dreamer eval report contract", () => {
         expect(() =>
             parseRunReport({ ...baseReport, receiptOutcomes: [{ ...receipt, claimId: "claim-999" }] }),
         ).toThrow(/receiptOutcomes\[0\].claimId: unobserved-claim/);
-        // An ERROR run may hold a partial capture, so it keeps the exemption.
+        // ERROR reports may use a partial capture.
         expect(
             parseRunReport({
                 ...baseReport,
@@ -1158,14 +1082,12 @@ describe("dreamer eval report contract", () => {
     });
 
     test("a capture cannot hold two active claims with one identity", () => {
-        // Content that normalizes onto the second claim's, with the locator digest
-        // moved to match the new bytes.
+        // The modified first claim collides with the second claim's normalized content, so duplicate detection must reject it.
         const collidingFirst = () => {
             const content = `  ${POOL_CAPTURE[1]!.content as string}  `;
             return { content, revisionLocator: locatorFor(OBSERVED_ID, content) };
         };
-        // assertNoLiveDuplicate keeps that state out of production, and a ledger
-        // built from such a capture would silently keep one owner.
+        // `assertNoLiveDuplicate` rejects duplicate active identities; otherwise, a ledger would retain only one owner.
         expect(() =>
             parseRunReport({
                 ...baseReport,
@@ -1173,7 +1095,7 @@ describe("dreamer eval report contract", () => {
                 poolAfter: captureWithFirst(collidingFirst()),
             }),
         ).toThrow(/poolBefore.content: duplicate/);
-        // Archived rows are outside the assertion's `active` filter.
+        // Archived claims may share identities because `assertNoLiveDuplicate` checks only active rows.
         expect(
             parseRunReport({
                 ...baseReport,
@@ -1184,8 +1106,7 @@ describe("dreamer eval report contract", () => {
     });
 
     test("a wrong-result-mode error belongs only to a verify task", () => {
-        // Map and classify pin expectedResultMode to null and preflight observes
-        // none, so neither can disagree about one.
+        // Only `verify` can produce `wrong-result-mode`.
         for (const task of ["map-memories", "classify-memories"]) {
             expect(() =>
                 parseRunReport({
@@ -1210,8 +1131,7 @@ describe("dreamer eval report contract", () => {
     });
 
     test("a task that selects nothing cannot produce an artifact", () => {
-        // Production returns immediately when a gate selects no inputs, so no
-        // manifest exists to score.
+        // When a gate selects no inputs, production returns immediately and scores no manifest.
         expectDiagnostic((raw) => {
             const tasks = raw.tasks as Array<{
                 preconditions: { mappings: unknown[] };
@@ -1228,8 +1148,7 @@ describe("dreamer eval report contract", () => {
     });
 
     test("a completed report must capture the scenario pool", () => {
-        // Binding equality is vacuous for two empty captures, and every scenario
-        // declares at least ten claims.
+        // Empty captures satisfy binding equality.
         expect(() => parseRunReport({ ...baseReport, poolBefore: [], poolAfter: [] })).toThrow(
             /poolBefore: pool-capture-incomplete/,
         );
@@ -1240,7 +1159,7 @@ describe("dreamer eval report contract", () => {
                 poolAfter: POOL_CAPTURE.slice(0, 9),
             }),
         ).toThrow(/poolBefore: pool-capture-incomplete/);
-        // An ERROR run may have died before observing anything.
+        // ERROR runs may omit pool captures.
         expect(
             parseRunReport({
                 ...baseReport,
@@ -1253,16 +1172,12 @@ describe("dreamer eval report contract", () => {
     });
 
     test("an empty aggregation is not a pass", () => {
-        // Every valid scenario carries at least one task, so nothing to
-        // aggregate means no evaluation ran.
         expect(dreamerEvalExitCode([])).toBe(1);
         expect(dreamerEvalExitCode([parseRunReport(baseReport)])).toBe(0);
     });
 
     test("a commit sha must be a full object id, not an intermediate length", () => {
-        // 40 hex characters under SHA-1, 64 under SHA-256, nothing between: an
-        // intermediate length names a commit that cannot exist, so the recorded
-        // source revision could not be checked out or verified.
+        // A source revision must contain either 40 hexadecimal characters for SHA-1 or 64 for SHA-256.
         for (const sha of ["a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65)]) {
             expect(() =>
                 parseRunReport({ ...baseReport, system: { ...baseReport.system, repoCommitSha: sha } }),
@@ -1277,9 +1192,7 @@ describe("dreamer eval report contract", () => {
     });
 
     test("blank provider output round-trips instead of collapsing into absence", () => {
-        // Every scorer records a blank manifest as ERROR:provider-failure, so the
-        // observed bytes have to survive the report; null stays reserved for "no
-        // output was captured".
+        // A blank `rawManifest` remains distinct from `null`.
         const blank = {
             ...baseReport,
             status: "ERROR",

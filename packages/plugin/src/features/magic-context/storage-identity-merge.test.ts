@@ -120,7 +120,6 @@ describe("project identity merge", () => {
             /historical alias of git:target/,
         );
 
-        // The rolled-back merge leaves both registries untouched.
         expect(
             database.prepare("SELECT COUNT(*) AS count FROM v22_identity_rekey_map").get(),
         ).toEqual({ count: 0 });

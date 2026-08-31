@@ -1,51 +1,31 @@
-//! Barrier-driven real-process crash harness for the shared-memory provider.
+//! The harness tests shared-memory-provider crashes with process barriers.
 //!
-//! # Provisional tuple
-//! The frozen retained-tuple manifest from Beads task `magic-context-ymc.12`
-//! (`crates/mc-shm-transport/benches/manifests/v1.json`) still contains
-//! unresolved fields, so this harness runs against the in-repo ring-backed
-//! `ShmProvider` tuple on Linux as the provisional tuple. Once `.12` freezes
-//! the retained matrix, these roles must be pointed at each retained tuple's
+//! The harness uses the in-repo ring-backed `ShmProvider` tuple.
 //! adapter instead.
 //!
 //! # Roles
-//! The parent (an ordinary libtest test in `shm_failure_modes.rs`) spawns
-//! the daemon and victim as real processes via libtest self-reexec (the
-//! `mc-shm-transport/tests/ring.rs` pattern): ignored tests dispatch on
-//! environment variables. The observer is an independently authenticated
-//! in-parent [`RawClient`] route.
+//! The parent spawns the daemon and victim as real processes through libtest self-reexec.
+//! Ignored tests dispatch by environment variable.
+//! The observer uses an independently authenticated in-parent [`RawClient`] route.
 //!
 //! # Barriers
-//! Roles exchange bounded machine-readable records over inherited pipes,
-//! one line each, prefixed with [`RECORD_PREFIX`]. The owner of each
-//! transition reports it: the victim reports `idle_committed` after its
-//! commit exchange, the victim's client provider side reports
-//! `request_published` after its ring commit, and the daemon provider
-//! reports `response_published` through the provider publish hook. No
-//! wall-clock sleep decides whether a crash point was reached.
+//! Roles exchange bounded machine-readable records over inherited pipes.
+//! Each record occupies one line and starts with [`RECORD_PREFIX`].
+//! The victim reports `idle_committed` after its commit exchange.
+//! The victim's client provider side reports `request_published` after its ring commit.
+//! The daemon provider reports `response_published` through the provider publish hook.
+//! No wall-clock sleep determines whether a crash point was reached.
 //!
-//! # Kill-and-reap discipline
 //! [`RoleProcess::kill`] sends `SIGKILL` and records only the kill instant.
-//! The bounded post-reap observation window starts only in
-//! [`RoleProcess::reap_killed`], after `wait` returned signal-9 status. The
-//! harness never resets the provider or client recovery episode deadlines,
-//! which keep their original start times.
+//! The observation window starts after `wait` returns signal-9 status.
+//! Provider and client recovery episode deadlines retain their original start times.
 //!
 //! # Redaction
-//! Records and failure output carry only redacted seed, tuple, and state
-//! names — never descriptors, grants, tokens, object names, addresses, or
+//! Records and failure output contain only redacted seed, tuple, and state.
 //! payloads.
 //!
-//! # JavaScript victim runtimes (stub category)
-//! [`VictimRuntime`] currently offers only `Rust`. Bun/Node victims need a
-//! JS client that drives the shared-memory provider end-to-end against a
-//! Rust daemon; today no daemon entrypoint installs `ShmProvider` (the
-//! `perf_host` example is TCP-only), so the JS path cannot be exercised
-//! honestly. U6, with the frozen `.12` manifest, must add a daemon
-//! entrypoint that installs the retained provider plus a prebundled
-//! `run-mc-shm-failure-child` script, then extend [`VictimRuntime`] with
-//! `Bun`/`Node` variants that spawn those runtimes directly so the signaled
-//! PID is the runtime under test. This is a stub category, not coverage.
+//! No daemon entrypoint installs `ShmProvider`; therefore JavaScript clients cannot drive it end-to-end.
+//! The `perf_host` example is TCP-only.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -65,28 +45,24 @@ use mc_shm_transport::profile::HostLimits as ShmHostLimits;
 use super::raw_client::{self, Discovered, RawClient, FLAGS_INTERACTIVE, TY_REQUEST, TY_RESPONSE};
 use super::{connection_file, TestHost, LINKED_MODULE_ID};
 
-/// Prefix that marks a machine-readable harness record on a role's stdout.
+/// `RECORD_PREFIX` marks machine-readable harness records on role stdout.
 pub const RECORD_PREFIX: &str = "MC_SHM_REC";
 
-/// Bounded post-reap observation window. Starts only after `wait` reaped the
-/// killed child; provider and client episode deadlines are independent.
 pub const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Bound on every wait for one role record.
+/// `RECORD_TIMEOUT` bounds every wait for one role record.
 pub const RECORD_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound on reaping an already-signaled child.
+/// `REAP_BUDGET` bounds reaping an already-signaled child.
 const REAP_BUDGET: Duration = Duration::from_secs(10);
 
-/// Bound on every in-role protocol exchange.
+/// `ROLE_BUDGET` bounds every in-role protocol exchange.
 const ROLE_BUDGET: Duration = Duration::from_secs(10);
 
-/// Deterministic recorded seed for the victim fill request.
 pub const VICTIM_FILL_BYTES: usize = 2048;
-/// Deterministic recorded seed for the victim fill request.
 pub const VICTIM_FILL_VALUE: u8 = 0x5a;
 
-/// Route identity root shared by every harness client.
+/// `CRASH_ROOT` is the route identity root shared by every harness client.
 pub const CRASH_ROOT: &str = "/workspace/shm-crash";
 
 pub const ENV_DAEMON_DATA_ROOT: &str = "MC_SHM_DAEMON_DATA_ROOT";
@@ -96,16 +72,12 @@ pub const ENV_VICTIM_SCENARIO: &str = "MC_SHM_VICTIM_SCENARIO";
 pub const ENV_VICTIM_SESSION: &str = "MC_SHM_VICTIM_SESSION";
 pub const ENV_VICTIM_STALE_FILE: &str = "MC_SHM_VICTIM_STALE_FILE";
 
-/// Victim runtimes the harness can spawn. Only `Rust` is implemented; see
-/// the module documentation's stub-category note for the Bun/Node gap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VictimRuntime {
     Rust,
 }
 
-/// Serializes the crash scenarios inside one test binary so plain
-/// `cargo test` stays safe; nextest-level serialization comes from the
-/// `shm-crash` test group in `.config/nextest.toml`.
+/// `serial_crash_lock` serializes crash scenarios within one test binary.
 pub async fn serial_crash_lock() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -113,19 +85,17 @@ pub async fn serial_crash_lock() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
-/// Writes one bounded machine-readable record to the inherited stdout pipe.
 pub fn emit_record(record: &str) {
     println!("{RECORD_PREFIX} {record}");
 }
 
-/// Instant `SIGKILL` was sent. Deliberately not an observation window: the
-/// window may start only after the child is reaped.
+/// `KillEvidence::killed_at` records when `SIGKILL` was sent; the observation window starts only after the child is reaped.
 #[derive(Clone, Copy, Debug)]
 pub struct KillEvidence {
     pub killed_at: Instant,
 }
 
-/// Bounded post-reap observation window, anchored to the reap instant.
+/// `ObservationWindow` bounds post-reap observation from the reap instant.
 #[derive(Clone, Copy, Debug)]
 pub struct ObservationWindow {
     pub started_at: Instant,
@@ -138,7 +108,6 @@ impl ObservationWindow {
     }
 }
 
-/// One spawned harness role process with its record pipe.
 pub struct RoleProcess {
     name: &'static str,
     child: Child,
@@ -148,8 +117,6 @@ pub struct RoleProcess {
     window: Option<ObservationWindow>,
 }
 
-/// Spawns `role_test` in a fresh copy of the current test binary with the
-/// given environment, wiring stdin commands and stdout records.
 pub fn spawn_role(name: &'static str, role_test: &str, envs: &[(&str, String)]) -> RoleProcess {
     let exe = std::env::current_exe().expect("test executable path");
     let mut command = Command::new(exe);
@@ -194,7 +161,7 @@ impl RoleProcess {
         self.child.id()
     }
 
-    /// Next record within [`RECORD_TIMEOUT`].
+    /// `next_record` returns the next record within [`RECORD_TIMEOUT`].
     pub fn next_record(&mut self) -> String {
         match self.records.recv_timeout(RECORD_TIMEOUT) {
             Ok(record) => record,
@@ -205,13 +172,12 @@ impl RoleProcess {
         }
     }
 
-    /// Asserts the next record equals `expected` exactly.
+    /// `expect_record` asserts that the next record equals `expected` exactly.
     pub fn expect_record(&mut self, expected: &str) {
         let record = self.next_record();
         assert_eq!(record, expected, "role {} record", self.name);
     }
 
-    /// Consumes records until `expected` appears, each read bounded.
     pub fn wait_for_record(&mut self, expected: &str) {
         loop {
             if self.next_record() == expected {
@@ -220,14 +186,12 @@ impl RoleProcess {
         }
     }
 
-    /// Writes one command line to the role's stdin pipe.
     pub fn send_command(&mut self, command: &str) {
         writeln!(self.stdin, "{command}").expect("write role command");
         self.stdin.flush().expect("flush role command");
     }
 
-    /// Daemon-only query: total handler dispatches so far. Skips unrelated
-    /// asynchronous barrier records queued ahead of the reply.
+    /// The daemon-only query returns total handler dispatches and skips unrelated asynchronous barrier records queued before the reply.
     pub fn query_dispatches(&mut self) -> u64 {
         self.send_command("stats");
         loop {
@@ -238,7 +202,7 @@ impl RoleProcess {
         }
     }
 
-    /// The query discards records before the `soak` reply.
+    /// `query_soak_stats` discards records received before its `soak` reply.
     pub fn query_soak_stats(&mut self) -> DaemonSoakStats {
         self.send_command("soak_stats");
         loop {
@@ -249,7 +213,7 @@ impl RoleProcess {
         }
     }
 
-    /// Sends `SIGKILL` without reaping and without starting any timing.
+    /// The kill operation does not reap the child or start the observation window.
     pub fn kill(&mut self) -> KillEvidence {
         assert!(self.status.is_none(), "role {} already reaped", self.name);
         self.child.kill().expect("SIGKILL role process");
@@ -258,13 +222,13 @@ impl RoleProcess {
         }
     }
 
-    /// The post-reap observation window, or `None` before the reap.
+    /// The accessor returns the post-reap observation window and returns `None` before the reap.
     pub fn observation_window(&self) -> Option<ObservationWindow> {
         self.window
     }
 
-    /// Reaps a killed child: `wait` must return signal-9 status, and only
-    /// then does the bounded observation window start.
+    /// `wait_status` must return signal-9 status before the observation window starts.
+    /// The bounded observation window starts only after `reap_killed` verifies signal 9.
     pub fn reap_killed(&mut self) -> ObservationWindow {
         let status = self.wait_status(REAP_BUDGET);
         {
@@ -285,13 +249,11 @@ impl RoleProcess {
         window
     }
 
-    /// Bounded wait for a clean voluntary exit.
     pub fn wait_exit_success(&mut self, budget: Duration) {
         let status = self.wait_status(budget);
         assert!(status.success(), "role {} must exit cleanly", self.name);
     }
 
-    /// Bounded wait until the killed-but-unreaped child is a zombie.
     pub fn wait_zombie(&self, budget: Duration) {
         let deadline = Instant::now() + budget;
         loop {
@@ -326,7 +288,6 @@ impl RoleProcess {
         }
     }
 
-    /// Bounded teardown: kill, wait, and verify no descendant survived.
     pub fn teardown(mut self) {
         let descendants = live_descendants(self.pid());
         if self.status.is_none() {
@@ -407,7 +368,6 @@ fn parse_charges(value: &str) -> Option<[u64; 4]> {
     Some(charges)
 }
 
-/// Transitive live descendants of `root`, from `/proc` parent links.
 pub fn live_descendants(root: u32) -> Vec<u32> {
     let mut table: Vec<(u32, u32)> = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -438,14 +398,12 @@ pub fn live_descendants(root: u32) -> Vec<u32> {
     out
 }
 
-/// Process state letter from `/proc/<pid>/stat`, or `None` once reaped.
 pub fn proc_state(pid: u32) -> Option<char> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_stat(&stat).map(|(state, _)| state)
 }
 
 fn parse_stat(stat: &str) -> Option<(char, u32)> {
-    // The comm field may contain spaces; fields resume after the last ')'.
     let rest = stat.rsplit_once(')')?.1.trim_start();
     let mut fields = rest.split_whitespace();
     let state = fields.next()?.chars().next()?;
@@ -453,7 +411,6 @@ fn parse_stat(stat: &str) -> Option<(char, u32)> {
     Some((state, ppid))
 }
 
-/// Negotiation body offering the qualified shared-memory profile plus TCP.
 pub fn shm_offers() -> serde_json::Value {
     serde_json::json!({
         "op": "transport.negotiate",
@@ -493,7 +450,6 @@ pub fn goodbye_header() -> EnvelopeHeader {
     }
 }
 
-/// Receives shared-memory frames until `corr`, skipping Pings, bounded.
 pub fn recv_response(peer: &TestShmPeer, corr: u64, budget: Duration) -> (EnvelopeHeader, Vec<u8>) {
     let deadline = Instant::now() + budget;
     loop {
@@ -509,7 +465,6 @@ pub fn recv_response(peer: &TestShmPeer, corr: u64, budget: Duration) -> (Envelo
     }
 }
 
-/// Opens a route over a committed shared-memory candidate (correlation 3).
 pub fn shm_route_open(peer: &TestShmPeer, session: &str) -> (u16, u32) {
     let open = serde_json::to_vec(&serde_json::json!({
         "op": "route.open",
@@ -538,9 +493,6 @@ fn direct_fill_body(bytes: usize, value: u8) -> Vec<u8> {
     .expect("direct fill body")
 }
 
-/// Daemon process role: a real host with the qualified shared-memory
-/// provider installed, publishing to the parent-owned data root and
-/// answering bounded stdin commands.
 pub fn daemon_role() {
     let Ok(data_root) = std::env::var(ENV_DAEMON_DATA_ROOT) else {
         return;
@@ -557,9 +509,6 @@ pub fn daemon_role() {
         mappings: charges.mappings * candidates,
         pinned_workers: 0,
     }));
-    // The daemon provider owns the response-publication transition, so it
-    // reports that barrier itself. Control replies (channel 0) are not
-    // route responses and stay silent.
     provider.set_publish_hook(Arc::new(|ty, channel| {
         if ty == FrameType::Response && channel != 0 {
             emit_record("barrier response_published");
@@ -626,19 +575,15 @@ pub fn daemon_role() {
                     emit_record("quarantine_armed");
                 }
                 "leak_fd" => {
-                    // A duplicated fd remains open.
                     assert!(unsafe { libc::dup(0) } >= 0, "duplicated fd fixture");
                     emit_record("leaked");
                 }
                 _ => {}
             }
         }
-        // Stdin EOF: the parent tears this role down with SIGKILL.
     });
 }
 
-/// Victim process role: authenticates, commits a shared-memory candidate,
-/// reports the owner-side barriers, and then follows its scenario.
 pub fn victim_role() {
     let Ok(connection) = std::env::var(ENV_VICTIM_CONNECTION) else {
         return;
@@ -675,8 +620,6 @@ pub fn victim_role() {
         .expect("activation token")
         .to_owned();
     if let Some(path) = stale_file {
-        // Private scratch handoff consumed by the parent's incarnation-fence
-        // scenario; never written to any record or diagnostic surface.
         let record = serde_json::json!({
             "activation_token": token,
             "descriptor": grant["descriptor"],
@@ -715,8 +658,6 @@ pub fn victim_role() {
             };
             peer.send(request_header(channel, epoch, 4, body.len()), &body)
                 .expect("publish request");
-            // The victim's client provider side owns this transition: the
-            // ring commit above completed publication.
             emit_record("barrier request_published");
             park();
         }
@@ -735,7 +676,6 @@ pub fn victim_role() {
             emit_record("terminal ok");
             peer.send(goodbye_header(), &[]).expect("publish goodbye");
             if scenario == "roundtrip_park" {
-                // Logical close precedes termination.
                 emit_record("closed");
                 park();
             }
@@ -744,7 +684,6 @@ pub fn victim_role() {
     }
 }
 
-/// Parks the role until the parent delivers `SIGKILL`.
 fn park() -> ! {
     loop {
         std::thread::sleep(Duration::from_secs(3600));
@@ -792,7 +731,6 @@ pub fn spawn_victim(
     spawn_role("victim", "shm_role_victim", &envs)
 }
 
-/// Independently authenticated observer route.
 pub struct Observer {
     client: RawClient,
     channel: u16,

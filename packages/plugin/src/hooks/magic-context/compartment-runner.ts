@@ -19,11 +19,10 @@ export interface ActiveCompartmentRun {
     published: boolean;
     kind?: "incremental" | "recomp" | "wrapup" | "other";
     /**
-     * Set to true once the 95%-emergency user-facing notification has been
-     * dispatched for this run. Prevents the notification from re-firing on
-     * every subsequent transform pass while the same compartment run is
-     * still active — which would otherwise persist a fresh ignored user
-     * message every pass and drive OpenCode's runLoop break condition false.
+     * notificationSent is true after the 95%-emergency user-facing notification is dispatched.
+     * notificationSent prevents repeat notifications during later transform passes for the same active run.
+     * Each repeat notification persists a fresh ignored user message.
+     * Repeated ignored user messages keep OpenCode's runLoop break condition false.
      */
     notificationSent?: boolean;
 }
@@ -40,19 +39,13 @@ export function markActiveCompartmentRunPublished(sessionId: string): void {
 }
 
 /**
- * Register a compartment-state-mutating promise with the active-runs map.
  *
- * Use this to serialize background compressor runs against historian/recomp
- * runs: both read-modify-write compartment rows, and while SQLite serializes
- * individual statements it does NOT serialize multi-step update cycles. If a
- * historian starts while a background compressor is still running, either
- * side's final write can overwrite the other's work.
+ * Background compressor and historian/recomp runs must not overlap.
+ * SQLite serializes individual statements, not multi-step update cycles.
+ * If historian and background compressor runs overlap, either final write can overwrite the other's work.
  *
- * The registered promise is cleared from activeRuns on settle so later passes
- * can start a new run. If a run is already registered for the session, the
- * caller is expected to have checked getActiveCompartmentRun() first and
- * bailed — this function will overwrite silently if called anyway, which is
- * the desired behavior for the retry path.
+ * The settled run must not delete a replacement registration.
+ * Callers must check getActiveCompartmentRun() before registering to avoid replacing an active run.
  */
 export function registerActiveCompartmentRun(
     sessionId: string,
@@ -65,8 +58,7 @@ export function registerActiveCompartmentRun(
         kind,
     };
     const wrapped = promise.finally(() => {
-        // Only clear if this is still the current entry (another run may have
-        // replaced us if the caller overwrote; don't stomp the replacement).
+        // The settled run must not delete a replacement registration.
         if (activeRuns.get(sessionId)?.promise === wrapped) {
             activeRuns.delete(sessionId);
         }
@@ -99,7 +91,7 @@ function startLeaseRenewal(
                 );
             }
         } catch (err) {
-            // A missed renewal is safe because the compartment lease has a five-minute TTL.
+            // A missed renewal leaves the lease valid until its five-minute TTL expires.
             sessionLog(
                 deps.sessionId,
                 `compartment lease renewal threw; publish will be skipped if holder is stale (${err instanceof Error ? err.message : String(err)})`,
@@ -109,9 +101,7 @@ function startLeaseRenewal(
 }
 
 export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
-    // Intentional: this check-then-set is safe in Bun's single-threaded event loop.
-    // The synchronous code between activeRuns.get() and activeRuns.set() cannot interleave,
-    // so another start for the same session cannot sneak in here.
+    // Bun's single-threaded event loop prevents this synchronous check-then-set sequence from interleaving.
     const existing = activeRuns.get(deps.sessionId);
     if (existing) {
         return;
@@ -119,8 +109,7 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
 
     if (isWrapupInProgress(deps.db, deps.sessionId)) {
         // /ctx-wrapup owns compartment-state publication while this marker is live.
-        // The marker has a five-minute TTL renewed by wrapup, so a crashed wrapup
-        // self-expires instead of suppressing trigger-fired historian runs forever.
+        // Wrapup renews the marker's five-minute TTL, so a crashed wrapup expires without permanently suppressing trigger-fired historian runs.
         sessionLog(deps.sessionId, "compartment agent skipped: /ctx-wrapup is active");
         updateSessionMeta(deps.db, deps.sessionId, { compartmentInProgress: false });
         return;
@@ -133,15 +122,13 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
             deps.sessionId,
             "compartment agent skipped: compartment lease held by another process",
         );
-        // The DB lease is the cross-process authority. If this process set the
-        // start-intent flag but did not win the lease, no local run will clear it;
-        // release the intent so later passes can retry instead of starving.
+        // The DB lease is the cross-process authority; a process that set the start-intent flag but did not acquire the lease must clear the flag so later passes can retry.
         updateSessionMeta(deps.db, deps.sessionId, { compartmentInProgress: false });
         return;
     }
     if (isWrapupInProgress(deps.db, deps.sessionId)) {
-        // Close the cross-process check/lease race: /ctx-wrapup may have published
-        // its marker after the first check but before this process won the lease.
+        // Acquiring the lease closes the race in which /ctx-wrapup publishes its marker after the first check but before this process acquires the lease.
+        // Acquiring the lease closes the race in which /ctx-wrapup publishes its marker after the first check but before this process acquires the lease.
         sessionLog(deps.sessionId, "compartment agent skipped: /ctx-wrapup became active");
         releaseCompartmentLease(deps.db, deps.sessionId, holderId);
         updateSessionMeta(deps.db, deps.sessionId, { compartmentInProgress: false });
@@ -150,9 +137,8 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
 
     const renewal = startLeaseRenewal(deps, holderId);
 
-    // Track the real underlying promise — NOT a raced wrapper.
-    // This ensures activeRuns.has(sessionId) stays true until the historian run
-    // actually completes, preventing duplicate runs even if an external await times out.
+    // activeRuns stores a promise that settles with the historian run, so the entry remains registered until the run settles.
+    // The entry remains until the historian run completes, preventing duplicate runs when an external await times out.
     let realRunStarted = false;
     const runnerDeps = withPublishedCallback({
         ...deps,
@@ -164,7 +150,6 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
     const promise = runCompartmentAgent(runnerDeps)
         .catch((err) => {
             sessionLog(deps.sessionId, "compartment agent: unhandled rejection:", err);
-            // Ensure compartmentInProgress is cleared on any failure
             try {
                 updateSessionMeta(deps.db, deps.sessionId, { compartmentInProgress: false });
             } catch {
@@ -179,17 +164,13 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
             }
         });
     activeRuns.set(deps.sessionId, { promise, published: false, kind: "incremental" });
-    // If the runner no-op'd synchronously (stale/empty snapshot, nothing to
-    // compact, drain-quota), it returned before signalling onHistorianRunStarted
-    // and before any `await`, so `promise` is already settling. It cleared
-    // compartmentInProgress in its own finally, but the activeRuns entry above
-    // would otherwise survive (cleared only by the microtask-scheduled
-    // promise.finally) and make the SAME transform pass treat a non-running
-    // historian as in-progress — deferring queued drop ops and starving them
-    // turn after turn (the production livelock). Drop the registration
-    // synchronously so pending ops can materialize this pass. The promise.finally
-    // below still runs for interval/lease cleanup; its `=== promise` guard makes
-    // the (now redundant) delete a no-op.
+    // A synchronous no-op for a stale or empty snapshot, no work to compact, or drain quota returns before invoking onHistorianRunStarted or awaiting.
+    // A synchronous no-op for a stale or empty snapshot, no work to compact, or drain quota returns before invoking onHistorianRunStarted or awaiting.
+    // The runner clears compartmentInProgress in its finally, but activeRuns requires separate cleanup.
+    // Synchronous deletion lets queued drop operations materialize in the same transform pass.
+    // `promise.finally` still performs interval and lease cleanup.
+    // `promise.finally`'s `=== promise` guard makes the later deletion a no-op.
+    // `promise.finally`'s `=== promise` guard makes its later deletion a no-op.
     if (!realRunStarted && activeRuns.get(deps.sessionId)?.promise === promise) {
         activeRuns.delete(deps.sessionId);
     }
@@ -197,16 +178,16 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
 
 export interface ExecuteContextRecompOptions {
     /**
-     * Optional partial range (inclusive raw message ordinals). When provided,
-     * runs partial recomp — snaps to enclosing compartment boundaries and
-     * rebuilds only the matching compartments, preserving prior/tail
-     * compartments and all session facts.
+     * `range` contains inclusive raw-message ordinals for partial recompilation.
+     * Partial recompilation snaps the range to enclosing compartment boundaries.
+     * Partial recompilation preserves compartments before and after the selected range.
+     * Partial recompilation preserves all session facts.
      *
-     * When omitted, runs full recomp from message 1 to the protected tail,
-     * replacing all compartments and facts.
+     * Without `range`, recompilation runs from message 1 through the protected tail.
+     * Full recompilation replaces all compartments and session facts.
      */
     range?: PartialRecompRange;
-    /** @internal Exercises the lease/marker race without delaying production callers. */
+    /** @internal */
     onLeaseAcquired?: () => void;
 }
 
@@ -229,10 +210,7 @@ export async function executeContextRecompWithResult(
     }
     if (activeRuns.has(sessionId)) {
         return {
-            // "— Skipped" suffix so isRecompFailure() (string-based callers) treats
-            // this as a non-success and never proceeds to migration / "complete"
-            // on it. The `published:false` flag is the robust
-            // primary signal; this heading is defense-in-depth.
+            // `published: false` reports that this invocation did not publish a recompilation.
             message:
                 "## Magic Recomp — Skipped\n\nHistorian is already running for this session. Wait for it to finish, then try `/ctx-recomp` again.",
             published: false,
@@ -251,9 +229,7 @@ export async function executeContextRecompWithResult(
     }
     options.onLeaseAcquired?.();
     if (isWrapupInProgress(deps.db, sessionId)) {
-        // Close the marker/lease race: wrapup publishes its durable ownership
-        // marker before it waits for the compartment lease, so a recomp that
-        // checked early can still win the lease after wrapup has started.
+        // Recheck after acquiring the lease because wrapup can start between the first check and lease acquisition.
         sessionLog(sessionId, "recomp skipped: /ctx-wrapup became active");
         releaseCompartmentLease(deps.db, sessionId, holderId);
         return {
@@ -275,10 +251,6 @@ export async function executeContextRecompWithResult(
     activeRuns.set(sessionId, { promise: wrappedPromise, published: false, kind: "recomp" });
     try {
         const message = await promise;
-        // Log EVERY recomp outcome here — this wraps all
-        // ~12 return paths in the runner, so a silently-non-publishing recomp is
-        // now always diagnosable from the log. The returned message carries the
-        // reason inline (e.g. "## Magic Recomp — Failed\n\n<reason>").
         const published = activeRuns.get(sessionId)?.published === true;
         const outcomeSummary = message.replace(/\s+/g, " ").trim().slice(0, 240);
         sessionLog(sessionId, `recomp finished (published=${published}): ${outcomeSummary}`);

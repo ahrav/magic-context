@@ -1,8 +1,7 @@
-//! Negotiation version 1 acceptance/rejection matrix (U1): the exact bodies
-//! and bounds pinned in `docs/mc-host-wire-protocol.md` §7.7, exercised
-//! against the production decoders and encoders. The TypeScript suite in
+//! Tests use the version 1 vectors defined by protocol §7.7.
+//! Protocol §7.7 defines the tested bodies and bounds.
+//! Tests exercise the production decoders and encoders.
 //! `packages/plugin/src/shared/mc-host-client/transport-negotiation.test.ts`
-//! mirrors this matrix vector-for-vector.
 
 mod support;
 
@@ -146,9 +145,8 @@ fn version_mismatches_encode_the_documented_tcp_fallback_reasons() {
         RESP_TCP_FALLBACK.as_bytes()
     );
 
-    // The closed table is pinned to §7.7.3's two literals rather than derived
-    // from the enum: a value the enum accepts but the table omits is exactly the
-    // fail-open this checks for.
+    // §7.7.3 permits only the two listed literals; enum-only validation would accept omitted values.
+    // §7.7.3 permits only the two listed literals; enum-only validation would accept omitted values.
     for (name, expected) in [
         ("unavailable", FallbackReason::Unavailable),
         (
@@ -168,8 +166,6 @@ fn version_mismatches_encode_the_documented_tcp_fallback_reasons() {
         };
         assert_eq!(reason, Some(expected));
     }
-    // §7.7.3 names these as not fallback evidence: a TCP selection carrying one
-    // must fail closed rather than commit the generation to TCP.
     for rejected in [
         "switching_transports",
         "negotiation_version_mismatch",
@@ -203,7 +199,7 @@ fn version_bounds_accept_1_and_u32_max_and_reject_everything_else() {
         assert_eq!(request.offers[0].capability_version.to_string(), version);
     }
 
-    // Zero, fractions, exponent forms, negatives, and over-u32 values fail.
+    // The version field rejects zero, fractions, exponent forms, negatives, and values above u32::MAX.
     for version in [
         "0",
         "1.5",
@@ -231,8 +227,8 @@ fn version_bounds_accept_1_and_u32_max_and_reject_everything_else() {
         );
     }
 
-    // A well-formed unsupported request version still decodes: the mismatch
-    // fallback is host policy, not grammar.
+    // A well-formed request with an unsupported version decodes; the host applies fallback policy.
+    // The host applies fallback policy after decoding an unsupported request version.
     let v2 = r#"{"op":"transport.negotiate","negotiation_version":2,"offers":[{"transport":"tcp","capability_version":1}]}"#;
     assert_eq!(
         decode_negotiate_request(v2.as_bytes())
@@ -294,11 +290,8 @@ fn transport_name_bounds_are_exact() {
 fn duplicate_keys_are_rejected_at_every_depth_before_typed_decoding() {
     // Root object.
     let root = r#"{"op":"transport.negotiate","op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1}]}"#;
-    // Inside an offer object.
     let offer = r#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","transport":"tcp","capability_version":1}]}"#;
-    // Inside opaque parameters, nested one level down. The offer is otherwise
-    // invalid too (bad version), proving the parse-level rejection wins
-    // before any typed decoding could classify the version.
+    // Malformed opaque parameters reject during JSON parsing before invalid offer versions are decoded.
     let parameters = r#"{"op":"transport.negotiate","negotiation_version":0,"offers":[{"transport":"tcp","capability_version":1,"parameters":{"nested":{"k":1,"k":2}}}]}"#;
     for body in [root, offer, parameters] {
         assert_eq!(
@@ -308,7 +301,6 @@ fn duplicate_keys_are_rejected_at_every_depth_before_typed_decoding() {
         );
     }
 
-    // Inside an opaque grant descriptor.
     let descriptor = r#"{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"00112233445566778899aabbccddeeff","descriptor":{"a":{"k":1,"k":2}}}"#;
     assert_eq!(
         code(decode_negotiate_response(
@@ -321,14 +313,13 @@ fn duplicate_keys_are_rejected_at_every_depth_before_typed_decoding() {
 
 #[test]
 fn offer_list_bounds_are_exact() {
-    // Duplicate (transport, capability_version) identity.
+    // Offers with the same `(transport, capability_version)` are duplicates.
     let duplicate = r#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1},{"transport":"tcp","capability_version":1}]}"#;
     assert_eq!(
         code(decode_negotiate_request(duplicate.as_bytes())),
         NegotiationErrorCode::DuplicateOffer
     );
-    // The same transport at a different capability version is a distinct
-    // identity and stays valid.
+    // An offer with the same transport and a different capability_version has a distinct identity and remains valid.
     let two_versions = r#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1},{"transport":"tcp","capability_version":2}]}"#;
     assert_eq!(
         decode_negotiate_request(two_versions.as_bytes())
@@ -338,7 +329,6 @@ fn offer_list_bounds_are_exact() {
         2
     );
 
-    // Missing required tcp fallback.
     let no_tcp = r#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"shm","capability_version":1}]}"#;
     assert_eq!(
         code(decode_negotiate_request(no_tcp.as_bytes())),
@@ -391,7 +381,7 @@ fn opaque_value_bounds_are_exact() {
         value
     }
 
-    // Depth: 8 levels valid, 9 rejected (protocol §7.1 counting).
+    // Opaque values nested to 8 levels pass; 9 levels fail under §7.1 counting.
     let at_depth = nested_objects(MAX_OPAQUE_DEPTH);
     decode_negotiate_request(request_with_parameters(&at_depth).as_bytes())
         .expect("depth 8 parameters");
@@ -430,7 +420,7 @@ fn opaque_value_bounds_are_exact() {
         );
     }
 
-    // The same bounds govern a grant descriptor.
+    // Grant descriptors use `MAX_OPAQUE_BYTES` and `MAX_OPAQUE_DEPTH`.
     fn grant_with_descriptor(descriptor: &str) -> String {
         format!(
             r#"{{"op":"transport.negotiate","negotiation_version":1,"selected":{{"transport":"shm","capability_version":1}},"activation_token":"{VECTOR_TOKEN}","descriptor":{descriptor}}}"#
@@ -524,7 +514,6 @@ fn unoffered_selections_are_rejected_by_the_client_decoder() {
         )),
         NegotiationErrorCode::UnofferedSelection
     );
-    // Offered transport at an unoffered capability version.
     let wrong_version = r#"{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":2}}"#;
     assert_eq!(
         code(decode_negotiate_response(wrong_version.as_bytes(), &offers)),
@@ -586,7 +575,7 @@ fn activation_and_commit_pin_their_correlations_and_bodies() {
         );
     }
 
-    // Wrong operation tags and versions are rejected on the candidate path.
+    // `decode_negotiate_response` rejects unsupported operation tags and negotiation versions.
     assert_eq!(
         code(decode_activate_request(COMMIT_REQ.as_bytes())),
         NegotiationErrorCode::WrongOperation
@@ -602,7 +591,7 @@ fn activation_and_commit_pin_their_correlations_and_bodies() {
 fn parse_failures_expose_bounded_codes_and_paths_without_provider_bytes() {
     const SENTINEL: &str = "SENTINEL-PROVIDER-SECRET";
 
-    // A failing body whose opaque value carries a sentinel: too deep.
+    // An opaque value nested deeper than MAX_OPAQUE_DEPTH is rejected.
     let too_deep = format!(
         r#"{{"op":"transport.negotiate","negotiation_version":1,"offers":[{{"transport":"tcp","capability_version":1,"parameters":{{"a":{{"b":{{"c":{{"d":{{"e":{{"f":{{"g":{{"h":{{"i":"{SENTINEL}"}}}}}}}}}}}}}}}}}}}}]}}"#
     );
@@ -646,7 +635,7 @@ fn parse_failures_expose_bounded_codes_and_paths_without_provider_bytes() {
 
 #[test]
 fn encoders_refuse_out_of_contract_values() {
-    // Missing tcp fallback.
+    // The decoder rejects offers without a tcp fallback.
     let no_tcp = NegotiateRequest {
         negotiation_version: NEGOTIATION_VERSION,
         offers: vec![shm_offer(1)],
@@ -655,7 +644,6 @@ fn encoders_refuse_out_of_contract_values() {
         code(encode_negotiate_request(&no_tcp)),
         NegotiationErrorCode::MissingTcpOffer
     );
-    // Too many offers.
     let mut offers: Vec<TransportOffer> = (0..MAX_OFFERS)
         .map(|i| TransportOffer {
             transport: format!("t{i}"),
@@ -671,7 +659,6 @@ fn encoders_refuse_out_of_contract_values() {
         })),
         NegotiationErrorCode::InvalidOfferCount
     );
-    // Invalid transport name.
     assert_eq!(
         code(encode_negotiate_request(&NegotiateRequest {
             negotiation_version: NEGOTIATION_VERSION,
@@ -706,7 +693,6 @@ fn encoders_refuse_out_of_contract_values() {
 }
 
 // ---------------------------------------------------------------------------
-// U4: host selection, legacy omission, and injected candidate activation.
 // ---------------------------------------------------------------------------
 
 const HOST_BUDGET: Duration = Duration::from_secs(5);
@@ -733,7 +719,7 @@ fn activate_body(token: &str) -> Vec<u8> {
         .into_bytes()
 }
 
-/// Sends one control request and returns its terminal, skipping host Pings.
+/// The bootstrap client sends one control request, returns its terminal response, and skips host Pings.
 async fn control_response(
     client: &mut raw_client::RawClient,
     body: &serde_json::Value,
@@ -750,8 +736,6 @@ async fn control_response(
     frame
 }
 
-/// Negotiates a fake-provider grant and returns the bootstrap client, the
-/// candidate's raw peer driver, and the granted activation token.
 async fn grant_over(
     host: &TestHost,
     peers: &mut tokio::sync::mpsc::UnboundedReceiver<tokio::io::DuplexStream>,
@@ -981,9 +965,6 @@ async fn repeated_negotiation_after_negotiated_tcp_selection_retires() {
 
 #[tokio::test]
 async fn stalled_provider_prepare_fails_setup_within_the_deadline() {
-    // A provider whose KTD9 attachment gate blocks must not pin the
-    // connection past the configured setup budget: the deadline exists
-    // before any provider code runs and `prepare` executes off the
     // connection task.
     struct StallingProvider;
     impl InjectedProvider for StallingProvider {
@@ -1010,9 +991,7 @@ async fn stalled_provider_prepare_fails_setup_within_the_deadline() {
         .await
         .expect("send negotiation");
     assert!(
-        // Shorter than the provider's 800 ms stall: only the 100 ms setup
-        // deadline can close the connection this early, so the assertion
-        // discriminates the deadline from the provider's own late error.
+        // The 100 ms setup deadline is shorter than the provider's 800 ms stall.
         client.closed_within(Duration::from_millis(400)).await,
         "a stalled provider gate fails the setup closed within the deadline"
     );
@@ -1021,10 +1000,6 @@ async fn stalled_provider_prepare_fails_setup_within_the_deadline() {
 
 #[tokio::test]
 async fn duplicate_key_negotiation_settles_with_its_terminal_and_retires() {
-    // Strict-parse failures (duplicate keys at any depth) inside a
-    // negotiation-family body take the authoritative-terminal-and-close
-    // path, never the generic rejection that would commit TCP and leave the
-    // generation usable (§7.7.1).
     let host = TestHost::start().await;
     let mut client = host.setup_client().await;
 
@@ -1092,7 +1067,7 @@ async fn injected_grant_activates_commits_and_serves_application_traffic() {
         "promotion retires the bootstrap"
     );
 
-    // The first application request uses correlation 3 (§7.7.4).
+    // The first application request uses correlation 3.
     let route_open = serde_json::json!({
         "op": "route.open",
         "target": {"kind": "tool_provider", "module_id": LINKED_MODULE_ID},
@@ -1174,8 +1149,8 @@ fn grant_record_rejects_wrong_tokens_and_every_mismatched_binding_field() {
         );
     }
 
-    // None of the rejections consumed the record; concurrent duplicate
-    // activations consume it exactly once.
+    // Rejected activations do not consume the record.
+    // Concurrent duplicate activations consume the activation record exactly once.
     let record = Arc::new(record);
     let attempts: Vec<std::thread::JoinHandle<bool>> = (0..8)
         .map(|_| {
@@ -1228,8 +1203,7 @@ async fn ktd9_attachment_failures_fail_closed_before_any_candidate_exists() {
 
 #[tokio::test]
 async fn queue_admission_alone_does_not_promote_until_local_completion() {
-    // A 16-byte transport buffer: the commit response cannot finish writing
-    // until this test reads it, separating admission from local completion.
+    // The 16-byte transport buffer blocks the commit response until the client reads it, separating admission from local completion.
     let (provider, mut peers) = FakeProvider::install(1, serde_json::json!({}), 16);
     let registry = FakeProvider::registry(&provider);
     let host = TestHost::start_with(move |config| config.transport_providers = registry).await;
@@ -1241,8 +1215,8 @@ async fn queue_admission_alone_does_not_promote_until_local_completion() {
         .send_frame(TY_REQUEST, FLAGS_INTERACTIVE, 0, 0, 2, COMMIT_BODY)
         .await
         .expect("send commit");
-    // The response is admitted and partially written, but its local
-    // completion is stalled on this unread stream: no promotion yet.
+    // The admitted commit response remains short of local completion, so promotion waits.
+    // The admitted commit response remains short of local completion, so promotion waits.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !client.closed_within(Duration::from_millis(200)).await,
@@ -1266,8 +1240,8 @@ async fn queue_admission_alone_does_not_promote_until_local_completion() {
 
 #[tokio::test]
 async fn application_frame_before_promotion_fails_setup_instead_of_dispatching() {
-    // The same 16-byte transport buffer stall as the admission test above:
-    // the commit response is admitted but short of local completion.
+    // The 16-byte transport buffer leaves the admitted commit response short of local completion.
+    // The admitted commit response remains short of local completion, so promotion waits.
     let (provider, mut peers) = FakeProvider::install(1, serde_json::json!({}), 16);
     let registry = FakeProvider::registry(&provider);
     let host = TestHost::start_with(move |config| {
@@ -1284,10 +1258,9 @@ async fn application_frame_before_promotion_fails_setup_instead_of_dispatching()
         .expect("send commit");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // An application Request at correlation 3 while promotion is still
-    // pending: an un-promoted host never consumes it, so this bounded write
-    // can only finish by failing once setup closes; a mutant that promoted
-    // at queue admission consumes and answers it instead.
+    // Before promotion, an application Request closes setup instead of dispatching the frame.
+    // Before promotion, the host does not consume application Requests.
+    // Before promotion, an application Request closes setup instead of dispatching the frame.
     let premature = tokio::time::timeout(
         Duration::from_secs(2),
         candidate.send_frame(
@@ -1355,8 +1328,8 @@ async fn liveness_hands_off_from_bootstrap_to_candidate_around_the_grant() {
     let peer = peers.recv().await.expect("candidate peer");
     let mut candidate = RawCandidate::new(peer);
 
-    // Bootstrap liveness was stopped and joined before the grant: several
-    // ping intervals pass with no bootstrap frame.
+    // Bootstrap liveness stops and joins before the grant.
+    // Commit succeeds without a candidate Ping.
     assert!(
         client
             .frame_within(Duration::from_millis(350))
@@ -1366,7 +1339,7 @@ async fn liveness_hands_off_from_bootstrap_to_candidate_around_the_grant() {
     );
 
     activate_ok(&mut candidate, &token).await;
-    // No candidate Ping before commit.
+    // Commit succeeds without a candidate Ping.
     assert!(
         candidate.quiet_for(Duration::from_millis(350)).await,
         "no candidate Ping may start before commit"
@@ -1374,7 +1347,7 @@ async fn liveness_hands_off_from_bootstrap_to_candidate_around_the_grant() {
     commit_ok(&mut candidate).await;
     assert!(client.closed_within(HOST_BUDGET).await);
 
-    // Candidate liveness starts after promotion.
+    // The host rejects a valid-form token with the wrong value without responding.
     let ping = candidate
         .frame_within(HOST_BUDGET)
         .await
@@ -1394,7 +1367,6 @@ async fn activation_failures_retire_candidate_and_bootstrap_without_tcp_continua
     let registry = FakeProvider::registry(&provider);
     let host = TestHost::start_with(move |config| config.transport_providers = registry).await;
 
-    // Wrong token (valid form, wrong value): rejected with no response.
     {
         let (mut client, mut candidate, token) = grant_over(&host, &mut peers).await;
         let wrong: String = token
@@ -1416,7 +1388,7 @@ async fn activation_failures_retire_candidate_and_bootstrap_without_tcp_continua
         assert!(client.closed_within(HOST_BUDGET).await);
     }
 
-    // Wrong setup correlation.
+    // The host rejects setup frames with the wrong correlation.
     {
         let (mut client, mut candidate, token) = grant_over(&host, &mut peers).await;
         candidate
@@ -1434,7 +1406,6 @@ async fn activation_failures_retire_candidate_and_bootstrap_without_tcp_continua
         assert!(client.closed_within(HOST_BUDGET).await);
     }
 
-    // Nonzero epoch: candidate control identity is exactly 0/0/corr (§7.7.4).
     {
         let (mut client, mut candidate, token) = grant_over(&host, &mut peers).await;
         candidate
@@ -1452,7 +1423,6 @@ async fn activation_failures_retire_candidate_and_bootstrap_without_tcp_continua
         assert!(client.closed_within(HOST_BUDGET).await);
     }
 
-    // Duplicate activation where the commit belongs.
     {
         let (mut client, mut candidate, token) = grant_over(&host, &mut peers).await;
         activate_ok(&mut candidate, &token).await;
@@ -1471,7 +1441,6 @@ async fn activation_failures_retire_candidate_and_bootstrap_without_tcp_continua
         assert!(client.closed_within(HOST_BUDGET).await);
     }
 
-    // An application frame before commit.
     {
         let (mut client, mut candidate, token) = grant_over(&host, &mut peers).await;
         activate_ok(&mut candidate, &token).await;
@@ -1490,7 +1459,7 @@ async fn activation_failures_retire_candidate_and_bootstrap_without_tcp_continua
         assert!(client.closed_within(HOST_BUDGET).await);
     }
 
-    // Candidate channel loss.
+    // The immutable setup deadline expires when the candidate sends no frame.
     {
         let (mut client, candidate, _token) = grant_over(&host, &mut peers).await;
         drop(candidate);
@@ -1511,7 +1480,7 @@ async fn activation_timeout_retires_candidate_and_bootstrap() {
     .await;
 
     let (mut client, mut candidate, _token) = grant_over(&host, &mut peers).await;
-    // Send nothing: the immutable setup deadline expires.
+    // The immutable setup deadline expires when the candidate sends no frame.
     assert!(candidate.closed_within(HOST_BUDGET).await);
     assert!(client.closed_within(HOST_BUDGET).await);
 
@@ -1530,8 +1499,8 @@ async fn max_connections_bounds_prepared_candidates_and_failure_releases_them() 
 
     let (mut client, candidate, _token) = grant_over(&host, &mut peers).await;
 
-    // The setup retains the sole connection permit: a second authenticated
-    // connection is refused while the candidate is prepared.
+    // Setup retains the sole connection permit while the candidate is prepared.
+    // The host refuses connections while the candidate is prepared.
     let mut second = raw_client::RawClient::connect_setup_only(&host.info)
         .await
         .expect("handshake completes");
@@ -1540,7 +1509,7 @@ async fn max_connections_bounds_prepared_candidates_and_failure_releases_them() 
         "no permit while a candidate is prepared"
     );
 
-    // Failing the candidate releases the permit for a fresh connection.
+    // Candidate failure releases the connection permit.
     drop(candidate);
     assert!(client.closed_within(HOST_BUDGET).await);
     let deadline = tokio::time::Instant::now() + HOST_BUDGET;
@@ -1594,8 +1563,8 @@ async fn sentinel_provider_data_stays_off_diagnostic_surfaces() {
     const SENTINEL: &str = "SENTINEL-PROVIDER-SECRET";
     let host = TestHost::start().await;
 
-    // A malformed negotiation whose unknown field name carries the sentinel
-    // gets the bounded terminal with no sentinel bytes echoed.
+    // A malformed negotiation with the sentinel in an unknown field name returns a bounded terminal response without echoing the sentinel.
+    // A malformed negotiation with the sentinel in an unknown field name returns a bounded terminal response without echoing the sentinel.
     let mut client = host.setup_client().await;
     let body = format!(
         r#"{{"op":"transport.negotiate","negotiation_version":1,"offers":[{{"transport":"tcp","capability_version":1}}],"{SENTINEL}":1}}"#
@@ -1610,7 +1579,7 @@ async fn sentinel_provider_data_stays_off_diagnostic_surfaces() {
     assert!(!String::from_utf8_lossy(&frame.body).contains(SENTINEL));
     assert!(client.closed_within(HOST_BUDGET).await);
 
-    // Offer parameters carrying the sentinel never reach the fallback
+    // Offer parameters containing the sentinel never reach fallback Grant records or provider-failure output.
     // response.
     let mut client = host.setup_client().await;
     let offers = serde_json::json!([
@@ -1624,7 +1593,7 @@ async fn sentinel_provider_data_stays_off_diagnostic_surfaces() {
     );
     assert!(!String::from_utf8_lossy(&frame.body).contains(SENTINEL));
 
-    // Grant records and provider failures format without token or provider
+    // Offer parameters containing the sentinel never reach fallback Grant records or provider-failure output.
     // bytes.
     let record = GrantRecord::new(
         GrantBinding {

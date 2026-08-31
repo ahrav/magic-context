@@ -14,22 +14,18 @@ import type { HarnessId } from "@magic-context/core/shared/harness";
 
 export interface ConfigPaths {
     configDir: string;
-    /** opencode.json or opencode.jsonc */
+    /* */
     opencodeConfig: string;
     opencodeConfigFormat: "json" | "jsonc" | "none";
     magicContextConfig: string;
-    /** oh-my-opencode/oh-my-openagent json(c) if exists */
+    /* */
     omoConfig: string | null;
     tuiConfig: string;
     tuiConfigFormat: "json" | "jsonc" | "none";
 }
 
 /**
- * OpenCode config dir resolution.
  *
- * OpenCode uses ~/.config/opencode on ALL platforms (including Windows),
- * not %APPDATA%. The plugin runtime resolves it the same way; setup must
- * match or it will create a config the plugin can't read.
  */
 export function getOpenCodeConfigDir(): string {
     const envDir = process.env.OPENCODE_CONFIG_DIR?.trim();
@@ -71,8 +67,7 @@ export function detectConfigPaths(): ConfigPaths {
         opencodeConfig = jsonPath;
         opencodeConfigFormat = "json";
     } else {
-        // Fresh installs use JSONC so users can add comments without creating a
-        // second, higher-precedence config later.
+        // New installations use JSONC so users can add comments without later creating a higher-precedence config.
         opencodeConfig = jsoncPath;
         opencodeConfigFormat = "none";
     }
@@ -80,17 +75,14 @@ export function detectConfigPaths(): ConfigPaths {
     const tuiJsoncPath = join(configDir, "tui.jsonc");
     const tuiJsonPath = join(configDir, "tui.json");
     if (existsSync(tuiJsoncPath)) {
-        // OpenCode merges tui.json + tui.jsonc with tui.jsonc winning, so an
-        // existing tui.jsonc is the higher-precedence user file — write into it.
+        // OpenCode gives tui.jsonc precedence over tui.json, so write to an existing tui.jsonc.
         tuiConfig = tuiJsoncPath;
         tuiConfigFormat = "jsonc";
     } else if (existsSync(tuiJsonPath)) {
         tuiConfig = tuiJsonPath;
         tuiConfigFormat = "json";
     } else {
-        // Fresh install: create tui.jsonc (not tui.json) so the user can add
-        // comments later and we don't leave a second, lower-precedence file
-        // alongside a tui.jsonc they create afterward (#176).
+        // New installations use tui.jsonc so users can add comments without later creating a higher-precedence tui.jsonc.
         tuiConfig = tuiJsoncPath;
         tuiConfigFormat = "none";
     }
@@ -115,36 +107,35 @@ function envFirstHomeDir(): string {
     return home || homedir();
 }
 
-/** Pi's per-user agent dir; overridable via PI_CODING_AGENT_DIR. */
+/* */
 export function getPiAgentDir(): string {
     const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
     if (envDir) return envDir;
     return join(envFirstHomeDir(), ".pi", "agent");
 }
 
-/** Pi's per-user agent dir; overridable via PI_CODING_AGENT_DIR. */
+/* */
 export function getPiAgentConfigDir(): string {
     return getPiAgentDir();
 }
 
-/** Pi session JSONL root (`<agentDir>/sessions`). */
+/* */
 export function getPiSessionsRoot(): string {
     return join(getPiAgentDir(), "sessions");
 }
 
-/** Pi cache root, kept beside the resolved agent dir (`<parent>/cache`). */
+/* */
 export function getPiCacheRoot(): string {
     return join(dirname(getPiAgentDir()), "cache");
 }
 
-/** Shared Magic Context user config, independent of the Pi agent settings dir. */
+/** Magic Context stores its shared user config independently of the Pi agent settings directory. */
 export function getPiUserConfigPath(): string {
     return resolveCortexKitUserConfigPath();
 }
 
 /**
- * Pi's `pi install <source>` command persists extension package sources in
- * the `packages` array inside ~/.pi/agent/settings.json.
+ * Pi persists extension package sources in `settings.json`'s `packages` array.
  */
 export function getPiUserExtensionsPath(): string {
     return join(getPiAgentConfigDir(), "settings.json");
@@ -163,7 +154,7 @@ export interface OmpPaths {
     sessionsRoot: string;
 }
 
-/** Mirror OMP's profile/custom-dir/XDG resolution without importing the host. */
+/** `resolveOmpPaths` resolves OMP profile, custom-directory, and XDG paths without importing OMP. */
 export function resolveOmpPaths(): OmpPaths {
     const rawProfile = process.env.OMP_PROFILE ?? process.env.PI_PROFILE;
     const normalizedProfile = rawProfile?.trim();
@@ -177,9 +168,7 @@ export function resolveOmpPaths(): OmpPaths {
     const baseConfigRoot = join(envFirstHomeDir(), configDirName);
     const configRoot = profile ? join(baseConfigRoot, "profiles", profile) : baseConfigRoot;
     const defaultAgentDir = join(configRoot, "agent");
-    // Named profiles deliberately ignore PI_CODING_AGENT_DIR. OMP sets the env
-    // to the derived profile path for children, but the profile remains the
-    // authority so a stale/custom override cannot escape its root.
+    // Named profiles ignore `PI_CODING_AGENT_DIR` so an override cannot escape the profile root.
     const override = profile ? undefined : process.env.PI_CODING_AGENT_DIR?.trim();
     const agentDir = override ? resolve(override) : defaultAgentDir;
     const canUseXdg =
@@ -206,22 +195,22 @@ export function resolveOmpPaths(): OmpPaths {
     };
 }
 
-/** OMP's active agent dir, including named profiles and explicit overrides. */
+/* */
 export function getOmpAgentDir(): string {
     return resolveOmpPaths().agentDir;
 }
 
-/** OMP session JSONL root, including its XDG data layout. */
+/** OMP stores session JSONL files under this root, including in its XDG data layout. */
 export function getOmpSessionsRoot(): string {
     return resolveOmpPaths().sessionsRoot;
 }
 
-/** OMP's global YAML settings file. */
+/** OMP stores global settings in this YAML file. */
 export function getOmpConfigPath(): string {
     return join(resolveOmpPaths().agentDir, "config.yml");
 }
 
-/** OMP package root override used by Nix/Guix and source installations. */
+/** Nix, Guix, and source installations use this OMP package-root override. */
 export function getOmpPackageDir(): string | undefined {
     const value = process.env.PI_PACKAGE_DIR?.trim();
     if (!value) return undefined;
@@ -233,11 +222,10 @@ export function getOmpPackageDir(): string | undefined {
 }
 
 /**
- * Non-global OMP settings layers that can override `omp config set`.
+ * OMP's non-global settings layers can override `omp config set`.
  *
- * `PI_CONFIG_FILES` paths resolve relative to the command cwd. OMP also merges
- * `<cwd>/.omp/config.yml` above the global agent config. Callers must not mutate
- * global settings in response to values owned by either higher-precedence layer.
+ * `PI_CONFIG_FILES` paths resolve relative to the command cwd.
+ * `<cwd>/.omp/config.yml` overrides the global agent config. Callers must not mutate global settings for values from `PI_CONFIG_FILES` or `<cwd>/.omp/config.yml`.
  */
 export function getOmpNonGlobalConfigSources(cwd = process.cwd()): string[] {
     const sources =
@@ -257,52 +245,47 @@ export function getOmpNonGlobalConfigSources(cwd = process.cwd()): string[] {
     return [...new Set(sources)];
 }
 
-/** OMP's npm/link plugin root, including profile and XDG data layout. */
+/** OMP uses this root for npm and linked plugins, including profile and XDG data layouts. */
 export function getOmpPluginsDir(): string {
     return resolveOmpPaths().pluginsDir;
 }
 
-/** OMP's plugin runtime lock file. */
+/** OMP's plugin runtime uses this lock file. */
 export function getOmpPluginsLockPath(): string {
     return join(resolveOmpPaths().pluginsDir, "omp-plugins.lock.json");
 }
 
-/** Shared Magic Context config used by OMP's Pi-compatible extension. */
+/** OMP's Pi-compatible extension uses this shared Magic Context config. */
 export function getOmpUserConfigPath(): string {
     return resolveCortexKitUserConfigPath();
 }
 
 // ============================================================================
-// Plugin / shared paths
 // ============================================================================
 
-/** Plugin log file path under the harness-scoped temp dir. */
+/** The harness stores plugin logs under its scoped temp directory. */
 export function getMagicContextLogPath(harness: HarnessId): string {
     return getMagicContextLogPathCore(harness);
 }
 
-/** Historian dump + state-file dir under the harness-scoped temp dir. */
+/** Historian stores dumps and state files under the harness-scoped temp directory. */
 export function getMagicContextHistorianDir(harness: HarnessId): string {
     return getMagicContextHistorianDirCore(harness);
 }
 
 /**
- * Cache directory used by OpenCode for installed plugin packages.
+ * OpenCode stores installed plugin packages in this cache directory.
  *
- * OpenCode uses the `xdg-basedir` package, which — on every platform, including
- * Windows — falls back to `<homedir>/.cache` when `XDG_CACHE_HOME` is unset.
- * A previous Windows-specific branch that resolved to `%LOCALAPPDATA%` did not
- * match OpenCode's own resolution and caused `doctor --force` to clear a
- * non-existent directory while the real cache at `C:\Users\<user>\.cache`
- * stayed untouched. The plugin runtime fixed the same bug in
- * packages/plugin/src/shared/data-path.ts; this CLI helper must stay aligned.
+ * OpenCode's `xdg-basedir` dependency falls back to `<homedir>/.cache` on every platform, including Windows, when `XDG_CACHE_HOME` is unset.
+ * `doctor --force` must clear the cache directory OpenCode uses.
+ * `getOpenCodePluginCacheDir` must match the plugin runtime's cache resolution.
  */
 export function getOpenCodePluginCacheDir(): string {
     const xdg = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
     return join(xdg, "opencode", "packages");
 }
 
-/** True if `path` exists and is a directory. */
+/* */
 export function isDir(path: string): boolean {
     try {
         return statSync(path).isDirectory();
@@ -311,7 +294,7 @@ export function isDir(path: string): boolean {
     }
 }
 
-/** Recursive size in bytes of a directory; returns 0 if missing. */
+/* */
 export function dirSizeBytes(path: string): number {
     if (!isDir(path)) return 0;
     let total = 0;
@@ -334,7 +317,6 @@ export function dirSizeBytes(path: string): number {
                 }
             }
         } catch {
-            // ignore unreadable directories
         }
     }
     return total;

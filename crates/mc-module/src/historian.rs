@@ -1,9 +1,7 @@
-//! Historian writer orchestration: the durable firing state machine
-//! (idle → firing → awaiting_producer → validating → publishing), the pinned
-//! ordinal-range chunk snapshot with fail-loud fingerprint verification, and the
-//! CAS-gated publish transaction whose writes surface only through the m1
-//! watermark on the next materializing pass (a publish never mutates cached
-//! render state directly).
+//! The writer persists transitions through idle, firing, awaiting_producer, validating, and publishing.
+//! The writer verifies the pinned ordinal-range chunk fingerprint and fails on mismatch.
+//! The publish transaction uses CAS gating and exposes its writes through the m1 watermark.
+//! The next materializing pass exposes publish writes through the m1 watermark without mutating cached render state.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -25,16 +23,13 @@ use crate::historian_validate::{
     ValidateOptions, ValidatedChunk, ValidatedCompartment,
 };
 
-/// Default cooldown after an abandoned historian firing.
+/// `HISTORIAN_FAILURE_BACKOFF_MS` sets a 60-second cooldown after an abandoned historian firing.
 pub const HISTORIAN_FAILURE_BACKOFF_MS: i64 = 60_000;
 
 const CHAIN_EXHAUSTED_PERMANENT_PREFIX: &str = "chain-exhausted-permanent:";
 const AUTH_REQUIRED_PREFIX: &str = "auth-required:";
 const UNKNOWN_ERROR_CLASS_PREFIX: &str = "unknown-error-class:";
 
-/// Project a validated compartment onto the durable store row shape. Validation
-/// resolves the message-id endpoints and tiers; publication stamps the row and
-/// carries the message-boundary dates captured by the native ingress path.
 fn to_stored_compartment(
     c: &ValidatedCompartment,
     created_at_ms: i64,
@@ -56,8 +51,8 @@ fn to_stored_compartment(
         p4: c.p4.clone(),
         importance: c.importance.map(|i| i as i32).unwrap_or(50),
         episode_type: c.episode_type.clone(),
-        // Strict validation makes tierless output unreachable, but derive legacy
-        // from P1 so a future bypass cannot falsely mark a flat row as v2.
+        // Strict validation rejects tierless output.
+        // P1 determines `legacy` so a validation bypass cannot mark a flat row as v2.
         legacy: if c.p1.as_deref().is_some_and(|p1| !p1.trim().is_empty()) {
             0
         } else {
@@ -137,10 +132,10 @@ fn to_store_user_observation(
     }
 }
 
-/// One flat item in the pinned chunk snapshot used to guard producer output.
-/// The fingerprint intentionally records byte lengths rather than content bytes:
-/// insertion/removal and type/id changes alter the fingerprint, while unrelated
-/// metadata drift and same-length content edits do not stale a snapshot.
+/// The snapshot fingerprint detects pinned-item insertion, removal, ID, kind, and byte-length changes.
+/// The fingerprint records byte lengths rather than content bytes.
+/// The fingerprint changes when chunk items are inserted, removed, or assigned different IDs or types.
+/// The fingerprint ignores unrelated metadata drift and same-length content edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkSnapshotItem<'a> {
     pub id: &'a str,
@@ -148,9 +143,7 @@ pub struct ChunkSnapshotItem<'a> {
     pub bytes: &'a str,
 }
 
-/// Compute the content-stable historian chunk fingerprint. For already-flattened
-/// chunk items it uses ordered `(id, kind, byte-length)` pieces joined without
-/// hashing so mismatches are readable in diagnostics.
+/// The fingerprint omits content bytes so diagnostics retain item-level fields.
 pub fn compute_chunk_fingerprint(items: &[ChunkSnapshotItem<'_>]) -> String {
     items
         .iter()
@@ -229,8 +222,8 @@ impl From<HistorianPublishError> for HistorianStateError {
     }
 }
 
-/// Try to start a historian firing. Single-flight is enforced here: any
-/// non-idle phase returns `Busy` with the unchanged state.
+/// The fire operation enforces single-flight.
+/// A non-idle phase returns `Busy` with the unchanged state.
 #[allow(clippy::too_many_arguments)] // The durable firing snapshot carries each fence explicitly.
 pub fn fire(
     current: &HistorianDurableState,
@@ -269,7 +262,7 @@ pub fn fire(
         compartment_set_generation,
         failure_backoff_at_ms: current.failure_backoff_at_ms,
         last_failure: current.last_failure.clone(),
-        // A fire resolves whatever skip reason preceded it.
+        // A fire clears the prior skip reason.
         last_no_fire: None,
         consecutive_publish_failures: current.consecutive_publish_failures,
     }))
@@ -286,11 +279,10 @@ pub fn producer_started(
     next.state = HistorianPhase::AwaitingProducer;
     next.producer_session_id = Some(producer_session_id);
     next.producer_run_id = Some(producer_run_id);
-    // Recovery must reattach under the harness that started the run: Broca
-    // scopes run identity by (project_root, harness, session).
+    // Recovery reattaches using the harness that started the run.
+    // Run recovery scopes run identity by `(project_root, harness, session)`.
     next.producer_harness = Some(producer_harness);
-    // A producer run is established: any failure detail or retry cooldown from a
-    // prior firing is resolved.
+    // Establishing a producer run clears failure detail and retry cooldown from the prior firing.
     next.failure_backoff_at_ms = None;
     next.last_failure = None;
     Ok(next)
@@ -332,9 +324,9 @@ pub fn tx_conflict(
     Ok(abandon(current, failure_backoff_at_ms))
 }
 
-/// Release the single-flight lease after any terminal/missing/expired producer,
-/// validation rejection, or stale snapshot. The failed firing sequence is kept so
-/// the next fire remains monotonic.
+/// The state machine releases the single-flight lease after a terminal, missing, or expired producer, validation rejection, or stale snapshot.
+/// The state machine retains the failed firing sequence after releasing the lease.
+/// The next fire increments the retained firing sequence.
 pub fn abandon(
     current: &HistorianDurableState,
     failure_backoff_at_ms: i64,
@@ -342,9 +334,8 @@ pub fn abandon(
     abandon_with_detail(current, failure_backoff_at_ms, None)
 }
 
-/// Abandon while recording WHY. The detail lands in durable state because the firing
-/// runs in a spawned task whose stderr a supervised deployment never captures; without
-/// this, a connect/bind failure is indistinguishable from any other in a state dump.
+/// Durable state preserves failure detail independently of spawned-task stderr.
+/// Without durable failure detail, a state dump cannot distinguish connect or bind failures from other failures.
 pub fn abandon_with_detail(
     current: &HistorianDurableState,
     failure_backoff_at_ms: i64,
@@ -422,25 +413,21 @@ pub struct ValidatedPublishRequest<'a> {
     pub collect_user_memory_candidates: bool,
     pub publication_floor_ordinal: u64,
     pub chunk_transcript: &'a str,
-    /// Original CK messages for exact durable full-message and verbose recovery.
+    /// `raw_chunk_messages` preserves original CK messages for exact durable full-message and verbose recovery.
     pub raw_chunk_messages: &'a str,
-    /// Creation timestamp stamped on the appended compartment rows.
     pub created_at_ms: i64,
-    /// YYYY-MM-DD dates keyed by native message id; missing entries remain date-less.
+    /// `boundary_dates` maps native message IDs to YYYY-MM-DD dates; absent IDs have no date.
     pub boundary_dates: &'a BTreeMap<String, String>,
     pub failure_backoff_at_ms: i64,
     pub publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
 
-/// Publish after re-checking the chunk fingerprint at the commit point. A mismatch
-/// abandons the matching firing before returning the typed error, so a future fire
-/// is not blocked by the stale producer.
+/// The commit re-checks the chunk fingerprint and abandons the matching firing before returning `HistorianStateError::FingerprintMismatch`.
+/// Abandoning the matching firing prevents a stale producer from blocking a future fire.
 ///
-/// The validation module owns the [`ValidatedChunk`] shape (message-id endpoints,
-/// tiers, discard-last healing); this boundary projects it onto the durable store
-/// rows and drives the CAS-gated publish transaction. Facts promote as additive
-/// inserts, so a publish only surfaces on the next materializing pass via the
-/// compartment/memory watermarks — it never mutates cached render state.
+/// Facts promote through additive inserts rather than updates.
+/// A publish surfaces only on the next materializing pass.
+/// Compartment and memory watermarks surface published facts without mutating cached render state.
 pub fn publish_validated_chunk(
     store: &McStore,
     request: ValidatedPublishRequest<'_>,
@@ -531,10 +518,10 @@ pub fn publish_validated_chunk(
     match publish_result {
         Ok(result) => Ok(result),
         Err(HistorianPublishError::FenceRejected { reason }) => {
-            // A fence rejection is a fast local race (the caller's snapshot was
-            // retired mid-round), not a producer failure: return the run to Idle
-            // with NO failure cooldown so an immediate retry on a fresh snapshot
-            // is admitted instead of reading backoff_active for a minute.
+            // A fence rejection means the caller's snapshot was retired mid-round.
+            // A fence rejection returns the run to `Idle` without a failure cooldown.
+            // The caller can retry immediately with a fresh snapshot.
+            // The retry bypasses `backoff_active` for one minute.
             abandon_matching_run_without_cooldown(
                 store,
                 request.session_id,
@@ -546,9 +533,9 @@ pub fn publish_validated_chunk(
             ))
         }
         Err(error @ HistorianPublishError::CompartmentOverlap { .. }) => {
-            // The storage backstop found an overlap after the optimistic fence. Treat it
-            // like every other stale local race: make the matching firing immediately
-            // idle so the caller never leaves a durable Publishing wedge behind.
+            // Storage-overlap handling treats a storage-detected overlap as a stale local race.
+            // A storage-detected overlap makes the matching firing immediately idle.
+            // Making the matching firing idle prevents a durable `Publishing` wedge.
             abandon_matching_run_without_cooldown(
                 store,
                 request.session_id,
@@ -582,9 +569,9 @@ pub fn publish_validated_chunk(
             ))
         }
         Err(err) => {
-            // The publish error occurs after the producer has completed its work, so
-            // leave the producer run available for the normal recovery path instead of
-            // abandoning it. Record the failure so repeated publication errors remain visible.
+            // A publish error occurs after the producer completes its work.
+            // The publish-error handler leaves the producer run available for normal recovery instead of abandoning it.
+            // The publisher records publish failures so repeated publication errors remain visible.
             let _ = store.record_historian_publish_failure_if_matching(
                 request.session_id,
                 request.predicate,
@@ -600,9 +587,9 @@ pub enum RestartAction {
     ReattachProducer {
         producer_session_id: String,
         producer_run_id: String,
-        /// The harness the run was started under, when the durable state
-        /// recorded it. Reattach must use this rather than the resuming
-        /// route's binding: Broca scopes run identity by (project_root,
+        /// The durable state records the harness under which the run started.
+        /// Reattach uses the durable state's harness binding, not the resuming route's binding.
+        /// Broca scopes run identity by the durable harness binding.
         /// harness, session).
         producer_harness: Option<String>,
         firing_seq: u64,
@@ -613,10 +600,9 @@ pub enum RestartAction {
     },
 }
 
-/// Interpret durable state after process restart. If publish had committed before
-/// the crash, the load observes idle and returns `Done`; if it still observes a
-/// publishing row, the transaction did not commit, so the stale single-flight is
-/// abandoned and a future trigger may refire when eligible.
+/// After restart, a committed publish loads as idle and returns `Done`.
+/// A remaining `Publishing` row means the publish transaction did not commit.
+/// Restart recovery abandons an uncommitted stale single-flight so a future eligible trigger can refire.
 pub fn handle_restart_load(
     store: &McStore,
     session_id: &str,
@@ -786,9 +772,8 @@ pub trait HistorianProducerDriver: Send {
         self.close().await
     }
     async fn close(&mut self) -> Result<(), HistorianProducerError>;
-    /// Delete the provider session on every terminal path. The default calls close()
-    /// for compatibility with older test producers, while production producers override
-    /// this method to explicitly delete session data before closing.
+    /// Terminal-path cleanup deletes the provider session; the default calls `close()`.
+    /// Implementations that retain provider session data must delete it before closing.
     async fn purge_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
         self.close().await
     }
@@ -888,11 +873,9 @@ pub struct HistorianFireRequest<'a> {
     pub session_id: &'a str,
     pub project_path: &'a str,
     pub project_slug: &'a str,
-    /// The harness this firing connects under, recorded with the awaiting
-    /// state so recovery reattaches to the run's own Broca identity.
+    /// The awaiting state records `harness` so recovery reattaches to the run's Broca identity.
     pub harness: &'a str,
-    /// The role-scoped historian SYSTEM prompt (HISTORIAN_SYSTEM_PROMPT). Sent via the
-    /// producer's `system` field, never concatenated into `prompt`. Empty means absent.
+    /// The producer sends `HISTORIAN_SYSTEM_PROMPT` through `system`, never concatenates it into `prompt`, and omits `system` when the value is empty.
     pub system: &'a str,
     pub prompt: &'a str,
     pub model_chain: &'a [String],
@@ -906,7 +889,6 @@ pub struct HistorianFireRequest<'a> {
     pub validation_chunk: &'a HistorianChunk,
     pub chunk_transcript: &'a str,
     pub raw_chunk_messages: &'a str,
-    /// Message boundary dates captured with the native ingress messages.
     pub boundary_dates: &'a BTreeMap<String, String>,
     pub prior_compartments: &'a [StoredCompartmentRange],
     pub validate_options: ValidateOptions,
@@ -924,7 +906,6 @@ pub struct HistorianReattachRequest<'a> {
     pub validation_chunk: &'a HistorianChunk,
     pub chunk_transcript: &'a str,
     pub raw_chunk_messages: &'a str,
-    /// Message boundary dates captured with the native ingress messages.
     pub boundary_dates: &'a BTreeMap<String, String>,
     pub prior_compartments: &'a [StoredCompartmentRange],
     pub validate_options: ValidateOptions,
@@ -935,81 +916,58 @@ pub struct HistorianReattachRequest<'a> {
     pub publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
 
-/// Session-id prefix for the module's own producer (child) sessions. The transform
-/// handler treats any session in this namespace as self-owned and passes it through
-/// untouched: routing a producer request back through the module's own transform
-/// prepends the m0/m1 framing ahead of the historian system prompt, restructuring the
-/// calibrated [system, user] request into one the model was never tuned on (observed
-/// live as template-echo and seed-regurgitation on the calibration model itself).
+/// `MC_CHILD_SESSION_PREFIX` marks producer sessions as self-owned.
+/// Re-transforming a producer request prepends m0/m1 framing and violates the expected `[system, user]` shape.
+/// Re-transforming a producer request violates the expected `[system, user]` shape.
 pub const MC_CHILD_SESSION_PREFIX: &str = "mc-historian:";
 
-/// Wait budget for a full historian run plus its one short timeout recovery re-drain.
+/// `completion_wait_budget` covers one historian run and one timeout recovery re-drain.
 pub fn completion_wait_budget() -> Duration {
     Duration::from_secs(660)
 }
 
-/// The per-attempt deadline a consumer sets, VERBATIM, for `session.wrapup` calls —
-/// margin included, no consumer-side arithmetic on top (the module owns the margin,
-/// mirroring `MAX_EMERGENCY_REQUEST_BUDGET`). The producer loop has NO round-count
-/// cap: it drains chunks until the keep watermark is reached or this budget expires,
-/// so the budget itself — not a chunk count — is the ceiling (the TypeScript wrapup
-/// drain has the same uncapped-until-target shape). Derivation: one busy-join at
-/// entry (bounded by [`completion_wait_budget`], 660s) plus producer rounds each
-/// bounded by [`wrapup_round_wait_budget`] (600s); the loop re-checks the remaining
-/// budget before every round, so the wall time is one join plus as many rounds as
-/// fit under the budget. Sized for a large multi-chunk drain with margin. Bump this
-/// in the same commit as any change to those inputs and notify consumers.
+/// Consumers must pass `MAX_WRAPUP_REQUEST_BUDGET` unchanged because it includes the margin.
+/// Consumers must not add margin to `MAX_WRAPUP_REQUEST_BUDGET` because it includes the margin.
+/// The producer has no round-count cap.
+/// The producer drains chunks until the keep watermark or the configured drain budget expires.
+/// The configured drain budget, not a chunk count, limits the drain.
 pub const MAX_WRAPUP_REQUEST_BUDGET: Duration = Duration::from_secs(3_800);
 
-/// Per-round wrapup wait bound. A timed-out producer keeps running under the normal
-/// historian guard so durable recovery remains identical to an incremental firing.
+/// A timed-out producer continues under the historian guard, so durable recovery matches an incremental firing.
 pub fn wrapup_round_wait_budget() -> Duration {
     Duration::from_secs(600)
 }
 
-/// The transform-call deadline a consumer sets, VERBATIM, for requests to this module —
-/// margin included, no consumer-side arithmetic on top (adding local margin would
-/// double-count and drift the number per consumer; this module owns the margin).
+/// Consumers must pass the transform-call deadline unchanged because the transform module includes the margin.
+/// Consumers must not add local margin because that would double-count the module's margin.
 ///
-/// Derivation: a ≥95% (Emergency95) request may legitimately block until compaction
-/// lands, and its worst case nests both emergency arms sequentially — busy-await of an
-/// active run (one `completion_wait_budget`, 660s) followed by an inline refire (a
-/// second 660s) plus transform re-runs — ≈ 1350s, rounded up with margin. A consumer
-/// deadline below this false-trips on legitimate work and forwards a RAW array at the
-/// exact pressure where raw risks provider context-overflow; a trip at THIS value means
-/// the module violated its own per-arm bounds (a bug), making forward-raw-and-discard
-/// the least-bad recovery. If per-arm semantics grow, bump this constant and re-sync
+/// Emergency95 can wait for an active run and then refire inline, requiring two 660-second completion waits.
+/// `MAX_EMERGENCY_REQUEST_BUDGET` includes a 180-second margin beyond two 660-second completion waits.
+/// The timeout path forwards the raw request array and discards the transform result.
 /// the consumers.
 pub const MAX_EMERGENCY_REQUEST_BUDGET: Duration = Duration::from_secs(1500);
 
-/// The transform-call deadline a consumer sets, VERBATIM, for every request whose fill
-/// signal is BELOW the emergency band (or unknown). Same no-consumer-arithmetic rule as
+/// Consumers set this deadline verbatim for requests with fill below the emergency band or unknown.
 /// `MAX_EMERGENCY_REQUEST_BUDGET`.
 ///
-/// Derivation: below `scheduler::EMERGENCY_PERCENTAGE` a transform request NEVER blocks
-/// on historian model work — a fire spawns in the background (`spawn_historian_firing`)
-/// and the request path does classification, compose, and store I/O only. The measured
-/// request-path work is sub-second; the budget covers worst-case SQLite busy storms and
-/// scheduler stalls with wide margin. A hang past this value is a wedge, and failing
-/// open to the raw array is cheap at sub-emergency fill. Deliberately NOT tiered on the
-/// execute threshold: execute-band passes do more local work than defers but still no
-/// model work, so one non-emergency bound covers both and stays immune to
+/// Below `scheduler::EMERGENCY_PERCENTAGE`, a transform request never blocks on historian model work.
+/// Below `scheduler::EMERGENCY_PERCENTAGE`, firings run in the background via `spawn_historian_firing`.
+/// The request path performs classification, composition, and store I/O only.
+/// All non-emergency fill levels use this bound.
+/// Execute-band passes perform more local work than defers.
+/// One non-emergency bound remains valid when `execute_threshold_percentage` changes.
 /// `execute_threshold_percentage` retunes.
 pub const MAX_NONEMERGENCY_REQUEST_BUDGET: Duration = Duration::from_secs(120);
 
-/// Build the llm-runner session id owned by Magic Context for one historian firing.
-/// The firing sequence is part of the id so a fallback model attempt never resumes a
-/// failed run under a different model.
+/// Including the firing sequence prevents fallback model attempts from resuming failed runs under a different model.
 ///
-/// The id must be unique per (lineage, firing), not per (project, firing): multiple
-/// lineages under one project — a parent conversation plus concurrent subagent
-/// lineages under composite keys — fold concurrently in normal operation, and their
-/// firing sequences advance independently. A project-scoped id lets two lineages at
-/// the same sequence share one producer session, crossing their terminal-run
-/// tracking (expected run-id from one lineage, found run-id from the other) and
-/// losing the commit. A stable hash of the bound session key disambiguates without
-/// leaking composite-key bytes (which may carry non-slug-safe delimiters) into the
-/// id, and keeps the `mc-historian:` prefix the self-exemption matches on.
+/// Producer session IDs must be unique per `(lineage, firing)`.
+/// Lineages under composite keys fold concurrently, and their firing sequences advance independently.
+/// A project-scoped ID can assign one producer session to two lineages at the same sequence.
+/// Sharing a producer session crosses lineage terminal-run tracking.
+/// Terminal-run tracking would compare one lineage's expected run ID with another's found run ID.
+/// Hashing prevents non-slug-safe composite-key delimiters from appearing in the ID.
+/// The `mc-historian:` prefix lets self-exemption identify producer sessions.
 pub fn historian_producer_session_id(
     project_slug: &str,
     session_id: &str,
@@ -1031,8 +989,7 @@ pub fn historian_producer_session_id(
     format!("mc-historian:{slug}:{lineage}:{firing_seq}")
 }
 
-/// FNV-1a 64-bit rendered in full so producer sessions retain the hash's
-/// collision resistance across adversarially chosen lineage keys.
+/// Zero-padding preserves the full 64-bit FNV-1a output.
 fn fnv1a_hex16(input: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in input.as_bytes() {
@@ -1067,9 +1024,9 @@ fn decide_producer_failure(
         };
     }
     if let Some(classification) = err.classification() {
-        // The producer owns classification. Once a class tag is present, the consumer
-        // branches only on that field and its structured retry-after sibling; provider
-        // codes/messages stay diagnostic detail and never override the tag.
+        // The producer owns classification.
+        // The consumer branches only on the producer's class tag and structured retry-after value.
+        // Provider codes and messages are diagnostic only; they do not override the producer's class tag.
         return match classification.class {
             ErrorClass::Permanent => {
                 let try_next = has_eligible_model(remaining_models, auth_blocked_providers);
@@ -1109,9 +1066,8 @@ fn decide_producer_failure(
             }
             ErrorClass::ContextOverflow => {
                 *all_failures_permanent = false;
-                // Historian chunks are sized below every configured model window; a
-                // source-classified overflow means our estimator is wrong. Trying a
-                // larger fallback would mask the bad budget and hide the health signal.
+                // Historian chunks are sized below every configured model window.
+                // A source-classified overflow indicates an estimator error; a larger fallback would mask the bad budget and hide the health signal.
                 ProducerFailureDecision {
                     try_next_model: false,
                     failure_backoff_at_ms: default_failure_backoff_at_ms,
@@ -1200,8 +1156,7 @@ fn prefixed_detail(prefix: Option<&str>, detail: String) -> String {
     }
 }
 
-/// The caller persists the durable transition before invoking
-/// `log_cleanup_failure`, so logging a cleanup failure cannot corrupt the
+/// The caller persists the durable transition before invoking `log_cleanup_failure`.
 /// transition.
 fn log_cleanup_failure(
     session_id: &str,
@@ -1213,9 +1168,6 @@ fn log_cleanup_failure(
     }
 }
 
-/// Closes the producer and logs a close failure without changing the outcome
-/// being returned. Named once because the drive paths exit through several
-/// branches that each owe this same cleanup.
 async fn close_and_log<P>(producer: &mut P, session_id: &str)
 where
     P: HistorianProducerDriver + ?Sized,
@@ -1223,18 +1175,14 @@ where
     log_cleanup_failure(session_id, "close", &producer.close().await);
 }
 
-/// Whether the cancel attempt proved the provider run is stopped.
 ///
-/// Authorizing fallback starts a second potentially billable run, so this needs
-/// positive proof, not the absence of one known-bad code. `Supervisor::cancel`
-/// takes its command permit *before* it calls `run.cancel.cancel()`, so a
-/// saturated command semaphore returns a terminal `queue_full` while the provider
-/// run is still executing — and treating every terminal code except
-/// `teardown_unconfirmed` as proof authorized fallback on exactly that failure.
+/// Fallback requires proof that cancellation stopped the provider run because a second run may be billable.
+/// The supervisor acquires its command permit before calling `run.cancel.cancel()`.
+/// A saturated command semaphore returns terminal `queue_full` while the provider run continues.
+/// Treating terminal errors other than `teardown_unconfirmed` as proof would authorize fallback after `queue_full`.
 ///
-/// `Ok(())` is the proof: the supervisor returns it when it cancelled the run and
-/// when the run is already absent from the index. Every terminal error leaves the
-/// run's state unproven, so none of them authorize a second run.
+/// Only `Ok(())` proves that cancellation stopped the run or that the run is absent from the index.
+/// Terminal errors leave the provider run state unproven and do not authorize a second run.
 fn cancellation_confirmed_stopped(result: &Result<(), HistorianProducerError>) -> bool {
     result.is_ok()
 }
@@ -1395,9 +1343,6 @@ where
                         )),
                     ),
                 )?;
-                // Fallback requires typed proof that the failed attempt is over.
-                // Transport failures and uncertain send outcomes cannot prove
-                // the cancellation reached and stopped the provider run.
                 if decision.try_next_model && cancellation_confirmed_stopped(&cancel_result) {
                     let cleanup = producer.close_attempt().await;
                     log_cleanup_failure(request.session_id, "cancel", &cancel_result);
@@ -1413,9 +1358,6 @@ where
             }
         };
 
-        // Always release both routes, whether publish succeeds or the validate/publish
-        // path errors out — an early `?` return here would leak the command + subscribe
-        // routes for this firing on the shared consumer connection.
         let publish_result = publish_output_from_awaiting(PublishOutputRequest {
             store: request.store,
             session_id: request.session_id,
@@ -1438,8 +1380,6 @@ where
         let row_version = match publish_result {
             Ok(row_version) => row_version,
             Err(HistorianDriveError::Validation(err)) => {
-                // Validation rejection is model-local output failure. Exhaust the
-                // configured fallback chain before returning the final rejection.
                 if has_eligible_model(&request.model_chain[index + 1..], &auth_blocked_providers) {
                     let cleanup = producer.close_attempt().await;
                     log_cleanup_failure(request.session_id, "attempt close", &cleanup);
@@ -1496,12 +1436,6 @@ where
     producer.bind_session(&producer_session_id).await?;
     let state = match producer.status(&producer_run_id).await {
         Ok(state) => state,
-        // Every status failure is inconclusive about the run — transport
-        // timeouts, EOF, and protocol violations alike — and the original
-        // run may still be active. Abandoning here would authorize a second
-        // billable firing; propagate instead and keep the durable awaiting
-        // state so a later reattach can ask again. Only an explicit
-        // `missing` answer below authorizes a refire.
         Err(err) => {
             let close_result = producer.close().await;
             return Err(HistorianDriveError::Producer(attach_cleanup(
@@ -1528,10 +1462,6 @@ where
 
     let loaded = request.store.load(request.session_id)?;
     let awaiting = loaded.meta.historian.clone();
-    // The initial firing path covers the gap between the producer's await
-    // window and Broca's longer run allowance with a recovery re-drain;
-    // reattachment gets the same grace so a run completing inside that gap
-    // is not cancelled and discarded.
     let awaited = match producer.await_output(&producer_run_id).await {
         Err(HistorianProducerError::TimedOut) => producer.redrain_output(&producer_run_id).await,
         other => other,
@@ -1587,8 +1517,6 @@ where
         }
     };
 
-    // Always release both routes, whether publish succeeds or errors — an early `?`
-    // return would leak the command + subscribe routes for this reattached firing.
     let publish_result = publish_output_from_awaiting(PublishOutputRequest {
         store: request.store,
         session_id: request.session_id,
@@ -1706,11 +1634,6 @@ fn publish_output_from_awaiting(
     let publishing = validation_ok(&validating)?;
     let publishing_row_version = persist_historian_state(store, session_id, publishing.clone())?;
     let predicate = publish_predicate(&publishing)?;
-    // Commit-point freshness checks live INSIDE publish_validated_chunk, which abandons
-    // the matching firing before returning a rejection. A separate pre-check could return
-    // early and strand the state in Publishing. Keep the row version written by the
-    // Publishing transition too: reloading here would adopt a racing sync's version and
-    // erase the CAS conflict that must retire this stale run.
     let published = publish_validated_chunk(
         store,
         ValidatedPublishRequest {
@@ -1779,9 +1702,6 @@ fn idle_after_success(firing_seq: u64) -> HistorianDurableState {
     }
 }
 
-/// Abandon like `abandon_matching_run_with_detail` but WITHOUT arming the
-/// failure backoff: used when the publish was refused by a local fence rather
-/// than failing in the producer, so the next attempt should not wait out a
 /// model-failure cooldown.
 fn abandon_matching_run_without_cooldown(
     store: &McStore,
@@ -2161,22 +2081,12 @@ mod tests {
 
     #[test]
     fn producer_session_ids_are_lineage_scoped_under_one_project() {
-        // A parent conversation and a concurrent subagent lineage (composite key
-        // with the U+241F delimiter) share the project slug and can reach the
-        // same firing sequence at the same time. Their producer sessions must
-        // not collide, or the terminal-run tracking crosses lineages and one
-        // fold's commit is lost.
         let parent = historian_producer_session_id("proj", "84b85b9f", 2);
         let subagent = historian_producer_session_id("proj", "84b85b9f\u{241F}a063e\u{241F}0", 2);
         assert_ne!(parent, subagent);
-        // Both stay inside the self-exemption namespace so the transform
-        // pass-through still recognizes them as MC-owned children.
         assert!(parent.starts_with("mc-historian:"));
         assert!(subagent.starts_with("mc-historian:"));
-        // Composite-key delimiter bytes never leak into the id (llm-runner
-        // session ids should stay slug-safe ASCII).
         assert!(subagent.is_ascii());
-        // Same lineage, different firing: still unique per firing.
         assert_ne!(parent, historian_producer_session_id("proj", "84b85b9f", 3));
     }
 
@@ -3379,11 +3289,6 @@ mod tests {
             .contains("producer output"));
     }
 
-    /// A retryable failure normally advances the model chain, but a cancel
-    /// that reports `teardown_unconfirmed` means the failed attempt's
-    /// provider descendant may still be executing — falling back would start
-    /// a second billable run beside it. The firing must end with the
-    /// unconfirmed cancellation surfaced, and the next model must never
     /// start.
     #[tokio::test]
     async fn unconfirmed_cancellation_stops_the_fallback_chain() {
@@ -3393,8 +3298,6 @@ mod tests {
         let chunk = historian_chunk();
         let prior = prior_ranges();
         let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
-        // Only ONE start is scripted: reaching for model-b would panic the
-        // scripted queue, so completion alone proves the chain stopped.
         let mut producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-1")))
             .with_output(Err(HistorianProducerError::tagged_call(
@@ -3488,12 +3391,6 @@ mod tests {
         }
     }
 
-    /// A terminal cancel error never authorizes fallback, because none of the
-    /// codes `run.cancel` can actually return proves the provider run stopped.
-    /// `queue_full` is the dangerous one: `Supervisor::cancel` takes its command
-    /// permit before it cancels, so a saturated command semaphore reports terminal
-    /// while the run is still executing. Falling back there starts a second
-    /// billable run beside the first.
     #[tokio::test]
     async fn a_terminal_cancel_error_never_authorizes_fallback() {
         for code in ["queue_full", "closed", "teardown_unconfirmed"] {
@@ -3503,8 +3400,6 @@ mod tests {
             let chunk = historian_chunk();
             let prior = prior_ranges();
             let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
-            // Only ONE start is scripted: reaching for model-b would panic the
-            // scripted queue, so completing at all proves the chain stopped.
             let mut producer = ScriptedProducer::default()
                 .with_start(Ok(run_handle("run-1")))
                 .with_output(Err(HistorianProducerError::tagged_call(
@@ -3645,8 +3540,6 @@ mod tests {
         let chunk = historian_chunk();
         let prior = prior_ranges();
         let models = vec!["prov/model-a".to_string()];
-        // A document cut mid-XML with the length flag set, the exact shape a
-        // max-output-capped model step produces under a completed run terminal.
         let mut truncated = producer_output(historian_xml("truncated summary"));
         truncated.text.truncate(truncated.text.len() / 2);
         truncated.length_capped = true;
@@ -3702,7 +3595,6 @@ mod tests {
             "connect/bind-class failures are diagnosable from the state dump alone: {detail}"
         );
 
-        // A later firing that establishes its run clears the stale detail.
         let mut ok_producer = ScriptedProducer::default()
             .with_start(Ok(run_handle("run-2")))
             .with_output(Ok(producer_output(historian_xml("recovery summary"))));
@@ -3774,10 +3666,6 @@ mod tests {
 
     #[tokio::test]
     async fn reattach_fingerprint_mismatch_recovers_to_idle_and_releases_routes() {
-        // A tail that changed under the historian makes the observed fingerprint differ
-        // from the frozen one at publish time. The mismatch must abandon the firing back
-        // to Idle (single source of the check lives inside publish_validated_chunk) — the
-        // historian must NOT wedge in Publishing — and both routes must be released.
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_prior_compartment(&store);
@@ -3822,7 +3710,6 @@ mod tests {
                 "summary for a changed tail",
             ))));
 
-        // observed fingerprint diverges from the stored "fp" — a tail change since firing.
         let request = HistorianReattachRequest {
             store: &store,
             session_id: "ses",
@@ -3862,8 +3749,6 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_path_validation_rejection_releases_routes() {
-        // A publish/validate failure on the fresh firing path must still release the
-        // producer routes — an early `?` return before close would leak them.
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_prior_compartment(&store);
@@ -4026,8 +3911,6 @@ mod tests {
             None
         );
 
-        // A later firing starts from the unchanged compartment boundary and can cover
-        // every rejected ordinal, including the former gap at 3..=7.
         let accepted_output = r#"<output><compartments>
 <compartment start="2" end="9" title="re-read" episode_type="feature" importance="50"><p1>all messages re-read</p1><p2>re-read</p2><p3>re-read</p3><p4 /></compartment>
 </compartments><meta><unprocessed_from>10</unprocessed_from></meta></output>"#;
@@ -4052,11 +3935,6 @@ mod tests {
         );
     }
 
-    /// The seam-close proof: a real historian output is parsed + validated by the
-    /// validation module, and the resulting `ValidatedChunk` drives the publish
-    /// path end to end. This is the capstone that both parallel units are correct
-    /// TOGETHER — the validator's message-id endpoints and tiers land as durable
-    /// compartment rows, and the publish stays defer-invisible.
     #[test]
     fn validated_output_drives_publish_end_to_end() {
         use crate::historian_validate::{
@@ -4065,8 +3943,6 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        // m0 already folds C1 (covers ordinal 1); ordinals 2..=4 are the chunk the
-        // historian just summarized into C2.
         store
             .replace_compartments("ses", &[comp(1, 1, 1, "m1", "C1 summary")])
             .unwrap();
@@ -4131,7 +4007,6 @@ mod tests {
         assert_eq!(validated.compartments.len(), 1);
         assert_eq!(validated.compartments[0].end_message_id, "m3#0");
 
-        // Drive the state machine to a publishing row and publish the validated chunk.
         let mut meta = store.load("ses").unwrap().meta;
         for selected in test_selected_range_identities() {
             meta.block_identity_by_mid
@@ -4192,8 +4067,6 @@ mod tests {
         )
         .expect("publish succeeds");
 
-        // The validated compartment landed as a durable v2 row with the resolved
-        // end message id and tier, and the state machine returned to idle.
         let after = store.load("ses").unwrap();
         assert_eq!(after.meta.historian.state, HistorianPhase::Idle);
         assert_eq!(after.meta.publication_floor_ordinal, Some(4));
@@ -4461,9 +4334,6 @@ mod tests {
             .unwrap();
         let predicate = publish_predicate(&store.load("ses").unwrap().meta.historian).unwrap();
 
-        // This models a state-sync commit that lands after the wrapup snapshot but before
-        // publication. Passing its fresh row version proves the compartment generation,
-        // not just the cache CAS, rejects the stale overlapping publish.
         store
             .append_compartments("ses", &[comp(1, 2, 4, "m4#0", "seeded summary")])
             .unwrap();
@@ -4628,9 +4498,6 @@ mod tests {
             RestartAction::ReattachProducer {
                 producer_session_id: "producer-session".into(),
                 producer_run_id: "run-1".into(),
-                // Recovery reattaches under the harness the run STARTED on,
-                // not whatever route resumes the session: Broca scopes run
-                // identity by (project_root, harness, session).
                 producer_harness: Some("pi".into()),
                 firing_seq: 1,
                 chunk_fingerprint: "fp".into(),

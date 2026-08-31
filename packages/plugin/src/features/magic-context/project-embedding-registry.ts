@@ -62,49 +62,32 @@ import {
 
 const OFF_PROVIDER_IDENTITY = "embedding-provider:off";
 const SWEEP_MAX_WALL_CLOCK_MS = 10 * 60 * 1000;
-// Backlog-drain caps for the commit-embedding path. The drain loops within one
-// held coordinator lease so a large backlog (e.g. a 2000-commit repo that was
-// indexed before embeddings were enabled) clears in a few ticks instead of
-// crawling one batch per tick. Bounded per sweep so one project can't starve
-// the others or pin the provider indefinitely.
+// The commit drain processes multiple batches while it holds the coordinator lease.
+// The per-sweep caps prevent one project from monopolizing the provider.
 const COMMIT_DRAIN_BATCH_SIZE = 16;
 const COMMIT_DRAIN_MAX_PER_SWEEP = 500;
 const CHUNK_DRAIN_BATCH_SIZE = 8;
 const CHUNK_DRAIN_MAX_PER_SWEEP = 200;
 const EMBEDDING_IDENTITY_GC_GRACE_MS = 14 * 24 * 60 * 60 * 1000;
 const STALE_EMBEDDING_GC_BATCH_SIZE = 250;
-// Hard cap on embedding-window texts sent in ONE provider call. Deliberately
-// SMALL: a local embedding endpoint (LMStudio/Ollama) runs one forward pass per
-// input, so batching many max_input_tokens-sized windows into a single request
-// makes that request too slow to finish inside the HTTP timeout (the dominant
-// failure was 16 windows/call timing out at 30s on a local 4B model) — or large
-// enough to 400. With each window already ≤ max_input_tokens, capping windows
-// per call also caps tokens per call, so a small value keeps every request fast.
-// More round-trips, but each completes; far better than oversized calls that
-// time out and stall the drain. Compartments are never split across calls; a
-// compartment with more windows than this still embeds as its own over-cap call.
+// Each embedding window contains at most `max_input_tokens`, so limiting windows also limits tokens per request.
+// Compartments are never split across provider calls.
+// A compartment with more than 2 windows is sent in one over-cap provider call.
 const MAX_WINDOWS_PER_EMBED_CALL = 2;
-// Session backfill (/ctx-embed) holds the coordinator lease for an unbounded
-// run, so it must renew before the TTL lapses (mirrors the git sweep).
+// Session backfill can outlive the coordinator lease TTL.
+// Session backfill renews the coordinator lease every 60 seconds.
 const SESSION_EMBED_LEASE_RENEWAL_MS = 60 * 1000;
-// Resilience for the session drain. The provider NEVER throws (it returns null /
-// all-null vectors and owns its own HTTP circuit breaker), so "retry" here is the
-// drain's stop policy, not HTTP retry:
-//   - EMBED_SLICE_RETRY_*: re-attempt a single provider call a few times with
-//     backoff when it comes back with no usable vectors (a transient blip before
-//     the provider's own breaker trips). Cheap insurance for same-run completion.
-//   - MAX_CONSECUTIVE_FAILED_BATCHES: a compartment that still won't embed after
-//     retries is recorded as failed, EXCLUDED so the oldest-first cursor advances
-//     past it (retried on a future run, not persisted as permanent skip), and the
-//     drain CONTINUES. Only after this many consecutive all-failed batches do we
-//     stop — that's a provider that's actually down, and hammering 800
-//     compartments against a dead endpoint helps no one.
+// The provider returns `null` or all-null vectors instead of throwing.
+// These retry constants control when the drain stops, not HTTP retries.
+// The drain makes up to 3 attempts for an all-null provider result with 250 ms base backoff.
+// The drain records a compartment as failed when all 3 attempts produce no usable vectors.
+// The drain excludes failed compartments so the oldest-first cursor can advance.
+// Failed compartments remain eligible for a future drain.
+// The drain stops after 3 consecutive all-failed batches.
 const EMBED_SLICE_RETRY_ATTEMPTS = 3;
 const EMBED_SLICE_RETRY_BASE_MS = 250;
-// If a single failed provider call took at least this long, treat it as a
-// timeout (not a transient blip) and do NOT retry it — re-sending the same
-// payload would just burn another full timeout. A healthy small call (≤2
-// windows) returns in a few seconds, well under this.
+// The drain treats a failed provider call lasting at least 10,000 ms as a timeout.
+// The drain does not retry timeout-classified failures.
 const EMBED_SLOW_FAILURE_NO_RETRY_MS = 10_000;
 const MAX_CONSECUTIVE_FAILED_BATCHES = 3;
 
@@ -124,10 +107,10 @@ export interface ProjectEmbeddingRegistrationSnapshot {
     gitCommitEnabled: boolean;
     modelId: string;
     chunkModelId: string;
-    /** Friendly configured model name (e.g. "text-embedding-qwen3-embedding-4b"),
-     *  for user-facing status. "off" when no provider / observation mode. */
+    /** `model` stores the friendly configured model name, such as "text-embedding-qwen3-embedding-4b".
+     * `model` is "off" when no provider is configured or observation mode is enabled. */
     model: string;
-    /** Configured provider kind (e.g. "openai-compatible", "local", "ollama"). */
+    /** `provider` stores the configured provider kind, such as "openai-compatible", "local", or "ollama". */
     provider: string;
 }
 
@@ -145,11 +128,11 @@ interface ProjectEmbeddingRegistration {
     chunkModelId: string;
     observationMode: boolean;
     /**
-     * Fingerprint of the DEFERRED configuration this registration was created
-     * from, retained across lane resolution. Resolving a lane rewrites `config`,
-     * `providerIdentity`, and `runtimeFingerprint` to the discovered lane, so
-     * without this the next registration from the same unchanged config would
-     * look like a different intent and discard a healthy resolved provider.
+     * `deferredIntent` fingerprints the DEFERRED configuration that created this registration.
+     * `deferredIntent` survives lane resolution.
+     * Resolving a lane rewrites `config`, `providerIdentity`, and `runtimeFingerprint` to the discovered lane.
+     * Without `deferredIntent`, a registration from the unchanged configuration appears to have different intent.
+     * The differing intent discards a healthy resolved provider.
      */
     deferredIntent?: string;
 }
@@ -170,7 +153,7 @@ interface ShadowEmbeddingRegistration {
     modelId: string;
     chunkModelId: string;
     generation: number;
-    /** See {@link ProjectEmbeddingRegistration.deferredIntent}. */
+    /** `ShadowEmbeddingRegistration.deferredIntent` has the same lane-resolution semantics as `ProjectEmbeddingRegistration.deferredIntent`. */
     deferredIntent?: string;
 }
 
@@ -191,27 +174,24 @@ const SHADOW_MAX_BYTES_PER_TICK = 512 * 1024;
 const SHADOW_MAX_WALL_CLOCK_MS = 2_000;
 
 /**
- * Shadow scopes that still owe a historical backfill for a project. A Synapse
- * fingerprint rotation gives the shadow lane a brand-new modelId, so every row
- * the primary lane already embedded lacks a counterpart under the new identity.
- * Rather than dump the whole corpus into one transaction we mark the affected
- * scopes here and let the shadow worker drain them a bounded chunk per tick
- * (see pumpShadowBackfill). A scope drops out once its missing set is empty.
+ * Shadow scopes owe a historical backfill for the project.
+ * Fingerprint rotation assigns the shadow lane a new `modelId`.
+ * Rows embedded by the primary lane have no counterpart under the new identity.
+ * The backfill marks affected scopes instead of processing the whole corpus in one transaction.
+ * `pumpShadowBackfill` drains each affected scope in bounded chunks per tick.
+ * A scope drops out once its missing set is empty.
  */
 const pendingShadowBackfills = new Map<string, Set<ShadowScope>>();
 /**
- * Last missing-id batch enqueued per `${projectIdentity}:${scope}`. Used as a
- * stall guard: if a pump produces the exact same id set as the previous one,
- * nothing was written in between (the embeds are failing), so we stop
- * re-enqueueing that scope instead of hot-looping the worker against a provider
- * that cannot succeed. Any real progress changes the set and clears the stall.
+ * `pumpShadowBackfill` stops a scope when consecutive pumps enqueue the same missing-ID set; progress clears the stall.
+ * Stalling prevents the worker from hot-looping after a batch makes no progress.
  */
 const shadowBackfillLastIds = new Map<string, string>();
-/** Why a (project:scope) backfill stopped: "drained" or "stalled_no_progress". */
+/* */
 const shadowBackfillStopReasons = new Map<string, ShadowBackfillStopReason>();
 export type ShadowBackfillStopReason = "drained" | "stalled_no_progress";
 
-/** Stop reason for a scope's last backfill retirement, for status surfaces. */
+/* */
 export function getShadowBackfillStopReason(
     projectIdentity: string,
     scope: "commit" | "chunk",
@@ -232,21 +212,19 @@ const deleteActiveIdentityStatements = new WeakMap<Database, PreparedStatement>(
 let globalRegistrationGeneration = 0;
 
 /**
- * Projects whose most-recent config load was untrusted (parse/IO error, legacy
- * config unmigrated, or an embedding-affecting substitution/recovery failure).
- * While a project is latched here we keep serving its last-known-good provider
- * for reads/writes but SUPPRESS the destructive stale-identity GC — a degraded
- * load must never delete embedding rows off a config we don't trust. The latch
- * clears the next time a trusted config successfully registers the project.
+ * Untrusted loads retain the last-known-good provider and suppress stale-identity GC; trusted registration clears the latch.
+ * Untrusted loads include parse or I/O errors, unmigrated legacy config, and embedding-affecting substitution or recovery failures.
+ * While latched, a project serves its last-known-good provider for reads and writes and suppresses stale-identity GC.
+ * Untrusted loads must not delete embedding rows.
  */
 const untrustedLoadProjects = new Set<string>();
 
-/** Latch a project as currently loaded from an untrusted config (suppresses GC). */
+/** Latch a project loaded from an untrusted config to suppress GC. */
 export function markProjectLoadUntrusted(projectIdentity: string): void {
     untrustedLoadProjects.add(projectIdentity);
 }
 let projectSweepInProgress = false;
-/** Construction context every provider receives from {@link createProvider}. */
+/** `createProvider` passes this context to every provider. */
 interface ProviderContext {
     projectRoot: string;
     session: string;
@@ -255,10 +233,9 @@ interface ProviderContext {
     ) => void;
 }
 /**
- * Test factory for the embedding provider. It receives the same context the
- * real providers get, so a fake can invoke `onSynapseLaneReady` and drive the
- * deferred-lane resolution path (`commitPrimarySynapseLane` /
- * `commitShadowSynapseLane`) instead of a hand-rolled imitation of it.
+ * The test factory receives the same context as `createProvider`.
+ * Test doubles receive the same context as real providers, so they can invoke `onSynapseLaneReady`.
+ * Test doubles can drive deferred-lane resolution through `commitPrimarySynapseLane` and `commitShadowSynapseLane`.
  */
 type TestProviderFactory = (
     config: EmbeddingConfig,
@@ -273,7 +250,7 @@ function synapseConfigFields(config: EmbeddingConfig): {
     dims?: number;
     provenance?: unknown;
 } {
-    // SAFETY: The function reads only fields guarded by typeof checks.
+    // SAFETY: The function accesses config only through Record<string, unknown>.
     const raw = config as unknown as Record<string, unknown>;
     return {
         ...(typeof raw.model === "string" ? { model: raw.model } : {}),
@@ -309,10 +286,10 @@ function isDeferredSynapseConfig(config: EmbeddingConfig): config is SynapseRunt
 }
 
 /**
- * Lane discovery state of a provider, or `undefined` for one that does not
- * report it. Read structurally rather than by class so a test double or a
- * non-Synapse provider simply declines to answer instead of being misread as
- * pending, which would preserve a lane that can never resolve.
+ * The function returns a provider's lane discovery state, or `undefined` when the provider does not report one.
+ * The function reads structurally so test doubles and non-Synapse providers can decline to report a state.
+ * Structural reads prevent nonreporting providers from being misread as pending.
+ * Misreading a nonreporting provider as pending would preserve a lane that can never resolve.
  */
 function synapseLaneDiscoveryState(
     provider: EmbeddingProvider,
@@ -485,14 +462,11 @@ function commitPrimarySynapseLane(
     const providerIdentity = getEmbeddingProviderIdentity(config);
     const chunkModelId = getChunkEmbeddingModelId(config, providerIdentity);
     const runtimeFingerprint = getRuntimeFingerprint(config);
-    // A rebind re-runs initialization against the replacement daemon and
-    // reports the same pinned metadata, so this fires again with an identity
-    // that did not move. Advancing the generation then invalidates in-flight
-    // lanes captured before the rebind: `stillCurrent()` compares exactly this
-    // counter, and a lane that fails it discards the vectors the rebind just
-    // recovered. Republish only what actually changed, matching the
-    // re-registration path, which likewise holds the generation steady when a
-    // caller re-registers an unchanged config.
+    // A rebind initializes the replacement daemon and invokes `onSynapseLaneReady` again.
+    // `onSynapseLaneReady` fires again with unchanged pinned metadata.
+    // A lane that fails the generation check discards vectors produced before the rebind.
+    // The rebind republishes only changed pinned metadata.
+    // Re-registering an unchanged config keeps `generation` unchanged.
     const identityUnchanged =
         registration.providerIdentity === providerIdentity &&
         registration.chunkModelId === chunkModelId &&
@@ -599,10 +573,6 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
                       ),
                   }
                 : {}),
-            // local_dtype is spread CONDITIONALLY to preserve the byte-identical
-            // default identity when unset (mirrors the schema transform). Only
-            // a user-configured dtype survives normalization and reaches the
-            // provider + identity hash. See issue #259.
             ...(config?.local_dtype ? { local_dtype: config.local_dtype } : {}),
         };
     }
@@ -617,12 +587,8 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             model: config.model.trim(),
             endpoint: config.endpoint.trim(),
             ...(apiKey ? { api_key: apiKey } : {}),
-            // Preserve provider-specific request fields (NVIDIA NIM input_type;
-            // truncate). They must survive normalization so (a) they reach the
-            // provider request body and (b) a change to either is part of the
-            // config identity hash → a real config change correctly wipes stale
-            // vectors. query_input_type shapes per-call requests only and is
-            // intentionally omitted from identity (stored vectors use passage).
+            // Preserve input_type and truncate through normalization because both affect provider requests and config identity.
+            // Exclude query_input_type from identity because stored vectors use passage input.
             ...(inputType ? { input_type: inputType } : {}),
             ...(queryInputType ? { query_input_type: queryInputType } : {}),
             ...(truncate ? { truncate } : {}),
@@ -782,13 +748,12 @@ function getChunkEmbeddingModelId(config: EmbeddingConfig, providerIdentity: str
     if (config.provider === "off") {
         return OFF_PROVIDER_IDENTITY;
     }
-    // Chunk vectors depend on the provider vector space AND the exact windowing
-    // contract used to derive chunk text. Memory/commit vectors intentionally use
-    // only providerIdentity so a chunk-window change does not wipe unrelated stores.
+    // Chunk identity includes the provider vector space and exact windowing.
+    // Memory and commit vectors use only providerIdentity so chunk-window changes do not invalidate them.
     const chunkIdentity = {
         providerIdentity,
-        // v3 adds Synapse's advertised UTF-8 byte ceiling. Other providers have
-        // no byte cap, so they retain v2 identity and avoid a no-op re-embed.
+        // v3 includes Synapse's advertised UTF-8 byte ceiling.
+        // Providers without a byte cap retain v2 identity to avoid no-op re-embedding.
         chunkerVersion: config.provider === "synapse" ? 3 : 2,
         maxInputTokens: normalizeCompartmentChunkMaxInputTokens(
             "max_input_tokens" in config ? config.max_input_tokens : undefined,
@@ -811,9 +776,9 @@ function snapshotFor(
 ): ProjectEmbeddingRegistrationSnapshot {
     // Enablement follows the configured provider, not the resolved identity:
     // a deferred Synapse lane carries OFF_PROVIDER_IDENTITY until first use,
-    // but must stay enabled or the embed entry points that resolve it (and
-    // that activate its fallback) would never run. getOrCreateProjectProvider
-    // applies the same provider-based gate.
+    // The lane must remain enabled so its embed entry points can resolve the lane and activate its fallback.
+    // getOrCreateProjectProvider enables providers from the configured provider rather than the resolved identity.
+    // `snapshotFor` enables providers from the configured provider rather than the resolved identity.
     const providerIsOn = (registration.config.provider ?? "local") !== "off";
     const enabled =
         !registration.observationMode && providerIsOn && registration.features.memoryEnabled;
@@ -1100,10 +1065,9 @@ export function sweepStaleEmbeddingIdentitiesForProject(
     };
     if (!snapshot) return result;
 
-    // A degraded/untrusted config load must never drive deletion: the snapshot
-    // we'd GC against may be last-known-good while the on-disk config is broken
-    // or mid-migration. Reads keep serving the cached vectors; GC waits until a
-    // trusted register clears the latch.
+    // GC skips vector deletion after a degraded or untrusted config load until a trusted registration.
+    // Without this guard, GC uses a last-known-good registration when the on-disk config is broken.
+    // A trusted registration clears untrustedLoadProjects for projectIdentity.
     if (untrustedLoadProjects.has(projectIdentity)) return result;
 
     const cutoff = now - EMBEDDING_IDENTITY_GC_GRACE_MS;
@@ -1130,9 +1094,7 @@ export function sweepStaleEmbeddingIdentitiesForProject(
         },
     ];
 
-    // One invocation removes at most one bounded batch. Keeping the stale
-    // identity marker until its final vector is gone makes later timer ticks
-    // resume safely without holding a writer lock across the whole backlog.
+    // Each invocation deletes one bounded batch and retains the stale identity until its final vector is deleted, letting later timer ticks resume without a long-held writer lock.
     let remainingBudget = STALE_EMBEDDING_GC_BATCH_SIZE;
     db.exec("BEGIN IMMEDIATE");
     try {
@@ -1165,7 +1127,7 @@ export function sweepStaleEmbeddingIdentitiesForProject(
                         modelId,
                     ).changes;
                 } else if (deleted === 0) {
-                    // Avoid spinning through an unexpectedly undeletable backlog.
+                    // The zero-delete check prevents spinning through an undeletable backlog.
                     remainingBudget = 0;
                 }
             }
@@ -1175,7 +1137,7 @@ export function sweepStaleEmbeddingIdentitiesForProject(
         try {
             db.exec("ROLLBACK");
         } catch {
-            // The transaction may already be closed by SQLite after a fatal error.
+            // SQLite can close the transaction after a fatal error.
         }
         throw error;
     }
@@ -1202,21 +1164,15 @@ export function registerProjectEmbedding(
         ? "off"
         : getChunkEmbeddingModelId(resolvedConfig, providerIdentity);
     const prior = projectRegistrations.get(projectIdentity);
-    // Callers re-register from the user's configuration on every tool call, so
-    // the incoming config for an already-resolved deferred lane is still the
-    // deferred one while the registration now carries the discovered lane.
-    // Matching the retained intent keeps that healthy provider and its
-    // descriptor instead of tearing both down and re-demanding per call.
+    // Retaining the requested provider preserves an already healthy provider and its fallback.
+    // A deferred registration retains the healthy provider and descriptor when it resumes a resolved lane.
     const resumesResolvedLane =
         deferredSynapse &&
         prior !== undefined &&
         !prior.observationMode &&
         prior.deferredIntent === runtimeFingerprint &&
-        // A fallback activation keeps the intent but replaces the config with the
-        // fallback, and that demotion must stay retryable: only a lane that is
-        // still a RESOLVED Synapse config may be carried forward. A prior that is
-        // still unresolved falls through to the ordinary reuse predicate, which
-        // already matches it on the deferred fingerprint.
+        // Fallback activation retains the deferred intent but replaces the config, so only a resolved Synapse config may be carried forward.
+        // The ordinary reuse predicate matches an unresolved prior on the deferred fingerprint.
         prior.config.provider === "synapse" &&
         !isDeferredSynapseConfig(prior.config);
     const canReuseProvider =
@@ -1225,8 +1181,8 @@ export function registerProjectEmbedding(
         (resumesResolvedLane ||
             (prior.runtimeFingerprint === runtimeFingerprint &&
                 prior.providerIdentity === providerIdentity));
-    // A resumed lane keeps the prior registration's resolved identity; only a
-    // genuinely new deferred registration publishes the placeholder.
+    // A resumed lane retains the prior registration's resolved identity.
+    // A new deferred registration publishes OFF_PROVIDER_IDENTITY.
     const effectiveConfig = resumesResolvedLane ? prior.config : resolvedConfig;
     const effectiveProviderIdentity = resumesResolvedLane
         ? prior.providerIdentity
@@ -1246,12 +1202,8 @@ export function registerProjectEmbedding(
     } else if (!resumesResolvedLane) {
         clearDeferredDescriptor(db, "embedding_registrations", projectIdentity);
     }
-    // Synthetic ledger sessions (this project's primary and shadow batch keys)
-    // are never deleted through session teardown, so prune their expired rows
-    // on every (re)registration to keep the ledger bounded.
+    // Each registration prunes expired synthetic-ledger rows because session teardown never deletes the primary and shadow batch sessions.
     pruneSynapseBatchLedgerForProject(db, projectIdentity);
-    // A trusted registration just landed — clear any prior untrusted-load latch
-    // so GC can resume for this project.
     untrustedLoadProjects.delete(projectIdentity);
     const generationChanged =
         prior === undefined ||
@@ -1276,13 +1228,6 @@ export function registerProjectEmbedding(
     };
     let registration: ProjectEmbeddingRegistration;
     if (canReuseProvider) {
-        // Carrying the provider forward means preserving the registration OBJECT,
-        // not copying its fields into a new one: the provider's
-        // `onSynapseLaneReady` closure captured this object, and
-        // `commitPrimarySynapseLane` only accepts the identity currently in the
-        // map. A fresh object would silently drop the lane resolution of an
-        // initialization already in flight, leaving an initialized provider whose
-        // registration stays at the placeholder identity forever.
         registration = Object.assign(prior, nextState);
         if (deferredSynapse) registration.deferredIntent = runtimeFingerprint;
         else delete registration.deferredIntent;
@@ -1296,8 +1241,7 @@ export function registerProjectEmbedding(
     }
 
     projectRegistrations.set(projectIdentity, registration);
-    // A resumed lane is fully resolved, so its descriptor stays authoritative;
-    // only an unresolved deferred registration has nothing to persist.
+    // A resumed lane is fully resolved, so its descriptor stays authoritative.
     if (!deferredSynapse || resumesResolvedLane) persistPrimaryDescriptor(db, registration);
 
     if (!canReuseProvider) {
@@ -1322,31 +1266,22 @@ export function registerProjectShadowEmbedding(
         ? `deferred-synapse:${sha256Prefix(stableStringify(resolvedConfig))}`
         : undefined;
     const priorRegistration = shadowRegistrations.get(projectIdentity);
-    // The primary lane's reasoning applies here too: an already-resolved lane
-    // is re-registered from the same deferred config on every tool call, and its
-    // descriptor now describes the discovered lane.
+    // A matching deferred intent can identify a lane resolved by an earlier registration.
+    // A resolved lane re-registered with the same deferred config retains its discovered descriptor.
     const resumesResolvedLane =
         deferredIntent !== undefined &&
         priorRegistration?.deferredIntent === deferredIntent &&
-        // Same rule the primary lane applies: only a lane that actually RESOLVED
-        // may be carried forward. A prior whose config is still the deferred one
-        // never received its metadata — lane-wide permanent errors such as
-        // `not_certified` and `artifact_invalid` end discovery that way — and its
-        // provider latches `permanentFailure`, so `initialize()` refuses to
-        // rediscover. Resuming it would keep the shadow experiment disabled for
-        // the process lifetime even after the daemon or model is repaired.
-        // An unresolved prior falls through to the ordinary reuse predicate.
         priorRegistration.config.provider === "synapse" &&
         !isDeferredSynapseConfig(priorRegistration.config);
-    // A lane whose first discovery is still in flight is neither resolved nor
-    // failed, and replacing it loses the experiment a different way: the new
-    // provider is installed, the in-flight one is disposed, and its
-    // `onSynapseLaneReady` is then rejected by the identity guard in
-    // `commitShadowSynapseLane`, leaving the replacement's cohort reading `off`.
-    // Two operations re-registering the same deferred lane before `models.list`
-    // returns is the ordinary case, so a pending prior is preserved. Descriptors
-    // are deliberately left alone here: the lane has not resolved, so there is
-    // nothing new to persist.
+    // The registration preserves a lane whose initial discovery is still in flight.
+    // Replacing an in-flight lane loses its pending discovery result.
+    // Replacing the lane disposes the provider that owns the pending callback.
+    // The identity guard rejects `onSynapseLaneReady` after replacement.
+    // The replacement cohort remains `off` when the identity guard rejects the pending callback.
+    // The registration path preserves a pending prior so its callback can commit the discovered lane.
+    // The registration path preserves a pending prior until `models.list` returns.
+    // The registration path does not persist a descriptor before the lane resolves.
+    // An unresolved lane has no descriptor to persist.
     const preservesPendingLane =
         deferredIntent !== undefined &&
         priorRegistration?.deferredIntent === deferredIntent &&
@@ -1381,10 +1316,9 @@ export function registerProjectShadowEmbedding(
     ) {
         void provider.dispose();
         dbForShadowQueue.set(projectIdentity, db);
-        // A pending lane has no resolved identity yet, so persisting here would
-        // write an `off` descriptor over the deferred state the first
-        // registration deliberately cleared. Its descriptor is written by
-        // `commitShadowSynapseLane` when discovery lands.
+        // The registration path does not persist a pending lane because it has no resolved identity.
+        // Persisting a pending lane would overwrite the cleared deferred descriptor with `off`.
+        // `commitShadowSynapseLane` persists the descriptor after discovery resolves.
         if (!preservesPendingLane) persistShadowDescriptor(db, prior);
         const backfillAlreadyArmed =
             hasPendingShadowBackfill(projectIdentity) ||
@@ -1433,11 +1367,7 @@ export function registerProjectShadowEmbedding(
             persistShadowDescriptor(db, registration);
         })();
     }
-    // A new shadow identity just landed (rotation, or a first/again registration
-    // over a corpus that already has primary rows). Re-embed the historical
-    // corpus under it so the measurement cohort keeps its coverage; the old
-    // identity's rows age out through the 14-day GC. No-op when nothing is
-    // missing (fresh project / identity unchanged path returned above).
+    // A changed shadow identity requires re-embedding historical primary rows to preserve cohort coverage.
     if (!deferredSynapse) maybeArmShadowBackfill(db, projectIdentity, registration);
     return {
         projectIdentity,
@@ -1530,11 +1460,8 @@ export function enqueueShadowEmbeddingItems(
 }
 
 /**
- * Base missing-set query for one shadow scope: the items the PRIMARY lane has
- * already embedded (row under the primary modelId) that have NO row under the
- * shadow modelId yet. Mirrors the primary backfill's LEFT JOIN ... WHERE NULL
- * shape. Returned without ORDER BY/LIMIT so callers can append a bounded LIMIT
- * (id listing) or wrap it in a COUNT(*).
+ * The query omits ORDER BY and LIMIT so callers can add a bounded LIMIT.
+ * Callers can wrap the query in COUNT(*).
  */
 function shadowBackfillMissingBase(
     scope: ShadowScope,
@@ -1566,7 +1493,7 @@ function shadowBackfillMissingBase(
     };
 }
 
-/** One bounded chunk of shadow-backfill ids for a scope (empty when drained). */
+/* */
 function shadowBackfillMissingIds(
     db: Database,
     projectIdentity: string,
@@ -1587,7 +1514,7 @@ function shadowBackfillMissingIds(
     return rows.map((row) => String(row.id));
 }
 
-/** Total outstanding shadow-backfill rows for a scope (progress reporting). */
+/* */
 function countShadowBackfillMissing(
     db: Database,
     projectIdentity: string,
@@ -1620,12 +1547,9 @@ function hasPendingShadowBackfill(projectIdentity?: string): boolean {
 }
 
 /**
- * Refill the shadow queue from pending historical backfills. Called by the
- * worker whenever the live queue runs dry: for each pending (project, scope) it
- * enqueues one bounded chunk of the missing set. A scope is retired when its
- * missing set is empty, or when the same id set comes back twice in a row (no
- * write landed — see shadowBackfillLastIds), so a failing provider can never
- * spin the worker forever.
+ * The worker refills an empty live queue from pending historical backfills.
+ * A repeated ID set means the prior pump made no progress.
+ * Retiring a stalled scope prevents a failing provider from restarting the worker indefinitely.
  */
 function pumpShadowBackfill(): void {
     for (const [projectIdentity, scopes] of pendingShadowBackfills) {
@@ -1661,7 +1585,6 @@ function pumpShadowBackfill(): void {
             }
             const signature = ids.join(",");
             if (shadowBackfillLastIds.get(stallKey) === signature) {
-                // No progress since the last pump for this scope; stop retrying.
                 shadowBackfillStopReasons.set(stallKey, "stalled_no_progress");
                 log(
                     `[shadow] backfill scope ${scope} for ${projectIdentity} retired without progress — ` +
@@ -1680,14 +1603,8 @@ function pumpShadowBackfill(): void {
 }
 
 /**
- * Detect whether a freshly registered shadow identity owes a historical
- * backfill and arm it. Runs whenever a NEW shadow identity lands — either a
- * rotation (prior identity differed) or a first/again registration whose corpus
- * already has primary rows but no shadow rows under the current identity (the
- * rotation-while-down case). Cheap: a LIMIT-1 probe per scope; the actual
- * embedding happens asynchronously in the bounded shadow worker, so this never
- * blocks registration. Gated on the untrusted-config latch so a degraded load
- * can never enqueue shadow work off a config we don't trust.
+ * A new identity includes rotations and registrations after primary rows already exist.
+ * The untrusted-config latch prevents degraded loads from enqueueing shadow work.
  */
 function maybeArmShadowBackfill(
     db: Database,
@@ -1718,7 +1635,7 @@ function maybeArmShadowBackfill(
     startShadowWorker();
 }
 
-/** Outstanding shadow-backfill rows per scope, for progress/status reporting. */
+/* */
 export function getShadowBackfillRemaining(
     db: Database,
     projectIdentity: string,
@@ -1743,10 +1660,7 @@ export function getShadowBackfillRemaining(
 }
 
 /**
- * Drain the shadow queue and any pending historical backfills to completion.
- * Used by tests and the manual backfill script; the running plugin never calls
- * this (it relies on the self-restarting bounded worker). `onSettled` fires
- * after each bounded worker pass so callers can report progress.
+ * The function drains pending historical backfills in addition to the live shadow queue.
  */
 export async function flushShadowEmbeddingBacklog(
     projectIdentity?: string,
@@ -1763,8 +1677,7 @@ export async function flushShadowEmbeddingBacklog(
             continue;
         }
         if (shadowQueue.length === 0 && !hasPendingShadowBackfill(projectIdentity)) return;
-        // Work remains but no worker is running (e.g. a fresh backfill was armed
-        // without a queue push); nudge it forward.
+        // Work can remain after a backfill is armed without a queue push; startShadowWorker() advances it.
         startShadowWorker();
         if (!shadowWorker) await new Promise((resolve) => setTimeout(resolve, 10));
         await onSettled?.();
@@ -1779,36 +1692,32 @@ interface DetailedLane {
     provider: DetailedCapableProvider;
     laneRole: "primary" | "shadow";
     sessionId: string;
-    /** Storage model id for memory/commit destination rows. */
+    /** modelId identifies the storage model for memory and commit destination rows. */
     modelId: string;
-    /** Storage model id for chunk destination rows. */
+    /** chunkModelId identifies the storage model for chunk destination rows. */
     chunkModelId: string;
-    /** Page timeout this lane's provider applies to the deadlines it writes.
-     *  A reopen rewrites the deadline of the very row the provider created, so
-     *  both deadlines must come from one basis: a provider running a non-default
-     *  timeout would otherwise poll a page against its own budget while the row
-     *  advertises a lease from an unrelated one. */
+    /** batchTimeoutMs is the page timeout the provider applies to written deadlines.
+     * The provider and reopened row must use the same timeout basis.
+     * A provider with a non-default timeout polls against its own timeout budget.
+     * Using another timeout makes the row advertise an unrelated lease. */
     batchTimeoutMs: number;
-    /** True while the registration that produced this lane is still current. */
+    /** stillCurrent returns true while the registration that produced this lane remains current. */
     stillCurrent: () => boolean;
 }
 
-/** Page timeout the provider itself resolves for its ledger deadlines. Reading
- *  it keeps a reopened row on the same deadline basis the provider used to open
- *  it; a provider that does not publish one is a non-journaling lane, which
- *  falls back to the same default the ledger helpers assume. */
+/** providerBatchTimeoutMs returns the timeout the provider resolves for ledger deadlines.
+ * Using the published timeout keeps reopened rows on the deadline basis used to open them.
+ * A provider without pageTimeoutMs is a non-journaling lane.
+ * A non-journaling lane uses SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS. */
 function providerBatchTimeoutMs(provider: EmbeddingProvider): number {
-    // SAFETY: Providers may expose an undeclared pageTimeoutMs; the return
-    // path accepts only finite positive numbers.
     const published = (provider as unknown as { pageTimeoutMs?: unknown }).pageTimeoutMs;
     return typeof published === "number" && Number.isFinite(published) && published > 0
         ? published
         : SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS;
 }
 
-/** Resolve the lane's provider only when it can journal versioned receipts.
- *  Providers without embedItemsDetailed (local, openai-compatible, test fakes)
- *  return null and keep their existing non-ledger paths. */
+/** getDetailedLane returns a lane only when the registration has a detailed-capable provider.
+ * */
 function getDetailedLane(
     projectIdentity: string,
     laneRole: "primary" | "shadow",
@@ -1853,13 +1762,12 @@ function getDetailedLane(
     };
 }
 
-/** Destination-row classification for one reopen-proof transaction. */
+/** Destination-row classification is scoped to one reopen-proof transaction. */
 interface DetailedDestinationProbe {
-    /** Classify one manifest item's exact destination row. */
+    /* */
     state: (item: { id: string; contentSha256: string }) => "absent" | "stale" | "current";
-    /** Remove one manifest item's destination row. A group reopen invalidates
-     *  every item of every page it reopens, so this runs for lanes that cannot
-     *  prove staleness too. */
+    /** A group reopen removes destination rows for every item in each reopened page, including lanes that cannot prove staleness.
+     * */
     invalidate: (item: { id: string; contentSha256: string }) => void;
 }
 
@@ -1869,26 +1777,18 @@ interface DetailedApplySpec {
     scope: "memory" | "commit" | "chunk";
     lane: DetailedLane;
     items: DetailedEmbedItem[];
-    /** Recompute current source hashes inside the destination transaction. */
+    /* */
     readCurrentHashes: (ids: readonly string[]) => ReadonlyMap<string, string>;
-    /** Write one application group's destination rows inside that transaction. */
+    /* */
     writeGroup: (group: string, vectors: ReadonlyMap<string, Float32Array>) => void;
-    /** Build a fresh probe for ONE reopen-proof transaction. Any snapshot the
-     *  probe caches must not outlive that transaction: an earlier proof's
-     *  invalidation changes the destination the next proof must observe. */
+    /** A fresh probe is built for each reopen-proof transaction; cached snapshots do not outlive that transaction.
+     * An earlier proof's invalidation changes the destination observed by the next proof. */
     makeDestinationProbe: () => DetailedDestinationProbe;
     signal?: AbortSignal;
 }
 
 /**
- * Embed items through the provider's durable page journal and apply every
- * fully-covered application group atomically: destination writes and every
- * contributing receipt's ready->complete CAS share one transaction; a group
- * with any failed page, missing vector, drifted source, or stale receipt
- * version applies nothing. When a group's pages report idempotency_conflict,
- * the group's complete pages are reopened together against one destination
- * proof and retried once.
- * Returns the applied item ids per application group.
+ * Each fully covered application group writes destination rows and changes every contributing receipt from ready to complete in one transaction.
  */
 async function embedAndApplyDetailed(spec: DetailedApplySpec): Promise<Map<string, Set<string>>> {
     const { db, lane, items } = spec;
@@ -1911,8 +1811,6 @@ async function embedAndApplyDetailed(spec: DetailedApplySpec): Promise<Map<strin
         for (const group of conflictedGroups) {
             const reopened = db.transaction(() => {
                 // A changed page has a fresh receipt rather than a conflict.
-                // Its destination evidence still proves every complete sibling
-                // in the atomic group must reopen.
                 const rowIds = (
                     db
                         .prepare(
@@ -1954,9 +1852,7 @@ async function embedAndApplyDetailed(spec: DetailedApplySpec): Promise<Map<strin
                 context,
                 spec.signal,
             );
-            // A retried group's first-round results are entirely superseded:
-            // keeping its earlier receipts beside the rerun's would present
-            // duplicate rows for one item set and fail the group preflight.
+            // The retry supersedes all first-round results; retaining both result sets creates duplicate rows and fails group preflight.
             result = {
                 receipts: [
                     ...result.receipts.filter(
@@ -2026,9 +1922,7 @@ async function embedCommitRowsDetailed(
     lane: DetailedLane,
     rows: readonly { sha: string; message: string }[],
 ): Promise<Set<string>> {
-    // Empty and over-limit messages fail the host's item schema. Dropping them
-    // before the group is formed keeps one invalid commit from discarding its
-    // otherwise valid siblings.
+    // The host's item schema rejects empty and over-limit messages; dropping them before grouping preserves valid siblings.
     const specs = rows
         .filter(
             (row) =>
@@ -2080,8 +1974,7 @@ async function embedCommitRowsDetailed(
                 saveCommitEmbedding(db, shaFromItemId(id), vector, lane.modelId);
             }
         },
-        // A commit's source text is fixed by its SHA, so an existing row can
-        // never be source-stale; the probe reports only current or absent.
+        // A commit's SHA fixes its source text, so an existing row cannot be source-stale; the probe reports only current or absent.
         makeDestinationProbe: () => ({
             state: (item) =>
                 hasCommitEmbedding(db, shaFromItemId(item.id), lane.modelId) ? "current" : "absent",
@@ -2100,9 +1993,8 @@ async function embedCommitRowsDetailed(
     return shas;
 }
 
-/** Embed and persist one batch of commit rows for the primary lane, through
- *  versioned receipts when the provider journals pages and through the
- *  existing guarded transaction otherwise. Returns how many commits landed. */
+/** The function uses versioned receipts for journaling providers and the existing guarded transaction otherwise.
+ * */
 export async function embedCommitRowsForProject(
     db: Database,
     projectIdentity: string,
@@ -2147,13 +2039,13 @@ interface CompartmentWindowsApplication {
     compartmentId: number;
     sessionId: string;
     windows: readonly CompartmentChunkWindow[];
-    /** Recompute the compartment's current windows inside the transaction;
-     *  defaults to reloading its stored source. */
+    /** The transaction recomputes the compartment's current windows and defaults to reloading its stored source.
+     * */
     currentWindows?: () => readonly CompartmentChunkWindow[];
 }
 
-/** One application group per compartment: the all-window replacement and every
- *  contributing page receipt commit together or not at all. */
+/** Each compartment has one application group; its all-window replacement and contributing page receipts commit atomically.
+ * */
 async function applyCompartmentWindowsDetailed(
     db: Database,
     projectIdentity: string,
@@ -2236,14 +2128,10 @@ async function applyCompartmentWindowsDetailed(
             replaceCompartmentChunkEmbeddings(db, rowsToWrite);
         },
         makeDestinationProbe: () => {
-            // One snapshot per proof transaction: the proof calls state() once
-            // per manifest item, and re-reading the whole hash map each time
-            // is O(items x windows) for the identical in-transaction answer.
-            // The snapshot must not outlive the proof: an earlier proof's
-            // invalidation deletes the rows the next proof must re-observe.
+            // The proof snapshots the hash map once; rereading it per item is O(items × windows) despite an identical in-transaction result.
+            // The snapshot must not outlive a proof because invalidation deletes rows that the next proof must re-observe.
             let existing: ReadonlyMap<number, string> | null = null;
-            // Invalidation is compartment-wide, so one call per proof
-            // transaction covers every window in its manifest.
+            // One compartment-wide invalidation per proof transaction covers every manifest window.
             let invalidated = false;
             return {
                 state: (item: { id: string; contentSha256: string }) => {
@@ -2272,8 +2160,8 @@ async function applyCompartmentWindowsDetailed(
     return applied.has(group);
 }
 
-/** Publish-path entry for one compartment's windows. Returns null when the
- *  primary lane has no durable page journal (caller uses its legacy path). */
+/**
+ * The function returns null when the primary lane has no durable page journal so the caller uses its legacy path. */
 export async function embedCompartmentWindowsDetailedForProject(
     db: Database,
     projectIdentity: string,
@@ -2355,9 +2243,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
         start_message: number;
         end_message: number;
     }>;
-    // One window ceiling for the whole item: the initial windows and the
-    // in-transaction recomputation must window identically, or every hash
-    // comparison against the recomputed set fails.
+    // Initial and in-transaction recomputation use the same token and byte ceilings; otherwise their window hashes differ.
     const maxInputTokens = laneMaxInputTokens(registration);
     const maxInputBytes = laneMaxInputBytes(registration);
     const prepared = candidates.flatMap((candidate) => {
@@ -2441,8 +2327,7 @@ async function runShadowWorker(): Promise<void> {
     let processedBytes = 0;
     for (;;) {
         if (shadowQueue.length === 0) {
-            // Live mirror writes are drained; top up from any pending historical
-            // backfill before idling so a rotation backlog drains incrementally.
+            // When live mirror writes are drained, the worker processes pending historical backfill before idling so rotation backlogs drain incrementally.
             pumpShadowBackfill();
             if (shadowQueue.length === 0) break;
         }
@@ -2535,9 +2420,8 @@ export function getProjectChunkEmbeddingModelId(projectIdentity: string): string
     return registration && !registration.observationMode ? registration.chunkModelId : "off";
 }
 
-/** Chunk window ceiling for one lane: the provider's advertised window when it
- *  reports one (the host can advertise a different window than the config's
- *  default), else the lane's configured cap. */
+/** A lane uses the provider-advertised chunk window when available; otherwise it uses the configured cap.
+ * */
 function laneMaxInputTokens(
     registration: { config: EmbeddingConfig; provider: EmbeddingProvider | null } | undefined,
 ): number {
@@ -2714,7 +2598,7 @@ export async function embedItemsForProject(
     };
 }
 
-/** Keep domain items bounded to the same per-call window cap used by positional providers. */
+/** Domain items use the positional providers' per-call window cap. */
 async function embedItemsWindowBounded(
     projectIdentity: string,
     items: readonly { id: string; text: string; contentSha256: string }[],
@@ -2749,7 +2633,7 @@ interface CommitBatchResult {
     embedded: number;
 }
 
-/** Drain a single batch of unembedded commits. */
+/* */
 async function embedCommitBatch(
     db: Database,
     projectIdentity: string,
@@ -2778,18 +2662,9 @@ async function embedCommitBatch(
 }
 
 /**
- * Drain a project's unembedded-commit backlog, coordinated across processes.
+ * The drain coordinates each project's unembedded-commit backlog across processes.
  *
- * Drains pure backlogs (indexed commits with no embedding row). The dream-timer
- * git-sweep embeds new commits from `git log` but skips backlog drain when
- * `embedded=0`; this path runs after each sweep (ignoreCooldown lease) so
- * pre-existing backlogs clear. Every plugin process runs this
- * on its dream-timer tick, so without coordination N processes hammer the
- * embedding provider with the same commits. We take the shared git-sweep lease
- * (mutual exclusion) per identity — but with `ignoreCooldown`, because a
- * backlog must keep draining every tick until empty and must not be blocked by
- * the cooldown the dream-timer sweep advances. We release without marking
- * success so the two paths' cooldown tracking stays independent.
+ * Backlog draining acquires the shared git-sweep lease per identity because every plugin process runs it each dream-timer tick. It ignores cooldown so indexed commits with `embedded=0` drain every tick, and releases without success so its cooldown remains independent of git sweeps.
  */
 export async function drainCommitBacklogForProject(
     db: Database,
@@ -2802,7 +2677,7 @@ export async function drainCommitBacklogForProject(
     const holderId = `embed-sweep-${randomUUID()}`;
     const lease = acquireGitSweepLease(db, projectIdentity, holderId, { ignoreCooldown: true });
     if (!lease.acquired) {
-        // Another process is sweeping/draining this identity — skip cleanly.
+        // Another process is sweeping or draining this identity; the worker skips this identity.
         return 0;
     }
 
@@ -2838,9 +2713,8 @@ export async function drainCommitBacklogForProject(
 }
 
 interface CompartmentChunkBatchResult {
-    /** Candidates the query returned; 0 means the backlog is drained (or chunk
-     *  embedding is off), which is the drain loop's only "stop, nothing left"
-     *  signal — an all-no-work batch still selected rows and must not stop it. */
+    /** A zero candidate count means the backlog is drained or chunk embedding is disabled; an all-no-work batch still selected candidates and must not stop the drain.
+     * */
     selected: number;
     embedded: number;
     noWork: number[];
@@ -2885,24 +2759,19 @@ async function embedCompartmentChunkBatch(
 }
 
 interface CandidateChunkBatchResult {
-    /** Compartments fully embedded + persisted this call. */
+    /** The set contains compartments whose embeddings were fully persisted in this call. */
     embedded: number;
-    /** Candidates that yielded NO embeddable work (empty canonical text or
-     *  windows already current) — they are not failures and the session drain
-     *  must skip past them rather than re-select them forever. */
+    /** Candidates with empty canonical text or current windows are not failures; session draining skips them to avoid selecting them again.
+     * */
     noWork: number[];
-    /** Candidates the provider could not embed this call even after retries
-     *  (returned no/partial vectors). NOT permanent: excluded for the rest of
-     *  THIS run so the cursor advances, but re-attempted on a future run. */
+    /**
+     * The drain excludes failed candidates for the current run and retries them in later runs. */
     failed: number[];
 }
 
-/** Embed + persist chunk vectors for an already-selected candidate batch.
- *  Shared by the project-wide passive drain and the session-scoped on-demand
- *  backfill. Provider calls are sub-batched by window count
- *  (`MAX_WINDOWS_PER_EMBED_CALL`) so a single large compartment (or a big
- *  `batchSize`) can't build one enormous payload tensor. Each compartment is the
- *  atomic persist unit — its windows are never split across provider calls. */
+/**
+ * The batcher limits each provider call to `MAX_WINDOWS_PER_EMBED_CALL` windows unless one compartment alone exceeds the cap.
+ * A compartment is an atomic persistence unit; never split its windows across provider calls. */
 async function embedCandidateChunkBatch(
     db: Database,
     projectIdentity: string,
@@ -2922,10 +2791,8 @@ async function embedCandidateChunkBatch(
     };
     const prepared: Prepared[] = [];
     for (const candidate of candidates) {
-        // Raw-span text first; fall back to the compartment's summary (title+p1)
-        // when the span has no indexable content (notification/tool-only beat),
-        // so such compartments still get a real embedding row instead of being
-        // re-counted as "remaining" forever (the desktop auto-embed loop).
+        // The embedder uses the compartment summary when its raw span has no indexable text so notification- and tool-only compartments receive an embedding.
+        // The embedder uses the compartment summary when raw text is not indexable.
         const canonicalText =
             buildCanonicalChunkTextFromFts(
                 db,
@@ -3003,17 +2870,12 @@ async function embedCandidateChunkBatch(
         return { embedded: embeddedDetailed, noWork, failed };
     }
 
-    // Embed the prepared compartments in sub-batches bounded by window count so
-    // the per-call payload (and the provider's padded tensor / JSON body) stays
-    // bounded regardless of how many windows a single compartment produced.
     let embedded = 0;
     let i = 0;
     while (i < prepared.length) {
         if (signal?.aborted) break;
         const slice: Prepared[] = [];
         let windowCount = 0;
-        // Always include at least one compartment, even if it alone exceeds the
-        // cap (a single very large compartment must still be embeddable).
         do {
             const item = prepared[i];
             slice.push(item);
@@ -3032,37 +2894,22 @@ async function embedCandidateChunkBatch(
             })),
         );
 
-        // Retry the provider call a few times with backoff. The provider returns
-        // null / all-null on failure (never throws), so we can't read the failure
-        // reason — but we CAN time it: a fast failure (refused connection, 400,
-        // brief blip) is worth a quick retry; a SLOW failure means the request hit
-        // the provider's HTTP timeout, and re-sending the identical (too-big/too-
-        // slow) payload would just burn another full timeout. So retry only when
-        // the prior attempt failed FAST. With MAX_WINDOWS_PER_EMBED_CALL=2 a
-        // healthy call returns in ~seconds, so this threshold cleanly separates a
-        // transient blip from a genuine timeout.
-        // Track WHICH compartments of the slice actually persisted (not just a
-        // count). A provider can return vectors for some inputs in a call but not
-        // others; with a count-only check, a partial-success slice would break the
-        // retry loop AND skip the failed-marking, leaving the non-persisted
-        // compartment neither saved nor excluded — so it gets re-queried (and
-        // re-sent) every iteration until it's the last candidate. Tracking ids
-        // lets us mark every NON-persisted item as failed regardless of partial
-        // success, so the cursor advances past it (retried next run).
+        // The retry loop retries failures that finish before EMBED_SLOW_FAILURE_NO_RETRY_MS with backoff.
+        // The retry loop retries failures that finish before EMBED_SLOW_FAILURE_NO_RETRY_MS.
+        // The batcher tracks persisted compartment IDs because provider calls can partially succeed.
+        // A count cannot identify which compartments remain unpersisted after a partial provider response.
+        // The batcher marks every compartment without persisted vectors as failed after a partial response.
+        // The batcher marks every non-persisted compartment failed so the cursor advances and the next run retries it.
         const persistedIds = new Set<number>();
         for (let attempt = 0; attempt < EMBED_SLICE_RETRY_ATTEMPTS; attempt++) {
             if (signal?.aborted) break;
             let result: Awaited<ReturnType<typeof embedItemsForProject>> = null;
             const attemptStart = Date.now();
             try {
-                // Sub-batch the provider call by window count so the per-request
-                // payload stays bounded even when a SINGLE compartment contributed
-                // more than MAX_WINDOWS_PER_EMBED_CALL windows (e.g. a huge file
-                // dump split into many sub-windows by chunkCanonicalText). Without
-                // this, the slice builder's "always include at least one
-                // compartment" rule could hand the provider one enormous text array
-                // in a single HTTP call, defeating the payload bound and risking
-                // provider timeouts/rejections (PR #207 review).
+                // embedItemsWindowBounded limits each provider request to MAX_WINDOWS_PER_EMBED_CALL windows, even when one compartment exceeds that limit.
+                // Without window-bounded sub-batching, the slice builder can send all windows from one oversized compartment in one provider request.
+                // The slice builder can include one oversized compartment even when its windows exceed MAX_WINDOWS_PER_EMBED_CALL.
+                // Window-bounded sub-batching prevents one oversized compartment from producing an unbounded provider request.
                 result = await embedItemsWindowBounded(projectIdentity, items, signal);
             } catch (error) {
                 log("[magic-context] failed to proactively embed compartment chunks:", error);
@@ -3095,11 +2942,9 @@ async function embedCandidateChunkBatch(
                 }
             }
             if (persistedIds.size === slice.length) break; // whole slice done
-            // Partial success: don't retry (would re-send the persisted items); the
-            // non-persisted ones are marked failed below and retried next run.
+            // After partial persistence, the caller does not retry because `items` includes chunks for persisted compartments; it marks each selected compartment absent from `persistedIds` failed for the next run.
             if (persistedIds.size > 0) break;
-            // Don't retry a SLOW failure: it timed out, so the same payload will
-            // just time out again. Mark failed and move on (retried next run).
+            // The retry loop does not retry failures lasting at least `EMBED_SLOW_FAILURE_NO_RETRY_MS`; it marks the slice failed for the next run.
             if (Date.now() - attemptStart >= EMBED_SLOW_FAILURE_NO_RETRY_MS) break;
             if (attempt < EMBED_SLICE_RETRY_ATTEMPTS - 1) {
                 await new Promise((resolve) =>
@@ -3109,10 +2954,7 @@ async function embedCandidateChunkBatch(
         }
 
         embedded += persistedIds.size;
-        // Every slice compartment that did NOT persist (full OR partial failure):
-        // record as failed (not no-work) so the drain advances past it this run
-        // and retries it next run, rather than re-selecting it every iteration.
-        // Skip on abort — those simply didn't get their turn and re-queue naturally.
+        // The batcher leaves unattempted compartments eligible after abort.
         if (!signal?.aborted) {
             for (const item of slice) {
                 if (!persistedIds.has(item.candidate.id)) failed.push(item.candidate.id);
@@ -3138,9 +2980,7 @@ async function drainCompartmentChunkBacklogForProject(
 
     let total = 0;
     let leaseLost = false;
-    // Every selected batch advances the run-local keyset cursor, including
-    // no-work and failed rows. The cursor is not persisted, so provider
-    // failures remain eligible for the next maintenance pass.
+    // The run-local keyset cursor is not persisted, so failed rows remain eligible for the next maintenance pass.
     let cursor: Pick<CompartmentChunkBackfillCandidate, "createdAt" | "id"> | undefined;
     let consecutiveFailedBatches = 0;
     const renewal = setInterval(() => {
@@ -3165,9 +3005,8 @@ async function drainCompartmentChunkBacklogForProject(
             if (selected === 0) break; // nothing left to select = drained
             cursor = nextCursor;
 
-            // No-work rows do not reset provider health. Mixed no-work/failed
-            // batches still prove the provider made no progress on attempted
-            // inputs; successful persistence resets the failure streak.
+            // No-work rows do not reset provider health.
+            // Mixed no-work/failed batches do not reset the failure streak; successful persistence resets it.
             if (embedded === 0 && failed.length > 0) {
                 consecutiveFailedBatches += 1;
                 if (consecutiveFailedBatches >= MAX_CONSECUTIVE_FAILED_BATCHES) break;
@@ -3175,9 +3014,7 @@ async function drainCompartmentChunkBacklogForProject(
                 consecutiveFailedBatches = 0;
             }
 
-            // An all-no-work batch performs no provider await. Yield explicitly
-            // so timers, lease cancellation, and request handling stay live while
-            // the cursor walks a long no-work prefix.
+            // The loop yields after an all-no-work batch so timers, lease cancellation, and request handling remain live during a long no-work prefix.
             await new Promise((resolve) => setTimeout(resolve, 0));
         }
     } finally {
@@ -3187,10 +3024,8 @@ async function drainCompartmentChunkBacklogForProject(
     return total;
 }
 
-/** Passive missing-chunk drain for one project. `deadlineAt` is the shared
- *  wall-clock budget of the maintenance pass that invoked it — callers that
- *  iterate several projects must pass ONE deadline across all of them so a
- *  multi-project pass cannot outrun the caller's own schedule. */
+/** The caller must share deadlineAt across projects in one maintenance pass to enforce one wall-clock budget.
+ * */
 export async function embedUnembeddedCompartmentChunksForProject(
     db: Database,
     projectIdentity: string,
@@ -3200,9 +3035,9 @@ export async function embedUnembeddedCompartmentChunksForProject(
 }
 
 export interface SessionChunkBackfillProgress {
-    /** Compartments fully embedded so far this run. */
+    /* */
     embedded: number;
-    /** Total compartments that needed embedding when the run started. */
+    /* */
     total: number;
 }
 
@@ -3212,21 +3047,11 @@ export type SessionChunkBackfillOutcome =
     | { status: "disabled"; embedded: 0; total: 0 }
     | { status: "busy"; embedded: 0; total: number }
     | { status: "aborted"; embedded: number; total: number; failed: number }
-    // Some candidates could not be embedded this run (provider returned no
-    // vectors for them after retries) and were not skippable no-work rows —
-    // surfaced so the command can tell the user it stopped early (with how many
-    // failed) instead of falsely "done". `remaining` is still-embeddable count.
     | { status: "stalled"; embedded: number; total: number; remaining: number; failed: number };
 
 /**
- * Backfill ALL un-embedded compartment chunks for ONE session in a single run
- * (the `/ctx-embed-history` command path), oldest-first so progress fills
- * chronologically. Unlike the passive project drain this has no per-sweep cap —
- * the user asked for the whole session — but it still runs under the per-project
- * embedding coordinator lease (mutual exclusion with the passive sweep + sibling
- * processes) and yields between batches so an 8-core local-inference burst stays
- * interruptible. Idempotent + resumable via chunk_hash; re-running embeds only
- * what's still missing.
+ * The active project drain has no per-sweep cap.
+ * `chunk_hash` makes the function idempotent: reruns embed only chunks that remain unembedded.
  */
 export async function embedSessionCompartmentChunks(
     db: Database,
@@ -3242,9 +3067,6 @@ export async function embedSessionCompartmentChunks(
     if (!snapshot?.enabled || snapshot.chunkModelId === "off") {
         return { status: "disabled", embedded: 0, total: 0 };
     }
-    // The session command path resolves this identity from the host session;
-    // persist it before counting so stale rows under another project cannot make
-    // this session look already embedded forever.
     recordSessionProjectIdentity(db, sessionId, projectIdentity);
     const total = countUnembeddedSessionCompartments(
         db,
@@ -3258,9 +3080,7 @@ export async function embedSessionCompartmentChunks(
     const lease = acquireGitSweepLease(db, projectIdentity, holderId, { ignoreCooldown: true });
     if (!lease.acquired) return { status: "busy", embedded: 0, total };
 
-    // Unbounded run → renew the lease before the TTL lapses so a sibling process
-    // or the passive sweep can't acquire the "expired" lease mid-run (mirrors the
-    // git sweep's renewal loop). Cleared in finally.
+    // The lease holder renews the lease before expiry to extend its TTL.
     let leaseLost = false;
     const drainAbort = new AbortController();
     const forwardCallerAbort = (): void => drainAbort.abort();
@@ -3273,20 +3093,14 @@ export async function embedSessionCompartmentChunks(
                 drainAbort.abort();
             }
         } catch {
-            /* best-effort; the current lease remains valid until its TTL */
+            /* */
         }
     }, SESSION_EMBED_LEASE_RENEWAL_MS);
     (renewal as { unref?: () => void }).unref?.();
 
     const batchSize = Math.max(1, options?.batchSize ?? CHUNK_DRAIN_BATCH_SIZE);
-    // Compartments that produced no embeddable work (empty canonical text /
-    // already-current windows) accumulate here and are excluded from subsequent
-    // candidate queries, so one un-embeddable old compartment can't block the
-    // oldest-first cursor from reaching newer ones (no infinite re-select).
     const skipIds: number[] = [];
-    // Compartments the provider couldn't embed THIS run (after retries). Excluded
-    // so the cursor advances past them and the drain finishes the rest, but NOT
-    // persisted as skip — a future run re-attempts them.
+    // The batcher keeps failed IDs only in memory so the cursor advances; future runs retry them.
     const failedIds: number[] = [];
     let embedded = 0;
     let aborted = false;
@@ -3294,11 +3108,10 @@ export async function embedSessionCompartmentChunks(
     let consecutiveFailedBatches = 0;
     try {
         options?.onProgress?.({ embedded, total });
-        // Re-query each iteration (rather than pre-loading all candidates) so
-        // newly-published compartments mid-run are picked up and chunk_hash dedup
-        // is re-checked against fresh state. `total` is the start-of-run
-        // denominator; `embedded` is clamped to it in the callback in case the
-        // historian published mid-run.
+        // The batcher re-queries each iteration so newly published compartments are included.
+        // Each query rechecks `chunk_hash` deduplication against fresh state.
+        // `total` remains the start-of-run denominator.
+        // The callback clamps `embedded` to `total` when the historian publishes compartments mid-run.
         for (;;) {
             if (leaseLost || drainAbort.signal.aborted) {
                 aborted = true;
@@ -3330,15 +3143,12 @@ export async function embedSessionCompartmentChunks(
                 aborted = true;
                 break;
             }
-            // Record no-work candidates so the next query advances past them.
+            // The batcher records no-work candidates so the next query advances past them.
             for (const id of noWork) skipIds.push(id);
-            // Record this-run failures so the cursor advances; retried next run.
+            // The batcher records this-run failures so the cursor advances; the next run retries them.
             for (const id of failed) failedIds.push(id);
 
-            // Circuit breaker: a batch that made zero forward progress and had no
-            // skippable no-work rows is an all-failed batch. A few in a row means
-            // the provider is down — stop instead of grinding every remaining
-            // compartment through retries against a dead endpoint.
+            // A zero-progress batch with no no-work rows is all failed.
             if (n === 0 && noWork.length === 0) {
                 consecutiveFailedBatches += 1;
                 if (consecutiveFailedBatches >= MAX_CONSECUTIVE_FAILED_BATCHES) {
@@ -3351,8 +3161,7 @@ export async function embedSessionCompartmentChunks(
 
             embedded += n;
             options?.onProgress?.({ embedded: Math.min(embedded, total), total });
-            // Yield to the event loop so the burst stays interruptible and the
-            // host process can serve other work between batches.
+            // The zero-delay timer lets the host serve other work between batches.
             await new Promise((resolve) => setTimeout(resolve, 0));
         }
     } finally {
@@ -3361,16 +3170,15 @@ export async function embedSessionCompartmentChunks(
         try {
             releaseGitSweepLease(db, projectIdentity, holderId);
         } catch (error) {
-            // A release-time SQLite error (e.g. lock contention) must not mask the
-            // drain's own result/throw. The lease TTL-expires on its own.
+            // The catch preserves the drain's result or thrown error if lease release fails.
+            // The lease expires after its TTL if release fails.
             log("[magic-context] embed drain: lease release failed (will TTL-expire):", error);
         }
     }
     if (aborted) return { status: "aborted", embedded, total, failed: failedIds.length };
-    // Either the provider went down (circuit broke) or some compartments failed
-    // their retries but the rest drained. Count what's genuinely still embeddable
-    // (excludes already-embedded rows; no-work skips are permanently empty-text
-    // compartments, not a stall).
+    // Return `stalled` when the circuit opens or failed compartments remain.
+    // `remaining` counts still-embeddable compartments.
+    // The count excludes already-embedded rows and skipped compartments.
     if (providerDown || failedIds.length > 0) {
         const remaining = Math.max(
             0,
@@ -3389,21 +3197,19 @@ export async function embedSessionCompartmentChunks(
 }
 
 export interface EmbeddingCoverageStatus {
-    /** Whether embedding is active at all for this project. */
+    /* */
     enabled: boolean;
-    /** Friendly configured model name, or "off"/"disabled". */
+    /* */
     model: string;
-    /** Configured provider kind ("local" / "openai-compatible" / "ollama" / "off"). */
+    /* */
     provider: string;
-    /** This session's compartment-chunk coverage. */
+    /* */
     session: { embedded: number; total: number };
-    /** Project-wide git-commit coverage (only meaningful when gitEnabled). */
+    /* */
     commits: { embedded: number; total: number; gitEnabled: boolean };
 }
 
 /**
- * The no-argument `/ctx-embed` status reports session and project git-commit
- * coverage for the active model. Pure reads — no provider calls.
  */
 export function getEmbeddingCoverageStatus(
     db: Database,

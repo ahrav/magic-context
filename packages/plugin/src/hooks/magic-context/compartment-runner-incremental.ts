@@ -4,10 +4,6 @@ import {
     appendCompartments,
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
-// Re-export the historian-state-file helpers so existing callers
-// (compartment-runner-recomp.ts, compartment-runner.ts, tests) keep working
-// unchanged. The implementation moved to ./historian-state-file.ts so Pi
-// can import it without pulling in the full incremental runner.
 import { cleanupHistorianStateFile } from "./historian-state-file";
 
 export {
@@ -78,7 +74,7 @@ import { estimateTokens } from "./read-session-formatting";
 import { buildReferenceBlocks } from "./reference-retrieval";
 import { sendIgnoredMessage } from "./send-session-notification";
 
-/** Suppress repeated historian failure notifications — at most once per 60 seconds per session */
+/* */
 const HISTORIAN_ALERT_COOLDOWN_MS = 60 * 1000;
 const lastHistorianAlertBySession = new Map<string, number>();
 
@@ -91,7 +87,7 @@ function shouldSuppressHistorianAlert(sessionId: string): boolean {
     return false;
 }
 
-/** Clean up module-level session state on session deletion. */
+/** Session deletion removes module-level historian alert state. */
 export function clearHistorianAlertState(sessionId: string): void {
     lastHistorianAlertBySession.delete(sessionId);
 }
@@ -112,9 +108,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
     let stateFilePath: string | undefined;
     let drainReservation: ReturnType<typeof reserveProtectedTailDrainTokens>["reservation"] = null;
 
-    // historian_runs telemetry (migration v24). Captured across the run and
-    // recorded ONCE in `finally` so every exit path (no-op, failure, success) is
-    // logged. Best-effort: recordHistorianRun never throws into this path.
+    // The runner records telemetry in `finally` for no-op, failure, and success exits.
     const runStartedAt = Date.now();
     const invocationBaseline = getLatestHistorianInvocationId(db, sessionId);
     const telemetry: Partial<HistorianRunInput> = {
@@ -122,8 +116,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         status: "failed", // pessimistic default; overwritten on no-op/success
     };
     const recordTelemetry = (): void => {
-        // Link the FK only when a NEW historian invocation was recorded during
-        // this run (serialized per session, so the newest > baseline is ours).
+        // `recordTelemetry` links the FK only when this run recorded a new historian invocation; per-session serialization makes the newest post-baseline invocation belong to this run.
         const latest = getLatestHistorianInvocationId(db, sessionId);
         const invocationId =
             latest != null && (invocationBaseline == null || latest > invocationBaseline)
@@ -192,8 +185,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
 
     try {
         const priorCompartments = getCompartments(db, sessionId);
-        // v2: session facts are no longer read here — the unbounded existing_state
-        // dump is gone. Facts dedup against <project-memory> in the prompt instead.
+        // The prompt deduplicates facts against `<project-memory>`.
 
         const existingValidationError = validateStoredCompartments(priorCompartments);
         if (existingValidationError) {
@@ -201,8 +193,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 sessionId,
                 `historian failure: source=existing-validation reason="${existingValidationError}"`,
             );
-            // This is a real failure (stored compartments are corrupt) — record
-            // it so `doctor --issue` and the >=95% abort path can see it.
+            // The runner records corrupt stored compartments so `doctor --issue` and the `>=95%` abort path can detect the failure.
             const failCount = incrementHistorianFailure(db, sessionId, existingValidationError);
             telemetry.failureReason = `existing-validation: ${existingValidationError}`;
             await notifyHistorianIssue(
@@ -239,19 +230,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                           deps.currentContextLimit ?? boundarySnapshot.contextLimit,
                   })
                 : { ok: true };
-        // In an active session the protected tail's newest message changes every
-        // turn (a fresh user/assistant message lands), so a snapshot captured at
-        // trigger time goes stale on the "last ordinal id" check by the time the
-        // historian actually runs — even though the ELIGIBLE HEAD (offset →
-        // eligibleEnd) it would compact is untouched. Left as-is the runner no-ops
-        // forever while the trigger refires each turn, and queued drop ops starve
-        // (observed in production: 27 consecutive stale-snapshot no-ops, 179
-        // pending drops, zero reduction). Re-resolve the boundary ONCE from the
-        // CURRENT session state and adopt the fresh snapshot when it still exposes
-        // a runnable head. This does NOT weaken the protected-tail guarantee: the
-        // refreshed snapshot recomputes protectedTailStart/eligibleEnd from the
-        // live messages, so the head can never include a message that now belongs
-        // to the current protected tail.
+        // The runner refreshes a stale boundary snapshot only when the current boundary still exposes a runnable head.
         if (!validation.ok && validation.reason === "stale_snapshot") {
             const refreshed = deps.refreshBoundarySnapshot
                 ? deps.refreshBoundarySnapshot(boundarySnapshot, validation)
@@ -310,9 +289,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                     `historian high-pressure no-op: recovery remains armed (noEligibleHeadCount=${count})`,
                 );
             }
-            // Tail is exhausted — nothing left to drain, so the emergency catch-up
-            // latch has done its job. Clear it so a high irreducible floor can't keep
-            // it armed and later bypass the steady-state throttle for fresh tail.
+            // The runner clears the emergency catch-up latch because an exhausted tail has nothing left to drain.
+            // The runner clears the emergency catch-up latch because an exhausted tail has nothing left to drain.
             clearEmergencyDrainLatch(db, sessionId);
             telemetry.status = "noop";
             telemetry.failureReason = "nothing to compact before protected tail";
@@ -365,8 +343,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             } else {
                 recordHighPressureNoEligibleHead(db, boundarySnapshot);
             }
-            // Eligible head produced no compactable chunk — treat as tail-exhausted
-            // and clear the catch-up latch (see the protected-tail no-op above).
+            // The runner treats an eligible head that produces no compactable chunk as tail-exhausted and clears the catch-up latch.
+            // The runner treats an eligible head that produces no compactable chunk as tail-exhausted and clears the catch-up latch.
             clearEmergencyDrainLatch(db, sessionId);
             telemetry.status = "noop";
             telemetry.failureReason = "chunk empty after filtering";
@@ -388,9 +366,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 sessionId,
                 `historian failure: source=chunk-coverage reason="${chunkCoverageError}" chunkRange=${chunk.startIndex}-${chunk.endIndex}`,
             );
-            // Record this so `doctor --issue` reports it and `>=95%` abort
-            // can react. Previously this path was silent (no failure count,
-            // recovery flag unchanged), making the loop bug invisible in
+            // The runner records the failure so `doctor --issue` and the `>=95%` abort can react.
             // diagnostics.
             const failCount = incrementHistorianFailure(db, sessionId, chunkCoverageError);
             await notifyHistorianIssue(buildHistorianFailureNotice(failCount, chunkCoverageError));
@@ -398,20 +374,14 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             return;
         }
 
-        // Past every synchronous no-op early-return and immediately before the
-        // first `await` (client.session.get below): we are now committed to a
-        // real historian pass. Signal the caller so startCompartmentAgent keeps
-        // the active-run registration; a synchronous no-op above never reaches
-        // here, so its lingering registration is cleared instead of blocking the
-        // same transform pass's pending-op drain.
+        // `runCompartmentAgent` calls `onHistorianRunStarted` before its first `await` so synchronous no-ops do not retain the active-run registration.
         deps.onHistorianRunStarted?.();
 
-        // v2 bounded reference model (replaces the unbounded existing_state dump):
-        //   - 4 rotating cross-project seeds + last-6 recency compartments (no
-        //     embedding at historian time), built from this session's prior
+        // `buildReferenceBlocks` bounds references to four rotating cross-project seeds and six recent session compartments.
+        // `buildReferenceBlocks` uses four rotating cross-project seeds and six recent session compartments without historian-time embeddings.
+        // The runner builds session-derived references without historian-time embeddings.
         //     compartments.
-        //   - <project-memory> for fact dedup (consolidation-bounded).
-        // No temp-file offload needed — the bounded blocks stay well within
+        // `<project-memory>` deduplicates facts.
         // serialization limits.
         const projectPath = resolveProjectIdentity(directory ?? process.cwd());
 
@@ -421,7 +391,6 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             sessionCompartments: priorCompartments,
         });
 
-        // Intentional: session.get failure is non-fatal — we fall back to deps.directory
         const parentSessionResponse = await client.session
             .get({ path: { id: sessionId } })
             .catch(() => null);
@@ -451,12 +420,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             memoryEnabled: deps.memoryEnabled !== false,
         });
 
-        // Defensive: use MAX(sequence) + 1 rather than .length. These only
-        // differ when the current DB state has a gap or non-zero-indexed
-        // sequences (e.g., from an older partial recomp that wrote off-by-one
-        // sequences). Using .length would pick a sequence that collides with
-        // an existing row and trigger "UNIQUE constraint failed:
-        // compartments.session_id, compartments.sequence" on insert.
+        // `MAX(sequence) + 1` avoids unique-key collisions when persisted sequences contain gaps or do not start at zero.
         const maxExistingSequence = priorCompartments.reduce(
             (max, c) => (c.sequence > max ? c.sequence : max),
             -1,
@@ -481,9 +445,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             language: deps.language,
         });
         if (!validatedPass.ok) {
-            // Always track historian failures regardless of usage percentage.
-            // The emergency abort path at 95% checks failureCount > 0, so failures
-            // at any pressure level must be recorded.
+            // The runner tracks historian failures regardless of usage percentage.
+            // The runner records failures at every pressure level because the 95% emergency abort checks `failureCount > 0`.
             sessionLog(
                 sessionId,
                 `historian failure: source=validation reason="${validatedPass.error}" chunkRange=${chunk.startIndex}-${chunk.endIndex} fallbackModel=${deps.fallbackModelId ?? "<none>"} twoPass=${deps.historianTwoPass ? "true" : "false"}`,
@@ -497,21 +460,12 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
 
         const emittedCompartments = validatedPass.compartments;
 
-        // Discard-last boundary healing: the LAST compartment of a greedy-consume
-        // run was decided WITHOUT lookahead (historian can't see past the chunk),
-        // so its boundary is structurally unreliable — unlike every earlier
-        // compartment, which the messages that followed it validated. If historian
-        // consumed ~the whole chunk (≤ BOUNDARY_HEALING_SLACK messages of lookahead
-        // past the last compartment), drop that provisional last compartment so it
-        // is re-derived next run with real following context. The existing
-        // `offset = lastCompartment.end + 1` logic then re-reads its range at the
-        // head — zero extra plumbing. Guards:
-        //   - at least two compartments were emitted, so one remains and publication advances.
+        // Consumption that leaves at most `BOUNDARY_HEALING_SLACK` messages after the final compartment causes the runner to discard it because it lacked lookahead; the next run rederives it with following context.
+        // After discarding the last compartment, the next run re-reads its range.
+        // At least two emitted compartments leave one retained compartment, allowing publication to advance.
         //   - the retained boundary cannot split a completed invocation/result pair.
-        //   - not emergency: at ≥95% recovery we need maximum relief NOW, so keep
-        //     all k and accept the boundary risk (correctness > quality).
-        // Self-healing: a wrong discard re-derives the same compartment next run
-        // (now non-last → persisted), so erring toward more slack is safe.
+        // Emergency recovery keeps all compartments to maximize relief.
+        // If a discard is wrong, the next run re-derives the compartment with following context.
         const inEmergency = getOverflowState(db, sessionId).needsEmergencyRecovery;
         let persistedCompartments = emittedCompartments;
         if (
@@ -554,65 +508,39 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
 
         retainDrainReservationForRetryThrottle = false;
 
-        // Plan v6 §4: when the runner is preserving the injection cache,
-        // defer marker movement until a later materializing transform pass.
-        // We persist a pending blob INSIDE the same publish transaction so a
-        // crash between publish and drain cannot leave the marker out of sync
-        // — either both land or neither does. The drain in
-        // transform-postprocess-phase consumes the blob via
+        // The runner defers marker movement to preserve the injection cache.
+        // Publication persists the pending blob so a crash cannot lose the deferred marker update.
+        // `transform-postprocess-phase` drains the blob with `applyDeferredCompactionMarker`.
         // `applyDeferredCompactionMarker`.
         //
-        // Direct apply (legacy path) still fires for non-deferring callers
-        // (recomp / partial-recomp / explicit flushes), which clear the
-        // injection cache eagerly anyway.
+        // Non-deferring callers apply the compaction marker directly.
+        // Recomp, partial recomp, and explicit flushes clear the injection cache eagerly.
+        // Non-deferring callers clear the injection cache eagerly.
         const deferMarkerApplication = deps.preserveInjectionCacheUntilConsumed === true;
 
         const lastCompartmentEnd = lastNewEnd;
         const lastNewEndMessageId = newCompartments[newCompartments.length - 1]?.endMessageId;
 
-        // Use the RESOLVED session directory for memory project identity, not
-        // raw deps.directory. deps.directory can be empty even
-        // when the session has a valid directory (resolved via session.get
-        // above); using it directly made promotion + embedding silently no-op.
+        // The session can have a valid resolved directory when `deps.directory` is empty.
+        // `sessionDirectory` can keep promotion and embedding active when `deps.directory` is empty.
         const promotionDirectory = sessionDirectory || deps.directory;
 
-        // Unanchored promotion (facts/observations/primers) is skipped in two
-        // distinct weak-boundary cases:
-        //  - discard-last: the provisional tail compartment was dropped, and facts
-        //    are unanchored so persisted-range facts cannot be separated from
-        //    discarded-tail facts; a reworded re-emission next run would double up.
-        //  - forced final keep: a wrapup's actual final chunk persists its
-        //    weak-lookahead tail for coverage, but nothing durable is extracted
-        //    from a boundary the discard-last heuristic would have distrusted.
-        // A wrapup caller may request final weak-lookahead preservation, but the
-        // runner is authoritative: a token-capped chunk (`chunk.hasMore`) still has
-        // more raw history after it, so it must use normal discard-last healing and
+        // After discard-last, skip unanchored promotion because persisted-range facts cannot be distinguished from discarded-tail facts.
+        // A wrapup persists its final weak-lookahead tail for coverage.
+        // A token-capped chunk must use normal discard-last healing because raw history remains after it.
         // promotion.
         const discardedLast = persistedCompartments.length < emittedCompartments.length;
         const weakLookaheadFinalCompartment = forceKeepLastCompartmentForChunk;
         const skipUnanchoredPromotion = discardedLast || weakLookaheadFinalCompartment;
 
-        // Issue #44: gate promotion behind both `memory.enabled` and
-        // `memory.auto_promote`. Without this, historian unconditionally
-        // wrote project memories (with embeddings) even for users who
-        // explicitly disabled the memory feature in config.
-        // Two distinct gates:
-        //  - embeddingActive: embeddings + project registration fire whenever the
-        //    memory FEATURE is enabled. They are the substrate for ctx_search +
-        //    future dreamer cross-linking and must NOT depend on auto_promote.
-        //  - promotionActive: writing facts as project memories additionally
-        //    requires auto_promote (a user who disabled auto-promotion still wants
-        //    search/embedding, just not auto-written memories).
+        // Project-memory promotion requires both `memory.enabled` and `memory.auto_promote`.
+        // Embedding and project registration require `promotionDirectory` and `memory.enabled`, but not `memory.auto_promote`.
         const embeddingActive = !!promotionDirectory && deps.memoryEnabled !== false;
         const promotionActive = embeddingActive && deps.autoPromote !== false;
         const promotionProjectIdentity = promotionDirectory
             ? resolveProjectIdentity(promotionDirectory)
             : "";
 
-        // discard-last: drop events anchored to the discarded provisional
-        // compartment (atCompartment is a 1-based index into the EMITTED list;
-        // anything > persistedCompartments.length pointed at the dropped tail).
-        // They re-emit next run anchored to the persisted range.
         const publishableEvents = (validatedPass.events ?? []).filter((e) => {
             if (typeof e.atCompartment !== "number") return !weakLookaheadFinalCompartment;
             if (e.atCompartment > persistedCompartments.length) return false;
@@ -623,10 +551,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         });
         let persistedIds: number[] = [];
 
-        // Append new compartments (existing stay untouched in DB) and publish all
-        // synchronous durable side effects atomically. BEGIN IMMEDIATE ensures the
-        // lease holder check and subsequent writes share one fresh write-locked
-        // snapshot across sibling processes.
+        // The transaction atomically appends compartments and publishes synchronous durable side effects.
+        // `BEGIN IMMEDIATE` makes the lease check and subsequent writes share a fresh write-locked snapshot across sibling processes.
         const holderId = deps.compartmentLeaseHolderId;
         if (!holderId) {
             sessionLog(sessionId, "historian publish skipped: missing compartment lease holder");
@@ -646,19 +572,13 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 return;
             }
             appendCompartments(db, sessionId, persistedCompartments);
-            // v2 (E2): resolve durable ids for the compartments we just appended.
-            // They are the last `persistedCompartments.length` rows by sequence
-            // (appendCompartments inserts at the tail). Used for events anchoring +
-            // embedding. Pure DB read — cheap, no message mutation.
+            // The appended compartments occupy the last `persistedCompartments.length` rows by sequence.
+            // Event anchoring uses the appended compartments' durable IDs.
             persistedIds = getCompartments(db, sessionId)
                 .slice(-persistedCompartments.length)
                 .map((c) => c.id);
-            // v2 faithful fact lifecycle: facts are NOT a REPLACE-the-whole-list
-            // store anymore. The historian emits only THIS chunk's facts (deduped
-            // against <project-memory> in the prompt); they flow to project memory
-            // via in-transaction durable promotion. session_facts is no longer
-            // written/bumped. Promotion is in the SAME transaction as the boundary
-            // floor below so a crash cannot advance past facts that never became
+            // In-transaction promotion writes extracted facts to project memory.
+            // Promotion and boundary-floor updates share one transaction so a crash cannot advance the boundary past unpersisted facts.
             // project memories.
             if (promotionActive && !skipUnanchoredPromotion) {
                 promoteSessionFactsDurable(
@@ -676,10 +596,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 );
             }
 
-            // v2 (E2): persist historian-extracted events (stored, NOT rendered).
-            // Independent of memory flags — events are a separate corpus for a future
-            // dreamer aggregation feature, not project memory. Best-effort and
-            // re-derivable, so an event failure logs and does NOT abort facts/boundary.
+            // Event persistence does not depend on memory flags.
+            // Event storage failures log without aborting fact or boundary publication.
             if (publishableEvents.length > 0) {
                 try {
                     insertCompartmentEvents(db, sessionId, publishableEvents, persistedIds);
@@ -695,12 +613,8 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             queueDropsForCompartmentalizedMessages(db, sessionId, lastCompartmentEnd);
 
             clearHistorianFailureState(db, sessionId);
-            // Healthy historian progress — clear the drain-failure backoff so the
-            // emergency catch-up latch can bypass the budget freely again.
             clearHistorianDrainFailure(db, sessionId);
-            // Normal historian publication resolves overflow recovery. A manual
-            // wrapup can publish several chunks before reaching its keep watermark,
-            // so it leaves the recovery flag armed until the orchestrator finishes.
+            // Emergency recovery remains armed while `isWrapupInProgress(db, sessionId)` is true.
             recordProtectedTailPublicationFloor(db, sessionId, lastCompartmentEnd + 1);
             if (!isWrapupInProgress(db, sessionId)) clearEmergencyRecovery(db, sessionId);
             drainReservation = null;
@@ -722,25 +636,21 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 }
             }
         }
-        // Background publication normally preserves the injection cache until
-        // a materializing pass can rebuild history and apply queued drops
-        // together. Explicit recomp paths leave preserve=false and invalidate
+        // preserveInjectionCacheUntilConsumed=true delays injection-cache invalidation until queued drops are consumed.
+        // A materializing pass rebuilds history and applies queued drops before invalidating the injection cache.
+        // preserveInjectionCacheUntilConsumed=false invalidates the injection cache immediately.
         // immediately.
         if (deps.preserveInjectionCacheUntilConsumed !== true) {
             clearInjectionCache(sessionId);
         }
 
-        // Signal publication immediately after COMMIT. All publish-visible durable
-        // state (compartments, boundary floor, promoted facts, event attempts, and
-        // drop queue) is already in the transaction above; embedding registration
-        // and provider calls below are post-commit best-effort and must never leave
-        // a committed publish marked failed or unsignaled.
+        // onCompartmentStatePublished runs after COMMIT and before post-commit provider work.
+        // The transaction persists compartments, the boundary floor, promoted facts, event attempts, and the drop queue before publication is signaled.
+        // Post-commit provider failures do not change the published state.
         deps.onCompartmentStatePublished?.(sessionId);
 
-        // Inject compaction marker into OpenCode's DB.
-        // When deferring (plan v6 §4), the pending blob was already written
-        // in-transaction and `onDeferredMarkerPending` signals the drain set.
-        // When NOT deferring, fall back to the legacy direct-apply path.
+        // updateCompactionMarkerAfterPublication writes the compaction marker to OpenCode's DB.
+        // When deferMarkerApplication is true, the transaction writes the pending marker before onDeferredMarkerPending signals the drain set.
         if (deferMarkerApplication) {
             deps.onDeferredMarkerPending?.(sessionId);
         } else {
@@ -752,13 +662,11 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             );
         }
 
-        // v2: the LLM compressor is gone — deterministic decay-tier rendering
-        // (decay-render.ts) replaces it. Older compartments demote tiers at
-        // render time with no LLM pass.
+        // decay-render.ts demotes older compartment tiers during rendering without an LLM call.
         updateSessionMeta(db, sessionId, { compartmentInProgress: false });
         completedSuccessfully = true;
 
-        // historian_runs telemetry — full success metrics (recorded in finally).
+        // Historian records one `historian_runs` row for every exit path.
         {
             const facts = validatedPass.facts ?? [];
             const validIds = persistedIds.filter((id): id is number => typeof id === "number");
@@ -780,9 +688,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
 
         onNoteTrigger(db, sessionId, "historian_complete");
 
-        // v2: compute + store raw chunk embeddings (the ctx_search semantic
-        // substrate over session history). Fire-and-forget, best-effort, gated by
-        // memory flags so a memory-off user never hits the embedding endpoint.
+        // Memory-enabled sessions store raw chunk embeddings best-effort; memory-off sessions never call the embedding endpoint.
         if (embeddingActive) {
             const chunksToEmbed = persistedCompartments
                 .map((c, i) => ({
@@ -811,12 +717,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             })();
         }
 
-        // Store user behavior observations as candidates ONLY when the user-memory
-        // feature is enabled. Without this gate we'd persist behavioral candidates
-        // for users who opted out of user memories entirely (privacy).
-        // Actual final wrapup chunks skip unanchored observations because the kept
-        // tail has weak lookahead; token-capped chunks still promote observations
-        // so facts from a never-re-read persisted range are not lost.
+        // The user-memory feature gate permits behavioral candidates only when user memory is enabled.
         if (
             deps.experimentalUserMemories === true &&
             !skipUnanchoredPromotion &&
@@ -843,9 +744,6 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             }
         }
 
-        // Primers v1 are recall-only side-table writes (dashboard + ctx_search),
-        // never prompt injection. Use the same actual-final weak-lookahead gate as
-        // facts and observations.
         if (
             !skipUnanchoredPromotion &&
             promotionProjectIdentity &&
@@ -855,16 +753,10 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             try {
                 const firstNew = newCompartments[0];
                 const lastNew = newCompartments[newCompartments.length - 1];
-                // The stable occurrence key intentionally excludes question text;
-                // therefore a source chunk stores at most one candidate occurrence
-                // (its origin-compartment tag is the single tagged origin).
                 const [candidate] = validatedPass.primerCandidates;
-                // Origin-tag: narrow the source to the SPECIFIC compartment the
-                // question came from (refresh-primers seeds its investigation from
-                // that compartment's raw chunk). `originCompartmentIndex` is 1-based
-                // into the emitted list — the SAME convention as <events>
-                // at_compartment. Fall back to the chunk span when untagged or
-                // out of range (loose but non-fatal — never fail the pass).
+                // The origin tag narrows the source to the specific compartment that produced the question.
+                // originCompartmentIndex is 1-based into newCompartments.
+                // The fallback uses the chunk span when originCompartmentIndex does not select a compartment.
                 const idx = candidate.originCompartmentIndex;
                 const origin =
                     typeof idx === "number" && idx >= 1 && idx <= newCompartments.length
@@ -900,7 +792,6 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             }
         }
     } catch (error: unknown) {
-        // Historian runs are fail-closed because they update durable compartment state.
         const desc = describeError(error);
         telemetry.failureReason = `exception: ${desc.brief}`;
         sessionLog(
@@ -916,16 +807,10 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             if (!retainDrainReservationForRetryThrottle) {
                 rollbackDrainReservation();
             } else {
-                // A genuine historian failure (model error / no output / invalid
-                // output) — the same condition that retains the drain reservation as
-                // a retry throttle. Record it so the emergency catch-up latch's
-                // bypass is suppressed for a short backoff and a broken historian
-                // can't retry-thrash every pass under the latch.
                 recordHistorianDrainFailure(db, sessionId);
             }
             updateSessionMeta(db, sessionId, { compartmentInProgress: false });
         }
-        // Record one historian_runs row for this attempt (every exit path).
         recordTelemetry();
         cleanupHistorianStateFile(stateFilePath);
     }

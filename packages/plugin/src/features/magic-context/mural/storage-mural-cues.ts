@@ -3,15 +3,13 @@ import { createHash } from "node:crypto";
 import type { Database } from "../../../shared/sqlite";
 
 /**
- * Bump when the cue compression contract changes (prompt, packing, or
- * validation rules): stored cues from an older epoch read as absent and the
- * compress-cues task regenerates them.
+ * A stored non-null cue needs regeneration when its `rendererEpoch` differs from `MURAL_CUE_RENDERER_EPOCH`.
  */
 export const MURAL_CUE_RENDERER_EPOCH = 1;
 
 export interface ClaimMuralCueState {
     cue: string | null;
-    /** Exact revision locator the stored cue was compressed for. */
+    /** `revisionLocator` identifies the revision compressed into the stored cue. */
     revisionLocator: string;
     rendererEpoch: number;
     rejectionCount: number;
@@ -25,7 +23,7 @@ interface ClaimMuralCueRow {
     rejection_count: number;
 }
 
-/** Stored cue state keyed by public claim ID. Absent keys have no row. */
+/* */
 export function getClaimMuralCueStates(
     db: Database,
     publicClaimIds: readonly string[],
@@ -36,7 +34,7 @@ export function getClaimMuralCueStates(
     const placeholders = ids.map(() => "?").join(", ");
     const rows = db
         .prepare(
-            // Interpolation is a compile-time placeholder list, not caller input.
+            // `placeholders` contains only `?` tokens generated from `ids`.
             // pi-lens-ignore: sql-injection
             `SELECT cpi.public_id, cues.revision_locator, cues.renderer_epoch,
                     cues.cue, cues.rejection_count
@@ -57,8 +55,6 @@ export function getClaimMuralCueStates(
 }
 
 /**
- * True when the claim needs (re)compression: no stored cue, a cue compressed
- * for a different revision locator, or a cue from another renderer epoch.
  */
 export function claimNeedsCue(
     state: ClaimMuralCueState | undefined,
@@ -71,8 +67,8 @@ export function claimNeedsCue(
     );
 }
 
-/** A stored cue renders only for the exact revision locator and renderer
- * epoch it was compressed for. */
+/**
+ * */
 export function claimCueCurrent(
     state: ClaimMuralCueState | undefined,
     currentRevisionLocator: string,
@@ -95,9 +91,7 @@ function claimIdForPublicId(db: Database, publicClaimId: string): number {
 }
 
 /**
- * Store a compressed cue. `revisionLocator` MUST be the locator the cue was
- * actually compressed from: a claim revised mid-run keeps a locator-stale
- * row, so the render path excludes it and the compress gate re-selects it.
+ * `revisionLocator` MUST identify the revision compressed into `cue`; a mid-run revision leaves the row stale so rendering excludes it and compression reselects it.
  */
 export function setClaimMuralCue(
     db: Database,
@@ -117,9 +111,8 @@ export function setClaimMuralCue(
     ).run(claimId, args.revisionLocator, MURAL_CUE_RENDERER_EPOCH, args.cue, Date.now());
 }
 
-/** Record one validation rejection for the exact revision locator. The
- * locator doubles as the latch key while the cue remains NULL; a revised
- * claim restarts at one rejection. */
+/** `rejectionCount` is keyed by `revisionLocator` while `cue` is `NULL`; a revised claim's first rejection sets the count to 1.
+ * */
 export function recordClaimMuralCueRejection(
     db: Database,
     args: { publicClaimId: string; revisionLocator: string },
@@ -156,13 +149,6 @@ export function recordClaimMuralCueRejection(
 }
 
 /**
- * The staleness key: sha256 of the RAW memory content the cue was compressed
- * FROM. Any edit to the content changes this hash, so a stored cue whose hash no
- * longer matches the current content is detected as stale — re-selected by the
- * compress-cues gate and excluded by resolveMural until recompressed. This is
- * deliberately distinct from `normalizedHash` (md5 of normalized text used for
- * dedup): cue staleness must react to every content change, including
- * whitespace/case edits that normalization would erase.
  */
 export function computeCueContentHash(content: string): string {
     return createHash("sha256").update(content).digest("hex");

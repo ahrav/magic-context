@@ -1,16 +1,6 @@
 /**
- * Pi-side wrapper for the `ctx_reduce` tool.
  *
- * Mirrors OpenCode's `packages/plugin/src/tools/ctx-reduce/tools.ts`.
- * The agent uses this tool to mark tag IDs (`§N§`) as "drop" — those
- * tags get removed from the live message array on the next execute pass
- * (via `applyPendingOperations` in the runPipeline). Used to keep
- * historian noise out of the working context window without paying for
- * a full historian round.
  *
- * Registered for primary Pi sessions. `--no-session` child processes omit this
- * tool because it resolves the current session id at call time, and those
- * children would otherwise write drops against their hidden ephemeral session.
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -60,13 +50,11 @@ function formatIds(ids: number[]): string {
 export interface CtxReduceToolDeps {
 	db: ContextDatabase;
 	protectedTags: number;
-	/** Resolve the protected-tail size from the current cwd at tool-call time.
-	 *  Pi keeps the tool registered across `/cd`, so the threshold must follow
-	 *  the active project rather than the launch project. */
+	/**
+	 * */
 	resolveProtectedTags?: (ctx: { cwd: string }) => number | undefined;
-	/** Optional callback to read live session input tokens; falls back to
-	 *  `getOrCreateSessionMeta(...).lastInputTokens`. Mirrors OpenCode's
-	 *  `getSessionTokens` deps field. */
+	/**
+	 * */
 	getSessionTokens?: (sessionId: string) => number;
 }
 
@@ -130,10 +118,6 @@ export function createCtxReduceTool(
 				pendingOps.map((op) => [op.tagId, op.operation]),
 			);
 
-			// Reject drops on compaction-survivor tags. Mirrors OpenCode's
-			// `tagStatusMap.get(id) === "compacted"` guard — those tags are
-			// the synthesized survivors of an OpenCode compaction marker and
-			// can't be dropped without confusing downstream readers.
 			const conflicts: string[] = [];
 			for (const id of dropIds) {
 				if (tagStatusMap.get(id) === "compacted") {

@@ -133,7 +133,7 @@ budget_collect() {
   return "$rc"
 }
 
-# Odd blocks run arms forward, even blocks reversed (matches
+# Even blocks reverse arm order to counter time-dependent drift.
 # evidence::counterbalanced_schedule).
 budget_block() {
   local block="$1"
@@ -153,8 +153,7 @@ budget_block() {
   done
   # Cross-NUMA paired arms: auto-selection either finds a pair or
   # finalizes a structured skip without failing the block. Their order
-  # reverses on even blocks exactly like the same-L3 arms, so
-  # time-dependent drift cancels for the cross-NUMA paired comparison
+  # Their order reverses on even blocks exactly like the same-L3 arms.
   # too.
   local cross=(atomic-floor tcp-serial)
   if (((block - 1) % 2 == 1)); then
@@ -296,24 +295,17 @@ stop_host() {
   kill -INT "$HOST_PID" 2>/dev/null || true
   wait "$HOST_PID" 2>/dev/null || true
   rm -rf "$DATA"
-  # Cleared so the EXIT trap cannot re-signal the reaped PID, which the
-  # OS may reassign to an unrelated process before the script exits.
+  # Clearing HOST_PID prevents the EXIT trap from signaling a PID the OS may reassign before the script exits.
   HOST_PID=""
   DATA=""
 }
 
 load() {
-  # Normal arms propagate a perf_load failure: an invalid run must fail
-  # the script. The EXIT trap below still tears the host down on abort.
   "$BIN/perf_load" "$PUB" --workload "${PERF_WORKLOAD:-raw}" "$@" | tee -a "$OUT/results.txt"
 }
 
 load_tolerant() {
-  # Adversarial arms (starvation, greedy, slowreader) drive failure
-  # modes on purpose, and perf_load exits nonzero on transport or
-  # correctness failures. Recording the status keeps the script from
-  # aborting mid-arm under set -e so the arm's recovery checks and
-  # cleanup still run.
+  # Record a nonzero pipeline exit status without aborting.
   local rc=0
   "$BIN/perf_load" "$PUB" --workload "${PERF_WORKLOAD:-raw}" "$@" | tee -a "$OUT/results.txt" || rc=$?
   if [[ $rc -ne 0 ]]; then
@@ -321,8 +313,6 @@ load_tolerant() {
   fi
 }
 
-# Tears the arm's host down on any exit, including a set -e abort from a
-# failed normal-arm load; every step tolerates an already-stopped host.
 cleanup_host() {
   if [[ -n "${HOST_PID:-}" ]]; then
     kill -INT "$HOST_PID" 2>/dev/null || true
@@ -384,8 +374,6 @@ starvation)
   sleep 2
   load_tolerant --label A5-victims --conns 2 --payload 256 --rate 400 --secs 20
   wait "$HOG_PID" || true
-  # The recovery probe exists to verify post-load recovery: a failure
-  # here fails the arm through the strict wrapper.
   load --label A5-recovery --conns 2 --payload 256 --rate 400 --secs 10
   stop_host
   ;;

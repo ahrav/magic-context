@@ -12,7 +12,6 @@ export function openTestDb(
 ): Database & PluginDatabase {
 	const db = new Database(path, options);
 	db.exec("PRAGMA busy_timeout=5000");
-	// SAFETY: E2E executes in Bun, so PluginDatabase selects bun:sqlite.
 	return db as Database & PluginDatabase;
 }
 

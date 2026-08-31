@@ -1,9 +1,6 @@
 /**
- * TestHarness — one-stop facade for end-to-end scenarios.
  *
- * Wraps the mock Anthropic server, the `opencode serve` subprocess, and the SDK client
- * into a single object. Also exposes helpers for inspecting both OpenCode's database
- * and magic-context's `context.db` so tests can assert on persisted state.
+ * Tests can assert persisted state through magicContext's `context.db`.
  *
  * Usage:
  *
@@ -29,25 +26,22 @@ import {
 } from "./opencode-runner/spawn";
 
 export interface TestHarnessOptions {
-    /** magic-context config overrides. Merged onto test defaults. */
+    /** `magicContextConfig` overrides test defaults. */
     magicContextConfig?: Record<string, unknown>;
-    /** Extra opencode.json config. Merged onto test defaults. */
+    /** `openCodeConfigExtra` overrides test defaults. */
     openCodeConfigExtra?: Record<string, unknown>;
-    /** Override the mock model's context token limit. Default 200000. */
+    /** `modelContextLimit` overrides the mock model's 200000-token context limit. */
     modelContextLimit?: number;
     /**
-     * Default response used when the mock queue is empty. Lets tests send extra
-     * prompts without worrying about scripting every one.
+     * `mockDefault` supplies responses after the mock queue is empty, so tests can send unscripted prompts.
      */
     mockDefault?: MockResponse;
     /**
-     * Extra environment for the `opencode serve` child. Merged last, so it can
-     * restore a real API key over the fake default. Secret-bearing entries
-     * require the loopback pin below: `assertSecretsBoundToLoopback` in
-     * spawn.ts refuses the pair otherwise.
+     * `extraEnv` overrides the fake API key after test defaults are merged.
+     * Secret-bearing `extraEnv` requires `hostname: "127.0.0.1"`.
      */
     extraEnv?: SpawnOptions["extraEnv"];
-    /** Serve bind address. Pass "127.0.0.1" whenever extraEnv carries a secret. */
+    /** `hostname` must be `"127.0.0.1"` when `extraEnv` contains a secret. */
     hostname?: SpawnOptions["hostname"];
 }
 
@@ -105,7 +99,7 @@ export class TestHarness {
         const mock = new MockProvider();
         const { baseURL } = await mock.start();
 
-        // Always install a default so unexpected extra requests don't 500.
+        // `TestHarness.create` installs a default response so unexpected mock requests do not return 500.
         mock.setDefault(options.mockDefault ?? DEFAULT_MOCK_RESPONSE);
 
         const spawnOpts: SpawnOptions = {
@@ -119,7 +113,7 @@ export class TestHarness {
         const opencode = await spawnOpencode(spawnOpts);
 
         const sdk = await import("@opencode-ai/sdk");
-        // SAFETY: harness uses only SdkClient methods shared with the generated SDK client.
+        // TestHarness uses only `SdkClient` methods shared with the generated SDK client.
         const client = sdk.createOpencodeClient({
             baseUrl: opencode.url,
         }) as unknown as SdkClient;
@@ -127,7 +121,7 @@ export class TestHarness {
         return new TestHarness(mock, opencode, client);
     }
 
-    /** Create a session bound to the isolated workdir. Throws on failure. */
+    /** `createSession` binds each session to the harness's isolated workdir. */
     async createSession(): Promise<string> {
         return this.createSessionWithRetry(
             () =>
@@ -139,12 +133,8 @@ export class TestHarness {
     }
 
     /**
-     * Post a session.create and retry the transient warmup failure where the
-     * server reports ready on `/doc` but its session route briefly returns an
-     * empty body under load (no `res.data`). This is harness readiness gating,
-     * not a product retry: no session exists yet, so nothing under test has run.
-     * A persistent failure (server actually down) still throws with captured
-     * stderr/stdout after the attempts are exhausted.
+     * `createSession` retries when `/doc` is ready but `/session` returns no `data`; no session exists before a response includes `data`.
+     * After retries are exhausted, `createSession` throws with captured stderr and stdout.
      */
     private async createSessionWithRetry(
         attempt: () => Promise<{ data?: { id: string } | null }>,
@@ -162,19 +152,12 @@ export class TestHarness {
                 `${label} failed after ${maxAttempts} attempts. stderr:\n${this.opencode.stderr()}\nstdout:\n${this.opencode.stdout()}`,
             );
         }
-        // Unreachable: the loop either returns an id or throws.
         throw new Error(`${label} failed`);
     }
 
     /**
-     * Create a child session (subagent) with the given parent. Mirrors what
-     * OpenCode's `task` tool does internally: posts to /session with a
-     * `parentID` body. The plugin's event-handler reads `parentID` from the
-     * `session.created` event and marks the row `isSubagent=true`.
+     * `parentID` makes the plugin mark the `session_meta` row `isSubagent=true` from `session.created`.
      *
-     * Use this to drive subagent-specific behavior: reduced feature mode,
-     * heuristic cleanup without historian, no 85%/95% emergency paths, no
-     * nudges, no §N§ prefix injection.
      */
     async createChildSession(
         parentId: string,
@@ -191,9 +174,7 @@ export class TestHarness {
     }
 
     /**
-     * Read the persisted `isSubagent` flag for a session from context.db.
-     * Returns null if the session_meta row doesn't exist yet (plugin may not
-     * have processed the `session.created` event yet — wait with `waitFor`).
+     * `session_meta` may be absent until the plugin processes `session.created`; callers must wait with `waitFor`.
      */
     isSubagent(sessionId: string): boolean | null {
         try {
@@ -211,9 +192,7 @@ export class TestHarness {
     }
 
     /**
-     * Count tags in a specific status for a session. Status is one of
-     * "active" | "dropped" (magic-context's TagStatus). Useful for
-     * verifying heuristic cleanup actually dropped tool tags.
+     * `status` accepts magic-context `TagStatus` values `"active"` and `"dropped"`.
      */
     countTagsByStatus(sessionId: string, status: string): number {
         try {
@@ -230,22 +209,10 @@ export class TestHarness {
     }
 
     /**
-     * Send a user prompt. Returns the raw prompt response.
-     * Default model routes to our mock-anthropic provider. Callers can override.
      */
     /**
-     * Generate ~`tokens` tokens of varied, realistic prose ballast.
      *
-     * The protected-tail boundary (v3) is SIZE-based: it measures the true-raw
-     * token content of the session, not the mock's fabricated usage numbers.
-     * Tests that fake pressure (90K `input_tokens` on a session whose actual
-     * text is a few hundred tokens) leave the boundary with no eligible head —
-     * the historian can never start, which is correct behavior for that
-     * (production-unreachable) state. Pressure-driving turns must therefore
-     * carry real content mass: `sendPrompt(id, prefix + h.ballast(N))`.
      *
-     * Delegates to the shared generator (see ballast.ts) so every consumer —
-     * harnesses and the historian-eval freeze lint — measures the same bytes.
      */
     ballast(tokens: number): string {
         return ballastProse(tokens);
@@ -261,11 +228,6 @@ export class TestHarness {
             timeoutMs?: number;
         } = {},
     ): Promise<unknown> {
-        // Default bumped from 30s → 180s. CI runners (GitHub-hosted ubuntu)
-        // can take 10-30s just for opencode serve to process a single prompt
-        // when historian/compressor work is involved. 180s leaves room for
-        // multi-step assistant turns while still catching genuinely stuck
-        // prompts. Individual tests can still pass a smaller timeoutMs.
         const timeoutMs = options.timeoutMs ?? 180_000;
         const promptPromise = this.client.session.prompt({
             path: { id: sessionId },
@@ -291,8 +253,6 @@ export class TestHarness {
     }
 
     /**
-     * Open the magic-context SQLite database in read-only mode.
-     * Cached per harness so repeated calls share the handle.
      */
     contextDb(): Database {
         if (this.contextDbCached) return this.contextDbCached;
@@ -306,10 +266,8 @@ export class TestHarness {
         return this.contextDbCached;
     }
 
-    /** Absolute path of the shared context.db (may not exist yet). */
+    /* */
     contextDbPath(): string {
-        // Plugin v0.16+ uses the shared cortexkit/magic-context path so OpenCode
-        // and Pi can share state. See packages/plugin/src/shared/data-path.ts.
         return join(
             this.opencode.env.dataDir,
             "cortexkit",
@@ -318,20 +276,16 @@ export class TestHarness {
         );
     }
 
-    /** Whether the plugin has created its database yet. */
+    /* */
     hasContextDb(): boolean {
         return existsSync(this.contextDbPath());
     }
 
-    /** Poll until `predicate` returns true or `timeoutMs` elapses. */
+    /* */
     async waitFor<T>(
         predicate: () => T | null | undefined | false,
         opts: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
     ): Promise<T> {
-        // Default bumped from 10s → 60s for CI. waitFor is called by tests
-        // to poll for DB rows / queued ops to appear; on CI shared runners
-        // there can be material latency between an event firing and the
-        // SQLite row being visible. Individual tests can still pass a
         // smaller timeoutMs.
         const timeoutMs = opts.timeoutMs ?? 60_000;
         const intervalMs = opts.intervalMs ?? 100;
@@ -347,7 +301,7 @@ export class TestHarness {
     }
 
     /**
-     * Count compartments for a session. Returns 0 if the table is empty or missing.
+     * `countCompartments()` returns 0 when the table is empty or missing.
      */
     countCompartments(sessionId: string): number {
         try {
@@ -363,7 +317,7 @@ export class TestHarness {
         }
     }
 
-    /** Count tags for a session. Useful to verify the plugin ran at all. */
+    /* */
     countTags(sessionId: string): number {
         try {
             const db = this.contextDb();
@@ -376,7 +330,7 @@ export class TestHarness {
         }
     }
 
-    /** All mock requests received in this session. */
+    /* */
     requests() {
         return this.mock.requests();
     }
@@ -386,7 +340,6 @@ export class TestHarness {
             try {
                 this.contextDbCached.close();
             } catch {
-                // ignore close errors
             }
             this.contextDbCached = null;
         }

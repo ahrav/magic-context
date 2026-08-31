@@ -386,8 +386,7 @@ fn u10_scenario_7_delete_and_reseed_require_drained_u5_intents() {
     let route_root = "/repo/claim-mirror-test";
     let store_uuid = "6f1d0c4a-6f2b-4b7a-9c3d-2e5f8a1b4c7d";
     let authority_project = "git:claim-mirror-test";
-    // Staging resolves memories authority through the bound route, so drive the
-    // route to MODULE before staging.
+    // Staging resolves the memories authority through the bound route.
     store
         .bind_authority_route(store_uuid, authority_project, route_root)
         .unwrap();
@@ -516,14 +515,7 @@ fn u10_scenario_8_reseed_reproduces_state_across_restart() {
     assert_eq!(state.projects[&42].acked_effect_id, 11);
 }
 
-/// A receipt that names one of several claims still advances the generation
-/// stamps of the project's untouched rows.
 ///
-/// The host stamps every claim in a full snapshot from the current vector, and
-/// replacement compares whole rows. Leaving an untouched row on the previous
-/// generation makes the next restart seed differ from durable state, which
-/// returns `ResetRequired` and suppresses the claim lane for a stable workspace
-/// that only committed one ordinary receipt.
 #[test]
 fn receipt_advances_generation_stamps_on_untouched_rows_so_restart_seed_matches() {
     let dir = tempfile::tempdir().unwrap();
@@ -558,7 +550,6 @@ fn receipt_advances_generation_stamps_on_untouched_rows_so_restart_seed_matches(
     );
     store.apply_claim_mirror_receipt(&receipt, 2).unwrap();
 
-    // The row no effect named carries the receipt's generations.
     let stored = store.list_claim_mirror(INCARNATION, Some(41)).unwrap();
     let stored_untouched = stored
         .iter()
@@ -567,8 +558,7 @@ fn receipt_advances_generation_stamps_on_untouched_rows_so_restart_seed_matches(
     assert_eq!(stored_untouched.project_generation, 2);
     assert_eq!(stored_untouched.policy_generation, 2);
 
-    // The seed a restarting host rebuilds is therefore equivalent, so replacement
-    // succeeds instead of demanding a reset.
+    // An equivalent snapshot replacement succeeds without a reset.
     let reseed = snapshot(
         INCARNATION,
         &[(41, 2)],
@@ -582,12 +572,7 @@ fn receipt_advances_generation_stamps_on_untouched_rows_so_restart_seed_matches(
     );
 }
 
-/// An effect reusing the stored revision with different content is rejected
-/// rather than silently overwriting the row.
 ///
-/// A revision locator embeds the content digest, so an equal revision arriving
-/// with a different locator means the same revision carries different content.
-/// Only a strict revision-regression check would let the upsert replace it.
 #[test]
 fn receipt_rejects_equal_revision_carrying_different_content() {
     let dir = tempfile::tempdir().unwrap();

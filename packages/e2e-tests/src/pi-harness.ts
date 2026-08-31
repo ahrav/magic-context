@@ -1,4 +1,4 @@
-/** PiTestHarness — facade for Pi Magic Context e2e tests. */
+/** PiTestHarness provides an e2e-test facade for Pi Magic Context. */
 
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -23,11 +23,11 @@ export interface PiTestHarnessOptions {
   piSettingsExtra?: Record<string, unknown>;
   modelContextLimit?: number;
   mockDefault?: MockResponse;
-  /** Share the cortexkit DB with another harness. */
+  /** `sharedDataDir` lets multiple harnesses share the cortexkit DB. */
   sharedDataDir?: string;
-  /** Optional working directory override before the persistent Pi process starts. */
+  /** `workdir` overrides the working directory before the persistent Pi process starts. */
   workdir?: string;
-  /** Verified immutable release root. Omitted keeps active-checkout behavior. */
+  /** `releaseRoot` selects a verified immutable release root; omitting it uses the active checkout. */
   releaseRoot?: VerifiedReleaseRoot;
 }
 
@@ -96,11 +96,10 @@ export class PiTestHarness {
   }
 
   /**
-   * Generate ~`tokens` tokens of varied prose ballast. Delegates to the shared
-   * generator (see ballast.ts): the v3 protected-tail boundary measures
-   * TRUE-RAW content, not mock usage numbers, so pressure-driving turns must
-   * carry real content mass or the boundary resolves no eligible head and the
-   * historian (correctly) never starts.
+   * `ballast()` returns approximately `tokens` tokens of varied prose ballast.
+   * The protected-tail boundary measures true raw content rather than mock usage.
+   * Pressure-driving turns require real content; otherwise, the boundary finds no eligible head.
+   * The historian starts only after the boundary finds an eligible head.
    */
   ballast(tokens: number): string {
     return ballastProse(tokens);
@@ -110,11 +109,8 @@ export class PiTestHarness {
     text: string,
     options: { timeoutMs?: number; continueSession?: boolean; images?: unknown[] } = {},
   ): Promise<PiRunResult> {
-    // Default bumped from 60s → 180s. Pi historian + ctx_search work spawn a
-    // `pi --print` subprocess that calls the mock provider over HTTP, which on
-    // GitHub-hosted ubuntu runners is ~3-5x slower than local hardware. 180s
-    // covers the slowest known Pi paths (historian + compartment publish chain)
-    // while still bounding tests. Individual call sites can pass smaller values.
+    // `sendPrompt` uses a 180s default timeout to accommodate historian and ctx_search subprocesses on GitHub-hosted Ubuntu runners.
+    // The `pi --print` subprocess calls the mock provider over HTTP.
     const timeoutMs = options.timeoutMs ?? 180_000;
     const events: PiRpcEvent[] = [];
     let capturing = false;
@@ -158,7 +154,6 @@ export class PiTestHarness {
   private static mockBaseURL(mock: MockProvider): string {
     const last = mock.requests()[0];
     if (last) return `http://${last.headers.host}`;
-    // SAFETY: MockProvider.start stores Bun server under this stable test-only field.
     const server = (mock as unknown as { server?: { port?: number } }).server;
     const port = server?.port;
     if (!port) throw new Error("mock provider is not running");
@@ -212,7 +207,6 @@ export class PiTestHarness {
     try {
       this.contextDbCached.close();
     } catch {
-      // ignore close errors in test polling helpers
     }
     this.contextDbCached = null;
   }
@@ -258,10 +252,7 @@ export class PiTestHarness {
     predicate: () => T | null | undefined | false,
     opts: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
   ): Promise<T> {
-    // Default bumped from 10s → 60s for CI. waitFor polls for DB rows /
-    // queued ops to appear; on CI shared runners there can be material
-    // latency between an event firing and the SQLite row being visible.
-    // Individual call sites can pass a smaller timeoutMs.
+    // `waitFor` uses a 60s default timeout because CI can delay SQLite-row visibility after events fire.
     const timeoutMs = opts.timeoutMs ?? 60_000;
     const intervalMs = opts.intervalMs ?? 100;
     const deadline = Date.now() + timeoutMs;
@@ -282,7 +273,6 @@ export class PiTestHarness {
       try {
         this.contextDbCached.close();
       } catch {
-        // ignore close errors
       }
       this.contextDbCached = null;
     }

@@ -61,7 +61,6 @@ describe("applyStickySnapshotCache", () => {
     });
 
     test("returns hybrid (cached tokens + fresh counts) when inputTokens drops to 0 mid-turn", () => {
-        // First: a good snapshot is cached.
         applyStickySnapshotCache(
             "ses_test",
             makeSnapshot({
@@ -78,8 +77,6 @@ describe("applyStickySnapshotCache", () => {
                 memoryCount: 486,
             }),
         );
-        // Now an in-flight pass returns 0 inputTokens but a fresh count
-        // (e.g. the user just sent a message and historian is updating).
         const flickered = makeSnapshot({
             inputTokens: 0, // mid-turn flicker
             compartmentCount: 393, // a new compartment landed
@@ -108,7 +105,6 @@ describe("applyStickySnapshotCache", () => {
     });
 
     test("clears cached tokens when zero snapshot drops counts too (real reset)", () => {
-        // Cache a non-zero snapshot WITH counts.
         applyStickySnapshotCache(
             "ses_test",
             makeSnapshot({
@@ -118,7 +114,7 @@ describe("applyStickySnapshotCache", () => {
             }),
         );
 
-        // Real reset: tokens AND counts both dropped to zero, no in-flight signal.
+        // The cache treats inputTokens, compartmentCount, and memoryCount of 0 with no in-flight signal as a reset.
         const reset = applyStickySnapshotCache(
             "ses_test",
             makeSnapshot({
@@ -131,8 +127,7 @@ describe("applyStickySnapshotCache", () => {
         );
         expect(reset.inputTokens).toBe(0);
 
-        // After reset, even with in-flight signal returning later, there's
-        // no prior cached entry to restore.
+        // The reset removes the cached entry, so later in-flight signals cannot restore tokens.
         const later = applyStickySnapshotCache(
             "ses_test",
             makeSnapshot({ inputTokens: 0, compartmentInProgress: true }),
@@ -141,13 +136,7 @@ describe("applyStickySnapshotCache", () => {
     });
 
     test("sticks during first-user-prompt flicker when counts survive", () => {
-        // Regression: when a session is opened in TUI, sidebar shows the full
-        // breakdown. Then the user types their first prompt. The transform
-        // runs before the model responds, so last_input_tokens transiently
-        // reads 0 — no historian, no queued ops, no compartment work in
-        // progress. Authoritative counts (compartments, memories) are
-        // unchanged. Previously this wiped the cache and the sidebar went
-        // blank until the assistant's first message arrived.
+        // The cache preserves cached tokens when inputTokens is 0, counts match the cached snapshot, and no in-flight signals are set.
         applyStickySnapshotCache(
             "ses_test",
             makeSnapshot({
@@ -164,17 +153,14 @@ describe("applyStickySnapshotCache", () => {
 
         const firstPromptFlicker = makeSnapshot({
             inputTokens: 0,
-            // No in-flight signals — user just typed, model hasn't responded.
             compartmentInProgress: false,
             historianRunning: false,
             pendingOpsCount: 0,
-            // Counts unchanged from the cached good reading.
             compartmentCount: 392,
             memoryCount: 486,
         });
         const result = applyStickySnapshotCache("ses_test", firstPromptFlicker);
 
-        // Breakdown survives the flicker.
         expect(result.inputTokens).toBe(350_000);
         expect(result.compartmentTokens).toBe(128_000);
         expect(result.memoryTokens).toBe(8_000);
@@ -192,16 +178,16 @@ describe("applyStickySnapshotCache", () => {
 
     test("does not stick after fresh non-zero overwrites the cached zero state", () => {
         applyStickySnapshotCache("ses_test", makeSnapshot({ inputTokens: 100_000 }));
-        // Mid-turn flicker — sticks.
+        // The cache preserves token breakdowns during a mid-turn flicker.
         const stuck = applyStickySnapshotCache(
             "ses_test",
             makeSnapshot({ inputTokens: 0, compartmentInProgress: true }),
         );
         expect(stuck.inputTokens).toBe(100_000);
-        // Fresh good reading lands — overwrites the cache.
+        // A nonzero inputTokens snapshot replaces the cached snapshot.
         const fresh = applyStickySnapshotCache("ses_test", makeSnapshot({ inputTokens: 200_000 }));
         expect(fresh.inputTokens).toBe(200_000);
-        // Subsequent flicker now sticks to the new value.
+        // A later zero-inputTokens snapshot uses the replacement.
         const stuck2 = applyStickySnapshotCache(
             "ses_test",
             makeSnapshot({ inputTokens: 0, compartmentInProgress: true }),
@@ -226,18 +212,18 @@ describe("applyStickySnapshotCache", () => {
         applyStickySnapshotCache("ses_test", makeSnapshot({ inputTokens: 100_000 }));
         clearSidebarSnapshotCache("ses_test");
         const result = applyStickySnapshotCache("ses_test", makeSnapshot({ inputTokens: 0 }));
-        // No prior cache after clear → passes through as new session.
+        // Without a cached snapshot, zero inputTokens passes through unchanged.
         expect(result.inputTokens).toBe(0);
     });
 
     test("expires stale cached snapshot after age threshold", () => {
-        // Manipulate the date to simulate aging beyond 5min.
+        // Cached snapshots expire after 5 minutes.
         const realNow = Date.now;
         const t0 = 1_000_000_000_000;
         Date.now = () => t0;
         applyStickySnapshotCache("ses_test", makeSnapshot({ inputTokens: 100_000 }));
 
-        // 6 minutes later, pass a zero snapshot.
+        // Snapshots older than 5 minutes do not restore zero-token readings.
         Date.now = () => t0 + 6 * 60 * 1000;
         const result = applyStickySnapshotCache("ses_test", makeSnapshot({ inputTokens: 0 }));
         expect(result.inputTokens).toBe(0);

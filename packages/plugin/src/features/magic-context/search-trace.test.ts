@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Database } from "../../shared/sqlite";
@@ -34,7 +33,7 @@ const PROJECT = "git:trace-fixture";
 const SESSION = "ses-trace-fixture";
 const MODEL = "mock:model";
 const QUERY = "queue drain backpressure";
-/** Byte length of every seeded Float32Array([1, 0]) vector. */
+/* */
 const VECTOR_BYTES = 8;
 
 const rawMessagesBySession = new Map<
@@ -129,7 +128,7 @@ function seedMixedCorpus(db: Database): { compartmentWindows: number } {
         content: "Queue drain backpressure needs a regression test.",
         anchorOrdinal: 2,
     });
-    // Pin the wall-clock note timestamp so cross-run projections are byte-identical.
+    // The fixed note timestamp makes projections deterministic.
     db.prepare("UPDATE notes SET created_at = ?, updated_at = ? WHERE id = ?").run(
         Date.UTC(2026, 1, 1),
         Date.UTC(2026, 1, 1),

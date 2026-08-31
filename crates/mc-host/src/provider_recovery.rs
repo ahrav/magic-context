@@ -1,21 +1,12 @@
-//! Provider readiness, candidate custody, and bounded recovery (plan U2).
 //!
-//! One provider-private [`CandidateCustody`] record owns candidate identity,
-//! exact admission charges, and cleanup authority from admission through
-//! release or quarantine (KTD4). Aggregate counters observe the record's
-//! charges but never reconstruct ownership. One bounded, deduplicated
-//! [`ProviderRecovery`] controller per provider dispatches at most one
-//! cleanup call at a time, on its own detached OS thread — never a Tokio
-//! request worker and never the provider preparation worker (R7) — under one
-//! injected, immutable 30-second episode deadline (KTD5). A non-returning
-//! cleanup suppresses further dispatch while live, may outlive controller
-//! shutdown without being joined, and cannot publish a late result unless
-//! both its episode and provider incarnation still match.
+//! `CandidateCustody` owns candidate identity, exact admission charges, and cleanup authority until release or quarantine; aggregate counters never reconstruct ownership.
+//! `ProviderRecovery` dispatches at most one cleanup call at a time.
+//! The controller runs cleanup on a detached OS thread, never on a Tokio request or provider preparation worker.
+//! Each recovery episode uses one injected, immutable 30-second deadline.
+//! A cleanup call may outlive controller shutdown without being joined and publishes a result only when its episode and provider incarnation still match.
 //!
-//! Readiness governs NEW offers only (R6): existing candidates continue to
-//! serve and release under their own owners regardless of state changes.
-//! Nothing here formats or logs provider descriptors, grants, tokens, object
-//! names, or addresses (R17).
+//! Readiness governs new offers only; existing candidates serve and release under their own owners regardless of state changes.
+//! The module does not format or log provider descriptors, grants, tokens, object names, or addresses.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -24,39 +15,33 @@ use std::time::Duration;
 
 use mc_shm_transport::profile::{Admission, QuarantineRecord};
 
-/// Immutable per-episode recovery deadline (R7): fixed when an episode
-/// starts and never extended by retry delay, repeated observations, or late
+/// Each recovery episode uses a fixed 30-second deadline that retries, observations, and late results cannot extend.
 /// results.
 pub const RECOVERY_EPISODE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Bounds suspects queued behind a wedged cleanup call: overflow isolates
-/// the incoming record immediately instead of growing host memory.
+/// `SUSPECT_INBOX_BOUND` limits suspects queued behind a wedged cleanup call; overflow immediately isolates the incoming record instead of increasing host memory use.
 const SUSPECT_INBOX_BOUND: usize = 8;
 
-/// Delay between retries of one transiently failing cleanup call.
 const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(50);
 
-/// Observable provider offer state (R6). Preflight may offer the provider
-/// only in `Ready`; the state never invalidates existing candidates.
+/// Preflight may offer a provider only when `ProviderReadiness` is `Ready`; readiness never invalidates existing candidates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderReadiness {
-    /// Suspect candidates are being reclaimed or isolated.
+    /// `Recovering` reclaims or isolates suspect candidates.
     Recovering,
-    /// Preflight may create a new offer.
     Ready,
-    /// Terminal for new offers; retained charges stay visible.
+    /// `Quarantined` blocks new offers but retains visible charges.
     Quarantined,
 }
 
-/// Injected monotonic clock so episode deadlines are test-controllable.
+/// `RecoveryClock` lets tests control episode deadlines with a monotonic clock.
 pub trait RecoveryClock: Send + Sync + 'static {
-    /// Monotonic offset from the clock's origin.
+    /// `now` returns the monotonic offset from the clock's origin.
     fn now(&self) -> Duration;
-    /// Blocks until `now() >= deadline`.
+    /// `wait_until` blocks until `now() >= deadline`.
     fn wait_until(&self, deadline: Duration);
 }
 
-/// Production clock over [`std::time::Instant`].
 pub struct SystemClock {
     origin: std::time::Instant,
 }
@@ -91,32 +76,28 @@ impl RecoveryClock for SystemClock {
     }
 }
 
-/// Outcome of one cleanup call over one suspect candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CleanupOutcome {
-    /// Stale resources are provably gone; active charges may return.
+    /// `Reclaimed` proves stale resources are gone and permits active charges to return.
     Reclaimed,
-    /// Transient stale state observed; retry under the original deadline.
+    /// `StaleRetry` retries transient stale state under the original deadline.
     StaleRetry,
-    /// Ownership cannot be proven; isolate the candidate.
+    /// `Uncertain` isolates candidates whose ownership cannot be proven.
     Uncertain,
 }
 
-/// Provider cleanup and readiness primitives, driven only by the recovery
-/// controller — never by preflight or request workers (R6-R7).
+/// Only the recovery controller invokes these primitives.
 pub trait RecoveryBackend: Send + Sync + 'static {
-    /// Blocking best-effort cleanup for one suspect candidate. May stall
-    /// forever; the controller fences its late result and never joins it.
+    /// cleanup may block while best-effort cleaning one suspect candidate.
     fn cleanup(&self, candidate_id: u64) -> CleanupOutcome;
-    /// Non-destructive readiness probe after cleanup: must not create,
-    /// consume, or release provider resources.
+    /// The probe must not create provider resources.
+    /// The probe must not consume or release provider resources.
     fn probe(&self) -> bool;
-    /// Whether another candidate's admission still fits the frozen host
-    /// limits, from immutable admission facts only.
+    /// admission_fits uses frozen host limits.
+    /// admission_fits uses only immutable admission facts.
     fn admission_fits(&self) -> bool;
 }
 
-/// Custody phase of one candidate lifecycle record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CustodyPhase {
     Active,
@@ -127,17 +108,14 @@ pub enum CustodyPhase {
 enum CustodyState {
     Active(Admission),
     Released,
-    // The retained record proves the charges stay host-accounted. `None`
-    // only when aggregate accounting itself failed; the phase is still
-    // terminal and storage is never reused.
+    // A retained record keeps the candidate's charges host-accounted.
+    // `None` indicates aggregate accounting failed.
+    // Quarantined storage is never reused.
     Quarantined { _retained: Option<QuarantineRecord> },
 }
 
-/// Provider-private candidate lifecycle record (KTD4): owns candidate
-/// identity, the exact admission charges, and cleanup authority from
-/// admission through release or quarantine. Both terminal transitions are
-/// exactly-once; a stale release after the controller reclaimed or isolated
-/// the record is rejected without touching aggregate counters.
+/// Release and quarantine execute at most once.
+/// A repeated release leaves aggregate counters unchanged.
 pub struct CandidateCustody {
     candidate_id: u64,
     incarnation: u64,
@@ -149,7 +127,6 @@ impl CandidateCustody {
         self.candidate_id
     }
 
-    /// Provider incarnation the candidate was admitted under.
     pub fn admitted_incarnation(&self) -> u64 {
         self.incarnation
     }
@@ -162,8 +139,8 @@ impl CandidateCustody {
         }
     }
 
-    /// Returns every active charge exactly once. Repeated or stale releases
-    /// are rejected and leave aggregate counters untouched.
+    /// Releasing an active record returns its charges once.
+    /// Repeated releases are rejected and leave aggregate counters untouched.
     pub fn release(&self) -> bool {
         let mut state = self.state.lock().expect("custody lock");
         match std::mem::replace(&mut *state, CustodyState::Released) {
@@ -178,8 +155,8 @@ impl CandidateCustody {
         }
     }
 
-    /// Isolates the candidate with its exact quarantine charges (R8) and
-    /// permanently prevents this record's storage from being reused.
+    /// quarantine retains the candidate's exact quarantine charges.
+    /// Quarantine permanently prevents this record's storage from being reused.
     fn quarantine(&self) -> bool {
         let mut state = self.state.lock().expect("custody lock");
         match std::mem::replace(&mut *state, CustodyState::Quarantined { _retained: None }) {
@@ -199,7 +176,6 @@ impl CandidateCustody {
 
 impl fmt::Debug for CandidateCustody {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Host-generated identity only; no provider data exists here (R17).
         formatter
             .debug_struct("CandidateCustody")
             .field("candidate_id", &self.candidate_id)
@@ -208,8 +184,8 @@ impl fmt::Debug for CandidateCustody {
     }
 }
 
-/// Publication fence: a cleanup result is discarded unless both the episode
-/// it was dispatched under is still open and the provider incarnation still
+/// The controller discards cleanup results unless their episode remains open.
+/// The controller accepts a cleanup result only when its provider incarnation matches.
 /// matches (KTD5).
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct EpisodeFence {
@@ -219,20 +195,18 @@ struct EpisodeFence {
 
 struct RecoveryState {
     readiness: ProviderReadiness,
-    /// Monotonic episode identity; `episode_open` distinguishes a live
-    /// episode from one already resolved at its deadline or completion.
+    /// Each episode has a monotonic identity.
     episode: u64,
     episode_open: bool,
-    /// Immutable per-episode deadline in clock time.
+    /// Each episode has an immutable deadline in clock time.
     deadline: Duration,
-    /// Monotonic provider incarnation; a clean reclamation mints the next.
+    /// A clean reclamation mints the next monotonic provider incarnation.
     incarnation: u64,
     inbox: VecDeque<Arc<CandidateCustody>>,
-    /// True while one dispatched cleanup call has not returned. Survives
-    /// episode resolution so a wedged call keeps suppressing dispatch.
+    /// `cleanup_live` remains true until the dispatched cleanup call returns.
+    /// A wedged cleanup call suppresses dispatch after episode resolution.
     cleanup_live: bool,
-    /// The record the live call owns, until it resolves or the deadline
-    /// watcher isolates it.
+    /// `inflight` holds the record until the live call resolves or the deadline watcher isolates it.
     inflight: Option<Arc<CandidateCustody>>,
 }
 
@@ -243,22 +217,20 @@ struct RecoveryShared {
     state: Mutex<RecoveryState>,
 }
 
-/// One bounded, deduplicated recovery controller per provider (KTD4-KTD5).
-/// Cheap to clone; dropping every clone is bounded shutdown and never joins
-/// a live cleanup call.
+/// Cloning shares the controller; dropping all clones never joins a live cleanup call.
 #[derive(Clone)]
 pub struct ProviderRecovery {
     shared: Arc<RecoveryShared>,
 }
 
 impl ProviderRecovery {
-    /// A provider with no suspects starts trivially `Ready`.
+    /// A provider with no suspects starts `Ready`.
     pub fn new(backend: Arc<dyn RecoveryBackend>, clock: Arc<dyn RecoveryClock>) -> Self {
         Self::with_retry_delay(backend, clock, CLEANUP_RETRY_DELAY)
     }
 
-    /// Test seam: controls the real-time delay between cleanup retries. The
-    /// episode deadline itself always comes from the injected clock.
+    /// `retry_delay` sets the real-time delay between cleanup retries.
+    /// The episode deadline comes from the injected clock.
     pub fn with_retry_delay(
         backend: Arc<dyn RecoveryBackend>,
         clock: Arc<dyn RecoveryClock>,
@@ -283,24 +255,21 @@ impl ProviderRecovery {
         }
     }
 
-    /// Pure state read for preflight: no backend call, no counter change,
-    /// no resource effect (R6).
     pub fn readiness(&self) -> ProviderReadiness {
         self.shared.state.lock().expect("recovery lock").readiness
     }
 
-    /// Current monotonic provider incarnation.
+    /// `incarnation` returns the current monotonic provider incarnation.
     pub fn incarnation(&self) -> u64 {
         self.shared.state.lock().expect("recovery lock").incarnation
     }
 
-    /// Monotonic count of started recovery episodes.
+    /// `episode` returns the monotonic count of started recovery episodes.
     pub fn episode(&self) -> u64 {
         self.shared.state.lock().expect("recovery lock").episode
     }
 
-    /// Transfers the admission charges into a lifecycle record bound to the
-    /// current provider incarnation, before the candidate is exposed.
+    /// `admit_candidate` transfers admission charges into a lifecycle record bound to the current provider incarnation before exposing the candidate.
     pub fn admit_candidate(
         &self,
         candidate_id: u64,
@@ -314,12 +283,8 @@ impl ProviderRecovery {
         })
     }
 
-    /// Atomically checks `Ready` readiness, admits the profile's charges,
-    /// and binds them into a custody record — all under the recovery lock,
-    /// so a suspect reported by another candidate cannot flip readiness to
-    /// `Recovering` between the readiness decision and the admission. A
-    /// candidate admitted through this gate was provably admitted while the
-    /// provider was `Ready`.
+    /// `admit_candidate_while_ready` holds the recovery lock while checking `Ready`, admitting charges, and binding custody, preventing another suspect from changing readiness before admission.
+    /// A candidate admitted through this gate was admitted while the provider was `Ready`.
     pub fn admit_candidate_while_ready(
         &self,
         candidate_id: u64,
@@ -330,9 +295,7 @@ impl ProviderRecovery {
         if state.readiness != ProviderReadiness::Ready {
             return None;
         }
-        // Lock order is recovery -> admission accounting, matching the
-        // cleanup path (recovery -> custody -> admission); no path takes
-        // the admission lock first.
+        // Lock acquisition order is recovery, then custody, then admission accounting; no path acquires the admission lock first.
         let charges = admission.admit(profile, None).ok()?;
         Some(Arc::new(CandidateCustody {
             candidate_id,
@@ -341,8 +304,7 @@ impl ProviderRecovery {
         }))
     }
 
-    /// Feeds one suspect record into the bounded, deduplicated inbox and
-    /// starts or continues a recovery episode.
+    /// `report_suspect` adds one suspect record to the bounded, deduplicated inbox and starts or continues recovery.
     pub fn report_suspect(&self, record: Arc<CandidateCustody>) {
         RecoveryShared::report_suspect(&self.shared, record);
     }
@@ -360,7 +322,7 @@ impl fmt::Debug for ProviderRecovery {
 impl RecoveryShared {
     fn report_suspect(shared: &Arc<Self>, record: Arc<CandidateCustody>) {
         if record.phase() != CustodyPhase::Active {
-            // Already released or isolated: no charges left to recover.
+            // Released or isolated records have no charges left to recover.
             return;
         }
         let mut state = shared.state.lock().expect("recovery lock");
@@ -374,8 +336,7 @@ impl RecoveryShared {
             return;
         }
         match state.readiness {
-            // Terminal for new offers: isolate directly, charges stay
-            // visible, and no new episode or cleanup call is created.
+            // A terminal record is isolated directly; its charges remain visible, and no recovery episode or cleanup call is created.
             ProviderReadiness::Quarantined => {
                 drop(state);
                 let _ = record.quarantine();
@@ -399,23 +360,18 @@ impl RecoveryShared {
     fn start_episode(shared: &Arc<Self>, state: &mut RecoveryState) {
         state.episode += 1;
         state.episode_open = true;
-        // The deadline is fixed here and never touched again (KTD5).
         state.deadline = shared.clock.now().saturating_add(RECOVERY_EPISODE_DEADLINE);
         state.readiness = ProviderReadiness::Recovering;
         let watcher = Arc::clone(shared);
         let episode = state.episode;
         let deadline = state.deadline;
-        // Detached and never joined: under the system clock the watcher
-        // lives at most one deadline. A failed spawn leaves resolution to
-        // the cleanup path; readiness simply stays `Recovering` (unoffered).
+        // The watcher is detached and never joined; under the system clock, it lives at most one deadline.
         let _ = std::thread::Builder::new()
             .name("mc-host-provider-recovery-deadline".to_owned())
             .spawn(move || Self::run_deadline(&watcher, episode, deadline));
         Self::maybe_dispatch(shared, state);
     }
 
-    /// Dispatches at most one cleanup call. A live call — including one
-    /// that never returns — suppresses every further dispatch until it
     /// returns (R7).
     fn maybe_dispatch(shared: &Arc<Self>, state: &mut RecoveryState) {
         if state.cleanup_live || !state.episode_open {
@@ -431,11 +387,9 @@ impl RecoveryShared {
             incarnation: state.incarnation,
         };
         let worker = Arc::clone(shared);
-        // Cleanup runs on its own detached OS thread — never a Tokio
-        // request worker and never the provider preparation worker — so a
-        // wedged call occupies exactly this thread and bounded shutdown
-        // never waits on it. A failed spawn is indistinguishable from a
-        // non-returning call: the episode deadline still resolves readiness.
+        // Cleanup runs on a detached OS thread, not a Tokio request worker or provider preparation worker.
+        // A wedged call occupies only its detached OS thread.
+        // The caller never waits for the cleanup thread; a failed spawn is indistinguishable from a non-returning call because the episode deadline resolves readiness.
         let _ = std::thread::Builder::new()
             .name("mc-host-provider-recovery".to_owned())
             .spawn(move || Self::run_cleanup(&worker, &record, fence));
@@ -449,24 +403,22 @@ impl RecoveryShared {
 
     fn run_cleanup(shared: &Arc<Self>, record: &Arc<CandidateCustody>, fence: EpisodeFence) {
         loop {
-            // A panicking cleanup is uncertain ownership, not a dead
-            // controller; `redact_sync` keeps provider panic payloads off
-            // diagnostic surfaces (R17).
+            // A cleanup panic leaves candidate ownership uncertain.
+            // diagnostic surfaces.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::panic_boundary::redact_sync(|| shared.backend.cleanup(record.candidate_id()))
             }))
             .unwrap_or(CleanupOutcome::Uncertain);
             let mut state = shared.state.lock().expect("recovery lock");
             if !Self::fence_holds(&state, fence) {
-                // Late result after the deadline resolved the episode or a
-                // newer incarnation was minted: publishing anything would
-                // return or revive charges the fence owner already settled.
+                // A result arriving after the episode deadline resolves or after a new incarnation is minted cannot be published.
+                // Publishing a result from a prior incarnation could revive charges already released or quarantined.
+                // Publishing a late result could revive charges already released or quarantined.
                 Self::retire_call(shared, &mut state);
                 return;
             }
             if outcome == CleanupOutcome::StaleRetry && shared.clock.now() < state.deadline {
-                // Retry the same one call under the original deadline; the
-                // delay never extends it.
+                // Retries retain the original deadline; sleeping never extends it.
                 drop(state);
                 std::thread::sleep(shared.retry_delay);
                 let mut state = shared.state.lock().expect("recovery lock");
@@ -481,15 +433,13 @@ impl RecoveryShared {
             state.inflight = None;
             match outcome {
                 CleanupOutcome::Reclaimed => {
-                    // Return every active charge exactly once, then mint the
-                    // next provider incarnation: stale releases and results
-                    // carrying the old incarnation are rejected.
+                    // `incarnation` advances only after `record.release()` succeeds.
+                    // Incrementing `incarnation` rejects stale releases and results carrying the prior incarnation.
                     if record.release() {
                         state.incarnation += 1;
                     }
                 }
-                // StaleRetry at the immutable deadline and every uncertain
-                // outcome isolate the candidate with exact charges (R8).
+                // `StaleRetry` at the immutable deadline and every `Uncertain` outcome isolate the candidate with its existing charges.
                 CleanupOutcome::StaleRetry | CleanupOutcome::Uncertain => {
                     let _ = record.quarantine();
                 }
@@ -513,8 +463,7 @@ impl RecoveryShared {
             Self::maybe_dispatch(shared, &mut state);
             return;
         }
-        // Every suspect is reclaimed or isolated: close the episode and
-        // resolve readiness off the lock (the probe is provider code).
+        // The resolver closes the episode and resolves readiness after releasing the lock because the probe calls provider code.
         state.episode_open = false;
         let episode = state.episode;
         drop(state);
@@ -522,9 +471,8 @@ impl RecoveryShared {
     }
 
     fn resolve_readiness(shared: &Arc<Self>, episode: u64) {
-        // The non-destructive probe proves isolation held; admission facts
-        // prove another candidate still fits the frozen limits (R8). A
-        // panicking probe is provider-wide uncertainty.
+        // The non-destructive probe proves that isolation held.
+        // A panicking probe creates provider-wide uncertainty.
         let ready = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::panic_boundary::redact_sync(|| {
                 shared.backend.probe() && shared.backend.admission_fits()
@@ -538,13 +486,11 @@ impl RecoveryShared {
         if ready {
             state.readiness = ProviderReadiness::Ready;
             if !state.inbox.is_empty() {
-                // Suspects reported during resolution get their own episode
-                // with its own immutable deadline.
+                // Suspects reported during resolution start a separate episode with a separate immutable deadline.
                 Self::start_episode(shared, &mut state);
             }
         } else {
-            // Provider-wide uncertainty or admission-cap exhaustion:
-            // terminal for new offers; charges stay visible (R8).
+            // Provider-wide uncertainty and admission-cap exhaustion are terminal for new offers; charges remain visible.
             state.readiness = ProviderReadiness::Quarantined;
             let stragglers: Vec<_> = state.inbox.drain(..).collect();
             drop(state);
@@ -560,10 +506,9 @@ impl RecoveryShared {
         if state.episode != episode || !state.episode_open {
             return;
         }
-        // The immutable deadline passed with unresolved suspects: isolate
-        // each with exact quarantine charges. A still-live cleanup call
-        // keeps `cleanup_live` set — suppressing dispatch — and its late
-        // result fails the fence.
+        // When the immutable deadline expires with unresolved suspects, the resolver isolates them.
+        // The resolver must not dispatch another record while the original cleanup can still return.
+        // The late cleanup result fails the episode fence.
         state.episode_open = false;
         let mut unresolved: Vec<_> = state.inbox.drain(..).collect();
         unresolved.extend(state.inflight.take());
@@ -824,7 +769,6 @@ mod tests {
         assert!(isolated.quarantine());
         assert_eq!(isolated.phase(), CustodyPhase::Quarantined);
         assert_eq!(rig.quarantined(), rig.charges());
-        // Neither release nor a second quarantine can move the charges.
         assert!(!isolated.release());
         assert!(!isolated.quarantine());
         assert_eq!(rig.quarantined(), rig.charges());
@@ -843,11 +787,7 @@ mod tests {
         assert_eq!(rig.quarantined(), ResourceCharges::ZERO);
     }
 
-    /// Seeded-defect detector for the readiness/admission race: a gate that
-    /// checks readiness and admits in two separate steps would admit a
-    /// candidate whose preparation crosses the `Ready`-to-`Recovering`
-    /// transition; the atomic gate refuses while a suspect is unresolved
-    /// even though admission capacity is free.
+    /// The atomic gate rejects admission while a suspect remains unresolved, even when capacity is free.
     #[test]
     fn ready_gate_admission_is_refused_while_recovering() {
         let rig = Rig::new(2);
@@ -857,8 +797,7 @@ mod tests {
             .expect("ready provider admits");
         assert_eq!(ready.admitted_incarnation(), 1);
 
-        // A blocked cleanup keeps the episode open: readiness is
-        // `Recovering` while a second candidate's charges would still fit.
+        // A blocked cleanup keeps the episode open, so readiness remains `Recovering` although a second candidate's charges fit.
         rig.backend.push(Scripted::Block);
         rig.recovery.report_suspect(Arc::clone(&ready));
         wait_for("recovering readiness", || {
@@ -871,8 +810,7 @@ mod tests {
             "a recovering provider must not admit a new candidate"
         );
 
-        // Clean reclamation resolves the episode; admission reopens with
-        // the freshly minted incarnation bound into the custody record.
+        // With an empty inbox, reclamation closes the episode before probing readiness.
         rig.backend.release_blocked(CleanupOutcome::Reclaimed);
         wait_for("ready readiness", || {
             rig.recovery.readiness() == ProviderReadiness::Ready
@@ -902,15 +840,11 @@ mod tests {
         assert_eq!(rig.backend.probe_calls.load(Ordering::SeqCst), 1);
         assert_eq!(rig.backend.max_live_cleanups.load(Ordering::SeqCst), 1);
         assert_eq!(rig.recovery.episode(), 1);
-        // Cleanup ran on the dedicated recovery thread, not a Tokio or
-        // preparation worker (R7).
         assert!(!rig.backend.saw_tokio_worker.load(Ordering::SeqCst));
         assert!(!rig.backend.saw_foreign_thread.load(Ordering::SeqCst));
-        // The old incarnation's stale release is rejected exactly.
         assert!(!record.release());
         assert_eq!(record.admitted_incarnation(), 1);
         assert_eq!(rig.active(), ResourceCharges::ZERO);
-        // A new candidate is permitted after clean reclamation.
         assert!(rig.admission.can_admit(&rig.profile, None).is_ok());
     }
 
@@ -930,8 +864,7 @@ mod tests {
         });
         assert_eq!(rig.backend.cleanup_calls(), 3);
         assert_eq!(rig.backend.max_live_cleanups.load(Ordering::SeqCst), 1);
-        // Retries stayed inside the one original episode: the deadline was
-        // never reset into a new episode.
+        // Retries remain in the original episode and retain its original deadline.
         assert_eq!(rig.recovery.episode(), 1);
         assert_eq!(rig.active(), ResourceCharges::ZERO);
     }
@@ -943,10 +876,9 @@ mod tests {
         rig.backend.set_default(CleanupOutcome::StaleRetry);
         rig.recovery.report_suspect(Arc::clone(&record));
         wait_for("retries running", || rig.backend.cleanup_calls() >= 2);
-        // Partway advance (20s of the 30s deadline): retries must keep
-        // running under the ORIGINAL deadline. A retry branch that reset
-        // `deadline = now() + 30s` here would survive the final advance to
-        // 31s below and hang the resolution wait.
+        // Retries retain the original 30 s deadline.
+        // Retries do not reset the deadline to `now() + 30s`.
+        // A reset deadline would delay resolution past the original 30 s deadline.
         rig.clock.advance(Duration::from_secs(20));
         let calls_partway = rig.backend.cleanup_calls();
         wait_for("retries continue past the partway advance", || {
@@ -957,8 +889,7 @@ mod tests {
         wait_for("deadline resolution", || {
             rig.recovery.readiness() != ProviderReadiness::Recovering
         });
-        // Uncertain ownership at the deadline isolates the exact charges;
-        // with single-candidate limits nothing else fits, so the provider
+        // At the deadline, uncertain ownership quarantines the exact charges, preventing admission under single-candidate limits.
         // quarantines.
         assert_eq!(rig.recovery.readiness(), ProviderReadiness::Quarantined);
         assert_eq!(record.phase(), CustodyPhase::Quarantined);
@@ -991,26 +922,24 @@ mod tests {
             1,
             "no second cleanup call may start while one is live"
         );
-        // The controller stays responsive while the call is wedged.
+        // The deadline resolves the episode without waiting for cleanup.
         assert_eq!(rig.recovery.readiness(), ProviderReadiness::Recovering);
         rig.clock
             .advance(RECOVERY_EPISODE_DEADLINE + Duration::from_secs(1));
         wait_for("deadline resolution", || {
             rig.recovery.readiness() != ProviderReadiness::Recovering
         });
-        // Both unresolved suspects were isolated with exact charges; the
-        // quarantine consumed both slots so admission no longer fits.
+        // Both unresolved suspects were isolated with their exact charges, consuming both slots and preventing admission.
         assert_eq!(rig.recovery.readiness(), ProviderReadiness::Quarantined);
         assert_eq!(first.phase(), CustodyPhase::Quarantined);
         assert_eq!(second.phase(), CustodyPhase::Quarantined);
         assert_eq!(rig.quarantined(), charges_times(rig.charges(), 2));
         assert_eq!(rig.active(), ResourceCharges::ZERO);
-        // Owner shutdown is bounded: dropping the controller never joins
-        // the wedged call.
+        // Dropping the controller never joins a wedged cleanup.
         let start = std::time::Instant::now();
         drop(rig.recovery.clone());
         assert!(start.elapsed() < Duration::from_secs(1));
-        // Late completion after the timeout is fenced out entirely.
+        // The stale completion returns no charges and does not increment incarnation.
         let incarnation = rig.recovery.incarnation();
         rig.backend.release_blocked(CleanupOutcome::Reclaimed);
         wait_for("late call retired", || {
@@ -1032,8 +961,7 @@ mod tests {
         wait_for("blocked call dispatched", || {
             rig.backend.cleanup_calls() == 1
         });
-        // Deadline isolates the wedged suspect; with room left the provider
-        // returns to Ready while the old call is still live.
+        // The deadline isolates the wedged suspect; because capacity remains, the provider returns to `Ready` while the old cleanup call remains live.
         rig.clock
             .advance(RECOVERY_EPISODE_DEADLINE + Duration::from_secs(1));
         wait_for("first episode resolves", || {
@@ -1041,7 +969,7 @@ mod tests {
         });
         assert_eq!(first.phase(), CustodyPhase::Quarantined);
         assert_eq!(rig.recovery.episode(), 1);
-        // A newer episode starts, but the live call keeps suppressing
+        // The live episode-1 cleanup call suppresses episode-2 cleanup dispatch.
         // dispatch.
         let second = rig.admit();
         rig.recovery.report_suspect(Arc::clone(&second));
@@ -1049,8 +977,8 @@ mod tests {
         std::thread::sleep(SETTLE);
         assert_eq!(rig.backend.cleanup_calls(), 1);
         assert_eq!(rig.recovery.readiness(), ProviderReadiness::Recovering);
-        // The stale episode-1 result is ignored: no charge return, no
-        // incarnation mint. Its retirement lets episode 2 dispatch.
+        // The stale episode-1 result returns no charges and does not increment incarnation.
+        // Retiring the stale episode-1 cleanup call lets episode 2 dispatch.
         rig.backend.release_blocked(CleanupOutcome::Reclaimed);
         wait_for("second episode resolves", || {
             rig.recovery.readiness() == ProviderReadiness::Ready
@@ -1073,13 +1001,13 @@ mod tests {
         wait_for("provider-wide uncertainty", || {
             rig.recovery.readiness() == ProviderReadiness::Quarantined
         });
-        // Admission still fits, so only the failed probe explains the
+        // A failed probe transitions the provider to `Quarantined` even when admission fits.
         // terminal state.
         assert!(rig.admission.can_admit(&rig.profile, None).is_ok());
         assert_eq!(first.phase(), CustodyPhase::Quarantined);
         let calls = rig.backend.cleanup_calls();
-        // A suspect reported after quarantine is isolated directly: no new
-        // episode, no cleanup call, charges retained exactly.
+        // A suspect reported after quarantine is isolated directly without starting a new episode.
+        // Direct isolation starts no episode or cleanup call and retains the suspect's charges.
         rig.recovery.report_suspect(Arc::clone(&second));
         wait_for("direct isolation", || {
             second.phase() == CustodyPhase::Quarantined
@@ -1127,9 +1055,9 @@ mod tests {
         for record in &queued {
             rig.recovery.report_suspect(Arc::clone(record));
         }
-        // The inbox is at its bound: the next distinct suspect must be
-        // isolated synchronously with its exact charges instead of growing
-        // host memory — no new episode and no additional cleanup dispatch.
+        // When the inbox reaches its bound, the next distinct suspect is isolated synchronously.
+        // The overflow suspect is isolated synchronously without growing the inbox.
+        // The overflow suspect starts no episode and dispatches no additional cleanup.
         let overflow = rig.admit();
         rig.recovery.report_suspect(Arc::clone(&overflow));
         assert_eq!(overflow.phase(), CustodyPhase::Quarantined);
@@ -1140,8 +1068,8 @@ mod tests {
         for record in &queued {
             assert_eq!(record.phase(), CustodyPhase::Active);
         }
-        // Deadline resolution isolates exactly the wedged call plus the
-        // bounded inbox; the overflow record is never double-counted.
+        // Deadline resolution isolates the blocked suspect and every record in the bounded inbox.
+        // Deadline resolution does not double-count the overflow record.
         rig.clock
             .advance(RECOVERY_EPISODE_DEADLINE + Duration::from_secs(1));
         wait_for("deadline resolution", || {

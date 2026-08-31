@@ -1,22 +1,18 @@
 /**
- * Bounded connection-generation engine.
  *
- * One `ConnectionGeneration` owns correlation allocation, pending entries,
- * terminal settlement, stream collection, route notifications, aggregate
- * memory policy, and one idempotent retirement path. Transport mechanics —
- * the `node:net` socket, dial, auth byte I/O, incremental framing, and the
- * single bounded FIFO writer — live below the complete-frame channel
- * boundary in `TcpFrameChannel` (KTD1); the generation owns no socket. It
- * owns no route cache and no reconnect policy; the facade layer above
- * reacts to retirement but is never imported here.
+ * ConnectionGeneration owns correlation allocation and pending entries.
+ * ConnectionGeneration owns terminal settlement, stream collection, route notifications, and aggregate memory policy.
+ * ConnectionGeneration has one idempotent retirement path.
+ * TcpFrameChannel owns the node:net socket, dialing, authentication byte I/O, and incremental framing.
+ * TcpFrameChannel owns the bounded FIFO writer below the complete-frame boundary.
+ * TcpFrameChannel owns transport mechanics below the complete-frame boundary; ConnectionGeneration owns no socket.
+ * ConnectionGeneration owns no route cache or reconnect policy.
  *
- * Send-outcome boundary: a queued request is classified `not_sent` until
- * the channel begins publishing its bytes — the instant immediately before
- * `socket.write()` is invoked for any of them. After publication starts,
- * only a matching terminal frame is authoritative; losing the terminal
- * (retirement, timeout, abort, EOF, error, close) classifies the request
- * `outcome_unknown`. Local write completion proves local handling only,
- * never peer receipt.
+ * A queued request remains `not_sent` until the channel begins `socket.write()`.
+ * The channel classifies a request as not_sent until immediately before socket.write() publishes its bytes.
+ * After `socket.write()` begins, only a matching terminal frame determines the request outcome.
+ * Retirement, timeout, abort, EOF, socket error, or close before a matching terminal frame yields `outcome_unknown`.
+ * Local write completion never proves peer receipt.
  */
 
 import { type AuthCredentials, AuthError } from "./auth";
@@ -47,24 +43,20 @@ import { AdmissionClass, Priority } from "./types";
 
 const DEFAULT_CLEANUP_TICKET_MS = 5_000;
 /**
- * How long setup lets a retired channel's `start()` settle before the
- * retirement cause wins the race: long enough for a rejection triggered by
- * the same event-loop turn as the retirement, short enough that a provider
- * promise that never settles cannot meaningfully extend teardown.
+ * Setup waits 50 ms for a retired channel's start() to settle before the retirement cause wins.
+ * A start() rejection triggered in the retirement event-loop turn can win before the 50 ms grace period expires.
+ * A provider promise that never settles cannot extend teardown beyond 50 ms.
  */
 const RETIREMENT_SETTLE_GRACE_MS = 50;
 /**
- * Fixed header/control overhead admitted above one maximum body (KTD7): the
- * aggregate cap must still accept one exact 64 MiB frame plus headers,
- * reserved control frames, and small control-plane bodies.
+ * The aggregate cap admits fixed header and control overhead above one maximum body.
+ * The aggregate cap accepts one 64 MiB frame plus headers.
+ * The aggregate cap reserves space for control frames and small control-plane bodies.
  */
 const DEFAULT_MEMORY_OVERHEAD_BYTES = 1_048_576;
 /**
- * Retained-item ceiling for one stream-mode request. The pending byte budget
- * admits roughly 65 MiB of wire bytes, which a peer can fill with millions of
- * minimal JSON items whose retained decode overhead (object, text, parsed
- * value) the budget never counts. Bounding item count keeps a stream's heap
- * cost proportional to a figure the client actually enforces.
+ * A stream-mode request retains at most 100,000 items because the byte budget excludes decoded-item overhead.
+ * The pending byte budget does not count decoded object, text, or parsed-value overhead.
  */
 const DEFAULT_MAX_STREAM_ITEMS = 100_000;
 const EMPTY_JSON_BODY: JsonReceiveBody = Object.freeze({
@@ -100,13 +92,13 @@ export interface RetirementInfo {
     readonly error?: unknown;
 }
 
-/** How a pending entry treats host StreamData/StreamEnd frames (KTD11). */
+/** PendingMode defines how pending entries treat host StreamData and StreamEnd frames. */
 export type PendingMode = "unary" | "stream";
 
 /**
- * Redacted per-frame diagnostics metadata (KTD12): header identity and byte
- * counts only, never body bytes, key material, or mutable engine state. The
- * hook must be read-only; exceptions are swallowed and cannot affect
+ * Diagnostics metadata includes only header identity and byte counts.
+ * Diagnostics metadata excludes body bytes, key material, and mutable engine state.
+ * The hook is read-only; swallowed exceptions cannot affect protocol work.
  * protocol work.
  */
 export interface ConnectionDiagnosticEvent {
@@ -128,17 +120,17 @@ export interface JsonReceiveBody {
 
 export type RequestReceiveBody = JsonReceiveBody | ReceiveLease;
 
-/** One observed matching terminal. `stream` holds stream-mode StreamData bodies. */
+/** `terminal` stores one observed matching terminal; `stream` stores stream-mode `StreamData` bodies. */
 export interface RequestTerminal {
     kind: "response" | "error" | "stream_end";
     body: RequestReceiveBody;
     flags: number;
     stream: RequestReceiveBody[];
     /**
-     * A StreamData frame arrived before this terminal. Unary mode drains
-     * stream bodies privately, so `stream` stays empty there and cannot
-     * report it; a caller that must prove the host produced no response
-     * data before a terminal reads this instead.
+     * `sawStream` is true when a `StreamData` frame arrives before this terminal.
+     * Unary mode drains stream bodies privately and leaves `stream` empty.
+     * Callers use `sawStream` to detect response data before a terminal in unary mode.
+     * Callers read `sawStream` to prove no response data preceded a terminal.
      */
     sawStream: boolean;
 }
@@ -147,14 +139,13 @@ export interface RequestParams {
     channel: number;
     epoch: number;
     body: Uint8Array | DirectFrameBody;
-    /** Absolute operation deadline; covers queueing, writing, and terminal wait. */
+    /** deadline is an absolute operation deadline covering queueing, writing, and terminal wait. */
     deadline: Deadline;
     mode?: PendingMode;
     /**
-     * Retained-item ceiling for a stream-mode request. The pending byte budget
-     * counts wire bytes only, so a peer emitting many tiny items can retain
-     * unbounded per-item decode overhead under it; this bounds item count too.
-     * Must be a non-negative safe integer; 0 retains nothing and refuses the
+     * `maxStreamItems` limits retained stream items independently of the byte budget.
+     * The pending byte budget counts wire bytes only; tiny items can otherwise retain unbounded decode overhead.
+     * `maxStreamItems` must be a non-negative safe integer; `0` retains no items and refuses the first item.
      * first item.
      */
     maxStreamItems?: number;
@@ -164,12 +155,12 @@ export interface RequestParams {
     admissionClass?: AdmissionClass;
 }
 
-/** Separate caller-result and cleanup-ticket settlement (KTD10). */
+/** Caller results and cleanup tickets settle independently. */
 export interface AbortHandle {
     /**
-     * Resolves on the original terminal, generation retirement, or the
-     * bounded cleanup deadline (whose expiry forces retirement). Pre-write
-     * aborts resolve it immediately.
+     * `cleanup` resolves on the original terminal, generation retirement, or cleanup-deadline expiry.
+     * Cleanup-deadline expiry forces generation retirement.
+     * Pre-write aborts resolve `cleanup` immediately.
      */
     cleanup: Promise<void>;
 }
@@ -184,40 +175,40 @@ export interface ConnectionGenerationOptions {
     host: string;
     port: number;
     /**
-     * Validated connection-file credentials. `daemonVer` is the file's
-     * `daemon_ver`, which the handshake requires the peer to report back.
+     * `credentials.daemonVer` is the connection file's `daemon_ver` value.
+     * The handshake requires the peer to report `credentials.daemonVer`.
      */
     credentials: AuthCredentials;
-    /** Frame deadline starting at the FIRST header byte (wire doc 6.3). */
+    /** `frameDeadlineMs` measures the frame deadline from the first header byte (wire doc 6.3). */
     frameDeadlineMs?: number;
-    /** Injectable body cap for scaled tests; defaults to the exact 64 MiB limit. */
+    /** `maxBodyLen` defaults to exactly 64 MiB and permits scaled tests to lower the cap. */
     maxBodyLen?: number;
-    /** One aggregate cap over reader, decoded, queued, and pending bytes. */
+    /** `memoryCapBytes` caps reader, decoded, queued, and pending bytes in aggregate. */
     memoryCapBytes?: number;
     maxQueuedFrames?: number;
     maxQueuedBytes?: number;
     controlReserveFrames?: number;
-    /** Bounded cleanup-ticket deadline for post-write aborts. */
+    /** `cleanupTicketMs` sets a bounded cleanup deadline for post-write aborts. */
     cleanupTicketMs?: number;
-    /** Test seam so correlation exhaustion is reachable; defaults to 1n. */
+    /** `firstCorrelation` defaults to 1n and lets tests reach correlation exhaustion. */
     firstCorrelation?: bigint;
-    /** @internal Not part of the consumer contract. */
+    /** @internal */
     channelFactory?: (args: {
         budget: ByteBudget;
         maxBodyLen: number;
         handlers: FrameChannelHandlers;
     }) => SetupFrameChannel;
     /**
-     * @internal Not part of the consumer contract. Identity a candidate
-     * generation adopts from the already-authenticated generation that
-     * negotiated it. A `channelFactory` channel runs no handshake and can
-     * report no identity of its own, so this is the candidate's only source.
+     * A candidate generation adopts identity from the authenticated generation that negotiated it.
+     * `inheritedIdentity` supplies the identity adopted from the authenticated generation.
+     * `channelFactory` channels run no handshake.
+     * `inheritedIdentity` is the candidate's only identity source when `channelFactory` supplies no identity.
      */
     inheritedIdentity?: { daemonVer: string; daemonId: Uint8Array | null };
-    /** Nonce source passthrough to U2's handshake. */
+    /** `generateNonce` supplies U2's handshake nonce source. */
     generateNonce?: (length: number) => Uint8Array;
     onRetired?: (info: RetirementInfo) => void;
-    /** Route Goodbye events; the generation owns no route cache (KTD6). */
+    /** `onRouteGoodbye` routes Goodbye events because the generation owns no route cache. */
     onRouteGoodbye?: (channel: number, epoch: number) => void;
     /**
      * onPendingZero signals an owner that outstanding work has drained.
@@ -225,13 +216,13 @@ export interface ConnectionGenerationOptions {
      */
     onPendingZero?: () => void;
     /**
-     * Fires after any ReceiveLease minted by this generation's channel is
-     * released. A caller-held binary or stream lease keeps a draining
-     * generation's storage aliased after its pending set empties, so an
-     * owner deferring retirement on `activeReceiveLeases` re-checks here.
+     * `onLeaseReleased` fires only after every `ReceiveLease` minted by this generation's channel is released.
+     * A caller-held binary or stream lease keeps the generation draining until the lease is released.
+     * A caller-held `ReceiveLease` keeps generation storage aliased after the pending set empties.
+     * An owner deferring retirement on `activeReceiveLeases` re-checks after the pending set empties.
      */
     onLeaseReleased?: () => void;
-    /** Bounded read-only diagnostics hook (KTD12); see ConnectionDiagnosticEvent. */
+    /** `onDiagnostic` receives bounded, read-only diagnostics; see `ConnectionDiagnosticEvent`. */
     onDiagnostic?: (event: ConnectionDiagnosticEvent) => void;
 }
 
@@ -245,7 +236,7 @@ export interface ConnectionStats {
     queuedDataFrames: number;
     queuedControlFrames: number;
     pendingRequests: number;
-    /** Live ReceiveLeases minted by the channel and not yet released. */
+    /** `activeReceiveLeases` counts `ReceiveLease` instances minted by the channel that remain unreleased. */
     activeReceiveLeases: number;
     droppedFrames: number;
     activeTimers: number;
@@ -275,7 +266,7 @@ interface PendingEntry {
     heldBytes: number;
     resolve: (terminal: RequestTerminal) => void;
     reject: (error: unknown) => void;
-    /** Cancels the deadline timer chain; stays valid across re-arms. */
+    /** The cancellation function cancels the deadline timer chain and remains valid across re-arms. */
     cancelDeadlineTimer: (() => void) | null;
     sendTicket: FrameSendTicket | null;
     ticket: CleanupTicket | null;
@@ -312,11 +303,9 @@ function consumeJsonBody(lease: ReceiveLease): JsonReceiveBody {
 }
 
 /**
- * Releases a lease without letting a quarantined outcome unwind the caller.
- * The outcome is already reported through the lease's `onRelease` before
- * `release()` throws, so the throw is a redundant signal that dispatch,
- * retirement, and body-consumption paths must contain: escaping there would
- * abort teardown mid-way or convert a known terminal into a channel close.
+ * `release()` releases a lease without allowing a quarantined outcome to unwind the caller.
+ * Dispatch, retirement, and body-consumption paths must catch `release()` errors.
+ * An escaping `release()` error would abort teardown or close the channel after a known terminal.
  */
 function releaseQuietly(lease: ReceiveLease): void {
     if (lease.isReleased()) return;
@@ -334,23 +323,21 @@ function releaseReceiveBodies(bodies: readonly RequestReceiveBody[]): void {
 }
 
 /**
- * The sole pending-entry, correlation, and terminal owner for one
- * connection generation (KTD6); its `TcpFrameChannel` owns the transport.
- * Construct, then `start()` exactly once; every setup failure routes
- * through the same idempotent retirement.
+ * A connection generation solely owns pending entries, correlations, and terminals; its `TcpFrameChannel` owns the transport.
+ * Callers must call `start()` exactly once after construction; every setup failure retires the generation idempotently.
  */
 export class ConnectionGeneration {
     readonly retired: Promise<RetirementInfo>;
-    /** Server-reported daemon version after a successful handshake. */
+    /** `daemonVer` stores the server-reported version after a successful handshake. */
     daemonVer: string | null = null;
-    /** Daemon ID retained from the handshake, when the channel supplies one. */
+    /** `authenticatedDaemonId` stores the handshake daemon ID when the channel supplies one. */
     authenticatedDaemonId: Uint8Array | null = null;
 
     private readonly channel: SetupFrameChannel;
     /**
-     * The same channel as {@link channel} when this generation dials and
-     * authenticates for itself, and the only source of a proven identity.
-     * Null for a `channelFactory` channel, which runs no handshake.
+     * `authChannel` is `channel` when this generation dials and authenticates itself.
+     * `authChannel` is the only source of a proven identity when this generation authenticates itself.
+     * `authChannel` is null for a `channelFactory` channel, which runs no handshake.
      */
     private readonly authChannel: TcpFrameChannel | null;
     private readonly budget: ByteBudget;
@@ -368,14 +355,14 @@ export class ConnectionGeneration {
     private phase: "setup" | "frames" = "setup";
     private readonly timers = new Set<ReturnType<typeof setTimeout>>();
 
-    // Consumer correlation namespace (host Ping correlations are never stored).
+    // `nextCorr` allocates only consumer correlations; host Ping correlations are never stored.
     private nextCorr: bigint;
     private corrExhausted = false;
 
     private readonly pending = new Map<string, PendingEntry>();
     private droppedFrameCount = 0;
 
-    // Pending-retention share of the one aggregate budget (KTD7).
+    // `pendingHeld` tracks the pending-retention share of the aggregate budget.
     private pendingHeld = 0;
 
     constructor(options: ConnectionGenerationOptions) {
@@ -384,8 +371,7 @@ export class ConnectionGeneration {
             options.memoryCapBytes ?? maxBodyLen + DEFAULT_MEMORY_OVERHEAD_BYTES,
         );
         this.cleanupTicketMs = options.cleanupTicketMs ?? DEFAULT_CLEANUP_TICKET_MS;
-        // Copied at construction: the retained identity that authorizes
-        // compatibility and fencing must not alias a caller-mutable array.
+        // `inheritedIdentity` must not alias a caller-mutable `daemonId` because it authorizes compatibility and fencing.
         this.inheritedIdentity = options.inheritedIdentity
             ? {
                   daemonVer: options.inheritedIdentity.daemonVer,
@@ -439,9 +425,9 @@ export class ConnectionGeneration {
     }
 
     /**
-     * Single-flight dial + authentication under `deadline`. Any failure
-     * (dial error, auth failure, deadline) retires the generation exactly
-     * once and rejects; no socket or timer survives a failed setup.
+     * Dial and authentication run single-flight under `deadline`.
+     * Dial errors, authentication failures, and deadline expiry retire the generation exactly once and reject setup.
+     * A failed setup leaves no socket or timer alive.
      */
     async start(deadline: Deadline): Promise<void> {
         if (this.startState !== "idle") {
@@ -452,10 +438,8 @@ export class ConnectionGeneration {
             await this.setup(deadline);
         } catch (error) {
             if (!this.retiredInfo) {
-                // An auth-layer deadline observation is the same owner-budget
-                // exhaustion the setup timer reports: auth I/O that completes
-                // after expiry but before the timer callback runs must not
-                // masquerade as an authentication failure.
+                // Authentication deadline observations consume the same owner budget.
+                // Auth I/O that completes after expiry but before the timer callback runs must not be reported as an authentication failure.
                 const reason: RetirementReason =
                     error instanceof AuthError
                         ? error.code === "deadline_expired"
@@ -493,10 +477,10 @@ export class ConnectionGeneration {
     }
 
     /**
-     * Synchronously admit one Request to the channel's writer FIFO and
-     * allocate its correlation with admission (KTD7), so writer-enqueue
-     * order equals correlation order. Throws a `not_sent` McHostCallError
-     * when admission is refused; nothing was allocated or queued in that
+     * `request` synchronously admits one `Request` to the channel writer FIFO and allocates its correlation with admission.
+     * The client allocates each correlation with writer admission so writer-enqueue order equals correlation order.
+     * `request` throws `McHostCallError("not_sent")` when admission is refused.
+     * `request` creates no correlation or queue entry when admission is refused.
      * case.
      */
     request(params: RequestParams): PendingRequest {
@@ -528,12 +512,9 @@ export class ConnectionGeneration {
                 "deadline_expired",
             );
         }
-        // An empty StreamData frame charges zero pending bytes yet still retains
-        // one decoded item wrapper, so the retained-item ceiling is the only
-        // bound on that growth. A non-finite or fractional ceiling makes the
-        // `streamItems.length >= maxStreamItems` comparison in
-        // `dispatchToPending` unsatisfiable, leaving retention unbounded; refuse
-        // it before a pending entry exists or any byte reaches the peer.
+        // Empty `StreamData` frames retain one item without charging pending bytes, so `maxStreamItems` is their only bound.
+        // `NaN` and `Infinity` make `streamItems.length >= maxStreamItems` false; a fractional ceiling permits `Math.ceil(maxStreamItems)` retained items.
+        // A `NaN` or `Infinity` ceiling leaves retention unbounded; reject it before a pending entry exists or any byte reaches the peer.
         const maxStreamItems = params.maxStreamItems ?? DEFAULT_MAX_STREAM_ITEMS;
         if (!Number.isSafeInteger(maxStreamItems) || maxStreamItems < 0) {
             throw new McHostCallError(
@@ -566,9 +547,7 @@ export class ConnectionGeneration {
             resolveResult = resolve;
             rejectResult = reject;
         });
-        // Rejections are always meaningful to the caller, but a caller that
-        // aborted (or a test tearing down) may not await; keep the runtime
-        // from reporting them as unhandled.
+        // The request path attaches a rejection handler because callers may abort or not await `result`.
         result.catch(() => {});
         const entry: PendingEntry = {
             key,
@@ -589,14 +568,11 @@ export class ConnectionGeneration {
             sendTicket: null,
             ticket: null,
         };
-        // The entry is registered before channel admission so a synchronous
-        // channel failure mid-publication settles it through retirement.
+        // `request` registers the entry before admission so retirement settles it if channel publication fails synchronously.
         this.pending.set(key, entry);
         let ticket: FrameSendTicket;
         try {
-            // The channel validates the encoded header and refuses a full
-            // queue or an over-cap frame BEFORE any state changes, so the
-            // correlation is committed only after successful admission.
+            // `request` commits `corr` only after successful channel admission.
             ticket = this.channel.produce(
                 {
                     ver: header.ver,
@@ -608,7 +584,6 @@ export class ConnectionGeneration {
                 },
                 body,
                 {
-                    // onPublish runs immediately before transport publication begins.
                     onPublish: () => {
                         entry.writeInvoked = true;
                     },
@@ -645,7 +620,7 @@ export class ConnectionGeneration {
         };
     }
 
-    /** Best-effort correlation-scoped routed Cancel through reserved capacity. */
+    /** The client routes a best-effort correlation-scoped `Cancel` through reserved capacity. */
     enqueueCancel(channel: number, epoch: number, corr: bigint): void {
         this.enqueueControlHeader({
             len: 0,
@@ -658,7 +633,7 @@ export class ConnectionGeneration {
         });
     }
 
-    /** Route Goodbye: nonzero channel, current epoch, correlation 0. */
+    /* */
     enqueueRouteGoodbye(channel: number, epoch: number): void {
         this.enqueueControlHeader({
             len: 0,
@@ -671,7 +646,7 @@ export class ConnectionGeneration {
         });
     }
 
-    /** Connection Goodbye: channel 0, epoch 0, correlation 0. */
+    /* */
     enqueueConnectionGoodbye(): void {
         this.enqueueControlHeader({
             len: 0,
@@ -685,12 +660,7 @@ export class ConnectionGeneration {
     }
 
     /**
-     * Idempotent retirement: freezes the shared budget, clears every
-     * generation timer, settles each pending identity exactly once (queued
-     * work `not_sent`, invoked work `outcome_unknown`), completes all
-     * cleanup tickets, discards the channel (which destroys the socket),
-     * and emits exactly one notification. Every late listener, callback,
-     * and timer becomes a no-op.
+     * `retire` invokes `onRetired` once and clears active timers.
      */
     retire(reason: RetirementReason, error?: unknown): void {
         if (this.retiredInfo) return;
@@ -742,7 +712,7 @@ export class ConnectionGeneration {
     }
 
     // ------------------------------------------------------------------
-    // Setup: channel dial + auth, then frame delivery.
+    // Setup dials and authenticates the channel before frame delivery.
     // ------------------------------------------------------------------
 
     private async setup(deadline: Deadline): Promise<void> {
@@ -753,14 +723,11 @@ export class ConnectionGeneration {
             ),
         );
         try {
-            // Raced against retirement: a provider channel whose start()
-            // never settles — or ignores the close() that retirement issues
-            // — must not strand setup after the timer above has already
-            // retired this generation. Retirement waits one grace beat
-            // before winning: a start() rejection caused by the same
-            // failure (the auth reader observing the socket close) settles
-            // within the window and keeps its richer classification, and
-            // both branches attach handlers, so no promise is left
+            // A provider channel's `start()` may never settle or may ignore `close()` issued during retirement.
+            // Deadline retirement must settle setup even if a provider channel's `start()` never settles or ignores `close()`.
+            // Retirement waits `RETIREMENT_SETTLE_GRACE_MS` before rejecting setup.
+            // Retirement delays its rejection so a related `start()` rejection can preserve its error classification.
+            // A `start()` rejection during `RETIREMENT_SETTLE_GRACE_MS` takes precedence over retirement.
             // unhandled.
             await new Promise<void>((resolve, reject) => {
                 let settled = false;
@@ -797,8 +764,7 @@ export class ConnectionGeneration {
             });
             if (this.retiredInfo) {
                 // A channel that ignored close() can still resolve start()
-                // inside the grace window; a success after retirement must
-                // surface the stored retirement cause, not a fresh generic
+                // A `start()` success after retirement must surface the stored retirement cause rather than a generic close error.
                 // close error.
                 const cause = this.retiredInfo.error;
                 throw cause instanceof Error
@@ -807,10 +773,6 @@ export class ConnectionGeneration {
                           `connection retired during setup: ${this.retiredInfo.reason}`,
                       );
             }
-            // Identity comes from whichever channel proved it: the TCP
-            // channel's own handshake, or — for a candidate channel, which
-            // runs none — the identity the negotiating generation
-            // authenticated and passed in.
             const identity = this.authChannel?.authenticated ?? this.inheritedIdentity;
             this.daemonVer = identity?.daemonVer ?? null;
             this.authenticatedDaemonId = identity?.daemonId ?? null;
@@ -818,13 +780,10 @@ export class ConnectionGeneration {
         } finally {
             cancelSetupTimer();
         }
-        // Auth-leftover bytes (a frame coalesced into the final handshake
-        // chunk) dispatch here, before setup returns.
         this.channel.beginFrames();
     }
 
     // ------------------------------------------------------------------
-    // Frame dispatch and pending-entry settlement.
     // ------------------------------------------------------------------
 
     private dispatch(header: EnvelopeHeader, body: ReceiveLease): void {
@@ -894,13 +853,6 @@ export class ConnectionGeneration {
                     ),
                 );
                 this.finishEntry(entry);
-                // The caller is settled but the host is still producing. Without
-                // a Cancel it keeps sending frames this connection can only drop,
-                // spending socket and frame-processing capacity that unrelated
-                // requests need. Settle first so the caller reads the ceiling it
-                // hit rather than a retirement; a refused Cancel retires the
-                // generation inside `enqueueControlHeader`, which is the bounded
-                // fallback when the stream cannot be stopped politely.
                 if (header.channel !== 0) {
                     this.enqueueCancel(header.channel, header.epoch, header.corr);
                 }
@@ -1039,16 +991,14 @@ export class ConnectionGeneration {
         try {
             this.onRouteGoodbyeHook?.(channel, epoch);
         } catch {
-            // Observer exceptions must not affect protocol progress.
         }
     }
 
-    /** Settle the caller result exactly once (identity guard on the flag). */
+    /* */
     private settleCallerResolve(entry: PendingEntry, terminal: RequestTerminal): void {
         if (entry.callerSettled) return;
         entry.callerSettled = true;
         this.clearEntryDeadline(entry);
-        // Stream-item ownership transfers to the caller with the terminal.
         if (entry.heldBytes > 0) {
             this.releasePending(entry.heldBytes);
             entry.heldBytes = 0;
@@ -1064,7 +1014,7 @@ export class ConnectionGeneration {
         entry.reject(error);
     }
 
-    /** Remove a settled/abandoned entry and complete its cleanup ticket. */
+    /* */
     private finishEntry(entry: PendingEntry): void {
         if (this.pending.get(entry.key) === entry) {
             this.pending.delete(entry.key);
@@ -1081,7 +1031,6 @@ export class ConnectionGeneration {
             try {
                 this.onPendingZeroHook?.();
             } catch {
-                // Observer exceptions must not affect protocol progress.
             }
         }
     }
@@ -1105,11 +1054,6 @@ export class ConnectionGeneration {
     }
 
     /**
-     * Remove the entry's frame from the channel queue while still
-     * unpublished. Returns true only when the channel proved the frame was
-     * never published; `false` is a possible send, so the caller must not
-     * settle `not_sent` (the ticket contract) — a replayed "unsent" frame
-     * that later publishes would reach the host twice.
      */
     private cancelQueuedFrame(entry: PendingEntry): boolean {
         const ticket = entry.sendTicket;
@@ -1143,11 +1087,6 @@ export class ConnectionGeneration {
     }
 
     /**
-     * Caller abort (KTD10). Pre-write: remove the queued frame and settle
-     * both caller and ticket as done (`not_sent`). Post-write: settle the
-     * caller `outcome_unknown` immediately and return a cleanup ticket that
-     * resolves on the original terminal, generation retirement, or its own
-     * bounded deadline — whose expiry forces retirement.
      */
     private abortEntry(entry: PendingEntry): AbortHandle {
         if (this.pending.get(entry.key) !== entry || entry.callerSettled) {
@@ -1173,7 +1112,6 @@ export class ConnectionGeneration {
                 "aborted",
             ),
         );
-        // Drained-in-private stream items are dropped with the abort.
         if (entry.heldBytes > 0) {
             this.releasePending(entry.heldBytes);
             entry.heldBytes = 0;
@@ -1201,14 +1139,11 @@ export class ConnectionGeneration {
     }
 
     // ------------------------------------------------------------------
-    // Control frames and graceful finish over the channel.
     // ------------------------------------------------------------------
 
     private enqueueControlHeader(header: EnvelopeHeader): void {
         if (this.retiredInfo) return;
         this.channel.sendControl(header);
-        // A refused control frame failed the channel (and retired this
-        // generation) synchronously; only an admitted frame is reported.
         if (this.retiredInfo) return;
         this.emitDiagnostic("enqueue", {
             ty: header.ty,
@@ -1220,10 +1155,6 @@ export class ConnectionGeneration {
     }
 
     /**
-     * Resolve once every queued frame byte has been handed to the socket and
-     * every write callback fired, the generation retires, or `deadline`
-     * expires — a bounded, best-effort primitive for the facade's awaitable
-     * Goodbye teardown. Never blocks retirement.
      */
     flushWrites(deadline: Deadline): Promise<void> {
         return this.channel.flush(deadline);
@@ -1242,12 +1173,10 @@ export class ConnectionGeneration {
                 len: meta.len,
             });
         } catch {
-            // Observer exceptions must never affect protocol work (KTD12).
         }
     }
 
     // ------------------------------------------------------------------
-    // Pending-retention share of the one aggregate budget (KTD7).
     // ------------------------------------------------------------------
 
     private chargePending(bytes: number): void {
@@ -1278,12 +1207,6 @@ export class ConnectionGeneration {
     }
 
     /**
-     * Deadline-bound timer whose callback implies `deadline.isExpired()`.
-     * Request and setup deadline errors feed replay-token gates that
-     * re-sample `isExpired()`; a single-shot timer can fire fractionally
-     * early and let the token spend a spurious extra attempt. Re-arms
-     * stay inside the retirement-gated tracked timer set. The returned
-     * cancel function stays valid across re-arms.
      */
     private armDeadlineTimer(deadline: Deadline, fn: () => void): () => void {
         return armExpiryTimer(deadline, fn, {

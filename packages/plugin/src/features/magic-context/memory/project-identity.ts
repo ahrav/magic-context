@@ -1,14 +1,11 @@
 /**
- * Resolve a stable project identity from the working directory.
  *
  * Strategy:
- *   1. Git repo with commits → root commit hash (same across worktrees, clones, forks)
- *   2. Git repo with no commits → fallback to directory hash via resolveProjectIdentity()
- *   3. No git repo → fallback to directory hash via resolveProjectIdentity()
+ * `resolveProjectIdentity()` uses the root commit hash for Git repositories with commits; repositories that retain the same root commit share it.
+ * `resolveProjectIdentity()` uses a directory hash for empty Git repositories.
+ * `resolveProjectIdentity()` uses a directory hash for non-Git directories.
  *
- * The root commit hash is immutable and survives remote renames, host
- * migrations, and SSH/HTTPS URL changes. It is the same across all
- * worktrees and clones of the same repository.
+ * The root commit hash is independent of remotes and URLs; repositories that retain the same root commit share it.
  */
 
 import { execFileSync } from "node:child_process";
@@ -18,28 +15,24 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { log } from "../../../shared/logger";
 
-// execFileSync is intentional here (audit #19): this runs once per unique directory per process
-// lifetime when git is healthy, and successful git identities are cached in identityCache. The
-// ~10-50ms block on first call is acceptable vs threading async through all callers of
-// resolveProjectIdentity. Transient git failures are cooled down below so a slow/broken git probe
-// cannot stall every transform pass.
+// The resolver caches successful Git identities to avoid repeated synchronous probes.
+// The cooldown prevents repeated failed Git probes.
 const GIT_TIMEOUT_MS = 5_000;
 const TRANSIENT_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const identityCache = new Map<string, string>();
 const linkedGitWorktreeCache = new Map<string, boolean>();
 const lastKnownGitIdentityCache = new Map<string, string>();
-// Cached `dir:` fallbacks for directories that have NO `.git` entry in their
-// ancestor chain. We only cache the no-`.git` case: once a `.git` appears we
-// must re-resolve every call so the identity flips to the stable `git:<root>`
-// the moment git becomes available (otherwise project memories/state split
-// across the first-commit boundary). Real git repos never reach this cache —
-// they hit `identityCache` or the transient cooldown.
+// `directoryFallbackCache` stores `dir:` fallbacks only when no ancestor has a `.git` entry.
+// Resolution bypasses `directoryFallbackCache` when an ancestor has a `.git` entry.
+// A `.git` entry bypasses cached directory identities so Git resolution can replace them.
+// Re-resolving prevents project state from splitting when the first commit is created.
+// Git repositories use `identityCache` or the transient-failure cooldown instead of `directoryFallbackCache`.
 const directoryFallbackCache = new Map<string, string>();
-// Cool down git-backed directories whose git probe failed transiently. During
-// the window we reuse the last successful `git:` identity when this process has
-// one; true cold-start failures still use the deterministic `dir:` fallback.
-// After the cooldown expires, the next call re-probes so the cache refreshes
-// when the user fixes git or the slow disk recovers.
+// The cooldown suppresses repeated Git probes after transient failures.
+// During `transientFailureCooldown`, resolution reuses a process-local successful `git:` identity when available.
+// Cold-start `git_missing`, `git_timeout`, `dubious_ownership`, and `unknown` failures use the deterministic `dir:` fallback.
+// After cooldown expiry, the next call re-probes Git.
+// Cooldown expiry allows recovery after Git or disk failures.
 const transientFailureCooldown = new Map<string, number>();
 const dubiousOwnershipFallbackDirectories = new Set<string>();
 const dubiousOwnershipLoggedDirectories = new Set<string>();
@@ -50,18 +43,14 @@ let userHomeDirectoryForIdentity = (): string => homedir();
 let nowMs = (): number => Date.now();
 
 /**
- * Type-checked project identity failure classes (Finding #16).
+ * Project identity failures use stable machine-readable classifications.
  *
  * Caller policy:
- * - `not_git_repo` is deterministic: the directory is accessible but has no git root commit, so
- *   callers that preserve the production contract may fall back to `dir:<md5-12>`.
- * - `git_missing`, `git_timeout`, `dubious_ownership`, and `unknown` git failures fall back in
- *   resolveProjectIdentity() with a short retry cooldown: staying enabled with a temporary
- *   directory identity is safer than disabling Magic Context, and the identity self-heals when git
+ * `not_git_repo` permits a `dir:<md5-12>` fallback for an accessible directory without a Git root commit.
+ * `git_missing`, `git_timeout`, `dubious_ownership`, and `unknown` failures use a directory fallback with a five-minute retry cooldown.
+ * Git recovery replaces the temporary directory identity.
  *   recovers.
- * - `permission_denied` is not safe to silently coerce during normal resolution: an unreadable
- *   directory may not be the path the user intended. Plugin-load call sites use
- *   resolveProjectIdentityOrFallback() as a final belt so identity resolution never disables load.
+ * `permission_denied` does not fall back during normal resolution because an unreadable directory may not be the intended path.
  */
 export type ProjectIdentityErrorClass =
     | "not_git_repo"
@@ -72,7 +61,7 @@ export type ProjectIdentityErrorClass =
     | "unknown";
 
 /**
- * Strict project identity resolution error with stable machine-readable classification.
+ * ProjectIdentityError exposes a stable, machine-readable errorClass.
  */
 export class ProjectIdentityError extends Error {
     readonly errorClass: ProjectIdentityErrorClass;
@@ -136,13 +125,7 @@ function getErrorStderr(error: unknown): string {
 }
 
 function directoryFallback(directory: string): string {
-    // Use a hash of the full canonical path to avoid collisions between
-    // directories with the same basename (e.g. /tmp/api vs /work/api).
-    // Switched from Bun.hash to MD5 prefix when the storage layer moved off
-    // bun:sqlite — see commit d03e148. This is a one-time prefix change for
-    // non-git project memories: existing `dir:<wyhash>` rows become orphaned
-    // and any new memories use `dir:<md5-prefix>`. Most users are git-backed
-    // (unaffected). Doctor can be extended to re-key if needed.
+    // The fallback hashes the full canonical path to distinguish directories with identical basenames.
     const canonical = path.resolve(directory);
     const hash = createHash("md5").update(canonical, "utf8").digest("hex").slice(0, 12);
     return `dir:${hash}`;
@@ -253,14 +236,11 @@ function classifyGitError(error: unknown, rawDirectory: string): ProjectIdentity
 }
 
 /**
- * Strictly resolve the project identity for a filesystem directory.
  *
- * Returns only `git:<root-commit-sha>` and never silently falls back. Failures are thrown as
- * `ProjectIdentityError` with a stable `errorClass` so callers can distinguish deterministic
- * non-git directories from transient git/runtime failures.
+ * `resolveProjectIdentity()` returns `git:<root-commit-sha>` or `dir:<md5-12>`, or throws `ProjectIdentityError`.
+ * ProjectIdentityError exposes errorClass so callers can distinguish non-git directories from transient git or runtime failures.
  *
- * The cache is process-local, keyed by `path.resolve(directory)`, and stores only successful git
- * identities. Transient failures are never cached.
+ * `identityCache` never stores transient failures.
  */
 export function resolveProjectIdentityStrict(directory: string): string {
     const canonical = path.resolve(directory);
@@ -292,11 +272,7 @@ export function resolveProjectIdentityStrict(directory: string): string {
         throw classifyGitError(error, directory);
     }
 
-    // Repos with grafted histories (merged with --allow-unrelated-histories) have
-    // MULTIPLE root commits, and git's enumeration order varies by traversal. Taking
-    // whichever line comes first samples nondeterministically from that set, flapping
-    // the project identity between sessions and splitting the memory pool. Pin the
-    // derivation to the lexicographic minimum so it is a pure function of the set.
+    // Repositories with multiple root commits require deterministic root selection.
     const rootCommit = output
         .split("\n")
         .map((line) => line.trim().slice(0, 64))
@@ -320,16 +296,12 @@ export function resolveProjectIdentityStrict(directory: string): string {
 }
 
 /**
- * Resolve the project identity for the given directory.
  *
- * Returns a stable string suitable for use as a database key:
- *   - `"git:<sha>"` for git repositories with at least one commit
- *   - `"dir:<md5-12>"` for accessible non-git directories, empty repos, or cold-start git-backed
- *     directories while initial git identity resolution is unavailable
+ * `resolveProjectIdentity()` returns `git:<sha>` for Git repositories with at least one commit.
+ * `resolveProjectIdentity()` returns `dir:<md5-12>` for accessible non-Git directories, empty repositories, and cold-start `git_missing`, `git_timeout`, `dubious_ownership`, or `unknown` failures.
  *
- * A cold-start `dir:` fallback can split project-scoped rows until git recovers, but that split is
- * bounded and self-heals through the backfill/reconciliation paths. After a successful git resolve,
- * transient failures reuse the last known `git:` identity so mid-session rows stay under one key.
+ * A cold-start `dir:` fallback can split project-scoped rows until Git recovers.
+ * During transient failures, resolution reuses the last known `git:` identity so mid-session rows stay under one key.
  */
 function shouldUseDirectoryFallback(error: ProjectIdentityError): boolean {
     return error.errorClass !== "permission_denied";
@@ -371,7 +343,6 @@ function nearestLastKnownGitIdentity(
         const realCanonical = realpathSync.native(canonical);
         if (realCanonical !== canonical) return walk(realCanonical);
     } catch {
-        // If realpath fails, the path-based ancestor walk above is the only safe cache lookup.
     }
     return undefined;
 }
@@ -409,18 +380,14 @@ export function takeDubiousOwnershipProjectIdentityWarning(directory: string): s
 }
 
 /**
- * Compare filesystem-canonical paths so a symlink spelling of $HOME cannot
- * accidentally create a second directory identity. The session resolver also
- * checks descendants whose nearest git root is the home directory.
+ * Filesystem-canonical paths prevent symlink aliases from creating separate directory identities.
  */
 function canonicalUserHomeDirectory(): string {
     const homeDirectory = userHomeDirectoryForIdentity();
     try {
         return realpathSync.native(homeDirectory);
     } catch {
-        // Sandboxed OpenCode processes may know $HOME but be denied access to its
-        // metadata. Returning the original path lets later checks still recognize
-        // projects under the user's home directory without aborting plugin startup.
+        // The fallback returns the original path so later checks can recognize projects under `$HOME`.
         return homeDirectory;
     }
 }
@@ -437,10 +404,7 @@ export function resolveProjectIdentity(directory: string): string {
     const canonical = path.resolve(directory);
     const cachedFallback = directoryFallbackCache.get(canonical);
     if (cachedFallback !== undefined) {
-        // Serve the cached `dir:` fallback only while the directory still has no
-        // `.git` in itself or any ancestor. If a repo appeared above a nested
-        // session since we cached, drop it and re-resolve so the identity can
-        // flip to the stable `git:<root>`.
+        // Fallback deletion forces re-resolution so the identity can become `git:<root>`.
         if (!hasGitDir(canonical)) {
             return cachedFallback;
         }
@@ -496,9 +460,9 @@ export function resolveProjectIdentityOrFallback(directory: string): string {
     }
 }
 
-/** Cheap probe: does `<dir>/.git` or any ancestor `.git` exist (a repo may have
- *  appeared since we cached a `dir:` fallback)? A plain file counts for worktrees
- *  and submodules. Any filesystem miss just means "keep walking". */
+/** The probe treats `.git` in `canonical` or any ancestor as Git metadata.
+ * The probe treats a `.git` file as Git metadata for worktrees and submodules.
+ * Filesystem misses do not prove that no ancestor contains `.git`. */
 function hasGitDir(canonical: string): boolean {
     if (hasGitDirInAncestorChain(canonical)) {
         return true;
@@ -546,12 +510,6 @@ function gitRootDirectory(canonical: string): string | null {
 }
 
 /**
- * The directory that owns a session's project identity: the git repository
- * root when the directory sits inside one, otherwise the canonical directory
- * itself. Command surfaces that canonicalize project-relative artifact paths
- * must resolve against THIS root, not the invoking cwd — a `/cd` into a
- * subdirectory keeps the same identity (resolved through the ancestor
- * repository), so a path elsewhere in the same repository is in-project, not
  * an escape.
  */
 export function resolveProjectRootDirectory(directory: string): string {
@@ -574,21 +532,15 @@ export function resolveProjectIdentityForSession(
     const inheritsHomeRepository = gitRootDirectory(canonicalDirectory) === canonicalHome;
     if (canonicalDirectory === canonicalHome || inheritsHomeRepository) {
         if (!allowHomeProject) return undefined;
-        // A session whose effective git root is $HOME belongs to the same protected
-        // home identity as an exact-home session. This prevents a child directory
-        // from bypassing the opt-in by inheriting $HOME/.git.
+        // Sessions whose effective Git root is `$HOME` use the home identity.
+        // Treating a session whose effective Git root is `$HOME` as the home identity prevents child directories from bypassing the home opt-in through `$HOME/.git`.
         return directoryFallback(canonicalHome);
     }
     return resolveProjectIdentityOrFallback(directory);
 }
 
 /**
- * Normalize a stored project path or legacy raw filesystem path.
  *
- * Already-resolved `git:` / `dir:` identities are returned byte-for-byte. Raw filesystem paths are
- * resolved through the production wrapper. This helper is intentionally best-effort for existing
- * stored data: if strict resolution cannot classify the path, it falls back to the deterministic
- * `dir:<md5-12>` identity instead of throwing.
  */
 export function normalizeStoredProjectPath(rawOrStored: string): string {
     if (rawOrStored.startsWith("git:") || rawOrStored.startsWith("dir:")) {
@@ -603,13 +555,8 @@ export function normalizeStoredProjectPath(rawOrStored: string): string {
 }
 
 /**
- * Ownership check for a memory row against the current session's resolved
- * project identity. A memory's stored `project_path` may be a raw filesystem
- * path (legacy) OR an already-normalized `git:`/`dir:` identity; either must
- * match the current identity after normalization. Used by ctx_memory
- * delete/update/archive/merge so a session can still manage memories stored
- * under a legacy raw path that normalizes to the same project (shared by both
- * harnesses — Pi previously used raw `===`, diverging from OpenCode).
+ * A memory row may store `project_path` as a raw filesystem path or a normalized identity.
+ * Normalization lets ownership checks accept both raw filesystem paths and `git:` or `dir:` identities.
  */
 export function storedPathBelongsToIdentity(
     storedProjectPath: string,
@@ -622,9 +569,9 @@ export function storedPathBelongsToIdentity(
 }
 
 /**
- * Detect whether a directory belongs to a linked Git worktree. Linked worktrees
- * have a per-worktree git dir while sharing the primary checkout's common dir.
- * The probe is cached because authority recovery can be considered every pass.
+ * Worktree detection uses each linked worktree's per-worktree Git directory.
+ * Linked worktrees use a per-worktree Git directory and share the primary checkout's common directory.
+ * The cache uses resolved paths to avoid rerunning Git.
  */
 export function isLinkedGitWorktree(directory: string): boolean {
     const resolvedDirectory = path.resolve(directory);
@@ -649,8 +596,7 @@ export function isLinkedGitWorktree(directory: string): boolean {
             .filter(Boolean);
         linked = Boolean(gitDir && commonDir && path.resolve(gitDir) !== path.resolve(commonDir));
     } catch {
-        // If Git metadata exists but its topology cannot be resolved, fail closed:
-        // the checkout may be linked and must not be allowed to drain shared authority.
+        // The probe treats Git probe failures as linked when a Git directory exists.
         linked = hasGitDir(resolvedDirectory);
     }
     linkedGitWorktreeCache.set(resolvedDirectory, linked);

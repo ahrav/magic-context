@@ -75,7 +75,7 @@ export function log(message: string, data?: unknown): void {
             scheduleFlush();
         }
     } catch {
-        // Intentional: logging must never throw
+        // Logging must never throw.
     }
 }
 
@@ -91,22 +91,17 @@ export function getLoggerDiagnostics(): LoggerDiagnostics {
     };
 }
 
-/** Flush buffered log entries immediately. Primarily useful to diagnostic readers and tests. */
+/* */
 export function flushLogger(): void {
     flush();
 }
 
 /**
- * Resolve the current log file path. The path is harness-aware (see
- * {@link getMagicContextLogPath}) and re-evaluated on every call, so callers
- * who format diagnostic output with this value always see the path the next
- * flush will actually use.
  */
 export function getLogFilePath(): string {
     return getMagicContextLogPath();
 }
 
-// Flush remaining buffer on process exit
 if (!isTestEnv) {
     process.on("exit", flush);
 }

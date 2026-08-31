@@ -28,7 +28,6 @@ if (result.available) {
 console.log(JSON.stringify({ runtime: process.release.name, ...result }));
 
 function runAttachBoundary(): void {
-    // Invalid descriptors create no native channels or external views.
     const hostile: unknown[] = [
         { profile: "mc-host-test-ring-v1", pid: Number.NaN },
         { profile: "mc-host-test-ring-v1", pid: 2.5 },

@@ -14,10 +14,10 @@ describe("scanForSensitiveContent", () => {
             [{ q: "use sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789AB" }, "secret-or-path"],
             [{ q: "file at /home/someone/project/notes.txt" }, "source-path"],
             [{ q: "file at C:\\Users\\someone\\notes.txt" }, "source-path"],
-            // Case-insensitive and separator-agnostic home spellings.
+            // The detector matches home paths case-insensitively across slash styles.
             [{ q: "file at c:/users/someone/notes.txt" }, "source-path"],
             [{ q: "file at /users/someone/notes.txt" }, "source-path"],
-            // Identifying paths outside home directories.
+            // The detector rejects identifying absolute paths outside home directories.
             [{ q: "see /workspace/customer-x/src/main.ts" }, "source-path"],
             [{ q: "<code>/workspace/customer-x</code>" }, "source-path"],
             [{ q: "directory </workspace/customer-x>" }, "source-path"],
@@ -25,7 +25,7 @@ describe("scanForSensitiveContent", () => {
             [{ q: "files{/workspace/customer-x" }, "source-path"],
             [{ q: "config at /mnt/projects/acme/file.ts" }, "source-path"],
             [{ q: "repo at D:\\repos\\private\\x.ts" }, "source-path"],
-            // Single-component absolute roots are identifying too.
+            // The detector rejects single-component absolute roots as source paths.
             [{ q: "see /customer-x" }, "source-path"],
             [{ q: "open /Client Work" }, "source-path"],
             [{ q: "drive D:\\customer-x" }, "source-path"],
@@ -87,8 +87,6 @@ describe("scanForSensitiveContent", () => {
     });
 
     it("is host-independent: the loader's username alone is not a violation", () => {
-        // Release validity must be identical on every machine. The author
-        // host's identity is supplied as forbiddenTokens at recovery time.
         const username = userInfo().username;
         const violations = scanForSensitiveContent({ q: `written by ${username} today` });
         expect(violations).toEqual([]);
@@ -108,7 +106,6 @@ describe("scanForSensitiveContent", () => {
     });
 
     it("matches forbidden identifiers as bounded words, not substrings", () => {
-        // Username "dev" must not reject ordinary words containing it.
         for (const clean of ["development work", "the device driver", "devops handbook"]) {
             expect(
                 scanForSensitiveContent({ q: clean }, { forbiddenIdentifiers: ["dev"] }),

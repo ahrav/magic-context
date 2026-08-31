@@ -61,8 +61,6 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
                       ),
                   }
                 : {}),
-            // local_dtype is spread CONDITIONALLY to preserve the byte-identical
-            // default identity when unset (mirrors the schema transform). See #259.
             ...(config?.local_dtype ? { local_dtype: config.local_dtype } : {}),
         };
     }
@@ -197,10 +195,8 @@ export function isEmbeddingEnabled(): boolean {
     return embeddingConfig.provider !== "off";
 }
 
-/** Restores the module-default embedding config. Tests that call
- *  `initializeEmbedding` share this module's global state with every other
- *  test file in the process; resetting to a non-default config (e.g.
- *  `"off"`) would silently disable semantic lanes for later files. */
+/**
+ * */
 export function _resetEmbeddingConfigForTests(): void {
     initializeEmbedding(DEFAULT_EMBEDDING_CONFIG);
 }

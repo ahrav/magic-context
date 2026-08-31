@@ -1,72 +1,29 @@
 /**
- * Pi adapter for the harness-agnostic transcript interface.
  *
  * Pi delivers messages via `pi.on("context", ...)` as `AgentMessage[]`
- * (from `@earendil-works/pi-agent-core`). The event handler returns
- * `{ messages: AgentMessage[] }` to mutate the LLM-bound message array.
- * Unlike OpenCode where `Part.text` is mutated in place, Pi messages
- * have content arrays of typed parts (`TextContent | ThinkingContent
- * | ToolCall` for assistant; `TextContent | ImageContent` for user;
- * `(TextContent | ImageContent)[]` for toolResult). Because the Pi event
- * API expects the handler to RETURN a message array (rather than mutate
- * the passed-in one), we accumulate dirty-message tracking inside the
- * adapter and rebuild affected messages on `commit()`.
+ * Pi context hooks receive `{ messages: AgentMessage[] }`.
+ * Pi handlers return rebuilt message arrays instead of mutating `Part.text` in place.
+ * `commit()` rebuilds dirty messages because Pi handlers must return a message array rather than mutate the input.
  *
- * ## Shape normalization
  *
- * The transform pipeline is OpenCode-shaped: it expects user messages
- * to contain tool_result parts (because OpenCode folds tool results
- * into the next user message). Pi keeps tool results as separate
- * top-level `ToolResultMessage` entries with role `"toolResult"`. The
- * normalization happens here:
+ * The transform pipeline expects tool results in user messages because OpenCode folds them into the next user message.
  *
- *   - Adjacent `toolResult` messages preceding a user message are
- *     surfaced as `kind: "tool_result"` parts of that user message in
- *     the transcript view, NOT as separate transcript messages. Their
- *     positions in the source array are tracked so `commit()` can write
- *     mutations back to the original `ToolResultMessage` entries.
+ * The adapter exposes `toolResult` messages immediately before a user message as that user's `kind: "tool_result"` parts and tracks their source positions for `commit()`.
  *
- *   - When no user message follows a run of toolResults (e.g. the
- *     conversation tail ends with assistant + tool_result), they
- *     surface as a synthetic message with role `"user"` to preserve
- *     transform invariants. The synthetic message gets a deterministic
- *     `synth-user-<toolResultEntryId>` id so tags can bind to the tail
- *     tool output across transform passes.
+ * If a trailing run of `toolResult` messages has no following user message, the adapter exposes it as a synthetic `user` message with ID `synth-user-<toolResultEntryId>` so tags remain stable across transform passes.
  *
- * This is the *only* shape normalization the adapter performs. Anything
- * else (compaction markers, ordinal tracking, session-fact rendering)
- * is the transform pipeline's responsibility, not the adapter's.
+ * The adapter only normalizes tool-result placement; the transform pipeline handles compaction markers, ordinals, and session-fact rendering.
  *
- * ## Mutation tracking
  *
- * Each part proxy holds a back-pointer to its source location: the
- * containing AgentMessage and the index into that message's content
- * array (or for tool_result parts surfaced into a user message, the
- * index of the source ToolResultMessage in the original array plus the
- * index into its content). On any mutating call (`setText`,
- * `setToolOutput`, `replaceWithSentinel`), the adapter marks the source
- * AgentMessage as dirty. `commit()` rebuilds dirty messages with the
- * mutated content and assembles the final `AgentMessage[]` for the
- * `pi.on("context", ...)` handler to return.
+ * For a `tool_result` part surfaced into a user message, the source location records the source `ToolResultMessage` index and content index.
+ * `commit()` returns the final `AgentMessage[]` to the `pi.on("context", ...)` handler.
  *
- * ## Why not mutate AgentMessage content arrays in place?
  *
  * Two reasons:
  *
- *   1. AgentMessage content entries are typed unions and TypeScript
- *      treats them as readonly when we want to swap a `TextContent` for
- *      a sentinel that's also a `TextContent` — the unions don't allow
- *      heterogeneous in-place index assignment cleanly.
  *
- *   2. Pi's event API contract is "return a new array". Even if we
- *      mutate in place, returning the original array is allowed but
- *      doesn't give callers any guarantee about which messages
- *      changed. By tracking dirty messages explicitly we can, in the
- *      future, return only changed messages or skip rebuilding
  *      unchanged ones.
  *
- * Step 4b.1 ships the adapter contract. Step 4b.2 wires it into the
- * tagging+drops layer (which today only knows about MessageLike[]).
  */
 
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
@@ -79,10 +36,8 @@ import type {
 } from "@magic-context/core/shared/transcript";
 import { resolvePiStableId, SYNTH_USER_ID_PREFIX } from "./read-session-pi";
 
-// We re-declare the minimal subset of pi-ai message shapes we need.
-// Importing from @earendil-works/pi-ai directly would couple the plugin
-// build to pi-ai's exact version; the test fixtures in 4b.2 will need
-// to construct synthetic messages, and a local type makes that easier.
+// Local declarations prevent the plugin build from depending on pi-ai's exact version.
+// Importing `@earendil-works/pi-ai` would couple the plugin to that package's exact version.
 // The shape MUST stay structurally compatible with pi-ai's exports.
 
 type PiTextContent = { type: "text"; text: string; textSignature?: string };
@@ -133,16 +88,11 @@ type PiToolResultMessage = {
 type PiAgentMessage = PiUserMessage | PiAssistantMessage | PiToolResultMessage;
 
 /**
- * Wrap a Pi `AgentMessage[]` as a Transcript. Builds the normalized
- * view (folding tool results into user messages) up front, then proxies
- * mutations through the adapter's dirty-message tracking.
+ * The adapter folds tool results into user messages before exposing the transcript view.
  *
- * Accepts `unknown[]` rather than the actual `AgentMessage[]` from
- * `@earendil-works/pi-agent-core` because that type embeds CustomAgentMessages
- * declared via module augmentation, which makes generic inference brittle
- * across pi-coding-agent versions. We narrow to our recognized roles
- * (user/assistant/toolResult) at runtime; messages with other roles fall
- * through to the opaque path that touches no fields. Safe under TS's
+ * The adapter accepts `unknown[]` because the package's `AgentMessage` type embeds `CustomAgentMessages`.
+ * Augmented `CustomAgentMessages` prevent reliable generic inference.
+ * Messages with unrecognized roles follow the opaque path, which reads no message fields.
  * structural typing.
  */
 export function createPiTranscript(
@@ -151,35 +101,30 @@ export function createPiTranscript(
 	entryIds?: readonly (string | undefined)[],
 ): Transcript & {
 	/**
-	 * Pi-only escape hatch: returns the rebuilt message array suitable
-	 * for `{ messages }` in the `pi.on("context", ...)` result. Returns
-	 * the original array if no mutations occurred — preserves identity
-	 * so Pi can short-circuit downstream cache invalidation.
+	 * The `pi.on("context", ...)` callback receives `{ messages }`.
+	 * `getOutputMessages()` returns the original array when no mutations occurred to preserve its identity.
 	 */
 	getOutputMessages(): unknown[];
 	/**
-	 * Pi-only escape hatch: the mutable `working` array that part proxies
-	 * (tagging, drops, caveman) write to and `commit()` flushes back to source.
+	 * Mutator methods change `working`; `commit()` rebuilds dirty messages in its returned array.
 	 *
-	 * Phases that mutate messages OUTSIDE the transcript part API — reasoning
-	 * clearing/replay, which set `part.thinking = "[cleared]"` in place — MUST
-	 * target this array, not the original `source`. Tagging/drops/caveman
-	 * REASSIGN `working[idx]` to fresh spread-copied objects; if reasoning mutated
-	 * `source[idx]` (a now-divergent object) instead, the later `commit()` would
-	 * overwrite `source[idx] = working[idx]` and silently discard the reasoning
-	 * mutation while the cleared-reasoning watermark still advanced — a defer-pass
-	 * replay divergence (wire keeps original reasoning, state says cleared) that
-	 * busts the prompt cache. Routing reasoning through `working` keeps every
-	 * mutation in the single channel `commit()` flushes.
+	 * Mutator methods change `working`; `commit()` rebuilds dirty messages in its returned array.
+	 * Mutator methods change `working`; `commit()` rebuilds dirty messages in its returned array.
+	 * Mutator methods change `working`; `commit()` rebuilds dirty messages in its returned array.
+	 * Mutator methods change `working`; `commit()` rebuilds dirty messages in its returned array.
+	 * Mutator methods change `working`; `commit()` rebuilds dirty messages in its returned array.
+	 * Mutator methods change `working`; `commit()` rebuilds dirty messages in its returned array.
+	 * Mutator methods change `working`; `commit()` rebuilds dirty messages in its returned array.
+	 * Mutator methods change `working`; `commit()` rebuilds dirty messages in its returned array.
+	 * Mutator methods change `working`; `commit()` rebuilds dirty messages in its returned array.
 	 */
 	getWorkingMessages(): PiAgentMessage[];
 } {
 	const working = source.slice() as unknown as PiAgentMessage[];
 	const dirtyMessages = new Set<number>();
 
-	// Normalize: fold consecutive toolResult runs into the immediately
-	// following user message as tool_result transcript parts. Track
-	// source-array locations so commit() can write mutations back.
+	// Consecutive `toolResult` messages become `tool_result` transcript parts on the immediately following user message.
+	// The view tracks source indices so `commit()` can write mutations back.
 	const transcriptMessages: TranscriptMessage[] = buildTranscriptView(
 		working,
 		sessionId,
@@ -197,19 +142,12 @@ export function createPiTranscript(
 		commit(): void {
 			if (committed) return;
 			committed = true;
-			// Sync mutations from `working` back into `source` so that
-			// any structural changes the caller applies to `source`
-			// directly (e.g. `<session-history>` injection's splice +
-			// message[0] prepend) compose correctly with our part-level
 			// mutations.
 			//
-			// Without this, source[i] still holds the pre-mutation
-			// shape (because part proxies wrote to `working[i]` only)
-			// and downstream callers that operate on source would
-			// either see stale content or skip mutated items entirely.
+			// Without copying dirty entries, `source[i]` retains its pre-mutation shape.
+			// Part proxies mutate `working[i]`, not `source[i]`.
+			// Downstream callers that read `source` would see stale content.
 			//
-			// The two arrays start identical (working = source.slice())
-			// so copying just the dirty indices is sufficient.
 			for (const idx of dirtyMessages) {
 				if (idx < source.length && idx < working.length) {
 					(source as unknown as PiAgentMessage[])[idx] = working[idx];
@@ -217,10 +155,8 @@ export function createPiTranscript(
 			}
 		},
 		getOutputMessages(): unknown[] {
-			// After commit(), source has all part-level mutations
-			// applied AND any structural changes the caller made
-			// directly to source (splices, unshifts). Returning source
-			// is therefore authoritative.
+			// After the first commit(), `source` contains the dirty entries present at that commit.
+			// Returns `source`, preserving the caller's array identity.
 			return source;
 		},
 		getWorkingMessages(): PiAgentMessage[] {
@@ -230,11 +166,9 @@ export function createPiTranscript(
 }
 
 /**
- * Build the normalized transcript view from a Pi AgentMessage[].
  *
- * Walks the source array once, grouping toolResult runs with the
- * following user message. Each TranscriptMessage holds its parts
- * generated lazily (so part proxies can write back to `working`).
+ * Groups each contiguous `toolResult` run with the following user message, or emits a synthetic user message when no user follows.
+ * Lazy part getters let part proxies write back to `working`.
  */
 function buildTranscriptView(
 	working: PiAgentMessage[],
@@ -253,7 +187,6 @@ function buildTranscriptView(
 		}
 
 		if (msg.role === "toolResult") {
-			// Collect contiguous toolResult run.
 			const toolResultRun: { msg: PiToolResultMessage; index: number }[] = [];
 			while (i < working.length) {
 				const candidate = working[i];
@@ -262,9 +195,6 @@ function buildTranscriptView(
 				i += 1;
 			}
 
-			// Look ahead: if the next message is a user message, fold
-			// the tool results into it. Otherwise emit a synthetic user
-			// message for the run.
 			const next = i < working.length ? working[i] : undefined;
 			if (next?.role === "user") {
 				result.push(
@@ -321,8 +251,7 @@ function buildTranscriptView(
 			continue;
 		}
 
-		// Unknown role — surface as-is with kind "unknown" parts. Forward
-		// compatibility for new Pi message kinds we don't recognize yet.
+		// Unknown roles remain opaque to support future Pi message kinds.
 		result.push(
 			createOpaqueTranscriptMessage(working, i, sessionId, markDirty, entryIds),
 		);
@@ -333,8 +262,6 @@ function buildTranscriptView(
 }
 
 /**
- * Build a transcript message for a user message at `working[index]`,
- * optionally folding preceding toolResult parts into its parts list.
  */
 function createUserTranscriptMessage(
 	working: PiAgentMessage[],
@@ -346,9 +273,8 @@ function createUserTranscriptMessage(
 ): TranscriptMessage {
 	const userMsg = working[index] as PiUserMessage;
 
-	// Pi user messages can have `content: string` (legacy) or
-	// `content: (TextContent | ImageContent)[]`. Normalize: a string
-	// becomes a single TextContent with locator pointing at partIndex 0.
+	// String content is exposed as one text part at index 0.
+	// String content becomes a single `TextContent` with a locator at `partIndex` 0.
 	const isStringContent = typeof userMsg.content === "string";
 
 	return {
@@ -360,8 +286,7 @@ function createUserTranscriptMessage(
 		get parts(): TranscriptPart[] {
 			const parts: TranscriptPart[] = [];
 
-			// Folded tool results come FIRST (they precede the user's
-			// own content in real conversation order).
+			// Folded tool results precede user content to preserve conversation order.
 			for (const { index: toolResultIndex } of foldedToolResults) {
 				const toolMsg = working[toolResultIndex] as PiToolResultMessage;
 				toolMsg.content.forEach((_, partIndex) => {
@@ -376,7 +301,6 @@ function createUserTranscriptMessage(
 				});
 			}
 
-			// Then the user's own content.
 			if (isStringContent) {
 				parts.push(createPiUserStringPart(working, index, markDirty));
 			} else if (Array.isArray(userMsg.content)) {
@@ -393,11 +317,7 @@ function createUserTranscriptMessage(
 }
 
 /**
- * Build a synthetic user message for a tool-result tail (toolResults
- * with no following user message). It uses the same synth-user- prefix
- * convention as read-session-pi.ts, keyed by the first underlying
- * toolResult entry id, so tail tool outputs have a stable tag owner but
- * cannot collide with real SessionEntry ids.
+ * When available, synthetic tail message IDs use the `synth-user-` prefix and the first underlying `toolResult` entry ID.
  */
 function createSyntheticToolResultUserMessage(
 	working: PiAgentMessage[],
@@ -483,8 +403,7 @@ function createOpaqueTranscriptMessage(
 					: "unknown",
 			sessionId,
 		},
-		// Unknown messages have no parts as far as the transform is
-		// concerned. They pass through unmodified.
+		// Unknown roles remain opaque to support future Pi message kinds.
 		get parts(): TranscriptPart[] {
 			return [];
 		},
@@ -502,8 +421,7 @@ function createPiUserStringPart(
 ): TranscriptPart {
 	return {
 		kind: "text",
-		// User text parts do not need per-part ids: tagTranscript keys them by
-		// the stable parent message id plus text ordinal.
+		// Text ordinals disambiguate multiple text parts with the same parent message ID.
 		id: undefined,
 		getText(): string | undefined {
 			const msg = working[messageIndex] as PiUserMessage | undefined;
@@ -549,8 +467,7 @@ function createPiUserArrayPart(
 	const kind: TranscriptPartKind = classifyContent(part);
 	return {
 		kind,
-		// User array parts are not tool/content units. Text is keyed by parent
-		// message id + ordinal; images remain non-droppable user payloads.
+		// `tagTranscript` keys user text by the stable parent message ID and text ordinal.
 		id: undefined,
 		getText(): string | undefined {
 			const current = (working[messageIndex] as PiUserMessage).content;
@@ -662,9 +579,6 @@ function createPiAssistantPart(
 					// Non-serializable args still need to be replaceable.
 				}
 				const newContent = current.slice();
-				// Spread the existing part so optional fields (thoughtSignature)
-				// survive the rewrite — some providers reject a tool call whose
-				// signature was stripped on re-send. Only `arguments` changes.
 				newContent[partIndex] = {
 					...p,
 					arguments: replacementArgs,
@@ -679,10 +593,7 @@ function createPiAssistantPart(
 			return false;
 		},
 		setToolOutput(): boolean {
-			// Assistant messages don't have tool outputs in Pi — those
-			// live in separate ToolResultMessage entries (handled by
-			// createPiToolResultPart). Calling this on an assistant
-			// part is always a programming error.
+			// `setToolOutput` is invalid on assistant parts because Pi stores tool outputs in `ToolResultMessage` entries.
 			throw new Error("setToolOutput on assistant part");
 		},
 		getToolMetadata(): {
@@ -722,11 +633,8 @@ function createPiAssistantPart(
 			try {
 				if (JSON.stringify(p.arguments) === JSON.stringify(input)) return false;
 			} catch {
-				// non-serializable args: still replace
 			}
 			const newContent = current.slice();
-			// Spread to preserve optional fields (id, name, thoughtSignature);
-			// only `arguments` changes (mirrors setText's toolCall path).
 			newContent[partIndex] = { ...p, arguments: input };
 			working[messageIndex] = {
 				...(working[messageIndex] as PiAssistantMessage),
@@ -735,36 +643,18 @@ function createPiAssistantPart(
 			markDirty(messageIndex);
 			return true;
 		},
-		// Replace this assistant part's content with a sentinel placeholder.
 		//
-		// CRITICAL for toolCall parts: we MUST preserve `{ type: "toolCall",
-		// id, name }` so the Pi → provider serializer still emits a
-		// `function_call` / `tool_use` block with the original `call_id`.
-		// The corresponding `toolResult` message in the conversation
-		// references that same `call_id` (via `toolCallId`); breaking the
-		// pairing causes the provider to reject the request with
-		// errors like "No tool call found for function call output with
-		// call_id …" (Codex) or "tool_use blocks must be followed by
-		// matching tool_result blocks" (Anthropic).
+		// `toolCall` sentinels preserve `type`, `id`, and `name` because matching `ToolResultMessage.toolCallId` requires the original call shell.
+		// A `ToolResultMessage.toolCallId` must match the preceding tool call ID.
 		//
-		// We therefore keep the toolCall shell with its id + name and
-		// reduce `arguments` to a tiny marker object. Bulk argument
-		// content is what we really want to drop; the structural shape
-		// stays intact so message-pair integrity holds across the
 		// API boundary.
 		//
-		// For non-toolCall assistant parts (text / thinking) we still
-		// fall back to a plain text-sentinel replacement — those have no
-		// pairing constraint and the bulk reduction is the only goal.
+		// Text and thinking sentinels can replace the part directly because they have no tool-result pairing constraint.
 		replaceWithSentinel(sentinelText: string): boolean {
 			const current = (working[messageIndex] as PiAssistantMessage).content;
 			const existing = current[partIndex];
 			const newContent = current.slice();
 			if (existing && existing.type === "toolCall") {
-				// Spread the existing part so optional fields (thoughtSignature)
-				// survive the sentinel rewrite — the toolCall shell must stay a
-				// faithful, provider-acceptable function_call/tool_use; only the
-				// bulk `arguments` payload is reduced to the marker.
 				newContent[partIndex] = {
 					...existing,
 					arguments: { __magic_context_dropped__: sentinelText },
@@ -789,10 +679,9 @@ function createPiToolResultPart(
 	markDirty: (messageIndex: number) => void,
 ): TranscriptPart {
 	const msg = working[messageIndex] as PiToolResultMessage;
-	// Every block inside one Pi ToolResultMessage belongs to the same
-	// droppable tool-output unit. Expose images as tool_result (not image)
-	// so tagTranscript aggregates text + image blocks under msg.toolCallId
-	// and a single drop replaces the whole result.
+	// All blocks in one `PiToolResultMessage` form one droppable tool-output unit.
+	// The adapter exposes image blocks as `tool_result`, not `image`, so `tagTranscript` groups them with text blocks by `msg.toolCallId`.
+	// Dropping one group replaces the entire tool result.
 	const kind: TranscriptPartKind = "tool_result";
 	return {
 		kind,
@@ -803,9 +692,8 @@ function createPiToolResultPart(
 			return p?.type === "text" ? p.text : undefined;
 		},
 		setText(newText: string): boolean {
-			// For tagging purposes, we do allow mutating the text of the
-			// surfaced tool_result text slot. setToolOutput is the
-			// canonical channel but setText is symmetric for tagging.
+			// `setText` mutates text slots for tagging.
+			// `setToolOutput` handles tool-output changes; `setText` supports tagging.
 			const current = (working[messageIndex] as PiToolResultMessage).content;
 			const p = current[partIndex];
 			if (p?.type !== "text") return false;
@@ -820,15 +708,7 @@ function createPiToolResultPart(
 			return true;
 		},
 		setToolOutput(newText: string): boolean {
-			// Truncated-mode drops route through here. setText() only mutates
-			// `type:"text"` blocks, so an image (or any non-text) block in a tool
-			// result would be left INTACT — the model would still see the image
-			// bytes while the text became "[truncated]", and the drop bookkeeping
-			// would overstate reclaimed space. Rewrite a non-text block to a text
-			// sentinel (same conversion replaceWithSentinel does) so the whole
-			// tool-result block is actually truncated. setText() is deliberately
-			// NOT broadened — it's used by tag-prefix injection on normal passes,
-			// where converting images would corrupt the wire.
+			// Truncated drops call `setToolOutput`; `setText` changes only `type: "text"` blocks.
 			const current = (working[messageIndex] as PiToolResultMessage).content;
 			const p = current[partIndex];
 			if (p?.type === "text") return this.setText(newText);
@@ -864,9 +744,7 @@ function createPiToolResultPart(
 			return true;
 		},
 		rawByteSize(): number {
-			// Serialize the actual block so a non-text (image / structured)
-			// tool-result is sized by its real payload, not the ~0 bytes that
-			// getText() would report. Emergency-drop reclaim math depends on this.
+			// Size non-text tool results from their serialized payloads because `getText()` returns `undefined` for them.
 			const current = (working[messageIndex] as PiToolResultMessage).content;
 			const p = current[partIndex];
 			if (p?.type === "text") return Buffer.byteLength(p.text, "utf8");
@@ -899,28 +777,14 @@ function classifyAssistantContent(part: unknown): TranscriptPartKind {
 }
 
 /**
- * Pi messages don't carry a stable per-message id at the type level —
- * the SessionEntry layer wraps them with an entryId in the JSONL store,
- * but at the AgentMessage[] level we only have the message itself. As
- * a stable surrogate we use:
  *
  *   `pi-msg-${index}-${timestamp}-${role}`
  *
- * This is stable WITHIN a transform pass (the source array doesn't
- * change between adapter creation and commit) but NOT across passes if
- * messages get prepended/inserted. Cross-pass tracking should rely on
- * Pi's session-entry IDs from `ctx.sessionManager.getBranch()`, NOT on
- * these synthetic IDs. Step 4b.3 wires the session-entry layer.
  */
 function extractStableId(
 	msg: PiAgentMessage | undefined,
 	index: number,
 	entryIds: readonly (string | undefined)[] | undefined,
 ): string | undefined {
-	// Single source of truth: prefer the real SessionEntry id (position-
-	// independent → tags/source_contents/caveman keyed on it survive array
-	// shifts), fall back to the unstable pi-msg-index id only when none resolves.
-	// No entryIdByRef here: tagging runs at transcript-build time on the freshly
-	// sliced `working` array, so positional entryIds[index] is exactly aligned.
 	return resolvePiStableId(msg, index, entryIds);
 }

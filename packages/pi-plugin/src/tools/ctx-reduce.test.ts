@@ -1,17 +1,8 @@
 /**
- * Regression coverage for the Pi `ctx_reduce` tool.
  *
- * Pin the parity-critical behaviors against OpenCode's
  * `packages/plugin/src/tools/ctx-reduce/tools.ts`:
  *
- *   1. Range parsing accepts comma-separated and dash ranges
- *   2. Unknown tag IDs are rejected
- *   3. Compaction-survivor tags are rejected
- *   4. Protected-tag deferral
- *   5. Idempotent dedup of already-queued / already-dropped IDs
  *
- * These contracts must not regress — agents rely on the exact response
- * messaging to know which drops are immediate vs deferred.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -129,7 +120,6 @@ describe("Pi ctx_reduce tool", () => {
 		expect(text).toContain("Unknown tag");
 		expect(text).toContain("§42§");
 
-		// Nothing was queued — fail-closed semantics.
 		expect(getPendingOps(db, sessionId)).toHaveLength(0);
 	});
 
@@ -168,7 +158,6 @@ describe("Pi ctx_reduce tool", () => {
 		expect(isError).toBe(false);
 		expect(text.toLowerCase()).toContain("already");
 
-		// Still exactly one pending op — no duplicate.
 		const ops = getPendingOps(db, sessionId);
 		expect(ops).toHaveLength(1);
 		expect(ops[0].tagId).toBe(2);
@@ -177,8 +166,6 @@ describe("Pi ctx_reduce tool", () => {
 	it("defers protected-tag drops with explicit 'deferred drop' messaging", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-reduce-protected";
-		// 5 active tags. With protectedTags=2, the most recent 2 (tags 4 & 5)
-		// are protected — drops of those land as deferred.
 		seedTags(db, sessionId, [
 			{ tagNumber: 1, messageId: "m1" },
 			{ tagNumber: 2, messageId: "m2" },

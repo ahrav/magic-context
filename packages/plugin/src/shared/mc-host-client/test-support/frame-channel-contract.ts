@@ -1,14 +1,6 @@
 /**
- * Reusable semantic contract suite for the complete-frame channel (KTD8).
  *
- * Every scenario is expressed against a provider-neutral factory, so TCP
- * runs the inventory now and a later provider (for example shared memory)
- * registers its own factory and reruns the same scenarios unchanged.
- * Adapter-specific behavior (socket fragmentation, auth leftover, EOF
- * variants) belongs in each adapter's own suite, not here.
  *
- * Runtime-neutral: `node:assert/strict` only — no bun:test — so the same
- * scenarios also execute under Node 24 through the existing bundle runner.
  */
 
 import assert from "node:assert/strict";
@@ -29,10 +21,10 @@ import { expectMcHostCallError, waitUntil } from "./test-util";
 
 const CHANNEL = 5;
 const EPOCH = 9;
-/** Large enough to park the writer pump on 'drain' behind a paused peer. */
+/** WEDGE_BYTES parks the writer pump on 'drain' while the peer is paused. */
 const WEDGE_BYTES = 8 * 1024 * 1024;
 
-/** One frame decoded by the remote end's own independent decoder. */
+/** The remote end decodes each frame independently. */
 export interface ContractPeerFrame {
     ty: number;
     flags: number;
@@ -50,24 +42,24 @@ export interface ContractPeerFrameFields {
     epoch?: number;
     corr?: bigint;
     body?: Uint8Array;
-    /** Overrides for malformed frames; default to the true values. */
+    /** `len` and `ver` override encoded values for malformed frames; otherwise they use the encoded values. */
     len?: number;
     ver?: number;
 }
 
-/** The remote end of a channel under contract test. */
+/* */
 export interface ContractPeer {
     readonly frames: readonly ContractPeerFrame[];
     send(fields: ContractPeerFrameFields): Promise<void>;
-    /** Deliver several frames as one coalesced burst when the transport allows. */
+    /** sendBurst delivers frames as one coalesced burst when the transport allows. */
     sendBurst(fields: ContractPeerFrameFields[]): Promise<void>;
     waitFor(check: () => boolean, timeoutMs?: number): Promise<void>;
-    /** Backpressure: stop consuming the channel's outbound bytes. */
+    /* */
     pauseReading(): void;
     resumeReading(): void;
-    /** Clean end-of-stream toward the channel. */
+    /** end sends a clean end-of-stream toward the channel. */
     end(): void;
-    /** Abortive teardown toward the channel. */
+    /** destroy performs abortive teardown toward the channel. */
     destroy(): void;
 }
 
@@ -86,18 +78,18 @@ export interface ContractReceivedFrame {
     body: Uint8Array;
 }
 
-/** One live channel/peer pair plus the factory-recorded observations. */
+/* */
 export interface FrameChannelContractHandle {
     channel: FrameChannel;
     budget: ByteBudget;
     peer: ContractPeer;
-    /** Whether releasing a lease must revoke aliases before backing storage is reused. */
+    /** reusesReceiveStorage is true when releasing a lease must revoke aliases before reusing backing storage. */
     reusesReceiveStorage: boolean;
     /** The contract factory retains owned bodies after the provider releases each inbound lease. */
     received: ContractReceivedFrame[];
-    /** Channel-detected closes, in order (owner close never records here). */
+    /** closes records channel-detected closes in order; owner closes do not appear. */
     closes: { reason: FrameChannelCloseReason; error: unknown }[];
-    /** Scenario-installed hook, run before each delivery is recorded. */
+    /** frameHook runs before each delivery is recorded. */
     frameHook: ((frame: InboundFrame) => boolean | undefined) | null;
     cleanup(): Promise<void>;
 }
@@ -111,7 +103,7 @@ export interface FrameChannelContractScenario {
     run(create: FrameChannelContractFactory): Promise<void>;
 }
 
-/** Run one scenario with automatic cleanup of every created handle. */
+/* */
 export async function runFrameChannelContractScenario(
     scenario: FrameChannelContractScenario,
     factory: FrameChannelContractFactory,
@@ -175,8 +167,6 @@ function requestCorrs(peer: ContractPeer): bigint[] {
 
 export const frameChannelContractScenarios: readonly FrameChannelContractScenario[] = [
     {
-        // R3: one logical writer with FIFO admission while inbound frames
-        // keep making progress in wire order.
         name: "concurrent send and receive preserve FIFO order",
         async run(create) {
             const h = await create();
@@ -206,9 +196,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R3: publication start and local completion are distinct and fire
-        // exactly once, in order; completion never claims peer receipt —
-        // both fire while the peer is provably not consuming.
+        // Publication start precedes local completion; each occurs once, and completion does not imply peer receipt.
         name: "publication and local completion fire exactly once, in order",
         async run(create) {
             const h = await create();
@@ -233,8 +221,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R4: a pre-publication cancel removes the frame without any byte
-        // reaching the transport; its charge releases.
+        // Cancel before publication removes the frame, sends no bytes, and releases its charge.
         name: "a queued frame cancels before publication and never reaches the peer",
         async run(create) {
             const h = await create();
@@ -250,15 +237,14 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             assert.equal(published, 0);
             h.channel.send(requestFrame(3n, Buffer.from("after")));
             h.peer.resumeReading();
-            // FIFO: if corr 2 had been published it would precede corr 3.
+            // Published frames are sent in publication order.
             await h.peer.waitFor(() => requestCorrs(h.peer).includes(3n), 15_000);
             assert.deepEqual(requestCorrs(h.peer), [1n, 3n]);
             await waitUntil(() => h.budget.used === 0, 15_000);
         },
     },
     {
-        // R3: frame-count saturation refuses admission at the same boundary
-        // while reserved control capacity stays available.
+        // Frame-count saturation rejects admission when the queue reaches `maxQueuedFrames`.
         name: "frame saturation refuses admission while control capacity stays reserved",
         async run(create) {
             const h = await create({ maxQueuedFrames: 2 });
@@ -284,8 +270,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R3: byte saturation blocks at the queue-byte and aggregate-cap
-        // boundaries with distinct refusal codes.
+        // Byte saturation returns distinct refusal codes at the queue-byte and aggregate-cap boundaries.
         name: "byte saturation refuses admission at the queue and aggregate caps",
         async run(create) {
             const capped = await create({ memoryCapBytes: 1_000 });
@@ -308,8 +293,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R4: reserve exhaustion fails the channel exactly once, because
-        // required cleanup can no longer queue safely.
+        // controlReserveFrames exhaustion closes the channel exactly once.
         name: "control reserve exhaustion fails the channel exactly once",
         async run(create) {
             const h = await create({ controlReserveFrames: 2 });
@@ -328,8 +312,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R3/KTD7: inbound admission pauses under the shared aggregate cap
-        // before allocation and resumes when retained bytes release.
+        // Inbound admission pauses before allocation under the shared aggregate cap and resumes when retained bytes release.
         name: "paused inbound admission resumes after retained bytes release",
         async run(create) {
             const h = await create({
@@ -365,13 +348,12 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             await waitUntil(() => h.received.length === 1);
             assert.equal(h.channel.stats().readPaused, false);
             assert.equal(h.received[0]?.body.length, 4_096);
-            // The cap was never exceeded while paused.
+            // The shared aggregate cap is never exceeded while inbound admission is paused.
             assert.ok(h.budget.peak <= 5_000);
         },
     },
     {
-        // R4: graceful finish drains admitted frames before close, while
-        // discard drops queued frames and releases every byte charge.
+        // Graceful finish drains admitted frames before close, while discard drops queued frames and releases every byte charge.
         name: "graceful flush drains admitted frames; discard drops and releases",
         async run(create) {
             const graceful = await create();
@@ -404,7 +386,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R4: closure reasons are preserved and reported exactly once.
+        // Closure reasons are preserved and reported exactly once.
         name: "close reasons: clean EOF, truncation, invalid header, role violation, frame deadline",
         async run(create) {
             const eof = await create();
@@ -423,8 +405,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             await new Promise((resolve) => setTimeout(resolve, 20));
             assert.equal(eof.closes.length, 1);
 
-            // Stream end while a declared body is still pending is a
-            // truncated-frame failure, not a clean boundary close.
+            // A stream end while a declared body is pending is a truncated-frame failure, not a clean boundary close.
             const truncated = await create({ frameDeadlineMs: 10_000 });
             await truncated.peer.send({
                 ty: FrameType.Response,
@@ -455,8 +436,6 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
             assert.equal(roleInvalid.closes[0]?.reason, "role_violation");
 
             const stalled = await create({ frameDeadlineMs: 80 });
-            // A header that declares a body which never arrives stalls the
-            // frame after its first header byte.
             await stalled.peer.send({
                 ty: FrameType.Response,
                 channel: CHANNEL,
@@ -470,7 +449,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R1: an oversized body declaration is rejected before allocation.
+        // An oversized body declaration is rejected before allocation.
         name: "an oversized body declaration closes the channel before allocation",
         async run(create) {
             const h = await create({ maxBodyLen: 4_096 });
@@ -487,8 +466,7 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
         },
     },
     {
-        // R3: coalesced frames deliver in wire order, each from the single
-        // delivery loop — never recursively from within another delivery.
+        // Coalesced frames deliver in wire order from the single delivery loop, never recursively from another delivery.
         name: "coalesced frames deliver in order without recursive re-entry",
         async run(create) {
             const h = await create();
@@ -667,8 +645,6 @@ export const frameChannelContractScenarios: readonly FrameChannelContractScenari
 ];
 
 // ----------------------------------------------------------------------
-// TCP registration of the contract factory. A later provider adds its own
-// factory next to this one and reruns the identical scenario inventory.
 // ----------------------------------------------------------------------
 
 function adaptFakePeer(peer: FakePeer): Promise<ContractPeer> {
@@ -689,7 +665,7 @@ function adaptFakePeer(peer: FakePeer): Promise<ContractPeer> {
     }));
 }
 
-/** Live, authenticated TCP channel/peer pair for the contract suite. */
+/* */
 export const tcpFrameChannelContractFactory: FrameChannelContractFactory = async (
     overrides = {},
 ) => {

@@ -9,11 +9,11 @@ export interface DreamRunTaskSummary {
     name: string;
     durationMs: number;
     resultChars: number;
-    /** Failure detail only. Missing means no failure was recorded; an empty
-     * string is treated as absent and is not persisted. */
+    /** Missing `error` means no failure was recorded.
+     * Empty `error` strings are treated as absent and are not persisted. */
     error?: string;
-    /** Successful progress/detail. Missing means no progress was reported; an
-     * empty string is treated as absent and is not persisted. */
+    /** Missing `progress` means no progress was reported.
+     * Empty `progress` strings are treated as absent and are not persisted. */
     progress?: string;
     backlog?: DreamTaskRunBacklog;
 }
@@ -23,60 +23,45 @@ export interface DreamRunMemoryChanges {
     deleted: number;
     archived: number;
     merged: number;
-    // Exact ids of the memories changed in each bucket (#221). Persisted in the
-    // same `memory_changes_json` blob (no schema migration) so a drill-down
-    // consumer can show EXACTLY which memories a run touched instead of
-    // reconstructing them with an approximate created_at/updated_at time-window
-    // query. Optional: older rows + the manual /ctx-dream summary path carry
-    // counts only. Each count stays === its array length when arrays are present.
+    // Each array contains the exact IDs changed in its bucket.
+    // The fields are persisted in `memory_changes_json`.
+    // Consumers use these IDs to report the exact memories a run touched instead of reconstructing them from an approximate `created_at`/`updated_at` time window.
+    // Older rows and the manual `/ctx-dream` summary path provide counts only.
+    // When arrays are present, each count equals its array's length.
     //
-    // These are LEGACY numeric ids from the `memories` table. Claim-native
-    // writers MUST leave all four absent rather than emit empty arrays — see
-    // `claimEffectMemoryChanges` for why an empty array is not a safe stand-in.
+    // These are legacy numeric IDs from the `memories` table.
+    // Claim-native writers must leave all four legacy numeric ID arrays absent rather than emit empty arrays.
     writtenIds?: number[];
     deletedIds?: number[];
     archivedIds?: number[];
     mergedIds?: number[];
-    // Public claim IDs (`mcm_<32hex>`) touched by a claim-native run, bucketed by
-    // the effect's `changeKind`. Additive to the legacy numeric fields above: the
-    // claim graph has no numeric memory id to report, so a claim-native run that
-    // filled only the legacy arrays would have to invent ids.
+    // Claim-native runs store touched public claim IDs (`mcm_<32hex>`) by the effect's `changeKind`.
+    // These fields supplement the legacy numeric ID fields.
+    // A claim-native run cannot populate only the legacy arrays without inventing IDs.
     //
-    // Bucketed by the change kinds that claim operations actually emit — NOT by
-    // the curate action names (archive/merge/split). One curate action fans out
-    // into several effects and several actions share a kind, so `changeKind` is
-    // the only grouping the effect itself carries:
-    //   claimUpsertedIds  — a new revision was written (create, revise, merge
-    //                       target, split parent + its new children).
-    //   claimLifecycleIds — a lifecycle state transition (archive, and the
-    //                       retirement of each merge source).
-    //   claimOtherIds     — any other kind (evidence/applicability/verification),
-    //                       so a future kind is recorded rather than dropped.
+    // These fields are bucketed by claim-operation `changeKind`, not curate action names.
+    // Several curate actions share a `changeKind`.
+    // `claimUpsertedIds` contains IDs whose new revision was written.
+    // `claimUpsertedIds` includes creates, revisions, merge targets, split parents, and new split children.
+    // `claimLifecycleIds` contains IDs whose lifecycle state changed.
+    // `claimLifecycleIds` includes archives and retired merge sources.
+    // `claimOtherIds` contains evidence, applicability, verification, and other `changeKind` values.
+    // `claimOtherIds` records unrecognized `changeKind` values instead of dropping them.
     claimUpsertedIds?: string[];
     claimLifecycleIds?: string[];
     claimOtherIds?: string[];
 }
 
 /**
- * Project applied claim-operation effects onto the `dream_runs` telemetry shape.
+ * `claimEffectMemoryChanges` projects applied claim-operation effects onto the `dream_runs` telemetry shape.
  *
- * Returns null when nothing was applied, matching `memoryChanges: null` so the
- * caller stores SQL NULL for a no-op run.
+ * `claimEffectMemoryChanges` returns `null` when no effects were applied.
  *
- * Two deliberate constraints keep this blob's shape stable for readers of
- * rows already written (the retired dashboard parsed it, and its convention
- * is the persisted format):
  *
- *  1. The legacy `*Ids` arrays stay ABSENT, not empty. A reader treats
- *     "all three of writtenIds/archivedIds/mergedIds missing" as its signal to
- *     fall back to the time-window reconstruction. Emitting `[]` instead would
- *     satisfy its presence check and make it report an EXACT-but-empty change
- *     set, suppressing that fallback.
- *  2. The legacy counts stay 0. A change-presence gate ORs over every value in
- *     this object, so a non-zero legacy count here would render a change block
- *     whose numeric drill-down has nothing behind it.
+ * A reader falls back to time-window reconstruction when all four legacy ID arrays are absent.
+ * Empty legacy ID arrays would satisfy the reader's presence check and report an exact-but-empty change set.
+ * An exact-but-empty change set suppresses time-window reconstruction.
  *
- * Claim-native counts are therefore carried by the arrays' lengths.
  */
 export function claimEffectMemoryChanges(
     effects: readonly ClaimOperationResultEffect[],
@@ -85,8 +70,6 @@ export function claimEffectMemoryChanges(
     const lifecycle = new Set<string>();
     const other = new Set<string>();
     for (const effect of effects) {
-        // The locator is the effect's only carrier of the public claim ID; a
-        // null one means the revision row was gone, which is not reportable.
         const publicClaimId = effect.revisionLocator
             ? parseRevisionLocator(effect.revisionLocator)?.publicClaimId
             : undefined;
@@ -128,9 +111,8 @@ export interface DreamRunInput {
     smartNotesSurfaced: number;
     smartNotesPending: number;
     memoryChanges?: DreamRunMemoryChanges | null;
-    /** Dreamer child session that produced this run — lets a telemetry reader
-     *  scope the token join to this run (avoids cross-summing concurrent
-     *  same-name cross-project runs). null when no parent session was resolved. */
+    /**
+     * */
     parentSessionId?: string | null;
 }
 

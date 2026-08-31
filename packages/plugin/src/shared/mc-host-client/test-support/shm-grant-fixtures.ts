@@ -1,5 +1,4 @@
 /**
- * Avoid `bun:test` so non-Bun test suites can import these helpers.
  */
 
 import assert from "node:assert/strict";
@@ -32,7 +31,7 @@ export function grantHex(
     return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-/** Runs `fn`, requiring it to throw a `ShmGrantError` with exactly `code`. */
+/* */
 export function expectGrantCode(fn: () => unknown, code: ShmGrantErrorCode): ShmGrantError {
     let caught: unknown;
     try {

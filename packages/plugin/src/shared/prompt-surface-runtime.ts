@@ -25,9 +25,6 @@ const GUIDANCE_MARKER = "## Magic Context";
 const GUIDANCE_MARKER_LINE = /^## Magic Context[\t ]*\r?$/gm;
 
 /**
- * The single source of truth for the ctx_* tools exposed by the prompt surface.
- * Consumers derive their registries and light-description catalogs from this list
- * so adding a tool cannot silently skip one prompt-surface integration point.
  */
 export const ACTIVE_TOOL_IDS = [
     "ctx_reduce",
@@ -37,7 +34,7 @@ export const ACTIVE_TOOL_IDS = [
     "ctx_search",
 ] as const;
 
-/** @deprecated Use ACTIVE_TOOL_IDS. Kept as an alias for existing consumers. */
+/** @deprecated Use ACTIVE_TOOL_IDS. */
 export const PROMPT_SURFACE_TOOL_IDS = ACTIVE_TOOL_IDS;
 
 export type PromptSurfaceToolId = (typeof ACTIVE_TOOL_IDS)[number];
@@ -51,8 +48,6 @@ export const LIGHT_TOOL_DESCRIPTIONS = {
 } as const satisfies Readonly<Record<PromptSurfaceToolId, string>>;
 
 /**
- * Preserve the existing full-preset hash exactly while giving other presets a
- * distinct semantic cache identity, including during any future asset fallback.
  */
 export function promptSurfaceHashMaterial(
     systemContent: string,
@@ -66,7 +61,7 @@ export function promptSurfaceHashMaterial(
 const PROMPT_SURFACE_TOOL_ID_SET = new Set<string>(ACTIVE_TOOL_IDS);
 
 export interface PromptSurfaceGuidanceSelection {
-    /** The configured built-in preset. */
+    /* */
     preset: PromptSurfacePreset;
     /** Complete user-authored primary section captured when a model-key epoch starts. */
     primaryOverride?: string;
@@ -118,9 +113,8 @@ function markerCount(content: string): number {
 }
 
 /**
- * Create one host-registration runtime. Its warning set is shared by tool
- * registration and every guidance epoch, so invalid overrides are reported once
- * instead of on every model call.
+ * The runtime shares one warning set across tool registration and every guidance epoch.
+ * The runtime reports each invalid override once instead of on every model call.
  */
 export function createPromptSurfaceRuntime(
     options: CreatePromptSurfaceRuntimeOptions,
@@ -182,7 +176,7 @@ export function createPromptSurfaceRuntime(
     return {
         resolveRegistration(config) {
             // OpenCode and Pi expose one immutable provider tool map per host
-            // registration. Model routes are intentionally ignored here: only the
+            // Model routes do not select text.
             // registration owner's default and user-tier overrides can choose text.
             const { preset } = resolvePromptSurface(config, undefined);
 
@@ -230,7 +224,7 @@ interface GuidanceEpoch {
     selection: PromptSurfaceGuidanceSelection;
 }
 
-/** Freeze preset selection and materialized override bytes for one model-key epoch. */
+/** Each model-key epoch retains its preset selection and materialized override bytes. */
 export function createPromptSurfaceGuidanceEpochCache(runtime: PromptSurfaceRuntime): {
     resolve: (
         sessionId: string,

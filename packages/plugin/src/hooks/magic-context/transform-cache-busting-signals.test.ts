@@ -1,17 +1,13 @@
 /// <reference types="bun-types" />
 
 /**
- * Regression suite for the three-set cache-busting refactor. Replaces the old monolithic `flushedSessions` set with three
  * single-purpose sets:
  *
- *   - `historyRefreshSessions`     one-shot, drained after `prepareCompartmentInjection`
- *   - `systemPromptRefreshSessions` one-shot, drained after the system-prompt handler
- *   - `pendingMaterializationSessions` persistent until heuristics actually run
+ * `prepareCompartmentInjection` drains one-shot `historyRefreshSessions`.
+ * The system-prompt handler drains one-shot `systemPromptRefreshSessions`.
+ * Heuristics drain `pendingMaterializationSessions` when they run.
  *
- * The four scenarios below are the regression targets Oracle called out
- * in the review. Each one exercises a behavior that the OLD single-set
- * design got wrong in a way that observably busted Anthropic prompt cache
- * or dropped /ctx-flush intent.
+ * `pendingMaterializationSessions` preserves `/ctx-flush` intent until heuristics run.
  */
 
 import { afterEach, describe, expect, it, mock } from "bun:test";
@@ -32,13 +28,11 @@ import { registerActiveCompartmentRun } from "./compartment-runner";
 import { createTransform } from "./transform";
 
 /**
- * Block "compartment running" by registering a never-resolving promise in
- * the active-runs map. Returns a resolver to lift the block.
  *
- * `compartmentRunning` in the postprocess phase reads from
- * `getActiveCompartmentRun()` (in-memory), NOT `compartmentInProgress` in
- * the DB (which is for restart-recovery). So tests must register a real
- * pending promise to simulate the block.
+ * `compartmentRunning` reads the in-memory active-run registry during postprocessing.
+ * `compartmentRunning` does not read DB-backed `compartmentInProgress`.
+ * `compartmentInProgress` supports restart recovery.
+ * Tests must register a pending promise to simulate a running compartment.
  */
 function blockCompartmentRun(sessionId: string): () => void {
     let resolver: (() => void) | undefined;
@@ -81,16 +75,16 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     }
     tempDirs.length = 0;
 });
 
 /**
- * Minimum client + directory needed to make `canRunCompartments=true`,
- * which is required for `compartmentRunning` to take effect. The methods
- * are no-ops since the tests don't actually invoke historian.
+ * A client and directory set `canRunCompartments` to `true`.
+ * `compartmentRunning` takes effect only when `canRunCompartments=true`.
+ * The client and directory are no-ops because the tests do not invoke historian.
  */
 const testClient = { session: { prompt: async () => ({}) } } as never;
 const testDirectory = "/tmp/ctx-busting-test";
@@ -110,16 +104,10 @@ function buildSimpleMessages(sessionId: string): TestMessage[] {
 
 describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
     it("Test 1: historian publish while compartment is running — history rebuild is one-shot, materialization persists", async () => {
-        // Scenario from Oracle: historian publishes mid-session (signaling
-        // both historyRefresh + pendingMaterialization), but a different
-        // compartment run is still active so heuristics can't materialize
-        // yet. The pre-refactor bug: every subsequent defer pass would
-        // re-fire the flush flag and rebuild `<session-history>` until
-        // compartmentRunning lifted, burning cache reuse for nothing.
+        // A historian publish signals both `historyRefreshSessions` and `pendingMaterializationSessions`; an active compartment run blocks materialization.
         //
-        // After the fix: history rebuild fires exactly once (consumed by
-        // prepareCompartmentInjection then drained), and materialization
-        // intent persists across blocked passes until heuristics run.
+        // `prepareCompartmentInjection` consumes and drains the history-refresh signal.
+        // `pendingMaterializationSessions` retains `/ctx-flush` intent across blocked passes until heuristics run.
         useTempDataHome("ctx-busting-test1-");
         const sessionId = "ses-historian-publish";
         const historyRefreshSessions = new Set<string>();
@@ -145,22 +133,19 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             directory: testDirectory,
         });
 
-        // First pass establishes the session in the DB.
         await transform({}, { messages: buildSimpleMessages(sessionId) });
 
-        // Simulate historian publication: signals BOTH history refresh and
-        // pending materialization (per the new producer rule).
+        // Historian publication signals both history refresh and pending materialization.
         historyRefreshSessions.add(sessionId);
         pendingMaterializationSessions.add(sessionId);
 
-        // Block compartment using the in-memory promise registry (this is
-        // what postprocess actually consults).
+        // `blockCompartmentRun` registers an in-memory pending promise because `compartmentRunning` reads active runs.
         const lift = blockCompartmentRun(sessionId);
 
         try {
-            // Defer pass A: prepareCompartmentInjection consumes
-            // historyRefresh and drains it. Heuristics are blocked by
-            // compartmentRunning, so pendingMaterialization survives.
+            // `prepareCompartmentInjection` drains `historyRefreshSessions`.
+            // prepareCompartmentInjection drains historyRefreshSessions.
+            // compartmentRunning blocks heuristics, so pendingMaterializationSessions retains the session.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
 
             expect(historyRefreshSessions.has(sessionId)).toBe(false); // drained
@@ -171,14 +156,10 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
     });
 
     it("Test 2: two subsequent defer passes after one historian publish — history is rebuilt exactly once", async () => {
-        // Scenario from Oracle: a single historian publish should NOT
-        // cause two cache busts (one per defer pass). The pre-refactor
-        // heuristics couldn't run, so each defer pass re-rebuilt the
+        // A single historian publish must not invalidate the cache twice.
         // injection block.
         //
-        // After the fix: history refresh is drained immediately after
-        // prepareCompartmentInjection consumes it, so even if subsequent
-        // defer passes happen back-to-back, they hit the cached injection.
+        // Subsequent defer passes use the cached injection after historyRefreshSessions is drained.
         useTempDataHome("ctx-busting-test2-");
         const sessionId = "ses-two-defer";
         const historyRefreshSessions = new Set<string>();
@@ -207,25 +188,18 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         // Establish session.
         await transform({}, { messages: buildSimpleMessages(sessionId) });
 
-        // Historian publish: both signals set.
         historyRefreshSessions.add(sessionId);
         pendingMaterializationSessions.add(sessionId);
 
-        // Defer pass A: drains historyRefresh.
         await transform({}, { messages: buildSimpleMessages(sessionId) });
         expect(historyRefreshSessions.has(sessionId)).toBe(false);
 
-        // Defer pass B: historyRefresh stays drained, no re-add.
         await transform({}, { messages: buildSimpleMessages(sessionId) });
         expect(historyRefreshSessions.has(sessionId)).toBe(false);
     });
 
     it("Test 3: /ctx-flush while compartment is running — materialization survives the blocked pass and runs on next safe pass", async () => {
-        // Scenario from Oracle: user runs /ctx-flush, but compartment is
-        // still running. The flush MUST survive into the next pass once
-        // compartmentRunning lifts. The pre-refactor design coupled this
-        // signal to history rebuild, but the consumer logic was correct;
-        // the new design makes the persistence semantics explicit.
+        // pendingMaterializationSessions retains the session until heuristics can consume it.
         useTempDataHome("ctx-busting-test3-");
         const sessionId = "ses-flush-during-compartment";
         const historyRefreshSessions = new Set<string>();
@@ -254,39 +228,34 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         // Establish session.
         await transform({}, { messages: buildSimpleMessages(sessionId) });
 
-        // Block compartment using in-memory promise registry.
+        // blockCompartmentRun registers the compartment in the in-memory promise registry that postprocess checks.
         const lift = blockCompartmentRun(sessionId);
 
         try {
-            // Simulate /ctx-flush: signals all three (we use the relevant two
-            // for this scope — system-prompt set is exercised in its own
+            // `/ctx-flush` adds the session to `historyRefreshSessions` and `pendingMaterializationSessions`.
             // module's tests).
             historyRefreshSessions.add(sessionId);
             pendingMaterializationSessions.add(sessionId);
 
-            // Pass A: blocked. historyRefresh drained by injection rebuild.
-            // pendingMaterialization persists because heuristics can't run.
+            // prepareCompartmentInjection drains historyRefreshSessions while compartmentRunning blocks heuristics.
+            // pendingMaterializationSessions retains the session while compartmentRunning blocks heuristics.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             expect(historyRefreshSessions.has(sessionId)).toBe(false);
             expect(pendingMaterializationSessions.has(sessionId)).toBe(true);
 
-            // Lift the block (simulate compartment finishing).
             lift();
 
-            // Pass B: heuristics CAN run now. pendingMaterialization gets
-            // drained by the heuristics block (line ~360 of postprocess).
+            // Heuristics drain `pendingMaterializationSessions` after `compartmentRunning` clears.
+            // Heuristics drain `pendingMaterializationSessions` after `compartmentRunning` clears.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
         } finally {
-            // Always lift if not already lifted (no-op if resolver was called).
             lift();
         }
     });
 
     it("Test 4: delayed heuristic execution after the active run settles — pendingMaterialization drains exactly once", async () => {
-        // Variant of Test 3 emphasizing that pendingMaterialization
-        // drains on the FIRST safe pass after the block lifts, and stays
-        // drained on subsequent passes (no spurious re-add).
+        // Heuristics drain `pendingMaterializationSessions` on the first pass after `compartmentRunning` clears.
         useTempDataHome("ctx-busting-test4-");
         const sessionId = "ses-delayed-drain";
         const historyRefreshSessions = new Set<string>();
@@ -315,27 +284,22 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         // Establish session.
         await transform({}, { messages: buildSimpleMessages(sessionId) });
 
-        // Block compartment using in-memory promise registry + signal flush.
         const lift = blockCompartmentRun(sessionId);
         pendingMaterializationSessions.add(sessionId);
 
         try {
-            // Pass A: blocked.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             expect(pendingMaterializationSessions.has(sessionId)).toBe(true);
 
-            // Pass B: still blocked. Materialization still pending.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             expect(pendingMaterializationSessions.has(sessionId)).toBe(true);
 
             // Lift block.
             lift();
 
-            // Pass C: heuristics run, drain.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
 
-            // Pass D: stays drained.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
         } finally {
@@ -344,10 +308,8 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
     });
 
     it("system-prompt-refresh decoupling: historian publish does NOT signal systemPromptRefreshSessions", async () => {
-        // Bonus regression for Oracle's separation requirement:
-        // historian publication should refresh history + materialization
-        // but NOT touch system-prompt adjuncts (docs/profile/key-files).
-        // This avoids burning IO re-reading disk-backed adjuncts on every
+        // Historian publication signals history refresh and pending materialization.
+        // Historian publication must not signal systemPromptRefreshSessions.
         // historian publish.
         useTempDataHome("ctx-busting-test5-");
         const sessionId = "ses-prompt-decouple";
@@ -377,15 +339,12 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
 
         await transform({}, { messages: buildSimpleMessages(sessionId) });
 
-        // Simulate historian publish: only history + materialization.
-        // The producer code in transform.ts/hook.ts MUST NOT touch
         // systemPromptRefreshSessions here.
         historyRefreshSessions.add(sessionId);
         pendingMaterializationSessions.add(sessionId);
 
         await transform({}, { messages: buildSimpleMessages(sessionId) });
 
-        // System-prompt set was never touched by historian publication.
         expect(systemPromptRefreshSessions.has(sessionId)).toBe(false);
     });
 
@@ -678,10 +637,6 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         const lift = blockCompartmentRun(sessionId);
         let passAText = "";
         try {
-            // Warm-up: materialize m[0] first so pass A is a SOFT pass (not a
-            // first_render HARD fold). A hard fold would correctly drain through
-            // the compartment veto via fold-exec — this test specifically covers
-            // the blocked-defer path on a NON-busting pass.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             historyRefreshSessions.add(sessionId);
             pendingMaterializationSessions.add(sessionId);
@@ -837,10 +792,6 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         });
 
         const lift = blockCompartmentRun(sessionId);
-        // Warm-up: materialize m[0] first so pass A is a SOFT pass (not a
-        // first_render HARD fold, which would correctly drain through the
-        // compartment veto via fold-exec). This test covers the blocked-defer
-        // retry path on a NON-busting pass.
         await transform({}, { messages: buildSimpleMessages(sessionId) });
         historyRefreshSessions.add(sessionId);
         pendingMaterializationSessions.add(sessionId);
@@ -895,5 +846,4 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
     });
 });
 
-// Reference unused imports to satisfy TS / silence linter:
 void getOrCreateSessionMeta;

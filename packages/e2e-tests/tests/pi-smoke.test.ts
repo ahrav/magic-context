@@ -3,10 +3,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
 
-// TODO: add Pi historian-success, dreamer-schedule, and
-// sidekick/ctx-aug e2e coverage once async listeners/subagent runs survive
-// `agent_end` in single-shot mode. Today `pi --print` exits immediately after
-// the parent turn, which makes those async features intentionally out of scope.
+// TODO: Add e2e coverage for Pi historian-success, dreamer-schedule, and sidekick/ctx-aug.
 
 let h: PiTestHarness;
 

@@ -73,11 +73,8 @@ const managedDemandStart = createLazyManagedDemandStart({
 });
 
 const server: Plugin = async (ctx) => {
-    // Broca child processes must not initialize Magic Context. The buffered
-    // logger is off limits here: it arms a flush timer and appends to the
-    // Magic Context log file, both of which this guard exists to prevent.
-    // stderr is side-effect-free and the host captures it as bounded
-    // diagnostics (stdout would corrupt the transcript stream).
+    // Broca child processes must not initialize Magic Context.
+    // Do not use the buffered logger: it arms a flush timer and appends to the Magic Context log file.
     if (process.env.MAGIC_CONTEXT_BROCA_CHILD === "1") {
         console.error(
             "[magic-context] broca child detected (MAGIC_CONTEXT_BROCA_CHILD=1); skipping plugin startup",
@@ -87,10 +84,9 @@ const server: Plugin = async (ctx) => {
     configureManagedDemandStart(managedDemandStart);
     configureSynapseManagedDemandStart(managedDemandStart);
     beginBootQuietPeriod();
-    // Move config from the legacy per-harness locations to the shared CortexKit
-    // location BEFORE loading (hard cutover: the loader reads only CortexKit).
-    // Idempotent + lock-guarded for Desktop multi-instance; fails open. Warnings
-    // (conflicts / partial failures) are surfaced via the config-warning path.
+    // Migrate legacy per-harness config before loading because the loader reads only the shared CortexKit location.
+    // The migration is idempotent, uses a lock across Desktop instances, and fails open.
+    // The config-warning path surfaces migration conflicts and partial failures.
     const configMigrationWarnings = migrateMagicContextConfigLocations(ctx.directory, {
         warn: (m) => log(`[magic-context] ${m}`),
         info: (m) => log(`[magic-context] ${m}`),
@@ -108,29 +104,26 @@ const server: Plugin = async (ctx) => {
             ...(pluginConfig.configWarnings ?? []),
         ];
     }
-    // Apply process-wide storage policy and SQLite tuning before the first
-    // openDatabase() below. Storage is user-tier only, so it is shared safely by
-    // every project handled by this plugin process.
+    // Configure storage policy and SQLite tuning before the first openDatabase() call.
+    // Storage is user-tier and shared by every project handled by this plugin process.
     setStoragePrivatePermissionEnforcement(pluginConfig.storage.enforce_private_permissions);
     setSqlitePragmaConfig({
         cacheSizeMb: pluginConfig.sqlite.cache_size_mb,
         mmapSizeMb: pluginConfig.sqlite.mmap_size_mb,
     });
-    // Debug data-collection toggle: when on, keep subagent child sessions
-    // (historian/dreamer/sidekick/migration) instead of deleting on success.
+    // When enabled, keep historian, dreamer, sidekick, and migration child sessions after success.
     setKeepSubagents(pluginConfig.keep_subagents === true);
     const autoUpdateAbort = new AbortController();
-    // Abort on process exit via the shared single-listener registry. Registering
-    // a process.once("exit") here directly would add one listener PER plugin
-    // instance, and OpenCode Desktop runs many in one process (Node warns past 10).
+    // Register autoUpdateAbort with the shared exit listener to avoid one process listener per plugin instance.
+    // Registering process.once("exit") per plugin instance would add one exit listener per instance.
+    // OpenCode Desktop runs many plugin instances in one process, and Node warns after 10 exit listeners.
     registerExitAbort(autoUpdateAbort);
 
-    // Surface config validation warnings to user and log
     if (pluginConfig.configWarnings?.length) {
         for (const w of pluginConfig.configWarnings) {
             log(`[magic-context] config warning: ${w}`);
         }
-        // Send warning to user via startup notification (after a short delay so session is ready)
+        // Delay the startup notification until an active session is available.
         const warningText = [
             "## ⚠️ Magic Context Config Warning",
             "",
@@ -146,16 +139,12 @@ const server: Plugin = async (ctx) => {
                 const { sendIgnoredMessage } = await import(
                     "./hooks/magic-context/send-session-notification"
                 );
-                // sendIgnoredMessage already handles TUI (toast) vs Desktop (ignored message)
-                // via isTuiConnected(). We need a session ID — use the first active session.
-                // SDK types don't expose `session.list()`'s actual response shape (the
-                // client surface has been through multiple revisions; some versions
-                // return `{ data: [...] }`, others return the array directly), so we
-                // probe both shapes defensively at runtime.
+                // sendIgnoredMessage routes TUI notifications to toasts and Desktop notifications to ignored messages via isTuiConnected().
+                // Use the first active session because sendIgnoredMessage requires a session ID.
+                // session.list() may return `{ data: [...] }` or an array, so handle both shapes at runtime.
                 type SessionListFn = () => Promise<
                     { data?: Array<{ id?: string }> } | Array<{ id?: string }>
                 >;
-                // SAFETY: probe guards every access at runtime.
                 const clientWithSessions = ctx.client as unknown as {
                     session?: { list?: SessionListFn };
                 };
@@ -165,35 +154,28 @@ const server: Plugin = async (ctx) => {
                 const sessionList = Array.isArray(sessions) ? sessions : sessions?.data;
                 const sessionId = sessionList?.[0]?.id;
                 if (sessionId) {
-                    // Pin the session's last real turn (agent + model + variant)
-                    // onto the warning. Passing nothing makes OpenCode record the
-                    // DEFAULT agent/model on this ignored message — which both
-                    // mis-attributes the notice (shows the default agent, not the
-                    // session's) AND switches the model on the user's next turn,
-                    // busting the prefix cache. resolvePromptContext reads from
-                    // real session messages and returns null on a fresh/empty
-                    // session, so this degrades safely there.
+                    // Pass the session's agent, model, and variant so the ignored message does not select the default agent or model.
+                    // Passing no agent, model, or variant records the ignored message with the defaults.
+                    // Using the defaults attributes the notice to the default agent rather than the session agent.
+                    // Using the defaults switches the model on the next user turn and invalidates the prefix cache.
+                    // `resolvePromptContext` reads real session messages and returns `null` for fresh or empty sessions.
                     await sendIgnoredMessage(ctx.client, sessionId, warningText, {});
                 }
             } catch {
-                // Intentional: config warning delivery must not crash startup
+                // Config warning delivery must not crash startup.
             }
         }, 3000);
     }
 
-    // Detect conflicts that prevent magic-context from operating correctly.
-    // The resolved MC compaction mode is threaded in explicitly — the detector
-    // never re-derives it from the config path. In compaction-off mode,
-    // native compaction.auto=true is NOT a conflict (native compaction is the
-    // user's chosen window manager), so the plugin stays enabled.
+    // Pass `resolvedCompaction` explicitly because `detectConflicts` does not re-derive it from config files.
+    // When MC compaction is off, native `compaction.auto=true` is not a conflict.
+    // When MC compaction is off, native `compaction.auto=true` leaves the plugin enabled.
     //
-    // The native compaction state comes from the host's RESOLVED config
-    // (ctx.client.config.get() — the same object `opencode debug config`
-    // prints), NOT from re-reading config files ourselves (issue #309: the
-    // file-based re-derivation defaults to auto=true when no file resolves,
-    // wrongly disabling the plugin for users whose auto=false lives in a layer
-    // we cannot see). If the resolved fetch fails or times out, we fall back to
-    // the file-based check unchanged and log one line naming the fallback.
+    // `ctx.client.config.get()` returns the configuration shown by `opencode debug config`.
+    // Native compaction state is read from `ctx.client.config.get()`, not re-derived from config files.
+    // File-based re-derivation defaults `compaction.auto` to `true` when no configuration file resolves.
+    // File-based detection can disable the plugin when `auto=false` is defined in an unresolved configuration layer.
+    // If the resolved-config fetch fails or times out, conflict detection uses the file-based check.
     let conflictResult: ConflictResult | null = null;
     if (pluginConfig.enabled) {
         const resolvedCompaction = await resolveCompactionForBoot(ctx.client);
@@ -228,8 +210,8 @@ const server: Plugin = async (ctx) => {
         promptSurfaceRuntime,
     });
 
-    // Mutable holder so a healed storage reopen can install real hooks without
-    // rebuilding the outer messages-transform wrapper.
+    // A healed storage reopen installs real hooks without rebuilding the outer messages-transform wrapper.
+    // The mutable holder lets a healed storage reopen install real hooks without rebuilding the outer messages-transform wrapper.
     const magicContextRuntime: {
         magicContext: typeof hooks.magicContext;
         rustToolBackends: typeof hooks.rustToolBackends;
@@ -238,9 +220,8 @@ const server: Plugin = async (ctx) => {
         rustToolBackends: hooks.rustToolBackends,
     };
 
-    // Loud fail-closed gate: when the user enabled MC but storage cannot open
-    // (schema fence / migration hard failure), block primary transforms instead
-    // of silently unregistering hooks and falling through to native compaction.
+    // When MC is enabled but storage cannot open because of a schema fence or migration failure, block primary transforms instead of falling through to native compaction.
+    // Storage-open failures must not unregister hooks and fall through to native compaction.
     const failClosed = createFailClosedController();
     const failClosedBlockingEnabled =
         pluginConfig.enabled === true && pluginConfig.fail_closed_blocking !== false;
@@ -287,21 +268,15 @@ const server: Plugin = async (ctx) => {
         registrationPromptSurface: loadedPluginConfig.registrationPromptSurface,
     });
 
-    // Resolve storage dir up front. Used by the RPC server below AND by
-    // the auto-update checker (for cross-process dedup of npm hits when
-    // multiple plugin instances boot concurrently). Resolving outside the
-    // `enabled` block lets the auto-update checker still coordinate even
-    // when the rest of the runtime is disabled by config or conflicts.
+    // The auto-update checker uses `storageDir` to deduplicate npm requests across concurrent plugin instances.
+    // The auto-update checker deduplicates npm requests even when configuration or conflicts disable the runtime.
     const storageDir = getMagicContextStorageDir();
 
-    // Per-instance process-resident handles, hoisted to function scope so the
-    // server.instance.disposed cleanup (wired into the event handler below, which
-    // is returned outside this block) can stop them.
+    // Function-scope handles let the `server.instance.disposed` cleanup handler stop them.
     let rpcServer: MagicContextRpcServer | null = null;
     let stopDreamTimerRegistration: (() => void) | undefined;
 
-    // Start independent dream schedule timer at plugin level (not inside hooks)
-    // so overnight dreaming works even when the user isn't chatting.
+    // The dream schedule timer runs at plugin level so overnight dreaming works without chat activity.
     if (pluginConfig.enabled) {
         const dreamerRunnable = isDreamerRunnable(pluginConfig);
         const classifyModuleClient = createDreamTimerModuleClient(rustModeModuleClient);
@@ -352,13 +327,10 @@ const server: Plugin = async (ctx) => {
                 },
                 moduleClient: classifyModuleClient,
             };
-            // Fail OPEN: the dream timer is best-effort background maintenance and must
-            // never abort the plugin load. This block is awaited and runs BEFORE the
-            // hooks are returned, so an unguarded throw here (e.g. a fatal DB open, or
-            // ensureRegistered failing) would escape server() and leave the transform /
-            // compaction pipeline unregistered — ballooning every session's context.
-            // openTimerDatabaseOrNull already degrades a fatal open to null, but we wrap
-            // the whole registration as defense in depth against any other throw path.
+            // The dream timer is best-effort background maintenance, so registration failures must not prevent hook registration.
+            // Registration failures must not leave the transform and compaction pipeline unregistered.
+            // `openTimerDatabaseOrNull` converts fatal timer-database opens to `null`.
+            // The registration wrapper catches errors other than fatal timer-database opens.
             try {
                 stopDreamTimerRegistration = await startDreamScheduleTimer(timerRegistration);
             } catch (err) {
@@ -368,8 +340,7 @@ const server: Plugin = async (ctx) => {
             }
         }
 
-        // Start RPC server for TUI↔server communication (replaces SQLite plugin_messages bus).
-        // `storageDir` is hoisted above so the auto-update checker can also use it.
+        // RPC communication between the TUI and server bypasses the SQLite plugin_messages bus.
         rpcServer = new MagicContextRpcServer(storageDir, ctx.directory);
         registerRpcHandlers(rpcServer, {
             directory: ctx.directory,
@@ -382,40 +353,24 @@ const server: Plugin = async (ctx) => {
             log(`[magic-context] RPC server failed to start: ${err}`);
         });
 
-        // Warm the model-context-limit cache from OpenCode's SDK once at startup.
-        // The API response matches OpenCode's internal resolution (live models.dev
-        // cache + compiled-in snapshot + custom provider overrides + derived
-        // experimental modes + auth-plugin caps), so any model OpenCode knows the
-        // limit for, we know too — and it is the SOLE source (we no longer read
-        // models.json ourselves). Until it warms, resolution falls back to the
-        // persisted last-known-good cache (instant on restart) then the 128k
-        // default for a brand-new install's first few passes.
+        // Startup warms the model-context-limit cache from OpenCode's SDK once.
+        // The resolver refreshes model context limits from the OpenCode API.
+        // Until refresh completes, resolution uses the persisted last-known-good limit, then 128k.
         //
-        // Retry a couple times if OpenCode's provider service isn't ready yet at
-        // our startup (the only "cold" case — OpenCode itself always has the data).
-        // Fire-and-forget so it never blocks plugin init.
+        // Startup retries up to 3 times when OpenCode's provider service is unavailable.
+        // The refresh runs fire-and-forget so it never blocks plugin initialization.
         //
-        // Do NOT refresh periodically. Limits are stable in practice, and newly
-        // added models require an OpenCode restart anyway because provider
-        // plugins, snapshots, and opencode.jsonc are loaded at process boot. More
-        // importantly, issue #77 showed that a later refresh can regress to a
-        // smaller/wrong limit and silently break an in-progress session. The
-        // event handler may still retry this refresh once when it detects an
-        // bad cache value, but normal operation is one-shot.
+        // The resolver does not schedule periodic refreshes because a later refresh can lower a limit during an active session.
         void refreshModelLimitsFromApi(ctx.client, { retries: 3, retryDelayMs: 1000 });
     }
 
-    // Schema-fence warning for Desktop mode. If openDatabase() fail-closed
-    // because the shared DB is newer than this build supports (cross-harness
-    // partial upgrade), the user otherwise sees Magic Context silently stop
-    // working. Surface a clear, actionable message. (TUI/Pi see the log line;
-    // Desktop has no dialog surface, so this ignored-message path covers it.)
+    // `openDatabase()` fails closed for newer shared schemas; warn Desktop users because Desktop has no dialog surface.
+    // The ignored-message path warns Desktop users because Desktop has no dialog surface.
     {
         const fence = getSchemaFenceRejection();
         if (fence) {
             void import("./plugin/conflict-warning-hook").then(({ sendSchemaFenceWarning }) =>
                 sendSchemaFenceWarning(
-                    // SAFETY: helper duck-types the client at runtime.
                     ctx.client as unknown as Record<string, unknown>,
                     ctx.directory,
                     fence,
@@ -424,44 +379,33 @@ const server: Plugin = async (ctx) => {
         }
     }
 
-    // Conflict warning / cleanup for Desktop mode.
-    // TUI handles this via a startup dialog; this covers Desktop where we can't show dialogs.
+    // Desktop has no dialog surface, so `sendConflictWarning` covers Desktop.
     if (conflictResult?.hasConflict) {
-        // Fire-and-forget: send warning to the last active session for this project
+        // The handler sends the warning to the project's last active session without awaiting it.
         void sendConflictWarning(
-            // SAFETY: helper duck-types the client at runtime.
             ctx.client as unknown as Record<string, unknown>,
             ctx.directory,
             conflictResult,
         );
     } else if (pluginConfig.enabled) {
-        // No conflicts — clean up any leftover warning messages from previous disabled runs
+        // The handler removes leftover conflict warnings only when no conflict exists and pluginConfig.enabled.
         const serverUrl = (ctx as Record<string, unknown>).serverUrl;
         const serverUrlStr =
             serverUrl instanceof URL ? serverUrl.toString().replace(/\/$/, "") : undefined;
         void cleanupConflictWarnings(
-            // SAFETY: helper duck-types the client at runtime.
             ctx.client as unknown as Record<string, unknown>,
             ctx.directory,
             serverUrlStr,
         );
     }
 
-    // The TUI sidebar entry in tui.json(c) is added ONLY by the setup wizard and
-    // `doctor` — never at plugin startup. Startup injection would re-add the entry
-    // every launch, so a user who deliberately removed the sidebar could never
-    // keep it removed.
+    // Only the setup wizard and `doctor` add the TUI sidebar entry; startup must not restore an entry the user removed.
 
-    // Desktop-only startup announcement: post a one-shot ignored message
-    // describing what's new in this release.
+    // Desktop posts one ignored announcement message per release.
     //
-    // TUI delivery is handled by the TUI plugin via the `get-announcement` /
-    // `mark-announced` RPC handlers (registered above). Both surfaces share
-    // the same `last_announced_version` persistence file so dismissal in
-    // either harness suppresses the dialog/message in the other.
+    // TUI and Desktop share `last_announced_version`, so dismissal on either surface suppresses announcements on both.
     //
-    // Deferred 8s so the active session has stabilized; runs fire-and-forget
-    // so a failure here can never block plugin startup.
+    // Startup delays delivery 8 seconds and does not await it, so delivery failures cannot block startup.
     if (pluginConfig.enabled && !conflictResult?.hasConflict) {
         try {
             const {
@@ -476,7 +420,6 @@ const server: Plugin = async (ctx) => {
                     void import("./plugin/conflict-warning-hook")
                         .then(({ sendStartupAnnouncement }) =>
                             sendStartupAnnouncement(
-                                // SAFETY: helper duck-types the client at runtime.
                                 ctx.client as unknown as Record<string, unknown>,
                                 ctx.directory,
                                 ANNOUNCEMENT_VERSION,
@@ -486,26 +429,17 @@ const server: Plugin = async (ctx) => {
                             ),
                         )
                         .catch(() => {
-                            // Best-effort — don't block startup
                         });
                 }, 8000);
             }
         } catch {
-            // Best-effort — never block startup on announcement delivery
         }
     }
 
-    // Latch: remembers the {providerID, modelID, agentName} from the most
-    // recent `chat.message` so we can attribute `tool.definition` hook fires
-    // to a key. The hook input only carries `toolID`, and `registry.tools()`
-    // runs right after `chat.message` in OpenCode's prompt flow, so this
-    // captures the correct owner for each flight.
+    // `tool.definition` events use the latest chat context because their input contains only `toolID`.
     let lastChatContext: { providerID: string; modelID: string; agentName: string } | null = null;
 
-    // Directory of the project THIS plugin instance serves. Desktop can run two
-    // instances whose directories resolve to the same project identity (for
-    // example through symlinks or alternate checkout paths), so disposal must
-    // match this concrete instance directory rather than the shared identity.
+    // Disposal matches `ownInstanceDirectory`, not a shared project identity.
     const ownInstanceDirectory = ctx.directory;
 
     return {
@@ -519,27 +453,15 @@ const server: Plugin = async (ctx) => {
             autoUpdateChecker: createAutoUpdateCheckerHook(ctx, {
                 autoUpdate: pluginConfig.auto_update !== false,
                 signal: autoUpdateAbort.signal,
-                // Multi-project plugin reloads coordinate via this on-disk
-                // timestamp so npm gets hit at most once per check window
-                // across every concurrent plugin instance on the machine.
                 storageDir,
             }),
-            // Orderly cleanup of THIS instance's process-resident resources when
-            // OpenCode disposes it (server.instance.disposed). Desktop runs many
-            // instances in one process, each disposed independently, so we only
-            // act when the disposed directory matches OUR concrete instance
-            // directory — tearing down a sibling instance's RPC server / dream timer would
-            // break still-live sessions. We deliberately do NOT dispose the
-            // native ONNX embedding session here: forcing onnxruntime-node's
-            // destructor on teardown makes the Bun N-API exit crash worse, not
-            // better (tracked upstream at oven-sh/bun#30291). The OS reclaims
-            // that memory on exit anyway.
+            // `onInstanceDisposed` cleans up only this instance's process-resident resources.
+            // Instance teardown must not dispose the native ONNX embedding session.
             onInstanceDisposed: (disposedDirectory: string) => {
                 if (!isDisposedInstanceDirectory(ownInstanceDirectory, disposedDirectory)) return;
                 try {
                     autoUpdateAbort.abort();
-                    // Drop it from the exit-abort registry so disposed instances'
-                    // controllers aren't retained there for the process lifetime.
+                    // Disposal unregisters `autoUpdateAbort` so the exit-abort registry does not retain it.
                     unregisterExitAbort(autoUpdateAbort);
                 } catch {
                     // best-effort
@@ -562,15 +484,12 @@ const server: Plugin = async (ctx) => {
                 );
             },
         }),
-        // SAFETY: wrapper matches the hook's runtime call shape.
         "experimental.chat.messages.transform": createMessagesTransformHandler({
             magicContext: magicContextRuntime.magicContext,
             getMagicContext: () => magicContextRuntime.magicContext,
             failClosed,
             failClosedBlockingEnabled,
-            // Compaction-off mode (issue #266): fail_closed_blocking is inert
-            // BY DESIGN in this mode — a failed transform degrades to
-            // passthrough of the input messages instead of blocking the turn.
+            // When compaction is disabled, a failed transform passes through the input messages even if `failClosedBlocking` is enabled.
             compactionOff: !isCompactionEnabled(pluginConfig),
             internalChildSessions: liveSessionState.internalChildSessions,
             tryReopenStorage,
@@ -586,14 +505,9 @@ const server: Plugin = async (ctx) => {
             await magicContextRuntime.magicContext?.["command.execute.before"]?.(input, output);
         },
         "chat.message": async (input, _output) => {
-            // The first real prompt is the lazy-load boundary. Awaiting here keeps
-            // the tokenizer out of cold start while ensuring synchronous token
-            // estimates later in this prompt use the installed package.
+            // The first prompt awaits `preloadTokenizer()` so later synchronous estimates use the installed package.
             await preloadTokenizer();
-            // Update tool-def measurement latch before delegating to magic-context
-            // hooks. `registry.tools()` is invoked right after chat.message inside
-            // OpenCode's prompt flow (see session/prompt.ts), so by the time
-            // `tool.definition` fires we'll have the correct {provider, model, agent}.
+            // The handler sets `lastChatContext` before magic-context hooks because `registry.tools()` runs next and `tool.definition` uses that context.
             const typed = input as {
                 model?: { providerID?: string; modelID?: string };
                 agent?: string;
@@ -607,11 +521,7 @@ const server: Plugin = async (ctx) => {
             await magicContextRuntime.magicContext?.["chat.message"]?.(input);
         },
         "tool.definition": async (input, output) => {
-            // Attribute tool schema tokens to the most recent chat-message context.
-            // If no chat.message has fired yet in this process (e.g. a subagent
-            // flight that reuses a historian/dreamer/sidekick agent whose
-            // chat.message preceded plugin init), skip — the measurement will
-            // land correctly on the next flight.
+            // The handler skips tool-definition measurement until `chat.message` supplies provider, model, and agent context.
             if (!lastChatContext) return;
             const typedInput = input as { toolID?: string };
             const typedOutput = output as { description?: unknown; parameters?: unknown };
@@ -633,16 +543,9 @@ const server: Plugin = async (ctx) => {
         },
         config: async (config) => {
             try {
-                // If the runtime is disabled (a conflicting plugin — DCP / OMO /
-                // OpenCode auto-compaction — was detected and we fail-safed at boot),
-                // do NOT register the /ctx-* commands or hidden agents. The transform/
-                // tools/RPC are already no-op'd, so surfacing command entries + hidden
-                // agents the runtime won't service is pure UX confusion.
                 if (pluginConfig.enabled !== true) {
                     return;
                 }
-                // See buildHiddenAgentConfig (agents/hidden-agent-registrations.ts)
-                // for permission precedence and hard `steps`/`maxSteps` cap semantics.
                 const commandConfig = {
                     ...(config.command ?? {}),
                     ...getMagicContextBuiltinCommands(isCompactionEnabled(pluginConfig)),
@@ -650,11 +553,7 @@ const server: Plugin = async (ctx) => {
                 };
 
                 config.command = commandConfig;
-                // Extract only agent-override fields (not scheduling fields) for agent registration
-                // thinking_level is stripped from every hidden agent's overrides: it
-                // is Pi-only (passed as --thinking to the Pi subprocess) and is not a
-                // valid OpenCode agent config field, so leaking it puts an unknown key
-                // on the OpenCode agent config.
+                // Hidden-agent overrides remove `thinking_level` because OpenCode does not accept it as an agent config field.
                 const dreamerAgentOverrides = pluginConfig.dreamer
                     ? (() => {
                           const {
@@ -677,13 +576,8 @@ const server: Plugin = async (ctx) => {
                           return agentOverrides;
                       })()
                     : undefined;
-                // Strip two_pass + disallowed_tools + thinking_level from historian
-                // overrides — two_pass is consumed by the runner, disallowed_tools is
-                // consumed below to build the permission map, thinking_level is Pi-only
-                // (passed as --thinking to the Pi subprocess). None is a valid OpenCode
-                // agent config field, so leaking them in would put unknown keys on the
-                // OpenCode agent config. Both historian and historian-editor agents use
-                // the remaining overrides (same model, fallbacks, etc.).
+                // Historian overrides remove `two_pass`, `disallowed_tools`, and `thinking_level` because OpenCode rejects them as agent config fields.
+                // Historian overrides remove `two_pass`, `disallowed_tools`, and `thinking_level` because OpenCode rejects them as agent config fields.
                 const historianAgentOverrides = pluginConfig.historian
                     ? (() => {
                           const {
@@ -695,20 +589,15 @@ const server: Plugin = async (ctx) => {
                           return agentOverrides;
                       })()
                     : undefined;
-                // Build hidden-agent registrations from a helper in a NON-entry
-                // module (see hidden-agent-registrations.ts: exporting it from the
-                // entry would make OpenCode's legacy loader invoke it as a plugin
-                // factory). Each agent is guarded on its prompt: if a prompt is
-                // somehow undefined at this instant, SKIP that agent and log,
-                // rather than register a broken agent.
+                // OpenCode's legacy loader invokes entry exports as plugin factories, so `buildHiddenAgentRegistrations` must remain outside the entry module.
+                // OpenCode's legacy loader invokes entry exports as plugin factories, so `buildHiddenAgentRegistrations` must remain outside the entry module.
+                // OpenCode's legacy loader invokes entry exports as plugin factories, so `buildHiddenAgentRegistrations` must remain outside the entry module.
+                // OpenCode's legacy loader invokes entry exports as plugin factories, so `buildHiddenAgentRegistrations` must remain outside the entry module.
+                // OpenCode's legacy loader invokes entry exports as plugin factories, so `buildHiddenAgentRegistrations` must remain outside the entry module.
+                // OpenCode's legacy loader invokes entry exports as plugin factories, so `buildHiddenAgentRegistrations` must remain outside the entry module.
                 const registrations = buildHiddenAgentRegistrations({
                     dreamerPrompt: DREAMER_SYSTEM_PROMPT,
                     smartNoteCompilerPrompt: SMART_NOTE_COMPILER_SYSTEM_PROMPT,
-                    // v2: the v8.7.3 historian prompt always describes the
-                    // <user_observations> output; observations are simply not
-                    // promoted to user-profile when user_memories is disabled
-                    // (gated in the runner). Keeping the system prompt constant
-                    // preserves prompt-cache byte stability.
                     historianPrompt: withContentLanguageDirective(
                         COMPARTMENT_AGENT_SYSTEM_PROMPT,
                         pluginConfig.language,
@@ -757,11 +646,8 @@ const server: Plugin = async (ctx) => {
                 );
                 config.agent = callerAgentConfig as NonNullable<typeof config.agent>;
             } catch (error) {
-                // A failure registering commands/agents must NEVER fail the whole
-                // plugin load — that would also disable the transform/compaction
-                // (the core context-management path), letting every session's
-                // context grow unbounded. Log with the stack so the real cause is
-                // visible, and let Magic Context keep running with whatever it had.
+                // Command and agent registration failures must not prevent plugin loading.
+                // Registration failures retain the previous agent configuration.
                 const e = error as { message?: string; stack?: string };
                 log(
                     `[magic-context] config hook failed (commands/agents NOT registered; transform still active): ${e?.message ?? error}`,
@@ -774,17 +660,6 @@ const server: Plugin = async (ctx) => {
     };
 };
 
-// V1 plugin-object shape (`{ id, server }`), NOT a bare function. This is
-// load-bearing, not cosmetic: OpenCode's loader (opencode plugin/index.ts →
-// readV1Plugin / shared.ts:278-283) detects a default export that is an OBJECT
-// carrying `id`/`server`/`tui` as a V1 plugin and uses ONLY its `server`
-// function. A default export that is a FUNCTION instead falls through to the
-// legacy `getLegacyPlugins` path, which invokes EVERY exported function in this
-// module as a plugin factory `fn(input, options)` — so any stray helper export
-// would be called with the plugin input and could throw, failing the whole
-// plugin load (this caused the 2026-06 hidden-agent load incident). The object
-// shape bypasses that scan entirely, eliminating the footgun class. The `./tui`
-// entry already uses this same `{ id, tui }` shape.
 const plugin: PluginModule = {
     id: "opencode-magic-context",
     server,

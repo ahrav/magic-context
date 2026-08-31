@@ -9,14 +9,13 @@ function normalizeEndpoint(endpoint?: string): string {
 
 export type LocalEmbeddingPooling = "mean" | "cls";
 
-/** How a model's card says its vectors must be produced. Wrong pooling or a
- *  missing query instruction still yields plausible-looking vectors, just
- *  quietly bad rankings, so the recipe is bound to the model id rather than
- *  left to configuration. Defined here because the recipe participates in the
- *  provider identity below, and the provider module already imports this one. */
+/** A recipe fixes the pooling and query prefix required by a model card.
+ * Omitting the required query prefix produces poor retrieval rankings.
+ * Each recipe must remain keyed by model ID, not configuration.
+ * Recipes stay in this module because `getEmbeddingProviderIdentity` depends on them. */
 export interface LocalEmbeddingRecipe {
     pooling: LocalEmbeddingPooling;
-    /** Prepended to `"query"`-purpose inputs only; passages embed unprefixed. */
+    /** `queryPrefix` applies only to `"query"`-purpose inputs; passages remain unprefixed. */
     queryPrefix: string;
 }
 
@@ -26,10 +25,7 @@ const SYMMETRIC_RECIPE: LocalEmbeddingRecipe = { pooling: "mean", queryPrefix: "
 const MODEL_RECIPES: Record<string, LocalEmbeddingRecipe> = {
     // BGE v1.5 CLS-pools and expects this exact retrieval instruction on short
     // queries: https://huggingface.co/BAAI/bge-small-en-v1.5#model-usage
-    // Both the Xenova ONNX export and the upstream BAAI id name the same model
-    // card, so both bind the same recipe. Other spellings deliberately fall
-    // back to the symmetric recipe: guessing a recipe from a fuzzy name match
-    // risks applying the wrong transforms, which corrupts silently.
+    // Other spellings fall back to the symmetric recipe because fuzzy matching can silently apply wrong transforms.
     "Xenova/bge-small-en-v1.5": {
         pooling: "cls",
         queryPrefix: "Represent this sentence for searching relevant passages: ",
@@ -45,12 +41,11 @@ export function getLocalEmbeddingRecipe(model: string): LocalEmbeddingRecipe {
 }
 
 /**
- * Stable embedding-provider identity used for provider/pipeline reuse.
+ * `getEmbeddingProviderIdentity` returns a stable identity for provider and pipeline reuse.
  *
- * The API key value is intentionally never hashed or stored. Only key
- * presence participates in identity so switching between anonymous and
- * authenticated modes recreates the provider, while rotating a key does not
- * leak secret material into logs or persisted model ids.
+ * The identity never hashes or stores the API key value.
+ * Switching authentication modes recreates the provider.
+ * Rotating an API key does not expose the key or change the provider identity.
  */
 export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
     if (config.provider === "off") {
@@ -71,13 +66,8 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
     }
 
     const truncate = config.provider === "openai-compatible" ? config.truncate?.trim() : undefined;
-    // local_dtype changes the produced vectors (a quantized ONNX model emits
-    // different embeddings than fp32), so a non-default dtype MUST fold into the
-    // model identity — switching dtype re-embeds rather than mixing vector
-    // spaces. Spread CONDITIONALLY and EXCLUDE the default "fp32": omitting the
-    // term when unset OR when set to the default keeps the identity byte-
-    // identical for the common config, so adding this field does not force a
-    // global re-embed on upgrade. Mirrors the truncate fold above. See #259.
+    // A quantized ONNX model can emit vectors that differ from fp32.
+    // Changing `local_dtype` between a non-`"fp32"` value and `"fp32"` or unset re-embeds vectors.
     const localDtype =
         config.provider === "local" && config.local_dtype && config.local_dtype !== "fp32"
             ? config.local_dtype
@@ -93,18 +83,12 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
                   model: config.model.trim(),
                   endpoint: normalizeEndpoint(config.endpoint),
                   apiKeyPresent: Boolean(config.api_key?.trim()),
-                  // input_type changes the embedding vector space (e.g. NIM
-                  // 'query' vs 'passage'), so it participates in identity — a
-                  // change must re-embed. truncate changes which text an over-long
-                  // input actually embeds, so a change can shift those vectors and
-                  // it participates too. (query_input_type shapes only per-call
-                  // query requests, never the stored passage vectors, so it stays
-                  // out.) truncate is spread CONDITIONALLY: omitting it when unset
-                  // keeps the identity byte-identical for the common no-truncate
-                  // config, so adding this term does not force a global re-embed —
-                  // only configs that actually set truncate get a new identity
-                  // (and under per-model coexistence even that just coexists +
-                  // lazily GCs, never a destructive wipe).
+                  // For NIM, `input_type` selects vector spaces such as `query` and `passage`.
+                  // `input_type` participates in identity so changing it re-embeds stored vectors.
+                  // `truncate` changes the text embedded for over-long inputs.
+                  // `truncate` participates in identity because changing it can change vectors for over-long inputs.
+                  // `query_input_type` affects only per-call query requests, not stored passage vectors.
+                  // `query_input_type` stays out of identity because it does not affect stored passage vectors.
                   inputType: config.input_type?.trim() || "",
                   ...(truncate ? { truncate } : {}),
               }
@@ -114,15 +98,6 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
                   endpoint: "",
                   apiKeyPresent: false,
                   ...(localDtype ? { localDtype } : {}),
-                  // The recipe (pooling + query instruction) changes the produced
-                  // vectors for the SAME model name: a bge-small vector embedded
-                  // under the symmetric mean recipe is not comparable to one
-                  // embedded under CLS with the query instruction. Folding the
-                  // recipe in re-embeds installations whose stored vectors
-                  // predate the model's bound recipe. Spread CONDITIONALLY and
-                  // EXCLUDE the symmetric recipe, so models without a bound
-                  // recipe keep a byte-identical identity — mirrors the
-                  // localDtype fold above.
                   ...(localRecipe &&
                   (localRecipe.pooling !== "mean" || localRecipe.queryPrefix !== "")
                       ? {

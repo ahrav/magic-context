@@ -137,8 +137,6 @@ describe("pi historian success path", () => {
                         .get(sessionId) as { c: number } | null;
                     return (row?.c ?? 0) >= 1;
                 },
-                // Bumped from 30s → 90s for CI: Pi historian publishes via
-                // pi --print subprocess + HTTP mock provider; slower on shared
                 // runners.
                 { timeoutMs: 300_000, label: "pi compartment row appears" },
             );
@@ -158,13 +156,9 @@ describe("pi historian success path", () => {
             console.log(`[TEST] pi historian requests: ${historianRequests.length}`);
             expect(historianRequests.length).toBeGreaterThanOrEqual(1);
 
-            // Wait for the runner to fully exit — compartment_in_progress is
-            // cleared in the runner's `finally` block AFTER post-publish work
-            // (memory promotion, queue drops, compaction marker, compressor).
-            // The compartment row appears earlier in the flow, so seeing the
-            // row doesn't guarantee the flag has flipped yet. On shared CI
-            // runners the gap between publish and `finally` can stretch
-            // beyond the initial 300ms sleep.
+            // The test waits for the runner to exit because the runner clears `compartment_in_progress` in `finally`.
+            // The compartment row can exist before `compartment_in_progress` clears.
+            // The test waits for `compartment_in_progress` to clear instead of relying on a fixed 300 ms delay.
             await h.waitFor(
                 () => {
                     const meta = h
@@ -187,7 +181,7 @@ describe("pi historian success path", () => {
             );
             expect(meta?.compartment_in_progress ?? 1).toBe(0);
         },
-        // Bumped from 120s → 600s for CI to give the bumped waitFor headroom.
+        // The test uses a 600 s timeout to accommodate the 90 s wait timeout.
         600_000,
     );
 });

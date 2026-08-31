@@ -32,7 +32,7 @@ function fakeTagTarget(messageId: string) {
 	};
 }
 
-/** Test helper: throw when piMessageStableId returns undefined. */
+/* */
 function requireId(msg: unknown, index: number): string {
 	const id = piMessageStableId(msg, index);
 	if (!id)
@@ -99,7 +99,7 @@ describe("clearOldReasoningPi", () => {
 				],
 			},
 		];
-		// Pretend tags 1..2 exist; clear messages with tag <= 1 (one message older than age 1).
+		// With max tag 2 and age 1, tags <= 1 are eligible for clearing.
 		const id0 = piMessageStableId(messages[0], 0);
 		const id1 = piMessageStableId(messages[1], 1);
 		if (!id0 || !id1) throw new Error("piMessageStableId returned undefined");
@@ -115,13 +115,10 @@ describe("clearOldReasoningPi", () => {
 		});
 		expect(result.cleared).toBe(1);
 		expect(result.newWatermark).toBe(1);
-		// Old reasoning is emptied (not "[cleared]"); every Pi serializer drops an
-		// empty thinking block before the wire.
 		expect(messages[0].content[0]).toMatchObject({
 			type: "thinking",
 			thinking: "",
 		});
-		// Recent message untouched.
 		expect(messages[1].content[0]).toMatchObject({
 			type: "thinking",
 			thinking: "recent reasoning",
@@ -150,10 +147,7 @@ describe("clearOldReasoningPi", () => {
 	});
 
 	it("leaves REDACTED thinking blocks untouched (signature + data preserved)", () => {
-		// A redacted block bypasses the empty-thinking drop in Pi's serializers
-		// (transform-messages.ts / anthropic.ts serialize `redacted` before the
-		// empty check), so emptying it + dropping the signature would leave a
-		// malformed redacted block on the wire. It must be preserved verbatim.
+		// `REDACTED` blocks must be preserved verbatim.
 		const messages = [
 			{
 				role: "assistant",
@@ -191,7 +185,7 @@ describe("replayClearedReasoningPi", () => {
 	it("replays emptied thinking for assistant parts below the watermark", () => {
 		const db = makeDb();
 		const sessionId = "ses_replay_pi_1";
-		// First make the session_meta row exist.
+		// The watermark update requires an existing `session_meta` row.
 		getOrCreateSessionMeta(db, sessionId);
 		updateSessionMeta(db, sessionId, { clearedReasoningThroughTag: 1 });
 
@@ -315,7 +309,7 @@ describe("replayStrippedInlineThinkingPi", () => {
 		const db = makeDb();
 		const sessionId = "ses_inline_pi_2";
 		getOrCreateSessionMeta(db, sessionId);
-		// no watermark update — defaults to 0
+		// `newWatermark` is 0 when `ageCutoff` is non-positive.
 		const messages = [
 			{
 				role: "assistant",

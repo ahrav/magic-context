@@ -149,7 +149,7 @@ interface FrameCursor {
     next(predicate: (frame: PeerFrame) => boolean, timeoutMs?: number): Promise<PeerFrame>;
 }
 
-/** Ordered frame consumption: each `next` scans forward from the last hit. */
+/* */
 function frameCursor(conn: FakePeerConnection): FrameCursor {
     let index = 0;
     return {
@@ -254,12 +254,12 @@ async function jamWriter(
 }
 
 /**
- * Arrange to pause the NEXT accepted connection's reads before the client's
- * auth hello is processed (the pause runs in a microtask ahead of any socket
- * 'data' event), deterministically stalling setup until `resumeReading()`.
- * Index-based selection: connections accepted before this call are never
- * returned, even when their peer-side sockets have not observed destruction
- * yet. Must be called before the dial is triggered.
+ * The microtask pauses the next accepted connection before the client's auth hello is processed.
+ * The pause runs in a microtask before any socket `data` event.
+ * The pause stalls setup until `resumeReading()`.
+ * Index-based selection excludes connections accepted before this call.
+ * Selection excludes earlier connections even if their peer-side sockets have not observed destruction.
+ * Call `stallNextConnection` before triggering the dial.
  */
 function stallNextConnection(peer: FakePeer): Promise<FakePeerConnection> {
     return peer.waitForConnectionAfter(peer.connections.length).then((conn) => {
@@ -876,8 +876,7 @@ describe("McHostClient facade", () => {
 
         const pending = client.requestStream(handle, { subscribe: true }, { maxStreamItems: 2 });
         const frame = await cursor.next(isRoutedRequest(7));
-        // A peer can stay far under the pending byte budget with tiny bodies, so
-        // the item ceiling is what bounds retained decode overhead.
+        // Tiny bodies can remain under the pending-byte budget, so the item ceiling bounds retained decode overhead.
         for (let index = 0; index < 3; index += 1) {
             await conn.send({
                 ty: PeerFrameType.StreamData,
@@ -889,9 +888,8 @@ describe("McHostClient facade", () => {
         }
 
         expectCallError(await rejection(pending), "terminal", "stream_item_limit");
-        // The caller is settled but the host is still producing. A Cancel scoped
-        // to this correlation stops it; without one the peer keeps sending frames
-        // this connection can only drop, spending capacity unrelated requests
+        // A `Cancel` scoped to the caller's correlation stops the host.
+        // Without `Cancel`, the peer sends frames the connection drops, consuming capacity for unrelated requests.
         // need.
         const cancel = await cursor.next((f) => f.ty === PeerFrameType.Cancel);
         expect(cancel.channel).toBe(7);
@@ -1124,7 +1122,7 @@ describe("deadline-independent setup coalescing", () => {
         events: McHostDiagnosticsEvent[];
     }
 
-    /** Connect, then retire the first generation so the next call redials. */
+    /** Retiring the first generation forces the next call to redial. */
     async function retiredHarness(
         overrides: Partial<McHostClientOptions> = {},
     ): Promise<ReconnectHarness> {
@@ -1224,9 +1222,8 @@ describe("deadline-independent setup coalescing", () => {
         const errB = rejection(client.call("mod-b", "b"));
         const failA = expectCallError(await errA, "terminal", "invalid_json");
         const failB = expectCallError(await errB, "terminal", "invalid_json");
-        // Both waiters carry the same underlying failure instance: a joiner
-        // that retried would have produced a second connection-file read and
-        // a distinct cause.
+        // Both waiters receive the same underlying failure instance.
+        // A retrying joiner would produce a second connection-file read and a distinct cause.
         expect(failA.cause).toBe(failB.cause);
         expect((failA.cause as Error).name).toBe("ConnectionFileError");
         expect(peer.connections.length).toBe(1);
@@ -1235,15 +1232,14 @@ describe("deadline-independent setup coalescing", () => {
     test("a mid-handshake socket failure is not owner-budget exhaustion: no replacement dial", async () => {
         const { client, peer } = await retiredHarness();
         const stalled = stallNextConnection(peer);
-        // catalogList joins the connection flight directly, with no route
-        // retry loop above it, so any extra dial can only come from flight
+        // `catalogList` joins the connection flight directly and has no route retry loop.
+        // Any extra dial can only originate in the connection flight.
         // replacement.
         const errA = rejection(client.catalogList());
         const errB = rejection(client.catalogList());
         const conn2 = await stalled;
         conn2.destroy();
 
-        // A mid-auth socket loss rejects callers with AuthError, not with
         // owner-budget exhaustion.
         expect(((await errA) as Error).name).toBe("AuthError");
         expect(((await errB) as Error).name).toBe("AuthError");
@@ -1293,7 +1289,7 @@ describe("deadline-independent setup coalescing", () => {
         const callC = client.call("magic-context", "c");
         await cursor.next(isRouteOpen);
 
-        // Never respond: the ambiguous owner open retires generation 1.
+        // With no response, the ambiguous owner open retires generation 1.
         expectCallError(await rejection(owner), "outcome_unknown", "deadline_expired");
 
         const conn2 = await nthConnection(peer, 2);
@@ -1340,8 +1336,6 @@ describe("deadline-independent setup coalescing", () => {
         const error = expectCallError(await ownerErr, "not_sent", "module_reloading");
         expect(error.message).toContain("retry budget exhausted");
 
-        // The surviving joiner runs one replacement route loop on the same
-        // connection under its unchanged stage.
         const replacementOpen = await cursor.next(isRouteOpen);
         await sendRouteOpenOk(conn, replacementOpen.corr, 7, 77);
         const body = await cursor.next(isRoutedRequest(7));
@@ -1387,9 +1381,8 @@ describe("deadline-independent setup coalescing", () => {
         const callB = client.call("magic-context", "b");
         const open1 = await cursor.next(isRouteOpen);
 
-        // Deliver the route success and a connection Goodbye in one chunk:
-        // the shared flight resolves and the generation retires synchronously
-        // before any caller's adoption continuation runs.
+        // The generation retires before any caller's adoption continuation runs.
+        // The generation retires before any caller's adoption continuation runs.
         await conn.sendRaw(
             Buffer.concat([
                 encodePeerFrame({
@@ -1403,8 +1396,7 @@ describe("deadline-independent setup coalescing", () => {
             ]),
         );
 
-        // Both callers recover inside route acquisition: one replacement
-        // connection and one shared replacement route open.
+        // Both callers recover inside route acquisition through one replacement connection and one shared replacement route open.
         const conn2 = await nthConnection(peer, 2);
         await conn2.authenticated;
         const cursor2 = frameCursor(conn2);
@@ -1417,8 +1409,8 @@ describe("deadline-independent setup coalescing", () => {
                 ? [first, second]
                 : [second, first];
         await sendResponse(conn2, bodyB.corr, { ok: "b" }, 9, 1);
-        // Caller A's managed replay token must still be unspent: the stale
-        // recovery happened pre-body, so unknown_channel earns the replay.
+        // Caller A's stale recovery occurs before its body, so `unknown_channel` preserves its managed replay token.
+        // Caller A's stale recovery occurs before its body, so `unknown_channel` preserves its managed replay token.
         await sendErrorBody(conn2, bodyA.corr, "unknown_channel", 9, 1);
         const open3 = await cursor2.next(isRouteOpen);
         await sendRouteOpenOk(conn2, open3.corr, 9, 2);
@@ -1431,8 +1423,8 @@ describe("deadline-independent setup coalescing", () => {
         expect(conn.frames.filter(isRoutedFrame)).toEqual([]);
         expect(peer.connections.length).toBe(2);
         expect(conn2.frames.filter(isRouteOpen).length).toBe(2);
-        // Each surviving caller paced its stale-success re-entry once; no
-        // other retry path slept.
+        // Each surviving caller paced its stale-success re-entry once.
+        // No retry path other than each caller's stale-success re-entry sleeps.
         expect(sleeps).toEqual([100, 100]);
     });
 
@@ -1446,10 +1438,8 @@ describe("deadline-independent setup coalescing", () => {
                 nowMs += ms;
             },
         });
-        // Every replacement dial completes auth and retires in the same
-        // read chunk: a Goodbye coalesced with the ServerHello. Setup then
-        // resolves on an already-retired generation, so adoption fails and
-        // the caller must re-dial.
+        // Every replacement dial completes auth and retires in the same read chunk because Goodbye is coalesced with ServerHello.
+        // Setup resolves on an already-retired generation, so adoption fails.
         peer.helloTrailer = encodePeerFrame({
             ty: PeerFrameType.Goodbye,
             channel: 0,
@@ -1462,9 +1452,8 @@ describe("deadline-independent setup coalescing", () => {
             "not_sent",
         );
         expect(error.message).toContain("connect failed");
-        // Exactly three paced dials (fake-clock 0ms, 100ms, 300ms) fit the
-        // 400ms stage; an unpaced loop would redial at socket speed and
-        // never advance this fake clock.
+        // Three paced dials at fake-clock 0 ms, 100 ms, and 300 ms fit the 400 ms stage.
+        // An unpaced loop would redial at socket speed and never advance this fake clock.
         expect(peer.connections.length).toBe(4);
         expect(sleeps.filter((ms) => ms > 0)).toEqual([100, 200, 100]);
     });
@@ -1491,7 +1480,7 @@ describe("deadline-independent setup coalescing", () => {
         const connGoodbye = await cursor.next((f) => f.ty === PeerFrameType.Goodbye);
         expect(connGoodbye.channel).toBe(0);
         await closePromise;
-        // No replacement connection or route open, and no body escaped.
+        // A late `RouteOpenOk` after owner close cannot reopen the route.
         expect(peer.connections.length).toBe(1);
         expect(conn.frames.filter(isRouteOpen).length).toBe(1);
         expect(conn.frames.filter(isRoutedFrame)).toEqual([]);
@@ -1505,8 +1494,7 @@ describe("deadline-independent setup coalescing", () => {
             connectionFileAfterOpen: () => {
                 if (!expireDuringSnapshot) return;
                 expireDuringSnapshot = false;
-                // Expire the short owner inside the snapshot: after the
-                // descriptor opens, before the next deadline check.
+                // The short owner expires after the descriptor opens and before the next deadline check.
                 nowMs += 300;
             },
         });
@@ -1516,8 +1504,8 @@ describe("deadline-independent setup coalescing", () => {
         );
         const joiner = client.call("magic-context", "join");
 
-        // The owner's budget is the failure authority: not_sent, never
-        // terminal, with the snapshot expiry as the cause.
+        // Snapshot expiry causes the owner to receive not_sent rather than a terminal error.
+        // Snapshot expiry causes the owner to receive not_sent rather than a terminal error.
         const failure = expectCallError(await ownerErr, "not_sent", "deadline_expired");
         expect((failure.cause as Error).name).toBe("ConnectionFileError");
 
@@ -1531,8 +1519,7 @@ describe("deadline-independent setup coalescing", () => {
         expect(bodyJson(body)).toEqual({ method: "join" });
         await sendResponse(conn2, body.corr, { ok: true }, 7, 77);
         expect(await joiner).toEqual({ ok: true });
-        // The owner never dialed: the only connections are the retired
-        // original and the joiner's single replacement.
+        // The owner never dialed; only the retired original and the joiner's replacement connection exist.
         expect(peer.connections.length).toBe(2);
         expect(conn2.frames.filter(isRouteOpen).length).toBe(1);
     });
@@ -1549,9 +1536,7 @@ describe("deadline-independent setup coalescing", () => {
             client.call("magic-context", "join", undefined, { timeoutMs: 100_000 }),
         );
         const open = await cursor.next(isRouteOpen);
-        // The joiner's stage expires on the fake clock while its real expiry
-        // timer stays pending; the flight then settles first, queueing the
-        // fulfillment ahead of any timer callback.
+        // The flight settles before any timer callback, queueing fulfillment first.
         nowMs = 100_001;
         await sendRouteOpenOk(conn, open.corr, 7, 77);
         expectCallError(await joinerErr, "not_sent", "deadline_expired");
@@ -1559,7 +1544,7 @@ describe("deadline-independent setup coalescing", () => {
         expect(bodyJson(body)).toEqual({ method: "own" });
         await sendResponse(conn, body.corr, { ok: true }, 7, 77);
         expect(await owner).toEqual({ ok: true });
-        // The expired joiner never adopted the route: one open, one body.
+        // The expired joiner never adopts the route: exactly one route open and one request body are sent.
         expect(peer.connections.length).toBe(1);
         expect(conn.frames.filter(isRouteOpen).length).toBe(1);
         expect(conn.frames.filter(isRoutedFrame).length).toBe(1);
@@ -1576,9 +1561,8 @@ describe("deadline-independent setup coalescing", () => {
             client.call("magic-context", "join", undefined, { timeoutMs: 100_000 }),
         );
         const open = await cursor.next(isRouteOpen);
-        // The joiner's stage expires on the fake clock while its real expiry
-        // timer stays pending; the flight then fails ahead of any timer
-        // callback, so the rejection is queued first.
+        // The joiner's stage expires on the fake clock while its real expiry timer remains pending.
+        // The flight fails before any timer callback, so rejection queues first.
         nowMs = 100_001;
         await sendErrorBody(conn, open.corr, "artifact_invalid");
         expectCallError(await joinerErr, "not_sent", "deadline_expired");
@@ -1595,15 +1579,12 @@ describe("deadline-independent setup coalescing", () => {
             connectionFileAfterOpen: () => {
                 if (!expireSnapshot) return;
                 expireSnapshot = false;
-                // Outlive the 2s handshake stage while most of the route
-                // budget stays live.
+                // The 2,500 ms fake-clock advance exceeds the 2,000 ms handshake-stage deadline without exhausting the route deadline.
                 nowMs += 2_500;
             },
         });
         expireSnapshot = true;
         const call = client.call("magic-context", "go");
-        // The owner reconnects under its unchanged route deadline instead
-        // of failing on the expired handshake-stage snapshot.
         const conn2 = await nthConnection(peer, 2);
         await conn2.authenticated;
         const cursor = frameCursor(conn2);
@@ -1626,7 +1607,7 @@ describe("deadline-independent setup coalescing", () => {
         const bigModule = "m".repeat(70_000);
         const error = await rejection(client.call(bigModule, "x", undefined, { timeoutMs: 500 }));
         expectCallError(error, "not_sent", "control_body_too_large");
-        // Deterministic local failure: no backoff spin, no wire traffic.
+        // The client fails locally without backoff or wire traffic.
         expect(sleeps).toBe(0);
         expect(conn.frames.filter(isRouteOpen).length).toBe(0);
     });
@@ -1679,8 +1660,6 @@ describe("transport negotiation", () => {
             }
             if (value instanceof Error) {
                 parts.push(value.name, value.message, value.stack ?? "");
-                // `cause` and AggregateError `errors` are non-enumerable, so
-                // the Object.values walk below never reaches them.
                 visit(value.cause);
                 visit((value as Partial<AggregateError>).errors);
             }
@@ -1911,8 +1890,7 @@ describe("transport negotiation", () => {
         expect(host.frames.map((f) => f.header.corr)).toEqual([1n, 2n]);
         const connectedEvent = events.find((e) => e.type === "connected") as McHostDiagnosticsEvent;
         expect(connectedEvent.transport).toBe("fake.shm");
-        // Promotion retires the bootstrap internally; that handoff must not
-        // surface as a client-level `retired` event next to `connected`.
+        // Promotion retires the bootstrap internally; the handoff must not surface as a client-level `retired` event next to `connected`.
         expect(events.some((e) => e.type === "retired")).toBe(false);
 
         expect(await client.catalogList()).toEqual([]);
@@ -1954,10 +1932,8 @@ describe("transport negotiation", () => {
         });
         clients.push(client);
         expect(provider.connectCount).toBe(1);
-        // The candidate channel runs no handshake: its setup reports
-        // "fake-candidate/1" and no daemon id. Promotion carries the
-        // bootstrap's authenticated identity across the barrier, so neither
-        // provider-supplied value may reach the published connection.
+        // The candidate channel runs no handshake: its setup reports `"fake-candidate/1"` and no daemon id.
+        // Promotion carries the bootstrap's authenticated identity across the barrier, so neither provider-supplied value may reach the published connection.
         expect(client.authenticated?.daemonVer).toBe("fake-peer/0.0.1");
         expect(Array.from(client.authenticated?.daemonId ?? [])).toEqual(Array.from(peer.daemonId));
     });
@@ -2029,8 +2005,7 @@ describe("transport negotiation", () => {
             peer,
             diagnostics: (event) => events.push(event),
         });
-        // The host's raw error body is peer-controlled; the caller sees a
-        // bounded negotiation failure, never the wire message (R14).
+        // The caller sees a bounded negotiation failure, never the wire message.
         expectCallError(error, "terminal", "host_negotiation_rejected");
         await waitUntil(() =>
             events.some((e) => e.type === "retired" && e.reason === "negotiation_failed"),
@@ -2092,8 +2067,7 @@ describe("transport negotiation", () => {
         provider.host.onFrame = candidateAutoResponder("ffffffffffffffffffffffffffffffff");
         const peer = await startPeer({ negotiate: negotiateResponder(() => grantBody()) });
         const { error } = await connectRejected({ peer, transportProviders: [provider] });
-        // The host's Error terminal is peer-controlled: the caller sees the
-        // bounded negotiation failure, never the wire code (R14).
+        // The caller sees the bounded negotiation failure, never the wire code.
         expectCallError(error, "terminal", "negotiation_failed");
         expect(provider.host.channelClosed).toBe(true);
         const conn = peer.connections[0] as FakePeerConnection;
@@ -2109,10 +2083,10 @@ describe("transport negotiation", () => {
             transportProviders: [provider],
             handshakeTimeoutMs: 300,
         });
-        // The generation's setup timer retires the candidate; the raced
-        // start observes retirement instead of stranding activateCandidate
-        // on a promise the provider never settles, and the surfaced error
-        // is the retirement cause (the setup timer's timeout).
+        // The generation's setup timer retires the candidate; the raced start observes retirement instead of stranding `activateCandidate` on a promise the provider never settles, and the surfaced error is the setup timer's timeout.
+        // The generation's setup timer retires the candidate; the raced start observes retirement instead of stranding `activateCandidate` on a promise the provider never settles, and the surfaced error is the setup timer's timeout.
+        // The generation's setup timer retires the candidate; the raced start observes retirement instead of stranding `activateCandidate` on a promise the provider never settles, and the surfaced error is the setup timer's timeout.
+        // The generation's setup timer retires the candidate; the raced start observes retirement instead of stranding `activateCandidate` on a promise the provider never settles, and the surfaced error is the setup timer's timeout.
         expect((error as Error).name).toBe("SocketTimeoutError");
         const conn = peer.connections[0] as FakePeerConnection;
         await conn.closed;
@@ -2188,9 +2162,9 @@ describe("transport negotiation", () => {
     });
 
     test("AE5/R14: a provider whose connect() throws still retires the bootstrap", async () => {
-        // The generation constructor invokes the provider synchronously, so
-        // this failure surfaces before candidate activation begins; the
-        // authenticated bootstrap must not be left alive.
+        // The generation constructor invokes the provider synchronously, so this failure surfaces before candidate activation begins; the authenticated bootstrap must not remain alive.
+        // The generation constructor invokes the provider synchronously, so this failure surfaces before candidate activation begins; the authenticated bootstrap must not remain alive.
+        // The generation constructor invokes the provider synchronously, so this failure surfaces before candidate activation begins; the authenticated bootstrap must not remain alive.
         const provider = createFakePairedProvider({
             connectError: new Error("provider-sentinel-3d1e"),
         });
@@ -2311,7 +2285,7 @@ describe("facade helpers", () => {
     });
 
     test("isMcHostCallError recognizes a second bundled copy and rejects old runtime names", () => {
-        // `SecondCopyCallError` models a separately bundled copy that fails
+        // `SecondCopyCallError` simulates a `CallError` from a separately bundled copy.
         // `instanceof McHostCallError`.
         class SecondCopyCallError extends Error {
             constructor(
@@ -2331,7 +2305,6 @@ describe("facade helpers", () => {
         expect(isMcHostCallError(new SecondCopyCallError("terminal", "x"))).toBe(true);
 
         const oldName = new SecondCopyCallError("terminal", "x", "c");
-        // Assembled from parts; boundary tests reject the joined spelling.
         oldName.name = ["Subc", "CallError"].join("");
         expect(isMcHostCallError(oldName)).toBe(false);
 
@@ -2381,8 +2354,7 @@ describe("shm re-upgrade probe eligibility (R11)", () => {
         const connectedEvent = events.find((e) => e.type === "connected") as McHostDiagnosticsEvent;
         expect(connectedEvent.transport).toBe("tcp");
         expect(connectedEvent.fallbackReason).toBe("unavailable");
-        // The shadow probe dials a SECOND authenticated connection while
-        // the primary stays published and usable.
+        // The shadow probe dials a second authenticated connection while the primary stays published and usable.
         await waitUntil(() => peer.connections.length >= 2, 10_000);
         const shadow = peer.connections[1] as FakePeerConnection;
         await shadow.authenticated;
@@ -2393,10 +2365,7 @@ describe("shm re-upgrade probe eligibility (R11)", () => {
 describe("authenticated state retention (U3/KTD6)", () => {
     test("authenticated identity comes from the handshake, publication from the file", async () => {
         const { client, peer } = await connected();
-        // The connection file's daemon_ver is written by test-util as
-        // "fake-peer/0.0.1" and the peer reports the same string in its
-        // ServerProof by default; the two surfaces must still be separate
-        // objects sourced from different transcripts.
+        // The connection file and `ServerProof` come from different authentication transcripts.
         const authenticated = client.authenticated;
         expect(authenticated).not.toBeNull();
         expect(authenticated?.daemonVer).toBe("fake-peer/0.0.1");
@@ -2412,18 +2381,16 @@ describe("authenticated state retention (U3/KTD6)", () => {
     test("a handshake daemon_ver diverging from the connection file rejects the dial", async () => {
         const peer = await startPeer({ daemonVer: "mc-host/999.0.0" });
         const filePath = freshFilePath();
-        // writeConnectionFile pins the file's daemon_ver to "fake-peer/0.0.1",
-        // so the peer reports a version the file never published. daemon_ver is
-        // outside the proof input, so the transcript's HMAC is still valid and
-        // only the connection-file comparison can reject this peer.
+        // The peer reports a version the connection file never published.
+        // The peer's version is outside the proof input, so the transcript's HMAC remains valid.
+        // Only the connection-file comparison can reject the peer's unpublished version.
         await writeConnectionFile(filePath, peer);
         const error = await rejection(McHostClient.connect({ connectionFile: filePath }));
         expect((error as Error).name).toBe("AuthError");
         expect((error as { code?: string }).code).toBe("daemon_ver_mismatch");
         const conn = peer.connections[0] as FakePeerConnection;
         await conn.closed;
-        // No ClientAuth reached the peer: the client emits none once a check
-        // fails, so the peer never observed a client proof at all.
+        // A failed `daemon_ver` comparison prevents `ClientAuth` emission, so the peer observes no client proof.
         expect(conn.clientAuthValid).toBeNull();
     });
 
@@ -2431,8 +2398,7 @@ describe("authenticated state retention (U3/KTD6)", () => {
         const { client, peer } = await connected();
         const borrowed = client.authenticated?.daemonId;
         expect(borrowed).not.toBeUndefined();
-        // The retained identity authorizes compatibility and fencing; mutating
-        // what the getter returned must not reach it.
+        // Mutating the getter's returned Uint8Array must not modify the retained identity.
         (borrowed as Uint8Array).fill(0);
         expect(Array.from(client.authenticated?.daemonId ?? [])).toEqual(Array.from(peer.daemonId));
     });

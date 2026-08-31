@@ -14,29 +14,26 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
 /**
- * Config-LOCATION migration: move Magic Context config from the per-harness
- * legacy locations to one shared CortexKit location, mirroring AFT's proven
- * move-and-marker design (NOT copy-in-place, which is a silent stale-edit trap).
+ * Migrate Magic Context config from per-harness paths to CortexKit paths.
+ * Renaming instead of copying prevents stale edits to legacy files.
  *
- * Legacy (read by old builds):
+ * Old builds read these legacy paths:
  *   user:    ~/.config/opencode/magic-context.{jsonc,json}
  *            ~/.pi/agent/magic-context.{jsonc,json}
  *   project: <root>/magic-context.{jsonc,json}            (bare root)
  *            <root>/.opencode/magic-context.{jsonc,json}
  *            <root>/.pi/magic-context.{jsonc,json}
  *
- * Target (the only thing new builds read — HARD CUTOVER, harness-agnostic):
+ * New builds read only these harness-agnostic target paths:
  *   user:    ~/.config/cortexkit/magic-context.jsonc
  *   project: <root>/.cortexkit/magic-context.jsonc
  *
- * The migrator runs at plugin init before the loader. Idempotency comes from
- * the legacy file being renamed away (not from a sentinel): once a source is
- * moved aside to `<name>.MOVED_READPLEASE`, later runs find no legacy source
- * and no-op. The marker is a pure human breadcrumb — the loader never reads it.
+ * The migrator runs at plugin initialization before the loader.
+ * After a legacy source is renamed to `<name>.MOVED_READPLEASE`, later runs find no source and no-op.
+ * The loader never reads the `.MOVED_READPLEASE` marker.
  *
- * NB: this is config-LOCATION migration. It is unrelated to the schema/key
- * migrations (migrate-dreamer-v2, migrate-experimental) that rewrite keys
- * INSIDE an already-located config file.
+ * Config-file migration changes locations, not keys.
+ * `migrate-dreamer-v2` and `migrate-experimental` rewrite keys within existing config files.
  */
 
 export interface LegacyConfigSource {
@@ -68,7 +65,6 @@ export interface ConfigFileMigrationResult {
 const CONFIG_FILE_BASENAME = "magic-context";
 const MOVED_MARKER_SUFFIX = ".MOVED_READPLEASE";
 
-// ── Path resolution ──────────────────────────────────────────
 
 function homeDir(): string {
     if (process.platform === "win32") {
@@ -93,12 +89,12 @@ export function cortexKitProjectConfigBasePath(directory: string): string {
     return join(directory, ".cortexkit", CONFIG_FILE_BASENAME);
 }
 
-/** The migration target: always normalized to `.jsonc`. */
+/* */
 export function resolveCortexKitUserConfigPath(): string {
     return `${cortexKitUserConfigBasePath()}.jsonc`;
 }
 
-/** The migration target: always normalized to `.jsonc`. */
+/* */
 export function resolveCortexKitProjectConfigPath(directory: string): string {
     return `${cortexKitProjectConfigBasePath(directory)}.jsonc`;
 }
@@ -111,15 +107,11 @@ function legacySourcesForBase(basePath: string, label: string): LegacyConfigSour
 }
 
 /**
- * Every user-scope config path the migrator knows: the CortexKit user target
- * plus the user legacy sources. A project-scope migration must NEVER move any of
- * these (they are user-scope files, not project files).
+ * `userScopeConfigPaths` contains CortexKit user targets and user legacy sources; project migrations must not move them.
  */
 function userScopeConfigPaths(): Set<string> {
     return new Set<string>([
-        // The CortexKit user target, both extensions: the bare-root project
-        // source produces `.jsonc` AND `.json`, so exclude both or a stray
-        // `~/.config/cortexkit/magic-context.json` would still be eaten.
+        // Include both target extensions so a bare-root project source cannot match `~/.config/cortexkit/magic-context.json`.
         `${cortexKitUserConfigBasePath()}.jsonc`,
         `${cortexKitUserConfigBasePath()}.json`,
         join(configHome(), "opencode", `${CONFIG_FILE_BASENAME}.jsonc`),
@@ -130,18 +122,10 @@ function userScopeConfigPaths(): Set<string> {
 }
 
 /**
- * The legacy config locations to migrate FROM, by scope. Each base produces a
- * `.jsonc` and a `.json` candidate; whichever exists migrates, target is always
- * `.jsonc`. The bare-root project source (`<root>/magic-context.*`) is unique to
- * Magic Context (AFT never had it) — omitting it would orphan repo-root configs.
+ * The bare-root project source (`<root>/magic-context.*`) must be included to migrate repo-root configs.
  *
- * Project sources are filtered against the user-scope path set: when a session's
- * project directory IS the user config home (e.g. opencode opened in
- * `~/.config/cortexkit`), the bare-root project source `<root>/magic-context.jsonc`
- * resolves to the USER config path. Without this guard the project migration
- * would "migrate" the user's own config into `<root>/.cortexkit/` and rename the
- * original aside, leaving the user on schema defaults (the config-eats-itself
- * failure mode). A project migration must never touch a user-scope file.
+ * `userScopeConfigPaths` prevents a project rooted at the user config directory from treating user config as a project source.
+ * The user-scope filter prevents project migration from moving a user-scope config into `<root>/.cortexkit/`.
  */
 export function resolveLegacyConfigSources(directory: string): {
     user: LegacyConfigSource[];
@@ -173,14 +157,12 @@ export function resolveLegacyConfigSources(directory: string): {
 export type ConfigHarness = "opencode" | "pi";
 
 /**
- * Legacy sources owned by ONE harness, most-specific first. Used by the loaders
- * as a NON-DESTRUCTIVE read fallback: when the shared CortexKit base is absent
- * (migration not yet run, or refused because OpenCode and Pi legacy configs
- * differ), the running harness reads its OWN legacy config rather than silently
- * falling back to schema defaults — which would re-enable features the legacy
- * config disabled. Each harness reads only its own files, so a differing pair
- * stays correct per-harness until the user consolidates. The bare project-root
- * `<root>/magic-context.*` was OpenCode-only historically.
+ * Each harness reads its own legacy sources, most-specific first.
+ * Each harness reads its legacy config when the shared CortexKit base is absent.
+ * The shared base can be absent when migration refuses differing OpenCode and Pi configs.
+ * The running harness reads its own legacy config instead of schema defaults.
+ * Schema defaults would re-enable features disabled by the legacy config.
+ * `<root>/magic-context.*` is an OpenCode legacy source.
  */
 export function resolveLegacyConfigSourcesForHarness(
     directory: string,
@@ -213,11 +195,10 @@ export function resolveLegacyConfigSourcesForHarness(
     };
 }
 
-// ── JSONC semantics comparison (dependency-free, ported from AFT) ─────────────
+// The migration compares JSONC values semantically.
 // A legacy source that semantically MATCHES an existing target is moved aside
-// (target wins); one that DIFFERS triggers refuse-and-warn (never auto-clobber).
-// We strip comments/trailing-commas and sort keys so formatting/comment/order
-// differences don't read as a conflict.
+// A differing legacy source triggers a warning; migration never overwrites the target.
+// Semantic comparison ignores comments, trailing commas, formatting, and key order.
 
 function stripJsoncForParse(input: string): string {
     let out = "";
@@ -299,29 +280,22 @@ function fileSemanticsMatch(a: string, b: string): boolean {
     try {
         return normalizedJsoncSemantics(a) === normalizedJsoncSemantics(b);
     } catch {
-        // If either side can't be parsed (truly malformed), fall back to an
-        // exact-bytes comparison — a parse-broken legacy file that differs byte
-        // for byte is conservatively treated as a conflict, never auto-clobbered.
+        // If either side cannot be parsed, compare the files byte-for-byte.
+        // A malformed legacy file that differs byte-for-byte is treated as a conflict.
         return a === b;
     }
 }
 
-// ── Cross-process lock (Desktop runs many instances concurrently) ────────────
+// Desktop instances use a cross-process lock because they can migrate concurrently.
 
-// A real migration is a sub-second rename+write, so a lock older than this was
-// almost certainly left by a crashed holder and is safe to reclaim.
+// Locks older than the stale threshold are reclaimed.
 const CONFIG_LOCK_STALE_MS = 4_000;
 
 /**
- * Directory-mkdir lock. `mkdir` is atomic; EEXIST means another instance holds
- * it. We do NOT block plugin init: migration is not correctness-critical this
- * run (the loaders read-legacy-on-conflict when the CortexKit base is absent),
- * so on a LIVE competing holder we return null immediately and skip migration
- * this run — the holder finishes its sub-second rename+write, and the next init
- * sees target-present and consolidates. The ONLY retry is a single one-shot
- * stale reclaim: a crashed holder's lock dir (older than the stale threshold) is
- * removed and we re-attempt mkdir once. No busy-wait, no synchronous sleep — the
- * init path never blocks on lock contention.
+ * `mkdir` atomically creates the lock directory; EEXIST indicates that the lock path already exists.
+ * A live competing lock holder causes migration to return `null` immediately.
+ * After reclaiming a stale lock directory, retry `mkdir` once.
+ * Lock contention returns `null` without waiting.
  */
 function acquireConfigMigrationLock(lockDir: string): (() => void) | null {
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -331,15 +305,12 @@ function acquireConfigMigrationLock(lockDir: string): (() => void) | null {
                 try {
                     rmSync(lockDir, { recursive: true, force: true });
                 } catch {
-                    // best-effort lock cleanup
+                    // Lock-cleanup failures do not affect migration.
                 }
             };
         } catch (err) {
             const code = (err as { code?: unknown })?.code;
             if (code !== "EEXIST") throw err;
-            // EEXIST: another instance holds the lock. Reclaim ONLY if it's stale
-            // (crashed holder) and retry mkdir once; otherwise a live holder owns
-            // it → skip this run rather than block init.
             try {
                 const ageMs = Date.now() - statSync(lockDir).mtimeMs;
                 if (ageMs > CONFIG_LOCK_STALE_MS) {
@@ -347,7 +318,7 @@ function acquireConfigMigrationLock(lockDir: string): (() => void) | null {
                     continue;
                 }
             } catch {
-                // Lock vanished between stat and now — retry mkdir once.
+                // On the first attempt, retry `mkdir` if lock inspection or removal fails.
                 continue;
             }
             return null;
@@ -356,7 +327,6 @@ function acquireConfigMigrationLock(lockDir: string): (() => void) | null {
     return null;
 }
 
-// ── Atomic writes ────────────────────────────────────────────
 
 function atomicCopyConfigFile(sourcePath: string, targetPath: string): void {
     mkdirSync(dirname(targetPath), { recursive: true });
@@ -376,13 +346,11 @@ function atomicCopyConfigFile(sourcePath: string, targetPath: string): void {
             try {
                 closeSync(fd);
             } catch {
-                // best-effort close before cleanup
             }
         }
         try {
             unlinkSync(tmpPath);
         } catch {
-            // best-effort temp cleanup
         }
         throw err;
     }
@@ -406,19 +374,16 @@ function atomicWriteConfigFile(targetPath: string, content: string): void {
             try {
                 closeSync(fd);
             } catch {
-                // best-effort close before cleanup
             }
         }
         try {
             unlinkSync(tmpPath);
         } catch {
-            // best-effort temp cleanup
         }
         throw err;
     }
 }
 
-// ── Marker ───────────────────────────────────────────────────
 
 function movedMarkerContent(
     targetPath: string,
@@ -448,11 +413,6 @@ function movedMarkerContent(
 }
 
 /**
- * After the live config is safely at the CortexKit target, rename each legacy
- * source aside to `<name>.MOVED_READPLEASE` so a user editing the old path
- * notices it is no longer read (a copy-in-place leaves a silent stale-edit
- * trap). A failure here is non-fatal: the content is already at the target, so
- * we warn and leave the legacy file in place.
  */
 function markLegacySourcesMovedAside(
     sources: readonly { path: string }[],
@@ -500,7 +460,6 @@ function visibleConfigMigrationWarning(
     );
 }
 
-// ── Core per-file migration (ported from AFT migrateAftConfigFile) ───────────
 
 export function migrateConfigFile(opts: ConfigFileMigrationOptions): ConfigFileMigrationResult {
     const warnings: string[] = [];
@@ -514,9 +473,6 @@ export function migrateConfigFile(opts: ConfigFileMigrationOptions): ConfigFileM
     mkdirSync(dirname(opts.targetPath), { recursive: true });
     const release = acquireConfigMigrationLock(`${opts.targetPath}.lock`);
     if (!release) {
-        // Another instance holds the lock past our short budget. Skip rather than
-        // block init; the loaders read-legacy-on-conflict so config is correct
-        // this run, and the next init retries the migration.
         warnings.push(
             `Config migration for ${opts.scope} skipped this run (another instance is migrating); will retry on next start.`,
         );
@@ -595,10 +551,6 @@ export function migrateConfigFile(opts: ConfigFileMigrationOptions): ConfigFileM
 }
 
 /**
- * Run both the user-scope and project-scope config-location migrations for a
- * project directory. Idempotent and cheap when nothing to migrate (a few
- * existsSync calls). Call once at plugin init, before loading config. Returns
- * any warnings (conflicts / partial failures) for the host to surface + log.
  */
 export function migrateMagicContextConfigLocations(
     directory: string,
@@ -624,9 +576,6 @@ export function migrateMagicContextConfigLocations(
             }).warnings,
         );
     } catch (err) {
-        // Fail OPEN: a migration failure must never abort plugin init. Worst
-        // case the loader reads the CortexKit path (possibly empty) and a legacy
-        // file is left in place for the user to consolidate.
         const msg = err instanceof Error ? err.message : String(err);
         logger?.warn?.(`Magic Context config-location migration error (continuing): ${msg}`);
         warnings.push(`Magic Context config-location migration error: ${msg}`);

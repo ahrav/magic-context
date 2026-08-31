@@ -1,12 +1,9 @@
 /**
- * Generate the differential historian OUTPUT VALIDATION golden for the Rust mc-module port.
+ * This generator produces differential historian validation golden cases.
  *
- * Drives the real TypeScript parser/validator from packages/plugin via Bun.resolveSync,
- * then applies the pure publication-time discard-last rule that currently lives in the
- * incremental runner. The emitted cases contain: raw historian XML, chunk/store metadata,
- * the parsed TS shape normalized to Rust field names, and the publishable validation verdict.
+ * The generator applies the publication-time discard-last rule from the incremental runner.
  *
- * Run: bun crates/mc-module/gen/gen-validate-golden.ts
+ * Bun runs this generator with `bun crates/mc-module/gen/gen-validate-golden.ts`.
  */
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -384,8 +381,7 @@ function runTsOracle(spec: CaseSpec, parsedTs: ParsedTs, options: ValidateOption
             keepSideChannel(observation.origin_compartment_index, persistedCount, discardedLast),
         );
 
-    // Ensure the parser was genuinely part of the oracle path. This catches cases where a
-    // malformed output would otherwise look successful only because the validator result was reused.
+    // The oracle must parse the output independently; reusing the validator result can let malformed output pass.
     if (parsedTs.compartments.length === 0 && emitted.length > 0) {
         throw new Error(`oracle invariant broken for ${spec.label}: validator emitted unparsed compartments`);
     }

@@ -17,8 +17,6 @@ if (mode !== "adversarial" && mode !== "smoke" && mode !== "synapse" && mode !==
     );
     process.exit(2);
 }
-// The synapse smoke needs a native ONNX Runtime library, so it runs only
-// when named explicitly.
 const selected = mode === "all" ? (["adversarial", "smoke"] as const) : ([mode] as const);
 
 const here = dirname(fileURLToPath(import.meta.url));

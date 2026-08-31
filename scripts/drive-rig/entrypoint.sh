@@ -34,29 +34,18 @@ if ! kill -0 "$forwarder_pid" 2>/dev/null; then
     exit 1
 fi
 
-# The cloned session row records its host-side working directory. OpenCode
-# resolves the session's project (and Magic Context finds the project config
-# carrying transform_mode) from that recorded path, so recreate it as a
-# symlink to the snapshot repo instead of rewriting database rows.
 : "${DRIVE_SESSION_DIR:=/Users/ufukaltinok/Work/Projects/CortexKit/benchmarks}"
 if [[ ! -e "$DRIVE_SESSION_DIR" ]]; then
     mkdir -p "$(dirname "$DRIVE_SESSION_DIR")"
     ln -s "$DRIVE_REPO" "$DRIVE_SESSION_DIR"
 fi
 
-# The plugin's subc client resolves the connection file from the XDG data dir
-# default, not only from the config value, so expose the mounted file at that
-# default location too.
 xdg_conn_dir="${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/run"
 mkdir -p "$xdg_conn_dir"
 if [[ ! -e "$xdg_conn_dir/subc-connection.json" ]]; then
     ln -s "$SUBC_CONNECTION_FILE" "$xdg_conn_dir/subc-connection.json"
 fi
 
-# tmux starts at the host-path symlink, not /snapshot/repo: the working
-# directory string travels to the host-side mc-module, which stats the
-# project root on the HOST filesystem. The host path exists there (the real
-# checkout) and resolves to the snapshot clone inside the container.
 if ! tmux has-session -t drive 2>/dev/null; then
     tmux new-session -d -s drive -c "$DRIVE_SESSION_DIR" bash
 fi

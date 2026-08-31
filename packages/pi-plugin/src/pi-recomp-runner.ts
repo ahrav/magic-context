@@ -6,29 +6,16 @@ import { sessionLog } from "@magic-context/core/shared/logger";
 import { setMagicContextRecompActive } from "./status-line";
 
 /**
- * In-flight detached recomp / upgrade runs, keyed by session, so the
- * `session_shutdown` handler can await them before Pi exits — mirrors
- * `inFlightHistorian` in context-handler.ts.
  *
- * Why detached: Pi's command handler IS the REPL turn (single process). Awaiting
- * a multi-pass recomp inline froze ALL input — new prompts and even /ctx-status —
- * until it finished (a 1105-message upgrade locked the REPL
- * across several ~4-min historian passes). OpenCode runs recomp/upgrade as
- * `void runManagedRecomp(...)` in its separate server process; Pi must do the
- * equivalent fire-and-forget so the REPL stays responsive while the historian
- * passes run in the background — the same pattern as `spawnPiHistorianRun`.
  */
 const inFlightRecomp = new Map<string, Promise<unknown>>();
 
-/** True when a detached recomp/upgrade is already running for this session. */
+/* */
 export function isPiRecompInFlight(sessionId: string): boolean {
 	return inFlightRecomp.has(sessionId);
 }
 
 /**
- * Await all in-flight recomp/upgrade runs. Called from `session_shutdown`
- * (bounded by a timeout there) so a background recomp can finish publishing
- * before Pi tears the session down.
  */
 export async function awaitInFlightRecomps(): Promise<void> {
 	if (inFlightRecomp.size === 0) return;
@@ -36,18 +23,12 @@ export async function awaitInFlightRecomps(): Promise<void> {
 }
 
 /**
- * Run a recomp/upgrade body detached from the command handler.
  *
- * Registers the raw-message provider + the `recomp` status-line flag for the
- * run's lifetime, tracks the promise for shutdown drain, and cleans everything
- * up on settle. The command handler returns immediately after calling this, so
- * the Pi REPL stays responsive. `work()` owns all command-specific logic
- * (the recomp call, the published gate, marker staging, migration, and the
- * status messages it sends) and must not throw uncaught — failures are logged.
+ * `spawnPiRecompRun` keeps `provider` registered and magic-context recompilation active until `work` settles.
+ * `spawnPiRecompRun` returns before `work()` settles.
+ * `work` may reject; `spawnPiRecompRun` logs failures.
  *
- * The provider unregister is closure-guarded (setRawMessageProvider only deletes
- * if the slot still holds THIS provider), so a concurrent user turn that
- * re-registers its own provider for the same session is not clobbered on
+ * `unregister` removes only `provider`, preserving a provider registered later for the same session.
  * cleanup.
  */
 export function spawnPiRecompRun(args: {

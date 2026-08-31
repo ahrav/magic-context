@@ -1,5 +1,4 @@
-//! Shared harness for `mc-host` conformance tests: a scriptable linked handler
-//! and a real-loopback host launcher.
+//! This crate provides a scriptable linked handler and a real-loopback host launcher for `mc-host` conformance tests.
 
 #![allow(dead_code)]
 
@@ -76,7 +75,7 @@ async fn json_response(ctx: &RequestCtx, value: serde_json::Value) -> RequestOut
     }
 }
 
-/// Everything the handler observed, in order.
+/// `Event` records handler observations in occurrence order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Initialized,
@@ -88,17 +87,16 @@ pub enum Event {
     HandlerDropped,
 }
 
-/// How the handler should answer `bind`.
 #[derive(Debug, Clone)]
 pub enum BindPolicy {
     AcceptAll,
-    /// Reject when the session equals this value.
+    /// `RejectSession` rejects binds whose session equals `session`.
     RejectSession {
         session: String,
         code: String,
         message: String,
     },
-    /// Block until released, so a close can race an in-flight bind.
+    /// `BlockUntilReleased` blocks binds until released so close can race an in-flight bind.
     BlockUntilReleased,
     Panic,
     Hang,
@@ -127,8 +125,7 @@ struct Inner {
     runtime_drop_gate: (Mutex<bool>, Condvar),
 }
 
-/// Scriptable linked handler. Per-request behavior is chosen by the request
-/// body, so the raw client drives it directly over the wire.
+/// `TestHandler` chooses per-request behavior from the request body so the raw client can drive it over the wire.
 pub struct TestHandler {
     inner: Arc<Inner>,
     record_runtime_drop: bool,
@@ -504,10 +501,7 @@ impl McHostHandler for TestHandler {
                 response_from_slice(&ctx, b"observed-cancel", false).await
             }
             "await_completion" => {
-                // `forget` keeps the permit consumed: each dispatch must be
-                // individually released via `release_completion`, or the
-                // returned permit would let later iterations complete without
-                // racing the release.
+                // `forget` consumes each completion permit until `release_completion` releases it, preventing later iterations from completing without racing the release.
                 self.inner
                     .completion_gate
                     .acquire()
@@ -583,19 +577,19 @@ pub struct TestHost {
 }
 
 impl TestHost {
-    /// Starts a host with test-sized limits and waits for its publication.
+    /// `start` waits for publication before returning.
     pub async fn start() -> Self {
         Self::start_with(|_config| {}).await
     }
 
-    /// Starts a host after applying `tweak` to the configuration.
+    /// `start` waits for publication before returning.
     pub async fn start_with(tweak: impl FnOnce(&mut HostConfig)) -> Self {
         Self::try_start_with(TestHandler::new(), tweak)
             .await
             .expect("host must publish")
     }
 
-    /// Starts `handler`, returning the harness once the publication appears.
+    /// `start` returns the harness after `handler`'s publication appears.
     pub async fn try_start_with(
         handler: TestHandler,
         tweak: impl FnOnce(&mut HostConfig),
@@ -605,7 +599,7 @@ impl TestHost {
             data_dir: Some(data_root.path().to_path_buf()),
             daemon_ver: "mc-host/test".to_owned(),
             limits: HostLimits {
-                // Small but still interoperable: one 64 MiB frame must fit.
+                // The limit must accommodate one 64 MiB frame.
                 max_resident_bytes: mc_host::config::MIN_RESIDENT_BYTES * 2,
                 ..Default::default()
             },
@@ -618,8 +612,7 @@ impl TestHost {
         config.timing.lifecycle_callback_deadline = Duration::from_secs(2);
         tweak(&mut config);
 
-        // A tweak may redirect the data root, so the publication path has to
-        // come from the effective configuration.
+        // A data-root tweak requires the publication path from the effective configuration.
         let publication = connection_file(
             config
                 .data_dir
@@ -633,12 +626,11 @@ impl TestHost {
         let join =
             tokio::spawn(async move { mc_host::run(run_handler, config, run_shutdown).await });
 
-        // A predecessor may already have published at this path, so a
-        // pre-existing snapshot must not be mistaken for this host's own.
+        // A pre-existing publication snapshot cannot identify this host because a predecessor may have published at the same path.
         let existing = std::fs::read(&publication).ok();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            // If `join` has finished, return its error before accepting a stale
+            // If `join` has finished, return its error before accepting a stale publication.
             // publication.
             if join.is_finished() {
                 return Err(join
@@ -691,7 +683,6 @@ impl TestHost {
             .expect("setup-only connection")
     }
 
-    /// Signals shutdown and returns the runtime's result.
     pub async fn shutdown(mut self) -> Result<(), HostError> {
         self.shutdown.cancel();
         let join = self.join.take().expect("host runs once");
@@ -701,7 +692,6 @@ impl TestHost {
             .expect("run task joins")
     }
 
-    /// Signals shutdown and expects a graceful result.
     pub async fn shutdown_gracefully(self) {
         let handler = self.handler.clone();
         self.shutdown().await.expect("graceful shutdown");
@@ -726,7 +716,6 @@ pub fn connection_file(data_root: &Path) -> PathBuf {
         .join(mc_host::CONNECTION_FILE_NAME)
 }
 
-/// Body for the handler's echo mode.
 pub fn echo_body(payload: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({"mode": "echo", "payload": payload}))
         .expect("body serializes")
@@ -736,10 +725,8 @@ pub fn mode_body(value: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&value).expect("body serializes")
 }
 
-/// Minimal scriptable composite child for three-component hosts. Per-request
-/// behavior is chosen by the request body, like [`TestHandler`]: mode `hang`
-/// parks the handler task forever (holding its pending and task permits, the
-/// capacity-isolation fixture); anything else answers `{"served_by": id}`.
+/// `TestComponent` serves as a scriptable child for three-component hosts. Request body `hang` parks the task while retaining pending and task permits for capacity-isolation tests; other bodies return `{"served_by": id}`.
+/// `TestComponent` chooses behavior from the request body: `hang` parks the handler task forever while retaining pending and task permits for capacity-isolation tests; other bodies return `{"served_by": id}`.
 #[derive(Clone)]
 pub struct StubComponent {
     id: &'static str,
@@ -820,8 +807,7 @@ impl SecondaryComponent for StubComponent {
     }
 }
 
-/// The direct profile's three stub children in catalog order, for tests
-/// whose subject is the host runtime rather than any one component.
+/// The direct profile uses three stub children in catalog order so runtime tests do not target a single component.
 pub fn stub_trio() -> (StubComponent, StubComponent, StubComponent) {
     (
         StubComponent::new("magic-context", "tool_provider"),
@@ -830,8 +816,8 @@ pub fn stub_trio() -> (StubComponent, StubComponent, StubComponent) {
     )
 }
 
-/// Real-loopback host over an arbitrary linked handler, for three-child
-/// composite tests that [`TestHost`]'s fixed [`TestHandler`] cannot express.
+/// `CompositeTestHost` runs a real loopback host over an arbitrary linked handler.
+/// `CompositeTestHost` supports three-child composite tests that [`TestHost`]'s fixed [`TestHandler`] cannot express.
 pub struct CompositeTestHost {
     pub info: Discovered,
     shutdown: CancellationToken,
@@ -840,8 +826,8 @@ pub struct CompositeTestHost {
 }
 
 impl CompositeTestHost {
-    /// Starts `handler`, returning the harness once the publication appears
-    /// or the runtime's startup error otherwise.
+    /// `try_start` returns the harness after publication or the runtime's startup error.
+    /// `try_start` returns `mc_host::run`'s error when the run task ends before publication.
     pub async fn try_start<H: McHostHandler>(
         handler: H,
         tweak: impl FnOnce(&mut HostConfig),
@@ -851,10 +837,6 @@ impl CompositeTestHost {
             data_dir: Some(data_root.path().to_path_buf()),
             daemon_ver: "mc-host/test".to_owned(),
             limits: HostLimits {
-                // Small but still interoperable: one 64 MiB frame must fit
-                // beside the largest real component declaration (Broca's),
-                // so composites embedding the production component start
-                // with ingress to spare.
                 max_resident_bytes: mc_host::config::MIN_RESIDENT_BYTES * 2
                     + mc_host::broca::config::DECLARED_RETAINED_RESIDENT_BYTES,
                 ..Default::default()
@@ -931,9 +913,6 @@ impl Drop for CompositeTestHost {
     }
 }
 
-/// Asserts every catalog module's `control_ops` equals `expected` exactly, so
-/// an unimplemented operation such as `wake.create` can never be advertised
-/// (protocol AE10) and TypeScript wake-plane probing stays fail-open.
 pub fn assert_control_ops(modules: &serde_json::Value, expected: &[&str]) {
     let modules = modules.as_array().expect("modules array");
     assert!(!modules.is_empty(), "catalog returned no modules");

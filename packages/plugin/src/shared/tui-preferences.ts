@@ -4,20 +4,12 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { parse, stringify } from "comment-json";
 
-// Shared preferences file for OpenCode TUI plugins. One top-level key per plugin
-// (short, non-integer-like name, e.g. "magic-context"). The file is OPTIONAL:
-// every reader falls back to defaults when it is missing or malformed.
+// The file stores one top-level key for each OpenCode TUI plugin.
+// Plugin keys must be non-integer-like names such as `magic-context`; the file is optional.
 //
-// Cross-plugin convention (anthropic-auth / aft / magic-context all mirror it):
-//   - same file name + env override + lookup order,
-//   - byte-identical `computeEffectiveOrder` so the three sort consistently,
-//   - a coordinated default-order ladder (anthropic-auth 160, MC 170, AFT 180).
 //
-// MC uses `comment-json` (already a dep, Bun-safe) for the WRITE path — a full
-// parse → mutate-one-key → stringify round-trip that preserves comments and
-// sibling plugins' keys. (anthropic-auth uses jsonc-parser's surgical `modify`;
-// AFT and MC use comment-json. Both are interop-safe as long as a sibling key's
-// values AND comments survive — asserted by the interop test.)
+// Magic Context uses `comment-json` when writing to preserve comments and sibling plugin keys.
+// Writers must preserve sibling plugins' values and comments.
 
 export const TUI_PREFS_FILE_ENV = "OPENCODE_TUI_PREFERENCES_FILE";
 const FILE_NAME = "tui-preferences.jsonc";
@@ -35,8 +27,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// Tolerant read: a missing file, parse error, or non-object root all resolve to
-// {} so the sidebar never crashes on hand-edited content. Never throws.
 export async function readTuiPreferencesFile(): Promise<Record<string, unknown>> {
     try {
         const raw = await readFile(getTuiPreferencesFile(), "utf8");
@@ -48,10 +38,8 @@ export async function readTuiPreferencesFile(): Promise<Record<string, unknown>>
     }
 }
 
-// Synchronous tolerant read — used once at slot mount to seed the initial
-// collapse state and effective order WITHOUT a frame of async flicker (the
-// sidebar must render at its final width/collapse on the very first paint).
-// Same tolerance contract as the async reader. Never throws.
+// The synchronous read prevents async flicker in the sidebar's initial collapse state and effective order.
+// The synchronous reader matches the async reader's tolerance contract and never throws.
 export function readTuiPreferencesFileSync(): Record<string, unknown> {
     try {
         const raw = readFileSync(getTuiPreferencesFile(), "utf8");
@@ -71,7 +59,7 @@ export interface MagicContextTuiPrefs {
     order: number;
     startCollapsed: boolean;
     rememberCollapsed: boolean;
-    // null = never persisted; seed the UI from `startCollapsed` instead.
+    // `collapsed: null` prevents persistence; the UI initializes from `startCollapsed`.
     collapsed: boolean | null;
     header: {
         label: string;
@@ -117,9 +105,8 @@ function label(value: unknown, fallback: string, maxLength: number): string {
     return value.slice(0, maxLength);
 }
 
-// Per-key validation: every value is independently clamped/defaulted so one bad
-// entry never poisons the rest. Never throws. A missing/non-object MC key →
-// full defaults clone.
+// Each preference is independently clamped or defaulted, so an invalid value does not affect valid preferences.
+// The reader never throws; a missing or non-object `magic-context` value produces a full defaults clone.
 export function resolveMagicContextPrefs(root: Record<string, unknown>): MagicContextTuiPrefs {
     const entry = root[PLUGIN_KEY];
     if (!isRecord(entry)) return structuredClone(DEFAULT_PREFS);
@@ -149,18 +136,14 @@ export function resolveMagicContextPrefs(root: Record<string, unknown>): MagicCo
 
 const FORCE_TOP_BASE = -100000;
 
-// Shared forceToTop convention — MUST stay byte-identical across anthropic-auth,
-// AFT, and magic-context or the three sort inconsistently against each other.
-// Forced plugins sort below FORCE_TOP_BASE, ordered among themselves by their
-// top-level key's position in the file, so users reprioritize by reordering
-// keys. The user-facing `order` knob clamps to -10000..10000, strictly above the
-// forced band, so a manual order can never beat forceToTop. Host slots render
-// ascending by order; OpenCode's built-ins occupy 100-500.
+// Forced plugins sort below `FORCE_TOP_BASE`; top-level key order breaks ties.
+// Users reprioritize forced plugins by reordering their top-level keys.
+// The `order` value clamps to -10000..10000, strictly above the forced band.
+// A manual `order` never overrides `forceToTop`.
+// Host slots render in ascending order.
 //
-// Key-naming requirement: plugin keys must be non-integer-like short names (e.g.
-// "magic-context"). JS object key iteration hoists integer-like keys ("0", "42")
-// ahead of string keys, which would skew the indexOf-based ordering of forced
-// plugins. The shared convention requires non-numeric names.
+// JavaScript iterates integer-like keys such as `"0"` and `"42"` before string keys.
+// Integer-like keys iterate before string keys, skewing index-based forced-plugin ordering.
 export function computeEffectiveOrder(
     root: Record<string, unknown>,
     pluginKey: string,
@@ -175,17 +158,13 @@ export function computeEffectiveOrder(
 }
 
 const TEMPLATE = `// Shared preferences for OpenCode TUI plugins.
-// One top-level key per plugin (short name). See each plugin's README for its
-// supported settings. This file is safe to hand-edit; plugins update individual
-// keys and preserve the rest (values and comments).
+// Plugins update individual keys and preserve all other values and comments.
 {}
 `;
 
 type JsonValue = string | number | boolean | null;
 
-// Set a nested path on a comment-json root, creating intermediate plain objects
-// as needed. Mutating an existing leaf preserves its comments; sibling keys are
-// untouched. Returns false when the path is blocked by a non-object value.
+// setDeep preserves comments on existing leaves.
 function setDeep(root: Record<string, unknown>, path: string[], value: JsonValue): boolean {
     let node: Record<string, unknown> = root;
     for (let i = 0; i < path.length - 1; i += 1) {
@@ -217,9 +196,7 @@ async function writePreference(pluginKey: string, path: string[], value: JsonVal
     try {
         root = parse(text);
     } catch {
-        // The shared file is currently malformed. Skip the write rather than
-        // clobber sibling plugins' keys — the user fixes the file, persistence
-        // resumes. (Collapse just won't survive restart until then.)
+        // If parsing the shared file fails, skip the write to preserve sibling plugins' keys.
         return;
     }
     if (!isRecord(root)) root = {};
@@ -235,10 +212,9 @@ async function writePreference(pluginKey: string, path: string[], value: JsonVal
 
 let writeChain: Promise<void> = Promise.resolve();
 
-// Writes are serialized on a promise chain: each update re-reads the file,
-// applies a comment-preserving edit to one property, and replaces the file
-// atomically (temp + rename in the same directory — the only safe cross-process
-// swap). Best-effort by design; preferences are never worth crashing the TUI.
+// The promise chain serializes writes so each update reads the latest file.
+// Same-directory temp-file renames replace the file atomically.
+// Preference-write failures do not crash the TUI.
 export function queueTuiPreferenceUpdate(
     pluginKey: string,
     path: string[],
@@ -272,17 +248,9 @@ export function __resetTuiPreferencesWatchTestHooks(): void {
     watchDirectory = (directory, listener) => watch(directory, listener);
 }
 
-// Watches the DIRECTORY, not the file: editors and our own atomic writes replace
-// the file via rename, which kills file-level watchers.
+// The watcher observes the directory because renaming the preference file invalidates file-level watchers.
 //
-// Two-stage filtering: (1) a cheap filename pre-filter on the prefs name or our
-// `.tmp`; (2) inside the debounce, re-read and compare against last-seen content
-// — the authority. Some platforms (macOS FSEvents, some inotify backends)
-// misattribute a sibling rename to the real filename, so a name filter alone
-// still produces strays; the content compare is robust against that, coalesced
-// events, and mtime granularity.
 //
-// Returns a disposer; never throws.
 export function watchTuiPreferences(onChange: () => void): () => void {
     const file = getTuiPreferencesFile();
     const name = basename(file);
@@ -314,9 +282,7 @@ export function watchTuiPreferences(onChange: () => void): () => void {
                 reconcile();
             }, WATCH_DEBOUNCE_MS);
         });
-        // Reconcile after registration: a change between the baseline read and
-        // watcher installation is observed here, while later changes schedule
-        // the same reconciliation path through the watcher callback above.
+        // Watcher setup reconciles after registration to observe changes between the baseline read and watcher installation.
         reconcile();
         return () => {
             if (timer) clearTimeout(timer);

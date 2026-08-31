@@ -1,12 +1,8 @@
-//! Factory-parameterized semantic contract suite for frame channels.
+//! This module defines factory-parameterized semantic contract tests for frame channels.
 //!
-//! Every scenario exercises only the neutral boundary — [`FrameSender`],
-//! [`FrameReceiver`], shared lifecycle tokens, and byte-charge ownership —
-//! through a [`ChannelFactory`], so a later provider registers by
-//! instantiating [`frame_channel_contract_suite!`] with its own factory and
-//! runs the identical inventory. Transport-specific behavior (TCP
-//! fragmentation, deadlines, oversize drains, socket close classes) lives in
-//! the adapter's own tests instead.
+//! Every scenario exercises `FrameSender`, `FrameReceiver`, lifecycle tokens, and byte-charge ownership only through `ChannelFactory`.
+//! `frame_channel_contract_suite!` lets providers register a factory for the same scenario inventory.
+//! Adapter tests cover transport-specific behavior instead of this suite.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -19,16 +15,15 @@ use tokio_util::sync::CancellationToken;
 use crate::frame_channel::{FrameReceiver, FrameSender, InboundEvent, OutboundFrame, ReadClose};
 use crate::wire::{encode_frame, pure_header_flags, response_flags, ByteBudget, FrameId};
 
-/// Channel dimensions a scenario controls; the factory maps them onto its
+/// `ChannelFactory` maps scenario-controlled channel dimensions onto its transport.
 /// transport.
 pub(crate) struct ContractConfig {
     pub queue_frames: usize,
     pub write_deadline: Duration,
-    /// Pool backing every inbound and test-created outbound charge.
+    /// `budget_bytes` backs every inbound and test-created outbound charge.
     pub budget_bytes: u64,
-    /// Outbound buffering between the channel and the peer. Scenarios that
-    /// need backpressure set this small so unread frames stall publication;
-    /// every real transport has finite buffering to map this onto.
+    /// `transport_buffer_bytes` bounds outbound buffering between the channel and peer.
+    /// Scenarios that need backpressure set `transport_buffer_bytes` small so unread frames stall publication.
     pub transport_buffer_bytes: usize,
 }
 
@@ -43,25 +38,21 @@ impl Default for ContractConfig {
     }
 }
 
-/// One connected channel under test plus the independent peer driving the
+/// `Harness` contains the channel under test and an independent peer for its far side.
 /// far side.
 pub(crate) struct Harness<C, P> {
     pub sender: FrameSender,
     pub channel: C,
     pub peer: P,
-    /// The engine-side retirement root shared with the channel.
+    /// `generation` is the engine-side retirement root shared with the channel.
     pub generation: CancellationToken,
-    /// The pool `ContractConfig::budget_bytes` created; scenarios assert
-    /// charge release against it.
+    /// `budget` is the pool created from `ContractConfig::budget_bytes`; scenarios assert charge release against it.
     pub budget: ByteBudget,
     pub io_task: tokio::task::JoinHandle<()>,
 }
 
-/// Frame-level far end of the channel under test. Implementations must
-/// encode and decode independently of the channel so the suite never uses
-/// the implementation to verify itself.
+/// `PeerDriver` represents the channel's frame-level far end and encodes and decodes independently of the channel.
 pub(crate) trait PeerDriver: Send {
-    /// Injects one complete inbound frame toward the channel.
     fn send_frame(
         &mut self,
         ty: FrameType,
@@ -69,15 +60,13 @@ pub(crate) trait PeerDriver: Send {
         id: FrameId,
         body: Vec<u8>,
     ) -> impl Future<Output = ()> + Send;
-    /// Yields the next complete frame the channel published, or `None` once
-    /// the channel closed its outbound side.
+    /// `recv_frame` returns `None` after the channel closes its outbound side.
     fn recv_frame(&mut self) -> impl Future<Output = Option<(EnvelopeHeader, Vec<u8>)>> + Send;
-    /// Closes the peer cleanly at a frame boundary.
+    /// `PeerDriver::close` closes the peer cleanly at a frame boundary.
     fn close(self) -> impl Future<Output = ()> + Send;
 }
 
-/// Builds connected channels for the semantic suite. Each provider supplies
-/// one factory; the scenarios themselves never change per provider.
+/// Each provider supplies one factory, while the scenarios remain identical across providers.
 pub(crate) trait ChannelFactory {
     type Channel: FrameReceiver;
     type Peer: PeerDriver;
@@ -111,9 +100,7 @@ fn outbound(corr: u64, body: &[u8]) -> OutboundFrame {
     }
 }
 
-/// Concurrent sends and receives both make progress, and the single logical
-/// writer publishes frames in exactly their admission order — including
-/// admissions interleaved across sender clones.
+/// Concurrent sends and receives make progress, and the logical writer publishes frames in admission order across sender clones.
 pub(crate) async fn concurrent_send_receive_preserves_fifo_admission<F: ChannelFactory>(
     factory: &F,
 ) {
@@ -149,10 +136,8 @@ pub(crate) async fn concurrent_send_receive_preserves_fifo_admission<F: ChannelF
     }
 }
 
-/// Frame-count saturation blocks admission at the queue bound and an expired
-/// admission deadline retires the generation, while a charge-free control
-/// frame still admits with the byte pool fully held: reserved control
-/// capacity is a frame-count grant, not a byte grant.
+/// Frame-count saturation blocks admission at `queue_frames`, and an expired admission deadline retires `generation`.
+/// `queue_frames` grants frame capacity, not byte capacity.
 pub(crate) async fn saturation_holds_at_frame_bound_and_spares_control_capacity<
     F: ChannelFactory,
 >(
@@ -165,7 +150,7 @@ pub(crate) async fn saturation_holds_at_frame_bound_and_spares_control_capacity<
             ..ContractConfig::default()
         })
         .await;
-    // Hold the entire byte pool: charge-free frames must remain admissible.
+    // Charge-free frames remain admissible when the entire byte pool is held.
     let held = h.budget.try_charge(h.budget.available()).expect("pool");
     h.sender
         .send(OutboundFrame {
@@ -199,9 +184,9 @@ pub(crate) async fn saturation_holds_at_frame_bound_and_spares_control_capacity<
     drop(held);
 }
 
-/// Local-completion hooks run exactly once, in admission order, and fire on
-/// local egress alone — before the peer has decoded anything, so completion
-/// never claims peer receipt.
+/// Local-completion hooks run exactly once in admission order.
+/// Hooks fire on local egress before peer decoding.
+/// Local completion never claims peer receipt.
 pub(crate) async fn completion_hooks_fire_once_in_order_without_claiming_receipt<
     F: ChannelFactory,
 >(
@@ -220,8 +205,8 @@ pub(crate) async fn completion_hooks_fire_once_in_order_without_claiming_receipt
         }));
         h.sender.send(frame).await.expect("admits");
     }
-    // Wait for all three completions WITHOUT the peer reading a frame: local
-    // completion must not depend on (or assert) peer consumption.
+    // The three local-completion hooks must run before the peer reads a frame.
+    // Local completion must not depend on peer consumption.
     let waited_at = Instant::now() + Duration::from_secs(5);
     loop {
         if completions.lock().expect("completions lock").len() == 3 {
@@ -237,15 +222,14 @@ pub(crate) async fn completion_hooks_fire_once_in_order_without_claiming_receipt
         "hooks fire exactly once each, in admission order"
     );
     assert!(seen.windows(2).all(|w| w[0].1 <= w[1].1));
-    // Only now does the peer consume what completion already reported.
     for corr in 1..=3u64 {
         let (header, _) = h.peer.recv_frame().await.expect("published frame");
         assert_eq!(header.corr, corr);
     }
 }
 
-/// A frame refused before admission is never published: after discard, sends
-/// fail and the peer observes no frame bytes at all.
+/// A frame refused before admission is never published.
+/// A send refused before admission fails, and the peer observes no frame bytes.
 pub(crate) async fn cancellation_before_admission_leaves_the_frame_unpublished<
     F: ChannelFactory,
 >(
@@ -265,8 +249,8 @@ pub(crate) async fn cancellation_before_admission_leaves_the_frame_unpublished<
     );
 }
 
-/// Publication failure after admission retires the whole channel — shared
-/// lifecycle state flips, later sends fail, and nothing is replayed.
+/// Publication failure after admission retires the entire channel.
+/// `generation` is canceled, later sends fail, and no frame is replayed.
 pub(crate) async fn failure_after_publication_begins_retires_without_replay<F: ChannelFactory>(
     factory: &F,
 ) {
@@ -277,8 +261,8 @@ pub(crate) async fn failure_after_publication_begins_retires_without_replay<F: C
     let charge = h.budget.try_charge(4096).expect("charge");
     let mut frame = outbound(1, &vec![0u8; 4096]);
     frame.charge = charge;
-    // Admission may succeed (the queue is healthy); publication must fail
-    // and retire rather than retry.
+    // After the peer disconnects, admission may succeed, but publication must fail.
+    // Publication failure retires the channel rather than retrying.
     let _ = h.sender.send(frame).await;
     h.io_task.await.expect("transport task");
     assert!(h.sender.is_retired());
@@ -294,7 +278,6 @@ pub(crate) async fn failure_after_publication_begins_retires_without_replay<F: C
     assert!(h.sender.send(outbound(2, b"late")).await.is_err());
 }
 
-/// Graceful finish publishes everything already admitted, then closes.
 pub(crate) async fn graceful_finish_drains_admitted_frames_before_close<F: ChannelFactory>(
     factory: &F,
 ) {
@@ -317,7 +300,6 @@ pub(crate) async fn graceful_finish_drains_admitted_frames_before_close<F: Chann
     );
 }
 
-/// Discard drops queued frames outright and releases every byte charge they
 /// carried.
 pub(crate) async fn discard_drops_queued_frames_and_releases_charges<F: ChannelFactory>(
     factory: &F,
@@ -346,7 +328,6 @@ pub(crate) async fn discard_drops_queued_frames_and_releases_charges<F: ChannelF
     );
 }
 
-/// Inbound frames arrive complete with transport-owned payloads: the byte
 /// charge lives exactly as long as the delivered body.
 pub(crate) async fn inbound_payload_ownership_travels_with_the_frame<F: ChannelFactory>(
     factory: &F,
@@ -379,8 +360,6 @@ pub(crate) async fn inbound_payload_ownership_travels_with_the_frame<F: ChannelF
     );
 }
 
-/// A peer close at a frame boundary is an orderly clean close, distinct from
-/// every corruption class.
 pub(crate) async fn clean_close_at_a_frame_boundary_is_orderly<F: ChannelFactory>(factory: &F) {
     let mut h = factory.connect(ContractConfig::default()).await;
     h.peer
@@ -401,8 +380,6 @@ pub(crate) async fn clean_close_at_a_frame_boundary_is_orderly<F: ChannelFactory
     );
 }
 
-/// Instantiates the full semantic inventory against one factory expression.
-/// A later provider registers here with one invocation; the scenarios above
 /// stay untouched.
 macro_rules! frame_channel_contract_suite {
     ($factory:expr) => {

@@ -116,8 +116,7 @@ describe("grant geometry and duplex-pair binding", () => {
             () => decodeShmGrant(validGrant(4), { ...OPTIONS, previousCandidate: mark }),
             "stale_candidate",
         );
-        // A fresh daemon incarnation (different pid) restarts the host's
-        // process-local candidate sequence: id 1 is valid, not a replay.
+        // A daemon with a different pid starts a new candidate sequence; candidateId 1 is not stale_candidate.
         expect(
             decodeShmGrant(validGrant(1, 4321), { ...OPTIONS, previousCandidate: mark })
                 .candidateId,
@@ -136,8 +135,7 @@ describe("accessor and proxy value defense", () => {
                 get() {
                     const count = (reads.get(key) ?? 0) + 1;
                     reads.set(key, count);
-                    // Later reads observe a poisoned value, so any
-                    // validate-then-reread gap fails this test.
+                    // Later reads return NaN; decodeShmGrant must read each field once.
                     return count === 1 ? value : Number.NaN;
                 },
             });
@@ -206,9 +204,7 @@ describe("provider grant handling before any native effect", () => {
             ...validGrant(),
             host_to_peer_grant: grantHex({ lane: 0, arena: overArena, total: overArena + 12_288n }),
         };
-        // Seeded-defect detector: if validation ran after attachment
-        // effects (inside start()), connect would return a channel and
-        // this throw assertion would fail.
+        // Validation must run before start() so invalid grants cannot create a channel.
         expect(() => provider.connect(grant, channelArgs())).toThrow(ShmGrantError);
         expect(activeNativeChannels()).toBe(channels);
         expect(activeExternalRefs()).toBe(refs);
@@ -230,10 +226,9 @@ describe("provider grant handling before any native effect", () => {
         const provider = createExplicitShmTestProvider(QUALIFIED_TEST_PROFILE);
         if (!provider) return;
         provider.connect(validGrant(7, 1000), channelArgs());
-        // The replacement daemon's process-local sequence restarts at 1;
-        // its first grant must attach instead of failing stale_candidate.
+        // A replacement daemon starts a new candidate sequence at 1; its first grant is not stale_candidate.
         provider.connect(validGrant(1, 2000), channelArgs());
-        // Monotonicity now tracks the NEW incarnation.
+        // A daemon with a different pid starts a new candidate sequence; candidateId 1 is not stale_candidate.
         expectCode(() => provider.connect(validGrant(1, 2000), channelArgs()), "stale_candidate");
         provider.connect(validGrant(2, 2000), channelArgs());
     });
@@ -244,11 +239,9 @@ describe("provider grant handling before any native effect", () => {
         const firstIncarnation = new Uint8Array(16).fill(1);
         const secondIncarnation = new Uint8Array(16).fill(2);
         provider.connect(validGrant(7, 1000), channelArgs(firstIncarnation));
-        // A replacement daemon can receive its predecessor's recycled PID;
-        // the authenticated incarnation identity differs, so its candidate
-        // sequence restarts at 1 and must attach.
+        // A daemon with a different pid starts a new candidate sequence; candidateId 1 is not stale_candidate.
         provider.connect(validGrant(1, 1000), channelArgs(secondIncarnation));
-        // Monotonicity now tracks the new incarnation under the same PID.
+        // A daemon with a different pid starts a new candidate sequence; candidateId 1 is not stale_candidate.
         expectCode(
             () => provider.connect(validGrant(1, 1000), channelArgs(secondIncarnation)),
             "stale_candidate",

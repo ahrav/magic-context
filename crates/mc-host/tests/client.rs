@@ -444,11 +444,9 @@ async fn managed_client_negotiation_failures_retire_socket_without_application_f
     }
 }
 
-/// Wire protocol §5.2 requires the client to reject a `ServerProof` whose
-/// `daemon_ver` disagrees with the connection file, before it emits `ClientAuth`.
-/// `daemon_ver` is not an input to either proof, so a peer holding the right key
-/// and daemon ID can still report any version it likes; only this comparison
-/// binds the reported version to the snapshot that was authenticated.
+/// Wire protocol §5.2 requires the client to reject a `ServerProof` whose `daemon_ver` differs from the connection file before emitting `ClientAuth`.
+/// Because `daemon_ver` is absent from both proofs, a peer with the key and daemon ID can report any version.
+/// Comparing `daemon_ver` with the connection file binds the reported version to the authenticated snapshot.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_rewritten_daemon_ver_fails_the_handshake() {
@@ -475,9 +473,6 @@ async fn a_rewritten_daemon_ver_fails_the_handshake() {
 
     let peer = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
-        // Correct key and daemon ID, but a version the connection file never
-        // published. The server-side handshake therefore fails on the client's
-        // refusal to send `ClientAuth`, which is the behavior under test.
         let _ = authenticate_server(
             &mut socket,
             &key,
@@ -500,10 +495,9 @@ async fn a_rewritten_daemon_ver_fails_the_handshake() {
 async fn zero_length_stream_item_is_delivered_and_does_not_retire_the_connection() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // Only `StreamEnd` must be empty, so a zero-length `StreamData` item is
-    // legal. It must reach the stream consumer rather than being misread as an
-    // exhausted retained-byte budget, which would retire the generation and
-    // fail every unrelated in-flight request.
+    // Only `StreamEnd` must be empty; a zero-length `StreamData` item is legal.
+    // A zero-length `StreamData` item must reach the stream consumer rather than be treated as an exhausted retained-byte budget.
+    // Treating a zero-length `StreamData` item as an exhausted retained-byte budget would retire the generation and fail unrelated in-flight requests.
     const STREAM_FLAGS: u8 = raw_client::FLAGS_INTERACTIVE;
 
     async fn read_frame(socket: &mut tokio::net::TcpStream) -> raw_client::RawFrame {
@@ -551,7 +545,6 @@ async fn zero_length_stream_item_is_delivered_and_does_not_retire_the_connection
         .await
         .expect("managed client authenticates");
 
-        // Negotiation (correlation 1).
         let negotiate = read_frame(&mut socket).await;
         assert_eq!(negotiate.corr, 1);
         let selection = br#"{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1}}"#;
@@ -581,8 +574,6 @@ async fn zero_length_stream_item_is_delivered_and_does_not_retire_the_connection
         reply.extend_from_slice(opened);
         socket.write_all(&reply).await.expect("route.open reply");
 
-        // Stream request (correlation 3): first item empty, then a payload
-        // item, then StreamEnd.
         let stream_request = read_frame(&mut socket).await;
         assert_eq!(stream_request.corr, 3);
         assert_eq!(stream_request.channel, 7);

@@ -15,8 +15,6 @@ name = "direct_host_fixture"
 path = "examples/direct_host_fixture.rs"
 required-features = ["direct-host-fixture"]
 
-# `ck-mc-host` is the production lifecycle/serve executable; it depends on
-# mc-module + mc-host, never the reverse.
 [[bin]]
 name = "ck-mc-host"
 path = "src/bin/ck-mc-host.rs"
@@ -32,42 +30,24 @@ cortexkit-lease = { workspace = true }
 async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Provider context-overflow error patterns (scheduler unit). Plain regex (no
-# lookarounds in those patterns); fancy-regex stays confined to mc-tokenizer.
 regex = "1"
-# `signal` enables the `ck-mc-host serve` SIGTERM handler.
 tokio = { workspace = true, features = ["signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = { workspace = true }
-# Only the detached-exec module in `src/bin/ck-mc-host.rs` uses libc
-# (fork/setsid/fexecve); library code never does.
 libc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [features]
-# Joint CC rig-drive fault injection. DEFAULT OFF.
 #
-# A default (deploy) build does not contain the corruption path at all: every line
-# of fault code lives under `#[cfg(feature = "drive-fault")]` in src/lib.rs, so its
-# ABSENCE from the shipped binary is the dormancy proof — there is no runtime-
-# reachable arm that a stray env var could activate (a runtime-reachable corruption
-# path was explicitly rejected: a forgotten var in prod would silently raw-fence
-# every CC session forever). The drive builds a SEPARATE binary with
-# `--features drive-fault`; that binary's only diff vs the deploy SHA is this flag,
-# and under it MC_DRIVE_FAULT selects an arm (fingerprint_skew | omit_ck_messages)
-# so the drive can flip arms between passes without rebuilding.
 #
-# Do NOT add drive-fault to a default feature set, and do NOT add new fault arms
-# without the matching absence-proof note here and the fault-shape tests in lib.rs.
+# `drive-fault` must remain outside the default feature set.
 drive-fault = []
-# The `direct-host-fixture` feature enables a test-only process fixture, not a production launch surface.
 direct-host-fixture = []
 
 [dev-dependencies]
 chrono-tz = "0.10"
 tokio = { workspace = true, features = ["signal"] }
-# Enable the store's seed helpers for mc-module's compose tests (populate memories +
-# mutations). The feature is gated so the writers never reach production builds.
+# `mc-store` enables `test-support` only in dev-dependencies, so production builds exclude the feature.
 mc-store = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 filetime = "0.2"

@@ -20,7 +20,7 @@ import { createTestDb, textOf, userMessage } from "./test-utils.test";
 
 const SESSION_ID = "ses_pi_mural_inject";
 
-// 1x1 transparent PNG data URL (same fixture as OpenCode mural inject tests).
+// FAKE_MURAL_DATA_URL encodes a 1x1 transparent PNG fixture.
 const FAKE_MURAL_DATA_URL =
 	"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 const FAKE_MURAL_BASE64 = FAKE_MURAL_DATA_URL.slice(
@@ -103,7 +103,6 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			expect(hardImage?.mimeType).toBe("image/png");
 			expect(hardImage?.data).toBe(FAKE_MURAL_BASE64);
 
-			// Simulate restart after another session advances the project manifest.
 			// The defer must reload this session's persisted frozen payload instead.
 			const currentManifestBase64 = replaceCurrentManifest(db);
 			__test.clearPiMuralProcessCache(SESSION_ID);
@@ -143,24 +142,22 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 				category: "ARCHITECTURE",
 			});
 
-			// Fold with a mural so both the marker and the image payload are cached
-			// against this claim snapshot.
+			// The hard pass caches the mural marker and image payload with the claim snapshot.
 			const foldMessages = [userMessage("hello")];
 			injectM0M1Pi(state, db, foldMessages as never, undefined, true);
 			expect(textOf(foldMessages[0])).toContain("<memory-mural>");
 			expect(textOf(foldMessages[0])).toContain("<project-memory>");
 			expect(findM0Image(foldMessages)?.data).toBe(FAKE_MURAL_BASE64);
 
-			// Withdraw the claim after the mural was cached, so the next pass must fold.
+			// Withdrawing the claim after caching the mural forces the next pass to fold.
 			setProjectMemoryClaimLifecycle(
 				db,
 				{ producer: "test", operationKey: "pi-mural-stale-archive" },
 				{ token: claim.token, state: "archived", actor: "user:test" },
 			);
 
-			// A sibling process holds the materialize lock, so every attempt loses
-			// BEGIN IMMEDIATE and the pass falls back to replaying the cached m[0]
-			// — which still carries the mural marker and the cached image payload.
+			// A sibling process holding the materialize lock makes `BEGIN IMMEDIATE` fail and forces cached m[0] replay.
+			// Cached m[0] retains the mural marker and image payload.
 			const locked = new Proxy(db, {
 				get(target, property, receiver) {
 					if (property === "exec") {
@@ -190,9 +187,7 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			);
 			expect(stale.contentionExhausted).toBe(true);
 
-			// The publication fence withholds the claim text, so every other
-			// claim-derived representation must obey it too: no image part, no
-			// marker promising one, and no cached payload left to replay.
+			// The publication fence suppresses all claim-derived representations: the image part, mural marker, and replayable cached payload.
 			const staleText = textOf(staleMessages[0]);
 			expect(staleText).not.toContain("<project-memory>");
 			expect(staleText).not.toContain("<memory-mural>");
@@ -394,7 +389,7 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 		clearModelsDevCache();
 		const db = createTestDb();
 		try {
-			// Seed a non-vision model so the gate has metadata but vision=false.
+			// A non-vision model gives the gate metadata with vision=false.
 			await refreshModelLimitsFromApi({
 				config: {
 					providers: async () => ({
@@ -452,8 +447,7 @@ describe("resolveMuralWire Pi provider-prefix translation", () => {
 	let originalXdgData: string | undefined;
 
 	beforeEach(() => {
-		// Isolate the persisted models-dev cache so vision seeds never touch the
-		// real ~/.local/share tree or leak across cases via cold-start reload.
+		// A test-local models-dev cache prevents vision seeds from touching the real cache or leaking through cold-start reloads.
 		tempDir = mkdtempSync(join(tmpdir(), "mc-pi-mural-models-"));
 		originalXdgData = process.env.XDG_DATA_HOME;
 		process.env.XDG_DATA_HOME = tempDir;
@@ -481,8 +475,7 @@ describe("resolveMuralWire Pi provider-prefix translation", () => {
 								models: {
 									"gpt-4o": {
 										limit: { context: 128_000, input: 128_000 },
-										// models-dev vision detection looks for modalities/input
-										// containing "image" or a vision-ish name.
+										// models-dev vision detection accepts `modalities.input` containing "image" or model names containing "vision".
 										modalities: { input: ["text", "image"] },
 									},
 								},
@@ -494,8 +487,8 @@ describe("resolveMuralWire Pi provider-prefix translation", () => {
 		});
 		const db = createTestDb();
 		try {
-			// Empty cue pool → supportsVision true but no dataUrl. The important
-			// assertion is that the Pi-native prefix is NOT rejected as unknown.
+			// An empty cue pool sets supportsVision to true without a dataUrl.
+			// `pi/` model keys are accepted rather than classified as unknown.
 			const wire = resolveMuralWire(
 				db,
 				"git:pi-mural-prefix",

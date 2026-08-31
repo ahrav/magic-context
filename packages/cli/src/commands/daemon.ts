@@ -9,14 +9,12 @@ import { sanitizeDiagnosticText } from "../lib/redaction";
 
 const ACTIONS = new Set<LifecycleCommand>(["start", "stop", "restart", "status", "doctor"]);
 
-/** Display bound for peer-supplied version text, matching the shared
- *  diagnostic-string limit used by the mc-host client. */
+/**
+ * */
 const MAX_VERSION_TEXT_LEN = 128;
 
-/** C0 and C1 control characters (including ESC and newlines): peer-supplied
- *  version text must not be able to move the cursor, erase lines, or forge
- *  additional output lines in the terminal. */
-// biome-ignore lint/suspicious/noControlCharactersInRegex: neutralizing them is the point
+/** Replacing C0 and C1 controls prevents peer-supplied version text from moving the cursor, erasing lines, or forging terminal output.
+ * */
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 
 interface DaemonPolicy {
@@ -85,14 +83,8 @@ function redactResult(
     const sensitiveRoots = root.ok ? sensitiveRootsFor(root.root, env) : [];
     const redact = (value: string | null): string | null => {
         if (value === null) return null;
-        // Failures inside the redaction chain (e.g. os.userInfo() throwing for
-        // a UID with no passwd entry) must not reject the command: the v1
-        // output contract requires exactly one result object, so fall back to
-        // a placeholder instead of leaking or throwing.
         try {
-            // Replace every occurrence of each sensitive root, not just a
-            // leading prefix: version text is free-form and may embed a path
-            // mid-string (R35 requires no such path reaches output).
+            // Version text may embed a sensitive root mid-string, so redaction replaces every occurrence.
             let redacted = value;
             for (const sensitiveRoot of sensitiveRoots) {
                 redacted = redacted.split(sensitiveRoot).join("<data-root>");
@@ -170,8 +162,6 @@ export async function runDaemonCommand(
         return 1;
     }
 
-    // Redaction and rendering must not reject the command: an escaped throw
-    // would exit without any v1 object, violating the one-result contract.
     let rendered: string;
     let ok: boolean;
     try {

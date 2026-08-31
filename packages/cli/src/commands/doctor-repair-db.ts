@@ -121,9 +121,8 @@ function classifyOpenDatabase(db: DatabaseType, path: string): FormatFamilyClass
     );
 }
 
-// A read-only SQLite open can rewrite an existing SHM file, so the probe runs
-// against a private scratch copy of the family. Unreadable contents return
-// null; migrateAndCheckRecoveredDatabase re-validates after `.recover`.
+// The probe uses a private scratch copy because a read-only SQLite open can rewrite an existing SHM file.
+// classifyDatabaseFamily returns null for unreadable contents; migrateAndCheckRecoveredDatabase re-validates after `.recover`.
 function classifyDatabaseFamily(dbPath: string): FormatFamilyClassification | null {
     let probeDir: string | null = null;
     let db: DatabaseType | null = null;
@@ -198,7 +197,6 @@ function readRowCounts(path: string): RowCounts {
             }
         }
     } catch {
-        // Every table remains n/a when SQLite cannot open the damaged file.
     } finally {
         db?.close();
     }
@@ -253,14 +251,12 @@ function sqliteError(result: ReturnType<typeof spawnSync>): string {
 }
 
 // `.recover` reads raw database pages through the sqlite_dbpage virtual table.
-// That table is a compile-time option (SQLITE_ENABLE_DBPAGE_VTAB); a shell built
-// without it dies the moment `.recover` reaches for it, with one of the first two
-// errors below. Shells older than SQLite 3.29 have no `.recover` command at all
-// and answer "unknown command". All three mean THIS SQLITE3 LACKS A FEATURE, not
-// that the data is gone: the same database may salvage fine on a full build, so
-// the command must stop without claiming it is unsalvageable and without offering
-// the destructive reset. Kept deliberately narrow — a genuine data-level failure
-// of `.recover` must still reach the normal failure path.
+// The `sqlite_dbpage` virtual table requires `SQLITE_ENABLE_DBPAGE_VTAB`.
+// A shell without `SQLITE_ENABLE_DBPAGE_VTAB` fails when `.recover` accesses `sqlite_dbpage`.
+// Shells older than SQLite 3.29 do not support `.recover`.
+// Missing-capability errors indicate missing SQLite capabilities, not data loss.
+// A missing-capability error stops recovery without offering recovery.
+// Data-level `.recover` failures are recovery failures.
 const RECOVER_UNAVAILABLE_PATTERNS = [
     /no such table: sqlite_dbpage/i,
     /no such module: sqlite_dbpage/i,
@@ -294,8 +290,8 @@ function runRecoverShell(
                 ok: false,
                 detail: `.recover failed: ${errorDetail}`,
                 attempted,
-                // Only a shell that actually ran can report a missing capability;
-                // a spawn failure is the could-not-start case, handled separately.
+                // Only a shell that ran can report a missing capability.
+                // A spawn failure produces a could-not-start error.
                 unavailable: attempted && isRecoverCapabilityMissing(errorDetail),
             };
         }
@@ -312,8 +308,8 @@ function runRecoverShell(
                     ok: false,
                     detail: `replaying .recover output failed: ${sqliteError(replayed)}`,
                     attempted: true,
-                    // The replay step only executes the SQL `.recover` emitted, so a
-                    // failure here is about the recovered data, never about the shell.
+                    // The replay step executes only SQL emitted by `.recover`.
+                    // A replay failure occurs after the shell emits `.recover` SQL.
                     unavailable: false,
                 };
             }
@@ -350,7 +346,7 @@ function migrateAndCheckRecoveredDatabase(path: string): SalvageResult {
                     `this command repairs only the supported direct claims format — run \`${DATABASE_RESET_COMMAND}\` to abandon the family`,
             };
         }
-        // Restore application_id and user_version before classifying.
+        // Classification requires the original `application_id` and `user_version`.
         // pi-lens-ignore: sql-injection
         db.exec(`PRAGMA application_id = ${MC_APPLICATION_ID}`);
         // pi-lens-ignore: sql-injection
@@ -625,10 +621,9 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
         return REPAIR_DB_EXIT.failed;
     }
     if (!salvage.ok && salvage.unavailable) {
-        // Same posture as the could-not-start branch above: no verdict about the
-        // DATA may be drawn from a tool that lacks a feature. The database stays
-        // untouched, the backup is named, and the destructive reset is never
-        // offered — exit code `failed`, not `unsalvageable`.
+        // A shell without required recovery capabilities cannot determine whether the database is salvageable.
+        // Handling a missing-capability error leaves the database untouched, retains the named backup, and skips the destructive reset.
+        // The repair flow exits with `failed`, not `unsalvageable`, on a missing-capability error.
         removeRecoveryBundle(recoveredPath);
         const unavailableAfter = Object.fromEntries(
             ROW_COUNT_TABLES.map((table) => [table, null]),
@@ -678,11 +673,10 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
         }
     }
 
-    // Keep the salvaged bundle. `.recover` emits a `lost_and_found` table
-    // whenever page-to-table attribution is lost, and the exact-inventory gate
-    // refuses any unregistered object, so the recoveries that salvage the most
-    // rows are precisely the ones that fail classification. Deleting them here
-    // would discard that data before the operator ever sees it.
+    // The repair flow keeps the salvaged bundle when `.recover` emits `lost_and_found`.
+    // The exact-inventory gate rejects the unregistered `lost_and_found` table.
+    // Recoveries with `lost_and_found` rows fail classification despite retaining recoverable data.
+    // Deleting recoveries with `lost_and_found` would discard recoverable data before the operator sees it.
     const unavailableAfter = Object.fromEntries(
         ROW_COUNT_TABLES.map((table) => [table, null]),
     ) as RowCounts;

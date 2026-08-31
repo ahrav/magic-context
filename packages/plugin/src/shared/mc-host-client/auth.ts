@@ -1,20 +1,7 @@
 /**
- * Pure client authentication state machine (wire doc Section 5).
  *
- * Runs the exact three-message handshake — ClientHello, ServerProof,
- * ClientAuth — over injected bounded byte I/O. This module owns no socket
- * and never imports `node:net`; the connection engine adapts its socket
- * to {@link AuthByteIo}.
  *
- * Each message is a `u32` little-endian byte length followed by at most
- * 4,096 UTF-8 JSON bytes. Proofs are
- * `HMAC-SHA256(key, ASCII(domain) || client_nonce || server_nonce ||
- * u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)`.
- * The client compares the server proof in constant time, then requires the
- * server's daemon ID to equal the connection-file daemon ID and its daemon
- * version to equal the connection-file `daemon_ver`, and emits no ClientAuth
- * until every check passes. Every failure is typed and redacted: no key,
- * nonce, or proof byte ever appears in an error message.
+ * Authentication errors do not include key, nonce, or proof bytes in their messages.
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
@@ -25,16 +12,15 @@ export const NONCE_LEN = 32;
 export const PROOF_LEN = 32;
 const KEY_BYTE_LEN = 32;
 export const AUTH_DAEMON_ID_LEN = 16;
-/** Length 4,096 is valid; 4,097 is rejected before body allocation. */
+/** Messages longer than 4,096 bytes are rejected. */
 export const MAX_AUTH_MESSAGE_LEN = 4_096;
 export const SERVER_PROOF_DOMAIN = "subc-server-v1";
 export const CLIENT_AUTH_DOMAIN = "subc-client-v1";
 export const CLIENT_ROLE = "client";
 
 /**
- * Bounded byte I/O the handshake runs over. Implementations must resolve
- * `readExact` only with exactly `n` bytes and reject on EOF, error, or
- * deadline expiry; `write` must reject unless every byte was accepted for
+ * Implementations must resolve readExact only with exactly n bytes and reject on EOF, I/O error, or deadline expiry.
+ * write must reject unless every byte was accepted for transmission.
  * transmission.
  */
 export interface AuthByteIo {
@@ -52,7 +38,7 @@ export type AuthErrorCode =
     | "daemon_ver_mismatch"
     | "invalid_credentials";
 
-/** Typed, redacted authentication failure. Never carries secret bytes. */
+/* */
 export class AuthError extends Error {
     constructor(
         message: string,
@@ -65,17 +51,15 @@ export class AuthError extends Error {
 }
 
 export interface AuthenticateOptions {
-    /** Test seam for nonce generation. Defaults to `node:crypto` randomBytes. */
+    /** Tests can inject generateNonce; production defaults to randomBytes. */
     generateNonce?: (length: number) => Uint8Array;
 }
 
 /**
- * One connection file's validated authentication material.
  *
- * `daemonVer` is the file's `daemon_ver`. It is the expected value the peer
- * must report, not a claim about the peer, and it is required: the version
- * cross-check runs on every handshake, so a caller with no expected version
- * has no authenticated connection to make.
+ * The peer must report credentials.daemonVer.
+ * daemonVer is required because every handshake validates the peer's reported version against it.
+ * A caller without an expected daemon version cannot establish an authenticated connection.
  */
 export interface AuthCredentials {
     key: Uint8Array;
@@ -83,21 +67,18 @@ export interface AuthCredentials {
     daemonVer: string;
 }
 
-/** Result of a successful handshake. */
+/* */
 export interface AuthResult {
     /**
-     * The server-reported daemon version string, necessarily equal to
-     * `credentials.daemonVer`: any other value fails the handshake.
+     * The server-reported daemon version always equals credentials.daemonVer.
+     * Any other value fails the handshake.
      */
     daemonVer: string;
     daemonId: Uint8Array;
 }
 
 /**
- * `HMAC-SHA256(key, ASCII(domain) || client_nonce || server_nonce ||
- * u32be(len(daemon_ver)) || UTF8(daemon_ver) || daemon_id)`
- * per wire doc Section 5.2. Exported so tests can reproduce the committed
- * literal vectors independently of the transcript path.
+ * The export lets tests reproduce literal proof vectors independently of transcript construction.
  */
 export function computeProof(
     key: Uint8Array,
@@ -121,9 +102,7 @@ export function computeProof(
 }
 
 /**
- * Length-guarded constant-time equality. A length mismatch is an ordinary
- * `false` (an authentication failure), never an exception, so malformed
- * peer input cannot escape the handshake's cleanup path.
+ * A length mismatch returns `false` rather than throwing.
  */
 function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (a.length !== b.length) return false;
@@ -141,7 +120,7 @@ function wrapIo(error: unknown): never {
     throw new AuthError("authentication byte I/O failed", "io_failure", error);
 }
 
-/** Frame one JSON value as `u32 LE length || UTF-8 body` and write it. */
+/* */
 async function writeMessage(io: AuthByteIo, value: unknown, deadline: Deadline): Promise<void> {
     const body = Buffer.from(JSON.stringify(value), "utf8");
     if (body.length > MAX_AUTH_MESSAGE_LEN) {
@@ -162,8 +141,8 @@ async function writeMessage(io: AuthByteIo, value: unknown, deadline: Deadline):
 }
 
 /**
- * Read one framed message. The declared length is validated against the
- * 4,096-byte cap before any body byte is requested or allocated.
+ * The parser validates the declared length before requesting the body.
+ * The parser validates the declared length against the 4,096-byte cap before requesting or allocating the body.
  */
 async function readMessage(io: AuthByteIo, deadline: Deadline): Promise<unknown> {
     checkDeadline(deadline);
@@ -207,7 +186,7 @@ interface ServerProofFields {
     daemonVer: string;
 }
 
-/** Exact-length field validation before any conversion or comparison. */
+/* */
 function parseServerProof(message: unknown): ServerProofFields {
     if (typeof message !== "object" || message === null || Array.isArray(message)) {
         throw new AuthError("ServerProof message must be a JSON object", "malformed_message");
@@ -245,13 +224,10 @@ function parseServerProof(message: unknown): ServerProofFields {
 }
 
 /**
- * Run the client side of the three-message handshake over `io`, bounded by
- * `deadline`. Emits ClientAuth only after the server proof passed a
- * constant-time comparison AND the server's daemon ID equals
- * `credentials.daemonId` AND the server's daemon version equals
- * `credentials.daemonVer`. Any malformed field, proof mismatch, daemon-ID
- * mismatch, daemon-version mismatch, EOF, or deadline expiry rejects with a
- * typed {@link AuthError} and writes nothing further.
+ * `ClientAuth` is emitted only after the server proof passes constant-time comparison.
+ * Malformed fields and authentication mismatches reject with `AuthError`.
+ * EOF and deadline expiry reject with `AuthError`.
+ * Authentication failures reject with `AuthError` and write no further messages.
  */
 export async function authenticateClient(
     io: AuthByteIo,
@@ -296,8 +272,7 @@ export async function authenticateClient(
             "daemon_id_mismatch",
         );
     }
-    // The proof authenticates `daemon_ver`; equality with the connection file
-    // also binds it to the discovery snapshot used to dial this peer.
+    // The server proof authenticates `daemon_ver`.
     if (server.daemonVer !== credentials.daemonVer) {
         throw new AuthError(
             "server daemon version does not match the connection file",

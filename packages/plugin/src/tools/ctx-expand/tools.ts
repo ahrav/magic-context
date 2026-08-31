@@ -40,8 +40,8 @@ const ctxExpandArgsShape = {
         ),
 };
 // The tool definition exposes only the documented argument shape to the model
-// provider, but older callers may still send extra arguments. Parse with
-// passthrough so execute() can receive those fields without advertising them.
+// Callers may still send extra arguments.
+// ctxExpandArgsSchema preserves unadvertised fields in parsedArgs.data.
 const ctxExpandArgsSchema = tool.schema.object(ctxExpandArgsShape).passthrough();
 
 function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
@@ -59,7 +59,6 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
             });
             const sessionId = toolContext.sessionID;
 
-            // By-ordinal mode: full recovery of a single message from stored history.
             if (typeof args.message === "number" && args.message >= 1) {
                 return renderMessageByOrdinal(sessionId, args.message);
             }
@@ -68,11 +67,9 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 return "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).";
             }
 
-            // Clamp the range to the last compartment boundary, mirroring
-            // ctx_search: anything after that boundary is the live tail the
-            // agent already sees in context, so re-reading it just burns output
-            // tokens and duplicates visible content. -1 means "no compartments
-            // yet" → nothing is compacted, so don't clamp.
+            // The tool does not expand messages after lastCompartmentEnd because they remain visible in context.
+            // Re-reading live-tail messages consumes output tokens and duplicates visible content.
+            // lastCompartmentEnd === -1 means no messages are compacted.
             const lastCompartmentEnd = getLastCompartmentEndMessage(deps.db, sessionId);
             if (lastCompartmentEnd >= 0 && args.start > lastCompartmentEnd) {
                 return `Range ${args.start}-${args.end} is entirely within the live tail (after the last compacted message ${lastCompartmentEnd}); those messages are already visible in context.`;
@@ -80,7 +77,6 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
             const effectiveEnd =
                 lastCompartmentEnd >= 0 ? Math.min(args.end, lastCompartmentEnd) : args.end;
 
-            // Verbose mode: each message separate, with ids + per-part previews.
             if (args.verbose === true) {
                 const v = renderVerboseRange(
                     sessionId,

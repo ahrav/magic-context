@@ -266,8 +266,6 @@ describe("applyIdentityMergeToProjectRegistry", () => {
             .prepare("INSERT INTO episodes (project_id, created_at) VALUES (?, 1)")
             .run(sourceId);
 
-        // The routine dir:/git: rekey renames the same numeric row; children
-        // keep their project_id, so owned history must not block it.
         applyIdentityMergeToProjectRegistry(database, "git:source", "git:brand-new", 2_000);
 
         expect(projectIdFor(database, "git:brand-new")).toBe(sourceId);

@@ -58,7 +58,7 @@ function sortKeys(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(sortKeys);
     if (value !== null && typeof value === "object") {
         const out: Record<string, unknown> = {};
-        // Code-point sort: deterministic across runtimes/locales.
+        // Default sort compares UTF-16 code units, independent of locale.
         for (const key of Object.keys(value as Record<string, unknown>).sort()) {
             out[key] = sortKeys((value as Record<string, unknown>)[key]);
         }
@@ -68,13 +68,6 @@ function sortKeys(value: unknown): unknown {
 }
 
 /**
- * Byte-identical to `canonicalJson` in
- * `scripts/generate-mc-host-release-manifest.ts`: recursively key-sorted with
- * code-point ordering, 2-space indentation, arrays keeping their order. The
- * `payload_manifest_digest` in the parent trust index is produced by the build
- * over exactly these bytes (`scripts/build-mc-host-payload.ts`), so any
- * divergence here fails every qualified package closed. `owner.test.ts`
- * asserts agreement against the producer implementation.
  */
 export function canonicalPayloadManifestJson(value: unknown): string {
     return JSON.stringify(sortKeys(value), null, 2);
@@ -275,10 +268,6 @@ function verifyPackage(
 }
 
 /**
- * Resolve one current-release launcher. Retained bootstrap validation always
- * runs first. Observational callers pass `allowPackageLookup:false`, making a
- * missing retained object a side-effect-free `null`; mutating callers may then
- * resolve one certified physical package and stage independent bytes.
  */
 export function prepareManagedLaunchTarget(
     options: PrepareManagedLaunchTargetOptions,

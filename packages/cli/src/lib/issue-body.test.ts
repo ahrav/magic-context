@@ -17,7 +17,7 @@ describe("extractRecentErrors", () => {
 
         const matches = extractRecentErrors(log, 20);
 
-        // Should include real errors but NOT the past-tense "0 failed" telemetry.
+        // `extractRecentErrors` excludes `0 failed` telemetry.
         expect(matches).toContain("2026-05-20 12:00:02 transform failed: SQLITE_BUSY");
         expect(matches).toContain(
             "2026-05-20 12:00:03 historian prompt failed: connection refused",
@@ -43,7 +43,6 @@ describe("extractRecentErrors", () => {
         ].join("\n");
 
         const matches = extractRecentErrors(log, 20);
-        // All four lines qualify — the Error and three stack frames.
         expect(matches.length).toBe(4);
     });
 
@@ -70,8 +69,6 @@ describe("extractRecentErrors", () => {
             lines.push(`transform failed: error ${i}`);
         }
         const matches = extractRecentErrors(lines.join("\n"), 5);
-        // We asked for 5; the 5 NEWEST errors should be returned, in
-        // chronological (oldest-first) order: 45, 46, 47, 48, 49.
         expect(matches.length).toBe(5);
         expect(matches[0]).toBe("transform failed: error 45");
         expect(matches[4]).toBe("transform failed: error 49");
@@ -89,17 +86,13 @@ describe("extractRecentErrors", () => {
 
 describe("capBodyToGithubLimit", () => {
     /**
-     * Build a synthetic issue body shaped like the real bundlers produce —
-     * a few small sections followed by a giant `## Log (last N lines,
-     * sanitized)` fenced block. We make the log section large enough to
-     * exceed the requested budget.
+     * Tests that require truncation use enough log lines to exceed the requested budget.
      */
     function makeBody(opts: { logLineCount: number; lineSize?: number }): string {
         const lineSize = opts.lineSize ?? 80;
         const logLines: string[] = [];
         for (let i = 0; i < opts.logLineCount; i += 1) {
-            // Each line is prefixed with its index so we can verify which
-            // ones get dropped vs kept after truncation.
+            // Line indexes identify content retained after truncation.
             const prefix = `LINE${String(i).padStart(6, "0")}: `;
             const padding = "x".repeat(Math.max(0, lineSize - prefix.length));
             logLines.push(prefix + padding);
@@ -138,10 +131,7 @@ describe("capBodyToGithubLimit", () => {
         const capped = capBodyToGithubLimit(body, 60_000);
         const cappedBytes = Buffer.byteLength(capped, "utf8");
 
-        // The body must now fit the budget.
         expect(cappedBytes).toBeLessThanOrEqual(60_000);
-        // And it must actually be smaller than the input (proving truncation
-        // happened, not just trivially passed-through).
         expect(cappedBytes).toBeLessThan(originalBytes);
     });
 
@@ -149,8 +139,7 @@ describe("capBodyToGithubLimit", () => {
         const body = makeBody({ logLineCount: 5000, lineSize: 200 });
         const capped = capBodyToGithubLimit(body, 60_000);
 
-        // The errors section MUST survive truncation — that's the whole
-        // point of separating it from the main log block.
+        // The errors section survives truncation.
         expect(capped).toContain("## Recent errors (last 20, sanitized)");
         expect(capped).toContain("transform failed: critical error 1");
         expect(capped).toContain("transform failed: critical error 2");
@@ -167,8 +156,6 @@ describe("capBodyToGithubLimit", () => {
         const body = makeBody({ logLineCount: 5000, lineSize: 200 });
         const capped = capBodyToGithubLimit(body, 60_000);
 
-        // The last log line (LINE004999) should be preserved — it's the
-        // newest and the most relevant.
         expect(capped).toContain("LINE004999:");
 
         // The first log line (LINE000000) should be gone — it's the oldest.
@@ -186,8 +173,7 @@ describe("capBodyToGithubLimit", () => {
     });
 
     it("uses MAX_GITHUB_BODY_BYTES as the default budget", () => {
-        // Building a body well past 60KB to force the default-budget path
-        // to engage. 80 chars * 5000 lines = ~400KB just for the log block.
+        // The 5000-line log exceeds the default 60 KB budget.
         const body = makeBody({ logLineCount: 5000, lineSize: 80 });
         const capped = capBodyToGithubLimit(body);
         expect(Buffer.byteLength(capped, "utf8")).toBeLessThanOrEqual(MAX_GITHUB_BODY_BYTES);
@@ -215,9 +201,7 @@ describe("capBodyToGithubLimit", () => {
         expect(capped).toContain("[truncated further to fit GitHub body limit]");
     });
     it("falls back to raw byte truncation when log heading is missing", () => {
-        // Synthetic input with no `## Log (last` heading — exercises the
-        // defensive fallback path. We pad with non-ASCII to ensure UTF-8
-        // boundary handling doesn't corrupt the slice.
+        // Non-ASCII padding verifies that UTF-8 boundary handling preserves valid text.
         const body = `## Other\n${"ü".repeat(50_000)}\n## End`;
         const capped = capBodyToGithubLimit(body, 10_000);
         expect(Buffer.byteLength(capped, "utf8")).toBeLessThanOrEqual(10_000);

@@ -1,5 +1,3 @@
-//! Production historian chunk assembly from CK flat blocks.
-
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
@@ -388,9 +386,7 @@ pub fn build_historian_chunk(
         if message.ordinal < start {
             continue;
         }
-        // System-role content is pinned prompt material, so Builder records it
-        // as metadata-only. Its real flat blocks remain available to identify an
-        // anchor when the ordinal is absorbed into a later narrative line.
+        // Builder records system-role messages as pending metadata without rendering them.
         let flat_message = FlatMessage {
             ordinal: message.ordinal,
             role,
@@ -415,9 +411,8 @@ pub fn build_historian_chunk(
     let _ = builder.flush_current_block();
     let tool_only_ranges = merge_tool_only_ranges(&builder.tool_only_ranges);
     let end = builder.last_ordinal;
-    // Filtering removes some scanned messages from the chunk text, but they still advance
-    // the reader. TS uses the furthest scanned ordinal for has_more rather than the last
-    // rendered line, otherwise a filtered tail is repeatedly offered to the historian.
+    // System-role messages still advance the scanned ordinal.
+    // Using the last rendered ordinal would repeatedly offer a filtered tail to the historian.
     let present_ordinals = input_ordinals;
     let snapshot = blocks
         .iter()
@@ -467,8 +462,7 @@ pub struct HistorianAssemblerConfig {
     pub extraction_free: bool,
     pub in_emergency: bool,
     pub force_keep_last_compartment: bool,
-    /// When true, tail reducers are off and the historian fold is the sole reclaim path
-    /// (e.g. Claude Code byte-splice). The substance floor must not block firing.
+    /// The substance floor must not block firing when `fold_is_only_reclaim` is true.
     pub fold_is_only_reclaim: bool,
     pub failure_backoff_at_ms: i64,
     pub min_chunk_tokens: usize,
@@ -496,7 +490,6 @@ pub struct AssembledHistorianFiring {
     pub prompt: String,
     pub model_chain: Vec<String>,
     pub chunk: HistorianBuiltChunk,
-    /// Original CK messages in the compacted interval, serialized for durable ctx_expand.
     pub raw_chunk_messages: String,
     pub chunk_fingerprint: String,
     pub selected_range_identities: Vec<HistorianSelectedMessageIdentity>,
@@ -508,7 +501,6 @@ pub struct AssembledHistorianFiring {
     pub to_ordinal: u64,
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
-    /// Native message ids mapped to local YYYY-MM-DD dates for temporal headings.
     pub boundary_dates: BTreeMap<String, String>,
 }
 
@@ -527,9 +519,6 @@ impl AssembledHistorianFiring {
             project_path,
             project_slug,
             harness,
-            // The role-scoped historian system prompt. The assembler builds the USER
-            // prompt (chunk + references); the system prompt is the vendored constant —
-            // per-firing static, byte-identical across firings.
             system: crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT,
             prompt: &self.prompt,
             model_chain: &self.model_chain,
@@ -585,9 +574,6 @@ fn historian_claim_block(store: &McStore, expected: Option<&SnapshotVector>) -> 
     if canonical_snapshot_vector(&vector).ok() != canonical_snapshot_vector(expected).ok() {
         return String::new();
     }
-    // A row the module cannot render is skipped on its own; failing the whole
-    // collection would blank the historian's project memory because of a single
-    // archived or attribute-incomplete row.
     let Some(claims) = store
         .list_claim_mirror(&before.database_incarnation_id, None)
         .ok()
@@ -675,14 +661,6 @@ pub fn assemble_historian_firing(
             HistorianNoFireReason::EmptyChunk,
         ));
     }
-    // The chunked-content floor prevents spawning a producer for a chunk with
-    // too little summarizable substance (tool arcs collapse to one-line TC:
-    // summaries, so a tool-dominated tail can be huge in raw bytes yet tiny in
-    // chunk text). Bypass the floor when emergency (>=95% usage) OR when the fold
-    // is the only reclaim (`fold_is_only_reclaim`): on verbatim-tail profiles there
-    // is no other reducer, so blocking a small chunk leaves the session with zero
-    // reclaim at any pressure (CC hard-blocks below ~95%, so emergency alone is
-    // insufficient). Where tail reducers exist, keep the floor unless in emergency.
     if chunk.token_estimate < config.min_chunk_tokens
         && !config.in_emergency
         && !config.fold_is_only_reclaim
@@ -731,10 +709,6 @@ pub fn assemble_historian_firing(
         chunk.chunk.start_index as i64,
         &compartments,
     );
-    // The claim mirror holds every workspace-authorized claim, including shared
-    // foreign-project ones, so a project with cross-session memory disabled
-    // contributes no project-memory block at all. The prompt's own
-    // memory-disabled toggle governs extraction, not what context is shown.
     let memory_block = if !config.memory_enabled {
         String::new()
     } else {
@@ -798,9 +772,6 @@ pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> S
         return input.to_string();
     }
 
-    // TypeScript slices by UTF-16 code units. Keep the same search space rather than
-    // treating an astral character as one scalar; a cut through a surrogate pair is
-    // represented by the replacement scalar Rust can safely emit for that lone unit.
     let input_units: Vec<u16> = input.encode_utf16().collect();
     let mut lo = 0usize;
     let mut hi = input_units.len();
@@ -1309,16 +1280,12 @@ mod tests {
             msg("a3", 3, "assistant", vec![text("done")]),
         ];
         let built = project_and_build(&messages, 1, 1_000, 4);
-        // System CONTENT stays out of the chunk text (pinned prompt material,
         // not conversation)...
         assert!(!built.text.contains("identity"));
         assert!(!built.text.contains("second pinned block"));
         assert!(built.text.contains("U: hello"));
         assert!(built.text.contains("A: done"));
         assert_eq!(built.chunk.start_index, 1);
-        // ...but its ordinal rides the line meta: every present ordinal in the
-        // claimed coverage range must be represented, even though consumer-leg
-        // ordinal spaces can be sparse.
         let ordinals: Vec<u64> = built.chunk.lines.iter().map(|line| line.ordinal).collect();
         assert_eq!(ordinals, vec![1, 2, 3]);
         assert_eq!(built.chunk.lines[0].message_id, "u1#0");
@@ -1770,7 +1737,6 @@ mod tests {
 
     #[test]
     fn below_budget_when_tail_reclaim_not_fold_only() {
-        // Tail reducers exist (owned-llmrunner leg): substance floor blocks below emergency.
         match tiny_chunk_assemble(false) {
             AssembleHistorianFiringOutcome::NoFire(HistorianNoFireReason::BelowBudget {
                 minimum,
@@ -1782,7 +1748,6 @@ mod tests {
 
     #[test]
     fn fold_only_fires_below_substance_floor_without_emergency() {
-        // Claude Code leg: fold is sole reclaim; must fire even when chunk << min_chunk_tokens.
         match tiny_chunk_assemble_fold_only(false) {
             AssembleHistorianFiringOutcome::Fire(_) => {}
             other => panic!("expected fold-only fire below min_chunk_tokens, got {other:?}"),
@@ -1791,7 +1756,6 @@ mod tests {
 
     #[test]
     fn below_budget_refuses_normally_but_fires_in_emergency() {
-        // Emergency (>=95%): bypasses floor even when tail reclaim exists (fold_is_only_reclaim false).
         match tiny_chunk_assemble(true) {
             AssembleHistorianFiringOutcome::Fire(_) => {}
             other => panic!("expected emergency fire despite tiny chunk, got {other:?}"),

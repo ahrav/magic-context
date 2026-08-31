@@ -55,8 +55,7 @@ async function resolveFenceRoots(
         throw fsError(configuredHomePath, error);
     }
 
-    // Runtime storage is rooted at XDG_DATA_HOME. Canonicalize the configured data
-    // root before checking paths, so a symlinked data directory is checked by its real path.
+    // Canonicalize the configured data directory before path checks so symlinked roots are checked by their real paths.
     const configuredDataDirectory = resolve(
         options.dataDirectory ?? process.env.XDG_DATA_HOME ?? join(home, ".local", "share"),
     );

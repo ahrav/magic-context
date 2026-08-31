@@ -1,12 +1,10 @@
-//! TCP measurement arms for the IPC budget: serial RTT, open-loop loaded
-//! latency, and timestamp-minimal closed-loop throughput.
+//! This module measures serial RTT, open-loop loaded latency, and closed-loop throughput for the IPC budget.
 //!
-//! All arms speak the production wire through the independent raw client,
-//! authenticate once, open one route, and echo the committed compact JSON
-//! fixture. Serial RTT is issue-to-validated-terminal with exactly one
-//! request in flight; loaded latency keeps scheduled-to-completion,
-//! issue-to-completion, and scheduler lag as separate distributions;
-//! throughput timestamps only the window boundaries.
+//! Each arm uses the independent raw client to speak the production wire.
+//! Each arm authenticates once, opens one route, and echoes the committed compact JSON fixture.
+//! Serial RTT measures issue-to-validated-terminal latency with exactly one request in flight.
+//! Loaded latency records scheduled-to-completion, issue-to-completion, and scheduler lag in separate distributions.
+//! Throughput timestamps only the measurement-window boundaries.
 
 #![allow(dead_code)]
 
@@ -27,12 +25,11 @@ use super::raw_client::{self, RawClient, FLAGS_INTERACTIVE, TY_ERROR, TY_RESPONS
 
 const MODULE_ID: &str = "perf-echo";
 const CORR_BASE: u64 = 1_000_000;
-/// Bound on post-window drain before pending requests resolve as
+/// Pending requests resolve as `UnresolvedAtDrain` after a five-second post-window drain.
 /// `UnresolvedAtDrain`.
 const DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
-/// Records one latency into a fixed-range histogram; a value outside the
-/// range is a `HistogramOverflow` terminal outcome, never an auto-resize.
+/// A latency outside the histogram's configured range records `HistogramOverflow`; the histogram never auto-resizes.
 fn record(hist: &mut Histogram<u64>, outcomes: &mut OutcomeCounts, value_ns: u64) {
     if hist.record(value_ns).is_ok() {
         outcomes.record(Outcome::Success);
@@ -41,13 +38,11 @@ fn record(hist: &mut Histogram<u64>, outcomes: &mut OutcomeCounts, value_ns: u64
     }
 }
 
-/// Classifies one non-ping terminal frame against the fixture, route, and
-/// wire contract. The pending identity on the wire is (channel, epoch,
-/// corr): a frame that resolves a pending correlation on the wrong channel
-/// or epoch is a routing failure. A success additionally requires the
-/// supported wire version and the exact terminal-response flag shape
-/// (non-binary, last): a version or flag regression must not produce
-/// successful evidence for a text fixture echo.
+/// The wire identifies pending requests by `(channel, epoch, corr)`.
+/// A frame matching `corr` on a different channel or epoch is a routing failure.
+/// Successful classification requires the supported wire version and exact terminal-response flags.
+/// A successful text-fixture echo requires non-binary, last terminal-response flags.
+/// A wire-version or flag regression cannot produce successful evidence for the text fixture echo.
 fn classify_terminal(frame: &raw_client::RawFrame, route: (u16, u32), body: &[u8]) -> Outcome {
     if (frame.channel, frame.epoch) != route || frame.ver != raw_client::WIRE_VERSION {
         return Outcome::UnexpectedFrame;
@@ -63,10 +58,9 @@ fn classify_terminal(frame: &raw_client::RawFrame, route: (u16, u32), body: &[u8
     }
 }
 
-/// Incremental header reader whose progress survives `select!`
-/// cancellation: each await is one `read` call, so a cancelled branch
-/// never discards partially read header bytes (`read_exact` is not
-/// cancellation-safe and would desync the stream).
+/// `HeaderReader` retains partial header bytes across `select!` cancellation.
+/// Each `HeaderReader::step` await performs one `read`, so cancellation preserves partial header bytes.
+/// Using `read_exact` here would discard partial header bytes on cancellation and desynchronize the stream.
 struct HeaderReader {
     buf: [u8; raw_client::HEADER_LEN],
     filled: usize,
@@ -80,7 +74,6 @@ impl HeaderReader {
         }
     }
 
-    /// Reads at most once; returns the decoded frame header when complete.
     async fn step<R: tokio::io::AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
@@ -98,12 +91,11 @@ impl HeaderReader {
     }
 }
 
-/// Reads one complete frame (header plus body) with cancellation-safe
-/// incremental progress: every await is a single `read` into a retained
-/// buffer, so a future dropped by `timeout` mid-frame loses no bytes and
-/// the next call resumes exactly where the stream left off. `read_exact`
-/// under `timeout` would instead discard a partial header or body and
-/// desynchronize every later read on the connection.
+/// The frame reader retains partial header and body bytes across cancellation.
+/// Each frame-reader await performs one `read` into a retained buffer.
+/// `timeout` cancellation preserves partial bytes in `FrameReader` for the next call.
+/// `read_exact` under `timeout` can discard a partial header or body.
+/// Discarding a partial header or body desynchronizes later reads on the connection.
 struct FrameReceiver {
     header: HeaderReader,
     frame: Option<raw_client::RawFrame>,
@@ -119,10 +111,9 @@ impl FrameReceiver {
         }
     }
 
-    /// Drives the receive one step; returns the decoded frame once its
-    /// body is fully buffered in `body`. An oversized length field is an
-    /// `InvalidData` error before any allocation: the length is untrusted
-    /// 32-bit input and the stream cannot resync past an unread body.
+    /// The receive driver returns a frame only after buffering its entire body in `body`.
+    /// The receive driver rejects oversized length fields with `InvalidData` before allocation.
+    /// The stream cannot resynchronize after an unread body.
     async fn step<R: tokio::io::AsyncRead + Unpin>(
         &mut self,
         reader: &mut R,
@@ -155,13 +146,10 @@ impl FrameReceiver {
     }
 }
 
-/// Bound on connection setup (discover, authenticate, open the route):
-/// none of the arm deadlines is armed until setup returns, so an
-/// unbounded control exchange against a live-but-stuck host would hang
-/// the whole run before any liveness check can fire.
+/// TODO: Apply a setup deadline to discovery, authentication, and route opening; a live stuck host otherwise blocks the run before arm deadlines start.
 const SETUP_BUDGET: Duration = Duration::from_secs(30);
 
-/// One authenticated connection with one open route to the echo module.
+/// Each arm uses one authenticated connection and one open route to the echo module.
 async fn open_route(publication: &Path, session: &str) -> Result<(TcpStream, u16, u32), String> {
     tokio::time::timeout(SETUP_BUDGET, async {
         let info = raw_client::discover(publication)?;
@@ -205,9 +193,9 @@ pub struct SerialResult {
     pub elapsed: Duration,
 }
 
-/// Serial loopback RTT: one established connection, one request in flight,
-/// issue-to-validated-terminal timing that excludes authentication and
-/// route setup. Warmup operations run on the same connection but are not
+/// Serial loopback RTT uses one established connection and one request in flight.
+/// Serial RTT timing runs from issue to validated terminal response and excludes authentication and route setup.
+/// Warmup operations use the same connection but are not timed.
 /// recorded.
 pub fn run_serial(publication: &Path, cfg: &SerialConfig) -> Result<SerialResult, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -237,8 +225,7 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
         if measured {
             measured_scheduled += 1;
         }
-        // The RTT boundary starts here: after admission and immediately
-        // before the write, so permit or setup waits never count.
+        // The RTT boundary starts after admission and immediately before the write, so permit and setup waits never count.
         let issue = Instant::now();
         if stream.write_all(&frame).await.is_err() {
             if measured {
@@ -246,11 +233,8 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
             }
             return finish_serial(hist, outcomes, measured_scheduled, window_start);
         }
-        // Each response wait is bounded: a live host that stops
-        // responding would otherwise hang the arm before its liveness
-        // and truncation checks can run. Expiry abandons the connection
-        // outright, so the cancelled read_exact cannot desync later
-        // reads — there are none.
+        // A response deadline lets liveness and truncation checks run when a live host stops responding.
+        // Returning after timeout prevents a cancelled read_exact from desynchronizing later reads.
         let response_deadline = Instant::now() + DRAIN_BUDGET;
         loop {
             let remaining = response_deadline.saturating_duration_since(Instant::now());
@@ -274,8 +258,7 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
                 return finish_serial(hist, outcomes, measured_scheduled, window_start);
             }
             let decoded = raw_client::decode_header(&header);
-            // The length field is untrusted 32-bit input: a corrupted
-            // value must fail the attempt, not drive the allocation, and
+            // Values above MAX_BODY_LEN fail before body.resize can allocate from them.
             // the stream cannot be resynchronized past an unread body.
             if decoded.len > MAX_BODY_LEN {
                 if measured {
@@ -313,9 +296,7 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
                     if let Some(violation) = raw_client::connection_frame_violation(&decoded) {
                         return Err(format!("wire-protocol violation: {violation}"));
                     }
-                    // Goodbye for this route (or the generation) is an
-                    // orderly teardown: the in-flight operation resolves
-                    // as connection loss and the truncation gate fails
+                    // A Goodbye that retires (channel, epoch) resolves the in-flight operation as connection loss.
                     // the attempt.
                     if goodbye_retires(&decoded, (channel, epoch)) {
                         if measured {
@@ -331,8 +312,8 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
                 ));
             }
             if decoded.corr != corr {
-                // One request is in flight on this route, so the only
-                // legal request terminal answers it; anything else is a
+                // Only the in-flight request can produce a valid terminal.
+                // A terminal for a different request is a protocol error.
                 // wire-protocol regression.
                 return Err(format!(
                     "wire-protocol violation: unsolicited terminal for correlation {} \
@@ -341,9 +322,7 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
                 ));
             }
             let rtt_ns = issue.elapsed().as_nanos() as u64;
-            // Warmup suppresses recording, never validation: a startup
-            // protocol regression must fail the attempt, not hide behind
-            // the warmup boundary.
+            // Warmup suppresses recording but not validation.
             let outcome = classify_terminal(&decoded, (channel, epoch), &body);
             if !measured {
                 if outcome != Outcome::Success {
@@ -386,25 +365,23 @@ pub struct OpenLoopConfig {
 
 #[derive(Debug)]
 pub struct OpenLoopResult {
-    /// Scheduled-send to validated-terminal (coordinated-omission honest).
+    /// The scheduled histogram records scheduled-send-to-validated-terminal latency to avoid coordinated omission.
     pub sched_to_completion: Histogram<u64>,
-    /// Actual-issue to validated-terminal.
+    /// The actual histogram records issue-to-validated-terminal latency.
     pub issue_to_completion: Histogram<u64>,
-    /// Issue minus scheduled: load-generator lag, kept separate so it is
-    /// never mislabeled as server latency.
+    /// The lag histogram records issue-minus-scheduled time separately so server latency excludes load-generator lag.
     pub scheduler_lag: Histogram<u64>,
     pub outcomes: OutcomeCounts,
     pub scheduled_slots: u64,
     pub elapsed: Duration,
-    /// True when the connection failed before the warmup+measure window
-    /// completed. Conservation still holds over the slots reached, so a
-    /// caller must check this flag to reject the partial window.
+    /// The partial_window flag is true when the connection fails before the warmup-and-measure window completes.
+    /// The caller must reject the partial window when partial_window is true.
     pub truncated: bool,
 }
 
-/// Open-loop loaded latency at one frozen offered rate. The arrival
-/// schedule is absolute: a slot whose permit is unavailable is a missed
-/// slot, never a catch-up burst.
+/// The benchmark measures open-loop latency at one fixed offered rate.
+/// The absolute arrival schedule treats an unavailable permit as a missed slot.
+/// A missed slot never triggers a catch-up burst.
 pub fn run_open_loop(publication: &Path, cfg: &OpenLoopConfig) -> Result<OpenLoopResult, String> {
     if cfg.measure.is_zero() {
         return Err("open-loop arm requires a nonzero measurement window".to_owned());
@@ -449,13 +426,9 @@ async fn run_open_loop_inner(
             break;
         }
         let at = start + Duration::from_nanos(scheduled_ns);
-        // The frame is built before the slot arrives, so neither the
-        // recorded scheduler lag (issue minus scheduled) nor the
-        // completion latency carries its construction and allocation
-        // cost; a cap-missed slot simply discards it.
+        // Completion latency starts at `issue`, after `frame` construction.
         let corr = slot + CORR_BASE;
         let frame = request_frame(channel, epoch, corr);
-        // Drain any ready responses while waiting for the next slot.
         loop {
             let now = Instant::now();
             if now >= at {
@@ -467,11 +440,7 @@ async fn run_open_loop_inner(
                     match step {
                         Ok(None) => {}
                         Ok(Some(frame)) => {
-                            // The body read is bounded: a peer that sends a
-                            // valid header and stalls mid-body would
-                            // otherwise hang the window with no deadline at
-                            // all, since the sleep arm above was already
-                            // cancelled when this arm won.
+                            // `DRAIN_BUDGET` bounds `consume` after `header.step` wins the select.
                             let consumed = tokio::time::timeout(
                                 DRAIN_BUDGET,
                                 state.consume(&mut read_half, frame),
@@ -514,11 +483,8 @@ async fn run_open_loop_inner(
             continue;
         }
         let issue_ns = start.elapsed().as_nanos() as u64;
-        // The write is bounded by the arm deadline plus the drain
-        // budget: a host that stops reading fills the TCP window and an
-        // unbounded write_all would park the sender past every deadline.
-        // Expiry abandons the run (truncated), so a partially written
-        // frame cannot corrupt later traffic — there is none.
+        // `write_deadline` limits `write_all` to the benchmark deadline plus `DRAIN_BUDGET`.
+        // A write timeout marks the run truncated and stops sending.
         let write_deadline = start + Duration::from_nanos(deadline_ns) + DRAIN_BUDGET;
         let remaining = write_deadline.saturating_duration_since(Instant::now());
         let wrote = if remaining.is_zero() {
@@ -552,8 +518,6 @@ async fn run_open_loop_inner(
         state.pending.insert(corr, (scheduled_ns, issue_ns));
     }
 
-    // Bounded drain: every in-flight request resolves or is counted
-    // unresolved; the loop cannot hang on a lost response.
     let drain_deadline = Instant::now() + DRAIN_BUDGET;
     while !state.pending.is_empty() {
         let remaining = drain_deadline.saturating_duration_since(Instant::now());
@@ -561,9 +525,7 @@ async fn run_open_loop_inner(
             state.fail_pending(Outcome::UnresolvedAtDrain);
             break;
         }
-        // The deadline bounds the whole receive, body included: a peer
-        // that sends a valid header and stalls mid-body would otherwise
-        // hang the drain inside `consume` despite the budget.
+        // `DRAIN_BUDGET` bounds `consume` after `header.step` wins the select.
         let step = tokio::time::timeout(remaining, async {
             match header.step(&mut read_half).await {
                 Ok(None) => Ok(()),
@@ -599,8 +561,6 @@ async fn run_open_loop_inner(
     })
 }
 
-/// Reader-side bookkeeping for one open-loop run: the three retained
-/// distributions, outcome counters, and in-flight request metadata.
 struct OpenLoopState {
     sched_hist: Histogram<u64>,
     issue_hist: Histogram<u64>,
@@ -609,12 +569,11 @@ struct OpenLoopState {
     pending: HashMap<u64, (u64, u64)>,
     start: Instant,
     warmup_ns: u64,
-    /// Route identity (channel, epoch) every terminal must carry.
+    /// Every terminal must carry the route identity: `channel` and `epoch`.
     route: (u16, u32),
     body: Vec<u8>,
 }
 
-/// True for frame types that answer a request and must therefore name an
 /// outstanding correlation.
 fn is_request_terminal(ty: u8) -> bool {
     matches!(
@@ -623,11 +582,6 @@ fn is_request_terminal(ty: u8) -> bool {
     )
 }
 
-/// True for the frame types a host may legally emit outside a request
-/// exchange, matching the wire contract's host-to-consumer set
-/// (keepalive pings, pushes, and the shutdown goodbye). Pong is
-/// consumer-to-host only. Everything that is neither a request terminal
-/// nor one of these is a wire-protocol violation, never a skippable
 /// frame.
 fn is_connection_frame(ty: u8) -> bool {
     matches!(
@@ -636,33 +590,22 @@ fn is_connection_frame(ty: u8) -> bool {
     )
 }
 
-/// True when a well-shaped goodbye closes THIS benchmark connection: the
-/// current route's teardown or the 0/0 generation close. Ignoring either
-/// would let a torn-down connection's straggling responses finalize
-/// successful evidence. A goodbye naming a different route is a stale
-/// idempotent no-op per the contract and stays skippable.
 fn goodbye_retires(frame: &raw_client::RawFrame, route: (u16, u32)) -> bool {
     frame.ty == raw_client::TY_GOODBYE
         && ((frame.channel, frame.epoch) == route || (frame.channel == 0 && frame.epoch == 0))
 }
 
-/// How one open-loop receive failed: transport failures resolve pending
-/// requests as connection loss, while a wire-protocol violation from a
-/// live host fails the whole attempt with its own reason.
 enum ConsumeFailure {
     Transport,
     Protocol(String),
 }
 
 impl OpenLoopState {
-    /// Reads the frame body and resolves its pending slot to one outcome.
     async fn consume(
         &mut self,
         read_half: &mut tokio::net::tcp::OwnedReadHalf,
         frame: raw_client::RawFrame,
     ) -> Result<(), ConsumeFailure> {
-        // Untrusted 32-bit length: refuse the allocation and fail the
-        // attempt, since the stream cannot resync past an unread body.
         if frame.len > MAX_BODY_LEN {
             return Err(ConsumeFailure::Protocol(format!(
                 "oversized response length {}",
@@ -678,9 +621,6 @@ impl OpenLoopState {
                 if let Some(violation) = raw_client::connection_frame_violation(&frame) {
                     return Err(ConsumeFailure::Protocol(violation));
                 }
-                // Goodbye for this route (or the generation) is an
-                // orderly teardown: pending requests resolve as
-                // connection loss and the truncation gate fails the
                 // attempt.
                 if goodbye_retires(&frame, self.route) {
                     return Err(ConsumeFailure::Transport);
@@ -694,17 +634,12 @@ impl OpenLoopState {
         }
         let now_ns = self.start.elapsed().as_nanos() as u64;
         let Some((scheduled_ns, issue_ns)) = self.pending.remove(&frame.corr) else {
-            // Only pings and responses to issued requests are legal on
-            // this single-route connection: a duplicate terminal or a
-            // never-issued correlation is a wire-protocol regression
-            // that must not finalize successful evidence.
+            // Each terminal frame must match an issued pending correlation; duplicates and never-issued correlations fail the attempt as protocol violations.
             return Err(ConsumeFailure::Protocol(format!(
                 "unsolicited terminal for correlation {}",
                 frame.corr
             )));
         };
-        // Warmup suppresses recording, never validation: a startup
-        // protocol regression must fail the attempt, not hide behind the
         // warmup boundary.
         let outcome = classify_terminal(&frame, self.route, &self.body);
         if scheduled_ns < self.warmup_ns {
@@ -717,12 +652,8 @@ impl OpenLoopState {
         }
         match outcome {
             Outcome::Success => {
-                // sched-to-completion spans both the lag and the
-                // issue-to-completion intervals, so it is the largest of
-                // the three values and its bounds check gates all three:
-                // on overflow none of the distributions record and the
-                // record is terminal as HistogramOverflow, keeping every
-                // histogram's sample count equal to `success`.
+                // The sched-to-completion bound gates all three histograms because it is their largest value.
+                // On sched-to-completion overflow, no histogram records a sample.
                 if self
                     .sched_hist
                     .record(now_ns.saturating_sub(scheduled_ns))
@@ -740,7 +671,6 @@ impl OpenLoopState {
         Ok(())
     }
 
-    /// Resolves every pending measured request with one failure outcome.
     fn fail_pending(&mut self, outcome: Outcome) {
         for (_, (scheduled_ns, _)) in self.pending.drain() {
             if scheduled_ns >= self.warmup_ns {
@@ -762,22 +692,15 @@ pub struct ThroughputResult {
     pub offered: u64,
     pub terminal: u64,
     pub successful: u64,
-    /// Successful fixture bytes echoed per measured second.
     pub goodput_bytes_per_sec: f64,
     pub successful_per_sec: f64,
     pub outcomes: OutcomeCounts,
     pub measured: Duration,
-    /// Responses drained after the measure window closes, one per request
-    /// still in flight at the window boundary; drained frames are never
     /// measured outcomes.
     pub drained: u64,
-    /// True when the connection failed before the measure window
-    /// completed; `measured` then covers only the partial window.
     pub truncated: bool,
 }
 
-/// Sustained closed-loop throughput at a fixed depth with timestamps only
-/// at the window boundaries.
 pub fn run_throughput(
     publication: &Path,
     cfg: &ThroughputConfig,
@@ -800,10 +723,6 @@ async fn run_throughput_inner(
         return Err("throughput arm requires a nonzero measurement window".to_owned());
     }
     if cfg.warmup.is_zero() {
-        // The primed pipeline is issued before `first_measured` can be
-        // set, so with a zero warmup the depth primed requests would sit
-        // inside the measured window yet be excluded from offered and
-        // terminal accounting, underreporting the rate.
         return Err("throughput arm requires a nonzero warmup window".to_owned());
     }
     let (mut stream, channel, epoch) = open_route(publication, "budget-throughput").await?;
@@ -815,18 +734,11 @@ async fn run_throughput_inner(
     let mut measuring = false;
     let mut measure_start = Instant::now();
     let mut measured_elapsed = Duration::ZERO;
-    // First corr sent inside the measured window: terminals attribute to
-    // the REQUEST's window, so a response to a warmup send arriving
-    // inside the window is carry-in, never measured work.
     let mut first_measured: Option<u64> = None;
     let measured_corr = |first: Option<u64>, c: u64| first.is_some_and(|f| c >= f);
     let start = Instant::now();
-    // Writes share the receive deadline (plus drain budget): a host that
-    // stops reading fills the TCP send buffer, and an unbounded
-    // write_all would park the arm past every deadline.
     let write_deadline = start + cfg.warmup + cfg.measure + DRAIN_BUDGET;
 
-    // Prime the pipeline to the fixed depth.
     for _ in 0..cfg.depth {
         corr += 1;
         outstanding.insert(corr);
@@ -840,12 +752,6 @@ async fn run_throughput_inner(
         .map_err(|err| format!("prime write: {err}"))?;
     }
 
-    // The window deadline bounds every receive: a host that delays one
-    // response past the deadline cannot stretch the fixed measurement
-    // window's denominator, and a live-but-silent host cannot hang the
-    // run with an unbounded read. The receiver's incremental state
-    // survives an expired timeout, so a window that closes mid-frame
-    // hands the partial frame to the drain instead of desynchronizing
     // the stream.
     let mut receiver = FrameReceiver::new();
     let window_deadline = start + cfg.warmup + cfg.measure;
@@ -860,16 +766,9 @@ async fn run_throughput_inner(
         };
         let decoded = match received {
             None => {
-                // Deadline reached without a frame. Inside the measured
-                // window that closes the window at its nominal length and
-                // hands the outstanding requests to the drain below; a
-                // deadline during warmup means the host produced no
-                // terminal for the whole warmup+measure budget and the
-                // zero measured window marks the run truncated. The
-                // denominator is the nominal window: the receive deadline
-                // stopped admitting completions there, and a collector
-                // descheduled across the deadline must not inflate the
-                // denominator with scheduler delay no completion could
+                // The receive deadline stops admitting measured completions at the window boundary.
+                // The receive deadline prevents post-window collector descheduling from extending the measurement window.
+                // Scheduler delay after the deadline cannot add a measured completion.
                 // fill.
                 if measuring {
                     measured_elapsed = cfg.measure;
@@ -892,10 +791,7 @@ async fn run_throughput_inner(
                 if let Some(violation) = raw_client::connection_frame_violation(&decoded) {
                     return Err(format!("wire-protocol violation: {violation}"));
                 }
-                // Goodbye for this route (or the generation) is an
-                // orderly teardown: outstanding measured requests
-                // resolve as connection loss and the truncation gate
-                // fails the attempt.
+                // Orderly teardown resolves outstanding measured requests as connection loss and fails the truncation gate.
                 if goodbye_retires(&decoded, (channel, epoch)) {
                     for c in outstanding.drain() {
                         if measured_corr(first_measured, c) {
@@ -911,19 +807,17 @@ async fn run_throughput_inner(
                 decoded.ty
             ));
         }
-        // A frame naming no outstanding request (a duplicate terminal or
-        // a never-issued correlation) is a wire-protocol regression: it
-        // must neither count as a terminal nor trigger a replacement
-        // send, and silently discarding it would let the attempt
-        // finalize despite the regression.
+        // A terminal for no outstanding request is a wire-protocol regression.
+        // Duplicate terminals and never-issued correlations name no outstanding request.
+        // A terminal for no outstanding request must neither count as a terminal nor trigger a replacement send.
+        // Silently discarding a terminal for no outstanding request would allow the attempt to finalize despite the regression.
         if !outstanding.remove(&decoded.corr) {
             return Err(format!(
                 "wire-protocol violation: unsolicited terminal for correlation {}",
                 decoded.corr
             ));
         }
-        // Warmup suppresses recording, never validation: a startup
-        // protocol regression must fail the attempt, not hide behind the
+        // Warmup suppresses outcome recording but still rejects protocol regressions.
         // warmup boundary.
         let outcome = classify_terminal(&decoded, (channel, epoch), &body);
         if measured_corr(first_measured, decoded.corr) {
@@ -934,16 +828,11 @@ async fn run_throughput_inner(
         let elapsed = start.elapsed();
         if !measuring && elapsed >= cfg.warmup {
             measuring = true;
-            // Anchored to the nominal warmup boundary, not this
-            // response's arrival time: a delayed first post-warmup
-            // response must not shrink the measured window below its
-            // configured length while the fixed deadline stays put.
+            // The measurement window starts at the nominal warmup boundary, not at the first post-warmup response.
+            // A delayed first post-warmup response does not shorten the configured measurement window.
             measure_start = start + cfg.warmup;
         } else if measuring && measure_start.elapsed() >= cfg.measure {
-            // Nominal-window denominator, matching the deadline branch:
-            // the window-deadline-bounded receive admits no completion
-            // after the nominal end, so observed overshoot is scheduler
-            // delay, not measurement time.
+            // The fixed deadline excludes completions received after the nominal measurement end.
             measured_elapsed = cfg.measure;
             break;
         }
@@ -967,9 +856,8 @@ async fn run_throughput_inner(
             .ok()
         };
         if !matches!(wrote, Some(Ok(()))) {
-            // The failed or deadline-expired send and every other
-            // outstanding measured request resolve as failures; the
-            // window did not complete.
+            // A failed or expired send records `WriteFailure` for the current request and `PeerClosed` for other outstanding measured requests.
+            // The failed send ends measurement before the window completes.
             for c in outstanding.drain() {
                 if measured_corr(first_measured, c) {
                     outcomes.record(if c == corr {
@@ -983,23 +871,15 @@ async fn run_throughput_inner(
         }
     }
 
-    // A zero measured window here means the loop exited before the
-    // measure window completed (transport failure, or a host silent for
-    // the whole warmup+measure budget); the fallback still reports the
-    // partial elapsed time for diagnostics. Truncated runs skip the
-    // drain: the caller rejects the attempt, so in-flight accounting
-    // proves nothing further.
+    // A zero `measured_elapsed` means measurement ended before the configured window completed.
     let truncated = measured_elapsed.is_zero();
     let mut drained = 0u64;
     if truncated {
         measured_elapsed = measure_start.elapsed();
     } else {
-        // Post-window drain: the host owes one response per request still
-        // in flight at the window close. Drained frames resolve pipeline
-        // accounting only and are never measured outcomes; a drain-budget
-        // expiry or connection failure with requests still outstanding is
-        // real response loss, and the arm fails rather than publishing a
-        // window that quietly dropped responses.
+        // The post-window drain resolves responses for requests outstanding at window close.
+        // Drained frames update pipeline accounting but are not measured outcomes.
+        // The post-window drain fails if the drain expires or the connection fails while responses remain outstanding.
         let undrained = |n: usize| {
             format!(
                 "{n} in-flight response(s) undrained after the {}s post-window drain budget",
@@ -1012,10 +892,10 @@ async fn run_throughput_inner(
             if remaining.is_zero() {
                 return Err(undrained(outstanding.len()));
             }
-            // The deadline bounds the whole receive, body included, and
-            // the receiver resumes any frame the window loop left
-            // partially read, so a peer that stalls mid-body cannot hang
-            // the drain and the handoff never desynchronizes the stream.
+            // The deadline bounds the whole receive, including the body.
+            // The receiver resumes a frame the window loop left partially read.
+            // A peer that stalls mid-body cannot hang the drain.
+            // Reusing `receiver` preserves stream synchronization after the window loop.
             let read = tokio::time::timeout(remaining, receiver.step(&mut stream, &mut body)).await;
             match read {
                 Ok(Ok(None)) => {}
@@ -1038,18 +918,14 @@ async fn run_throughput_inner(
                     {
                         return Err(format!("wire-protocol violation: {violation}"));
                     } else if goodbye_retires(&decoded, (channel, epoch)) {
-                        // An orderly teardown mid-drain: the outstanding
-                        // responses are never coming.
+                        // A matching goodbye retires the connection, so outstanding responses will not arrive.
                         return Err(format!(
                             "connection closed by goodbye with {} in-flight response(s) undrained",
                             outstanding.len()
                         ));
                     }
                     if is_request_terminal(decoded.ty) {
-                        // Every drained response passes the same terminal
-                        // validation as an in-window frame: the window
-                        // boundary does not exempt the final measured
-                        // requests from the correctness contract.
+                        // Drained terminal responses must satisfy the same validation as in-window responses.
                         let outcome = classify_terminal(&decoded, (channel, epoch), &body);
                         if outcome != Outcome::Success {
                             return Err(format!(
@@ -1084,8 +960,7 @@ async fn run_throughput_inner(
     })
 }
 
-/// Persistent serial connection for Criterion's `iter_custom`: times `n`
-/// consecutive fixture round trips on one established route.
+/// Criterion's `iter_custom` times `n` consecutive fixture round trips on one established connection.
 pub struct SerialProbe {
     runtime: tokio::runtime::Runtime,
     stream: TcpStream,
@@ -1123,10 +998,8 @@ impl SerialProbe {
             for _ in 0..n {
                 *corr += 1;
                 let frame = request_frame(channel, epoch, *corr);
-                // Each exchange is bounded like every other arm's I/O: a
-                // live-but-stuck host would otherwise park the Criterion
-                // sample forever. Expiry abandons the connection, so the
-                // cancelled read cannot desync later traffic.
+                // Each exchange has an I/O deadline so a live but stalled host cannot block a Criterion sample indefinitely.
+                // Expiry abandons the connection, preventing a cancelled read from desynchronizing later traffic.
                 let deadline = Instant::now() + DRAIN_BUDGET;
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 tokio::time::timeout(remaining, stream.write_all(&frame))
@@ -1144,8 +1017,8 @@ impl SerialProbe {
                         .map_err(|err| format!("read: {err}"))?;
                     let decoded = raw_client::decode_header(&header);
                     if decoded.len > MAX_BODY_LEN {
-                        // Untrusted 32-bit length: refuse the allocation;
-                        // the stream cannot resync past an unread body.
+                        // The decoder rejects allocations derived from untrusted 32-bit lengths.
+                        // The decoder must not continue because it would parse the unread body as the next header.
                         return Err(format!("oversized response length {}", decoded.len));
                     }
                     body.resize(decoded.len as usize, 0);

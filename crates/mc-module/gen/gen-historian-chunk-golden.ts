@@ -1,7 +1,7 @@
 /**
- * Generate historian chunk differential goldens from the real TS readSessionChunk.
+ * This script generates historian chunk differential goldens from the TS `readSessionChunk` implementation.
  *
- * Run: bun crates/mc-module/gen/gen-historian-chunk-golden.ts [--check]
+ * `bun crates/mc-module/gen/gen-historian-chunk-golden.ts [--check]` invokes this script.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -162,12 +162,6 @@ const cases: Array<{
         offset: 1,
         eligibleEnd: 4,
         exercises: ["system_skip"],
-        // The TS leg never sees a wire system message (system prompts are not
-        // session rows), so the oracle-equivalent of CK's system-at-ordinal-2 is
-        // a zero-part message occupying the same ordinal: no summarizable
-        // content, but the ordinal still rides the coverage line meta. The CK
-        // builder feeds system messages through as zero-block for exactly this
-        // reason — a mid-span system ordinal must not open a coverage gap.
         ts: [
             { ordinal: 1, id: "u1", role: "user", parts: [text("hello")] },
             { ordinal: 2, id: "sys2", role: "user", parts: [] },

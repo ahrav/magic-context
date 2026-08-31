@@ -20,8 +20,7 @@ describe("redactSecretText — token counts and scalar diagnostics stay visible"
     });
 
     test("still redacts real secret string values", () => {
-        // High-entropy / non-scalar values must always be redacted; only bare
-        // numeric/boolean scalars are exempt from the key-based match.
+        // Key-based matching exempts numeric and boolean scalar values.
         const syntheticApiKey = "sk-abc123XYZ" + "secretvalue"; // gitleaks:allow redaction-test fixture
         expect(redactSecretText(`api_key=${syntheticApiKey}`)).toContain("<REDACTED:");
         expect(redactSecretText(`api_key=${syntheticApiKey}`)).not.toContain(syntheticApiKey);

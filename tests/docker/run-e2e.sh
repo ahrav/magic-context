@@ -1,15 +1,7 @@
 #!/usr/bin/env bash
-# Run all docker E2E test images locally.
 #
 # Usage:
-#   tests/docker/run-e2e.sh              # every harness
-#   tests/docker/run-e2e.sh opencode     # OpenCode only
-#   tests/docker/run-e2e.sh pi           # Pi only
-#   tests/docker/run-e2e.sh omp          # Oh My Pi only (installs real OMP)
 #
-# Pre-requisite: run `bun run --cwd packages/plugin build` and
-# `bun run --cwd packages/pi-plugin build` first — the Dockerfiles
-# COPY pre-built dist/ trees rather than build inside the image.
 
 set -euo pipefail
 
@@ -49,20 +41,12 @@ run_target() {
     fi
 }
 
-# Pre-build local dists. The Dockerfiles COPY these — they don't build
-# inside the image. This is intentional: keeps the image small, makes
-# iteration fast, and tests the same artifact CI publishes.
 echo "Pre-building local dist artifacts..."
 bun run --cwd "$REPO_ROOT/packages/plugin" build
 bun run --cwd "$REPO_ROOT/packages/pi-plugin" build
 bun run --cwd "$REPO_ROOT/packages/pi-plugin" build:e2e-argv
-# Dockerfile.pi and Dockerfile.omp both COPY packages/cli/dist for their
-# `magic-context doctor --harness …` invocations.
 bun run --cwd "$REPO_ROOT/packages/cli" build
 
-# pi-plugin runtime deps are installed inside the Pi Docker image
-# (see Dockerfile.pi) so better-sqlite3 builds against the correct
-# linux/amd64 platform — no host install needed.
 
 EXIT=0
 case "$TARGET" in

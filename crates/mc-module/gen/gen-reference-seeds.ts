@@ -1,8 +1,5 @@
 /**
- * Vendor the historian reference-seed corpus for the Rust prompt builder.
  *
- * Run:        bun crates/mc-module/gen/gen-reference-seeds.ts
- * Drift check: bun crates/mc-module/gen/gen-reference-seeds.ts --check
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

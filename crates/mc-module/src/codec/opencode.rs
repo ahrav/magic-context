@@ -31,9 +31,6 @@ pub fn decode_opencode_with_sidecar(
     decode_opencode_with_sidecar_and_base(messages, prior, 0)
 }
 
-/// Decode a wholly fresh OpenCode array in the absolute ordinal space inherited from a
-/// completed lineage descent. Explicit absolute ordinals win; otherwise the positional
-/// fallback starts after `provisional_base` instead of silently restarting at one.
 pub fn decode_opencode_with_sidecar_and_base(
     messages: &[MessageV2Json],
     prior: Option<&DecodeSidecar>,
@@ -291,10 +288,9 @@ pub fn encode_opencode(
     }
 }
 
-/// Encode CK messages back to OpenCode while optionally supplying the session id used by
-/// newly-created synthetic user messages. Existing messages use their retained sidecar raw
-/// value, so provider fields that CK does not model remain untouched. Native serving also
-/// retains compaction parts because it promises a full-array replay of untouched ingress.
+/// `session_id` applies only to newly created synthetic user messages.
+/// Retained raw values preserve provider fields that CK does not model.
+/// The decoder retains compaction parts to replay untouched ingress.
 pub fn encode_opencode_with_session(
     messages: &[CkWireMessage],
     sidecar: &DecodeSidecar,
@@ -416,9 +412,9 @@ pub(crate) fn encode_opencode_chunks_with_transition_state(
             }
         }
         let msg = &messages[index];
-        // Decoded input messages retain their harness id, so metadata can be rebound by
-        // identity. A positional synthetic fallback can instead attach an input nudge's
-        // native envelope to a fresh module-authored m0/m1 message.
+        // Decoded messages retain their harness IDs for metadata rebinding.
+        // A positional synthetic fallback may attach an input nudge envelope to a fresh module-authored message.
+        // A positional synthetic fallback may attach a native envelope to a fresh module-authored m0/m1 message.
         let meta = meta_for_ck(sidecar, msg, absolute_index);
         let value = match meta {
             Some(meta) if mutation_exempt_mids.contains(&meta.mid.as_str()) => meta.raw.clone(),
@@ -747,10 +743,10 @@ fn encode_with_meta(
                     continue;
                 }
                 if call_native_index.is_none() && result_native_index.is_none() {
-                    // OpenCode stores a completed invocation as one part, while CK expands that
-                    // part into adjacent call and result blocks. This provider-validity invariant
-                    // cannot depend on whether an older renderer-transition marker was persisted:
-                    // two independently emitted shells carry the same callID.
+                    // OpenCode represents a completed invocation as one part; CK represents it as adjacent call and result blocks.
+                    // The paired call and result blocks must retain one `callID`.
+                    // The paired blocks must retain one `callID` even when no renderer-transition marker exists.
+                    // OpenCode matches call and result shells by their shared `callID`.
                     parts.push(render_tool_pair_as_part(block, result));
                     block_index += 2;
                     continue;
@@ -764,9 +760,8 @@ fn encode_with_meta(
                     block_index += 1;
                     continue;
                 }
-                // Reasoning parts may contain provider signatures, so changing their bytes could
-                // invalidate verification. Preserve the matched native reasoning part exactly;
-                // apply updates only to separately mapped sibling parts.
+                // The encoder preserves matched native reasoning parts exactly because provider signatures may require their original bytes.
+                // The converter applies updates only to separately mapped sibling parts.
                 if !matches!(
                     &block.kind,
                     CkKind::Reasoning { .. } | CkKind::RedactedReasoning { .. }
@@ -2039,9 +2034,7 @@ mod tests {
             reduced_tail,
         ];
 
-        // A hard request triggered by an epoch change can be the first request after a renderer
-        // deployment, before the session row contains a transition marker. The codec must still
-        // produce a valid request when that marker is absent.
+        // A hard request after an epoch change must remain valid without a transition marker.
         let encoded = encode_opencode_with_transition_state(
             &served,
             &decoded.sidecar,
@@ -2144,8 +2137,6 @@ mod tests {
             3
         );
 
-        // Mutation proof: dropping inherited pins before the third generation creates a second
-        // identity for the repeated stable key and must diverge from the full decoder.
         let mut broken_prior = second;
         broken_prior.mid_pins.clear();
         let broken = decode_opencode_sidecar_incremental(&generation_3, &broken_prior, 2);

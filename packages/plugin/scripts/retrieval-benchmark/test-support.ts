@@ -1,4 +1,4 @@
-/** Test-only builders for a minimal valid release; not exported by the facade. */
+/* */
 
 import { SOURCE_LOCATOR_KIND } from "./physical-locator";
 import { canonicalFingerprint } from "./canonical-json";
@@ -68,8 +68,6 @@ export function makeQuery(
         queryText,
         sourceFilters: null,
         fixtureScope: { projectScope: FIXTURE_PROJECT_SCOPE, sessionScope: null },
-        // Positive cutoff: message/compartment targets must stay reachable
-        // (validateRelease rejects positive targets behind a zero cutoff).
         visibleState: { visibleMemoryIds: [], messageOrdinalCutoff: 100_000 },
         referenceTimeMs: 1_700_000_000_000,
         partition,
@@ -79,15 +77,13 @@ export function makeQuery(
     };
 }
 
-/** One query + one graded document per category per partition. */
+/* */
 export function makeValidCorpus(): CorpusArtifact {
     const queries: QueryScenario[] = [];
     const documents: CorpusDocument[] = [];
     QUERY_CATEGORIES.forEach((category, c) => {
         for (const partition of ["development", "holdout"] as const) {
             const slug = `${category}-${partition === "development" ? "dev" : "hold"}`;
-            // Partition-distinct text: reusing one normalized query text
-            // across partitions is itself a contract violation.
             queries.push(
                 makeQuery(slug, category, partition, `how does ${category} work in ${partition}`),
             );
@@ -131,8 +127,6 @@ const SCALE_LABELS: Record<number, string> = {
 export function makeValidSyntheticProfiles(): SyntheticProfilesArtifact {
     return {
         schemaVersion: SYNTHETIC_SCHEMA_VERSION,
-        // Every scale exactly once — parseSyntheticProfiles enforces full
-        // scale coverage so U5 always has a descriptor per required run.
         profiles: SYNTHETIC_SCALES.map((scale) => ({
             id: `syn-smoke-${SCALE_LABELS[scale]}`,
             generatorVersion: SYNTHETIC_GENERATOR_VERSION,
@@ -150,8 +144,6 @@ export function makeManifestFor(
     judgments: unknown,
     syntheticProfiles: unknown,
 ): ManifestArtifact {
-    // Test-support is not the facade, so it may import the promoter: reusing
-    // buildReleaseTuple keeps this in lockstep with the ReleaseTuple shape.
     const releaseTuple = buildReleaseTuple({ corpus, judgments, syntheticProfiles });
     const releaseTupleFingerprint = canonicalFingerprint(releaseTuple);
     return {

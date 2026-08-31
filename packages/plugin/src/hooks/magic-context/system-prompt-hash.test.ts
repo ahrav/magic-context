@@ -1,18 +1,10 @@
 /// <reference types="bun-types" />
 
 /**
- * Regression suite for `createSystemPromptHashHandler`'s drain semantics.
  *
  * The handler's
- * unconditional drain of `systemPromptRefreshSessions` at the end of the
- * handler was silently dropping the flag added by hash-change detection
- * earlier in the same handler call. That meant a real prompt-content
- * change set the flag, then immediately discarded it before any future
- * pass could observe it — adjuncts (project docs, user profile, key
- * files) stayed stale forever.
  *
- * The fix made the drain conditional on the value of `isCacheBusting`
- * captured at the top of the handler. These tests lock that contract in.
+ * The handler drains refresh sessions only when `isCacheBusting` was true at handler entry.
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
@@ -71,7 +63,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     }
     tempDirs.length = 0;
@@ -151,8 +143,7 @@ describe("system-prompt-hash drain semantics (Oracle review 2026-04-26 Finding A
 
         const { handler } = buildHandler({ systemPromptRefreshSessions });
 
-        // Seed a prior hash so this looks like an existing session, no
-        // hash change on this pass.
+        // The test seeds a prior hash so the session appears existing without a hash change on this pass.
         const db = openDatabase();
         getOrCreateSessionMeta(db, sessionId);
         updateSessionMeta(db, sessionId, {
@@ -162,7 +153,7 @@ describe("system-prompt-hash drain semantics (Oracle review 2026-04-26 Finding A
 
         await handler({ sessionID: sessionId }, { system: ["You are a helpful agent."] });
 
-        // Flag was set on entry → handler consumed it → drain.
+        // `systemPromptRefreshSessions` was set at entry, so the handler consumes and drains it.
         expect(systemPromptRefreshSessions.has(sessionId)).toBe(false);
     });
 
@@ -179,7 +170,7 @@ describe("system-prompt-hash drain semantics (Oracle review 2026-04-26 Finding A
             pendingMaterializationSessions,
         });
 
-        // Seed a prior hash that will mismatch the prompt below.
+        // The test seeds a prior hash that mismatches the prompt below.
         const db = openDatabase();
         getOrCreateSessionMeta(db, sessionId);
         updateSessionMeta(db, sessionId, {
@@ -192,15 +183,10 @@ describe("system-prompt-hash drain semantics (Oracle review 2026-04-26 Finding A
             { system: ["You are a helpful agent.", "New system content here"] },
         );
 
-        // Hash detection added all three signals.
         expect(historyRefreshSessions.has(sessionId)).toBe(true);
         expect(pendingMaterializationSessions.has(sessionId)).toBe(true);
 
-        // CRITICAL: systemPromptRefreshSessions was added by hash-change
-        // detection AFTER `isCacheBusting` was captured at the top of
-        // the handler. The drain at the end is conditional on that
-        // captured value (false in this case), so the just-added flag
-        // must SURVIVE for the next pass to consume.
+        // The end-of-handler drain preserves `systemPromptRefreshSessions` added after `isCacheBusting` is captured as false.
         expect(systemPromptRefreshSessions.has(sessionId)).toBe(true);
     });
 
@@ -211,19 +197,10 @@ describe("system-prompt-hash drain semantics (Oracle review 2026-04-26 Finding A
 
         const { handler } = buildHandler({ systemPromptRefreshSessions });
 
-        // Empty system prompt triggers early return at line 375.
         await handler({ sessionID: sessionId }, { system: [] });
 
-        // The handler returned early before reaching the drain. With the
-        // OLD unconditional drain, the flag would have been dropped
-        // anyway because the early return is BEFORE the drain. With the
-        // current code structure, the drain still only fires after Step
-        // 3 — so this test documents that early returns preserve the
-        // flag for a future valid pass to consume.
+        // `systemPromptRefreshSessions` survives because an empty system prompt returns before the drain.
         //
-        // Note: this is a low-severity Oracle finding D — the main fix
-        // was for Finding A1, but the conditional drain also makes
-        // early-return paths safer by default.
         expect(systemPromptRefreshSessions.has(sessionId)).toBe(true);
     });
 
@@ -247,13 +224,13 @@ describe("system-prompt-hash drain semantics (Oracle review 2026-04-26 Finding A
             systemPromptTokens: 100,
         });
 
-        // Pass 1: hash mismatch → flag added but survives.
+        // Pass 1 preserves `systemPromptRefreshSessions` after a hash mismatch.
         await handler({ sessionID: sessionId }, { system: ["New prompt content"] });
         expect(systemPromptRefreshSessions.has(sessionId)).toBe(true);
 
-        // Pass 2: same prompt content (hash now matches stored value
-        // from Pass 1). Flag was set on entry → handler reads adjuncts
-        // with isCacheBusting=true → drain.
+        // On pass 2, the hash matches the value stored on pass 1.
+        // Because the refresh flag is set on entry, the handler reads adjuncts with isCacheBusting=true.
+        // The cache-busting adjunct read drains the refresh flag.
         await handler({ sessionID: sessionId }, { system: ["New prompt content"] });
         expect(systemPromptRefreshSessions.has(sessionId)).toBe(false);
     });
@@ -293,21 +270,18 @@ describe("system-prompt-hash fail-open (per-turn handler must never throw)", () 
         const { handler } = buildHandler();
         const db = openDatabase();
 
-        // Pass 1 primes session_meta (hash + tokens) cleanly.
+        // Pass 1 creates session_meta with a system-prompt hash and token estimate.
         await handler({ sessionID: sessionId }, { system: ["You are a helpful agent."] });
 
-        // Now sabotage the persistence layer so the hash-change branch's
-        // updateSessionMeta throws on pass 2. Dropping the table makes any write
-        // raise — simulating a busy/failing DB. The handler must NOT propagate it.
+        // The test removes `session_meta` to make `updateSessionMeta` fail.
+        // The handler must suppress updateSessionMeta failures.
         db.exec("DROP TABLE session_meta");
 
         const system = ["You are a helpful agent.", "DIFFERENT content forces a hash change"];
-        // Must not throw — a throw here would fail the LLM call instead of just
-        // losing a telemetry write.
+        // The handler must suppress telemetry-write failures so they do not fail the LLM call.
         await handler({ sessionID: sessionId }, { system });
 
-        // The prompt was still mutated/injected (guidance present) — failing open
-        // means we keep what we did, not crash.
+        // A metadata-write failure must not discard injected guidance.
         expect(system.join("\n")).toContain("## Magic Context");
     });
 });
@@ -504,11 +478,7 @@ describe("single system-entry serialization (issue #311)", () => {
 });
 
 /**
- * Issue #52 regression: Magic Context guidance was being injected into the
- * system prompt for OpenCode's three native hidden agents (title, summary,
- * compaction). These agents run on small/cheap models with a fixed single-
- * shot job — they don't benefit from any of our injection (no tools, no
- * `ctx_reduce`, no nudges) and pay for the extra prompt content in cost.
+ * Magic Context does not inject guidance into OpenCode's title, summary, or compaction agents.
  */
 describe("system-prompt-hash skips OpenCode internal hidden agents (issue #52)", () => {
     const TITLE_PROMPT_HEAD =
@@ -526,9 +496,8 @@ describe("system-prompt-hash skips OpenCode internal hidden agents (issue #52)",
         const system = [TITLE_PROMPT_HEAD];
         await handler({ sessionID: sessionId }, { system });
 
-        // Nothing appended: no `## Magic Context`, no `<project-docs>`,
-        // no `<user-profile>`, no `<key-files>`. The system array stays
-        // exactly as OpenCode passed it in.
+        // The handler does not append `## Magic Context`, `<project-docs>`, `<user-profile>`, or `<key-files>` to the system prompt.
+        // The handler preserves the system array exactly as OpenCode passed it.
         expect(system).toHaveLength(1);
         expect(system[0]).toBe(TITLE_PROMPT_HEAD);
         expect(system.join("\n")).not.toContain("## Magic Context");
@@ -559,10 +528,9 @@ describe("system-prompt-hash skips OpenCode internal hidden agents (issue #52)",
     });
 
     it("does NOT update systemPromptHash for internal-agent calls", async () => {
-        // Title-gen runs once on the first user turn with a totally
-        // different system prompt than the main agent. If we updated the
-        // hash here, every subsequent main-agent turn would see a
-        // "hash changed" flush and burn cache for nothing.
+        // The title generator runs once on the first user turn with a system prompt that differs from the main agent's.
+        // Updating the hash on the title-generation turn would make later main-agent turns treat it as changed.
+        // That false hash change would flush the cache unnecessarily.
         useTempDataHome("sph-skip-no-hash-update-");
         const sessionId = "ses-no-hash-update";
         const db = openDatabase();
@@ -592,19 +560,18 @@ describe("system-prompt-hash skips OpenCode internal hidden agents (issue #52)",
 });
 
 /**
- * Magic Context's OWN hidden children (historian/dreamer/sidekick/migration)
- * must not get the guidance block — wasted spend + a contradictory second
- * identity frame. Detected by prompt signature (pass-1, timing-independent)
- * AND the title-prefix `internalChildSessions` flag.
+ * The handler must not inject guidance into Magic Context's historian, dreamer, sidekick, or migration children.
+ * A second identity frame would contradict these children's prompts and increase cost.
+ * The prompt signature identifies these children independently of timing.
+ * The `internalChildSessions` title-prefix flag also identifies these children.
  */
 describe("system-prompt-hash skips Magic Context internal child agents", () => {
     const HISTORIAN_HEAD =
         "You are Historian — the hippocampus of a long-running coding agent. You and the primary agent are one mind.";
     const SIDEKICK_HEAD =
         "You are Sidekick, a focused memory-retrieval subagent for an AI coding assistant.";
-    // Every dreamer task prompt shares "for the magic-context system"; each opener
-    // below must be detected so the guidance block is never injected into a dreamer
-    // child even in the title-flag race window.
+    // All dreamer task prompts contain "for the magic-context system".
+    // The dreamer signature must match each task-prompt opener to exclude dreamer children before the title flag is available.
     const DREAMER_BASE_HEAD =
         "You are a background maintenance agent for the magic-context system,";
     const CURATE_HEAD = "You are a memory-pool curator for the magic-context system.";
@@ -653,10 +620,7 @@ describe("system-prompt-hash skips Magic Context internal child agents", () => {
     });
 
     it("does not forbid the project promotion its own verdict schema requests", () => {
-        // The reviewer's task text and output schema define `promote_project`.
-        // A system role that also says it must not touch project memories makes
-        // a compliant model omit the action, so promotion becomes
-        // provider-dependent or inert.
+        // A system prompt that prohibits touching project memories conflicts with `promote_project`, causing compliant models to omit promotion.
         expect(REVIEW_USER_MEMORIES_SYSTEM_PROMPT).not.toMatch(/do NOT touch project memories/i);
         expect(REVIEW_USER_MEMORIES_SYSTEM_PROMPT).toContain("promote_project");
     });
@@ -684,9 +648,7 @@ describe("system-prompt-hash skips Magic Context internal child agents", () => {
     });
 
     it("skips injection via the internalChildSessions flag even when the prompt has no known signature", async () => {
-        // Covers the title-prefix detection path: a child whose prompt opener
-        // we don't signature-match (e.g. a future MC agent) is still exempt
-        // because session.created flagged it by `magic-context-` title.
+        // An `internalChildSessions` entry skips injection even when its prompt matches no known signature.
         useTempDataHome("sph-skip-mc-flag-");
         const sessionId = "ses-mc-flagged";
         const { handler } = buildHandler({
@@ -711,10 +673,8 @@ describe("system-prompt-hash skips Magic Context internal child agents", () => {
 });
 
 /**
- * Unit B: subagent self-management. A subagent session (isSubagent=true) with
- * ctx_reduce enabled gets the MINIMAL §N§ + ctx_reduce block — not the full
- * primary block, not the no-reduce block. Internal MC children still skip
- * entirely (order invariant: the internal-child skip runs BEFORE the subagent
+ * Subagent sessions with `ctx_reduce` receive only the minimal `§N§` and `ctx_reduce` block, not either primary block.
+ * The internal-child skip runs before subagent handling, so internal Magic Context children receive no block.
  * branch).
  */
 describe("system-prompt-hash subagent self-management (Unit B)", () => {
@@ -730,11 +690,10 @@ describe("system-prompt-hash subagent self-management (Unit B)", () => {
         await handler({ sessionID: sessionId }, { system });
 
         const joined = system.join("\n");
-        // Minimal block: marker + §N§ + ctx_reduce mechanics …
+        // The minimal block contains only the marker, §N§, and `ctx_reduce` mechanics.
         expect(joined).toContain("## Magic Context");
         expect(joined).toContain("§N§ identifiers");
         expect(joined).toContain("ctx_reduce");
-        // … but NONE of the primary's role/guidance.
         expect(joined).not.toContain("long-term partner");
         expect(joined).not.toContain("### Reduction Triggers");
         expect(joined).not.toContain("ctx_memory");
@@ -748,9 +707,7 @@ describe("system-prompt-hash subagent self-management (Unit B)", () => {
         getOrCreateSessionMeta(db, sessionId);
         updateSessionMeta(db, sessionId, { isSubagent: true });
 
-        // Tool allow-list denies ctx_reduce: the subagent has no §N§ and no tool
-        // to act on, so it must get NO Magic Context block — not the no-reduce
-        // PRIMARY block (which would leak the partner frame + memory/search/note
+        // If the tool allow-list excludes `ctx_reduce`, the subagent receives no Magic Context block.
         // guidance).
         clearCtxReduceAvailability(sessionId);
         resolveCtxReduceAvailabilityFromMessages(sessionId, [
@@ -771,7 +728,6 @@ describe("system-prompt-hash subagent self-management (Unit B)", () => {
         const sessionId = "ses-primary-full";
         const db = openDatabase();
         getOrCreateSessionMeta(db, sessionId);
-        // isSubagent defaults false.
 
         const { handler } = buildHandler();
         const system = ["You are the primary coding assistant."];
@@ -819,9 +775,8 @@ describe("system-prompt-hash subagent self-management (Unit B)", () => {
 });
 
 /**
- * Issue #53 regression: users can opt specific agents out of system-prompt
- * injection so Magic Context's `## Magic Context` guidance doesn't tell the
- * LLM to use tools that the user has denied for that agent.
+ * Agents opted out of system-prompt injection must not receive Magic Context tool guidance.
+ * Tool opt-outs suppress Magic Context guidance because that guidance requires unavailable tools.
  */
 describe("system-prompt-hash honors per-agent opt-out (issue #53)", () => {
     it("skips ALL injection when injectionEnabled=false (global escape hatch)", async () => {
@@ -880,16 +835,13 @@ describe("system-prompt-hash honors per-agent opt-out (issue #53)", () => {
         const system = ["You are a normal agent without any skip marker."];
         await handler({ sessionID: sessionId }, { system });
 
-        // Injection still happened without adding a second system entry.
+        // Magic Context injection appends to the existing system entry instead of adding a second entry.
         expect(system).toHaveLength(1);
         expect(system[0]).toContain("## Magic Context");
     });
 
     it("ignores empty skip-signature strings (would otherwise match everything)", async () => {
-        // Defensive: an empty string in skip_signatures would make
-        // `prompt.includes("")` true for every prompt, silently disabling
-        // injection globally. The handler explicitly filters out empty
-        // signatures so a misconfiguration can't break injection silently.
+        // An empty string in `skip_signatures` makes `prompt.includes("")` true for every prompt, silently disabling injection globally.
         useTempDataHome("sph-issue53-empty-sig-");
         const sessionId = "ses-emptysig";
         const { handler } = buildHandler({
@@ -899,16 +851,12 @@ describe("system-prompt-hash honors per-agent opt-out (issue #53)", () => {
         const system = ["You are a normal agent — no skip marker here."];
         await handler({ sessionID: sessionId }, { system });
 
-        // Empty signature ignored, real signature didn't match → guidance injected.
         expect(system).toHaveLength(1);
         expect(system[0]).toContain("## Magic Context");
     });
 
     it("does NOT update systemPromptHash for opted-out calls", async () => {
-        // Same reasoning as the issue #52 hash-update test: an opted-out
-        // agent's system prompt is structurally different from the main
-        // agent's, so updating the hash here would cause every later
-        // main-agent turn to see a hash-change flush.
+        // An opted-out agent's system prompt differs from the main agent's, so updating the hash would make every later main-agent turn see a hash-change flush.
         useTempDataHome("sph-issue53-no-hash-update-");
         const sessionId = "ses-issue53-no-hash";
         const db = openDatabase();
@@ -943,18 +891,13 @@ describe("provisional ctx_reduce availability (pre-first-user race)", () => {
     }
 
     it("does not persist a hash while the availability verdict is provisional", async () => {
-        // A system pass can run BEFORE the session's first user message is
-        // persisted to opencode.db. The availability verdict is then a
-        // provisional fail-open true; persisting a hash computed from the
-        // reduce-enabled guidance variant would flip (hash change → flush →
-        // HARD fold) as soon as the real first user message denies the tool.
+        // Before the first user message, fail-open `ctx_reduce` availability is provisional; persisting its guidance hash would cause a hash-change flush and hard fold if that message denies the tool.
         const dir = mkdtempSync(join(tmpdir(), "sph-provisional-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
         const { mkdirSync } = require("node:fs");
         const { Database } = require("../../shared/sqlite");
         mkdirSync(join(dir, "opencode"), { recursive: true });
-        // opencode.db exists but has NO first-user row for this session yet.
         const oc = new Database(join(dir, "opencode", "opencode.db"));
         oc.exec(
             "CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
@@ -970,9 +913,9 @@ describe("provisional ctx_reduce availability (pre-first-user race)", () => {
         const system = ["Base agent prompt"];
         await handler({ sessionID: sessionId }, { system });
 
-        // Guidance still renders (a prompt must go out)...
+        // The handler must send guidance while the verdict is provisional.
         expect(system.join("\n")).toContain("## Magic Context");
-        // ...but no hash baseline is written from the provisional variant.
+        // The handler does not persist a hash from the provisional guidance variant.
         const meta = getOrCreateSessionMeta(db, sessionId);
         expect(meta.systemPromptHash === "" || meta.systemPromptHash === "0").toBe(true);
     });
@@ -993,11 +936,10 @@ describe("provisional ctx_reduce availability (pre-first-user race)", () => {
         const system = ["Base agent prompt"];
         await handler({ sessionID: sessionId }, { system });
 
-        // Deny-list session: the no-reduce guidance variant renders...
         const joined = system.join("\n");
         expect(joined).toContain("## Magic Context");
         expect(joined).not.toContain("ctx_reduce");
-        // ...and the hash IS persisted (frozen verdict owns the baseline).
+        // The handler persists the hash after the verdict is frozen.
         const meta = getOrCreateSessionMeta(db, sessionId);
         expect(meta.systemPromptHash).not.toBe("");
         expect(meta.systemPromptHash).not.toBe("0");

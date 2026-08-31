@@ -60,9 +60,9 @@ interface CompilerResponse {
 const MAX_COMPILER_OUTPUT_CHARS = 128 * 1024;
 const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
 const MAX_MANIFEST_ENTRIES = 64;
-/** Wire limit mirrored from the module's NOTE_EVALUATOR_MAX_MANIFEST_BYTES. */
+/** The module limits manifests to NOTE_EVALUATOR_MAX_MANIFEST_BYTES (32 KiB). */
 const MAX_MANIFEST_BYTES = 32 * 1024;
-/** Wire limit mirrored from the module's NOTE_EVALUATOR_MAX_CRON_BYTES. */
+/** The module limits cron expressions to NOTE_EVALUATOR_MAX_CRON_BYTES (256 bytes). */
 const MAX_CRON_BYTES = 256;
 const MAX_COMPILER_ERROR_CHARS = 2 * 1024;
 
@@ -95,9 +95,7 @@ Remember: output only the JSON object described by the system prompt.`;
             db: args.db,
             parentSessionId: args.parentSessionId,
             harness: "opencode",
-            // Dashboard token rollups group dream-task invocations under the
-            // historical dreamer bucket. The session.prompt agent is still the
-            // no-tool smart-note compiler.
+            // Dashboard token rollups classify dream-task invocations as `dreamer`.
             subagent: "dreamer",
             task: "evaluate-smart-notes",
             startedAt,
@@ -195,8 +193,6 @@ Remember: output only the JSON object described by the system prompt.`;
         recordInvocation({ status: cancelled ? "aborted" : "failed", error: message });
         return { ok: false, cancelled, error: message };
     } finally {
-        // Compiler prompts include note content and conditions, so they are
-        // deleted regardless of debug-retention settings.
         if (childSessionId) {
             await args.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
         }
@@ -265,11 +261,7 @@ export function normalizeManifest(manifest: SmartNoteCheckManifest): SmartNoteCh
         signals: uniqueStrings(manifest.signals),
         summary: typeof manifest.summary === "string" ? manifest.summary.slice(0, 160) : undefined,
     };
-    // Entry counts are bounded above but individual strings are not, and the
-    // module rejects a serialized manifest over its wire limit at completion —
-    // after the billable prompt already ran. Failing here records a compile
-    // failure (with backoff) instead of an abandoned claim that stays eligible
-    // and recompiles on every drain.
+    // The validator rejects manifests over 32 KiB because 64 entries do not bound string sizes.
     if (Buffer.byteLength(JSON.stringify(normalized), "utf8") > MAX_MANIFEST_BYTES) {
         throw new Error("manifest exceeds 32 KiB");
     }
@@ -277,9 +269,6 @@ export function normalizeManifest(manifest: SmartNoteCheckManifest): SmartNoteCh
 }
 
 /**
- * Best-effort manifest drift notes for audit visibility only. Runtime guards in
- * the capability implementations are the security boundary; this check must not
- * accept or reject code.
  */
 export function manifestAdvisoryWarnings(code: string, manifest: SmartNoteCheckManifest): string[] {
     const warnings: string[] = [];
@@ -361,9 +350,6 @@ function literalCalls(code: string, method: "readFile" | "httpGet"): string[] {
 
 export function normalizeCron(cron: string): string {
     const normalized = cron.trim() || "0 * * * *";
-    // The module enforces this limit in UTF-8 bytes on the wire artifact;
-    // measuring UTF-16 length here would accept a multibyte cron the module
-    // then rejects at completion, abandoning the claim without recording a
     // compilation failure.
     if (Buffer.byteLength(normalized, "utf8") > MAX_CRON_BYTES)
         throw new Error("check_cron exceeds 256 bytes");

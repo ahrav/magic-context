@@ -1,8 +1,3 @@
-//! Injected fake transport provider and a raw driver for its candidate
-//! channel, used by the negotiation host tests. The fake never touches
-//! `mc-host` encoders on the assertion side: candidate frames are built and
-//! decoded with the independent `raw_client` codec.
-
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,8 +25,6 @@ pub struct FakeProvider {
 }
 
 impl FakeProvider {
-    /// Builds a provider plus the receiver on which each prepared
-    /// candidate's peer half arrives.
     pub fn install(
         capability_version: u32,
         descriptor: serde_json::Value,
@@ -51,12 +44,10 @@ impl FakeProvider {
         )
     }
 
-    /// The registry includes this provider and built-in TCP only.
     pub fn registry(provider: &Arc<Self>) -> TransportProviders {
         TransportProviders::with_injected(vec![Arc::clone(provider) as Arc<dyn InjectedProvider>])
     }
 
-    /// Scripts the next `prepare` to fail its KTD9 attachment gate.
     pub fn fail_next(&self, failure: ProviderFailure) {
         *self.fail_next.lock().expect("fail lock") = Some(failure);
     }
@@ -90,7 +81,6 @@ impl InjectedProvider for FakeProvider {
     }
 }
 
-/// Raw v2 frame driver over a candidate's peer duplex half.
 pub struct RawCandidate {
     stream: DuplexStream,
     pub next_corr: u64,
@@ -143,7 +133,6 @@ impl RawCandidate {
         }
     }
 
-    /// True when no frame (or close) arrives for the whole budget.
     pub async fn quiet_for(&mut self, budget: Duration) -> bool {
         tokio::time::timeout(budget, self.expect_frame())
             .await

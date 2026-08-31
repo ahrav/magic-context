@@ -11,13 +11,10 @@ import type { VectorLoadObserver } from "./search-trace";
 export const DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS = 512;
 
 /**
- * Fraction of the configured `max_input_tokens` we actually fill per window.
  *
- * `max_input_tokens` is the provider's HARD context ceiling, but we window using
- * our own `estimateTokens` heuristic, which drifts from the provider's real
- * tokenizer (observed ~1% on Qwen3 — a chunk we sized at 8192 counted 8261 on
- * the server and was silently truncated). Targeting 90% of the ceiling absorbs
- * that cross-tokenizer drift so a window never exceeds the provider limit.
+ * max_input_tokens is the provider's hard context ceiling; estimateTokens may drift from the provider tokenizer.
+ * On Qwen3, a chunk estimated at 8192 tokens counted as 8261 tokens and was silently truncated.
+ * Targeting 90% of the ceiling leaves headroom for observed cross-tokenizer drift.
  */
 export const CHUNK_WINDOW_SAFETY_RATIO = 0.9;
 
@@ -190,9 +187,7 @@ function getInsertEmbeddingStatement(db: Database): PreparedStatement {
 function getSearchPoolProbeStatement(db: Database): PreparedStatement {
     let stmt = searchPoolProbeStatements.get(db);
     if (!stmt) {
-        // idx_cce_project_model bounds this to one project/model pool, with the
-        // session predicate applied before aggregation. Excluding vector keeps
-        // steady-state searches from reading or decoding blobs.
+        // The decoded-pool cache prevents steady-state searches from reading or decoding blobs.
         stmt = db.prepare(
             `SELECT COUNT(*) AS rowCount, MAX(id) AS maxRowId
              FROM compartment_chunk_embeddings
@@ -296,8 +291,7 @@ function touchDecodedSearchPoolEntry(entry: DecodedSearchPoolEntry): void {
 function estimateDecodedSearchPoolBytes(rows: readonly StoredCompartmentChunkEmbedding[]): number {
     let bytes = 0;
     for (const row of rows) {
-        // Vectors dominate, but include a conservative allowance for the row
-        // object and UTF-16 metadata so the process-wide budget remains real.
+        // The cache budget includes row objects and UTF-16 metadata.
         bytes +=
             row.vector.byteLength +
             256 +
@@ -359,7 +353,7 @@ function invalidateDecodedSearchPools(
     }
 }
 
-/** Clear process-level decoded vectors between isolated test cases. */
+/** Test isolation requires clearing process-level decoded vectors. */
 export function _resetCompartmentChunkSearchCacheForTests(): void {
     for (const entry of [...decodedSearchPoolLru.keys()]) {
         removeDecodedSearchPoolEntry(entry);
@@ -471,20 +465,12 @@ export function buildCanonicalChunkTextFromFts(
 }
 
 /**
- * Fallback embeddable text for a compartment whose RAW span has NO indexable
- * content. A thin one-beat compartment — e.g. a host-injected
- * `<system-reminder>` notification (stripped to empty by the indexer) plus an
- * assistant tool-call (no text) — leaves `buildCanonicalChunkTextFromFts`
- * returning "". Such a compartment would never acquire an embedding row, so it
- * stays counted as "remaining" forever and the auto-embed drain re-fires its
- * start/finish notification on every restart (the desktop "Embedding 1 /
- * Embedded 0" loop).
+ * Fallback text lets compartments with no indexable assistant tool-call text acquire embeddings.
+ * An empty canonical string prevents embedding compartments without indexable assistant tool-call text.
+ * A compartment without an embedding row remains eligible for auto-embedding.
+ * A compartment without an embedding row remains counted as remaining, so the auto-embed drain retries it.
  *
- * The compartment still carries a real summary (title + p1 paraphrase) — the
- * ONLY signal it has — so we embed that instead. This is NOT the redundancy that
- * retired `p1_embedding` (which embedded the summary ALONGSIDE the raw chunk):
- * here there is no raw chunk to embed, so the summary is the sole content.
- * Returns "" only when the compartment has neither a title nor p1/content.
+ * Summary fallback preserves embedding coverage when no raw chunk exists.
  */
 export function buildCompartmentSummaryFallbackText(db: Database, compartmentId: number): string {
     const row = db
@@ -501,9 +487,8 @@ export function buildCompartmentSummaryFallbackText(db: Database, compartmentId:
 }
 
 /**
- * Convert historian input text into the same embeddable subset used by the FTS
- * backfill producer: only U:/A: conversational lines remain, and TC: tool-call
- * summaries are removed because they are better served by exact FTS probes.
+ * The backfill producer retains only U:/A: conversational lines from historian input.
+ * The backfill producer retains only U:/A: conversational lines from historian input.
  */
 export function canonicalizeInMemoryChunkTextForEmbedding(
     chunkText: string,
@@ -568,8 +553,7 @@ export function chunkCanonicalText(
     if (lines.length === 0 || endOrdinal < startOrdinal) return [];
 
     const normalizedMax = normalizeCompartmentChunkMaxInputTokens(maxInputTokens);
-    // Window against a safety-margined budget, not the raw ceiling, so estimator
-    // drift can't push a window past the provider's real token limit.
+    // The safety margin reduces the chance that estimator drift exceeds the provider token limit.
     const effectiveMax = Math.max(1, Math.floor(normalizedMax * CHUNK_WINDOW_SAFETY_RATIO));
     const fullText = lines.join("\n");
     if (estimateTokens(fullText) <= effectiveMax) {
@@ -615,13 +599,11 @@ export function chunkCanonicalText(
         const lineEnd = range?.end ?? lineStart;
         const lineTokens = estimateTokens(line);
 
-        // A single canonical line (one U:/A: span) can itself exceed the per-window
-        // budget — e.g. a span containing a large file dump or paste rendered into
-        // one line. Packing only flushes BETWEEN lines, so such a line would be
-        // emitted as one oversized window and blow past the provider's hard context
-        // window (#206: jina returned 400 exceed_context_size for a 51774-token
-        // window against an 8192 ceiling). Split the line down to budget first, and
-        // emit each sub-slice as its own window carrying this line's ordinal range.
+        // A single canonical U:/A: line can exceed the per-window token budget.
+        // Packing flushes only between lines, so an oversized line cannot be reduced by normal packing.
+        // A line larger than effectiveMax would otherwise form an oversized window.
+        // The window builder splits oversized lines before packing so each slice is estimated at no more than effectiveMax tokens.
+        // The window builder emits each oversized-line slice as a separate window with the source line's ordinal range.
         if (lineTokens > effectiveMax) {
             flush();
             for (const slice of splitOversizedLine(line, effectiveMax)) {
@@ -648,10 +630,6 @@ export function chunkCanonicalText(
     }
     flush();
 
-    // windowIndex is assigned contiguously as 1-based at push time (both the
-    // flush path and the oversized-line split use `windows.length + 1`), so it is
-    // already gap-free and stable — preserve it (chunk identity = compartmentId +
-    // windowIndex + hash; renumbering would orphan every stored chunk row).
     return constrainWindowsByUtf8Bytes(windows, maxInputBytes);
 }
 
@@ -684,19 +662,11 @@ function constrainWindowsByUtf8Bytes(
 }
 
 /**
- * Split a single oversized canonical line into sub-slices each within
- * `effectiveMax` tokens, using a recursive character splitter (best-in-class
- * boundary hierarchy: paragraph → line → sentence → word → char). The
- * `lengthFunction` is our real tokenizer (`estimateTokens`), so slicing is
- * token-accurate against the same heuristic the windower uses — deterministic,
- * no provider call, cache-stable. A hard char-level safety cap guarantees
- * termination even if a single token-dense fragment resists separator splitting.
+ * splitOversizedLine returns slices estimated at no more than effectiveMax tokens.
+ * charBudgetSplit terminates even when separator-based splitting cannot reduce a fragment.
  */
 function splitOversizedLine(line: string, effectiveMax: number): string[] {
-    // Recursive split on the best-in-class separator hierarchy (paragraph → line
-    // → word → char), measured with our real tokenizer. Fall back to a
-    // deterministic char-budget split if the splitter throws or yields nothing
-    // (never leave an oversized line un-split).
+    // charBudgetSplit uses a deterministic fallback when the separator-based splitter throws or yields no fragments.
     let slices: string[] = [];
     try {
         slices = recursiveCharacterSplit(line, {
@@ -704,29 +674,16 @@ function splitOversizedLine(line: string, effectiveMax: number): string[] {
             lengthFunction: estimateTokens,
         });
     } catch (error) {
-        // Surface the regression instead of degrading silently: if the splitter
-        // consistently fails for some input shape the char-budget fallback still
-        // embeds, but we want a signal.
         log("[magic-context] recursiveCharacterSplit failed; using char-budget fallback:", error);
         slices = [];
     }
     if (slices.length === 0) {
         slices = charBudgetSplit(line, effectiveMax);
     }
-    // Final guard: any slice still over budget (token-dense, no separators) is
-    // hard-split by character budget. charBudgetSplit is the TERMINAL splitter —
-    // it shrinks to a single character, the smallest indivisible unit — so its
-    // output is budget-compliant by construction EXCEPT for the degenerate case
-    // of a lone character that alone exceeds the budget (only reachable with a
-    // tiny effectiveMax; never with real provider budgets). We assert that
-    // contract in dev/test rather than re-splitting (which cannot reduce a
-    // 1-char slice further and would loop): any escapee is a genuine bug, not
-    // something to silently paper over.
+    // Re-splitting a one-character slice would not reduce it and could loop.
     const safe: string[] = [];
     const pushChecked = (slice: string): void => {
         if (estimateTokens(slice) > effectiveMax && slice.length > 1) {
-            // Not terminal yet — split further. (Defensive: charBudgetSplit
-            // should already guarantee this; only triggers if its contract
             // regresses.)
             safe.push(...charBudgetSplit(slice, effectiveMax));
             return;
@@ -744,16 +701,9 @@ function splitOversizedLine(line: string, effectiveMax: number): string[] {
 }
 
 /**
- * Deterministic character-budget fallback split. Estimates a chars-per-token
- * ratio from the input and slices on that, then trims each slice down until it
- * fits the token budget. Always terminates.
+ * The splitting loop terminates even when one character exceeds `effectiveMax`.
  *
- * Budget guarantee: every emitted slice is within `effectiveMax` tokens EXCEPT
- * the degenerate case where a single character already exceeds the budget (only
- * reachable when `effectiveMax` is tiny — e.g. 1 — and one char tokenizes to
- * multiple tokens). In that case the slice is a single character: it cannot be
- * split further, so emitting it is the only progress-making choice. With real
- * provider budgets (thousands of tokens) this case never arises.
+ * Each emitted slice has at most `effectiveMax` estimated tokens unless one character alone exceeds that budget.
  */
 function charBudgetSplit(text: string, effectiveMax: number): string[] {
     const totalTokens = Math.max(1, estimateTokens(text));
@@ -764,10 +714,7 @@ function charBudgetSplit(text: string, effectiveMax: number): string[] {
     while (pos < text.length) {
         let end = Math.min(text.length, pos + sliceChars);
         let slice = text.slice(pos, end);
-        // Shrink until the slice fits the token budget (handles dense regions).
-        // Floor at one character: a single char is the smallest indivisible unit,
-        // so we stop there even if it alone exceeds the budget (degenerate tiny
-        // budget) — otherwise the loop could not make progress.
+        // The splitter stops at one character because smaller slices cannot make progress.
         while (slice.length > 1 && estimateTokens(slice) > effectiveMax) {
             end = pos + Math.max(1, Math.floor((end - pos) / 2));
             slice = text.slice(pos, end);
@@ -848,7 +795,7 @@ export function replaceCompartmentChunkEmbeddings(
     );
 }
 
-/** Remove one compartment's rows under one model, invalidating decoded pools. */
+/** Deleting a compartment's rows for one model invalidates decoded pools. */
 export function deleteCompartmentChunkEmbeddingsForModel(
     db: Database,
     compartmentId: number,
@@ -872,10 +819,9 @@ export function loadCompartmentChunkEmbeddingsForSearch(
     projectPath: string,
     modelId: string,
     onVectorLoad?: VectorLoadObserver,
-    /** Ordinal cutoff the caller applies before comparing vectors. Warm
-     *  touched-byte evidence counts only rows the search can actually
-     *  compare; the cold decode below still reports the whole pool, since
-     *  a cache miss genuinely decodes everything. */
+    /**
+     * Touched-byte evidence counts only rows the search compares.
+     * */
     touchedMaxOrdinal?: number | null,
 ): StoredCompartmentChunkEmbedding[] {
     if (!modelId) {
@@ -952,12 +898,10 @@ export function loadCompartmentChunkEmbeddingsForSearch(
     return decodedRows;
 }
 
-/** Project-wide candidates for the passive missing-chunk drain, newest-first (a
- *  fresh compartment is the one a search is most likely to want).
+/**
  *
- *  `before` is a run-local keyset cursor. It advances past every selected batch,
- *  including no-work and failed candidates, without growing a SQL parameter
- *  list. The cursor is not persisted, so failures remain eligible on the next
+ * `before` is a keyset cursor over `createdAt` and `id`.
+ * `before` keeps the query's parameter count fixed as batches progress.
  *  maintenance pass. */
 export function loadUnembeddedCompartmentChunkCandidates(
     db: Database,
@@ -1011,16 +955,10 @@ function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCand
 
 const sessionBackfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
 
-/** Session-scoped variant of {@link loadUnembeddedCompartmentChunkCandidates}.
- *  Used by the on-demand `/ctx-embed-history` command, which backfills ONE
- *  session at a time (oldest-first so the user watches it fill chronologically),
- *  unlike the project-wide passive drain. A compartment is a candidate when it
- *  has no chunk-embedding row for `modelId` yet.
+/**
+ * A compartment is a candidate only when no chunk-embedding row exists for `projectPath` and `modelId`.
  *
- *  `excludeIds` lets the drain loop advance past compartments that produced no
- *  embeddable work this run (empty canonical text / windows already current) so
- *  one un-embeddable old compartment can't block every newer one — without it
- *  the oldest-first query would re-select the same stuck prefix forever. */
+ * */
 export function loadUnembeddedSessionChunkCandidates(
     db: Database,
     projectPath: string,
@@ -1030,8 +968,7 @@ export function loadUnembeddedSessionChunkCandidates(
     excludeIds?: readonly number[],
 ): CompartmentChunkBackfillCandidate[] {
     if (excludeIds && excludeIds.length > 0) {
-        // Exclusion sets are per-run and unbounded in shape, so this statement
-        // is built ad hoc (not cached) with an inline placeholder list.
+        // `excludeIds` requires an inline placeholder list, so this branch cannot reuse the cached statement.
         const placeholders = excludeIds.map(() => "?").join(", ");
         const stmt = db.prepare(
             `SELECT c.id AS id,
@@ -1108,8 +1045,8 @@ export function loadUnembeddedSessionChunkCandidates(
     return mapBackfillCandidateRows(rows);
 }
 
-/** Count compartments in this session that still lack a chunk embedding for
- *  `modelId` — drives the `/ctx-embed-history` progress total. */
+/**
+ * */
 export function countUnembeddedSessionCompartments(
     db: Database,
     projectPath: string,
@@ -1139,10 +1076,8 @@ export function countUnembeddedSessionCompartments(
     return typeof row?.n === "number" ? row.n : 0;
 }
 
-/** Total embeddable compartments in this session (have a message range), and how
- *  many are currently embedded under `modelId`. Drives the `/ctx-embed` status
- *  line: `embedded / total`. Counts the project's OWN compartments for the
- *  session (same `session_projects` scoping as the unembedded counter). */
+/**
+ * */
 export function countSessionCompartmentEmbedCoverage(
     db: Database,
     projectPath: string,

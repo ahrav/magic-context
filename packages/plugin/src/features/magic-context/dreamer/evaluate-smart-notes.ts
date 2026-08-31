@@ -41,13 +41,13 @@ export interface EvaluateSmartNotesArgs {
     parentSessionId: string | undefined;
     sessionDirectory: string | undefined;
     holderId: string;
-    /** Keyed lease this task holds (Dreamer v2: per-project evaluate-smart-notes domain). */
+    /** `leaseKey` scopes the evaluate-smart-notes lease to one project. */
     leaseKey: string;
     deadline: number;
     leaseAcquisition?: LeaseAcquisition;
     model?: string;
     fallbackModels?: readonly string[];
-    /** When true, authoring-compiled provider conditions are owned by retina. */
+    /** `retinaHandoff` assigns authoring-compiled provider conditions to retina. */
     retinaHandoff?: boolean;
     onLeaseLost?: (phase: string, error?: unknown) => void;
 }
@@ -55,7 +55,7 @@ export interface EvaluateSmartNotesArgs {
 export interface EvaluateSmartNotesResult {
     surfaced: number;
     pending: number;
-    /** False when there were no pending notes requiring compile/fallback work. */
+    /** `ran` is false when no pending notes require compile or fallback work. */
     ran: boolean;
 }
 
@@ -85,10 +85,9 @@ function createPromptAbortSignal(
 }
 
 /**
- * Compile and maintain smart-note checks. The legacy broad-tool agentic
- * evaluator is intentionally retired: this task uses a no-tool compiler agent,
- * runs code only in the QuickJS capability sandbox, and falls back to a no-tool
- * read-only confirmation prompt when compilation repeatedly fails.
+ * evaluateSmartNotes uses a no-tool compiler agent.
+ * The compiler executes code only in the QuickJS capability sandbox.
+ * After repeated compilation failures, evaluateSmartNotes uses a no-tool read-only confirmation prompt.
  */
 export async function evaluateSmartNotes(
     args: EvaluateSmartNotesArgs,
@@ -102,16 +101,14 @@ export async function evaluateSmartNotes(
     const projectRoot = args.sessionDirectory ?? args.projectIdentity;
     const moduleBridge = findModuleNoteEvaluationBridgeForDrain(args.projectIdentity, projectRoot);
     if (moduleBridge) {
-        // The module authority owns selection; the local mirror count is not
-        // the work gate. This cron-scheduled (or manual) task is the single
-        // full-budget drain — the timer's per-tick sweep drains with zero
-        // compile/fallback budget, so billable prompts run only inside the
-        // configured schedule window.
+        // The module authority owns selection; the local mirror count does not gate work.
+        // Only cron-scheduled and manual drains receive the full compile/fallback budget.
+        // Per-tick timer sweeps receive zero compile/fallback budget.
+        // Per-tick sweeps cannot issue billable prompts because their compile/fallback budget is zero.
         //
-        // The drain can run several sequential compiler/fallback prompts and
-        // outlive the two-minute Dreamer lease, so the lease heartbeat wraps
-        // it: an expired lease would let the next scheduler tick launch an
-        // overlapping billable drain.
+        // A drain can outlive its lease because it runs sequential compiler and fallback prompts.
+        // The lease heartbeat renews the lease while the drain runs.
+        // Without heartbeats, an expired lease lets the next scheduler tick launch an overlapping billable drain.
         const leaseAbortController = new AbortController();
         let moduleLeaseLost = false;
         const heartbeat = startLeaseHeartbeat(
@@ -140,16 +137,15 @@ export async function evaluateSmartNotes(
             `[dreamer] smart notes: module drain claimed=${result.claimed} completed=${result.completed} surfaced=${result.surfaced}`,
         );
         if (moduleLeaseLost) {
-            // The drain aborted mid-flight and a new lease holder may already
-            // be running; recording completion would advance the schedule for
-            // work this run did not finish.
+            // The drain must not record completion after a mid-flight abort because another lease holder may be running.
+            // The scheduler must not advance the schedule when a drain has unfinished work.
+            // Recording completion would advance the schedule for unfinished drain work.
             throw new Error("Dream lease lost during module smart-note drain");
         }
         if (!result.drained && result.claimed === 0) {
-            // Registration failure or a transport error before any claim:
-            // reporting success would advance the cron (nightly by default)
-            // past a transient outage while the per-tick sweep excludes the
-            // billable work this task exists to run.
+            // The scheduler must not report success after a registration or transport failure before any claim.
+            // Reporting success before any claim would advance the cron past a transient outage.
+            // Per-tick sweeps exclude billable work, so the scheduled drain must retry failures before any claim.
             throw new Error("module smart-note drain stopped before reaching no_work");
         }
         return {
@@ -413,8 +409,8 @@ export async function confirmSmartNoteReadOnly(
 ): Promise<boolean | null> {
     const { noteId, content, surfaceCondition, signal: leaseSignal } = args;
     let childSessionId: string | null = null;
-    // Hoisted so the catch below can distinguish a deadline abort (the prompt
-    // never concluded — inconclusive) from a genuine failed confirmation.
+    // The abort state remains in outer scope so the catch can treat deadline aborts as inconclusive.
+    // A deadline abort is inconclusive because the prompt never concluded.
     let promptSignal: ReturnType<typeof createPromptAbortSignal> | undefined;
     const startedAt = Date.now();
     let invocationRecorded = false;
@@ -429,11 +425,9 @@ export async function confirmSmartNoteReadOnly(
             db: args.db,
             parentSessionId: args.parentSessionId,
             harness: "opencode",
-            // Token rollups group dream-task invocations under the historical
-            // "dreamer" bucket persisted in subagent_invocations rows; changing
-            // the label would split rollups over rows already written. The
-            // actual child agent remains the no-tool SMART_NOTE_COMPILER_AGENT
-            // passed to session.prompt below.
+            // `dreamer` groups dream-task token rollups because existing `subagent_invocations` rows use that bucket.
+            // Existing `subagent_invocations` rows persist the `dreamer` bucket.
+            // Changing the `dreamer` label would split token rollups across existing `subagent_invocations` rows.
             subagent: "dreamer",
             task: "evaluate-smart-notes",
             startedAt,
@@ -458,9 +452,7 @@ export async function confirmSmartNoteReadOnly(
             },
         );
         childSessionId = typeof created?.id === "string" ? created.id : null;
-        // No session means the confirmation never ran (schema-fence rejection
-        // or malformed SDK response): inconclusive, so abandon rather than
-        // record a genuine met=false verdict.
+        // The evaluator treats a missing session as inconclusive because schema-fence rejection and malformed SDK responses yield no usable confirmation result.
         if (!childSessionId) return null;
         const prompt = `You are the read-only confirmation evaluator for a smart note whose compiled check is unavailable.
 
@@ -525,9 +517,8 @@ Output exactly JSON: {"met": false}`;
         return run.validated;
     } catch (error) {
         if (leaseSignal.aborted || promptSignal?.signal.aborted) {
-            // Lease loss or the deadline timer aborted the prompt mid-flight:
-            // the confirmation never concluded, so record an abandonment
-            // instead of a genuine met=false verdict.
+            // The evaluator treats prompts aborted by lease loss or the deadline timer as inconclusive.
+            // The evaluator records "aborted" and returns null because the confirmation never concluded.
             recordInvocation({ status: "aborted", error });
             return null;
         }
@@ -535,8 +526,6 @@ Output exactly JSON: {"met": false}`;
         log(`[dreamer] smart note #${noteId}: read-only confirmation failed — ${error}`);
         return false;
     } finally {
-        // Confirmation prompts include note content and conditions, so they are
-        // deleted regardless of debug-retention settings.
         if (childSessionId) {
             await args.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
         }

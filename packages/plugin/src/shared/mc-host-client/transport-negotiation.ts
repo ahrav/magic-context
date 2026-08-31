@@ -1,47 +1,42 @@
 /**
- * Negotiation version 1 wire grammar for the mc-host direct profile:
- * `transport.negotiate` offers and selections plus the candidate-only
- * `transport.activate` and `transport.commit` exchanges (wire doc Section
+ * This module implements version 1 of the mc-host direct-profile negotiation wire grammar.
  * 7.7).
  *
- * Leaf module: no imports from connection or facade code. Decoding is
- * strict — closed field sets, exact bounds, and a duplicate-aware JSON
- * parse that rejects repeated object keys at every depth (including inside
- * the opaque provider `parameters` and `descriptor` values) before any
- * typed or opaque value is materialized. Decode failures carry only a
- * bounded code and a structural field path; provider bytes, tokens, and
- * descriptors never reach error messages.
+ * The decoder enforces closed field sets and exact bounds.
+ * The JSON parser rejects duplicate object keys at every depth, including opaque values.
+ * Decode failures contain only a bounded code and structural field path.
+ * Error messages never include provider bytes, tokens, or descriptors.
  */
 
 const OP_TRANSPORT_NEGOTIATE = "transport.negotiate";
 const OP_TRANSPORT_ACTIVATE = "transport.activate";
 const OP_TRANSPORT_COMMIT = "transport.commit";
 
-/** The negotiation grammar version this module implements. */
+/* */
 export const NEGOTIATION_VERSION = 1;
-/** The required fallback transport name (wire doc Section 7.7.2). */
+/** `tcp` is the required fallback transport name. */
 export const TRANSPORT_TCP = "tcp";
 /** Offers are ordered by client preference, 1 to 8 entries. */
 export const MAX_OFFERS = 8;
 /** Transport names are 1-32 ASCII bytes matching `^[a-z][a-z0-9._-]{0,31}$`. */
 export const MAX_TRANSPORT_NAME_BYTES = 32;
-/** Opaque `parameters`/`descriptor` compact-JSON sub-cap in bytes. */
+/** Opaque `parameters` and `descriptor` values each occupy at most 8192 compact-JSON bytes. */
 export const MAX_OPAQUE_BYTES = 8192;
-/** Opaque `parameters`/`descriptor` nesting bound (Section 7.1 counting). */
+/** Opaque `parameters` and `descriptor` values may nest at most 8 levels. */
 export const MAX_OPAQUE_DEPTH = 8;
 /** Activation tokens are exactly 32 lowercase hexadecimal characters. */
 export const ACTIVATION_TOKEN_LEN = 32;
 /** Versions are JSON integers in `1..=u32::MAX`. */
 const MAX_VERSION = 4_294_967_295;
 
-/** Candidate consumer correlation reserved for `transport.activate`. */
+/** `transport.activate` reserves consumer correlation `1n`. */
 export const ACTIVATION_CORRELATION = 1n;
-/** Candidate consumer correlation reserved for `transport.commit`. */
+/** `transport.commit` reserves consumer correlation `2n`. */
 export const COMMIT_CORRELATION = 2n;
-/** First candidate consumer correlation available to application requests. */
+/** Application requests may use consumer correlations starting at `3n`. */
 export const FIRST_APPLICATION_CORRELATION = 3n;
 
-/** Bounded decode/encode failure taxonomy, mirrored by the Rust host. */
+/** Decode and encode failures use only `NegotiationErrorCode`. */
 export type NegotiationErrorCode =
     | "malformed_json"
     | "invalid_type"
@@ -60,10 +55,7 @@ export type NegotiationErrorCode =
     | "wrong_operation";
 
 /**
- * One negotiation decode/encode failure: a bounded code plus a structural
- * field path built only from documented field names and offer indices.
- * Client- or host-supplied bytes — unknown key names, provider parameters,
- * descriptors, and tokens — never appear here.
+ * Error messages never include client- or host-supplied bytes.
  */
 export class NegotiationError extends Error {
     constructor(
@@ -76,13 +68,7 @@ export class NegotiationError extends Error {
 }
 
 /**
- * Closed fallback vocabulary (wire doc Section 7.7.3).
  *
- * Only these two reasons are fallback evidence. Every other setup outcome —
- * negotiation-version mismatch, `unsupported_operation`, `connection_in_use`,
- * timeout, malformed content, an unoffered selection — must fail closed with no
- * same-generation TCP continuation, so accepting one here would commit the
- * generation to TCP on evidence the protocol rejects.
  */
 export const FALLBACK_REASONS = ["unavailable", "capability_version_mismatch"] as const;
 export type FallbackReason = (typeof FALLBACK_REASONS)[number];
@@ -94,29 +80,26 @@ function isFallbackReason(value: string): value is FallbackReason {
 /** Opaque provider data: a bounded JSON object the core never interprets. */
 export type OpaqueObject = Record<string, unknown>;
 
-/** One ordered client offer. */
+/* */
 export interface TransportOffer {
     transport: string;
     capabilityVersion: number;
     parameters?: OpaqueObject;
 }
 
-/** The validated `transport.negotiate` request. */
+/** The decoder returns `NegotiateRequest` only after validation. */
 export interface NegotiateRequest {
     negotiationVersion: number;
     offers: TransportOffer[];
 }
 
-/** The exact offered entry a response names. */
+/** A response must name an offered `transport` and `capabilityVersion` pair. */
 interface SelectedTransport {
     transport: string;
     capabilityVersion: number;
 }
 
 /**
- * The validated `transport.negotiate` response. The tagged union encodes the
- * field mix invariants: only a TCP selection may carry a `reason`, and only
- * a non-TCP grant carries the token/descriptor pair.
  */
 export type NegotiateResponse =
     | { kind: "tcp"; selected: SelectedTransport; reason?: FallbackReason }
@@ -127,15 +110,13 @@ export type NegotiateResponse =
           descriptor: OpaqueObject;
       };
 
-/** The validated candidate `transport.activate` request (correlation 1). */
+/** The decoder accepts `ActivateRequest` only with correlation `1n`. */
 export interface ActivateRequest {
     activationToken: string;
 }
 
 /**
- * Strict JSON value with per-value metadata the standard `JSON.parse` cannot
- * provide: duplicate-key rejection at every depth and the raw number
- * literal, so `1.0` and `1e2` stay distinguishable from `1`.
+ * `StrictValue` preserves duplicate keys and raw number literals so typed decoding can reject duplicates and distinguish `1.0` and `1e2` from `1`.
  */
 type StrictValue =
     | { kind: "null" }
@@ -145,13 +126,11 @@ type StrictValue =
     | { kind: "array"; items: StrictValue[] }
     | { kind: "object"; entries: Map<string, StrictValue> };
 
-/** Matches serde_json's default recursion limit so both decoders agree. */
+/** The recursion limit matches serde_json's default so both decoders agree. */
 const PARSER_RECURSION_LIMIT = 128;
 
 /**
- * Recursive-descent strict JSON parser. Rejects duplicate object keys at
- * any depth, invalid UTF-8, trailing content, and out-of-grammar numbers —
- * all before any typed decoding sees the document.
+ * The parser rejects duplicate keys at every depth, invalid UTF-8, trailing content, and out-of-grammar numbers before typed decoding.
  */
 class StrictJsonParser {
     private pos = 0;
@@ -217,8 +196,7 @@ class StrictJsonParser {
             if (this.text[this.pos] !== '"') this.fail();
             const key = this.parseString();
             if (entries.has(key)) {
-                // Duplicate keys are rejected outright, at every depth, so
-                // no later consumer can depend on decoder or field order.
+                // Duplicate keys are rejected at every depth, preventing decoder- or field-order-dependent interpretation.
                 this.fail();
             }
             this.skipWhitespace();
@@ -317,7 +295,7 @@ class StrictJsonParser {
             case "u": {
                 const first = this.parseHex4();
                 if (first >= 0xd800 && first <= 0xdbff) {
-                    // Require a full surrogate pair, matching serde_json.
+                    // A high surrogate must be followed by a `\u`-encoded low surrogate.
                     if (this.text[this.pos] !== "\\" || this.text[this.pos + 1] !== "u") {
                         this.fail();
                     }
@@ -349,7 +327,6 @@ class StrictJsonParser {
         const raw = match[0];
         this.pos += raw.length;
         const value = Number(raw);
-        // Non-finite numbers are out of range for JSON, matching serde_json.
         if (!Number.isFinite(value)) this.fail();
         return { kind: "number", value, raw };
     }
@@ -379,8 +356,7 @@ function requireRootObject(bytes: JsonInput): Map<string, StrictValue> {
 }
 
 /**
- * Rejects any key outside `allowed`. The unknown key itself is peer-supplied
- * and is deliberately not echoed into the error path.
+ * Unknown keys are rejected without echoing the peer-supplied key into the error path.
  */
 function checkClosedFields(
     fields: Map<string, StrictValue>,
@@ -402,9 +378,7 @@ function requireOp(fields: Map<string, StrictValue>, expected: string): void {
 }
 
 /**
- * A version field is a JSON integer in `1..=u32::MAX`. The raw literal is
- * checked, so `1.0` and `1e2` fail exactly like they do in the Rust decoder
- * (where they parse as floats).
+ * A version field must be a JSON integer in `1..=u32::MAX`; checking `value.raw` rejects `1.0` and `1e2`.
  */
 function requireVersion(fields: Map<string, StrictValue>, key: string, path: string): number {
     const value = fields.get(key);
@@ -446,11 +420,7 @@ function strictToPlain(value: StrictValue, path: string): PlainJson {
         case "string":
             return value.value;
         case "number":
-            // A JSON number that is mathematically an integer but beyond
-            // the double-safe range silently rounds (9007199254740993
-            // becomes ...992) in ANY notation, plain or exponent form,
-            // handing the provider altered identifiers. This client cannot
-            // represent it faithfully, so it is rejected rather than
+            // Numbers beyond the double-safe integer range are rejected because JavaScript rounds them before they reach the provider.
             // corrupted.
             if (Number.isInteger(value.value) && !Number.isSafeInteger(value.value)) {
                 throw new NegotiationError("invalid_type", path);
@@ -459,11 +429,9 @@ function strictToPlain(value: StrictValue, path: string): PlainJson {
         case "array":
             return value.items.map((item) => strictToPlain(item, path));
         case "object": {
-            // Null prototype: an own `"__proto__"` key must become an own
-            // data property. Assigning it onto `{}` would invoke the
-            // inherited prototype setter, handing the provider altered
-            // descriptor data and hiding the subtree from the
-            // `JSON.stringify` size bound in `checkOpaque`.
+            // An own `"__proto__"` key must remain an own data property rather than mutate the object's prototype.
+            // Assigning an own `"__proto__"` key to `{}` invokes the inherited prototype setter instead of creating an own data property.
+            // The prototype setter can hide the subtree from `JSON.stringify`, bypassing `checkOpaque`'s size bound.
             const out: { [key: string]: PlainJson } = Object.create(null) as {
                 [key: string]: PlainJson;
             };
@@ -476,8 +444,8 @@ function strictToPlain(value: StrictValue, path: string): PlainJson {
 }
 
 /**
- * Container depth (wire doc §7.1): 1 at the subtree root, +1 per nested
- * object/array. Scalar leaves add no level, so `{"a":1}` is depth 1.
+ * Container depth is 1 at the subtree root plus 1 for each nested container.
+ * Each nested object or array adds one level; scalar leaves add none, so `{"a":1}` has depth 1.
  */
 function strictDepth(value: StrictValue): number {
     switch (value.kind) {
@@ -496,9 +464,8 @@ function strictDepth(value: StrictValue): number {
 }
 
 /**
- * Opaque `parameters`/`descriptor` bounds: a JSON object at most
- * {@link MAX_OPAQUE_BYTES} compact bytes and {@link MAX_OPAQUE_DEPTH} levels
- * deep. Duplicate keys inside the value were already rejected by the strict
+ * Opaque `parameters` and `descriptor` values must be JSON objects no larger than `MAX_OPAQUE_BYTES` compact bytes.
+ * Opaque values must not exceed `MAX_OPAQUE_BYTES` compact bytes or `MAX_OPAQUE_DEPTH` levels.
  * parse.
  */
 function checkOpaque(value: StrictValue, path: string): OpaqueObject {
@@ -560,11 +527,6 @@ function decodeOffers(fields: Map<string, StrictValue>): TransportOffer[] {
 }
 
 /**
- * Decodes and fully validates one `transport.negotiate` request body. The
- * duplicate-aware parse runs first, so repeated keys at any depth —
- * including inside opaque `parameters` — fail before any typed decoding.
- * An unsupported-but-valid `negotiation_version` decodes successfully: the
- * version-mismatch fallback is host policy, not grammar.
  */
 export function decodeNegotiateRequest(bytes: JsonInput): NegotiateRequest {
     const fields = requireRootObject(bytes);
@@ -577,7 +539,7 @@ export function decodeNegotiateRequest(bytes: JsonInput): NegotiateRequest {
 
 const ACTIVATION_TOKEN_RE = /^[0-9a-f]{32}$/;
 
-/** Exactly 32 lowercase hexadecimal ASCII characters. */
+/* */
 export function isValidActivationToken(token: string): boolean {
     return ACTIVATION_TOKEN_RE.test(token);
 }
@@ -593,9 +555,6 @@ function requireActivationToken(fields: Map<string, StrictValue>): string {
 }
 
 /**
- * Decodes and fully validates one `transport.negotiate` response body
- * against the request's `offers`: the selection MUST name an exact offered
- * `(transport, capability_version)` entry (wire doc Section 7.7.2).
  */
 export function decodeNegotiateResponse(
     bytes: JsonInput,
@@ -659,7 +618,7 @@ export function decodeNegotiateResponse(
     return { kind: "grant", selected, activationToken, descriptor };
 }
 
-/** Decodes one candidate `transport.activate` request body (correlation 1). */
+/* */
 export function decodeActivateRequest(bytes: JsonInput): ActivateRequest {
     const fields = requireRootObject(bytes);
     checkClosedFields(fields, ["op", "negotiation_version", "activation_token"], "body");
@@ -669,20 +628,18 @@ export function decodeActivateRequest(bytes: JsonInput): ActivateRequest {
 }
 
 /**
- * Decodes one tagged candidate `transport.activate` response body. Carries
- * no provider data: any additional field is malformed (wire doc Section
  * 7.7.4).
  */
 export function decodeActivateResponse(bytes: JsonInput): void {
     decodeTaggedOnly(bytes, OP_TRANSPORT_ACTIVATE);
 }
 
-/** Decodes one candidate `transport.commit` request body (correlation 2). */
+/* */
 export function decodeCommitRequest(bytes: JsonInput): void {
     decodeTaggedOnly(bytes, OP_TRANSPORT_COMMIT);
 }
 
-/** Decodes one tagged candidate `transport.commit` response body. */
+/* */
 export function decodeCommitResponse(bytes: JsonInput): void {
     decodeTaggedOnly(bytes, OP_TRANSPORT_COMMIT);
 }
@@ -707,7 +664,7 @@ function checkVersionRange(version: number, path: string): void {
     }
 }
 
-/** Container depth of a plain value; same §7.1 counting as `strictDepth`. */
+/* */
 function plainDepth(value: unknown): number {
     if (Array.isArray(value)) {
         return 1 + value.reduce((max: number, item) => Math.max(max, plainDepth(item)), 0);
@@ -723,43 +680,28 @@ function plainDepth(value: unknown): number {
 }
 
 /**
- * Encode-side counterpart of `checkOpaque`: the same object, depth, and
- * compact-size bounds, applied to a provider-supplied value about to be
- * serialized, so a provider cannot push an out-of-contract offer or
- * descriptor onto the wire and burn the generation on the host's reject.
- * Bounds are checked on the SERIALIZED form — `toJSON`, `Date`, dropped
- * `undefined` members, and other JavaScript-only shapes all differ from
- * their pre-serialization value — and the returned parsed snapshot is what
- * callers MUST encode: a stateful `toJSON` could otherwise pass validation
- * and emit a different shape on the second serialization. The
- * `JSON.stringify` may run provider-authored `toJSON`; callers holding a
- * provider-owned value contain that call and pass the string to
- * {@link checkOpaqueSerialized} instead.
+ * Bounds apply to the serialized form because JavaScript values can serialize differently from their in-memory representation.
+ * `toJSON`, `Date`, and `undefined` members can serialize differently from their in-memory representation.
  */
 export function checkOpaquePlain(value: unknown, path: string): OpaqueObject {
     return checkOpaqueSerialized(serializeOpaqueBounded(value, path), path);
 }
 
 /**
- * Hard ceiling on the string `serializeBounded` will materialize. Slack over
- * {@link MAX_OPAQUE_BYTES} is deliberate: the accumulator below estimates
- * emitted size rather than measuring it, so the guard must not reject a
- * value that is genuinely under the exact bound. The exact byte check in
- * {@link checkOpaqueSerialized} stays authoritative; this only stops an
- * arbitrarily large provider value from being materialized at all.
+ * The estimate may exceed the emitted size, so the guard must not reject values under the exact bound.
+ * `checkOpaqueSerialized` performs the authoritative exact byte check.
+ * The estimate only prevents arbitrarily large provider values from being fully materialized.
  */
 const SERIALIZE_HARD_LIMIT = MAX_OPAQUE_BYTES * 4;
 
-/** Marks the estimate tripping, so a provider `toJSON` throw stays distinct. */
+/** `OpaqueSerializationBound` distinguishes estimate overflow from provider `toJSON` errors. */
 class OpaqueSerializationBound extends Error {}
 
 /**
- * `JSON.stringify` with a conservative running size estimate that aborts
- * past {@link SERIALIZE_HARD_LIMIT}, so an oversized value is rejected
- * during traversal instead of allocating its full text. Returns `undefined`
- * for a non-serializable value (the caller reports `invalid_type`), throws
- * `opaque_too_large` when the estimate trips, and lets any other throw —
- * notably a provider-authored `toJSON` — propagate to its own containment.
+ * The replacer aborts traversal when its size estimate exceeds {@link SERIALIZE_HARD_LIMIT}.
+ * The function aborts traversal before materializing the full serialized text.
+ * When `JSON.stringify` returns `undefined`, `checkOpaqueSerialized` throws `invalid_type`.
+ * The function throws `opaque_too_large` when the estimate exceeds the limit and propagates other errors.
  */
 export function serializeOpaqueBounded(value: unknown, path: string): string | undefined {
     let estimate = 0;
@@ -782,9 +724,8 @@ export function serializeOpaqueBounded(value: unknown, path: string): string | u
 }
 
 /**
- * Validates one already-serialized opaque value — pure data, no provider
- * code — against the object, depth, and compact-size bounds, returning the
- * parsed snapshot to encode.
+ * The function validates already-serialized data without invoking provider code.
+ * Callers must encode the returned parsed snapshot.
  */
 export function checkOpaqueSerialized(serialized: string | undefined, path: string): OpaqueObject {
     if (serialized === undefined) {
@@ -809,23 +750,16 @@ export function checkOpaqueSerialized(serialized: string | undefined, path: stri
     return parsed as OpaqueObject;
 }
 
-/** A UTF-16 code unit in the surrogate range without its required partner. */
+/** A lone surrogate has no required UTF-16 partner. */
 const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 /**
- * Rejects strings (values and keys) containing lone surrogates.
- * `JSON.stringify` escapes them (`\ud800`) rather than failing, but the
- * host's strict UTF-8 decoder rejects unpaired surrogate escapes — the
- * client must fail locally instead of burning the authenticated generation
- * on the host's reject.
+ * The validator rejects strings and object keys containing lone surrogates.
+ * `JSON.stringify` escapes each lone surrogate as a `\uXXXX` sequence rather than failing.
  */
 /**
- * Rejects opaque leaves this client cannot carry faithfully: strings with
- * lone surrogates (`JSON.stringify` escapes them, but the host's strict
- * UTF-8 decoder rejects unpaired surrogate escapes) and integral numbers
- * outside the double-safe range (already rounded, so the advertised
- * identifier would not be the one the peer meant). Mirrors the decode-side
- * guards so both directions reject the same values.
+ * Integral numbers outside the safe-integer range cannot represent every integer exactly.
+ * Distinct integers can collapse to the same `Number`.
  */
 function assertOpaqueLeaves(value: unknown, path: string): void {
     if (typeof value === "string") {
@@ -855,9 +789,7 @@ function assertOpaqueLeaves(value: unknown, path: string): void {
 }
 
 /**
- * Encodes one compact canonical `transport.negotiate` request after
- * revalidating the same bounds the decoder enforces, so a conforming
- * encoder cannot emit out-of-contract bytes.
+ * `encodeNegotiateRequest` revalidates decoder bounds so it cannot emit out-of-contract bytes.
  */
 export function encodeNegotiateRequest(request: NegotiateRequest): Uint8Array {
     checkVersionRange(request.negotiationVersion, "negotiation_version");
@@ -881,8 +813,7 @@ export function encodeNegotiateRequest(request: NegotiateRequest): Uint8Array {
         ) {
             throw new NegotiationError("duplicate_offer", path);
         }
-        // The validated snapshot — not the original value — reaches the
-        // wire, so what was checked is exactly what is sent.
+        // The validated snapshot, not the original value, reaches the wire.
         const parameters =
             offer.parameters === undefined
                 ? undefined
@@ -907,7 +838,7 @@ export function encodeNegotiateRequest(request: NegotiateRequest): Uint8Array {
     );
 }
 
-/** Encodes one compact canonical `transport.negotiate` response. */
+/* */
 export function encodeNegotiateResponse(response: NegotiateResponse): Uint8Array {
     const selected = response.selected;
     checkVersionRange(selected.capabilityVersion, "selected.capability_version");
@@ -932,7 +863,6 @@ export function encodeNegotiateResponse(response: NegotiateResponse): Uint8Array
     if (!isValidActivationToken(response.activationToken)) {
         throw new NegotiationError("invalid_activation_token", "activation_token");
     }
-    // The validated snapshot — not the original value — reaches the wire.
     const descriptor = checkOpaquePlain(response.descriptor, "descriptor");
     return new TextEncoder().encode(
         JSON.stringify({
@@ -948,7 +878,7 @@ export function encodeNegotiateResponse(response: NegotiateResponse): Uint8Array
     );
 }
 
-/** Encodes the candidate `transport.activate` request (correlation 1). */
+/* */
 export function encodeActivateRequest(activationToken: string): Uint8Array {
     if (!isValidActivationToken(activationToken)) {
         throw new NegotiationError("invalid_activation_token", "activation_token");
@@ -963,9 +893,7 @@ export function encodeActivateRequest(activationToken: string): Uint8Array {
 }
 
 /**
- * One `{op, negotiation_version}` candidate body. Built from the module
- * constants rather than a frozen literal so a {@link NEGOTIATION_VERSION}
- * bump cannot leave these emitting a version their own decoders reject.
+ * Candidate bodies use module constants rather than frozen literals so a `NEGOTIATION_VERSION` bump remains compatible with their decoders.
  */
 function taggedBody(op: string): Uint8Array {
     return new TextEncoder().encode(
@@ -973,17 +901,17 @@ function taggedBody(op: string): Uint8Array {
     );
 }
 
-/** The tagged candidate `transport.activate` response (correlation 1). */
+/* */
 export function activateResponseJson(): Uint8Array {
     return taggedBody(OP_TRANSPORT_ACTIVATE);
 }
 
-/** The candidate `transport.commit` request (correlation 2). */
+/* */
 export function commitRequestJson(): Uint8Array {
     return taggedBody(OP_TRANSPORT_COMMIT);
 }
 
-/** The tagged candidate `transport.commit` response (correlation 2). */
+/* */
 export function commitResponseJson(): Uint8Array {
     return taggedBody(OP_TRANSPORT_COMMIT);
 }

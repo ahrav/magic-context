@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-/** FM-OC-4: real SIGKILL at provider-proven emergency pressure refuses instead of serving raw bytes. */
+/* */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";
@@ -52,7 +52,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-4: emergency ref
             try {
                 await h.sendPrompt(sessionId, `FM-OC-4 continue after SIGKILL: ${h.ballast(400)}`);
             } catch {
-                // The first raw continuation reaches the provider, which proves the limit.
+                // The mocked 80,000-token provider error is expected.
             }
             await h.waitFor(
                 () => {
@@ -77,7 +77,6 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-4: emergency ref
                     `FM-OC-4 dead module at ${RUST_EMERGENCY_WALL_PCT}%: ${h.ballast(400)}`,
                 );
             } catch {
-                // OpenCode may surface the refusal as a resolved session error.
             }
             await h.waitForRustPasses(passCountBeforeRefusal + 1);
             await h.waitFor(

@@ -4,30 +4,15 @@ import type { PendingOp } from "../../features/magic-context/types";
 import { isEditTool } from "./edit-marker";
 import type { TagTarget } from "./tag-messages";
 
-// Smart-drops Phase 1: select provably-superseded "spent control-plane" tool
-// outputs for reclaim, on top of the positional watermark sweep. These classes
-// are dead by SUPERSESSION (not age), so selection ignores the watermark — but
-// the caller only ACTS on the result inside the existing
-// execute + already-mutating gate, so this never originates a cache bust.
 //
-// Keep-counts are fixed constants (no config sub-knobs):
-//   - todowrite: keep newest 1 (the live plan is the synthetic todowrite we
-//     inject + protect every pass; real ones are older snapshots).
-//   - ctx_reduce: keep the shared newest-K housekeeping exemplars.
-//   - zero-value meta: keep 0 (worthless once executed).
 const TODOWRITE_KEEP = 1;
 
-// Tools whose output is worthless once the call ran. ctx_note is handled
-// separately because only its read/dismiss actions are zero-value.
 const ZERO_VALUE_META_TOOLS = new Set(["bash_status", "bash_kill"]);
-// ctx_note actions that carry no durable value (write/update carry intent and
-// are never dropped). An unreadable action fails safe = not a target.
+// ctx_note write and update actions are not drop targets.
+// An unreadable `ctx_note` action is not a drop target.
 const CTX_NOTE_ZERO_VALUE_ACTIONS = new Set(["read", "dismiss"]);
 
 /**
- * Build synthetic drop ops for superseded spent-control-plane tool outputs.
- * Mirrors `buildSyntheticToolReclaimOps`'s op shape. The caller merges these
- * into the same gated `applyPendingOperations` call as the positional sweep.
  */
 export function buildSupersessionReclaimOps(input: {
     db: ContextDatabase;
@@ -62,7 +47,6 @@ export function buildSupersessionReclaimOps(input: {
             isTarget = true;
         } else if (name === "ctx_note") {
             const action = input.targets.get(tag.tagNumber)?.readInput?.()?.action;
-            // Fail safe: only drop when we can positively read a zero-value action.
             isTarget = typeof action === "string" && CTX_NOTE_ZERO_VALUE_ACTIONS.has(action);
         }
         if (isTarget) dropTagIds.push(tag.tagNumber);
@@ -85,13 +69,9 @@ export function buildSupersessionReclaimOps(input: {
 
 /**
  * Select superseded edit/write tool calls for COMPRESSION (not full drop).
- * Among active edit/write tags grouped by their `filePath`, the newest stays
- * full; every older edit to the same file is an edit_marker target. Like the
- * control-plane selector, supersession is age-independent so the watermark is
- * ignored, but the caller only acts inside the gated pass.
+ * The selector keeps the newest active edit/write tag for each `filePath`.
+ * The selector marks older edits to the same file as `edit_marker` targets.
  *
- * Returns both the drop ops AND the set of tag ids that must be compressed as
- * edit_marker (the caller passes the set to applyPendingOperations).
  */
 export function buildEditSupersessionReclaim(input: {
     db: ContextDatabase;
@@ -113,14 +93,12 @@ export function buildEditSupersessionReclaim(input: {
 
     for (const tag of editTags) {
         const filePath = readFilePath(input.targets.get(tag.tagNumber));
-        // No resolvable filePath → cannot prove supersession by file identity;
-        // leave it alone (fail safe).
+        // The selector excludes tags without a resolvable `filePath` because file identity cannot prove supersession.
         if (!filePath) continue;
         if (!seenFile.has(filePath)) {
             seenFile.add(filePath); // newest edit to this file stays full
             continue;
         }
-        // Older edit to an already-seen file → compress.
         if (realPendingTagIds.has(tag.tagNumber)) continue;
         if (input.targets.get(tag.tagNumber)?.canDrop?.() !== true) continue;
         editMarkerTagIds.add(tag.tagNumber);

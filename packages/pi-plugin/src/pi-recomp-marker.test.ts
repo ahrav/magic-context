@@ -8,15 +8,8 @@ import { queueAndApplyPiRecompMarker } from "./pi-recomp-marker";
 import { createTestDb } from "./test-utils.test";
 
 /**
- * queueAndApplyPiRecompMarker is the EAGER marker path: it writes AND applies
- * the native compaction marker immediately, bypassing the rendered-coverage
- * gate the pipeline's deferred drain enforces. Its safety depends on the
- * caller having just republished the compartments (a recomp/upgrade is a HARD
- * bust, so the same pass's m[0] re-materialization covers the marker). These
- * tests pin both halves of that contract: application happens ONLY when the
- * branch already contains the entries covering the marker boundary (i.e. the
- * recomp materialization rendered them), and the live background commands
- * stay on the deferred staging path instead of this eager bypass.
+ * The branch must contain the entry at the marker boundary.
+ * Background commands must use the deferred staging path.
  */
 
 function branchEntry(id: string, role: "user" | "assistant", text: string) {
@@ -43,10 +36,8 @@ describe("queueAndApplyPiRecompMarker (eager path coverage precondition)", () =>
 			const ctx = {
 				sessionManager: {
 					appendCompaction,
-					// The recomp materialization rendered the compartment; the
-					// branch still carries the kept tail starting at ordinal 3
-					// (lastCompactedOrdinal 2 + 1), so the boundary resolves to
-					// a real, replay-safe entry id.
+					// The kept tail begins at ordinal 3.
+					// The marker boundary is `lastCompactedOrdinal + 1`.
 					getBranch: () => [
 						branchEntry("e1", "user", "one"),
 						branchEntry("e2", "assistant", "two"),
@@ -61,7 +52,6 @@ describe("queueAndApplyPiRecompMarker (eager path coverage precondition)", () =>
 			const call = appendCompaction.mock.calls[0] as unknown[];
 			expect(call[1]).toBe("e3"); // firstKeptEntryId heads the kept tail
 			expect(call[4]).toBe(true); // fromHook
-			// Applied AND CAS-cleared in the same call — no pending marker left.
 			expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 		} finally {
 			closeQuietly(db);
@@ -87,9 +77,7 @@ describe("queueAndApplyPiRecompMarker (eager path coverage precondition)", () =>
 			const ctx = {
 				sessionManager: {
 					appendCompaction,
-					// No entry at ordinal 3: the rendered content covering the
-					// marker boundary does not exist (no recomp materialization
-					// in this context), so nothing may be trimmed.
+					// Without an entry at ordinal 3, the marker boundary cannot be resolved.
 					getBranch: () => [
 						branchEntry("e1", "user", "one"),
 						branchEntry("e2", "assistant", "two"),
@@ -100,7 +88,6 @@ describe("queueAndApplyPiRecompMarker (eager path coverage precondition)", () =>
 			queueAndApplyPiRecompMarker({ db, sessionId, ctx });
 
 			expect(appendCompaction).not.toHaveBeenCalled();
-			// The guard runs BEFORE staging, so no unmatchable marker persists.
 			expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 		} finally {
 			closeQuietly(db);
@@ -137,10 +124,7 @@ describe("queueAndApplyPiRecompMarker (eager path coverage precondition)", () =>
 });
 
 describe("recomp marker command wiring stays on the deferred path", () => {
-	// The eager bypass is only safe inside a same-pass rendered-coverage
-	// context that the background commands cannot guarantee (they run
-	// DETACHED, mid-turn). They must stage + defer so the pipeline's
-	// coverage-gated drain applies the marker on the next busting pass.
+	// Background commands must stage markers because they lack same-pass coverage validation.
 	for (const name of ["ctx-recomp.ts", "ctx-session-upgrade.ts"]) {
 		it(`${name} stages the marker and never calls the eager apply path`, () => {
 			const src = readFileSync(join(import.meta.dir, "commands", name), "utf8");

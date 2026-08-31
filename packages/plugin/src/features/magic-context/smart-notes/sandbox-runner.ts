@@ -1,19 +1,13 @@
-// The SINGLEFILE variant embeds the WASM as binary INSIDE the JS module, so it
-// survives bundling into dist/index.js. The default wasmfile variant loads a
-// sibling `emscripten-module.wasm` via `new URL(..., import.meta.url)`, which
-// resolves to `dist/emscripten-module.wasm` in the bundle — a file the build
-// never emits, so every sandbox run fails with ENOENT. (Documented fix:
-// emscriptenInclusion=singlefile is "for missing .wasm files when bundling".)
-// We use the ASYNCIFY variant because the capability API (readFile/httpGet/git)
-// is async and the sandbox installs async host functions.
+// The SINGLEFILE variant embeds the WASM in the JavaScript module.
+// The embedded WASM survives bundling into `dist/index.js`.
+// The default variant loads `emscripten-module.wasm` with `new URL(..., import.meta.url)`.
+// `new URL(..., import.meta.url)` resolves the sibling WASM path to `dist/emscripten-module.wasm`.
+// The build emits no `dist/emscripten-module.wasm`, so the default variant fails with `ENOENT`.
+// The capability API requires the ASYNCIFY variant because the sandbox installs asynchronous host functions.
 //
-// These two modules are imported LAZILY inside getAsyncModule() (below), not at
-// the top of this file. The singlefile variant inlines ~2.6MB of base64 WASM into
-// the bundle; a top-level import forced the JS engine to parse that blob on every
-// plugin load — and on every subagent child spawn — adding hundreds of ms (issue
-// #242). Deferring the import to the first smart-note evaluation splits the variant
-// into its own chunk that stays out of the cold-start parse. The type-only import
-// below is erased at build time and pulls in no runtime code.
+// The SINGLEFILE variant inlines ~2.6 MB of base64 WASM.
+// A top-level import parses the inlined base64 WASM during cold start.
+// Deferring the import to the first smart-note evaluation keeps the variant in a separate chunk outside the cold-start parse.
 import type {
     QuickJSAsyncContext,
     QuickJSAsyncWASMModule,
@@ -24,13 +18,12 @@ import type { SmartNoteCapabilityApi, SmartNoteCapabilityFactory } from "./capab
 import { isSmartNoteNetworkError, type SmartNoteCheckResult } from "./types";
 
 /**
- * The WASM module is expensive to instantiate (~1MB compile) but reusable across
- * checks — each check gets its own disposable CONTEXT off the shared module. Cache
- * the module promise process-wide so we compile once, not per check.
+ * The reusable WASM module requires ~1 MB of compilation.
+ * Each check creates a disposable context from the shared module.
+ * The process-wide module promise creates the WASM module once rather than per check.
  *
- * The QuickJS variant + runtime are loaded here on first use via dynamic import so
- * their (large) modules are parsed only when a smart-note check actually runs,
- * never at plugin import time. See the file-header note for the cold-start reason.
+ * Dynamic imports load the QuickJS variant and runtime on the first smart-note check.
+ * Dynamic imports defer parsing the large QuickJS modules until a smart-note check runs.
  */
 let asyncModulePromise: Promise<QuickJSAsyncWASMModule> | null = null;
 function getAsyncModule(): Promise<QuickJSAsyncWASMModule> {
@@ -46,22 +39,16 @@ function getAsyncModule(): Promise<QuickJSAsyncWASMModule> {
 }
 
 /**
- * Process-wide serialization for sandbox runs.
+ * The process-wide chain serializes sandbox runs.
  *
- * The asyncify variant has ONE suspension stack per WASM module instance, and we
- * share a single cached module across every check (above). When a check awaits a
- * host capability (httpGet/git/readFile) the WASM stack is unwound and parked;
- * if a SECOND check's `evalCodeAsync` suspends on the same module before the
- * first resumes, the two share/clobber that single asyncify stack and a
- * continuation later resumes against a context that has since been disposed,
- * surfacing as `QuickJSUseAfterFree: Lifetime not alive`. This is reachable in
- * normal operation: the dream timer fires per-project smart-note sweeps
- * un-awaited during multi-project startup, so two projects' sweeps overlap.
+ * Each asyncify WASM module instance has one suspension stack.
+ * Awaiting a host capability unwinds and parks the WASM stack.
+ * A second `evalCodeAsync` suspension before the first resumes corrupts the shared asyncify stack.
+ * A later continuation can resume against a disposed context.
+ * Resuming against a disposed context surfaces as `QuickJSUseAfterFree: Lifetime not alive`.
  *
- * Serializing every run through one promise chain makes "one suspended eval at a
- * time" an invariant. These are background sweeps with no user-facing latency, so
- * the serialization cost is irrelevant. A failed/rejected run must not break the
- * chain for the next caller, so we continue the chain on both settle paths.
+ * withSandboxLock permits at most one suspended eval at a time.
+ * Both `sandboxRunChain` handlers advance the chain, so a rejected run does not block later callers.
  */
 let sandboxRunChain: Promise<unknown> = Promise.resolve();
 function withSandboxLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -113,10 +100,9 @@ const DEFAULT_STACK_LIMIT_BYTES = 512 * 1024;
 const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
 const MAX_SANDBOX_ERROR_CHARS = 2 * 1024;
 
-// Host calls can outlive the VM interrupt path, so any capability that touches
-// the outside world must listen to this run's controller. Otherwise one tarpit
-// request can keep the shared QuickJS module suspended past the sandbox budget
-// and block the next caller on the process-wide lock.
+// Capabilities that outlive VM interruption must observe signal.
+// A tarpit request can keep the shared QuickJS module suspended past the sandbox budget.
+// A suspended request blocks the next caller on the process-wide lock.
 function resolveCapabilitiesForRun(
     options: RunCompiledSmartNoteCheckOptions,
     signal: AbortSignal,
@@ -143,10 +129,8 @@ export async function runCompiledSmartNoteCheck(
     if (Buffer.byteLength(options.compiledCheck, "utf8") > MAX_COMPILED_CHECK_BYTES) {
         return failureResult("compiled check exceeds 64 KiB", false);
     }
-    // Serialize the actual sandbox work (see withSandboxLock): only one
-    // asyncify-suspended eval may exist at a time on the shared module. The
-    // per-check timeout and host-capability controller start INSIDE the lock so
-    // a check queued behind another doesn't burn its own budget waiting.
+    // The lock initializes each check's timeout and host-capability controller.
+    // A queued check's timeout starts after it acquires the lock.
     return withSandboxLock(() => runCompiledSmartNoteCheckLocked(options));
 }
 
@@ -192,8 +176,6 @@ async function runCompiledSmartNoteCheckLocked(
             context.dispose();
         }
     } catch (error) {
-        // Queue deadlines and lease loss are control flow, not evidence that a
-        // healthy compiled check is failing. Only this run's own timeout counts.
         if (externallyCancelled && !executionTimedOut) return cancelledResult(error);
         return failureResult(formatSandboxError(error), isSmartNoteNetworkError(error));
     } finally {

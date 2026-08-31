@@ -8,89 +8,40 @@ export function getDataDir(): string {
 }
 
 /**
- * Per-harness scratch directory under the OS temp dir.
  *
  * Layout:
- *   - OpenCode: `${os.tmpdir()}/opencode/magic-context/`
- *   - Pi:       `${os.tmpdir()}/pi/magic-context/`
  *
- * Why a per-harness subtree of `os.tmpdir()`:
- *   1. OpenCode Desktop runs as an Electron app with a permission sandbox.
- *      Writing to arbitrary tmp paths can trigger user-visible permission
- *      prompts; the `${tmpdir}/opencode/` subtree is allow-listed by
- *      OpenCode, so anything we put under it never asks for permission.
- *   2. Splitting OpenCode from Pi keeps their logs and historian dump
- *      directories cleanly separated. `doctor --issue` for each harness
- *      reports diagnostics from the matching subtree, so an OpenCode
- *      issue report never includes Pi log noise (and vice versa).
- *   3. Pi has no permission sandbox, so the path choice is purely
- *      cosmetic for Pi — it just keeps the layout symmetric.
  *
- * Pass an explicit `harness` only when the caller already knows the
- * harness without relying on the global `setHarness()` state (e.g. the
- * CLI's doctor commands, which target a specific harness regardless of
- * which plugin is loaded). Production runtime callers should omit it so
- * the helper picks up the boot-time harness automatically.
  */
 export function getMagicContextTempDir(harness: HarnessId = getHarness()): string {
     return path.join(os.tmpdir(), harness, "magic-context");
 }
 
 /**
- * Standard log file path the plugin writes to. Pi and OpenCode write to
- * SEPARATE logs under their respective harness subtrees so a single
- * machine running both harnesses doesn't interleave session traces.
+ * The default path includes `harness`, preventing default-path collisions.
  *
- * The plugin's buffered logger calls this on every flush rather than
- * caching, so `setHarness("pi")` taking effect after module load is
- * reflected in the next flush.
  */
 export function getMagicContextLogPath(harness: HarnessId = getHarness()): string {
-    // An explicit override wins over the harness temp-dir default, so users on
-    // sandboxed/ephemeral setups (Docker, CI) can point the diagnostic log at a
-    // persistent or shared path. Blank/whitespace is treated as unset.
     const envPath = process.env.MAGIC_CONTEXT_LOG_PATH?.trim();
     if (envPath) return envPath;
     return path.join(getMagicContextTempDir(harness), "magic-context.log");
 }
 
 /**
- * Directory used for both historian validation-failure dumps and the
- * existing-state offload XMLs that large historian/recomp passes write
- * before invoking the model. Per-harness so dumps from different
- * harnesses don't collide on filename and so `doctor --issue` for each
- * harness reports only its own historian artifacts.
+ * Each harness stores historian artifacts separately.
  */
 export function getMagicContextHistorianDir(harness: HarnessId = getHarness()): string {
     return path.join(getMagicContextTempDir(harness), "historian");
 }
 
 /**
- * Project-local magic-context artifact directory.
  *
  * Layout: `<project-directory>/.cortexkit/magic-context/`
  *
- * Used for artifacts that the historian/recomp pipeline writes during a run
- * and that the model is asked to read via its native Read tool. OpenCode's
- * `external_directory` permission system asks the user before reading any
- * file outside the project directory or its worktree, which interrupts every
- * historian run when artifacts live under `os.tmpdir()`. Writing under the
- * project's own `.cortexkit/` subtree falls inside the project boundary and
- * never triggers a permission prompt.
  *
- * `.cortexkit/` is the shared CortexKit per-project dir (also holds the
- * project config `magic-context.jsonc`). Because these artifacts are transient
- * debug dumps that shouldn't dirty the user's repo, the first write also drops
- * a fenced-block `.gitignore` entry ignoring this subdir (see
- * ensureCortexKitArtifactGitignore) while leaving `*.jsonc` config tracked.
+ * The ignore rule leaves `magic-context.jsonc` trackable.
  *
- * Migration note: artifacts used to live under `.opencode/magic-context/`. We
- * cut the write path forward only — old transient dumps are git-ignored and
- * regenerated, so they are intentionally NOT migrated (left to be cleaned).
  *
- * Logger does NOT use this — log files stay in the per-harness tmp subtree
- * because they are written by the plugin process itself (no model-side Read
- * tool call, no permission prompt) and span sessions/projects.
  */
 export function getProjectMagicContextDir(directory: string): string {
     return path.join(directory, ".cortexkit", "magic-context");
@@ -100,18 +51,10 @@ const GITIGNORE_GUARD_OPEN = "# >>> cortexkit:magic-context";
 const GITIGNORE_GUARD_CLOSE = "# <<< cortexkit:magic-context";
 
 /**
- * Ensure `<project>/.cortexkit/.gitignore` ignores Magic Context's transient
- * artifact subdir (`magic-context/`) without touching anything else in the
- * shared `.cortexkit/` dir — the project config `magic-context.jsonc` stays
- * tracked, and any sibling module's (e.g. AFT's) entries are preserved.
+ * If no opening guard exists, preserve existing entries and append the `magic-context/` block.
  *
- * Uses the shared CortexKit fenced-block convention: each module owns exactly
- * its `# >>> cortexkit:<module>` … `# <<< cortexkit:<module>` block and appends
- * it idempotently (no-op when its own guard line is already present). This lets
- * multiple cortexkit modules coexist in one `.gitignore` without clobbering.
+ * The opening guard prevents duplicate block insertion.
  *
- * Best-effort: a write failure never blocks an artifact write (the caller
- * already degrades gracefully on its own write failures).
  */
 export function ensureCortexKitArtifactGitignore(directory: string): void {
     try {
@@ -120,7 +63,6 @@ export function ensureCortexKitArtifactGitignore(directory: string): void {
         let existing = "";
         if (existsSync(gitignorePath)) {
             existing = readFileSync(gitignorePath, "utf8");
-            // Already fenced by us — nothing to do.
             if (existing.includes(GITIGNORE_GUARD_OPEN)) return;
         }
         const block = `${GITIGNORE_GUARD_OPEN}\nmagic-context/\n${GITIGNORE_GUARD_CLOSE}\n`;
@@ -129,23 +71,17 @@ export function ensureCortexKitArtifactGitignore(directory: string): void {
         mkdirSync(cortexKitDir, { recursive: true });
         writeFileSync(gitignorePath, next, "utf8");
     } catch {
-        // best-effort — never block an artifact write on the gitignore.
+        // Ignore errors while reading or updating `.cortexkit/.gitignore`.
     }
 }
 
 /**
- * Project-local historian artifact directory.
  *
  * Layout: `<project-directory>/.opencode/magic-context/historian/`
  *
  * Used for:
- *   - existing-state offload XMLs that long historian/recomp passes write
- *     before invoking the model (the model reads the file via Read tool)
- *   - validation-failure dump XMLs preserved for debugging
  *
- * Callers must `mkdirSync(dir, { recursive: true })` before writing — the
- * `.opencode/` parent may not exist on a fresh project, and write failures
- * here must degrade gracefully (e.g. historian falls back to inline state).
+ * Callers must create this directory before writing because a fresh project may not contain `.cortexkit/`.
  */
 export function getProjectMagicContextHistorianDir(directory: string): string {
     return path.join(getProjectMagicContextDir(directory), "historian");
@@ -156,43 +92,20 @@ export function getOpenCodeStorageDir(): string {
 }
 
 /**
- * Resolve the shared magic-context storage directory.
  *
- * Magic-context's own data (compartments, facts, memories, embeddings, dream
- * runs, notes, etc.) lives at this path regardless of which harness loaded the
- * plugin (OpenCode or Pi). This enables:
- *   - Shared project memories across harnesses
- *   - Shared embedding cache
- *   - Shared Dreamer runs (one per project per machine)
- *   - Future cross-harness session migration
+ * `OpenCode` and `Pi` use this path for shared persistent storage.
  *
  * Layout: <XDG_DATA_HOME>/cortexkit/magic-context/
  *
- * TEST-ISOLATION GUARD. `openDatabase()` has been guarded in
- * `resolveDatabasePath()` after the v26 and v41 migration incidents, in which unisolated tests migrated the user's REAL shared DB.
- * Every OTHER caller bypassed that guard — notably the CLI doctors, which
- * build `join(getMagicContextStorageDir(), "context.db")` themselves and run
- * `PRAGMA integrity_check` against it. A test that deletes XDG_DATA_HOME to
- * exercise path fallbacks cannot restore isolation by setting
- * `process.env.HOME`: bun caches `os.homedir()` at startup, so `getDataDir()`
- * still resolves to the real home. MAGIC_CONTEXT_TEST_DATA_DIR — set by
- * `packages/plugin/test-preload.ts`, and restored by any test that touches it
- * — is honored here, so the preload's "cannot be defeated" guarantee holds for
- * every caller, not just `openDatabase()`. It is never set in production.
+ * Tests must not resolve the user's shared database path.
+ * When `XDG_DATA_HOME` is unset, `MAGIC_CONTEXT_TEST_DATA_DIR` overrides the storage root.
+ * When `XDG_DATA_HOME` is unset, `MAGIC_CONTEXT_TEST_DATA_DIR` overrides the storage root.
+ * `MAGIC_CONTEXT_TEST_DATA_DIR` overrides the storage root only when `XDG_DATA_HOME` is unset.
  *
- * CWD-INDEPENDENT BACKSTOP. The preload only runs when `bun test`'s CWD has a
- * bunfig wiring `[test] preload`. A run from a dir WITHOUT that wiring (a
- * package missing its bunfig, or a brand-new one) executes every *.test.ts with
- * NO preload, and this resolver would hand back the REAL shared path — which is
- * how the live DB reached v41. Bun sets NODE_ENV=test for EVERY `bun test`
- * regardless of CWD, and production never sets it, so that window redirects to
- * a memoized throwaway dir instead. It lives here rather than in
- * `resolveDatabasePath()` so direct callers (the CLI doctors' own
- * `PRAGMA integrity_check`, announcements, the models.dev cache) are covered
- * too — they never go through the DB resolver.
+ * When `XDG_DATA_HOME` is unset, `NODE_ENV=test` without `MAGIC_CONTEXT_TEST_DATA_DIR` uses a throwaway directory.
+ * When `XDG_DATA_HOME` is unset, `NODE_ENV=test`, and `MAGIC_CONTEXT_TEST_DATA_DIR` is unset, the resolver uses a memoized throwaway directory.
  *
- * XDG_DATA_HOME still wins over both: a test that manages its own data home is
- * already controlled, and production has no test dir set at all.
+ * `XDG_DATA_HOME` takes precedence over test isolation.
  */
 export function getMagicContextStorageDir(): string {
     if (!process.env.XDG_DATA_HOME) {
@@ -211,15 +124,10 @@ let testBackstopDataRoot: string | null = null;
 let testBackstopWarned = false;
 
 /**
- * The throwaway data ROOT used when `NODE_ENV=test` and no isolation variable is
- * set. Memoized per process so repeated calls in the same unisolated test
- * resolve to the SAME path — `openDatabase()` caches by path, and a fresh temp
- * dir per call would defeat that cache and hand back different DB handles.
+ * The resolver uses this throwaway data root when `XDG_DATA_HOME` is unset, `NODE_ENV=test`, and `MAGIC_CONTEXT_TEST_DATA_DIR` is unset.
+ * Memoization keeps repeated calls on one database path.
+ * A fresh temporary directory per call would bypass `openDatabase()`'s path cache.
  *
- * Exported so the mc-host lifecycle resolver can share this exact root. In
- * production both it and the storage dir derive from one `XDG_DATA_HOME`, so a
- * backstop that split them would put a test's daemon state and its database
- * under different trees.
  */
 export function getTestBackstopDataRoot(): string {
     if (!testBackstopDataRoot) {
@@ -227,7 +135,6 @@ export function getTestBackstopDataRoot(): string {
     }
     if (!testBackstopWarned) {
         testBackstopWarned = true;
-        // Deliberately console, not the logger: logger.ts imports this module.
         console.warn(
             "[magic-context] TEST BACKSTOP: NODE_ENV=test with no MAGIC_CONTEXT_TEST_DATA_DIR " +
                 `— redirecting storage to a throwaway temp dir (${testBackstopDataRoot}) so no ` +
@@ -243,10 +150,6 @@ function getTestBackstopStorageDir(): string {
 }
 
 /**
- * Legacy magic-context storage directory used by the OpenCode plugin before the
- * shared cortexkit path. Used only for one-time migration of existing data into
- * the new shared location. The legacy directory is left in place after copy so
- * users can roll back if needed; manual cleanup is safe after one stable
  * release.
  */
 export function getLegacyOpenCodeMagicContextStorageDir(): string {
@@ -254,13 +157,8 @@ export function getLegacyOpenCodeMagicContextStorageDir(): string {
 }
 
 /**
- * Resolve OpenCode's cache base directory.
  *
- * OpenCode uses the `xdg-basedir` package, which — on every platform, including
- * Windows — falls back to `<homedir>/.cache` when `XDG_CACHE_HOME` is unset.
- * A previous Windows-specific branch that resolved to `%LOCALAPPDATA%` did not
- * match OpenCode's own resolution and caused `doctor --force` to target a
- * non-existent directory, leaving the real cache at `C:\Users\<user>\.cache`
+ * OpenCode falls back to `<homedir>/.cache` when `XDG_CACHE_HOME` is unset, including on Windows.
  * untouched.
  */
 export function getCacheDir(): string {
