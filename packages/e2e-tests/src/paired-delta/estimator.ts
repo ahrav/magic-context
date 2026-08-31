@@ -302,15 +302,25 @@ export function estimateFamilyDeltas(input: {
         noiseFloors.set(floor.familyId, floor);
     }
 
-    const sorted = [...input.observations].sort((left, right) => compareCodeUnits(
-        `${left.endpoint}:${left.familyId}:${left.coordinateId}`,
-        `${right.endpoint}:${right.familyId}:${right.coordinateId}`,
+    const sorted = [...input.observations].sort((left, right) =>
+        compareCodeUnits(left.endpoint, right.endpoint) ||
+        compareCodeUnits(left.familyId, right.familyId) ||
+        compareCodeUnits(left.coordinateId, right.coordinateId));
+    const familiesByPrimaryEndpoint = PRIMARY_ENDPOINTS.map((endpoint) => new Set(
+        sorted.filter((observation) => observation.endpoint === endpoint)
+            .map(({ familyId }) => familyId),
     ));
-    const estimates = [...new Set(sorted.map(({ endpoint }) => endpoint))]
+    // A family observed at one primary endpoint only has no paired counterpart, so it constrains neither the pooled primary estimates nor the evidence count.
+    const pairedFamilies = new Set([...familiesByPrimaryEndpoint[0]!].filter((familyId) =>
+        familiesByPrimaryEndpoint.every((families) => families.has(familyId))));
+    const analyzable = sorted.filter((observation) =>
+        !PRIMARY_ENDPOINTS.includes(observation.endpoint as PrimaryEndpoint) ||
+        pairedFamilies.has(observation.familyId));
+    const estimates = [...new Set(analyzable.map(({ endpoint }) => endpoint))]
         .sort(compareCodeUnits)
         .map((endpoint) => estimateEndpoint(
             endpoint,
-            sorted.filter((observation) => observation.endpoint === endpoint),
+            analyzable.filter((observation) => observation.endpoint === endpoint),
             noiseFloors,
             input.minimumAnalyzableFamilyCount,
             input.bootstrapResamples,
@@ -318,13 +328,7 @@ export function estimateFamilyDeltas(input: {
         ));
     const endpoints = estimates.filter(({ endpoint }) =>
         PRIMARY_ENDPOINTS.includes(endpoint as PrimaryEndpoint));
-    const familiesByPrimaryEndpoint = PRIMARY_ENDPOINTS.map((endpoint) => new Set(
-        endpoints.find((estimate) => estimate.endpoint === endpoint)
-            ?.families.map(({ familyId }) => familyId) ?? [],
-    ));
-    // Equal-sized but disjoint family sets carry no paired evidence, so the count is the intersection across every primary endpoint rather than the smallest set.
-    const analyzableFamilyCount = [...familiesByPrimaryEndpoint[0]!].filter((familyId) =>
-        familiesByPrimaryEndpoint.every((families) => families.has(familyId))).length;
+    const analyzableFamilyCount = pairedFamilies.size;
     return {
         poolManifestFingerprint: input.lane.poolManifestFingerprint,
         pinnedSnapshotId: input.lane.pinnedSnapshotId,

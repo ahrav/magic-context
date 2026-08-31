@@ -155,6 +155,25 @@ describe("family-clustered delta estimator", () => {
         })).toThrow(/lane-paired-facts-fingerprint-invalid/);
     });
 
+    it("orders observations independently of caller order when an identifier contains a colon", () => {
+        // family `a:b` + coordinate `c` and family `a` + coordinate `b:c` share one joined sort key.
+        const rows: FamilyDeltaObservation[] = [
+            { coordinateId: "c", familyId: "a:b", endpoint: "retrieval", delta: 0.2, runHealth: "completed" },
+            { coordinateId: "b:c", familyId: "a", endpoint: "retrieval", delta: 0.4, runHealth: "completed" },
+            { coordinateId: "p:0", familyId: "fam-p", endpoint: "mc-on-vs-mc-off", delta: 0.3, runHealth: "completed" },
+            { coordinateId: "p:0", familyId: "fam-p", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
+        ];
+        const forward = estimate({ minimumAnalyzableFamilyCount: 1, observations: rows, noiseFloors: undefined });
+        const reversed = estimate({
+            minimumAnalyzableFamilyCount: 1,
+            observations: [...rows].reverse(),
+            noiseFloors: undefined,
+        });
+        expect(reversed).toEqual(forward);
+        expect(forward.rawRegretRecords.map(({ familyId, coordinateId }) => [familyId, coordinateId]))
+            .toEqual([["a", "b:c"], ["a:b", "c"]]);
+    });
+
     it("rejects an undeclared endpoint instead of estimating and dropping it", () => {
         expect(() => estimate({
             observations: [
@@ -182,13 +201,40 @@ describe("family-clustered delta estimator", () => {
                 : row),
             noiseFloors: undefined,
         });
-        expect(disjoint.endpoints.map(({ familyCount }) => familyCount)).toEqual([5, 5]);
+        expect(disjoint.endpoints).toEqual([]);
         expect(disjoint.analyzableFamilyCount).toBe(0);
         expect(disjoint.evidenceSufficient).toBe(false);
 
         const overlapping = estimate({ minimumAnalyzableFamilyCount: 2, noiseFloors: undefined });
         expect(overlapping.analyzableFamilyCount).toBe(5);
         expect(overlapping.evidenceSufficient).toBe(true);
+    });
+
+    it("pools each primary endpoint over the paired families alone", () => {
+        // fam-shared is neutral at both endpoints; the unpaired families are strongly positive.
+        const partial = estimate({
+            minimumAnalyzableFamilyCount: 1,
+            observations: [
+                { coordinateId: "shared:0", familyId: "fam-shared", endpoint: "mc-on-vs-mc-off", delta: 0.01, runHealth: "completed" },
+                { coordinateId: "shared:1", familyId: "fam-shared", endpoint: "mc-on-vs-mc-off", delta: -0.01, runHealth: "completed" },
+                { coordinateId: "only-a:0", familyId: "fam-a", endpoint: "mc-on-vs-mc-off", delta: 0.9, runHealth: "completed" },
+                { coordinateId: "only-a:1", familyId: "fam-b", endpoint: "mc-on-vs-mc-off", delta: 0.9, runHealth: "completed" },
+                { coordinateId: "shared:2", familyId: "fam-shared", endpoint: "mc-on-vs-compaction", delta: 0.01, runHealth: "completed" },
+                { coordinateId: "shared:3", familyId: "fam-shared", endpoint: "mc-on-vs-compaction", delta: -0.01, runHealth: "completed" },
+                { coordinateId: "only-c:0", familyId: "fam-c", endpoint: "mc-on-vs-compaction", delta: 0.9, runHealth: "completed" },
+                { coordinateId: "only-c:1", familyId: "fam-d", endpoint: "mc-on-vs-compaction", delta: 0.9, runHealth: "completed" },
+            ],
+            noiseFloors: undefined,
+        });
+        expect(partial.analyzableFamilyCount).toBe(1);
+        expect(partial.evidenceSufficient).toBe(true);
+        expect(partial.endpoints).toHaveLength(2);
+        for (const endpoint of partial.endpoints) {
+            expect(endpoint.families.map(({ familyId }) => familyId)).toEqual(["fam-shared"]);
+            expect(endpoint.familyCount).toBe(1);
+            expect(endpoint.pointEstimate).toBeCloseTo(0, 12);
+            expect(endpoint.resolution).toBe("unresolved");
+        }
     });
 
     it("reports a malformed noise floor as an estimator error", () => {
@@ -295,8 +341,8 @@ describe("bound prospective estimator adapter", () => {
         expect(adapter(analysis).analyze(pairs, H3).direction).toBe("no-change");
     });
 
-    it("withholds direction when a resolved endpoint has no paired counterpart", () => {
-        // Both endpoints resolve positive over disjoint families, so no family is measured at both.
+    it("withholds direction when no family is measured at both primary endpoints", () => {
+        // Strongly positive deltas over disjoint families: no primary estimate survives, so nothing can resolve.
         const disjoint = estimate({
             minimumAnalyzableFamilyCount: 2,
             observations: observations.map((row) => {
@@ -311,7 +357,7 @@ describe("bound prospective estimator adapter", () => {
             }),
             noiseFloors: undefined,
         });
-        expect(disjoint.endpoints.every(({ resolution }) => resolution === "resolved")).toBe(true);
+        expect(disjoint.endpoints).toEqual([]);
         expect(disjoint.analyzableFamilyCount).toBe(0);
         expect(disjoint.evidenceSufficient).toBe(false);
         expect(adapter(disjoint).analyze(pairs, H3).direction).toBe("no-change");
