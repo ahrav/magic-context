@@ -63,6 +63,14 @@ export interface ProspectiveReport {
     reportFingerprint: string;
 }
 
+export function completeFamilyCount(pairs: readonly PairedCaseFact[]): number {
+    const families = [...new Set(pairs.map((pair) => pair.familyId))];
+    return families.filter((familyId) =>
+        pairs.filter((pair) => pair.familyId === familyId)
+            .every((pair) => pair.status === "complete")
+    ).length;
+}
+
 function summarizePairs(pairs: readonly PairedCaseFact[]): {
     pairedFactsFingerprint: string;
     completeFamilyCount: number;
@@ -78,12 +86,9 @@ function summarizePairs(pairs: readonly PairedCaseFact[]): {
     );
     const incompletePairs = sortedPairs.filter((pair) => pair.status === "incomplete");
     const incompleteCaseIds = [...new Set(incompletePairs.map((pair) => pair.caseId))];
-    const families = [...new Set(sortedPairs.map((pair) => pair.familyId))];
     return {
         pairedFactsFingerprint: canonicalFingerprint(sortedPairs),
-        completeFamilyCount: families.filter((familyId) =>
-            sortedPairs.filter((pair) => pair.familyId === familyId).every((pair) => pair.status === "complete")
-        ).length,
+        completeFamilyCount: completeFamilyCount(sortedPairs),
         incompleteCaseIds,
         familyMisses: [...new Set(sortedPairs
             .filter((pair) => pair.releaseN.productOutcome === "fail" || pair.releaseNMinus1.productOutcome === "fail")
