@@ -22,7 +22,10 @@ declared in [../METHOD.md](../METHOD.md). The seven records that carried it —
 the five Group K iceoryx records, `custody-terminal-transition-exactly-once`,
 and `clean-reclamation-is-reachable` — now read `Status: invalidated`, each
 naming the removal commit. Record bodies are kept as the evidence of what the
-removed mechanisms did and did not guarantee.
+removed mechanisms did and did not guarantee. A follow-up unit in the same
+pass added Group N: seven records covering the doorbell delivery and
+demand-paging mechanisms PR #131 introduced, discovered from that PR's own
+fix history and verified against HEAD code.
 
 ## Citation refresh pass, 2026-08-30
 
@@ -226,6 +229,13 @@ decide whether to ship the transport. A defect there is live today.
 | [reclamation-keeps-pace-with-completion](#reclamation-keeps-pace-with-completion) | liveness | high | no |
 | [lease-saturation-is-reached-then-drains](#lease-saturation-is-reached-then-drains) | reachability | high | no |
 | [duplex-overlap-is-reached](#duplex-overlap-is-reached) | reachability | high | no |
+| [attach-validates-doorbell-eventfds](#attach-validates-doorbell-eventfds) | safety | high | yes |
+| [wake-published-during-readiness-callback-is-not-lost](#wake-published-during-readiness-callback-is-not-lost) | liveness | high | yes |
+| [queued-write-needs-no-second-wake](#queued-write-needs-no-second-wake) | liveness | high | yes |
+| [released-charges-wake-blocked-readers](#released-charges-wake-blocked-readers) | liveness | medium | yes |
+| [capacity-recheck-after-a-wake-race](#capacity-recheck-after-a-wake-race) | liveness | medium | yes |
+| [reclamation-excludes-pages-with-live-wrapped-bytes](#reclamation-excludes-pages-with-live-wrapped-bytes) | safety | high | yes |
+| [reactor-callback-is-one-in-flight](#reactor-callback-is-one-in-flight) | safety | high | yes |
 
 ---
 
@@ -3341,6 +3351,344 @@ Open questions:
 
 ---
 
+## Group N: doorbell delivery and demand paging
+
+PR #131 (merge `5d638e3e8`) replaced the transport's polling with sparse
+eventfd doorbells and made reclamation return pages with `MADV_REMOVE`. The
+new mechanism family is: two doorbells per ring (`ring.rs:723-724`), a shared
+parked-epoch wake protocol (`signal_wake`, `ring.rs:1418-1432`; `arm_data_wait`,
+`:828-854`), a one-in-flight readiness reactor in the addon
+(`packages/mc-shm-native/src/scheduling.rs:79`), and page-granular reclamation
+(`removal_ranges`, `ring.rs:221-273`). Because signals are sparse — the eventfd
+is written only when a waiter was parked — the dominant new hazard class is the
+lost wake: a defect here presents as a healthy channel that stopped making
+progress, with no error, quarantine, or counter. Each record below was
+discovered from a fix commit inside the PR's own branch history and then
+re-verified against HEAD code; the commit is the trigger, the code is the
+evidence.
+
+### attach-validates-doorbell-eventfds
+
+Type: safety
+Reachability: default-production — the ring transport is built unconditionally
+(`crates/mc-host/src/runtime.rs:741`), every accepted connection prepares a
+duplex ring (`crates/mc-host/src/connection.rs:117`), and the client bridge
+attaches transferred descriptors through this gate
+(`crates/mc-host/src/client.rs:1827`).
+Status: active
+Exercised: yes — `doorbell_attachment_requires_nonblocking_eventfd`
+(`crates/mc-shm-transport/src/backend/ring.rs:2248-2270`) constructs both
+rejection arms, a blocking eventfd and a nonblocking non-eventfd; the positive
+arm is every cross-process attach (`ring_child_exchange`,
+`tests/ring.rs:597-626`). No test substitutes a bad doorbell into a full
+`Ring::attach` call.
+Guarantee: `Ring::attach` accepts a doorbell descriptor only when it is a live
+nonblocking eventfd, and rejects anything else as `DoorbellFailed` before the
+ring is usable.
+Check: `always` — at every successful attach, both doorbell descriptors carry
+`O_NONBLOCK` in `F_GETFL` and readlink to `anon_inode:[eventfd]`
+(`ring.rs:397-409`). `always` because the property must hold at every
+evaluation of the attach gate; there is no optional path and no state to reach
+first.
+Fault/timing angle: none at the gate itself. The consequence of a miss is
+timing-shaped: `signal` and `drain` (`ring.rs:416-448`) rely on `EAGAIN` for
+their sparse semantics, so a blocking descriptor converts the first empty
+`drain` (`arm_data_wait`, `:846`) into an unbounded block on the bridge or
+reactor thread.
+Required faults and enabling state: a peer transferring a non-conforming
+descriptor in a doorbell slot of the setup handshake — fault class F15
+(doorbell fd substitution). No shared state needs preparation.
+Confidence: high — [evidence](evidence/attach-validates-doorbell-eventfds.md).
+Both gate predicates, both attach call sites, and the absence of any
+post-attach `F_SETFL` were read directly.
+Existing check: `doorbell_attachment_requires_nonblocking_eventfd`
+(`ring.rs:2248-2270`), unit-level against `Doorbell::from_fd` directly; status
+unaudited.
+Impact: a wedged setup with no error — the attaching thread blocks forever
+inside a doorbell read, indistinguishable from a slow peer, on the thread that
+also services every other channel event.
+Open questions:
+
+- The identity half of the gate depends on `/proc/self/fd`; it fails closed
+  elsewhere, which couples doorbell attach to Linux. Is that intended for the
+  macOS ring path? (needs human input)
+
+### wake-published-during-readiness-callback-is-not-lost
+
+Type: liveness
+Reachability: default-production — the addon readiness path is the production
+client delivery path: `ShmFrameChannel` registers its handler via
+`startReadiness`
+(`packages/plugin/src/shared/mc-host-client/shm-frame-channel.ts:110`), which
+wires the reactor (`packages/mc-shm-native/src/lib.rs:1109-1131`).
+Status: active
+Exercised: yes — `readiness acknowledgement preserves a frame published during
+callback` (`packages/mc-shm-native/tests/mechanism.ts:211-278`) publishes
+frame 2 from inside callback 1 and requires `received == [1, 2]` with exactly
+two callbacks. Not covered: the same race through the `NativeChannel` wrapper
+with multiple registered channels.
+Guarantee: a frame published while the one in-flight readiness callback runs is
+delivered by a subsequent callback without any further publication, within one
+acknowledgement cycle.
+Check: `always` — every `readiness_handled` acknowledgement whose per-channel
+re-arm observes visible data or a generation change (`arm_data_wait` returning
+false, `lib.rs:1148-1152`) returns `redispatch = true`, and the dispatcher
+re-enters on true (`index.ts:524-526`). `always` because the acknowledgement
+runs after every callback and is the sole carrier of a wake whose doorbell
+token was already drained; a bounded window (one cycle) makes this checkable
+by a finite test.
+Fault/timing angle: the window is the whole callback execution, from the
+reactor's `pending` CAS (`scheduling.rs:169-172`) to `handled()` (`:279-282`),
+during which the reactor thread is blocked in `wait_until_handled` (`:52-68`)
+and observes no epoll edges. A kick raised inside the window is preserved by
+rewriting the control eventfd (`:178-181`).
+Required faults and enabling state: a publication concurrent with an
+unacknowledged callback — a parked-then-drained consumer plus a publisher
+signaling into the drained window. Enabling situation
+`shm_publish_during_readiness_callback`.
+Confidence: high —
+[evidence](evidence/wake-published-during-readiness-callback-is-not-lost.md).
+The re-arm walk, the redispatch boolean, both dispatcher `finally` blocks, and
+the kick-preservation path were read directly.
+Existing check: `readiness acknowledgement preserves a frame published during
+callback` (`mechanism.ts:211-278`), raw-addon level; status unaudited.
+Impact: a delivered frame sits invisible until an unrelated event; on an
+otherwise idle channel, forever. The client sees a response that never
+arrives; the host sees a healthy setup socket. Silent, no counter fires.
+Open questions:
+
+- The raw addon makes honoring `readinessHandled`'s return the caller's
+  obligation. Should the contract be enforced natively (redispatch from Rust)
+  rather than by convention? (needs human input)
+
+### queued-write-needs-no-second-wake
+
+Type: liveness
+Reachability: default-production — `start_ring_bridge`
+(`crates/mc-host/src/client.rs:1805`) is the client's ring worker, spawned for
+every shm-negotiated connection; the ring transport itself is built
+unconditionally (`crates/mc-host/src/runtime.rs:741`).
+Status: active
+Exercised: yes — `ring_bridge_drains_inbound_and_queued_writes`
+(`client.rs:4003-4076`) queues eight writes with zero per-write wakes,
+delivers one edge, and bounds every completion at 250 ms.
+Guarantee: once the bridge wakes, every write already queued completes without
+any further wake — k queued writes drain in k loop passes.
+Check: `always` — a bridge loop pass that completed a write re-polls the write
+queue without arming or blocking (`wrote` at `:1846`/`:1858`, checked at
+`:1913-1915`), so per-write completion latency is bounded in loop passes, not
+in external events. `always` because the property must hold on every pass;
+the bound (k passes, no second signal) is what a finite test asserts.
+Fault/timing angle: eventfds coalesce. N `try_send` signals
+(`:1764-1768`) before the bridge polls collapse into one readable edge, and
+`drain_eventfd` (`:1800-1803`) consumes it whole; the window opens whenever
+more than one write queues before the drain and closes only on the next
+unrelated edge.
+Required faults and enabling state: at least two writes enqueued before the
+bridge drains its wake eventfd, then no further signals. Enabling situation
+`shm_queued_writes_exceed_one_per_wake`.
+Confidence: high — [evidence](evidence/queued-write-needs-no-second-wake.md).
+The loop order (one write, inbound drain, `wrote` check, arm, block) was read
+directly, as was the test's deliberate bypass of the signaling sender.
+Existing check: `ring_bridge_drains_inbound_and_queued_writes`
+(`client.rs:4003-4076`); status unaudited.
+Impact: burst writes complete with unbounded latency or expire at their
+deadlines on a healthy channel; the host attributes the timeout to the
+transport and cancels work the peer would have absorbed.
+Open questions: None.
+
+### released-charges-wake-blocked-readers
+
+Type: liveness
+Reachability: default-production — the charge wait is inside the same
+unconditionally spawned bridge loop (`crates/mc-host/src/client.rs:1869-1902`);
+reaching the *blocking* arm additionally requires inbound frames wide enough
+to exhaust `CLIENT_INBOUND_FRAME_BYTES`, which no test and no measured
+workload has yet demonstrated.
+Status: active
+Exercised: not yet — no test exhausts the read budget with the bridge parked
+and then releases a charge from another thread; existing `ByteCounter` tests
+(`client.rs:3805-3891`) are synchronous accounting checks that never reach the
+poll arm.
+Guarantee: when a released byte charge frees read-budget capacity, a bridge
+blocked waiting for that capacity resumes within one poll wakeup, admits the
+pending frame, and continues delivery.
+Check: `always` — every `ByteCharge::drop` that decrements a counter with a
+registered wake signals that wake's eventfd (`client.rs:1711-1725`), and a
+bridge parked in the charge loop observes it on its next poll (`:1879-1901`).
+`always` because the drop-side signal is unconditional given a registered
+wake; the bounded window is one poll wakeup plus one loop iteration.
+Fault/timing angle: signal-before-park — the drop can land between the failed
+`charge` attempt and the bridge's `poll`. The eventfd absorbs it: the write
+leaves the counter readable, so the later poll returns immediately. No
+parked-epoch protocol exists on this path and none is needed; the eventfd is
+the level-observable state.
+Required faults and enabling state: read-budget exhaustion with the bridge
+parked in the charge poll, then a concurrent charge drop. Needs a shrunken
+budget or frames wider than the default. Enabling situation
+`shm_read_budget_exhausted_with_parked_bridge`.
+Confidence: medium —
+[evidence](evidence/released-charges-wake-blocked-readers.md). The wiring
+(`set_wake` at `:1821`, drop-side signal, poll arm) was read directly, but no
+test has ever executed the blocking arm, so the claim rests on reading alone.
+Existing check: none.
+Impact: a read-heavy channel with no outbound writes wedges permanently at the
+first budget exhaustion — frames accumulate unread, the producer exhausts and
+reports deadlines, and the defect is attributed to the peer.
+Open questions:
+
+- Can any shipped workload exceed `CLIENT_INBOUND_FRAME_BYTES` in flight, or
+  is the blocking arm latent until frame sizes grow? (needs human input)
+
+### capacity-recheck-after-a-wake-race
+
+Type: liveness
+Reachability: default-production — `reserve_until` is the blocking send path
+for every ring producer (`endpoint.send` from the bridge,
+`crates/mc-host/src/client.rs:1850-1852`), on the unconditionally built ring
+transport (`crates/mc-host/src/runtime.rs:741`).
+Status: active
+Exercised: partial — `two_process_zero_copy_exchange_uses_authenticated_grant`
+(`crates/mc-shm-transport/tests/ring.rs:551-592`) parks a `reserve_until`
+behind a child's held lease and converges after the release, exercising the
+block-then-wake path; nothing lands a release inside the arm window itself.
+Guarantee: capacity freed at any point after a producer's failed reservation
+is consumed without waiting out the deadline — before blocking by the in-loop
+rechecks, during blocking by the doorbell.
+Check: `always` — a `reserve_until` iteration reaches
+`capacity_ready.wait_until` (`ring.rs:1035`) only after a post-park
+`try_reserve` (`:1001`), a generation recheck (`:1012`), a doorbell drain
+(`:1016`), a second `try_reserve` (`:1020`), and a second generation recheck
+(`:1031`) all found no progress; assert that a release completing before the
+block yields success in the same iteration. `always` because the recheck
+ladder must hold on every iteration; the bounded window (one iteration) is
+what a racing test can refute.
+Fault/timing angle: the vulnerable window is generation-read (`:994`) to poll
+entry, a few dozen instructions. The publisher bumps the generation SeqCst and
+writes the eventfd only when it swapped a parked epoch
+(`signal_wake`, `:1426-1429`); the drain at `:1016` is why the second
+`try_reserve` exists — it can consume a stale token whose capacity would
+otherwise be represented only by the byte just discarded. Correctness rests on
+SeqCst pairing that no tool validates (fault class F5).
+Required faults and enabling state: a parked producer plus a release racing
+the arm sequence — true concurrency (F4) or a model checker. Enabling
+situation `shm_capacity_signal_hit_parked_epoch`, witnessed on the release
+side when `signal_wake` swaps a nonzero epoch.
+Confidence: medium —
+[evidence](evidence/capacity-recheck-after-a-wake-race.md). The full loop and
+both publisher orderings were read and the interleaving case analysis is
+recorded, but it is a hand proof over atomics with no loom or Miri backing.
+Existing check: partial —
+`two_process_zero_copy_exchange_uses_authenticated_grant`
+(`tests/ring.rs:551-592`), block-then-wake only; status unaudited.
+Impact: `ProducerError::Deadline` on a ring with free capacity — a stranded
+full ring, reported as a transport failure on a channel whose receiver was
+draining correctly. Intermittent, load-dependent, and unreproducible by any
+lockstep test.
+Open questions:
+
+- A loom model of `signal_wake` against the park ladder is the cheapest
+  oracle; the state space is four atomics. Queue it?
+
+### reclamation-excludes-pages-with-live-wrapped-bytes
+
+Type: safety
+Reachability: default-production — `reclaim_completed` runs at the head of
+every `try_reserve` (`ring.rs:916`) on the unconditionally built ring
+transport; page removal requires only a released whole page, which normal
+traffic produces.
+Status: active
+Exercised: yes — `removal_ranges_exclude_partial_pages_and_split_once_at_wrap`
+(`ring.rs:2279-2297`) sweeps three page sizes over the pure function including
+the wrap split, and `partial_page_reclaim_preserves_live_neighbor`
+(`:2337-2353`) holds a live lease on a shared page through a reclaim and reads
+its bytes back. The trailing-partial-page exception has never been reached
+with a wrapped cursor.
+Guarantee: `MADV_REMOVE` is applied only to pages every byte of which belongs
+to released frames; a page shared with any live byte — including the wrapped
+tail of a partially released run — is never removed.
+Check: `always` — every range passed to `remove_pages` is page-aligned, lies
+within the logical span `[reclaimed, new_reclaimed)` rounded inward
+(`removal_ranges`, `:221-273`: start rounds up `:243-249`, end rounds down
+`:250`), and the sole exception, the trailing partial page, is removed only
+under `arena_write == new_reclaimed` with a crossed boundary (`:1533-1548`).
+`always` because the invariant must hold at every removal; there is no state
+in which a live-byte removal is acceptable.
+Fault/timing angle: none required — the defect class is arithmetic and
+reachable single-threaded. The failure containment is ordered: a failed
+`madvise` quarantines before any capacity publication (`:1514-1517`), and
+`arena_reclaimed` advances only after all removals succeed (`:1557-1563`).
+Required faults and enabling state: a released run sharing a page with a live
+lease, and separately a run crossing the arena wrap. Enabling situations
+`shm_partial_page_shared_with_live_lease` and the existing
+`shm_arena_wrap_with_live_lease`. Page-size sensitivity makes a non-4096 host
+(F11) the cheap amplifier.
+Confidence: high —
+[evidence](evidence/reclamation-excludes-pages-with-live-wrapped-bytes.md).
+The rounding arithmetic, the wrap split, the trailing-page guard, and the
+ordering of removal before capacity publication were all read directly and
+are pinned by the unit tests named above.
+Existing check: the four Linux unit tests at `ring.rs:2279-2353` plus
+`page_removal_failure_quarantines_before_capacity_publication` (`:2355-2373`);
+all status unaudited.
+Impact: silent corruption — a leased frame's bytes read back as zeros after
+validation already passed. The receiver delivers zeroed payload with a valid
+header; nothing downstream can detect it. This is the only record in this
+group whose failure is data loss rather than lost progress.
+Open questions:
+
+- The trailing-partial-page exception with a wrapped `arena_write` is
+  untested; the guard's soundness argument is recorded in the evidence file
+  but unexecuted.
+
+### reactor-callback-is-one-in-flight
+
+Type: safety
+Reachability: default-production — the reactor is created on the first
+`watch` (`packages/mc-shm-native/src/lib.rs:1117-1119`), which the production
+client reaches through `startReadiness`
+(`packages/plugin/src/shared/mc-host-client/shm-frame-channel.ts:110`).
+Status: active
+Exercised: partial — `readiness acknowledgement preserves a frame published
+during callback` (`mechanism.ts:211-278`) pins exactly one deferred dispatch
+(`callbacks === 2`), and `pending_callback_waits_for_acknowledgement`
+(`scheduling.rs:320-348`) pins that a control write alone does not release the
+wait. No test lands edges from multiple channels in one pending window.
+Guarantee: the reactor never has two unacknowledged readiness callbacks in
+flight — a second dispatch occurs only after `readiness_handled` re-armed
+every channel and cleared the pending gate.
+Check: `always` — a callback is dispatched only through a successful
+`pending` compare-exchange (`scheduling.rs:169-175`) and the reactor blocks in
+`wait_until_handled` (`:52-68`) until `handled()` (`:279-282`) clears the
+flag; assert no dispatch while an acknowledgement is outstanding. `always`
+because the mutual exclusion must hold at every dispatch decision.
+Fault/timing angle: edges and kicks arriving during the pending window are the
+hazard. A kick is deferred, not dropped: `wait_until_handled` returning with
+`kick` set rewrites the control eventfd (`:178-181`) for exactly one later
+pass. One documented exception exists: a `wait_until_handled` *error* fires a
+final non-gated callback and terminates the thread (`:184-189`).
+Required faults and enabling state: doorbell or kick edges concurrent with an
+unacknowledged callback — one in-flight callback plus a publisher or a
+`poll`-side `kick` (`lib.rs:1226-1235`). Enabling situation
+`shm_kick_during_pending_callback`.
+Confidence: high —
+[evidence](evidence/reactor-callback-is-one-in-flight.md). The CAS, the wait,
+the acknowledgement ordering (re-arm before `handled()`,
+`lib.rs:1136-1156`), and both error paths were read directly.
+Existing check: `mechanism.ts:211-278` and `scheduling.rs:320-348` as above;
+both status unaudited.
+Impact: overlapping dispatchers interleave over the thread-confined registry —
+"native channel is busy" errors on a healthy channel — and a double
+acknowledgement releases a reactor epoch whose re-arm never ran, which
+manufactures the lost wake the previous record guards against.
+Open questions:
+
+- The terminal-path non-gated callback (`scheduling.rs:184-189`) can overlap
+  an unacknowledged one exactly once, on a dying reactor. Acceptable by
+  design? (needs human input)
+
+---
+
 ## Relationship map
 
 Grouped by shared mechanism, with suspected dominance noted where one property
@@ -3383,3 +3731,34 @@ holding would make another likely to hold. Dominance is a hypothesis, not proof.
   `clean-reclamation-is-reachable`, `capability-probe-gates-every-advertised-mechanism`.
   Each has a passing or partial traceability status attached to a mechanism that
   production does not reach or does not gate.
+- **The doorbell and parked-epoch wake protocol.** All of Group N except the
+  reclamation record, plus the six Group M records rewritten by the eventfd
+  reconciliation: `backpressure-converges-in-a-bounded-reclaim-window`,
+  `receive-resumes-when-lease-capacity-clears`,
+  `neither-direction-starves-the-other`, `reclamation-keeps-pace-with-completion`,
+  `lease-saturation-is-reached-then-drains`, `duplex-overlap-is-reached`. One
+  mechanism carries them: `signal_wake` bumps a generation and writes the
+  eventfd only when a waiter was parked, so every record's hazard is some form
+  of lost wake. Suspected dominance: `capacity-recheck-after-a-wake-race`
+  holding would make the producer half of
+  `backpressure-converges-in-a-bounded-reclaim-window` likely to hold, since
+  the bounded convergence window is exactly the recheck ladder; and
+  `wake-published-during-readiness-callback-is-not-lost` presupposes
+  `reactor-callback-is-one-in-flight`, because a double acknowledgement
+  releases an epoch whose re-arm never ran and manufactures the lost wake the
+  first record excludes. `attach-validates-doorbell-eventfds` sits upstream of
+  the entire cluster: none of the wake properties are meaningful over a
+  descriptor that is not a nonblocking eventfd.
+- **Wake delivery outside the ring pages.**
+  `queued-write-needs-no-second-wake` and
+  `released-charges-wake-blocked-readers` are the same coalesced-eventfd hazard
+  on the bridge's private `worker_wake` rather than on a shared doorbell; the
+  parked-epoch protocol does not apply there, level-observable eventfd state
+  does. Neither dominates the other — one guards the write queue, one the read
+  budget — but a fix that serialized bridge passes wrongly would break both.
+- **Reclamation correctness versus reclamation progress.**
+  `reclamation-excludes-pages-with-live-wrapped-bytes` is the safety bound on
+  the same walk whose progress `reclamation-keeps-pace-with-completion` and
+  `backpressure-converges-in-a-bounded-reclaim-window` assert; the rounding
+  that protects live bytes is precisely what defers page removal, so tests for
+  the liveness pair must not treat retained partial pages as a defect.
