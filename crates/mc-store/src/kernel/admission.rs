@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "30bf56f78179b6a51cc4ad958da2c23e23a2cfd5e1b71153cc1b91c20336678c";
+    "1f79e3f18543eb373baa6f82ef3cecd414213e4877b2347169ec72339688e9e3";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -240,6 +240,10 @@ pub struct Evaluation {
     pub visibility: VisibilityRow,
     pub sensitivity: Sensitivity,
     pub outcome: Outcome,
+    /// The request was refused for want of authority. `Outcome::Deny` alone cannot
+    /// express this: `Other`, `MarkStale`, and `MarkDisputed` also resolve to it
+    /// while retaining the support their prior decision already held.
+    pub denied: bool,
     pub no_op: bool,
 }
 
@@ -348,6 +352,7 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         visibility,
         sensitivity,
         outcome,
+        denied,
         no_op,
     })
 }
@@ -387,6 +392,11 @@ struct PreparedDecision {
 
 /// Each approval may support at most 1,024 distinct subjects.
 const MAX_APPROVAL_DEPENDENTS: usize = 1_024;
+
+/// Total demotions one authority invalidation may perform. The transitive closure
+/// over an authority graph is unbounded by the per-approval cap alone, and the whole
+/// walk runs in the invalidating transaction.
+const MAX_AUTHORITY_DEMOTIONS: usize = 4_096;
 
 /// Selects rows of `admission_decisions a` with no later committed decision
 /// for the same subject. `load_prior_decision` expresses this same rule as an
@@ -496,9 +506,57 @@ impl Envelope<'_> {
         &mut self,
         request: AdmissionRequest,
     ) -> Result<Option<AdmissionDecision>, KernelError> {
-        if matches!(request.event.kind, EventKind::Correct | EventKind::Replace) {
+        if matches!(
+            request.event.kind,
+            EventKind::Correct | EventKind::Replace | EventKind::ApprovalRevoked
+        ) {
             return Err(KernelError::AdmissionPolicy);
         }
+        let subject_object_id = request.subject_object_id.clone();
+        let reason = request.event.reason.clone();
+        let granted_before = self.subject_grants_authority(subject_object_id.as_deref())?;
+        let decision = self.apply_admission(request)?;
+        if decision.is_some() && granted_before {
+            self.demote_dependents_if_authority_lost(subject_object_id.as_deref(), &reason)?;
+        }
+        Ok(decision)
+    }
+
+    fn subject_grants_authority(
+        &self,
+        subject_object_id: Option<&str>,
+    ) -> Result<bool, KernelError> {
+        match subject_object_id {
+            Some(subject) => validate_approval(self, Some(subject), None),
+            None => Ok(false),
+        }
+    }
+
+    /// Quarantine, contradiction, rejection, and supersession break an approval's
+    /// authority exactly as revocation does, so dependents still citing it follow.
+    fn demote_dependents_if_authority_lost(
+        &mut self,
+        subject_object_id: Option<&str>,
+        reason: &str,
+    ) -> Result<(), KernelError> {
+        let Some(subject) = subject_object_id else {
+            return Ok(());
+        };
+        if validate_approval(self, Some(subject), None)? {
+            return Ok(());
+        }
+        let subject = subject.to_string();
+        self.demote_authority_dependents(&subject, reason)?;
+        Ok(())
+    }
+
+    /// Writes a decision without the caller-event restrictions of
+    /// [`Self::record_admission_inner`]. `ApprovalRevoked` lowers support to the
+    /// automatic ceiling on its own authority, so only revocation may emit it.
+    fn apply_admission(
+        &mut self,
+        request: AdmissionRequest,
+    ) -> Result<Option<AdmissionDecision>, KernelError> {
         let prepared = self.prepare_admission(request)?;
         if prepared.evaluation.no_op {
             return Ok(None);
@@ -524,7 +582,10 @@ impl Envelope<'_> {
         domain: AdmissionDomainSpec,
     ) -> Result<AdmissionDecision, KernelError> {
         let prepared = self.prepare_admission(request)?;
-        if prepared.facts.candidate_id().is_none() || prepared.evaluation.no_op {
+        let Some(candidate_id) = prepared.facts.candidate_id() else {
+            return Err(KernelError::AdmissionPolicy);
+        };
+        if prepared.evaluation.no_op || candidate_is_materialized(self, candidate_id)? {
             return Err(KernelError::AdmissionPolicy);
         }
         if prepared.evaluation.outcome == Outcome::Deny
@@ -615,7 +676,13 @@ impl Envelope<'_> {
                 .ok_or(KernelError::AdmissionPolicy)?
                 .kind = "replace";
         }
-        self.write_admission(prepared, None)
+        let reason = prepared.event.reason.clone();
+        let granted_before = self.subject_grants_authority(Some(&replaced_object_id))?;
+        let decision = self.write_admission(prepared, None)?;
+        if granted_before {
+            self.demote_dependents_if_authority_lost(Some(&replaced_object_id), &reason)?;
+        }
+        Ok(decision)
     }
 
     pub fn revoke_approval(
@@ -654,37 +721,7 @@ impl Envelope<'_> {
             .optional()
             .map_err(map_sqlite)?
             .ok_or(KernelError::NotFound)?;
-        let dependents = {
-            let mut statement = self
-                .tx
-                .prepare(&format!(
-                    "SELECT a.subject_object_id,a.source_class,a.taint_class
-                     FROM admission_decisions a
-                     WHERE a.approval_object_id=?1
-                       AND a.subject_object_id IS NOT NULL
-                       AND a.commit_seq IS NOT NULL
-                       AND {LATEST_SUBJECT_DECISION_PREDICATE}
-                     ORDER BY a.subject_object_id
-                     LIMIT {limit}",
-                    limit = MAX_APPROVAL_DEPENDENTS + 1
-                ))
-                .map_err(map_sqlite)?;
-            let rows = statement
-                .query_map([approval_object_id.as_str()], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .map_err(map_sqlite)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(map_sqlite)?;
-            rows
-        };
-        if dependents.len() > MAX_APPROVAL_DEPENDENTS {
-            return Err(KernelError::AdmissionPolicy);
-        }
+        let dependents = load_approval_dependents(self, &approval_object_id)?;
         let registry = self
             .tx
             .execute(
@@ -706,31 +743,75 @@ impl Envelope<'_> {
         }
         let mut invalidated = approval;
         invalidated.invalidated_commit_seq = Some(self.commit_seq);
+        let revocation_reason = redact(reason);
+        let revocation_audit = serde_json::json!({
+            "approval_object_id": approval_object_id,
+            "reason": revocation_reason.text,
+            "dependents": dependents.len(),
+            "policy_revision": POLICY_REVISION,
+        });
         self.changes.push(PendingChange {
             object: invalidated,
             kind: "approval_revoke",
             replaced_object_id: None,
-            redactions: Vec::new(),
-            audit: None,
+            redactions: vec![("reason".to_string(), revocation_reason)],
+            audit: Some(revocation_audit),
         });
 
-        let mut decisions = Vec::with_capacity(dependents.len());
-        for (subject_object_id, source_class, taint_class) in dependents {
-            let request = AdmissionRequest {
-                candidate_id: None,
-                subject_object_id: Some(subject_object_id),
-                source_class: Some(SourceClass::try_from(source_class.as_str())?),
-                taint_class: Some(TaintClass::try_from(taint_class.as_str())?),
-                event: AdmissionEvent {
-                    kind: EventKind::ApprovalRevoked,
-                    trigger_object_id: None,
-                    approval_object_id: None,
-                    evidence_id: None,
-                    reason: reason.to_string(),
-                },
-            };
-            if let Some(decision) = self.record_admission_inner(request)? {
-                decisions.push(decision);
+        self.demote_authority_dependents(&approval_object_id, reason)
+    }
+
+    /// Demotes every subject whose support descends from `authority_object_id`.
+    ///
+    /// An authority chain is transitive: when A approves B and B approves C,
+    /// invalidating A leaves C's chain broken. Demoting B alone stops B granting
+    /// future admissions but leaves C surfaced, so the closure follows dependents
+    /// that are themselves approvals until no live authority remains.
+    ///
+    /// `visited` bounds the walk over a cyclic authority graph, and each level is
+    /// bounded by [`MAX_APPROVAL_DEPENDENTS`]; together they cap the transaction at
+    /// [`MAX_AUTHORITY_DEMOTIONS`] demotions so revocation always completes in one
+    /// transaction rather than becoming unrevokable.
+    fn demote_authority_dependents(
+        &mut self,
+        authority_object_id: &str,
+        reason: &str,
+    ) -> Result<Vec<AdmissionDecision>, KernelError> {
+        let mut decisions = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut frontier = vec![authority_object_id.to_string()];
+        visited.insert(authority_object_id.to_string());
+        while let Some(authority) = frontier.pop() {
+            for (subject_object_id, source_class, taint_class) in
+                load_approval_dependents(self, &authority)?
+            {
+                if !visited.insert(subject_object_id.clone()) {
+                    continue;
+                }
+                if decisions.len() >= MAX_AUTHORITY_DEMOTIONS {
+                    return Err(KernelError::AdmissionPolicy);
+                }
+                let request = AdmissionRequest {
+                    candidate_id: None,
+                    subject_object_id: Some(subject_object_id.clone()),
+                    source_class: Some(SourceClass::try_from(source_class.as_str())?),
+                    taint_class: Some(TaintClass::try_from(taint_class.as_str())?),
+                    event: AdmissionEvent {
+                        kind: EventKind::ApprovalRevoked,
+                        trigger_object_id: None,
+                        approval_object_id: None,
+                        evidence_id: None,
+                        reason: reason.to_string(),
+                    },
+                };
+                if let Some(decision) = self.apply_admission(request)? {
+                    decisions.push(decision);
+                }
+                // The demoted subject may itself have granted authority, whose
+                // dependents are now unsupported.
+                if !validate_approval(self, Some(&subject_object_id), None)? {
+                    frontier.push(subject_object_id);
+                }
             }
         }
         Ok(decisions)
@@ -849,8 +930,12 @@ impl Envelope<'_> {
             .as_ref()
             .map(|object| object.object_id.clone())
             .or_else(|| prepared.facts.subject_object_id().map(str::to_string));
-        if let Some(approval) = approval_object_id.as_deref() {
-            enforce_approval_dependent_cap(self, approval, subject_object_id.as_deref())?;
+        // A refused decision receives no support from the approval it cites, so it
+        // neither consumes nor tests a dependent slot.
+        if !prepared.evaluation.denied {
+            if let Some(approval) = approval_object_id.as_deref() {
+                enforce_approval_dependent_cap(self, approval, subject_object_id.as_deref())?;
+            }
         }
         let candidate_payload_digest = prepared
             .facts
@@ -974,6 +1059,27 @@ impl SubjectFacts {
             AdmissionKey::Object(object_id) => Some(object_id),
         }
     }
+}
+
+/// A candidate binds to at most one canonical object. Without this a repeat
+/// admission is not a no-op, because the first decision's `admit` outcome differs
+/// from the `promote` a later identical request produces.
+fn candidate_is_materialized(
+    envelope: &Envelope<'_>,
+    candidate_id: &str,
+) -> Result<bool, KernelError> {
+    envelope
+        .tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM admission_decisions
+                 WHERE candidate_id=?1 AND subject_object_id IS NOT NULL
+                   AND commit_seq IS NOT NULL
+             )",
+            [candidate_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(map_sqlite)
 }
 
 /// Maps failed, canceled, abandoned, and lease-expired active staging rows to
@@ -1171,6 +1277,45 @@ fn enforce_approval_dependent_cap(
         return Err(KernelError::AdmissionPolicy);
     }
     Ok(())
+}
+
+/// Subjects whose latest decision still cites `approval_object_id`.
+///
+/// `LIMIT` exceeds [`MAX_APPROVAL_DEPENDENTS`] by one so the caller can distinguish
+/// a set at the cap from one over it, while bounding the allocation.
+fn load_approval_dependents(
+    envelope: &Envelope<'_>,
+    approval_object_id: &str,
+) -> Result<Vec<(String, String, String)>, KernelError> {
+    let mut statement = envelope
+        .tx
+        .prepare(&format!(
+            "SELECT a.subject_object_id,a.source_class,a.taint_class
+             FROM admission_decisions a
+             WHERE a.approval_object_id=?1
+               AND a.subject_object_id IS NOT NULL
+               AND a.commit_seq IS NOT NULL
+               AND {LATEST_SUBJECT_DECISION_PREDICATE}
+             ORDER BY a.subject_object_id
+             LIMIT {limit}",
+            limit = MAX_APPROVAL_DEPENDENTS + 1
+        ))
+        .map_err(map_sqlite)?;
+    let dependents = statement
+        .query_map([approval_object_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(map_sqlite)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(map_sqlite)?;
+    if dependents.len() > MAX_APPROVAL_DEPENDENTS {
+        return Err(KernelError::AdmissionPolicy);
+    }
+    Ok(dependents)
 }
 
 fn validate_provenance(

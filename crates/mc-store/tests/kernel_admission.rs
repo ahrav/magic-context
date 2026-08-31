@@ -1644,3 +1644,224 @@ fn an_admission_event_carries_the_subject_it_changed() {
         assert_eq!(audit["source_class"], "trusted_local_code", "{table}");
     }
 }
+
+#[test]
+fn a_caller_cannot_manufacture_an_approval_revocation() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "victim", "code_present", 1, "victim-trigger");
+    assert_eq!(
+        admit(&store, request("victim"), "victim", "victim"),
+        "admit"
+    );
+
+    let error = store
+        .commit(intent("forged-revocation"), |envelope| {
+            envelope
+                .record_admission(subject_request("object-victim", EventKind::ApprovalRevoked))?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(error, KernelError::AdmissionPolicy);
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT visibility FROM admission_decisions
+             WHERE subject_object_id='object-victim'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "automatic"
+    );
+}
+
+#[test]
+fn quarantining_an_approval_demotes_its_dependents() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "dependent");
+    let mut promoted = request("dependent");
+    promoted.source_class = Some(SourceClass::ModelInference);
+    promoted.taint_class = Some(TaintClass::AssistantInference);
+    promoted.event.kind = EventKind::Verify;
+    promoted.event.trigger_object_id = None;
+    promoted.event.approval_object_id = Some("approval".to_string());
+    assert_eq!(admit(&store, promoted, "dependent", "promote"), "admit");
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT visibility FROM admission_decisions
+             WHERE subject_object_id='object-dependent'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "automatic"
+    );
+
+    // Quarantining the approval breaks its authority, so the dependent cannot keep
+    // the automatic visibility that authority bought.
+    store
+        .commit(intent("quarantine-approval"), |envelope| {
+            let mut quarantine = subject_request("approval", EventKind::Quarantine);
+            quarantine.source_class = Some(SourceClass::ExplicitUser);
+            quarantine.taint_class = Some(TaintClass::UserExplicit);
+            envelope.record_admission(quarantine)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT visibility FROM admission_decisions
+             WHERE subject_object_id='object-dependent'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "explicit_labeled"
+    );
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT outcome FROM admission_decisions
+             WHERE subject_object_id='object-dependent'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "demote_support"
+    );
+}
+
+#[test]
+fn revocation_cascades_through_dependent_approvals() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    seed_dependent_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    // `approval-b` is itself an approval whose authority descends from `approval`.
+    stage(&store, "grandchild");
+    let mut promoted = request("grandchild");
+    promoted.source_class = Some(SourceClass::ModelInference);
+    promoted.taint_class = Some(TaintClass::AssistantInference);
+    promoted.event.kind = EventKind::Verify;
+    promoted.event.trigger_object_id = None;
+    promoted.event.approval_object_id = Some("approval-b".to_string());
+    assert_eq!(admit(&store, promoted, "grandchild", "promote"), "admit");
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT visibility FROM admission_decisions
+             WHERE subject_object_id='object-grandchild'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "automatic"
+    );
+
+    // Revoking the root must reach the grandchild, not stop at `approval-b`.
+    store
+        .commit(intent("revoke-root"), |envelope| {
+            let decisions = envelope.revoke_approval("approval", "root authority withdrawn")?;
+            assert!(decisions.len() >= 2, "{decisions:?}");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT visibility FROM admission_decisions
+             WHERE subject_object_id='object-grandchild'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "explicit_labeled"
+    );
+}
+
+#[test]
+fn a_refused_decision_does_not_consume_approval_capacity() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "refused");
+
+    // `missing-approval` never validates, so the decision is refused and must be
+    // retained in the audit rather than rolled back by the dependent cap.
+    let mut refused = request("refused");
+    refused.source_class = Some(SourceClass::ModelInference);
+    refused.taint_class = Some(TaintClass::AssistantInference);
+    refused.event.kind = EventKind::Verify;
+    refused.event.trigger_object_id = None;
+    refused.event.approval_object_id = Some("approval-domain-object".to_string());
+    store
+        .commit(intent("refused"), |envelope| {
+            let decision = envelope.record_admission(refused)?.unwrap();
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM admission_decisions
+             WHERE candidate_id='refused' AND outcome='deny'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn a_revocation_reason_survives_without_dependents() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("revoke-unused"), |envelope| {
+            let decisions = envelope.revoke_approval("approval", "superseded by policy review")?;
+            assert!(decisions.is_empty());
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let payload = inspect_text(
+        directory.path(),
+        "SELECT CAST(payload AS TEXT) FROM change_event WHERE change_kind='approval_revoke'",
+    );
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        payload["audit"]["approval_object_id"], "approval",
+        "{payload}"
+    );
+    assert!(
+        payload.to_string().contains("superseded by policy review"),
+        "{payload}"
+    );
+}
+
+#[test]
+fn a_candidate_materializes_at_most_one_canonical_object() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "once", "code_present", 1, "once-trigger");
+    assert_eq!(admit(&store, request("once"), "once", "once"), "admit");
+
+    // The second admission is not a no-op: the first stored `admit` while an
+    // identical request now evaluates to `promote`.
+    let error = store
+        .commit(intent("once-again"), |envelope| {
+            envelope.admit_domain_candidate(
+                request("once"),
+                AdmissionDomainSpec {
+                    domain_id: "domain-once-again".to_string(),
+                    object_id: "object-once-again".to_string(),
+                    name: "name-once".to_string(),
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(error, KernelError::AdmissionPolicy);
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='object-once-again'"
+        ),
+        0
+    );
+}
