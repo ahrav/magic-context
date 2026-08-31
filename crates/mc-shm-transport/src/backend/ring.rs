@@ -238,9 +238,19 @@ fn removal_ranges(
     if logical_len > arena_bytes as u64 {
         return Err(RingError::InvalidSharedState);
     }
-    let page_mask = !(page_size as u64 - 1);
-    let removable_start = logical_start & page_mask;
+    let page_size = page_size as u64;
+    let page_mask = !(page_size - 1);
+    let removable_start = if logical_start.is_multiple_of(page_size) {
+        logical_start
+    } else {
+        (logical_start & page_mask)
+            .checked_add(page_size)
+            .ok_or(RingError::ArithmeticOverflow)?
+    };
     let removable_end = logical_end & page_mask;
+    if removable_start >= removable_end {
+        return Ok([(0, 0); 2]);
+    }
     let len = usize::try_from(removable_end - removable_start)
         .map_err(|_| RingError::ArithmeticOverflow)?;
     let start = usize::try_from(removable_start % arena_bytes as u64)
@@ -1457,6 +1467,7 @@ impl Ring {
     }
 
     fn reclaim_completed(&self) -> Result<(), RingError> {
+        let producer = self.producer_ptr()?;
         let reclaim = self.reclaim_ptr()?;
         // SAFETY: producer-owned reclaim page remains mapped.
         let completed = unsafe { (*reclaim).completed.load(Ordering::Relaxed) };
@@ -1494,21 +1505,44 @@ impl Ring {
         if last == completed {
             return Ok(());
         }
+        let new_reclaimed = reclaimed
+            .checked_add(run_len)
+            .ok_or(RingError::ArithmeticOverflow)?;
+        let page_size = system_page_size();
+        let remove = |offset, len| {
+            if remove_pages(self.mapping.base.as_ptr(), offset, len) != 0 {
+                self.enter_quarantine();
+                return Err(RingError::PageRemovalFailed);
+            }
+            Ok(())
+        };
         for (offset, len) in removal_ranges(
             self.layout.arena,
             self.arena_bytes(),
             reclaimed,
             run_len,
-            system_page_size(),
+            page_size,
         )?
         .into_iter()
         .filter(|(_, len)| *len != 0)
         {
-            let result = remove_pages(self.mapping.base.as_ptr(), offset, len);
-            if result != 0 {
-                self.enter_quarantine();
-                return Err(RingError::PageRemovalFailed);
-            }
+            remove(offset, len)?;
+        }
+        let arena_write = unsafe { (*producer).arena_write.load(Ordering::Relaxed) };
+        let page_size_u64 = page_size as u64;
+        if arena_write == new_reclaimed
+            && !reclaimed.is_multiple_of(page_size_u64)
+            && new_reclaimed.is_multiple_of(page_size_u64)
+        {
+            let logical_page = reclaimed & !(page_size_u64 - 1);
+            let physical = usize::try_from(logical_page % self.arena_bytes() as u64)
+                .map_err(|_| RingError::ArithmeticOverflow)?;
+            let offset = self
+                .layout
+                .arena
+                .checked_add(physical)
+                .ok_or(RingError::ArithmeticOverflow)?;
+            remove(offset, page_size)?;
         }
         for sequence in completed + 1..=last {
             let slot = self.slot_ptr(sequence)?;
@@ -1519,9 +1553,6 @@ impl Ring {
                 (*slot).state.store(SLOT_FREE, Ordering::Release);
             }
         }
-        let new_reclaimed = reclaimed
-            .checked_add(run_len)
-            .ok_or(RingError::ArithmeticOverflow)?;
         // SAFETY: capacity becomes visible only after every removal succeeds.
         unsafe {
             (*reclaim)
@@ -2248,8 +2279,12 @@ mod tests {
         for page in [4 * 1024, 16 * 1024, 64 * 1024] {
             let arena = page * 4;
             assert_eq!(
+                removal_ranges(page, arena, 1, (page - 1) as u64, page).unwrap(),
+                [(0, 0), (0, 0)]
+            );
+            assert_eq!(
                 removal_ranges(page, arena, 1, (page * 3 - 2) as u64, page).unwrap(),
-                [(page, page * 2), (0, 0)]
+                [(page * 2, page), (0, 0)]
             );
             assert_eq!(
                 removal_ranges(page, arena, (arena - page) as u64, (page * 2) as u64, page)
