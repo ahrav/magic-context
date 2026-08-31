@@ -302,6 +302,76 @@ describe("paired-delta runner", () => {
         expect(disposedArms).toEqual(["mc-on"]);
     });
 
+    it("bounds rollout creation with the run deadline and disposes a late handle", async () => {
+        const disposedArms: string[] = [];
+        let released: (() => void) | null = null;
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                createRollout({ coordinate }): Promise<RolloutHandle> {
+                    // Creation outlives the deadline, so the handle arrives after
+                    // the runner has already given up on it.
+                    return new Promise<RolloutHandle>((resolve) => {
+                        released = () =>
+                            resolve({
+                                async run() {
+                                    throw new Error("run must not start after the deadline");
+                                },
+                                async dispose() {
+                                    disposedArms.push(coordinate.armId);
+                                },
+                            });
+                    });
+                },
+            },
+        );
+
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+        expect(result.records[0]?.harnessDisposed).toBe(false);
+        expect(disposedArms).toEqual([]);
+
+        released!();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        // The harness the late creation owns is still reclaimed.
+        expect(disposedArms).toEqual(["mc-on"]);
+    });
+
+    it("gives the rollout only the deadline left after creation", async () => {
+        let now = 1_000;
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: now + 100 },
+            {
+                now: () => now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    // Creation consumes 90 of the run's 100ms budget, leaving 10.
+                    now += 90;
+                    return {
+                        async run() {
+                            // Longer than the 10ms that remain, shorter than the
+                            // 100ms measured before creation.
+                            await new Promise((resolve) => setTimeout(resolve, 40));
+                            return observation(coordinate.armId);
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+    });
+
     it("classifies a malformed check vector as an exclusion and continues", async () => {
         const result = await runPairedDelta(
             options(),
@@ -414,7 +484,7 @@ describe("paired-delta runner", () => {
         expect(resumed.spentUsd).toBeCloseTo(spentBefore, 12);
     });
 
-    it("charges a retried coordinate once across a resume", async () => {
+    it("bills every attempt at a retried coordinate exactly once", async () => {
         const store = new MemoryStore();
         await runPairedDelta(
             options(store),
@@ -425,23 +495,29 @@ describe("paired-delta runner", () => {
         if (failedEstimate === undefined) throw new Error("missing failed record");
 
         const resumed = await runPairedDelta(options(store), dependencies());
-        const observedCost = resumed.records.find(({ armId }) => armId === "mc-off")?.costUsd;
+        const retried = resumed.records.find(({ armId }) => armId === "mc-off");
 
+        // Counters cover records reported by this run; a rerun counts once, not
+        // once per attempt.
         expect(resumed.observedCostRollouts + resumed.estimatedCostRollouts)
             .toBe(resumed.records.length);
+        // Spend is lifetime, so the failed attempt is billed alongside the retry
+        // and the estimate it was priced at stays a reserve floor.
+        expect(retried?.priorAttemptsCostUsd).toBeCloseTo(failedEstimate, 12);
         expect(resumed.spentUsd).toBeCloseTo(
-            resumed.records.reduce((sum, { costUsd }) => sum + costUsd, 0),
+            resumed.records.reduce((sum, { costUsd }) => sum + costUsd, 0) + failedEstimate,
             12,
         );
-        // The retry's own cost replaces the estimate rather than stacking on it,
-        // while the estimate stays a reserve floor.
-        expect(resumed.spentUsd).toBeLessThan(
-            resumed.records.reduce((sum, { costUsd }) => sum + costUsd, 0) + failedEstimate,
-        );
-        expect(observedCost).toBeLessThan(failedEstimate);
+        expect(retried?.costUsd).toBeLessThan(failedEstimate);
         expect(resumed.reserveUsd).toBeGreaterThanOrEqual(failedEstimate);
-    });
 
+        // A third run reconstructs the same lifetime spend.
+        const third = await runPairedDelta(options(store), dependencies());
+
+        expect(third.spentUsd).toBeCloseTo(resumed.spentUsd, 12);
+        expect(third.observedCostRollouts + third.estimatedCostRollouts)
+            .toBe(third.records.length);
+    });
     it("floors failure cost estimates at one full-context request", async () => {        const expensive = {
             ...options(),
             pricesPerMillionTokens: {

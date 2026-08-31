@@ -71,6 +71,8 @@ export interface RolloutRecord extends RolloutCoordinate {
     checks: CheckResult[];
     usage: TokenUsage;
     costUsd: number;
+    /** Spend on earlier attempts at this coordinate, which replacement would otherwise erase from the file the next resume reconstructs spend from. commentlint: allow(JUDGE) */
+    priorAttemptsCostUsd: number;
     costSource: "observed" | "estimated";
     wallClockMs: number;
     turns: number;
@@ -212,6 +214,12 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
         }
         if (!Number.isFinite(record.costUsd) || (record.costUsd as number) < 0) {
             fail("cost-invalid");
+        }
+        if (
+            !Number.isFinite(record.priorAttemptsCostUsd) ||
+            (record.priorAttemptsCostUsd as number) < 0
+        ) {
+            fail("prior-attempts-cost-invalid");
         }
         if (record.costSource !== "observed" && record.costSource !== "estimated") {
             fail("cost-source-invalid");
@@ -371,18 +379,19 @@ export async function runPairedDelta(
         }
     }
 
+    /** Spend and rollout counts answer different questions, so the pre-scan keeps them apart: every attempt that already ran was billed and counts against the lifetime cap, while the counters describe the records this run reports. Adding a re-run coordinate to the counters would push `observedCostRollouts + estimatedCostRollouts` past `records.length`; dropping its cost would let a failure/retry cycle spend past `maxCostUsd`. commentlint: allow(JUDGE) */
     for (const record of stored) {
         /** A record from another commit or pinned model priced a different build, so it informs neither this run's reserve nor its spend. commentlint: allow(JUDGE) */
         if (!inMatrix(record) || !bindingMatches(record, options)) continue;
-        /** A failed attempt on this same binding was priced by `failedRecord` at the scenario's worst case, so its cost is a valid reserve floor even though the retry replaces it. commentlint: allow(JUDGE) */
+        /** A failed attempt was priced by `failedRecord` at the scenario's worst case, so its cost is a valid reserve floor even though the retry replaces the record. commentlint: allow(JUDGE) */
         reserveUsd = Math.max(reserveUsd, record.costUsd);
-        /** A record that will be re-run has its cost replaced by the retry, so charging it here would count one coordinate twice and push `observedCostRollouts + estimatedCostRollouts` past `records.length`. commentlint: allow(JUDGE) */
+        const attemptsCostUsd = record.priorAttemptsCostUsd + record.costUsd;
+        spentUsd += attemptsCostUsd;
+        /** Restored spend is billed spend, so the next rollout meets the cost cap instead of being admitted as this run's first. commentlint: allow(JUDGE) */
+        if (attemptsCostUsd > 0) startedAny = true;
         if (!isResumable(record, options)) continue;
-        spentUsd += record.costUsd;
         if (record.costSource === "observed") observedCostRollouts++;
         else estimatedCostRollouts++;
-        /** Restored spend is billed spend, so the next rollout meets the cost cap instead of being admitted as this run's first. commentlint: allow(JUDGE) */
-        startedAny = true;
     }
 
     outer:
@@ -434,22 +443,36 @@ export async function runPairedDelta(
                 startedAny = true;
                 const intervention = interventionFor(scenario, armId);
                 const startedAt = dependencies.now();
+                /** The previous attempt's spend is retained on the replacement record because `put` keeps one record per coordinate, so the file a later resume reads would otherwise show only the last attempt. commentlint: allow(JUDGE) */
+                const priorAttemptsCostUsd = existing
+                    ? existing.priorAttemptsCostUsd + existing.costUsd
+                    : 0;
                 let handle: RolloutHandle | null = null;
+                let creation: Promise<RolloutHandle> | null = null;
                 let observation: RolloutObservation | null = null;
                 let failure: unknown;
                 let disposed = false;
                 try {
-                    handle = await dependencies.createRollout({
+                    /** Creation spawns the harness, so it is inside the deadline: a hung create would otherwise outlive `deadlineEpochMs` unbounded. The handle is captured off the promise rather than the race result, so one that arrives after the deadline is still disposed instead of leaking a live harness. commentlint: allow(JUDGE) */
+                    creation = dependencies.createRollout({
                         scenario,
                         coordinate,
                         baseScriptFingerprint: fingerprint,
                         intervention,
                     });
-                    const started = handle;
+                    const pendingCreation = creation;
+                    pendingCreation.then((created) => {
+                        handle = created;
+                    }, () => {});
+                    const started = await withRolloutDeadline(() => pendingCreation, remainingMs);
+                    handle = started;
+                    /** Creation consumed part of the budget, so the rollout gets what is left rather than the allowance measured before it. commentlint: allow(JUDGE) */
+                    const runMs = options.deadlineEpochMs - dependencies.now();
+                    if (runMs <= 0) throw new RolloutDeadlineError("deadline reached before run");
                     observation = await withRolloutDeadline(async () => {
                         await started.prepare?.();
                         return started.run();
-                    }, remainingMs);
+                    }, runMs);
                 } catch (error) {
                     failure = error;
                 } finally {
@@ -460,6 +483,9 @@ export async function runPairedDelta(
                         } catch (error) {
                             failure ??= error;
                         }
+                    } else {
+                        /** A handle that lost the creation race still owns a harness, so it is disposed when it arrives; nothing waits on it because a hung creation is what the deadline is for. commentlint: allow(JUDGE) */
+                        if (creation) disposeLateHandle(creation);
                     }
                 }
                 const wallClockMs = Math.max(0, dependencies.now() - startedAt);
@@ -474,6 +500,7 @@ export async function runPairedDelta(
                         wallClockMs,
                         disposed,
                         reserveUsd,
+                        priorAttemptsCostUsd,
                     )
                     : failedRecord(
                         options,
@@ -485,6 +512,7 @@ export async function runPairedDelta(
                         disposed,
                         failure,
                         reserveUsd,
+                        priorAttemptsCostUsd,
                     );
                 options.store.put(record);
                 records.push(record);
@@ -562,6 +590,7 @@ function completedRecord(
     wallClockMs: number,
     harnessDisposed: boolean,
     reserveUsd: number,
+    priorAttemptsCostUsd: number,
 ): RolloutRecord {
     const identityMatches =
         observation.echoedProviderId === options.pinnedProviderId &&
@@ -635,6 +664,7 @@ function completedRecord(
         costUsd: usage === null
             ? Math.max(reserveUsd, worstCaseUsd(scenario, options.pricesPerMillionTokens))
             : tokenCostUsd(usage, options.pricesPerMillionTokens),
+        priorAttemptsCostUsd,
         costSource: usage === null ? "estimated" : "observed",
         wallClockMs,
         turns: observation.turns,
@@ -652,6 +682,7 @@ function failedRecord(
     harnessDisposed: boolean,
     failure: unknown,
     reserveUsd: number,
+    priorAttemptsCostUsd: number,
 ): RolloutRecord {
     const providerUnavailable = failure instanceof ProviderUnavailableError;
     const deadlineExceeded = failure instanceof RolloutDeadlineError;
@@ -687,6 +718,7 @@ function failedRecord(
         checks: [],
         usage: ZERO_USAGE,
         costUsd: providerUnavailable ? reserveUsd : Math.max(reserveUsd, worstCase),
+        priorAttemptsCostUsd,
         costSource: "estimated",
         wallClockMs,
         turns: 0,
@@ -774,6 +806,14 @@ function coordinateKey(coordinate: RolloutCoordinate): string {
         coordinate.armId,
         coordinate.replicateIndex,
     ].join(":");
+}
+
+/** A creation that lost its deadline race still resolves eventually, and the handle it yields owns a live harness that would contaminate later arms. commentlint: allow(JUDGE) */
+function disposeLateHandle(creation: Promise<RolloutHandle>): void {
+    void creation.then(
+        (handle) => handle.dispose().catch(() => {}),
+        () => {},
+    );
 }
 
 async function withRolloutDeadline<T>(
