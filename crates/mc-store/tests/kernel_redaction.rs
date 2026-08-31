@@ -202,7 +202,20 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
         .any(|window| window == SECRET.as_bytes()));
 }
 
-fn shared_run_candidate(candidate_id: &str, recorded_at: i64) -> StagingCandidateSpec {
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// `offset` shifts the heartbeat relative to the store clock, so a reused run is
+/// still live when the reuse path checks it.
+fn shared_run_candidate(candidate_id: &str, offset: i64) -> StagingCandidateSpec {
+    let recorded_at = now_ms() + offset;
     StagingCandidateSpec {
         extraction_run_id: "shared-run".to_string(),
         candidate_id: candidate_id.to_string(),
@@ -217,7 +230,7 @@ fn shared_run_candidate(candidate_id: &str, recorded_at: i64) -> StagingCandidat
             revision: "abc123".to_string(),
         }),
         recorded_at,
-        lease_expires_at: recorded_at + 10,
+        lease_expires_at: recorded_at + 600_000,
     }
 }
 
@@ -225,12 +238,11 @@ fn shared_run_candidate(candidate_id: &str, recorded_at: i64) -> StagingCandidat
 fn staging_run_is_inserted_once_and_reused_for_multiple_candidates() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
+    let second = shared_run_candidate("candidate-b", 5);
     store
         .stage_candidate(shared_run_candidate("candidate-a", 1))
         .unwrap();
-    store
-        .stage_candidate(shared_run_candidate("candidate-b", 5))
-        .unwrap();
+    store.stage_candidate(second.clone()).unwrap();
 
     let connection = Connection::open_with_flags(
         directory.path().join("core.sqlite"),
@@ -258,16 +270,19 @@ fn staging_run_is_inserted_once_and_reused_for_multiple_candidates() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(renewal, (5, 15));
+    assert_eq!(
+        renewal,
+        (second.recorded_at, second.lease_expires_at),
+        "the later candidate renews the run"
+    );
 }
 
 #[test]
 fn staging_run_reuse_with_changed_immutable_metadata_is_a_typed_conflict() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
-    store
-        .stage_candidate(shared_run_candidate("candidate-a", 1))
-        .unwrap();
+    let first = shared_run_candidate("candidate-a", 1);
+    store.stage_candidate(first.clone()).unwrap();
     let mut mismatch = shared_run_candidate("candidate-b", 5);
     mismatch.source_id = "different-source".to_string();
     let error = store.stage_candidate(mismatch).unwrap_err();
@@ -292,7 +307,11 @@ fn staging_run_reuse_with_changed_immutable_metadata_is_a_typed_conflict() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(renewal, (1, 11));
+    assert_eq!(
+        renewal,
+        (first.recorded_at, first.lease_expires_at),
+        "a rejected reuse leaves the original lease untouched"
+    );
 }
 
 #[test]
@@ -363,19 +382,30 @@ fn a_terminal_or_expired_run_refuses_further_candidates() {
         .stage_candidate(shared_run_candidate("candidate-a", 1))
         .unwrap();
 
-    // recorded_at past the stored lease_expires_at of 11.
+    // Retire the lease behind the store's back, as a stalled worker would.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE extraction_runs
+             SET started_at=1,heartbeat_at=1,lease_expires_at=2",
+            [],
+        )
+        .unwrap();
+    drop(connection);
     assert_eq!(
         store
-            .stage_candidate(shared_run_candidate("candidate-late", 99))
+            .stage_candidate(shared_run_candidate("candidate-late", 1))
             .unwrap_err(),
-        KernelError::Conflict
+        KernelError::Conflict,
+        "an expired lease must not be renewed"
     );
 
     let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
     connection
         .execute(
-            "UPDATE extraction_runs SET terminal_state='completed',terminal_at=5",
-            [],
+            "UPDATE extraction_runs
+             SET lease_expires_at=?1,terminal_state='completed',terminal_at=?1",
+            [now_ms() + 600_000],
         )
         .unwrap();
     drop(connection);
@@ -383,7 +413,8 @@ fn a_terminal_or_expired_run_refuses_further_candidates() {
         store
             .stage_candidate(shared_run_candidate("candidate-after-terminal", 2))
             .unwrap_err(),
-        KernelError::Conflict
+        KernelError::Conflict,
+        "a terminal run must not accept work even with a live lease"
     );
 }
 
@@ -391,18 +422,20 @@ fn a_terminal_or_expired_run_refuses_further_candidates() {
 fn a_run_whose_lease_expires_exactly_now_is_not_resurrected() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
-    // shared_run_candidate(_, 1) stores lease_expires_at = 11.
-    store
-        .stage_candidate(shared_run_candidate("candidate-a", 1))
-        .unwrap();
+    let first = shared_run_candidate("candidate-a", 1);
+    store.stage_candidate(first.clone()).unwrap();
+
+    let mut boundary = shared_run_candidate("candidate-boundary", 1);
+    boundary.recorded_at = first.lease_expires_at;
+    boundary.lease_expires_at = boundary.recorded_at + 1_000;
     assert_eq!(
-        store
-            .stage_candidate(shared_run_candidate("candidate-boundary", 11))
-            .unwrap_err(),
-        KernelError::Conflict
+        store.stage_candidate(boundary).unwrap_err(),
+        KernelError::InvalidInput,
+        "a heartbeat at the stored expiry is beyond the allowed clock skew"
     );
+
     store
-        .stage_candidate(shared_run_candidate("candidate-live", 10))
+        .stage_candidate(shared_run_candidate("candidate-live", 2))
         .unwrap();
 }
 
@@ -638,5 +671,32 @@ fn blank_run_identity_fields_are_rejected() {
     assert_eq!(
         inspect_count(directory.path(), "SELECT COUNT(*) FROM extraction_runs"),
         0
+    );
+}
+
+#[test]
+fn a_terminal_candidate_is_not_replayed_under_a_live_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .stage_candidate(shared_run_candidate("candidate-a", 1))
+        .unwrap();
+
+    // The candidate finishes while its run stays live.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE candidates SET terminal_state='completed',terminal_at=heartbeat_at",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        store
+            .stage_candidate(shared_run_candidate("candidate-a", 2))
+            .unwrap_err(),
+        KernelError::Conflict,
+        "a terminal candidate must not be treated as an idempotent replay"
     );
 }

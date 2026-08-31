@@ -593,6 +593,7 @@ impl KernelStore {
             if stored_identity != expected
                 || terminal_state.is_some()
                 || lease_expires_at <= spec.recorded_at
+                || lease_expires_at <= current_time_ms()
             {
                 return Err(KernelError::Conflict);
             }
@@ -631,7 +632,7 @@ impl KernelStore {
         }
         let existing_candidate = tx
             .query_row(
-                "SELECT extraction_run_id,sensitivity_class,redaction_metadata
+                "SELECT extraction_run_id,sensitivity_class,redaction_metadata,terminal_state
                  FROM candidates WHERE candidate_id=?1",
                 [spec.candidate_id.as_str()],
                 |row| {
@@ -639,16 +640,20 @@ impl KernelStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()
             .map_err(map_sqlite)?;
-        if let Some((run_id, stored_class, stored_metadata)) = existing_candidate {
+        if let Some((run_id, stored_class, stored_metadata, candidate_terminal)) =
+            existing_candidate
+        {
             let stored_digest = stored_request_digest(&stored_metadata);
             if run_id != spec.extraction_run_id
                 || stored_class != candidate_sensitivity.as_str()
                 || stored_digest.as_deref() != Some(spec.request_digest.as_str())
+                || candidate_terminal.is_some()
             {
                 return Err(KernelError::Conflict);
             }
@@ -1129,7 +1134,11 @@ struct RedactedProjection {
 
 impl RedactedProjection {
     fn new(spec: &AlignmentProjectionSpec) -> Result<Self, KernelError> {
-        if spec.built_through_commit_seq < 1 {
+        if spec.built_through_commit_seq < 1
+            || spec.alignment_kind.trim().is_empty()
+            || spec.decision_id.trim().is_empty()
+            || spec.observation_id.trim().is_empty()
+        {
             return Err(KernelError::InvalidInput);
         }
         Ok(Self {
