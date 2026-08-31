@@ -131,6 +131,7 @@ impl KernelStore {
             &mut writer,
             self.lease_epoch(),
             request.capture_pin_expires_at,
+            request.deadline,
         )?;
         let unique = next_unique();
         let final_name = final_name_override
@@ -342,10 +343,20 @@ impl KernelStore {
             (false, false, false)
         };
         let mut source = open_private_regular_nofollow(backup_path)?;
-        let source_seq = verify_database(backup_path, None, KernelError::InvalidRestore, None)?;
-        // Verification resolves a pathname while the copy reads the descriptor, so a
-        // source replaced in between would install bytes that were never verified.
-        assert_same_open_file(&source, backup_path, KernelError::InvalidRestore)?;
+        let temp_path = restore_temp_path(&self.db_path);
+        copy_to_private_temp(&mut source, &temp_path)?;
+        // Verifying the staged copy rather than the source makes the verified bytes
+        // the installed bytes, so neither a replaced pathname nor an in-place
+        // rewrite of the source can change what is installed. It also keeps the
+        // verification outside the writer lock.
+        let staged = verify_database(&temp_path, None, KernelError::InvalidRestore, None);
+        let source_seq = match staged {
+            Ok(seq) => seq,
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        };
 
         let mut writer = self.lock_writer()?;
         let mut readers = self
@@ -369,7 +380,6 @@ impl KernelStore {
             .map(|_| Connection::open_in_memory().map_err(|_| KernelError::Io))
             .collect::<Result<Vec<_>, _>>()?;
         let recovery_dir = allocate_recovery_dir(&self.db_path)?;
-        let temp_path = restore_temp_path(&self.db_path);
         if let Err(error) = publish_restore_marker(&self.db_path, &recovery_dir) {
             let _ = fs::remove_dir(&recovery_dir);
             return Err(error);
@@ -396,7 +406,6 @@ impl KernelStore {
             if fault_after_displace {
                 return Err(KernelError::Fault);
             }
-            copy_to_private_temp(&mut source, &temp_path)?;
             fs::rename(&temp_path, &self.db_path).map_err(|_| KernelError::Io)?;
             sync_parent(&self.db_path)?;
             let opened =
@@ -578,19 +587,6 @@ fn sync_child(directory: &File, name: &str) -> Result<(), KernelError> {
     File::from(file).sync_all().map_err(|_| KernelError::Io)
 }
 
-fn assert_same_open_file(
-    file: &File,
-    pathname: &Path,
-    error: KernelError,
-) -> Result<(), KernelError> {
-    let opened = file.metadata().map_err(|_| error)?;
-    let resolved = fs::symlink_metadata(pathname).map_err(|_| error)?;
-    if opened.dev() != resolved.dev() || opened.ino() != resolved.ino() {
-        return Err(error);
-    }
-    Ok(())
-}
-
 fn assert_same_file(directory: &File, name: &str, pathname: &Path) -> Result<(), KernelError> {
     let anchored = rfs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| KernelError::InvalidBackup)?;
@@ -626,7 +622,45 @@ fn publish_noreplace(
     Err(KernelError::UnsafeDestination)
 }
 
+// Reference collection, the sensitivity scan and the per-evidence inserts all
+// scale with stored rows, so a progress handler bounds them rather than leaving
+// the writer held past the deadline.
 fn capture_state(
+    writer: &mut Connection,
+    lease_epoch: u64,
+    expires_at: Option<i64>,
+    deadline: Instant,
+) -> Result<CaptureState, KernelError> {
+    if Instant::now() >= deadline {
+        return Err(KernelError::Deadline);
+    }
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = Arc::clone(&interrupted);
+        writer
+            .progress_handler(
+                1_000,
+                Some(move || {
+                    let expired = Instant::now() >= deadline;
+                    if expired {
+                        interrupted.store(true, Ordering::Release);
+                    }
+                    expired
+                }),
+            )
+            .map_err(|_| KernelError::Io)?;
+    }
+    let captured = capture_state_inner(writer, lease_epoch, expires_at);
+    writer
+        .progress_handler(0, None::<fn() -> bool>)
+        .map_err(|_| KernelError::Io)?;
+    match captured {
+        Err(KernelError::Io) if interrupted.load(Ordering::Acquire) => Err(KernelError::Deadline),
+        other => other,
+    }
+}
+
+fn capture_state_inner(
     writer: &mut Connection,
     lease_epoch: u64,
     expires_at: Option<i64>,
@@ -962,6 +996,10 @@ pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
         recovery_directory.join(path.file_name().ok_or(KernelError::Inconclusive)?);
     if displaced_main.exists() {
         remove_family(path).map_err(|_| KernelError::Inconclusive)?;
+    } else if !path.exists() {
+        // The main file is in neither place, so the recovery directory cannot be
+        // trusted to hold the family. Bootstrapping here would discard it.
+        return Err(KernelError::Inconclusive);
     }
     restore_displaced_family(path, &recovery_directory).map_err(|_| KernelError::Inconclusive)?;
     remove_restore_marker(path)?;
@@ -971,6 +1009,16 @@ pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
 
 // A crash between removing the marker and cleaning up leaves the prior family,
 // which may hold sensitive rows, under `.mc-restore-*` with nothing to reclaim it.
+// `allocate_recovery_dir` appends only decimal digits, so anything else sharing
+// the prefix was created by someone else and is left alone.
+fn generated_recovery_suffix(name: &std::ffi::OsStr, prefix: &str) -> bool {
+    let name = name.to_string_lossy();
+    match name.strip_prefix(prefix) {
+        Some(suffix) => !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
 pub(super) fn reap_orphan_restore_recovery(path: &Path) -> Result<(), KernelError> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -987,10 +1035,28 @@ pub(super) fn reap_orphan_restore_recovery(path: &Path) -> Result<(), KernelErro
             continue;
         }
         let candidate = entry.path();
-        if !candidate.is_dir() {
+        if !candidate.is_dir() || !generated_recovery_suffix(&entry.file_name(), &prefix) {
             continue;
         }
-        fs::remove_dir_all(&candidate).map_err(|_| KernelError::Inconclusive)?;
+        // Removing only family members and then rmdir leaves any directory holding
+        // anything else intact, so an operator copy sharing the prefix survives.
+        for member in
+            std::iter::once(candidate.join(path.file_name().ok_or(KernelError::Inconclusive)?))
+                .chain(
+                    family_sidecars(path)
+                        .into_iter()
+                        .map(|sidecar| candidate.join(sidecar.file_name().unwrap_or_default())),
+                )
+        {
+            match fs::remove_file(&member) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(KernelError::Inconclusive),
+            }
+        }
+        if fs::remove_dir(&candidate).is_err() {
+            continue;
+        }
         reaped = true;
     }
     if reaped {

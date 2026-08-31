@@ -1228,3 +1228,61 @@ fn an_oversized_or_special_restore_marker_is_refused_before_it_is_read() {
     let reopened = KernelStore::open(root.path()).unwrap();
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 1);
 }
+
+#[test]
+fn a_recovery_directory_not_created_by_the_store_is_left_untouched() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    drop(store);
+
+    // `allocate_recovery_dir` appends only digits, so an operator copy sharing the
+    // prefix must survive an open, contents included.
+    let operator_copy = root.path().join("core.sqlite.mc-restore-incident-4821");
+    fs::create_dir(&operator_copy).unwrap();
+    fs::write(operator_copy.join("core.sqlite"), b"operator evidence").unwrap();
+    fs::write(operator_copy.join("notes.txt"), b"do not delete").unwrap();
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert!(operator_copy.is_dir(), "operator directory was reaped");
+    assert_eq!(
+        fs::read(operator_copy.join("core.sqlite")).unwrap(),
+        b"operator evidence"
+    );
+    assert_eq!(
+        fs::read(operator_copy.join("notes.txt")).unwrap(),
+        b"do not delete"
+    );
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 1);
+}
+
+#[test]
+fn restore_verifies_the_staged_copy_so_a_mutated_source_cannot_install() {
+    let root = private_dir();
+    let destination = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    let backup = store.backup(request(destination.path())).unwrap();
+    insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // Rewriting the artifact in place keeps its device and inode, so only verifying
+    // the staged copy can reject it.
+    let mut corrupted = fs::read(&backup.destination_path).unwrap();
+    let tail = corrupted.len() - 512;
+    corrupted[tail..].fill(0x5a);
+    fs::write(&backup.destination_path, &corrupted).unwrap();
+
+    assert_eq!(
+        store.restore(&backup.destination_path).unwrap_err(),
+        KernelError::InvalidRestore
+    );
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(store.facts(1).unwrap().commit_seq, 2);
+    assert!(!fs::read_dir(root.path()).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains(".restore-")));
+    assert_eq!(insert_domain(&store, 3, Sensitivity::Normal), 3);
+}
