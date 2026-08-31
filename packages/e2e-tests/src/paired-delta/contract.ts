@@ -65,6 +65,7 @@ export interface ScenarioInterventions {
     r1: {
         insertAfterTurnId: string;
         query: string;
+        /** Symbolic `mem-*` handles, never wire ids: a `mcm_<32hex>` public claim id is assigned by `seedGoldMemories` per run, so freezing one would freeze a value that never resolves. A runner must map each handle to the seeded `publicClaimId` before calling `scriptedCtxSearchTurn` and must assert the wire result against that resolved id — passing a handle through unmapped demotes the turn to a text search that cannot serve project-memory claims, silently collapsing R1 onto R0. commentlint: allow(JUDGE) */
         locatorIds: string[];
     };
     r2: {
