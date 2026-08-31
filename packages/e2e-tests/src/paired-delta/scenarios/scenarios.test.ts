@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { validateCheckVector } from "../contract";
+import { r3PromptEvidence, validateCheckVector } from "../contract";
 import { CHARS_PER_TOKEN } from "../../ballast";
 import { pairedDeltaScenarios } from "./index";
 import { r1QueryLeaksAnswer, r1WireDelivered } from "./support";
@@ -77,9 +77,11 @@ describe("paired-delta authored scenarios", () => {
             }
         });
 
-        it(`${scenario.scenarioId} carries the same gold in R2 and R3`, () => {
-            expect(scenario.interventions.r2.memories.map(({ claim }) => claim))
-                .toContain(scenario.interventions.r3.evidence);
+        it(`${scenario.scenarioId} derives R3 gold from the R2 claims`, () => {
+            const prompt = r3PromptEvidence(scenario);
+            for (const { claim } of scenario.interventions.r2.memories) {
+                expect(prompt).toContain(claim);
+            }
         });
 
         it(`${scenario.scenarioId} flags a resolved id that reveals the answer`, () => {

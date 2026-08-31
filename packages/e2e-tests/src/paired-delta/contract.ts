@@ -3,6 +3,10 @@ import { makeContractPrimitives } from "../contract-primitives";
 import { ID_SHAPED_QUERY_MAX_TOKENS } from "../../../plugin/src/features/magic-context/search";
 import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 import { PUBLIC_CLAIM_ID_PREFIX } from "../../../plugin/src/features/magic-context/memory/claim-operation-contract";
+import {
+    SCRIPTED_SEARCH_FOLLOW_UP,
+    SCRIPTED_SEARCH_PROMPT_PREFIX,
+} from "../oracle-arms/scripted-ctx-search";
 
 export const ARM_IDS = ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"] as const;
 export type ArmId = (typeof ARM_IDS)[number];
@@ -87,9 +91,6 @@ export interface ScenarioInterventions {
     };
     r2: {
         memories: Array<{ claim: string; evidence: string }>;
-    };
-    r3: {
-        evidence: string;
     };
 }
 
@@ -212,7 +213,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     const turnIds = new Set(turnScript.map(({ id }) => id));
 
     const interventions = p.record(root.interventions, "scenario.interventions");
-    p.exact(interventions, ["r1", "r2", "r3"], "scenario.interventions");
+    p.exact(interventions, ["r1", "r2"], "scenario.interventions");
     const r1 = p.record(interventions.r1, "scenario.interventions.r1");
     p.exact(r1, ["insertAfterTurnId", "locatorIds"], "scenario.interventions.r1");
     const expectedAnswer = p.string(root.expectedAnswer, "scenario.expectedAnswer");
@@ -223,6 +224,11 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     /** Every resolved locator begins with this prefix, so an answer occurring inside it leaks from every id a reseed could produce — the runner's pre-search gate would never clear and the scenario could never execute. Only the prefix is invariant; a collision with the random hex is cleared by reseeding. commentlint: allow(JUDGE) */
     if (revealsAnswer(expectedAnswer, PUBLIC_CLAIM_ID_PREFIX)) {
         p.fail("scenario.expectedAnswer: collides-with-claim-id-prefix");
+    }
+    /** The R1 search turn adds this wrapper text to the transcript whatever the query resolves to, so an answer occurring in it is readable by the later probe without any retrieval — and unlike an id collision, no reseed can clear it. commentlint: allow(JUDGE) */
+    if ([SCRIPTED_SEARCH_PROMPT_PREFIX, SCRIPTED_SEARCH_FOLLOW_UP].some((text) =>
+        revealsAnswer(expectedAnswer, text))) {
+        p.fail("scenario.expectedAnswer: revealed-by-search-prompt");
     }
     const answerMatch = p.enumeration(root.answerMatch, ANSWER_MATCHES, "scenario.answerMatch");
     const leaks = (text: string): boolean => revealsAnswer(expectedAnswer, text);
@@ -297,16 +303,9 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     if (!memories.some(({ claim }) => suppliesAnswer(claim))) {
         p.fail("scenario.interventions.r2.memories: answer-absent");
     }
-    const r3 = p.record(interventions.r3, "scenario.interventions.r3");
     /** `r2.memories` is the declaration's only gold, so it is also what a runner seeds and resolves `r1.locatorIds` against. Unequal lengths leave a handle with no `publicClaimId` to map to and make R1 and R2 compare different gold sets; pairing is positional. commentlint: allow(JUDGE) */
     if (locatorIds.length !== memories.length) {
         p.fail("scenario.interventions.r1.locatorIds: memory-cardinality-mismatch");
-    }
-    p.exact(r3, ["evidence"], "scenario.interventions.r3");
-    const r3Evidence = p.string(r3.evidence, "scenario.interventions.r3.evidence");
-    /** R3 is the oracle upper bound and this string is the only gold it receives verbatim. Without the answer in it the arm cannot produce `expectedAnswer` at all, so `R3 - R2` would report missing gold as representation regret. commentlint: allow(JUDGE) */
-    if (!suppliesAnswer(r3Evidence)) {
-        p.fail("scenario.interventions.r3.evidence: answer-absent");
     }
 
     const absence = p.record(root.absencePrecondition, "scenario.absencePrecondition");
@@ -374,7 +373,6 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
                 locatorIds,
             },
             r2: { memories },
-            r3: { evidence: r3Evidence },
         },
         absencePrecondition: {
             evidenceTurnId,
@@ -472,6 +470,11 @@ export function parsePairedDeltaManifest(raw: unknown): PairedDeltaManifest {
     });
     p.unique(scenarios.map(({ scenarioId }) => scenarioId), "manifest.scenarios");
     return { schema: PAIRED_DELTA_MANIFEST_SCHEMA, scenarios };
+}
+
+/** The R3 arm receives its gold in the prompt rather than as memory, so its content is exactly the R2 claim set — deriving it keeps `R3 - R2` a comparison of representation instead of also comparing what each arm was told. commentlint: allow(JUDGE) */
+export function r3PromptEvidence(declaration: ScenarioDeclaration): string {
+    return declaration.interventions.r2.memories.map(({ claim }) => claim).join("\n");
 }
 
 export function validateCheckVector(

@@ -93,8 +93,6 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
             r2: {
                 memories: [{ claim: spec.evidence, evidence: spec.evidence }],
             },
-            /** Gold evidence verbatim, matching the R3 arm contract; injecting the bare answer would make the critical check trivially satisfiable and collapse the representation regret rung. commentlint: allow(JUDGE) */
-            r3: { evidence: spec.evidence },
         },
         absencePrecondition: {
             evidenceTurnId: "turn-evidence",

@@ -43,6 +43,10 @@ function locatorQuery(claims: readonly GoldMemoryId[]): string {
  * subsequent step, and must read any wire observation they need from an earlier
  * turn before scripting this one.
  */
+/** The invariant text this turn adds to the model-visible transcript, independent of the query. Exposed so a gold contract can reject an answer the prompt itself would reveal. commentlint: allow(JUDGE) */
+export const SCRIPTED_SEARCH_PROMPT_PREFIX = "Search project memory for oracle evidence: ";
+export const SCRIPTED_SEARCH_FOLLOW_UP = "oracle search complete";
+
 export async function scriptedCtxSearchTurn(
     harness: TestHarness,
     sessionId: string,
@@ -53,8 +57,8 @@ export async function scriptedCtxSearchTurn(
     const call = await runScriptedToolCall(harness, sessionId, {
         tool: "ctx_search",
         input: { query, sources: ["memory"], limit: 5 },
-        prompt: `Search project memory for oracle evidence: ${query}`,
-        followUpText: "oracle search complete",
+        prompt: `${SCRIPTED_SEARCH_PROMPT_PREFIX}${query}`,
+        followUpText: SCRIPTED_SEARCH_FOLLOW_UP,
     });
     return call.resultText;
 }

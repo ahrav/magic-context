@@ -33,7 +33,6 @@ function scenario(overrides: Partial<ScenarioDeclaration> = {}): ScenarioDeclara
             r2: {
                 memories: [{ claim: "The ID is alpha-17.", evidence: "Remember ID alpha-17." }],
             },
-            r3: { evidence: "The required ID is alpha-17." },
         },
         absencePrecondition: {
             evidenceTurnId: "turn-evidence",
@@ -111,7 +110,6 @@ describe("paired-delta scenario contract", () => {
             interventions: {
                 ...base.interventions,
                 r2: { memories: [{ claim: content, evidence: content }] },
-                r3: { evidence: content },
             },
         });
         expect(() =>
@@ -154,14 +152,6 @@ describe("paired-delta scenario contract", () => {
                 },
             })),
         ).toThrow(/r2\.memories: answer-absent/);
-        expect(() =>
-            parseScenarioDeclaration(scenario({
-                interventions: {
-                    ...base.interventions,
-                    r3: { evidence: "Some unrelated context." },
-                },
-            })),
-        ).toThrow(/r3\.evidence: answer-absent/);
         expect(() =>
             parseScenarioDeclaration(scenario({
                 turnScript: [

@@ -55,6 +55,8 @@ function semanticInput(declaration: ScenarioDeclaration): unknown {
 const LANE_VALIDATION_FILES = [
     "src/paired-delta/contract.ts",
     "src/paired-delta/scenarios/support.ts",
+    /** Where every declaration is passed through `parseScenarioDeclaration`; dropping that call would admit unvalidated declarations while leaving every other digest input byte-identical. commentlint: allow(JUDGE) */
+    "src/paired-delta/scenarios/index.ts",
 ] as const;
 
 /** Read once per root rather than once per scenario: these files are identical for every entry, so re-reading them per scenario is pure I/O that grows with the pool. commentlint: allow(JUDGE) */
