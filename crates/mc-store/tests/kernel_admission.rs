@@ -4333,3 +4333,120 @@ fn a_self_admitting_record_does_not_inherit_a_revoked_approval() {
     granted.event.approval_object_id = Some("approval-b".to_string());
     assert_eq!(admit(&store, granted, "regranted", "regranted"), "admit");
 }
+
+#[test]
+fn a_hidden_approval_is_not_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // Row-level `automatic` says nothing about sensitivity, so an accepted ADR can
+    // be classified beyond every automatic surface and still look eligible.
+    connection
+        .execute_batch(
+            "INSERT INTO object_registry(
+                 object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                 created_commit_seq,sensitivity_class
+             ) VALUES ('secret-adr','decision','approval-domain','fixture','secret-adr',1,1,
+                       'secret');
+             INSERT INTO decisions(
+                 decision_id,object_id,decision_kind,decision_payload,created_commit_seq,
+                 sensitivity_class
+             ) VALUES ('secret-adr-decision','secret-adr','adr_accepted',X'7b7d',1,'secret');
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'secret-adr-admission','secret-adr','fixture','secret-adr',1,'explicit_user',
+                 'user_explicit','other','approved','approved','active','automatic','admit',
+                 'secret',1,'fixture',1,1
+             );",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+    // The stored row really does claim the automatic surface.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT visibility||'/'||sensitivity_class FROM admission_decisions
+             WHERE subject_object_id='secret-adr'"
+        ),
+        "automatic/secret"
+    );
+    // And serving withholds it everywhere.
+    assert!(store
+        .visible_as_of(Surface::ExplicitSearch, 1)
+        .unwrap()
+        .rows
+        .iter()
+        .all(|row| row.object.object_id != "secret-adr"));
+
+    stage(&store, "blocked-by-secret-authority");
+    let mut approved = request("blocked-by-secret-authority");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("secret-adr".to_string());
+    store
+        .commit(intent("blocked-by-secret-authority"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "secret-authority-domain".to_string(),
+                    object_id: "secret-authority-object".to_string(),
+                    name: "name-blocked-by-secret-authority".to_string(),
+                },
+            )?;
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='secret-authority-object'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn support_above_earned_history_never_serves() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let seq = insert_subject(
+        &store,
+        "impossible",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    drop(store);
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // Support clamps history; it cannot exceed it. Every other field stays valid.
+    connection
+        .execute(
+            "UPDATE admission_decisions SET maturity='candidate',effective_maturity='verified'
+             WHERE subject_object_id='object-impossible'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT disposition||'/'||visibility FROM admission_decisions
+             WHERE subject_object_id='object-impossible'"
+        ),
+        "active/automatic"
+    );
+    for surface in [Surface::AutoInject, Surface::ExplicitSearch] {
+        assert!(
+            store.visible_as_of(surface, seq).unwrap().rows.is_empty(),
+            "effective maturity above historical must fail closed"
+        );
+    }
+}

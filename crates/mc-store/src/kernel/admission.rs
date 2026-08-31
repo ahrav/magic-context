@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "f464ffa934bdaa62f8ded420814d5575a08d51f9e85291bb3e3a0e015fd0b1ac";
+    "45e40ff443b4f8ce2d8ac1178187fdb158f44315be7d4c9cee14694ecab201e2";
 
 /// The enclosing query must bind `o` to `object_registry`.
 /// Serving and approval validation must agree on which decision governs an
@@ -537,6 +537,9 @@ fn approval_qualifies_predicate(object_column: &str) -> String {
                AND a.effective_maturity IN ('approved','enforced')
                AND a.disposition='active'
                AND a.visibility='automatic'
+               AND a.sensitivity_class='normal'
+               AND o.sensitivity_class='normal'
+               AND a.maturity IN ('approved','enforced')
                AND a.policy_revision={POLICY_REVISION}
                AND {own_decision}
          )"
@@ -1781,13 +1784,20 @@ fn decided_row(
     let stored = row
         .get::<_, Option<String>>(&*format!("{prefix}visibility"))?
         .and_then(|value| VisibilityRow::try_from(value.as_str()).ok());
+    let historical = row
+        .get::<_, Option<String>>(&*format!("{prefix}maturity"))?
+        .and_then(|value| Maturity::try_from(value.as_str()).ok());
     let expected = match (
         row.get::<_, Option<String>>(&*format!("{prefix}effective_maturity"))?
             .map(|value| Maturity::try_from(value.as_str())),
         row.get::<_, Option<String>>(&*format!("{prefix}disposition"))?
             .map(|value| Disposition::try_from(value.as_str())),
     ) {
-        (Some(Ok(effective)), Some(Ok(disposition))) => {
+        // Support can only clamp what history earned, so effective above
+        // historical is a state the evaluator cannot produce.
+        (Some(Ok(effective)), Some(Ok(disposition)))
+            if historical.is_some_and(|historical| effective.rank() <= historical.rank()) =>
+        {
             Some(visibility_row(effective, disposition))
         }
         _ => None,
@@ -1824,11 +1834,13 @@ impl KernelStore {
                 .prepare(&format!(
                     "SELECT o.object_id,o.object_kind,o.domain_id,o.source_kind,o.source_id,
                             o.source_revision,o.created_commit_seq,NULL,NULL,o.sensitivity_class,
+                            d.maturity AS d_maturity,
                             d.effective_maturity AS d_effective_maturity,
                             d.disposition AS d_disposition,d.visibility AS d_visibility,
                             d.taint_class AS d_taint_class,d.source_class AS d_source_class,
                             d.policy_revision AS d_policy_revision,
                             d.sensitivity_class AS d_sensitivity_class,
+                            s.maturity AS s_maturity,
                             s.effective_maturity AS s_effective_maturity,
                             s.disposition AS s_disposition,s.visibility AS s_visibility,
                             s.taint_class AS s_taint_class,s.source_class AS s_source_class,
