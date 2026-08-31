@@ -1088,3 +1088,82 @@ fn fifo_swapped_under_a_live_reference_does_not_block_reads() {
     let error = store.read_artifact(&handle).unwrap_err();
     assert_eq!(error.kind(), ArtifactErrorKind::MissingObject);
 }
+
+#[test]
+fn oversized_identity_field_is_rejected_before_redaction() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    for mutate in [
+        (|r: &mut ArtifactIngestRequest| r.evidence_id = "key=a ".repeat(4000))
+            as fn(&mut ArtifactIngestRequest),
+        |r: &mut ArtifactIngestRequest| r.object_id = "key=a ".repeat(4000),
+        |r: &mut ArtifactIngestRequest| r.object_kind = "key=a ".repeat(4000),
+        |r: &mut ArtifactIngestRequest| r.domain_id = "key=a ".repeat(4000),
+        |r: &mut ArtifactIngestRequest| r.source_kind = "key=a ".repeat(4000),
+        |r: &mut ArtifactIngestRequest| r.source_id = "key=a ".repeat(4000),
+    ] {
+        let mut flooded = request("identity-flood", b"small payload".to_vec());
+        mutate(&mut flooded);
+        let error = store.ingest_artifact(flooded).unwrap_err();
+
+        assert_eq!(error.kind(), ArtifactErrorKind::TextFieldTooLong);
+    }
+
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
+fn swapped_objects_directory_is_not_followed_when_reading() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(request("swap-read", b"swap read bytes".to_vec()))
+        .unwrap();
+    assert_eq!(store.read_artifact(&handle).unwrap(), b"swap read bytes");
+
+    let artifacts = root.path().join("artifacts");
+    let objects = artifacts.join("objects");
+    let shard = &handle.digest[..2];
+    let name = &handle.digest[2..];
+
+    let foreign = root.path().join("foreign-objects");
+    fs::create_dir(&foreign).unwrap();
+    fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+    let foreign_shard = foreign.join(shard);
+    fs::create_dir(&foreign_shard).unwrap();
+    fs::set_permissions(&foreign_shard, fs::Permissions::from_mode(0o700)).unwrap();
+    let foreign_object = foreign_shard.join(name);
+    fs::write(
+        &foreign_object,
+        fs::read(objects.join(shard).join(name)).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&foreign_object, fs::Permissions::from_mode(0o600)).unwrap();
+
+    fs::rename(&objects, artifacts.join("objects-real")).unwrap();
+    std::os::unix::fs::symlink(&foreign, &objects).unwrap();
+
+    let error = store.read_artifact(&handle).unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::MissingObject);
+}
+
+#[test]
+fn nested_directory_under_a_shard_is_not_charged_against_the_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open_with_artifact_cap_for_test(root.path(), 4096).unwrap();
+    seed_domain(&store);
+
+    let nested = root.path().join("artifacts/objects/zz/nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("bulk"), vec![b'q'; 8192]).unwrap();
+
+    let handle = store
+        .ingest_artifact(request("nested-usage", b"nested usage".to_vec()))
+        .unwrap();
+    assert_eq!(store.read_artifact(&handle).unwrap(), b"nested usage");
+}

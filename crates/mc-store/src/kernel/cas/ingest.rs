@@ -69,19 +69,6 @@ impl PreparedArtifact {
             request.domain_id.as_str(),
             request.source_kind.as_str(),
             request.source_id.as_str(),
-        ]
-        .into_iter()
-        .any(|field| identity(field).is_err())
-        {
-            return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
-        }
-        if [
-            request.evidence_id.as_str(),
-            request.object_id.as_str(),
-            request.object_kind.as_str(),
-            request.domain_id.as_str(),
-            request.source_kind.as_str(),
-            request.source_id.as_str(),
             request.media_type.as_str(),
             request.retention_class.as_str(),
             request.intent.producer.as_str(),
@@ -93,6 +80,19 @@ impl PreparedArtifact {
         .any(|field| field.len() > MAX_TEXT_FIELD_BYTES)
         {
             return Err(ArtifactError::new(ArtifactErrorKind::TextFieldTooLong));
+        }
+        if [
+            request.evidence_id.as_str(),
+            request.object_id.as_str(),
+            request.object_kind.as_str(),
+            request.domain_id.as_str(),
+            request.source_kind.as_str(),
+            request.source_id.as_str(),
+        ]
+        .into_iter()
+        .any(|field| identity(field).is_err())
+        {
+            return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
         if request.evidence_id.trim().is_empty()
             || request.object_id.trim().is_empty()
@@ -523,7 +523,7 @@ impl KernelStore {
         if tx.commit().is_err() || protected != 0 {
             return;
         }
-        let Ok(objects) = File::open(self.artifacts_path.join("objects")) else {
+        let Ok(objects) = self.open_objects_directory() else {
             self.latch_cas_failure();
             return;
         };
@@ -778,16 +778,24 @@ fn verify_object(shard: &File, name: &str, digest: &str) -> Result<(), ArtifactE
     Ok(())
 }
 
-fn regular_file_bytes(directory: &std::path::Path) -> Result<u64, StorageError> {
+fn regular_file_bytes(objects: &std::path::Path) -> Result<u64, StorageError> {
     let mut bytes = 0_u64;
-    let entries = fs::read_dir(directory).map_err(classify_io)?;
-    for entry in entries {
+    for entry in fs::read_dir(objects).map_err(classify_io)? {
         let entry = entry.map_err(classify_io)?;
         let metadata = entry.metadata().map_err(classify_io)?;
         if metadata.file_type().is_file() {
             bytes = bytes.saturating_add(metadata.len());
-        } else if metadata.file_type().is_dir() {
-            bytes = bytes.saturating_add(regular_file_bytes(&entry.path())?);
+            continue;
+        }
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        for shard_entry in fs::read_dir(entry.path()).map_err(classify_io)? {
+            let shard_entry = shard_entry.map_err(classify_io)?;
+            let shard_metadata = shard_entry.metadata().map_err(classify_io)?;
+            if shard_metadata.file_type().is_file() {
+                bytes = bytes.saturating_add(shard_metadata.len());
+            }
         }
     }
     Ok(bytes)
