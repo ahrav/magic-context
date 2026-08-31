@@ -866,7 +866,7 @@ fn validate_pypi(value: &[u8]) -> OfflineVerdict {
     }
 }
 
-// Recognized prefixes return Invalid for body-shape violations; unrecognized prefixes return Indeterminate. The upstream Slack rules spell the first segment after the prefix as a numeric identifier, except `xox[ar]`, which allows one alphanumeric segment.
+// Unsupported prefixes and unparsable `xoxe` values return Indeterminate; malformed shapes for supported prefixes return Invalid. `xapp` requires only its first segment to start with a digit, while `xoxa` and `xoxr` allow one alphanumeric segment.
 fn validate_slack(value: &[u8]) -> OfflineVerdict {
     if value.len() < 10 {
         return OfflineVerdict::Indeterminate;
@@ -882,23 +882,27 @@ fn validate_slack(value: &[u8]) -> OfflineVerdict {
     } else {
         return OfflineVerdict::Indeterminate;
     };
-    let numeric_identifier = matches!(prefix, b"xoxb" | b"xoxp" | b"xoxo" | b"xoxs")
-        || prefix.eq_ignore_ascii_case(b"xapp")
-        || prefix.eq_ignore_ascii_case(b"xoxe");
-    let alphanumeric_identifier = matches!(prefix, b"xoxa" | b"xoxr");
-    if !numeric_identifier && !alphanumeric_identifier {
+    let segments: Vec<&[u8]> = value[body_start..].split(|byte| *byte == b'-').collect();
+    let leading = match segments.split_last() {
+        Some((_, leading)) if !leading.is_empty() => leading,
+        _ => &segments[..],
+    };
+    let starts_with_digit = |segment: &[u8]| segment.first().is_some_and(u8::is_ascii_digit);
+    let shaped = if matches!(prefix, b"xoxa" | b"xoxr") {
+        segments.first().is_some_and(|segment| {
+            !segment.is_empty() && segment.iter().all(u8::is_ascii_alphanumeric)
+        })
+    } else if prefix.eq_ignore_ascii_case(b"xapp") {
+        segments
+            .first()
+            .is_some_and(|segment| starts_with_digit(segment))
+    } else if matches!(prefix, b"xoxb" | b"xoxp" | b"xoxo" | b"xoxs")
+        || prefix.eq_ignore_ascii_case(b"xoxe")
+    {
+        leading.iter().all(|segment| starts_with_digit(segment))
+    } else {
         return OfflineVerdict::Indeterminate;
-    }
-    let segment = value[body_start..]
-        .split(|byte| *byte == b'-')
-        .next()
-        .unwrap_or_default();
-    let shaped = !segment.is_empty()
-        && if alphanumeric_identifier {
-            segment.iter().all(u8::is_ascii_alphanumeric)
-        } else {
-            segment.iter().all(u8::is_ascii_digit)
-        };
+    };
     if shaped {
         OfflineVerdict::Valid
     } else {

@@ -569,20 +569,45 @@ fn local_context_rejects_key_names_embedded_in_other_identifiers() {
     }
 }
 
-/// A recognized prefix over a malformed body is invalid, not unverifiable.
+/// A recognized prefix over a malformed body is invalid, not unverifiable. The
+/// accepted cases are one per upstream Slack shape.
 #[test]
 fn slack_validation_rejects_malformed_bodies() {
-    let scanner = Scanner::new(ScanProfile::Conservative).unwrap();
-    for input in ["xoxb-not-a-real-token", "xoxb-GGGGGGGGGG"] {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    for input in [
+        "xoxb-not-a-real-token",
+        "xoxb-1234567890-not-a-real-token",
+        "xoxb-GGGGGGGGGG",
+        "xapp-notadigit-A012345-1234567890-abcdef",
+    ] {
         assert!(
             scanner.scan(input).unwrap().findings.is_empty(),
             "{input} was reported as a Slack token"
         );
     }
-    let shaped = "xoxp-1234567890-1234567890-1234567890-abcdefghijklmnopqrstuvwxyz1234";
+    // Bodies are joined to their prefix at run time so no line of this file holds
+    // a well-formed token, which GitHub push protection rejects.
+    let prefix = "xox";
+    for body in [
+        "b-1234567890123-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx",
+        "b-1234567890-1234567890Ab-Cd",
+        "b-12345678-abcdefghijklmnopqr",
+        "p-1234567890-1234567890-1234567890-abcdefghijklmnopqrstuvwxyz1234",
+        "o-1-22-333-abcdef123456",
+        "a-2-abc12345",
+        "r-abc12345678",
+        "e-1-ABCDEF0123456789ABCDEF0123456789",
+    ] {
+        let input = format!("{prefix}{body}");
+        assert!(
+            !scanner.scan(&input).unwrap().findings.is_empty(),
+            "{input} stopped reporting"
+        );
+    }
+    let app = format!("{}-1-A012345-1234567890-abcdef", "xapp");
     assert!(
-        !scanner.scan(shaped).unwrap().findings.is_empty(),
-        "a well-formed token stopped reporting"
+        !scanner.scan(&app).unwrap().findings.is_empty(),
+        "{app} stopped reporting"
     );
 }
 
