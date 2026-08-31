@@ -68,10 +68,12 @@ executes. The situation needs a shrunken budget (a constructor exists,
 - Findings: under-subtraction is impossible; over-subtraction saturates at
   zero and would over-free capacity, the opposite failure. Out of scope for
   this record; the charge-conservation records own it.
+- Missing evidence: none.
 - Conclusion: resolved with answer — different property.
 
 ### Q: is a poisoned wake mutex a hang path?
 
 - Sources examined: `lock_unpoisoned` usage at `:1713`, `:1719`.
 - Findings: poison is bypassed, not propagated; the signal still fires.
+- Missing evidence: none.
 - Conclusion: resolved with answer — no.

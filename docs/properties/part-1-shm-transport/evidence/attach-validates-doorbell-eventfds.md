@@ -78,4 +78,5 @@ gate Linux-shaped; a platform without that readlink would fail closed
   post-attach fcntl; it touches `FD_CLOEXEC` (F_SETFD), not `O_NONBLOCK`
   (F_SETFL).
 - Findings: no F_SETFL call exists in the crate outside the unit test.
+- Missing evidence: none.
 - Conclusion: resolved with answer — no.

@@ -72,6 +72,7 @@ re-arm (`lib.rs:1226-1235`) landing during a pending callback.
 - Sources examined: `Doorbell::signal` (`ring.rs:416-428`).
 - Findings: `EAGAIN` on write means the counter is at its maximum, which
   already reads as `POLLIN`; treating it as success loses nothing.
+- Missing evidence: none.
 - Conclusion: resolved with answer — no.
 
 ### Q: is the generation bump alone sufficient when no epoch is parked?
@@ -81,6 +82,7 @@ re-arm (`lib.rs:1226-1235`) landing during a pending callback.
 - Findings: an unparked consumer is by definition about to run
   `data_available` or `arm_data_wait`, both of which observe the published
   cursor or the changed generation before blocking.
+- Missing evidence: none.
 - Conclusion: resolved with answer — yes, for consumers using the arm
   protocol; a consumer blocking on the raw fd without arming would race, and
   none exists at HEAD.

@@ -217,7 +217,7 @@ and asserts on the client's own observable behaviour.
 **Zero doctests, so no check resident in `client.rs` is CI-executed.**
 `grep -c '```'` over the file returns 0: there is no code fence, `text` fence, or
 `compile_fail` block anywhere in its 3,998 lines. This matters because
-`cargo test -p mc-host --doc` **does** run, at `ci.yml:190` under the step name
+`cargo test -p mc-host --doc` **does** run, at `ci.yml:175` under the step name
 "Rust lease non-escape", and it builds the lib target's doctests. Sub-part 2b has
 two `compile_fail` doctests (`frame_channel.rs:296-301`, `:303-308`) and they are
 its only CI-executed source-resident checks. 2d has no equivalent. The sub-part's

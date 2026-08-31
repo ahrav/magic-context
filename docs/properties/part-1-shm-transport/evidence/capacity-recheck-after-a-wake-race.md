@@ -78,6 +78,7 @@ Release-not-SeqCst parked resets.
   this park epoch, so capacity freed by that earlier wake must be re-checked
   after the drain or it is only represented by a token the producer just
   discarded.
+- Missing evidence: none.
 - Conclusion: resolved with answer — the drain is why the second retry
   exists.
 
@@ -91,4 +92,6 @@ Release-not-SeqCst parked resets.
   SeqCst would validate different code.
 - Findings: the pairing argument above is by hand; no concurrency tool runs
   anywhere in the repository (existing-checks.md, concurrency section).
+- Missing evidence: no loom or Miri model of the park/wake protocol exists
+  anywhere in the repository.
 - Conclusion: unresolved, needs a loom or Miri pass over the wake protocol.

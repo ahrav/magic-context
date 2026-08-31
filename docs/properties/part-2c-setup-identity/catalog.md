@@ -220,7 +220,7 @@ removed with every other macOS job by PR #131 (merge `5d638e3e8`).
 So the 2 tests in the peer's `setup.rs` do run while the 11 in `auth.rs` that pin
 the same proof construction on the host side do not.
 
-**There is no other source-resident check.** `ci.yml:190` runs
+**There is no other source-resident check.** `ci.yml:175` runs
 `cargo test -p mc-host --doc`, but this sub-part has zero doctests: a grep for
 `/// ``` ` and `//! ``` ` fences across `setup_socket.rs`, `auth.rs`,
 `instance.rs` and `connection_file.rs` returns zero in each file, verified at

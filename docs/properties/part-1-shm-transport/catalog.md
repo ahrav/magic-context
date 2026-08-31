@@ -737,7 +737,8 @@ Verified by direct read of both signatures:
 (`ring.rs:1769`) hands that identity to the producer. No role, owner, or
 lease-token check exists on the release path.
 Reachability verdict: **not reachable in the shipped two-process topology.**
-Re-verified against `ring_transport.rs` at `e447c927, and again at post-#131 HEAD (2026-08-31)` after the refactor rewrote
+Re-verified against `ring_transport.rs` at `e447c927`, and again at post-#131
+HEAD (2026-08-31), after the refactor rewrote
 every host-side producer path, because the verdict rests on caller behaviour that
 the refactor could have changed. It did not. Every non-test `commit` caller still
 discards the returned identity: all three host call sites put `commit` in

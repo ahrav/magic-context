@@ -1555,7 +1555,7 @@ other would double-count in the wrong direction.
 rather than inherited.** `decode_header` has three production call sites and one
 behind a test-only hook. Production: `ring_transport.rs:503` in `receive_one`,
 paired with `validate_inbound_header` at `:505`; `ring_transport.rs:729` in
-`RingClientEndpoint::try_recv_with`; and `client.rs:1908` in `decode_outbound`.
+`RingClientEndpoint::try_recv_with`; and `client.rs:1978` in `decode_outbound`.
 The fourth, `ring_transport.rs:593`, is inside the `if let Some(hook)` branch at
 `:592` and so is reached only through the test-only `PublishHook` this catalog
 already labels. The ungated chain under the first of those is the one this
@@ -1595,7 +1595,7 @@ Type: safety
 Reachability: default-production — `decode_header` (`wire.rs:306`) has three
 production call sites, all on ungated paths: `ring_transport.rs:503` in
 `receive_one`, `ring_transport.rs:729` in `RingClientEndpoint::try_recv_with`,
-and `client.rs:1908` in `decode_outbound`. The first is under the chain this
+and `client.rs:1978` in `decode_outbound`. The first is under the chain this
 catalog established against three misleading signals: `RingTransport` built
 unconditionally at `runtime.rs:876`, stored non-optionally at `:104`,
 `ring.prepare` called by every authenticated connection at `connection.rs:148`.
@@ -1644,10 +1644,10 @@ second test's span is `:745-774`, not `:745-773`; the closing brace is at 774
 and the lens range truncated it by one line.
 Impact: today, none observable, and the reason was refreshed at carry time. All
 three production callers pass an exactly-21-byte array, not a variable-length
-slice: `ring_transport.rs:503` and `:729` pass `&lease.wire_header()`, typed
+slice: `ring_transport.rs:503` and `:730` pass `&lease.wire_header()`, typed
 `[u8; WIRE_V2_HEADER_BYTES]` at `crates/mc-shm-transport/src/lease.rs:163` with
-that constant equal to 21 at `descriptor.rs:10`, and `client.rs:1908` passes
-`header_bytes: &[u8; HEADER_LEN]` narrowed at `:1907`. **The lens said "both
+that constant equal to 21 at `descriptor.rs:10`, and `client.rs:1978` passes
+`header_bytes: &[u8; HEADER_LEN]` narrowed at `:1977`. **The lens said "both
 production callers" and there are three; the count is repaired and the
 conclusion is unchanged.** The value of the record is that the reasoning keeping
 totality true lives nowhere in the tree, and the moment a caller passes a

@@ -67,6 +67,7 @@ frame at all would isolate the `wrote` path).
   inbound frame; neither side can monopolize a pass. The pre-fix test name,
   `ring_bridge_drains_inbound_between_sustained_writes`, pinned the inbound
   half; the renamed test pins both.
+- Missing evidence: none.
 - Conclusion: resolved with answer — no.
 
 ### Q: is one write per pass a throughput ceiling worth recording?
@@ -74,4 +75,5 @@ frame at all would isolate the `wrote` path).
 - Sources examined: `:1847-1861`; `CLIENT_DATA_QUEUE_FRAMES` queue bound.
 - Findings: deliberate shape, bounded queue, no evidence of a measured
   problem; a per-pass batch would change deadline fairness.
+- Missing evidence: none.
 - Conclusion: resolved with answer — not a property; noted as context only.

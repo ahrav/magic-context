@@ -80,5 +80,7 @@ makes "everything before `new_reclaimed` is dead" a sound premise.
   `arena_write == new_reclaimed` with both mid-lap is a state no test
   constructs, and the equality is between values a hostile peer cannot forge
   only because both pages are producer-owned.
+- Missing evidence: no test constructs the `arena_write == new_reclaimed`
+  state with a wrapped cursor.
 - Conclusion: unresolved, needs a test that reaches the exception with a
   wrapped cursor.

@@ -264,7 +264,7 @@ and the doctest at `handler.rs:213-219` asserts that constructing
 `RequestOutcome::Response { body: Vec::<u8>::new(), binary: false }` must fail
 to compile. This is the sharpest disagreement in the sub-part because the two
 sides are not merely unsynchronised, they are mechanically opposed: the document
-describes a construction, and a check that **runs in CI** (`ci.yml:190`) fails
+describes a construction, and a check that **runs in CI** (`ci.yml:175`) fails
 the build if that construction ever becomes possible. The mechanism the code
 enforces is absent from the document — `OutputBuffer`, `reserve_output`, and
 `output_from_writer` appear nowhere in `docs/mc-host-wire-protocol.md`, grepped,
@@ -301,7 +301,7 @@ CI-executed check on any record in this catalog.** "Zero executed by CI" is true
 of the 121 tests in the five source files and six subject binaries. It is not true
 of this sub-part's *record coverage*, because one record is asserted exactly by a
 test in a binary CI does name.
-`tests/lifecycle.rs:576-657` `shutdown_refuses_new_routes_and_new_routed_work`
+`tests/lifecycle.rs:570-651` `shutdown_refuses_new_routes_and_new_routed_work`
 drives a `route.open` and a routed request into one draining host and asserts
 `target_unavailable` and `server_busy` respectively, which is
 [req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes](#req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes)
@@ -315,7 +315,7 @@ what produced the error.
 
 The four doctests are the exception and they matter. All four are
 `compile_fail`, all four are in `handler.rs`, and all four execute because
-`handler.rs` is `pub mod` (`lib.rs:17`) and `ci.yml:190` runs
+`handler.rs` is `pub mod` (`lib.rs:17`) and `ci.yml:175` runs
 `cargo test -p mc-host --doc` under the step name "Rust lease non-escape",
 printed and confirmed.
 
@@ -1079,13 +1079,13 @@ external shutdown signal, with a client pipelining both a routed request and a
 Confidence: high — [evidence](evidence/req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes.md).
 Both call sites read; protocol §10.2's two retry rows compared.
 Existing check: **corrected during disposition from "none".**
-`tests/lifecycle.rs:576-657` `shutdown_refuses_new_routes_and_new_routed_work`
+`tests/lifecycle.rs:570-651` `shutdown_refuses_new_routes_and_new_routed_work`
 asserts this property exactly and in the record's own shape: it holds a drain open
-with a parked handler (`:590-606`), spawns the shutdown (`:611`), waits for the
-publication to be unlinked (`:614-621`), then sends a `route.open` and asserts
-`open_error.error_code() == "target_unavailable"` (`:626-638`) and sends a routed
+with a parked handler (`:584-600`), spawns the shutdown (`:605`), waits for the
+publication to be unlinked (`:608-615`), then sends a `route.open` and asserts
+`open_error.error_code() == "target_unavailable"` (`:620-632`) and sends a routed
 request on the still-live route and asserts
-`request_error.error_code() == "server_busy"` (`:640-657`). Both codes, one
+`request_error.error_code() == "server_busy"` (`:634-651`). Both codes, one
 draining host, one test. Status `unaudited`. **In CI**, unlike every other check
 this catalog cites: `ci.yml:168-169` runs `--test client --test lifecycle` on
 Linux. The former macOS run of the same pair was removed by PR #131 (merge
@@ -1189,7 +1189,7 @@ hypothesis** about which oracle subsumes which, offered to order the work, not a
 verified claim. None has been tested. **Corrected during disposition: one record
 is CI-tested, though no dominance statement is.** The four `compile_fail` doctests
 bear on the handler API surface rather than on any record here, but
-`tests/lifecycle.rs:576-657` asserts the divergent-codes record exactly and runs
+`tests/lifecycle.rs:570-651` asserts the divergent-codes record exactly and runs
 at `ci.yml:178-179` and `:187`. That record appears in the fourth cluster below,
 and its presence there is the only place a hypothesis could be checked against
 something CI executes today.

@@ -24,17 +24,16 @@ field (`:83-92`). So from `:240` onward the endpoint thread is the sole owner.
 `catch_unwind` block at `:264-275` and immediately before
 `done_tx.send(())` at `:277`.
 
-`Admission::release` (`crates/mc-shm-transport/src/profile.rs:561-564`;
-`profile.rs` was not re-swept post-#131) consumes
+`Admission::release` (`crates/mc-shm-transport/src/profile.rs:512-515`) consumes
 `self`, calls `controller.release(self.charges)`, and sets state to `Released`.
-`AdmissionController::release` (`profile.rs:512-520`) takes the accounting lock,
+`AdmissionController::release` (`profile.rs:462-470`) takes the accounting lock,
 does a `checked_sub`, and on success also calls
 `accounting.release_spans(charges.spans_per_frame)`. On lock-poison it returns
-silently (`:513-515`); on `checked_sub` underflow it silently does nothing
-(`:516-519`).
+silently (`:463-465`); on `checked_sub` underflow it silently does nothing
+(`:466-469`).
 
 **The three paths that never reach `:276`.** All rely on `Admission`'s `Drop`
-(`profile.rs:583-589`), which releases when the state is still `Active`:
+(`profile.rs:531-537`), which releases when the state is still `Active`:
 
 1. `:249-255` — runtime build or `DuplexRing::create` failure. Sends
    `Err(RingUnavailable)` on the init channel and `return`s from the closure.

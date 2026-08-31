@@ -78,6 +78,7 @@ and a hostile double-`readinessHandled` probing the epoch pairing.
   eventfd; the thread then breaks, `failed` is not set on this branch, but
   `ensure_healthy` (`:268-276`) is also not consulted by the JS dispatcher.
   One extra callback on a dying reactor is the worst case.
+- Missing evidence: none.
 - Conclusion: resolved with answer — bounded single-shot exception on a
   terminal path; recorded in the catalog's open questions.
 
@@ -86,5 +87,6 @@ and a hostile double-`readinessHandled` probing the epoch pairing.
 - Sources examined: `:96-99` (builder), napi-rs weak threadsafe semantics.
 - Findings: a collected callback makes `call` return non-Ok, which rolls
   `pending` back (`:175-177`); no permanent wedge.
+- Missing evidence: none.
 - Conclusion: resolved with answer — no wedge; delivery stops when the JS
   side drops the function, which is shutdown behavior.
