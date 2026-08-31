@@ -102,6 +102,36 @@ export function lockSidelinePath(lock: string): string {
 }
 
 /**
+ * A live owner can replace the judged lock between `takeOverLock`'s ownership check and `renameSync`; verify `sideline`'s owner before removing it.
+ * `sideline` is the foreign owner's only lock record; restore it before removal, by `link` into the reclaimed path or by moving the directory itself.
+ * If neither restoration succeeds, leave `sideline` in place: deleting it can destroy a live owner's lock record, and an orphaned sideline only leaves `lock` unreclaimed.
+ * Exported for tests: the branch is reachable only through a rename that races a live claimant, which a single process cannot stage.
+ * commentlint: allow(JUDGE)
+ */
+export function restoreOrRemoveSideline(
+    lock: string,
+    sideline: string,
+    judged: LockAbandonment,
+): void {
+    if (sameLockOwner(readLockOwner(sideline), judged.owner)) {
+        rmSync(sideline, { recursive: true, force: true });
+        return;
+    }
+    try {
+        /** `link` refuses an occupied destination, so a third claimant that already published its own record is not overwritten. commentlint: allow(JUDGE) */
+        linkSync(join(sideline, LOCK_OWNER_FILE), join(lock, LOCK_OWNER_FILE));
+    } catch {
+        try {
+            renameSync(sideline, lock);
+        } catch {
+            return;
+        }
+        return;
+    }
+    rmSync(sideline, { recursive: true, force: true });
+}
+
+/**
  *
  * `renameSync` makes takeover exclusive: only the first waiter can move the expired lock from `lock`.
  * `rmSync(lock)` could delete a replacement lock and allow two waiters to enter the guarded operation.
@@ -122,25 +152,7 @@ export function takeOverLock(lock: string, judged: LockAbandonment): void {
         // A `renameSync` error makes `takeOverLock` return without deleting `lock`.
         return;
     }
-    // `rename` moves whatever occupies the path, and a live owner can replace the judged
-    // lock between the check above and that move. Re-reading the moved directory is what
-    // distinguishes the two: a foreign owner's lock is put back rather than deleted, and
-    // `link` refuses an occupied destination so a third claimant is not overwritten either.
-    if (!sameLockOwner(readLockOwner(sideline), judged.owner)) {
-        try {
-            linkSync(join(sideline, LOCK_OWNER_FILE), join(lock, LOCK_OWNER_FILE));
-        } catch {
-            try {
-                renameSync(sideline, lock);
-                return;
-            } catch {
-                // The path is occupied again, so the mover keeps nothing and deletes nothing.
-            }
-        }
-        rmSync(sideline, { recursive: true, force: true });
-        return;
-    }
-    rmSync(sideline, { recursive: true, force: true });
+    restoreOrRemoveSideline(lock, sideline, judged);
 }
 
 /** True when `lock` still carries this process's claim. A holder that intends to act on a lock reads it again rather than trusting acquisition, because reclamation of an expired lock cannot be made atomic against a concurrent reclaimer. */

@@ -95,6 +95,8 @@ export interface RolloutHandle {
 export interface RolloutStore {
     list(): RolloutRecord[];
     put(record: RolloutRecord): void;
+    /** Optional because a store need not hold anything: `list()` can claim a records path, and a run that rejects before any rollout frees the claim here so a corrected call can retry in the same process. commentlint: allow(JUDGE) */
+    release?(): void;
 }
 
 export interface RunnerDependencies {
@@ -564,8 +566,7 @@ function validateRunOptions(options: RunPairedDeltaOptions): void {
 }
 
 /**
- * A caller that owns the store releases it on rejection before retrying in the same process.
- * `RolloutStore` cannot release claims acquired by `store.list()`, so retries after rejection can fail with `RolloutStoreBusyError`.
+ * Rejections raised before any rollout release the store, so a corrected call can retry in the same process; a rejection after a rollout has run leaves the claim held because the run's records are the caller's to reconcile.
  * commentlint: allow(JUDGE)
  */
 export async function runPairedDelta(
@@ -600,6 +601,7 @@ export async function runPairedDelta(
     if (!options.resume) {
         const conflict = stored.find(inMatrix);
         if (conflict) {
+            options.store.release?.();
             throw new Error(
                 `records file already contains rollouts for this matrix ` +
                     `(${coordinateKey(conflict)}); resume the run or point ` +
@@ -617,6 +619,7 @@ export async function runPairedDelta(
         spentUsd += record.priorAttemptsCostUsd + record.costUsd;
         /** `parseRolloutRecords` bounds the file's whole total, but `RolloutStore` is an interface any caller can implement, so a store that skips that check still cannot hand this loop an unbounded ledger: an infinite `spentUsd` makes every cap comparison false and serializes as `null`. A store reaching this throw holds no records claim to release, because the file store rejects the same total while parsing. commentlint: allow(JUDGE) */
         if (!Number.isFinite(spentUsd)) {
+            options.store.release?.();
             throw new Error(
                 `records file spend total overflows the finite range at ` +
                     `${coordinateKey(record)}; point at a fresh records path`,
@@ -639,6 +642,39 @@ export async function runPairedDelta(
             };
             /** A completed record from another binding cannot be replaced and the coordinate key carries no binding, so any arm executed beside it could never form a valid comparison; the coordinate stops rather than paying for evidence it cannot use. commentlint: allow(JUDGE) */
             let coordinateBlocked = false;
+            /** A blocked coordinate can never form a valid comparison, so the primary arms are inspected before any of them runs: the record that blocks may belong to a later arm, and discovering it inside the loop lets the earlier arms pay for evidence the coordinate must discard. Only the primary arms are unconditionally scheduled, so preflighting the regret ladder would refuse coordinates whose ladder never runs. commentlint: allow(JUDGE) */
+            const blockingStoredArm = (armId: ArmId): RolloutCoordinate | null => {
+                const coordinate: RolloutCoordinate = {
+                    poolManifestFingerprint: options.poolManifestFingerprint,
+                    scenarioId: scenario.scenarioId,
+                    armId,
+                    replicateIndex,
+                };
+                const existing = storedByCoordinate.get(coordinateKey(coordinate));
+                if (existing === undefined) return null;
+                const boundToRun = bindingMatches(existing, options);
+                if (
+                    (!boundToRun || !completedIdentityMatches(existing, options)) &&
+                    existing.cell.runHealth === "completed"
+                ) {
+                    return coordinate;
+                }
+                if (
+                    boundToRun && isResumable(existing, options) &&
+                    !resumableEvidence(existing, scenario)
+                ) {
+                    return coordinate;
+                }
+                return null;
+            };
+            for (const armId of PRIMARY_ARM_IDS) {
+                const blocked = blockingStoredArm(armId);
+                if (blocked) {
+                    invalidStoredCoordinates.push(blocked);
+                    coordinateBlocked = true;
+                    break;
+                }
+            }
             const runArm = async (armId: ArmId): Promise<RolloutRecord | null> => {
                 /** Checked before anything is created: a blocked coordinate can be reached from the ladder as well as the primary loop, and the caller's own check runs only after this call would have paid. commentlint: allow(JUDGE) */
                 if (coordinateBlocked) return null;
@@ -651,23 +687,10 @@ export async function runPairedDelta(
                 const existing = storedByCoordinate.get(coordinateKey(coordinate));
                 const boundToRun = existing !== undefined && bindingMatches(existing, options);
                 if (existing) {
-                    if (!boundToRun || !completedIdentityMatches(existing, options)) {
-                        /** Only completed evidence is immutable: `put` replaces a non-completed record, so a failure left by another commit or model is re-run rather than abandoning the coordinate and leaving the comparison incomplete. commentlint: allow(JUDGE) */
-                        if (existing.cell.runHealth === "completed") {
-                            invalidStoredCoordinates.push(coordinate);
-                            coordinateBlocked = true;
-                            return null;
-                        }
-                    }
-                    // Completed records are immutable evidence; re-executing
-                    // one would pay for a rollout whose result the store must
-                    // then discard.
-                    /** A stored vector is only unique strings to the parser, which has no declaration; an id set that does not belong to this scenario would be rehydrated as evidence and can leave `score()` dividing by an empty selection. commentlint: allow(JUDGE) */
-                    if (
-                        boundToRun && isResumable(existing, options) &&
-                        !resumableEvidence(existing, scenario)
-                    ) {
-                        invalidStoredCoordinates.push(coordinate);
+                    /** The regret ladder is scheduled after the primary arms, so its records reach this check without a preflight; `blockingStoredArm` reads the same conditions and pushes the same coordinate. commentlint: allow(JUDGE) */
+                    const blocked = blockingStoredArm(armId);
+                    if (blocked) {
+                        invalidStoredCoordinates.push(blocked);
                         coordinateBlocked = true;
                         return null;
                     }
@@ -1145,15 +1168,12 @@ function finiteUsage(usage: TokenUsage): TokenUsage | null {
 
 /** Prices a rollout whose real usage is unknown at the scenario's context limit in and out. commentlint: allow(JUDGE) */
 function worstCaseUsd(scenario: ScenarioDeclaration, prices: TokenPrices): number {
-    return tokenCostUsd(
-        {
-            input: scenario.modelContextLimit,
-            output: scenario.modelContextLimit,
-            cacheCreation: 0,
-            cacheRead: 0,
-        },
-        prices,
-    );
+    /** Each prompt token is billed in exactly one category and the prompt cannot exceed the context limit, so the dearest prompt category bounds the whole prompt: hard-coding the cache counters to zero priced a cached-prefix call at nothing when cache pricing is the only material rate, and summing all three categories at full context would triple-count one prompt instead. commentlint: allow(JUDGE) */
+    const promptPricePerMillion = Math.max(prices.input, prices.cacheCreation, prices.cacheRead);
+    return (
+        scenario.modelContextLimit * promptPricePerMillion +
+        scenario.modelContextLimit * prices.output
+    ) / 1_000_000;
 }
 
 function exclusionCountsOf(
@@ -1253,14 +1273,16 @@ async function withRolloutDeadline<T>(
         };
         arm();
     });
-    const pending = work();
+    /** `work()` runs inside the guard because a `run()` or `prepare()` that throws synchronously — a valid implementation, since the contract only promises a returned promise — would otherwise escape before the timer could be cleared, leaving `expiry` armed to hold the process open and then reject with no consumer. commentlint: allow(JUDGE) */
+    let pending: Promise<T> | undefined;
     try {
+        pending = work();
         return await Promise.race([pending, expiry]);
     } finally {
         clearTimeout(timer);
         // On timeout the losing promise settles later with no consumer;
         // swallow its rejection so it cannot surface as unhandled.
-        pending.catch(() => {});
+        pending?.catch(() => {});
         expiry.catch(() => {});
     }
 }

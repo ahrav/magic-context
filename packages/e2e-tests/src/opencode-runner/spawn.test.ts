@@ -275,6 +275,42 @@ describe("opencode child lifecycle", () => {
                 })
             ).toThrow(/magicContextConfig must serialize to a JSON object/);
 
+            // The user config loader expands `{env:NAME}`, and `embedding.api_key` is the only
+            // channel for the remote embedding key, so the token itself must be writable.
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                    magicContextConfig: {
+                        embedding: {
+                            provider: "openai-compatible",
+                            api_key: "{env:EMBEDDING_KEY}",
+                        },
+                    },
+                })
+            ).not.toThrow();
+            expect(
+                readFileSync(join(env.configDir, "opencode", "magic-context.jsonc"), "utf8"),
+            ).toContain("{env:EMBEDDING_KEY}");
+
+            // Only a whole, named placeholder: a credential must not ride along behind one,
+            // and an empty or malformed name resolves to nothing.
+            for (
+                const value of [
+                    "{env:EMBEDDING_KEY} sk-ant-abcdefghijklmnopqrstuv",
+                    "sk-ant-abcdefghijklmnopqrstuv",
+                    "{env:}",
+                    "{env:9NOPE}",
+                    "prefix{env:EMBEDDING_KEY}",
+                ]
+            ) {
+                expect(() =>
+                    __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                        mockProviderURL: "http://127.0.0.1:4321",
+                        magicContextConfig: { embedding: { api_key: value } },
+                    })
+                ).toThrow(/magicContextConfig\.embedding\.api_key/);
+            }
+
             for (const header of ["Cookie", "Proxy-Authorization", "set-cookie"]) {                expect(() =>
                     __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
                         mockProviderURL: "http://127.0.0.1:4321",

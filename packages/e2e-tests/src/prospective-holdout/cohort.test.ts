@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { buildCohortClose, ProspectiveIntakeStore } from "./cohort";
 import { HoldoutContractError } from "./contract";
 import { reviewSanitizedIntake, staticPrivacyRejection } from "./intake";
-import { LOCK_OWNER_FILE, lockAbandoned, lockSidelinePath, takeOverLock, withRecoverableLock } from "./lock";
+import { LOCK_OWNER_FILE, lockAbandoned, lockSidelinePath, restoreOrRemoveSideline, takeOverLock, withRecoverableLock } from "./lock";
 import { deadPid, H1, H2, H3, sanitizedIntakeFixture, frozenEventFixture } from "./test-fixtures";
 
 const key = new TextEncoder().encode("c".repeat(32));
@@ -385,6 +385,51 @@ describe("cohort store lock", () => {
             expect(existsSync(lock)).toBe(true);
             expect(JSON.parse(readFileSync(join(lock, LOCK_OWNER_FILE), "utf8"))).toEqual(fresh);
             expect(existsSync(lockSidelinePath(lock))).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps a displaced live lock when neither restoration can land", () => {
+        const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
+        try {
+            const lock = join(root, ".lock");
+            const sideline = lockSidelinePath(lock);
+            // A reclaimer judged a dead holder, but renamed away a live holder's replacement lock.
+            const displaced = { pid: process.pid, nonce: "displaced-holder", acquiredAt: Date.now() };
+            mkdirSync(sideline, { recursive: true });
+            writeFileSync(join(sideline, LOCK_OWNER_FILE), `${JSON.stringify(displaced)}\n`);
+            // A third claimant published its own record, so `link` is refused and the sideline directory cannot move back.
+            const third = { pid: process.pid, nonce: "third-claimant", acquiredAt: Date.now() };
+            mkdirSync(lock, { recursive: true });
+            writeFileSync(join(lock, LOCK_OWNER_FILE), `${JSON.stringify(third)}\n`);
+
+            const judgedDead = {
+                owner: { pid: 999_999, nonce: "abandoned-worker", acquiredAt: Date.now() - 600_000 },
+            };
+            restoreOrRemoveSideline(lock, sideline, judgedDead);
+
+            expect(existsSync(join(sideline, LOCK_OWNER_FILE))).toBe(true);
+            expect(JSON.parse(readFileSync(join(sideline, LOCK_OWNER_FILE), "utf8")))
+                .toEqual(displaced);
+            expect(JSON.parse(readFileSync(join(lock, LOCK_OWNER_FILE), "utf8"))).toEqual(third);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("removes the sideline when it still holds the judged abandoned lock", () => {
+        const root = mkdtempSync(join(tmpdir(), "cohort-lock-"));
+        try {
+            const lock = join(root, ".lock");
+            const sideline = lockSidelinePath(lock);
+            const stale = { pid: 999_999, nonce: "abandoned-worker", acquiredAt: Date.now() - 600_000 };
+            mkdirSync(sideline, { recursive: true });
+            writeFileSync(join(sideline, LOCK_OWNER_FILE), `${JSON.stringify(stale)}\n`);
+
+            restoreOrRemoveSideline(lock, sideline, { owner: stale });
+
+            expect(existsSync(sideline)).toBe(false);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

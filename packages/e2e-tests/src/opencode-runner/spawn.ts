@@ -278,6 +278,13 @@ function canonicalConfig(
 }
 
 /**
+ * The user config loader expands `{env:NAME}` before the plugin reads a value, and `embedding.api_key` is the schema's only channel for the remote embedding key, so a harness cannot deliver it through `extraEnv` alone.
+ * Anchored at both ends and restricted to an environment variable name, so a credential cannot ride along after the placeholder and an empty name is refused.
+ * commentlint: allow(JUDGE)
+ */
+const ENV_PLACEHOLDER = /^\{env:\s*[A-Za-z_][A-Za-z0-9_]*\s*\}$/;
+
+/**
  * `assertConfigHasNoCredentials` refuses a credential-shaped key name and a value in a named
  * credential format. Neither test reads a value into a diagnostic: a match is reported by
  * format name, so a refusal never puts the secret in a log.
@@ -293,6 +300,8 @@ function assertConfigHasNoCredentials(value: unknown, label: string): void {
         seen.add(current);
         for (const [key, child] of Object.entries(current)) {
             const childPath = `${path}.${key}`;
+            /** A placeholder is not a credential: what reaches disk is the token, and the value it stands for is resolved from the environment after the file is read. Checked before the key rule so a credential-shaped name can still carry one. commentlint: allow(JUDGE) */
+            if (typeof child === "string" && ENV_PLACEHOLDER.test(child)) continue;
             if (!Array.isArray(current) && isCredentialBearingConfigKey(key)) {
                 throw new Error(
                     `config contains credential-shaped key: ${childPath}; ` +

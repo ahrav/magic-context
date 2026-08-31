@@ -306,6 +306,31 @@ describe("paired-delta runner", () => {
         expect(result.invalidStoredCoordinates).toHaveLength(1);
     });
 
+    it("blocks a coordinate before any arm pays when a later arm is stale", async () => {
+        const first = await runPairedDelta(options(), dependencies());
+        // The stale record belongs to `compaction`, which the primary order reaches last.
+        const stale = structuredClone(
+            first.records.find(({ armId }) => armId === "compaction")!,
+        );
+        stale.echoedModelId = "different-snapshot";
+        // `mc-on` is missing, so without a preflight it runs and pays first.
+        const store = new MemoryStore([stale]);
+        const events: string[] = [];
+
+        const result = await runPairedDelta(options(store), dependencies(undefined, events));
+
+        expect(result.status).toBe("invalid-stored-records");
+        expect(result.invalidStoredCoordinates).toContainEqual({
+            poolManifestFingerprint: "a".repeat(64),
+            scenarioId: scenario.scenarioId,
+            armId: "compaction",
+            replicateIndex: 0,
+        });
+        // No arm may run for a coordinate whose comparison can never be valid.
+        expect(events.filter((event) => event.startsWith("create:"))).toEqual([]);
+        expect(result.records).toHaveLength(0);
+    });
+
     it("always starts the first rollout then stops between rollouts at the cost cap", async () => {
         const constrained = { ...options(), maxCostUsd: 0 };
         const result = await runPairedDelta(constrained, dependencies());
@@ -1259,6 +1284,30 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("frees the claim when a non-resume run finds the matrix occupied", async () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-occupied-"));
+        try {
+            const path = join(root, "records.json");
+            writeFileSync(path, JSON.stringify([storedRecord("mc-on")]));
+
+            const store = new FileRolloutStore(path);
+            await expect(
+                runPairedDelta({ ...options(), store, resume: false }, dependencies()),
+            ).rejects.toThrow(/already contains rollouts for this matrix/);
+
+            // A corrected call in the same process would otherwise hit `RolloutStoreBusyError`.
+            const resumed = new FileRolloutStore(path);
+            const result = await runPairedDelta(
+                { ...options(), store: resumed, resume: true },
+                dependencies(),
+            );
+            expect(result.status).toBe("completed");
+            resumed.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("rejects a records file total that cannot be summed and frees the claim", () => {
         const root = mkdtempSync(join(tmpdir(), "paired-delta-file-total-"));
         try {
@@ -1304,6 +1353,62 @@ describe("paired-delta runner", () => {
 
         expect(result.status).toBe("cost-cap-reached");
         expect(events.filter((event) => event.startsWith("create:"))).toEqual(["create:mc-on"]);
+    });
+
+    it("reserves the failure estimate from cache pricing when it is the dearest rate", async () => {
+        const store = new MemoryStore();
+        // A build billed only for cached prompt tokens: the input and output rates are zero,
+        // so cache pricing is the whole charge.
+        const cached = {
+            ...options(store),
+            deskCostCeilingUsd: 0,
+            pricesPerMillionTokens: { input: 0, output: 0, cacheCreation: 3, cacheRead: 1 },
+        };
+        const worstCase = (scenario.modelContextLimit * 3) / 1_000_000;
+        expect(worstCase).toBeGreaterThan(0);
+        const events: string[] = [];
+
+        const result = await runPairedDelta(
+            { ...cached, maxCostUsd: worstCase, store },
+            dependencies(undefined, events),
+        );
+
+        // Ignoring the cache counters priced this fallback at zero, which admitted every arm.
+        expect(result.status).toBe("cost-cap-reached");
+        expect(events.filter((event) => event.startsWith("create:"))).toEqual(["create:mc-on"]);
+    });
+
+    it("records a rollout whose run throws synchronously without leaving the deadline armed", async () => {
+        const store = new MemoryStore();
+        const rejections: unknown[] = [];
+        const onRejection = (reason: unknown): void => {
+            rejections.push(reason);
+        };
+        process.on("unhandledRejection", onRejection);
+        try {
+            const result = await runPairedDelta(
+                { ...options(store), deadlineEpochMs: Date.now() + 30 },
+                {
+                    now: Date.now,
+                    async createRollout(): Promise<RolloutHandle> {
+                        return {
+                            // Throws before returning a promise at all.
+                            run: (() => {
+                                throw new Error("run exploded");
+                            }) as unknown as () => Promise<RolloutObservation>,
+                            async dispose() {},
+                        };
+                    },
+                },
+            );
+
+            expect(result.records[0]?.cell.runHealth).toBe("crash");
+            // An armed timer outliving the arm rejects later with no consumer.
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            expect(rejections).toEqual([]);
+        } finally {
+            process.off("unhandledRejection", onRejection);
+        }
     });
 
     it("records a rollout whose disposal throws synchronously", async () => {
