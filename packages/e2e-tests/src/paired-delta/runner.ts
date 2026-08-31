@@ -133,7 +133,12 @@ export interface CoordinateResult {
 }
 
 export interface PairedDeltaRunResult {
-    status: "completed" | "cost-cap-reached" | "deadline-reached" | "invalid-stored-records";
+    status:
+        | "completed"
+        | "cost-cap-reached"
+        | "deadline-reached"
+        | "invalid-stored-records"
+        | "harness-unreclaimed";
     records: RolloutRecord[];
     coordinates: CoordinateResult[];
     spentUsd: number;
@@ -285,6 +290,17 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
                 fail("completed-cell-invalid");
             }
         }
+    });
+    /** `put` indexes by coordinate and refuses to replace completed evidence, so a duplicate makes both wrong at once: the pre-scan bills every copy, and the index points at whichever landed last rather than at the completed record it must protect. commentlint: allow(JUDGE) */
+    const seen = new Set<string>();
+    (raw as RolloutRecord[]).forEach((record, index) => {
+        const key = coordinateKey(record);
+        if (seen.has(key)) {
+            throw new Error(
+                `rollout store ${path} record ${index}: duplicate-coordinate ${key}`,
+            );
+        }
+        seen.add(key);
     });
     return raw as RolloutRecord[];
 }
@@ -574,6 +590,8 @@ export async function runPairedDelta(
                 else estimatedCostRollouts++;
                 if (record.cell.reasonCode) incrementExclusion(exclusionCounts, armId, record.cell.reasonCode);
                 if (failure instanceof RolloutDeadlineError) status = "deadline-reached";
+                /** A harness that would not dispose may still be holding its workspace and session, so the next arm would measure a contaminated environment; the run ends rather than producing arms whose comparison cannot be trusted. commentlint: allow(JUDGE) */
+                else if (!disposed && handle) status = "harness-unreclaimed";
                 return record;
             };
 

@@ -486,6 +486,11 @@ describe("paired-delta runner", () => {
         });
         expect(undisposed?.harnessDisposed).toBe(false);
         expect(first.coordinates[0]?.incomplete).toBe(true);
+        // The harness may still hold its workspace, so no later arm is measured
+        // against a possibly contaminated environment.
+        expect(first.status).toBe("harness-unreclaimed");
+        expect(first.records).toHaveLength(1);
+        expect(events.filter((event) => event.startsWith("create:"))).toEqual(["create:mc-on"]);
         // A rollout that may have contaminated the arm is not evidence, so the
         // regret ladder never scores it.
         expect(first.coordinates[0]?.regret).toBeNull();
@@ -494,6 +499,7 @@ describe("paired-delta runner", () => {
         const resumed = await runPairedDelta(options(store), dependencies(undefined, resumeEvents));
 
         expect(resumeEvents).toContain("create:mc-on");
+        expect(resumed.status).toBe("completed");
         expect(resumed.records.find(({ armId }) => armId === "mc-on")?.cell.runHealth)
             .toBe("completed");
         expect(store.records.filter(({ armId }) => armId === "mc-on")).toHaveLength(1);
@@ -852,6 +858,11 @@ describe("file rollout store", () => {
             writeFileSync(path, JSON.stringify([{ ...record, priorAttemptsCostUsd: -1 }]));
             expect(() => new FileRolloutStore(path).list())
                 .toThrow(/prior-attempts-cost-invalid/);
+
+            // `put` protects completed evidence by coordinate index, which a
+            // duplicate would silently point away from.
+            writeFileSync(path, JSON.stringify([record, record]));
+            expect(() => new FileRolloutStore(path).list()).toThrow(/duplicate-coordinate/);
 
             // A completed cell suppresses its live rollout, so an impossible one
             // must not be accepted as evidence.
