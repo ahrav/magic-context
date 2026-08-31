@@ -20,5 +20,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 subtle = "2"
 
+[dev-dependencies]
+napi = { version = "=3.12.2", default-features = false, features = ["napi8", "dyn-symbols"] }
+
 [build-dependencies]
 napi-build = "2"
