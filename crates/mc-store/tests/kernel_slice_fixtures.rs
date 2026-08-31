@@ -4,9 +4,10 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use mc_store::kernel::{
-    AlignmentRow, CommitIntent, DecisionPayload, DecisionSpec, DomainSpec, KernelStore,
-    ObservationDependencySpec, ObservationPayload, ObservationSpec, RepositoryProvenance,
-    ScopeSpec, ScopeTermSpec, Sensitivity, StagingCandidateSpec,
+    AlignmentRow, CommitIntent, DecisionEventPayload, DecisionEventSpec, DecisionPayload,
+    DecisionSpec, DomainSpec, KernelStore, ObservationDependencySpec, ObservationPayload,
+    ObservationSpec, RepositoryProvenance, ScopeSpec, ScopeTermSpec, Sensitivity,
+    StagingCandidateSpec,
 };
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use sha2::{Digest, Sha256};
@@ -15,20 +16,23 @@ const PRODUCER: &str = "session-cache-fixture";
 const ACTOR: &str = "hand-authored-test";
 const MAIN_SCOPE: &str = "scope-main";
 const BRANCH_SCOPE: &str = "scope-redis-branch";
+const AUDIT_SCOPE: &str = "scope-audit";
 const CANDIDATE_ID: &str = "candidate-object";
 const CANDIDATE_TEXT: &str = "unreviewed-redis-candidate";
-const OPERATION_KEYS: [&str; 6] = [
+const SECRET_CLASSIFICATION: &str = "password=hunter2";
+const OPERATION_KEYS: [&str; 7] = [
     "fixture/domain",
     "fixture/scopes",
     "fixture/lru-pair",
     "fixture/redis-pair",
+    "fixture/audit-pair",
     "fixture/correct-lru-observation",
     "fixture/accept-redis",
 ];
 
 // Acceptance clause map:
 // R6, R20 -> staged_candidate_never_enters_canonical_state.
-// R16, R17, KTD6, KTD7 -> branch_alignment_then_main_acceptance_preserves_redis_lineage.
+// R16, R17, KTD6, KTD7 -> branch_alignment_then_main_acceptance_supersedes_lru_decision.
 // R18 -> false_lru_classification_is_corrected_append_only.
 // R19 -> canonical_slice_and_projection_are_restart_identical.
 // Deterministic rebuild acceptance -> canonical_slice_and_projection_are_restart_identical.
@@ -151,6 +155,7 @@ fn build_fixture(root: &std::path::Path) -> Fixture {
         .commit(intent("fixture/scopes"), |envelope| {
             envelope.insert_scope(scope(MAIN_SCOPE, "main"))?;
             envelope.insert_scope(scope(BRANCH_SCOPE, "feature/redis"))?;
+            envelope.insert_scope(scope(AUDIT_SCOPE, "audit"))?;
             Ok(String::new())
         })
         .unwrap();
@@ -195,6 +200,39 @@ fn build_fixture(root: &std::path::Path) -> Fixture {
                 1,
                 "implemented",
                 "redis-branch-decision-object",
+            ))?;
+            Ok(String::new())
+        })
+        .unwrap();
+    store
+        .commit(intent("fixture/audit-pair"), |envelope| {
+            envelope.insert_decision(decision(
+                "audit-decision",
+                "audit-decision-object",
+                AUDIT_SCOPE,
+                "audit-decision-lineage",
+                1,
+                "Audit cache configuration handling",
+            ))?;
+            envelope.append_decision_event(
+                "audit-decision",
+                DecisionEventSpec {
+                    event_kind: "review".to_string(),
+                    payload: DecisionEventPayload {
+                        summary: "audit trail opened".to_string(),
+                    },
+                    evidence_id: None,
+                    recorded_at: 1,
+                },
+            )?;
+            envelope.insert_observation(observation(
+                "audit-observation",
+                "audit-observation-object",
+                AUDIT_SCOPE,
+                "audit-observation-lineage",
+                1,
+                SECRET_CLASSIFICATION,
+                "audit-decision-object",
             ))?;
             Ok(String::new())
         })
@@ -411,8 +449,17 @@ fn query_count(root: &std::path::Path, sql: &str) -> i64 {
     connection.query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
+fn query_count_matching(root: &std::path::Path, sql: &str, pattern: &str) -> i64 {
+    let connection =
+        Connection::open_with_flags(root.join("core.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    connection
+        .query_row(sql, [pattern], |row| row.get(0))
+        .unwrap()
+}
+
 #[test]
-fn branch_alignment_then_main_acceptance_preserves_redis_lineage() {
+fn branch_alignment_then_main_acceptance_supersedes_lru_decision() {
     let root = tempfile::tempdir().unwrap();
     let fixture = build_fixture(root.path());
 
@@ -444,6 +491,7 @@ fn branch_alignment_then_main_acceptance_preserves_redis_lineage() {
             .map(|row| (row.decision_id.as_str(), row.observation_id.as_str()))
             .collect::<Vec<_>>(),
         [
+            ("audit-decision", "audit-observation"),
             ("lru-decision", "lru-observation"),
             ("redis-branch-decision", "redis-branch-observation"),
         ]
@@ -463,7 +511,10 @@ fn branch_alignment_then_main_acceptance_preserves_redis_lineage() {
             .iter()
             .map(|row| (row.decision_id.as_str(), row.observation_id.as_str()))
             .collect::<Vec<_>>(),
-        [("redis-main-decision", "redis-main-observation")]
+        [
+            ("audit-decision", "audit-observation"),
+            ("redis-main-decision", "redis-main-observation"),
+        ]
     );
     let history = fixture
         .store
@@ -524,18 +575,20 @@ fn false_lru_classification_is_corrected_append_only() {
             .classification,
         "intended"
     );
-    assert_eq!(
-        fixture
-            .store
-            .known_as_of(fixture.pre_correction)
-            .unwrap()
-            .objects
-            .iter()
-            .find(|row| row.object_id == "lru-observation-wrong-object")
-            .unwrap()
-            .invalidated_commit_seq,
-        None
-    );
+    assert!(fixture
+        .store
+        .known_as_of(fixture.pre_correction)
+        .unwrap()
+        .objects
+        .iter()
+        .any(|row| row.object_id == "lru-observation-wrong-object"));
+    assert!(fixture
+        .store
+        .known_as_of(fixture.pre_acceptance)
+        .unwrap()
+        .objects
+        .iter()
+        .all(|row| row.object_id != "lru-observation-wrong-object"));
     let corrected = fixture.store.slice_as_of(fixture.pre_acceptance).unwrap();
     assert!(corrected
         .observations
@@ -570,7 +623,7 @@ fn false_lru_classification_is_corrected_append_only() {
     );
     assert_eq!(
         query_count(root.path(), "SELECT COUNT(*) FROM observations"),
-        4
+        5
     );
 }
 
@@ -583,6 +636,13 @@ fn canonical_slice_and_projection_are_restart_identical() {
     let alignment = fixture.store.alignment_as_of(fixture.accepted).unwrap();
     let digests = canonical_slice_digests(root.path());
     let first = projection_evidence(root.path());
+    // Require non-empty redaction evidence and one decision event so the
+    // restart-equality assertions cannot pass vacuously.
+    assert!(!first.1.is_empty());
+    assert_eq!(
+        query_count(root.path(), "SELECT COUNT(*) FROM decision_events"),
+        1
+    );
 
     fixture.store.rebuild_alignment().unwrap();
     assert_eq!(projection_evidence(root.path()), first);
@@ -656,19 +716,31 @@ fn staged_candidate_never_enters_canonical_state() {
         query_count(root.path(), "SELECT COUNT(*) FROM admission_decisions"),
         0
     );
+    let candidate_pattern = format!("%{CANDIDATE_TEXT}%");
+    // Positive control: `candidate_pattern` must match the staged candidate
+    // row before the leak scan below may claim its zero count is meaningful.
     assert_eq!(
-        query_count(
+        query_count_matching(
+            root.path(),
+            "SELECT COUNT(*) FROM candidates WHERE payload LIKE ?1",
+            &candidate_pattern,
+        ),
+        1
+    );
+    assert_eq!(
+        query_count_matching(
             root.path(),
             "SELECT (
                  SELECT COUNT(*) FROM decisions
-                 WHERE CAST(decision_payload AS TEXT) LIKE '%unreviewed-redis-candidate%'
+                 WHERE CAST(decision_payload AS TEXT) LIKE ?1
              ) + (
                  SELECT COUNT(*) FROM observations
-                 WHERE CAST(observation_payload AS TEXT) LIKE '%unreviewed-redis-candidate%'
+                 WHERE CAST(observation_payload AS TEXT) LIKE ?1
              ) + (
                  SELECT COUNT(*) FROM alignment_projection
-                 WHERE alignment_payload LIKE '%unreviewed-redis-candidate%'
-             )"
+                 WHERE alignment_payload LIKE ?1
+             )",
+            &candidate_pattern,
         ),
         0
     );
