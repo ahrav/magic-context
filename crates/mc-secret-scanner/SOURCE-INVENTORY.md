@@ -23,9 +23,14 @@ License: MIT. The complete notice is in `NOTICE`.
 | `crates/scanner-engine/src/engine/window_validate.rs` | `0b8b88e0daab93cc07044b85c4f1c7d105e7d7f3` | `a362a1c1c3addbd937e0591032dd655c69559bd1eaff66e1fa1c861f1e715299` | `crates/mc-secret-scanner/src/evaluator.rs` | Rewritten direct candidate evaluation and confidence flow |
 | `LICENSE` | `00b501fa03e6a1b190c0a4a2f2ef66fd57431a3c` | `96afec54cd8f9e6497c91826a6f9576e7ae92c3c3dd68c4c0b170d9b996e2e2d` | `crates/mc-secret-scanner/NOTICE` | Verbatim license terms with attribution |
 
+Destinations under `crates/mc-secret-scanner/src/` are unmet. This tree carries the
+pinned corpus, the local overlay, `NOTICE`, and the drift check, so those rows
+record where each adapted source belongs and the digest it must be adapted from.
+The drift check verifies digests and provenance; it does not verify adaptation.
+
 Local overlay: `crates/mc-secret-scanner/conservative_overlay.yaml`.
 
-Overlay SHA-256: `bf5179b1a30ec1e87f7c6533785fca8b86f42805820ba1052b34ab221b43bcc6`
+Overlay SHA-256: `3ab8bd153504b1fcead037e26f8b2acda29acbc62973d6e3e1fd219cc8240f92`
 
 The overlay is original Magic Context compatibility policy and is not copied from
 Gossip-rs. Its vendor rules reuse the lengths, alphabets, entropy floors, and

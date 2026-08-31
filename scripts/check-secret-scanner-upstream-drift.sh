@@ -50,13 +50,17 @@ sha256_of() {
 
 # A row clears one drifted source when it names both the path and the digest observed
 # on the watched branch, so an unrelated review decision cannot silence a new change.
+# The verdict is read from the Disposition field alone; prose elsewhere in the row that
+# happens to say "rejected" must not open the gate.
 disposition_recorded() {
     awk -F'|' -v path="$1" -v digest="$2" '
         /^\|/ {
             row = $0
             gsub(/[ `]/, "", row)
+            verdict = $4
+            gsub(/[ `]/, "", verdict)
             if (index(row, path) && index(row, digest) &&
-                (index(row, "Accepted") || index(row, "Rejected") || index(row, "Superseded"))) {
+                (verdict ~ /^Accepted/ || verdict ~ /^Rejected/ || verdict ~ /^Superseded/)) {
                 found = 1
                 exit
             }
