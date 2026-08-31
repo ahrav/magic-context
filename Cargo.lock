@@ -2408,6 +2408,7 @@ dependencies = [
  "cortexkit-lease",
  "cortexkit-store",
  "cortexkit-store-types",
+ "criterion",
  "flate2",
  "gix",
  "mc-core",

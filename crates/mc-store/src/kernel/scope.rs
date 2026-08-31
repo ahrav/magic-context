@@ -724,6 +724,9 @@ impl MatchOutcome {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScopeMatchContext {
     values: BTreeMap<Dimension, String>,
+    /// Caching coerced versions during insertion avoids re-coercion during
+    /// evaluation.
+    coerced: BTreeMap<Dimension, semver::Version>,
     head_commit: Option<String>,
 }
 
@@ -733,7 +736,16 @@ impl ScopeMatchContext {
     }
 
     pub fn with_value(mut self, dimension: Dimension, value: impl Into<String>) -> Self {
-        self.values.insert(dimension, value.into());
+        let value = value.into();
+        match coerce_version(&value) {
+            Some(version) => {
+                self.coerced.insert(dimension, version);
+            }
+            None => {
+                self.coerced.remove(&dimension);
+            }
+        }
+        self.values.insert(dimension, value);
         self
     }
 
@@ -744,6 +756,10 @@ impl ScopeMatchContext {
 
     pub fn value(&self, dimension: Dimension) -> Option<&str> {
         self.values.get(&dimension).map(String::as_str)
+    }
+
+    fn coerced_version(&self, dimension: Dimension) -> Option<&semver::Version> {
+        self.coerced.get(&dimension)
     }
 }
 
@@ -770,7 +786,7 @@ pub fn coerce_version(raw: &str) -> Option<semver::Version> {
     };
     let mut components = [0u64; 3];
     let mut count = 0usize;
-    let mut trailing_suffix: Option<String> = None;
+    let mut trailing_suffix: Option<&str> = None;
     for part in numeric.split('.') {
         if count == 3 {
             break;
@@ -783,14 +799,14 @@ pub fn coerce_version(raw: &str) -> Option<semver::Version> {
             Err(_) => {
                 // A vendor suffix glued to the last numeric component, such
                 // as "3ubuntu1", splits into the digits and a build qualifier.
-                let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
-                let rest = &part[digits.len()..];
+                let digit_len = part.bytes().take_while(u8::is_ascii_digit).count();
+                let (digits, rest) = part.split_at(digit_len);
                 if digits.is_empty() || rest.is_empty() {
                     return None;
                 }
                 components[count] = digits.parse().ok()?;
                 count += 1;
-                trailing_suffix = Some(rest.trim_start_matches(['-', '.', '_']).to_string());
+                trailing_suffix = Some(rest.trim_start_matches(['-', '.', '_']));
                 break;
             }
         }
@@ -798,19 +814,20 @@ pub fn coerce_version(raw: &str) -> Option<semver::Version> {
     if count == 0 {
         return None;
     }
-    let build_source = trailing_suffix.or_else(|| suffix.map(str::to_string));
+    let build_source = trailing_suffix.or(suffix);
     let build = match build_source {
         Some(suffix) if !suffix.is_empty() => {
-            let sanitized: String = suffix
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect();
+            let valid_build_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '.';
+            let sanitized: std::borrow::Cow<'_, str> = if suffix.chars().all(valid_build_char) {
+                std::borrow::Cow::Borrowed(suffix)
+            } else {
+                std::borrow::Cow::Owned(
+                    suffix
+                        .chars()
+                        .map(|c| if valid_build_char(c) { c } else { '-' })
+                        .collect(),
+                )
+            };
             semver::BuildMetadata::new(&sanitized).ok()?
         }
         _ => semver::BuildMetadata::EMPTY,
@@ -1213,8 +1230,8 @@ fn term_matches(
         TermValue::Exact(expected) => bool_outcome(expected == value),
         TermValue::Set(values) => bool_outcome(values.contains(value)),
         TermValue::Range { start, end } => bool_outcome(range_contains(start, end, value)),
-        TermValue::VersionRange(spec) => match version_req_matches(&spec.req, value) {
-            Some(holds) => bool_outcome(holds),
+        TermValue::VersionRange(spec) => match ctx.coerced_version(dimension) {
+            Some(version) => bool_outcome(spec.req.matches(version)),
             None => MatchOutcome::Uncertain,
         },
         TermValue::GitReachable(_) | TermValue::RedactedPlaceholder => unreachable!(),

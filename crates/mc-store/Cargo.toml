@@ -33,5 +33,10 @@ test-support = []
 [dev-dependencies]
 # Self dev-dependency so integration tests see the `test-support` fixtures.
 mc-store = { path = ".", features = ["test-support"] }
+criterion = "=0.8.2"
 proptest = "1"
 tempfile = "3"
+
+[[bench]]
+name = "scope_algebra"
+harness = false
