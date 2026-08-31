@@ -3,6 +3,7 @@ mod read;
 
 use std::fmt;
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -251,6 +252,18 @@ impl KernelStore {
     pub(super) fn latch_cas_failure(&self) {
         self.cas_failed.store(true, Ordering::Release);
     }
+}
+
+pub(super) fn read_capped(source: impl std::io::Read) -> std::io::Result<Option<Vec<u8>>> {
+    let limit = u64::try_from(MAX_PAYLOAD_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    source.take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_PAYLOAD_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 pub(super) fn is_artifact_digest(value: &str) -> bool {
