@@ -250,6 +250,19 @@ function writeConfigs(
 
 }
 
+/** `isSecretKey` needs a qualifier segment before its secret word, so header names that carry a credential without one — `Cookie`, `Proxy-Authorization` — are named here instead. commentlint: allow(JUDGE) */
+const CREDENTIAL_HEADER_NAMES: ReadonlySet<string> = new Set([
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+    "www-authenticate",
+    "proxy-authenticate",
+]);
+
+function isCredentialShapedConfigKey(key: string): boolean {
+    return isSecretKey(key) || CREDENTIAL_HEADER_NAMES.has(key.trim().toLowerCase());
+}
+
 /**
  * `assertConfigHasNoCredentials` matches key names and never values, so
  * `opencode.json` can still contain a credential stored under an innocuous key.
@@ -261,7 +274,7 @@ function assertConfigHasNoCredentials(value: unknown): void {
         seen.add(current);
         for (const [key, child] of Object.entries(current)) {
             const childPath = `${path}.${key}`;
-            if (!Array.isArray(current) && isSecretKey(key)) {
+            if (!Array.isArray(current) && isCredentialShapedConfigKey(key)) {
                 throw new Error(
                     `config contains credential-shaped key: ${childPath}; ` +
                         "pass credentials through extraEnv",

@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
@@ -329,6 +330,7 @@ export class RolloutStoreBusyError extends Error {}
 
 /** The pid file cannot separate two stores inside one process, which race exactly as two processes do, so live owners are tracked here as well. Read-only stores never claim ownership, so inspecting a records file never conflicts with the run that owns it. commentlint: allow(JUDGE) */
 const ownedRecordPaths = new Set<string>();
+const LOCK_ACQUIRE_ATTEMPTS = 8;
 
 
 export class FileRolloutStore implements RolloutStore {
@@ -374,33 +376,72 @@ export class FileRolloutStore implements RolloutStore {
         }
         /** The records path's directory is created by the first publish, so the lock cannot assume it exists. commentlint: allow(JUDGE) */
         mkdirSync(dirname(this.lockPath), { recursive: true });
+        /** Bounded because each pass either takes the lock, proves a live owner, or removes one stale lock: two runners racing the same stale lock cannot both win, and the loser observes the winner's live pid on its next pass. commentlint: allow(JUDGE) */
+        for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
+            if (this.claimLockFile()) {
+                this.lockHeld = true;
+                ownedRecordPaths.add(this.claim);
+                process.on("exit", this.releaseOnExit);
+                return;
+            }
+        }
+        throw new RolloutStoreBusyError(
+            `rollout store ${this.path} lock could not be claimed`,
+        );
+    }
+
+    /** Returns true when this process now holds the lock. Removing a stale lock is a separate pass, so the creation that follows is still exclusive. commentlint: allow(JUDGE) */
+    private claimLockFile(): boolean {
         try {
             writeFileSync(this.lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+            return true;
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-            /** A crashed run cannot release its lock, so an owner that no longer exists is not a conflict; `kill(pid, 0)` is the liveness test and `ESRCH` means the process is gone. commentlint: allow(JUDGE) */
-            const owner = Number.parseInt(readFileSync(this.lockPath, "utf8").trim(), 10);
-            if (Number.isSafeInteger(owner) && owner > 0 && owner !== process.pid) {
-                try {
-                    process.kill(owner, 0);
-                    throw new RolloutStoreBusyError(
-                        `rollout store ${this.path} is in use by pid ${owner}`,
-                    );
-                } catch (probe) {
-                    if (probe instanceof RolloutStoreBusyError) throw probe;
-                    if ((probe as NodeJS.ErrnoException).code === "EPERM") {
-                        throw new RolloutStoreBusyError(
-                            `rollout store ${this.path} is in use by pid ${owner}`,
-                        );
-                    }
-                }
-            }
-            rmSync(this.lockPath, { force: true });
-            writeFileSync(this.lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
         }
-        this.lockHeld = true;
-        ownedRecordPaths.add(this.claim);
-        process.on("exit", this.releaseOnExit);
+        const observed = this.readLockOwner();
+        if (observed !== null && this.ownerIsLive(observed)) {
+            throw new RolloutStoreBusyError(
+                `rollout store ${this.path} is in use by pid ${observed}`,
+            );
+        }
+        /** Takeover moves the observed lock aside first: `rename` is atomic, so of two runners reclaiming one stale lock only one moves that file, and the other either finds it gone or finds the winner's new lock and puts it back. commentlint: allow(JUDGE) */
+        const claimed = `${this.lockPath}.claim-${process.pid}-${randomBytes(4).toString("hex")}`;
+        try {
+            renameSync(this.lockPath, claimed);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+            throw error;
+        }
+        const moved = this.readLockOwner(claimed);
+        if (moved !== null && moved !== observed && this.ownerIsLive(moved)) {
+            renameSync(claimed, this.lockPath);
+            throw new RolloutStoreBusyError(
+                `rollout store ${this.path} is in use by pid ${moved}`,
+            );
+        }
+        rmSync(claimed, { force: true });
+        return false;
+    }
+
+    private readLockOwner(path = this.lockPath): number | null {
+        try {
+            const owner = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+            return Number.isSafeInteger(owner) && owner > 0 ? owner : null;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+            throw error;
+        }
+    }
+
+    /** A crashed run cannot release its lock, so an owner that no longer exists is not a conflict; `kill(pid, 0)` is the liveness test and `ESRCH` means the process is gone. commentlint: allow(JUDGE) */
+    private ownerIsLive(owner: number): boolean {
+        if (owner === process.pid) return false;
+        try {
+            process.kill(owner, 0);
+            return true;
+        } catch (error) {
+            return (error as NodeJS.ErrnoException).code === "EPERM";
+        }
     }
 
     put(record: RolloutRecord): void {
@@ -549,6 +590,18 @@ export async function runPairedDelta(
     /** The loop visits every declaration while the coordinate map is keyed by id, so a repeated id would pay for a coordinate the store already holds completed evidence for and then fail to record it. commentlint: allow(JUDGE) */
     if (selectedScenarioIds.size !== options.scenarios.length) {
         throw new Error("scenarios contain a duplicate scenarioId");
+    }
+    /** A non-positive or fractional count silently produces a matrix with no measurements — or one the loop rounds up — and the run would still report `completed`. commentlint: allow(JUDGE) */
+    if (!Number.isSafeInteger(options.replicateCount) || options.replicateCount < 1) {
+        throw new Error("replicateCount must be a positive integer");
+    }
+    /** A negative price makes a rollout's cost negative, which subtracts from `spentUsd` and lets the cap admit calls after the real spend passed it. commentlint: allow(JUDGE) */
+    if (
+        Object.values(options.pricesPerMillionTokens).some(
+            (price) => !Number.isFinite(price) || price < 0,
+        )
+    ) {
+        throw new Error("pricesPerMillionTokens must be finite and non-negative");
     }
     const inMatrix = (record: RolloutRecord): boolean =>
         record.poolManifestFingerprint === options.poolManifestFingerprint &&
@@ -821,7 +874,9 @@ function completedRecord(
     const observedCostUsd = observedUsage === null
         ? null
         : tokenCostUsd(observedUsage, options.pricesPerMillionTokens);
-    const usage = observedCostUsd === null || !Number.isFinite(observedCostUsd)
+    const usage = observedCostUsd === null ||
+            !Number.isFinite(observedCostUsd) ||
+            observedCostUsd < 0
         ? null
         : observedUsage;
     /** Every field copied onto the record crosses the adapter boundary, and one value `JSON.stringify` refuses makes the whole record unwritable — which loses the paid coordinate instead of recording it as malformed. commentlint: allow(JUDGE) */

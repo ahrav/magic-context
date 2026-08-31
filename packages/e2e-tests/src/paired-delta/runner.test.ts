@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -780,6 +780,27 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("does not delete a new owner's lock while reclaiming a stale one", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-takeover-"));
+        const live = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+        try {
+            const path = join(root, "records.json");
+            const lock = `${path}.lock`;
+            // Stands in for the interleaving where this runner read a dead pid
+            // and another runner claimed the lock before it acted on that read.
+            writeFileSync(lock, `${live.pid}\n`);
+
+            expect(() => new FileRolloutStore(path).list()).toThrow(RolloutStoreBusyError);
+            // The other runner's lock survives the refused takeover.
+            expect(readFileSync(lock, "utf8").trim()).toBe(String(live.pid));
+
+            live.kill();
+        } finally {
+            live.kill();
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("reclaims a lock whose owner is gone", () => {
         const root = mkdtempSync(join(tmpdir(), "paired-delta-stale-lock-"));
         try {
@@ -825,6 +846,30 @@ describe("paired-delta runner", () => {
             ),
         ).rejects.toThrow(/duplicate scenarioId/);
         expect(events).toHaveLength(0);
+    });
+
+    it("refuses a matrix or price table that cannot produce measurements", async () => {
+        for (const replicateCount of [0, -1, 1.5, Number.NaN]) {
+            await expect(runPairedDelta({ ...options(), replicateCount }, dependencies()))
+                .rejects.toThrow(/replicateCount must be a positive integer/);
+        }
+
+        // A negative price subtracts from `spentUsd`, so the cap would admit
+        // calls after the real spend passed it.
+        await expect(
+            runPairedDelta(
+                {
+                    ...options(),
+                    pricesPerMillionTokens: {
+                        input: -3,
+                        output: 15,
+                        cacheCreation: 3.75,
+                        cacheRead: 0.3,
+                    },
+                },
+                dependencies(),
+            ),
+        ).rejects.toThrow(/pricesPerMillionTokens must be finite and non-negative/);
     });
 
     it("classifies a malformed check vector as an exclusion and continues", async () => {

@@ -151,6 +151,19 @@ describe("opencode child lifecycle", () => {
             ).toThrow(
                 /credential-shaped key: openCodeConfigExtra\.mcp\.docs\.headers\.Authorization/,
             );
+
+            // `isSecretKey` wants a qualifier before its secret word, so these
+            // credential-bearing header names need naming outright.
+            for (const header of ["Cookie", "Proxy-Authorization", "set-cookie"]) {
+                expect(() =>
+                    __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                        mockProviderURL: "http://127.0.0.1:4321",
+                        openCodeConfigExtra: {
+                            mcp: { docs: { headers: { [header]: "sk-live" } } },
+                        },
+                    })
+                ).toThrow(new RegExp(`credential-shaped key: .*${header}`));
+            }
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
