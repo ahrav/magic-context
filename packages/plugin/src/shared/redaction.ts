@@ -114,7 +114,6 @@ export function isSecretKey(key: string): boolean {
  * `webhookSecret`, and the glued `APIKEY` that no case transition splits.
  */
 const CREDENTIAL_TAIL_WORDS = [
-    "key",
     "secret",
     "password",
     "passwd",
@@ -127,47 +126,87 @@ const CREDENTIAL_TAIL_WORDS = [
     "dsn",
 ];
 
-/** `token` is the one credential word that also counts things — `maxTokens`, `promptTokens`, `injection_budget_tokens` — so it needs a qualifier that names an issued credential. */
-const TOKEN_CREDENTIAL_QUALIFIERS = [
-    "access",
-    "id",
-    "refresh",
-    "bearer",
-    "auth",
-    "session",
-    "api",
-    "client",
-    "service",
-    "private",
-    "secret",
-    "oauth",
+/**
+ * `token` is the one credential word that also counts things, so it needs a rule rather
+ * than a listing. The rule is inverted deliberately: a `*Token` key is credential-shaped
+ * unless its qualifier names a quantity. An allowlist of issuers is open-ended — `botToken`,
+ * `webhookToken`, `csrfToken`, and every future vendor's noun would have to be added, and a
+ * missing entry writes a credential to disk — while the token-accounting vocabulary is small
+ * and stable.
+ */
+const TOKEN_COUNTING_QUALIFIERS = [
+    "max",
+    "min",
+    "total",
+    "prompt",
+    "completion",
+    "input",
+    "output",
+    "cache",
+    "cached",
+    "budget",
+    "limit",
+    "count",
+    "remaining",
+    "used",
+    "spent",
+    "window",
+    "context",
+    "chunk",
+    "sample",
+    "estimated",
+    "average",
+    "avg",
+    "num",
+    "idle",
+    "ideal",
+];
+
+/** `key` names a position in a data structure as often as a credential, and these qualifiers only ever mean the former. Kept closed and structural: anything not named here is treated as a credential, because a refused spawn is visible and a written credential is not. */
+const STRUCTURAL_KEY_QUALIFIERS = [
+    "foreign",
+    "primary",
+    "composite",
+    "natural",
+    "surrogate",
+    "partition",
+    "sort",
+    "range",
+    "index",
+    "map",
+    "hot",
+    "short",
+    "cache",
+    "group",
 ];
 
 export function isCredentialBearingConfigKey(key: string): boolean {
     if (isSecretKey(key)) return true;
     // Separators are dropped rather than split on, so `APIKEY` is judged like `api_key`.
     const compact = key.toLowerCase().replace(/[^a-z0-9]/g, "");
-    // Plurals are derived rather than listed, so `dbPasswords` cannot slip past a singular entry.
-    if (CREDENTIAL_TAIL_WORDS.some((word) => compact.endsWith(word) || compact.endsWith(`${word}s`))) {
-        return true;
-    }
-    if (!compact.endsWith("token") && !compact.endsWith("tokens")) return false;
     const segments = key
         .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
         .toLowerCase()
         .split(/[^a-z0-9]+/)
         .filter(Boolean);
-    const last = segments.at(-1);
-    if (last === "token" || last === "tokens") {
-        // The qualifier must be the adjacent segment, not any prefix: `idleTokens` and
-        // `identityTokens` both begin with the `id` qualifier and count things.
-        const qualifier = segments.at(-2);
-        return qualifier !== undefined && TOKEN_CREDENTIAL_QUALIFIERS.includes(qualifier);
+    // The qualifier is read from the adjacent segment, not from any prefix of the compacted
+    // key: `identityTokens` and `idleTokens` both begin with `id`.
+    const qualifier = segments.length > 1 ? segments.at(-2) : undefined;
+    const endsWith = (word: string): boolean =>
+        // Plurals are derived rather than listed, so `dbPasswords` cannot slip past a
+        // singular entry.
+        compact.endsWith(word) || compact.endsWith(`${word}s`);
+    if (endsWith("key")) {
+        if (qualifier !== undefined) return !STRUCTURAL_KEY_QUALIFIERS.includes(qualifier);
+        // A glued name has no segment to read, so the qualifier is matched against the whole
+        // word: `hotkey` is a keystroke, `apikey` is a credential.
+        return !STRUCTURAL_KEY_QUALIFIERS.some((word) =>
+            compact === `${word}key` || compact === `${word}keys`
+        );
     }
-    // A glued name has no boundary before the token word, so only exact forms qualify.
-    return TOKEN_CREDENTIAL_QUALIFIERS.some((word) =>
-        compact === `${word}token` || compact === `${word}tokens`
-    );
+    if (CREDENTIAL_TAIL_WORDS.some(endsWith)) return true;
+    if (!endsWith("token")) return false;
+    return qualifier === undefined || !TOKEN_COUNTING_QUALIFIERS.includes(qualifier);
 }
 
 /**
@@ -176,7 +215,11 @@ export function isCredentialBearingConfigKey(key: string): boolean {
  * the value in a diagnostic.
  */
 const CREDENTIAL_VALUE_FORMATS: ReadonlyArray<{ label: string; pattern: RegExp }> = [
-    { label: "HTTP authorization scheme", pattern: /^(?:bearer|basic|digest|token)\s+\S+/i },
+    /** One opaque payload, long enough to be a credential and end-anchored: `Basic auth is optional here` is prose, not a header value. commentlint: allow(JUDGE) */
+    {
+        label: "HTTP authorization scheme",
+        pattern: /^(?:bearer|basic|digest|token)\s+[A-Za-z0-9+/_=.~-]{16,}$/i,
+    },
     { label: "JWT", pattern: /^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./ },
     // Ordered before the general `sk-` shape, which would otherwise claim it.
     { label: "Anthropic-style key", pattern: /^sk-ant-[A-Za-z0-9_-]{16,}/ },
@@ -186,7 +229,8 @@ const CREDENTIAL_VALUE_FORMATS: ReadonlyArray<{ label: string; pattern: RegExp }
     { label: "Google API key", pattern: /^AIza[0-9A-Za-z_-]{30,}/ },
     { label: "Slack token", pattern: /^xox[abprs]-[0-9A-Za-z-]{10,}/ },
     { label: "PEM private key", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
-    { label: "credential-bearing URI", pattern: /^[a-z][a-z0-9+.-]*:\/\/[^/@\s:]+:[^/@\s]+@/i },
+    /** The username may be empty — `redis://:secret@host` is the common password-only shape. commentlint: allow(JUDGE) */
+    { label: "credential-bearing URI", pattern: /^[a-z][a-z0-9+.-]*:\/\/[^/@\s:]*:[^/@\s]+@/i },
 ];
 
 /** Returns the format a value announces itself as, or null. The label never contains the value. */

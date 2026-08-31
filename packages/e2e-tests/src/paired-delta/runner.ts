@@ -602,6 +602,8 @@ export async function runPairedDelta(
             /** A completed record from another binding cannot be replaced and the coordinate key carries no binding, so any arm executed beside it could never form a valid comparison; the coordinate stops rather than paying for evidence it cannot use. commentlint: allow(JUDGE) */
             let coordinateBlocked = false;
             const runArm = async (armId: ArmId): Promise<RolloutRecord | null> => {
+                /** Checked before anything is created: a blocked coordinate can be reached from the ladder as well as the primary loop, and the caller's own check runs only after this call would have paid. commentlint: allow(JUDGE) */
+                if (coordinateBlocked) return null;
                 const coordinate: RolloutCoordinate = {
                     poolManifestFingerprint: options.poolManifestFingerprint,
                     scenarioId: scenario.scenarioId,

@@ -133,6 +133,14 @@ describe("isCredentialBearingConfigKey", () => {
             "customCookies",
             "backupPassphrases",
             "apitoken",
+            // A `*Token` qualifier that names an issuer rather than a quantity.
+            "botToken",
+            "webhookToken",
+            "slackToken",
+            "csrfToken",
+            "verificationToken",
+            // An identity token is a credential, whatever the plural suggests.
+            "identityTokens",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(true);
         }
@@ -143,10 +151,15 @@ describe("isCredentialBearingConfigKey", () => {
             "promptTokens",
             "tokenBudget",
             "idleTokens",
-            "identityTokens",
             "idealTokens",
             "baseURL",
             "models",
+            // `key` names a position in a data structure at least as often as a credential.
+            "foreignKey",
+            "primaryKey",
+            "partitionKey",
+            "sortKey",
+            "hotkey",
         ]) {
             expect(isCredentialBearingConfigKey(key)).toBe(false);
         }
@@ -165,9 +178,21 @@ describe("credentialValueFormat", () => {
         expect(credentialValueFormat("postgres://user:pw@host/db")).toBe(
             "credential-bearing URI",
         );
+        // The password-only shape, whose username segment is empty.
+        expect(credentialValueFormat("redis://:supersecret@cache.internal:6379")).toBe(
+            "credential-bearing URI",
+        );
         expect(credentialValueFormat("-----BEGIN RSA PRIVATE KEY-----")).toBe("PEM private key");
 
-        for (const value of ["run-42", "application/json", "https://example.test/path", ""]) {
+        for (const value of [
+            "run-42",
+            "application/json",
+            "https://example.test/path",
+            "",
+            // Prose that opens with a scheme word: one payload, not four words.
+            "Basic auth is optional here",
+            "Bearer tokens are supported",
+        ]) {
             expect(credentialValueFormat(value)).toBeNull();
         }
     });

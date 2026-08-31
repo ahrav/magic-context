@@ -967,6 +967,35 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("pays for no ladder rung once the coordinate is blocked", async () => {
+        const store = new MemoryStore();
+        // mc-on completes with a failing critical check, so the ladder is due;
+        // mc-off's stored record is then aged so it blocks the coordinate.
+        await runPairedDelta(
+            options(store),
+            dependencies((armId) => observation(armId, armId !== "mc-on")),
+        );
+        const blocked = store.records.find(({ armId }) => armId === "mc-off");
+        if (!blocked) throw new Error("missing mc-off record");
+        blocked.echoedModelId = "another-snapshot";
+        for (const armId of ["r1", "r2", "r3"] as const) {
+            const index = store.records.findIndex((record) => record.armId === armId);
+            if (index >= 0) store.records.splice(index, 1);
+        }
+        const events: string[] = [];
+
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => observation(armId, armId !== "mc-on"), events),
+        );
+
+        // The ladder is entered from mc-on's own completed record, so the block has
+        // to be seen before a rung is created rather than after it has been paid.
+        expect(result.status).toBe("invalid-stored-records");
+        expect(events.filter((event) => event.startsWith("create:"))).toEqual([]);
+        expect(result.coordinates[0]?.incomplete).toBe(true);
+    });
+
     it("classifies a malformed check vector as an exclusion and continues", async () => {
         const result = await runPairedDelta(
             options(),
