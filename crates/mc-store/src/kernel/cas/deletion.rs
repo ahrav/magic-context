@@ -348,8 +348,6 @@ impl KernelStore {
             fault == Some(ArtifactDeletionFault::BeforeCommit),
         )
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-        crate::kernel::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
-            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
 
         let committed = serde_json::from_str::<DeletionReceiptPayload>(&receipt.result)
             .unwrap_or_else(|_| DeletionReceiptPayload {

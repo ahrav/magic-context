@@ -352,15 +352,13 @@ impl KernelStore {
         fault_after_events: bool,
     ) -> Result<CommitReceipt, KernelError> {
         let mut writer = self.lock_writer()?;
-        let receipt = commit_with_writer(
+        commit_with_writer(
             &mut writer,
             self.lease_epoch(),
             intent,
             operation,
             fault_after_events,
-        )?;
-        super::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())?;
-        Ok(receipt)
+        )
     }
 }
 
@@ -397,6 +395,7 @@ pub(super) fn commit_with_writer(
         if digest != intent.request_digest {
             return Err(KernelError::Conflict);
         }
+        super::slice::rebuild_alignment_tx(&tx)?;
         tx.commit().map_err(|_| KernelError::Io)?;
         return Ok(CommitReceipt {
             commit_seq,
@@ -541,6 +540,7 @@ pub(super) fn commit_with_writer(
         &result,
         Some(commit_seq),
     )?;
+    super::slice::rebuild_alignment_tx(&tx)?;
     tx.commit().map_err(|_| KernelError::Io)?;
     Ok(CommitReceipt {
         commit_seq,

@@ -2,9 +2,10 @@
 
 use mc_store::kernel::{
     AlignmentProjectionSpec, ArtifactDeletionIdentity, ArtifactDeletionKind,
-    ArtifactDeletionRequest, ArtifactIngestRequest, CommitIntent, DecisionPayload, DecisionSpec,
-    DomainSpec, KernelStore, ObservationDependencySpec, ObservationPayload, ObservationSpec,
-    ProviderEgress, RepositoryProvenance, Sensitivity,
+    ArtifactDeletionRequest, ArtifactIngestRequest, CommitIntent, DecisionEventPayload,
+    DecisionEventSpec, DecisionPayload, DecisionSpec, DomainSpec, KernelErrorKind, KernelStore,
+    ObservationDependencySpec, ObservationPayload, ObservationSpec, ProviderEgress,
+    RepositoryProvenance, Sensitivity,
 };
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
@@ -185,7 +186,14 @@ fn rebuild_is_deterministic_and_historical_derivation_is_stable() {
     assert_eq!(current.rows[0].decision_id, "decision-2");
 
     let old_slice = store.slice_as_of(2).unwrap();
-    assert_eq!(old_slice.decisions[0].decision_id, "decision-1");
+    assert_eq!(
+        old_slice
+            .decisions
+            .iter()
+            .map(|row| row.decision_id.as_str())
+            .collect::<Vec<_>>(),
+        ["decision-1"]
+    );
     assert_eq!(old_slice.decisions[0].invalidated_commit_seq, None);
     assert_eq!(old_slice.decisions[0].superseded_by, None);
     let current_slice = store.slice_as_of(3).unwrap();
@@ -286,12 +294,68 @@ fn deletion_replay_repairs_projection() {
         reason: None,
         deleted_at: 42,
     };
+    let before_deletion = store.alignment_as_of(3).unwrap();
+    assert_eq!(before_deletion.rows.len(), 1);
     store.delete_artifact(request.clone()).unwrap();
     let expected = projection_rows(root.path());
+    assert!(expected.is_empty());
+    assert_eq!(store.alignment_as_of(3).unwrap().rows, before_deletion.rows);
+    assert!(store.alignment_as_of(4).unwrap().rows.is_empty());
     store.replace_alignment_projection(&[]).unwrap();
     assert!(projection_rows(root.path()).is_empty());
 
     let replay = store.delete_artifact(request).unwrap();
     assert!(replay.already_applied);
     assert_eq!(projection_rows(root.path()), expected);
+}
+
+#[test]
+fn projection_failure_rolls_back_the_canonical_mutation_and_receipt() {
+    let (root, store) = open_store();
+    seed_domain(&store);
+    seed_pair(&store, None);
+    drop(store);
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations SET observation_payload=X'00'
+             WHERE observation_id='observation-1'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = KernelStore::open(root.path()).unwrap();
+    let error = store
+        .commit(intent("must-roll-back"), |envelope| {
+            envelope.append_decision_event(
+                "decision-1",
+                DecisionEventSpec {
+                    event_kind: "status".to_string(),
+                    payload: DecisionEventPayload {
+                        summary: "must not persist".to_string(),
+                    },
+                    evidence_id: None,
+                    recorded_at: 10,
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), KernelErrorKind::Io);
+
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    for (table, expected) in [
+        ("commit_log", 2),
+        ("operation_receipts", 2),
+        ("decision_events", 0),
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, expected, "{table}");
+    }
 }

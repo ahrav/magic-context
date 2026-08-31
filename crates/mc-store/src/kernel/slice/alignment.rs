@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde::Serialize;
 
-use super::read::{load_observations, snapshot_tip};
+use super::read::snapshot_tip;
+use super::ObservationPayload;
 use crate::kernel::envelope::{
     check_fence, replace_alignment_projection_tx, AlignmentProjectionSpec,
 };
@@ -91,6 +92,12 @@ pub(crate) fn rebuild_alignment_with_writer(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| KernelError::Io)?;
     check_fence(&tx, lease_epoch)?;
+    let result = rebuild_alignment_tx(&tx)?;
+    tx.commit().map_err(|_| KernelError::Io)?;
+    Ok(result)
+}
+
+pub(crate) fn rebuild_alignment_tx(tx: &Transaction<'_>) -> Result<AlignmentRebuild, KernelError> {
     let tip = tx
         .query_row(
             "SELECT COALESCE(MAX(commit_seq),0) FROM commit_log",
@@ -99,7 +106,6 @@ pub(crate) fn rebuild_alignment_with_writer(
         )
         .map_err(|_| KernelError::Io)?;
     if tip == 0 {
-        tx.commit().map_err(|_| KernelError::Io)?;
         return Ok(AlignmentRebuild {
             built_through_commit_seq: 0,
             rows: 0,
@@ -117,8 +123,7 @@ pub(crate) fn rebuild_alignment_with_writer(
             built_through_commit_seq: tip,
         })
         .collect::<Vec<_>>();
-    let result = replace_alignment_projection_tx(&tx, &specs)?;
-    tx.commit().map_err(|_| KernelError::Io)?;
+    let result = replace_alignment_projection_tx(tx, &specs)?;
     Ok(AlignmentRebuild {
         built_through_commit_seq: tip,
         rows: result.rows,
@@ -137,8 +142,16 @@ fn load_alignment_input(
                 "SELECT decision_id,object_id,
                         CASE WHEN invalidated_commit_seq<=?1 THEN invalidated_commit_seq END,
                         CASE WHEN invalidated_commit_seq<=?1 THEN superseded_by END
-                 FROM decisions
+                 FROM decisions d
                  WHERE created_commit_seq<=?1
+                   AND (
+                       evidence_id IS NULL OR EXISTS(
+                           SELECT 1 FROM evidence_meta e
+                           WHERE e.evidence_id=d.evidence_id
+                             AND e.created_commit_seq<=?1
+                             AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
+                       )
+                   )
                  ORDER BY object_id",
             )
             .map_err(|_| KernelError::Io)?;
@@ -158,18 +171,49 @@ fn load_alignment_input(
             .map_err(|_| KernelError::Io)?;
         rows
     };
-    let observations = load_observations(tx, requested)?
-        .into_iter()
-        .map(|row| {
-            (
-                row.observation_id.clone(),
-                ObservationInput {
-                    observation_id: row.observation_id,
-                    alignment_kind: row.payload.classification,
-                },
+    let observations = {
+        let mut statement = tx
+            .prepare(
+                "SELECT observation_id,observation_payload
+                 FROM observations o
+                 WHERE created_commit_seq<=?1
+                   AND (invalidated_commit_seq IS NULL OR ?1<invalidated_commit_seq)
+                   AND (
+                       evidence_id IS NULL OR EXISTS(
+                           SELECT 1 FROM evidence_meta e
+                           WHERE e.evidence_id=o.evidence_id
+                             AND e.created_commit_seq<=?1
+                             AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
+                       )
+                   )
+                 ORDER BY observation_id",
             )
-        })
-        .collect::<HashMap<_, _>>();
+            .map_err(|_| KernelError::Io)?;
+        let rows = statement
+            .query_map([requested], |row| {
+                let observation_id = row.get::<_, String>(0)?;
+                let payload = row.get::<_, Vec<u8>>(1)?;
+                let payload: ObservationPayload =
+                    serde_json::from_slice(&payload).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            payload.len(),
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })?;
+                Ok((
+                    observation_id.clone(),
+                    ObservationInput {
+                        observation_id,
+                        alignment_kind: payload.classification,
+                    },
+                ))
+            })
+            .map_err(|_| KernelError::Io)?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()
+            .map_err(|_| KernelError::Io)?;
+        rows
+    };
     let dependencies = {
         let mut statement = tx
             .prepare(
@@ -179,6 +223,14 @@ fn load_alignment_input(
                  WHERE d.dependency_kind='implements'
                    AND o.created_commit_seq<=?1
                    AND (o.invalidated_commit_seq IS NULL OR ?1<o.invalidated_commit_seq)
+                   AND (
+                       o.evidence_id IS NULL OR EXISTS(
+                           SELECT 1 FROM evidence_meta e
+                           WHERE e.evidence_id=o.evidence_id
+                             AND e.created_commit_seq<=?1
+                             AND (e.invalidated_commit_seq IS NULL OR ?1<e.invalidated_commit_seq)
+                       )
+                   )
                  ORDER BY d.observation_id,d.dependency_object_id",
             )
             .map_err(|_| KernelError::Io)?;
