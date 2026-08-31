@@ -453,6 +453,16 @@ function gitAt(cwd: string): (args: string[]) => string {
     };
 }
 
+/** The harness drives the installed OpenCode binary, so the same checkout can produce different rollouts under a different release. `bindingMatches` compares this alongside `repoCommit`, which pins the repository but says nothing about the binary under it, so a resume across an OpenCode upgrade reuses coordinates the new release may no longer reproduce. commentlint: allow(JUDGE) */
+function openCodeVersion(): string {
+    const result = Bun.spawnSync(["opencode", "--version"], {
+        stdout: "pipe",
+        stderr: "pipe",
+    });
+    if (result.exitCode !== 0) throw new Error("cannot resolve OpenCode version");
+    return result.stdout.toString().trim();
+}
+
 function recordsRepoCommit(ownedPaths: readonly string[]): string {
     /** Run from the worktree root: `git ls-files --others` and the paths `git status` prints are both relative to the working directory, so a package-local cwd would miss a change made anywhere else in the repository. commentlint: allow(JUDGE) */
     const root = worktreeRoot();
@@ -653,6 +663,8 @@ async function runSmoke(args: CliArgs): Promise<void> {
             scenarios: SCENARIOS,
             poolManifestFingerprint: "smoke-pool-v1",
             repoCommit: recordsRepoCommit([args.recordsPath, args.reportPath, args.calibrationRecordPath]),
+            /** The smoke lane answers prompts from an in-process mock and never launches the installed binary, so it pins a literal beside its other mock identities rather than binding to whatever release happens to be on PATH. commentlint: allow(JUDGE) */
+            openCodeVersion: "mock-opencode",
             pinnedProviderId: "mock-live",
             pinnedSnapshotId: "mock-snapshot-2026-08-31",
             replicateCount: 1,
@@ -2191,6 +2203,7 @@ async function runLive(args: CliArgs): Promise<void> {
                     args.reportPath,
                     args.calibrationRecordPath,
                 ])}${calibrationFingerprint === null ? "" : `-cal-${calibrationFingerprint}`}`,
+                openCodeVersion: openCodeVersion(),
                 pinnedProviderId: model.providerId,
                 pinnedSnapshotId: model.modelId,
                 replicateCount: policy.replicateCount,

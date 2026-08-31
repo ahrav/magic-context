@@ -131,7 +131,9 @@ export function assertFrozenPool(
         const frozen = expected.get(actual.scenarioId)!;
         if (
             actual.semanticFingerprint !== frozen.semanticFingerprint ||
-            actual.verifierBundleDigest !== frozen.verifierBundleDigest
+            actual.verifierBundleDigest !== frozen.verifierBundleDigest ||
+            actual.runModes.length !== frozen.runModes.length ||
+            actual.runModes.some((mode) => !frozen.runModes.includes(mode))
         ) {
             throw new Error(
                 `paired-delta frozen scenario drift: ${actual.scenarioId}; ` +

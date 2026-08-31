@@ -13,7 +13,7 @@ describe("paired-delta pool freeze", () => {
         expect(() => assertFrozenPool(buildPairedDeltaRegistry(), manifest)).not.toThrow();
     });
 
-    it("rejects semantic and verifier drift while allowing run-mode edits", () => {
+    it("rejects semantic, verifier, and destructive run-mode drift", () => {
         const registry = buildPairedDeltaRegistry();
         const manifest = parsePairedDeltaManifest(manifestJson);
         const semanticDrift = structuredClone(manifest);
@@ -26,9 +26,11 @@ describe("paired-delta pool freeze", () => {
         expect(() => assertFrozenPool(registry, verifierDrift)).toThrow(
             new RegExp(manifest.scenarios[0]!.scenarioId),
         );
-        const membershipEdit = structuredClone(manifest);
-        membershipEdit.scenarios[0]!.runModes = ["release"];
-        expect(() => assertFrozenPool(registry, membershipEdit)).not.toThrow();
+        const membershipRemoval = structuredClone(manifest);
+        membershipRemoval.scenarios[0]!.runModes = ["release"];
+        expect(() => assertFrozenPool(registry, membershipRemoval)).toThrow(
+            /frozen scenario drift|cannot remove/,
+        );
     });
 
     it("rejects missing registrations in either direction", () => {
