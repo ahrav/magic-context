@@ -22,7 +22,7 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
             ...(context.armId === "r1"
                 ? [{
                     id: "check-r1-wire",
-                    passed: context.scriptedTurnText?.includes(spec.locatorId) ?? false,
+                    passed: context.scriptedTurnText?.includes(spec.answer) ?? false,
                 }]
                 : []),
         ];

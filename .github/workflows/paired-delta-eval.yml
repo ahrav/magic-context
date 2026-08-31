@@ -1,0 +1,118 @@
+name: paired-delta-eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Paired-delta pool mode
+        type: choice
+        options:
+          - calibration
+          - weekly
+          - release
+        default: weekly
+  schedule:
+    - cron: "29 6 * * 4"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: paired-delta-eval-live
+  cancel-in-progress: false
+
+jobs:
+  live-lane:
+    if: >-
+      github.event_name == 'schedule' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Resolve closed mode
+        env:
+          MODE_INPUT: ${{ inputs.mode }}
+        run: |
+          case "${MODE_INPUT:-weekly}" in
+            calibration|weekly|release) MODE="${MODE_INPUT:-weekly}" ;;
+            *) echo "unknown paired-delta mode: $MODE_INPUT" >&2; exit 1 ;;
+          esac
+          echo "PAIRED_DELTA_MODE=$MODE" >> "$GITHUB_ENV"
+
+      - name: Gate deterministic lane without credentials
+        run: |
+          bun run --cwd packages/e2e-tests typecheck
+          bun run --cwd packages/e2e-tests test:paired-delta-unit
+          bun run --cwd packages/e2e-tests validate-mode-manifest
+
+      - name: Install OpenCode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Build harness plugin
+        run: bun run --cwd packages/plugin build
+
+      - name: Restore mode rollout records
+        uses: actions/cache/restore@v4
+        with:
+          path: packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json
+          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.run_id }}
+          restore-keys: |
+            paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-
+
+      - name: Restore calibration evidence
+        if: env.PAIRED_DELTA_MODE != 'calibration'
+        uses: actions/cache/restore@v4
+        with:
+          path: packages/e2e-tests/artifacts/paired-delta-calibration.json
+          key: paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.run_id }}
+          restore-keys: |
+            paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-
+
+      - name: Run live paired-delta lane
+        timeout-minutes: 300
+        env:
+          NODE_ENV: ""
+          PAIRED_DELTA_ANTHROPIC_API_KEY: ${{ secrets.PAIRED_DELTA_ANTHROPIC_API_KEY }}
+        run: |
+          RECORDS="packages/e2e-tests/artifacts/paired-delta-${PAIRED_DELTA_MODE}-records.json"
+          REPORT="packages/e2e-tests/artifacts/paired-delta-${PAIRED_DELTA_MODE}-report.json"
+          ARGS=("--${PAIRED_DELTA_MODE}" "--records" "$RECORDS" "--report" "$REPORT" "--deadline-minutes" "290")
+          if [[ -f "$RECORDS" ]]; then ARGS+=("--resume"); fi
+          bun packages/e2e-tests/scripts/run-paired-delta.ts "${ARGS[@]}"
+
+      - name: Save rollout records for the next dispatch
+        if: always() && hashFiles(format('packages/e2e-tests/artifacts/paired-delta-{0}-records.json', env.PAIRED_DELTA_MODE)) != ''
+        uses: actions/cache/save@v4
+        with:
+          path: packages/e2e-tests/artifacts/paired-delta-${{ env.PAIRED_DELTA_MODE }}-records.json
+          key: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.run_id }}
+
+      - name: Save calibration evidence
+        if: always() && env.PAIRED_DELTA_MODE == 'calibration' && hashFiles('packages/e2e-tests/artifacts/paired-delta-calibration.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: packages/e2e-tests/artifacts/paired-delta-calibration.json
+          key: paired-delta-calibration-${{ hashFiles('packages/e2e-tests/pools/paired-delta-manifest.json') }}-${{ github.run_id }}
+
+      - name: Archive reports and rollout records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paired-delta-${{ env.PAIRED_DELTA_MODE }}-${{ github.run_id }}
+          path: packages/e2e-tests/artifacts/
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,0 +1,39 @@
+{
+  "schema": "prospective-policy-owner/v1",
+  "owner": "magic-context-x4l.14",
+  "status": "ready",
+  "policy": {
+    "schema": "paired-delta-policy/v1",
+    "endpoint": "paired-valid-success-delta",
+    "targetMinimumDetectableDelta": 0.15,
+    "minimumAnalyzableFamilyCount": 8,
+    "bootstrapResamples": 5000,
+    "poolManifestFingerprint": "a46f9b125c06cb25f0e16917badab4898aa162a335fe948a76889310e7628a9e",
+    "modelMatrix": [
+      {
+        "providerId": "anthropic",
+        "modelId": "claude-sonnet-4-5-20250929",
+        "contextLimit": 8192
+      }
+    ],
+    "replicateCount": 3,
+    "costBudgetUsd": {
+      "calibration": 500,
+      "weekly": 300,
+      "release": 1000
+    },
+    "pricesPerMillionTokens": {
+      "input": 3,
+      "output": 15,
+      "cacheCreation": 3.75,
+      "cacheRead": 0.3
+    },
+    "gates": [
+      "all-primary-arms-completed",
+      "absence-precondition-held",
+      "arm-identity-matched",
+      "pinned-model-echo-matched"
+    ]
+  },
+  "policyFingerprint": "0fd8247050c0db6edccd9f0fd0d5dbcf2ff5a9ea35f149620176fcc5815d22db"
+}

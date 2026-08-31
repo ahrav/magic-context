@@ -6,10 +6,12 @@ import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmar
 import { POLICY_OWNER_SCHEMA } from "../prospective-holdout/contract";
 import { estimateFamilyDeltas } from "./estimator";
 import {
+    buildCalibrationRecord,
     PAIRED_DELTA_REPORT_SCHEMA,
     buildPairedDeltaReport,
     publishPairedDeltaReport,
 } from "./report";
+import type { RolloutRecord } from "./runner";
 
 const H1 = "1".repeat(64);
 const H2 = "2".repeat(64);
@@ -61,6 +63,12 @@ function report() {
                 label: "raw-non-inferential",
             },
         ],
+        runSummary: {
+            status: "completed",
+            spentUsd: 12.5,
+            observedCostRollouts: 9,
+            estimatedCostRollouts: 1,
+        },
     });
 }
 
@@ -77,6 +85,12 @@ describe("paired-delta report", () => {
         expect(built.body.regret.providerMixed.map(({ endpoint }) => endpoint)).toEqual(["retrieval"]);
         expect(built.body.regret.live.map(({ endpoint }) => endpoint)).toEqual(["formation"]);
         expect(built.body.regret.raw[0]!.label).toBe("raw-non-inferential");
+        expect(built.body.runSummary).toEqual({
+            status: "completed",
+            spentUsd: 12.5,
+            observedCostRollouts: 9,
+            estimatedCostRollouts: 1,
+        });
         expect(built.reportFingerprint).toBe(canonicalFingerprint(built.body));
     });
 
@@ -120,6 +134,122 @@ describe("paired-delta report", () => {
                 turnsByArm: {},
             },
             rawRegretRecords: [],
+            runSummary: {
+                status: "cost-cap-reached",
+                spentUsd: 1,
+                observedCostRollouts: 0,
+                estimatedCostRollouts: 1,
+            },
         })).toThrow(/policy: identity-invalid/);
+    });
+});
+
+function calibrationRecord(
+    scenarioId: string,
+    replicateIndex: number,
+    checksPassed: number,
+): RolloutRecord {
+    return {
+        schema: "paired-delta-rollout/v1",
+        poolManifestFingerprint: H1,
+        scenarioId,
+        armId: "mc-on",
+        replicateIndex,
+        repoCommit: "abc123",
+        pinnedProviderId: "anthropic",
+        pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+        echoedProviderId: "anthropic",
+        echoedModelId: "claude-sonnet-4-5-20250929",
+        baseScriptFingerprint: H2,
+        intervention: { kind: "none", value: null },
+        cell: {
+            armId: "mc-on",
+            checksPassed,
+            checksTotal: 2,
+            criticalPassed: checksPassed > 0 ? 1 : 0,
+            criticalTotal: 1,
+            invalidSuccess: false,
+            runHealth: "completed",
+            reasonCode: null,
+        },
+        checks: [
+            { id: "check-file", passed: checksPassed > 0 },
+            { id: "check-answer", passed: checksPassed > 1 },
+        ],
+        usage: { input: 10, output: 5, cacheCreation: 0, cacheRead: 0 },
+        costUsd: 1.25,
+        costSource: "observed",
+        wallClockMs: 1000,
+        turns: 3,
+        harnessDisposed: true,
+    };
+}
+
+describe("paired-delta calibration record", () => {
+    const families = new Map([
+        ["var-a", "fam-one"],
+        ["var-b", "fam-two"],
+    ]);
+    const records = [
+        calibrationRecord("var-a", 0, 0),
+        calibrationRecord("var-a", 1, 1),
+        calibrationRecord("var-a", 2, 2),
+        calibrationRecord("var-b", 0, 2),
+        calibrationRecord("var-b", 1, 2),
+        calibrationRecord("var-b", 2, 2),
+    ];
+
+    it("derives measured family spread, variance, cost, and wall clock", () => {
+        const built = buildCalibrationRecord({
+            records,
+            scenarioFamilies: families,
+            runStatus: "completed",
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+            decisions: {
+                poolSize: 20,
+                familyCount: 8,
+                replicateCount: 3,
+                cadence: "weekly-and-release",
+            },
+        });
+
+        expect(built.validForPoolSizing).toBe(true);
+        expect(built.measuredCostUsd).toBe(7.5);
+        expect(built.measuredWallClockMs).toBe(6000);
+        expect(built.familyNoise).toEqual([
+            {
+                familyId: "fam-one",
+                replicateCount: 3,
+                spread: 1,
+                variance: 0.25,
+                interval: { lower: 0, upper: 1 },
+            },
+            {
+                familyId: "fam-two",
+                replicateCount: 3,
+                spread: 0,
+                variance: 0,
+                interval: { lower: 0, upper: 0 },
+            },
+        ]);
+        const { recordFingerprint, ...body } = built;
+        expect(recordFingerprint).toBe(canonicalFingerprint(body));
+    });
+
+    it("marks cap-terminated calibration invalid for sizing", () => {
+        expect(buildCalibrationRecord({
+            records,
+            scenarioFamilies: families,
+            runStatus: "cost-cap-reached",
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "claude-sonnet-4-5-20250929",
+            decisions: {
+                poolSize: 20,
+                familyCount: 8,
+                replicateCount: 3,
+                cadence: "weekly-and-release",
+            },
+        }).validForPoolSizing).toBe(false);
     });
 });

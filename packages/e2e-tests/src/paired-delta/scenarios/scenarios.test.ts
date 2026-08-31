@@ -48,7 +48,7 @@ describe("paired-delta authored scenarios", () => {
                 const checks = await scenario.verifier({
                     armId: "r1",
                     workspacePath: root,
-                    scriptedTurnText: scenario.interventions.r1.locatorIds.join(" "),
+                    scriptedTurnText: scenario.interventions.r3.evidence,
                 });
                 validateCheckVector(scenario, "r1", checks);
                 expect(checks.every(({ passed }) => passed)).toBe(true);
