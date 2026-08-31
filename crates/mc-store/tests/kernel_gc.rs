@@ -775,3 +775,64 @@ fn a_full_artifact_cap_is_reported_as_retriable() {
     store.run_staging_maintenance(15 * DAY_MS).unwrap();
     store.ingest_artifact(request("cap-retry", b"x")).unwrap();
 }
+
+#[test]
+fn ordinary_reclaim_leaves_a_concurrent_ingest_staging_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(request("stage-race", b"stage-race"))
+        .unwrap();
+    invalidate(root.path(), &handle.evidence_id, 0);
+
+    // A same-digest ingest that has staged its bytes and is waiting for the writer.
+    let staged = root
+        .path()
+        .join("artifacts/tmp")
+        .join(format!(".artifact-{}-99.tmp", handle.digest));
+    fs::write(&staged, b"stage-race").unwrap();
+
+    assert_eq!(
+        store
+            .run_staging_maintenance(15 * DAY_MS)
+            .unwrap()
+            .artifact_gc
+            .reclaimed_objects,
+        1
+    );
+
+    assert!(!object_path(root.path(), &handle.digest).exists());
+    assert!(
+        staged.exists(),
+        "ordinary reclaim swept a concurrent ingest's staged bytes"
+    );
+}
+
+#[test]
+fn a_resumed_purge_still_sweeps_its_own_temps() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(request("purge-temps", b"purge-temps"))
+        .unwrap();
+    seed_pending_unlink(root.path(), &handle.digest);
+    let leftover = root
+        .path()
+        .join("artifacts/tmp")
+        .join(format!(".artifact-{}-7.tmp", handle.digest));
+    fs::write(&leftover, b"purge-temps").unwrap();
+
+    assert_eq!(
+        store
+            .run_staging_maintenance(HOUR_MS)
+            .unwrap()
+            .artifact_gc
+            .reclaimed_objects,
+        1
+    );
+
+    assert!(!object_path(root.path(), &handle.digest).exists());
+    assert!(!leftover.exists(), "purge resume left plaintext behind");
+}

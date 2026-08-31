@@ -69,6 +69,13 @@ impl KernelStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| KernelError::Io)?;
         check_fence(&tx, self.lease_epoch())?;
+        let resuming_purge: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM artifact_pending_unlinks WHERE artifact_digest=?1)",
+                [&candidate.digest],
+                |row| row.get(0),
+            )
+            .map_err(|_| KernelError::Io)?;
         if !prepare_reclaim(&tx, candidate, now, self.lease_epoch())? {
             tx.commit().map_err(|_| KernelError::Io)?;
             return Ok(None);
@@ -83,8 +90,10 @@ impl KernelStore {
         // live reference for this digest land between the eligibility decision and the
         // unlink, leaving that reference pointing at absent bytes.
         let (removed, bytes) = self.unlink_artifact(&candidate.digest)?;
-        self.sweep_digest_temps(&candidate.digest)
-            .map_err(|error| self.map_gc_storage_error(error))?;
+        if resuming_purge {
+            self.sweep_digest_temps(&candidate.digest)
+                .map_err(|error| self.map_gc_storage_error(error))?;
+        }
 
         let tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)

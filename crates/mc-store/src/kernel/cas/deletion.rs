@@ -220,7 +220,7 @@ impl KernelStore {
             })
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::InvalidInput))?;
             line.push(b'\n');
-            receipt_conflict_free(&writer, &request.intent)?;
+            receipt_conflict_free(&writer, &request.intent, &state.barrier_id, request.kind)?;
             let mut log = self
                 .purge_intent_log
                 .lock()
@@ -666,23 +666,33 @@ fn load_artifact_state(
 fn receipt_conflict_free(
     connection: &rusqlite::Connection,
     intent: &CommitIntent,
+    barrier_id: &str,
+    kind: ArtifactDeletionKind,
 ) -> Result<(), ArtifactError> {
-    let recorded: Option<String> = connection
+    let recorded: Option<(String, String)> = connection
         .query_row(
-            "SELECT request_digest FROM operation_receipts
+            "SELECT request_digest,result_payload FROM operation_receipts
              WHERE producer=?1 AND operation_key=?2",
             params![
                 redact(&intent.producer).text,
                 redact(&intent.operation_key).text
             ],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-    if recorded.is_some_and(|digest| digest != intent.request_digest) {
+    let Some((digest, payload)) = recorded else {
+        return Ok(());
+    };
+    if digest != intent.request_digest {
         return Err(ArtifactError::new(ArtifactErrorKind::ReferenceCommit));
     }
-    Ok(())
+    // This receipt will be replayed, so it has to describe this deletion.
+    serde_json::from_str::<DeletionReceiptPayload>(&payload)
+        .ok()
+        .filter(|stored| stored.barrier_id == barrier_id && stored.kind == kind)
+        .map(|_| ())
+        .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))
 }
 
 fn injected_storage_error(errno: rustix::io::Errno) -> StorageError {
