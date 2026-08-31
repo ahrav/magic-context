@@ -122,6 +122,10 @@ pub struct AlignmentProjectionSpec {
 const DOMAIN_OBJECT_KIND: &str = "domain";
 /// R4 caps an active staging lease at one hour past its last heartbeat.
 const MAX_STAGING_LEASE_MS: i64 = 3_600_000;
+/// A caller-supplied heartbeat may lead the store clock only by this much, which
+/// stays small against the lease cap so a future timestamp cannot extend the
+/// reaper boundary.
+const MAX_STAGING_CLOCK_SKEW_MS: i64 = 60_000;
 
 struct PendingChange {
     object: ObjectRow,
@@ -974,12 +978,20 @@ impl RedactedCandidate {
             .recorded_at
             .checked_add(MAX_STAGING_LEASE_MS)
             .ok_or(KernelError::InvalidInput)?;
+        let skew_ceiling = current_time_ms()
+            .checked_add(MAX_STAGING_CLOCK_SKEW_MS)
+            .ok_or(KernelError::InvalidInput)?;
         if spec.source_revision < 0
             || spec.recorded_at < 0
+            || spec.recorded_at > skew_ceiling
             || spec.lease_expires_at <= spec.recorded_at
             || spec.lease_expires_at > lease_ceiling
             || spec.extraction_run_id.trim().is_empty()
             || spec.candidate_id.trim().is_empty()
+            || spec.extractor.trim().is_empty()
+            || spec.source_kind.trim().is_empty()
+            || spec.source_id.trim().is_empty()
+            || spec.candidate_kind.trim().is_empty()
         {
             return Err(KernelError::InvalidInput);
         }

@@ -582,3 +582,61 @@ fn an_identical_restage_renews_the_candidate_lease_with_its_run() {
         "a replayed candidate must not keep an older lease than its run"
     );
 }
+
+#[test]
+fn a_far_future_heartbeat_cannot_outrun_the_reaper() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut future = shared_run_candidate("candidate-future", 1);
+    // A lease within one hour of a far-future heartbeat would stay active for years.
+    future.recorded_at = i64::MAX - 3_600_000;
+    future.lease_expires_at = i64::MAX;
+    assert_eq!(
+        store.stage_candidate(future).unwrap_err(),
+        KernelError::InvalidInput
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let mut skewed = shared_run_candidate("candidate-skewed", 1);
+    skewed.recorded_at = now + 3_600_000;
+    skewed.lease_expires_at = skewed.recorded_at + 1_000;
+    assert_eq!(
+        store.stage_candidate(skewed).unwrap_err(),
+        KernelError::InvalidInput,
+        "an hour of clock lead is beyond the allowed skew"
+    );
+
+    let mut current = shared_run_candidate("candidate-current", 1);
+    current.recorded_at = now;
+    current.lease_expires_at = now + 1_000;
+    store.stage_candidate(current).unwrap();
+}
+
+#[test]
+fn blank_run_identity_fields_are_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    type Mutation = (&'static str, fn(&mut StagingCandidateSpec));
+    let mutations: [Mutation; 4] = [
+        ("extractor", |spec| spec.extractor = "  ".to_string()),
+        ("source_kind", |spec| spec.source_kind = String::new()),
+        ("source_id", |spec| spec.source_id = "\t".to_string()),
+        ("candidate_kind", |spec| spec.candidate_kind = String::new()),
+    ];
+    for (field, mutate) in mutations {
+        let mut spec = shared_run_candidate("candidate-blank", 1);
+        mutate(&mut spec);
+        assert_eq!(
+            store.stage_candidate(spec).unwrap_err(),
+            KernelError::InvalidInput,
+            "{field}"
+        );
+    }
+    assert_eq!(
+        inspect_count(directory.path(), "SELECT COUNT(*) FROM extraction_runs"),
+        0
+    );
+}
