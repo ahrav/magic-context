@@ -50,9 +50,10 @@ pub use outbox::{ConsumerAbandonment, OutboxPruneResult};
 pub use retention::{StagingMaintenanceResult, StagingTerminalState, STAGING_RETENTION_MS};
 pub use scope::{ScopeSpec, ScopeTermSpec, ScopeWriteOutcome};
 pub use slice::{
-    DecisionEventOutcome, DecisionEventPayload, DecisionEventSpec, DecisionPayload, DecisionSpec,
-    DecisionWriteOutcome, ObservationDependencySpec, ObservationPayload, ObservationSpec,
-    ObservationWriteOutcome, RetirementOutcome,
+    AlignmentRebuild, AlignmentRow, AlignmentSnapshot, DecisionEventOutcome, DecisionEventPayload,
+    DecisionEventSpec, DecisionPayload, DecisionRow, DecisionSpec, DecisionWriteOutcome,
+    ObservationDependencySpec, ObservationPayload, ObservationRow, ObservationSpec,
+    ObservationWriteOutcome, RetirementOutcome, SliceSnapshot,
 };
 
 /// A constraint violation is permanent and a lock wait is retryable, so collapsing both into `Io` would make either untreatable.
