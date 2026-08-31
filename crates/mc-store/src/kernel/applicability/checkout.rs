@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use gix::bstr::{BStr, ByteSlice};
@@ -70,28 +70,40 @@ impl EvalBudget {
     }
 }
 
+/// `DeadlineWatchdog` raises `budget`'s interrupt when its deadline passes, so commentlint: allow(JUDGE)
+/// an in-flight gix walk stops at its next poll. commentlint: allow(JUDGE)
+///
+/// The wait is a condvar rather than a sleep: `drop` has to stop this thread commentlint: allow(JUDGE)
+/// promptly, and a sleeping thread cannot be woken, which would add the commentlint: allow(JUDGE)
+/// remainder of its nap to every snapshot that finishes early. commentlint: allow(JUDGE)
 struct DeadlineWatchdog {
-    stop: Arc<AtomicBool>,
+    stop: Arc<(Mutex<bool>, Condvar)>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DeadlineWatchdog {
-    /// TICK bounds deadline detection and drop-time join latency to 25 ms.
-    const TICK: std::time::Duration = std::time::Duration::from_millis(25);
-
     fn arm(budget: &EvalBudget) -> Option<Self> {
         let deadline = budget.deadline?;
         let interrupt = budget.interrupt_flag();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_signal = Arc::clone(&stop);
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let signal = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
-            while !stop_signal.load(Ordering::Relaxed) {
+            let (lock, woken) = &*signal;
+            // A poisoned lock still carries the flag, and its only writer sets commentlint: allow(JUDGE)
+            // it to `true`, so an unwind mid-update cannot invent a stop. commentlint: allow(JUDGE)
+            let mut stop = lock.lock().unwrap_or_else(|error| error.into_inner());
+            while !*stop {
                 let now = Instant::now();
                 if now >= deadline {
                     interrupt.store(true, Ordering::Relaxed);
                     return;
                 }
-                std::thread::sleep((deadline - now).min(Self::TICK));
+                // The guard is held across the deadline test, so a `drop` commentlint: allow(JUDGE)
+                // racing this wait cannot signal into the gap and be missed. commentlint: allow(JUDGE)
+                stop = woken
+                    .wait_timeout(stop, deadline - now)
+                    .unwrap_or_else(|error| error.into_inner())
+                    .0;
             }
         });
         Some(Self {
@@ -103,7 +115,12 @@ impl DeadlineWatchdog {
 
 impl Drop for DeadlineWatchdog {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        let (lock, woken) = &*self.stop;
+        {
+            let mut stop = lock.lock().unwrap_or_else(|error| error.into_inner());
+            *stop = true;
+        }
+        woken.notify_all();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -302,7 +319,7 @@ pub fn snapshot_checkout(
         .to_string();
     // The scan polls between items and a clean checkout emits none;
     // `DeadlineWatchdog` interrupts the scan at `budget`'s deadline.
-    let _watchdog = DeadlineWatchdog::arm(budget);
+    let watchdog = DeadlineWatchdog::arm(budget);
     let ctx = ScanCtx::root(budget);
     let dirty_entries = scan_dirty_entries(&repo, &ctx)?;
     // A concurrent checkout, reset, or branch switch can pair old HEAD with
@@ -319,8 +336,10 @@ pub fn snapshot_checkout(
     }
     let sparse_state = sparse_state(&repo, &ctx)?;
     let dirty_fingerprint = fingerprint_entries(&dirty_entries, &sparse_state);
-    // Hashing a large entry set can outrun the deadline that the scan's last commentlint: allow(JUDGE)
-    // poll still satisfied, and a snapshot handed back here is cacheable. commentlint: allow(JUDGE)
+    // Stop the watchdog before the last check, so neither the fingerprint nor commentlint: allow(JUDGE)
+    // the watchdog's own teardown can carry a cacheable snapshot past the commentlint: allow(JUDGE)
+    // deadline that the scan's final poll still satisfied. commentlint: allow(JUDGE)
+    drop(watchdog);
     budget.check()?;
     Ok(CheckoutSnapshot {
         repo,

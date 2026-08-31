@@ -1385,3 +1385,41 @@ fn an_unreadable_patch_rung_still_reaches_the_tree_rung() {
         "an unreadable patch rung must not suppress a tree-rung match"
     );
 }
+
+#[test]
+fn a_reached_end_closes_the_window_despite_an_unresolved_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("a.txt", "a\n")], "base", 1);
+    let end = commit_snapshot(repo, "main", &[base], &[("a.txt", "b\n")], "end", 2);
+    let head = commit_snapshot(repo, "main", &[end], &[("a.txt", "c\n")], "head", 3);
+
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, head);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+
+    // A start this build cannot resolve at all, paired with an end that is
+    // plainly reachable. `start && !end` is already false either way.
+    let unresolvable_start = "ab".repeat(32);
+    assert_eq!(
+        ladder.evaluate(&GitCondition::ReachableBetween {
+            start_oid: unresolvable_start,
+            end_oid: end.to_string(),
+            captures: BTreeMap::new(),
+        }),
+        GitConditionOutcome::DoesNotHold { historical: true },
+        "a reached end closes the window whatever the start resolves to"
+    );
+
+    // An unresolvable start with an unreached end stays genuinely unknown.
+    let unborn_end = "cd".repeat(20);
+    assert_eq!(
+        ladder.evaluate(&GitCondition::ReachableBetween {
+            start_oid: "ab".repeat(32),
+            end_oid: unborn_end,
+            captures: BTreeMap::new(),
+        }),
+        GitConditionOutcome::Uncertain
+    );
+}

@@ -808,3 +808,40 @@ fn large_sparse_pattern_files_key_by_content() {
     let changed = snapshot_checkout(dir.path(), &budget).unwrap();
     assert_ne!(first.dirty_fingerprint(), changed.dirty_fingerprint());
 }
+
+#[test]
+fn a_finite_deadline_does_not_add_watchdog_latency() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    const ROUNDS: u32 = 6;
+    let baseline = Instant::now();
+    for _ in 0..ROUNDS {
+        snapshot_checkout(dir.path(), &EvalBudget::unbounded()).unwrap();
+    }
+    let unarmed = baseline.elapsed();
+
+    let armed_start = Instant::now();
+    for _ in 0..ROUNDS {
+        // Far enough out that the deadline never fires; only the watchdog's
+        // own teardown separates this from the unbounded case.
+        let budget = EvalBudget::new(
+            Some(Instant::now() + Duration::from_secs(30)),
+            Default::default(),
+        );
+        snapshot_checkout(dir.path(), &budget).unwrap();
+    }
+    let armed = armed_start.elapsed();
+
+    // A watchdog that cannot be woken adds the remainder of a 25 ms nap per
+    // snapshot. The bound is loose enough to survive a loaded machine while
+    // still failing on a per-snapshot quantum of that size.
+    let ceiling = unarmed + Duration::from_millis(15) * ROUNDS;
+    assert!(
+        armed < ceiling,
+        "armed {armed:?} exceeded {ceiling:?} (unbounded baseline {unarmed:?})"
+    );
+}

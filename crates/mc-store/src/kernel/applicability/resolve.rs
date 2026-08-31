@@ -99,14 +99,18 @@ impl<'s> ResolutionLadder<'s> {
                     (CommitResolution::NotReachable, _) => {
                         GitConditionOutcome::DoesNotHold { historical: false }
                     }
+                    // A reached end closes the window whatever the start commentlint: allow(JUDGE)
+                    // resolves to, so false dominates unknown on this side commentlint: allow(JUDGE)
+                    // too, and the end having been reached is what commentlint: allow(JUDGE)
+                    // `historical` records. commentlint: allow(JUDGE)
+                    (_, CommitResolution::Reachable) => {
+                        GitConditionOutcome::DoesNotHold { historical: true }
+                    }
                     (CommitResolution::Uncertain, _) | (_, CommitResolution::Uncertain) => {
                         GitConditionOutcome::Uncertain
                     }
                     (CommitResolution::Reachable, CommitResolution::NotReachable) => {
                         GitConditionOutcome::Holds
-                    }
-                    (CommitResolution::Reachable, CommitResolution::Reachable) => {
-                        GitConditionOutcome::DoesNotHold { historical: true }
                     }
                 }
             }
@@ -449,9 +453,6 @@ pub fn compute_patch_id(
         };
         file_hashes.push(file_hash);
     }
-    // Loading, decompressing, and hashing the last blob runs after the final commentlint: allow(JUDGE)
-    // poll, and callers persist or cache what this returns. commentlint: allow(JUDGE)
-    budget_gate(budget)?;
     // Hashing all file hashes together prevents linear cancellation.
     file_hashes.sort_unstable();
     let mut combined = Sha256::new();
@@ -461,6 +462,10 @@ pub fn compute_patch_id(
     for file_hash in &file_hashes {
         combined.update(file_hash);
     }
+    // The last blob's load and hash, the sort, and this fold all run after the commentlint: allow(JUDGE)
+    // final per-change poll, and callers persist or cache what comes back, so commentlint: allow(JUDGE)
+    // the gate sits at the exit rather than ahead of the aggregation. commentlint: allow(JUDGE)
+    budget_gate(budget)?;
     Ok(Some(format!("{:x}", combined.finalize())))
 }
 
