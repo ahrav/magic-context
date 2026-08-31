@@ -2358,3 +2358,90 @@ fn the_durable_candidate_binding_lookup_is_indexed() {
         "expected the candidate_ref index, planner chose: {plan}"
     );
 }
+
+#[test]
+fn materialization_refuses_internal_and_succession_events() {
+    for kind in [
+        EventKind::ApprovalRevoked,
+        EventKind::Correct,
+        EventKind::Replace,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KernelStore::open(directory.path()).unwrap();
+        stage(&store, "internal");
+        let mut forged = request("internal");
+        forged.event.kind = kind;
+        forged.event.trigger_object_id = None;
+
+        let error = store
+            .commit(intent("internal"), |envelope| {
+                envelope.admit_domain_candidate(
+                    forged.clone(),
+                    AdmissionDomainSpec {
+                        domain_id: "domain-internal".to_string(),
+                        object_id: "object-internal".to_string(),
+                        name: "name-internal".to_string(),
+                    },
+                )?;
+                Ok(String::new())
+            })
+            .unwrap_err();
+        assert_eq!(error, KernelError::AdmissionPolicy, "{kind:?}");
+        assert_eq!(
+            inspect(directory.path(), "SELECT COUNT(*) FROM domains"),
+            0,
+            "{kind:?}"
+        );
+        assert_eq!(
+            inspect(directory.path(), "SELECT COUNT(*) FROM admission_decisions"),
+            0,
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn quarantining_a_supported_subject_records_a_quarantine_not_a_demotion() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "supported-q");
+    let mut promoted = request("supported-q");
+    promoted.source_class = Some(SourceClass::ModelInference);
+    promoted.taint_class = Some(TaintClass::AssistantInference);
+    promoted.event.kind = EventKind::Verify;
+    promoted.event.trigger_object_id = None;
+    promoted.event.approval_object_id = Some("approval".to_string());
+    assert_eq!(admit(&store, promoted, "supported-q", "promote"), "admit");
+
+    store
+        .commit(intent("quarantine-supported"), |envelope| {
+            let mut quarantine = subject_request("object-supported-q", EventKind::Quarantine);
+            quarantine.source_class = Some(SourceClass::ModelInference);
+            quarantine.taint_class = Some(TaintClass::AssistantInference);
+            quarantine.event.approval_object_id = Some("approval".to_string());
+            let decision = envelope.record_admission(quarantine)?;
+            assert_eq!(decision.disposition.as_str(), "quarantined");
+            assert_eq!(decision.outcome.as_str(), "quarantine");
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // The immutable ledger row and the projector payload must agree with it.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT outcome FROM admission_decisions
+             WHERE subject_object_id='object-supported-q'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "quarantine"
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM change_event WHERE change_kind='quarantine'"
+        ),
+        1
+    );
+}

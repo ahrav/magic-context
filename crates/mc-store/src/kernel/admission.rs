@@ -1,6 +1,7 @@
 use super::envelope::{
     object_row_from, DomainSpec, Envelope, ObjectRow, PendingChange, OBJECT_ROW_COLUMNS,
 };
+use super::object_write;
 use super::redaction::{identity, record, redact};
 use super::{map_sqlite, KernelError, Sensitivity};
 use crate::current_time_ms;
@@ -10,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "2e93066f164fa6ffa464193b800bdb62fe401f92195aa6bbaefa2d78be6e4834";
+    "087ed5ad51d003cb302c3eac67501749fb811e527b6796b763610dbf3b323922";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -266,13 +267,18 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         (_, None) => current_effective,
     };
     let ceiling = automatic_ceiling(input.source_class, input.taint_class);
-    // Support above `ceiling` survives only while the approval that granted it does.
-    let carried_effective =
-        if current_effective.rank() > ceiling.rank() && input.supporting_authority == Some(false) {
-            ceiling
-        } else {
-            current_effective
-        };
+    // Support above `ceiling` survives only while the authority that granted it does.
+    // A self-approving accepted decision cites no approval, so its own accepted
+    // status is that authority.
+    let authority_holds = match input.supporting_authority {
+        Some(valid) => valid,
+        None => input.subject_is_accepted_decision,
+    };
+    let carried_effective = if current_effective.rank() > ceiling.rank() && !authority_holds {
+        ceiling
+    } else {
+        current_effective
+    };
     let (requested, requested_disposition, requested_outcome) = event_effect(input.event, current);
     let raises_support =
         event_can_raise_support(input.event) && requested.rank() > carried_effective.rank();
@@ -320,14 +326,14 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
 
     let outcome = if denied {
         Outcome::Deny
-    } else if effective.rank() < current_effective.rank() {
-        Outcome::DemoteSupport
     } else if historical.rank() > current.rank() || effective.rank() > current_effective.rank() {
         if input.prior.is_some() {
             Outcome::Promote
         } else {
             Outcome::Admit
         }
+    } else if effective.rank() < current_effective.rank() && requested_disposition.is_none() {
+        Outcome::DemoteSupport
     } else {
         requested_outcome
     };
@@ -597,6 +603,24 @@ impl Envelope<'_> {
         request: AdmissionRequest,
         domain: AdmissionDomainSpec,
     ) -> Result<AdmissionDecision, KernelError> {
+        if !matches!(
+            request.event.kind,
+            EventKind::AcceptedAdr
+                | EventKind::CodeObserved
+                | EventKind::ConfigObserved
+                | EventKind::Corroborate
+                | EventKind::Verify
+                | EventKind::Approve
+                | EventKind::Enforce
+                | EventKind::ExplicitReject
+                | EventKind::Contradict
+                | EventKind::Quarantine
+                | EventKind::MarkStale
+                | EventKind::MarkDisputed
+                | EventKind::Other
+        ) {
+            return Err(KernelError::AdmissionPolicy);
+        }
         let prepared = self.prepare_admission(request)?;
         let Some(candidate_id) = prepared.facts.candidate_id() else {
             return Err(KernelError::AdmissionPolicy);
@@ -736,25 +760,13 @@ impl Envelope<'_> {
             .map_err(map_sqlite)?
             .ok_or(KernelError::NotFound)?;
         let dependents = load_approval_dependents(self, &approval_object_id)?;
-        let registry = self
-            .tx
-            .execute(
-                "UPDATE object_registry SET invalidated_commit_seq=?1
-                 WHERE object_id=?2 AND invalidated_commit_seq IS NULL",
-                params![self.commit_seq, approval_object_id],
-            )
-            .map_err(map_sqlite)?;
-        let decision = self
-            .tx
-            .execute(
-                "UPDATE decisions SET invalidated_commit_seq=?1
-                 WHERE object_id=?2 AND invalidated_commit_seq IS NULL",
-                params![self.commit_seq, approval_object_id],
-            )
-            .map_err(map_sqlite)?;
-        if registry != 1 || decision != 1 {
-            return Err(KernelError::NotFound);
-        }
+        object_write::invalidate(
+            self.tx,
+            self.commit_seq,
+            "decisions",
+            "object_id",
+            &approval_object_id,
+        )?;
         let mut invalidated = approval;
         invalidated.invalidated_commit_seq = Some(self.commit_seq);
         let revocation_reason = redact(reason);
@@ -898,10 +910,15 @@ impl Envelope<'_> {
             request.event.approval_object_id.as_deref(),
             facts.subject_object_id(),
         )?;
-        let supporting_authority = match stored
+        // The chain walk is expensive, and the cited approval is usually the stored
+        // one because `prepare_admission` back-fills it.
+        let stored_approval = stored
             .as_ref()
-            .and_then(|stored| stored.approval_object_id.as_deref())
-        {
+            .and_then(|stored| stored.approval_object_id.as_deref());
+        let supporting_authority = match stored_approval {
+            Some(approval) if Some(approval) == request.event.approval_object_id.as_deref() => {
+                Some(approval_valid)
+            }
             Some(approval) => Some(validate_approval(
                 self,
                 Some(approval),
@@ -1330,11 +1347,11 @@ fn load_prior_decision(
 /// Strict counterpart of [`Sensitivity::from_stored`] for ledger rows: an
 /// unknown value is an error, never a substituted default.
 fn sensitivity_from_ledger(value: &str) -> Result<Sensitivity, KernelError> {
-    match value {
-        "normal" => Ok(Sensitivity::Normal),
-        "sensitive" => Ok(Sensitivity::Sensitive),
-        "secret" => Ok(Sensitivity::Secret),
-        _ => Err(KernelError::AdmissionPolicy),
+    let parsed = Sensitivity::from_stored(value);
+    if parsed.as_str() == value {
+        Ok(parsed)
+    } else {
+        Err(KernelError::AdmissionPolicy)
     }
 }
 
@@ -2494,6 +2511,93 @@ mod tests {
         })
         .unwrap();
         assert_eq!(uncited.effective_maturity.get(), Maturity::Verified);
+    }
+
+    #[test]
+    fn an_event_that_names_a_disposition_keeps_its_own_outcome() {
+        // A non-active disposition withdraws support, so effective maturity drops.
+        // That must not relabel the event as a support demotion.
+        for (event, expected, disposition) in [
+            (
+                EventKind::Quarantine,
+                Outcome::Quarantine,
+                Disposition::Quarantined,
+            ),
+            (
+                EventKind::ExplicitReject,
+                Outcome::Reject,
+                Disposition::Rejected,
+            ),
+            (
+                EventKind::Contradict,
+                Outcome::Deny,
+                Disposition::Contradicted,
+            ),
+            (EventKind::MarkStale, Outcome::Deny, Disposition::Stale),
+            (
+                EventKind::MarkDisputed,
+                Outcome::Deny,
+                Disposition::Disputed,
+            ),
+        ] {
+            let result = evaluate_admission(EvaluationInputs {
+                prior: Some(approved_prior()),
+                supporting_authority: Some(true),
+                approval_valid: true,
+                ..trusted_code_input(event)
+            })
+            .unwrap();
+            assert_eq!(result.disposition, disposition, "{event:?}");
+            assert_eq!(result.outcome, expected, "{event:?}");
+            assert!(
+                result.effective_maturity.get().rank() < approved_prior().effective_maturity.rank(),
+                "{event:?} should withdraw support"
+            );
+        }
+    }
+
+    #[test]
+    fn a_support_only_change_still_reports_a_demotion() {
+        let demoted = evaluate_admission(EvaluationInputs {
+            prior: Some(approved_prior()),
+            supporting_authority: Some(false),
+            ..trusted_code_input(EventKind::CodeObserved)
+        })
+        .unwrap();
+        assert_eq!(demoted.disposition, Disposition::Active);
+        assert_eq!(demoted.outcome, Outcome::DemoteSupport);
+    }
+
+    #[test]
+    fn a_self_approving_record_decays_once_its_accepted_status_is_gone() {
+        let self_approved = PriorDecision {
+            source_class: SourceClass::ExplicitUser,
+            taint_class: TaintClass::UserExplicit,
+            ..approved_prior()
+        };
+        let base = EvaluationInputs {
+            source_class: SourceClass::ExplicitUser,
+            taint_class: TaintClass::UserExplicit,
+            prior: Some(self_approved),
+            // A self-approving record cites no approval.
+            supporting_authority: None,
+            ..trusted_code_input(EventKind::CodeObserved)
+        };
+        let held = evaluate_admission(EvaluationInputs {
+            subject_is_accepted_decision: true,
+            ..base
+        })
+        .unwrap();
+        assert_eq!(held.effective_maturity.get(), Maturity::Approved);
+
+        // Once the backing accepted status is gone, the support it granted goes too.
+        let decayed = evaluate_admission(EvaluationInputs {
+            subject_is_accepted_decision: false,
+            ..base
+        })
+        .unwrap();
+        assert_eq!(decayed.effective_maturity.get(), Maturity::Verified);
+        assert_eq!(decayed.outcome, Outcome::DemoteSupport);
     }
 
     #[test]
