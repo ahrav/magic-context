@@ -1,4 +1,5 @@
 mod backup;
+mod durable_fs;
 mod envelope;
 mod facts;
 mod open;

@@ -1,20 +1,23 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use rustix::fs::RenameFlags;
 use rustix::fs::{self as rfs, AtFlags, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::durable_fs::{
+    create_new_file, create_secure_directory, durable_unlink, next_unique_id,
+    publish_noreplace_locked, sync_directory as sync_directory_fd, temp_name as durable_temp_name,
+    write_and_sync, PublishOutcome,
+};
 use super::envelope::check_fence;
 use crate::current_time_ms;
 
@@ -51,7 +54,6 @@ const LOCAL_FILESYSTEMS: &[u64] = &[
     0x5265_4973, // ReiserFS
     0x0000_3434, // NILFS
 ];
-static UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct BackupRequest {
@@ -138,16 +140,16 @@ impl KernelStore {
             request.capture_pin_expires_at,
             request.deadline,
         )?;
-        let unique = next_unique();
+        let unique = next_unique_id();
         let final_name = final_name_override
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{BACKUP_PREFIX}{}-{unique}.sqlite", capture.commit_seq));
-        let temp_name = format!(".{BACKUP_PREFIX}{}-{unique}.tmp", capture.commit_seq);
+        let temp_name = durable_temp_name(&format!("{BACKUP_PREFIX}{}", capture.commit_seq));
         let final_path = request.destination_directory.join(&final_name);
 
         let mut published = false;
         let result = (|| {
-            create_private_file_at(&destination, &temp_name)?;
+            drop(create_new_file(&destination, &temp_name).map_err(|_| KernelError::Io)?);
             if let Some(callback) = hook.as_mut() {
                 callback();
             }
@@ -202,9 +204,22 @@ impl KernelStore {
             if fault_before_rename {
                 return Err(KernelError::Fault);
             }
-            publish_noreplace(&destination, &temp_name, &final_name)?;
+            // Set `published` before `sync_directory_fd` so cleanup removes an
+            // artifact published before a directory-sync failure.
+            match publish_noreplace_locked(&destination, &temp_name, &final_name)
+                .map_err(|_| KernelError::Io)?
+            {
+                PublishOutcome::AlreadyExists => return Err(KernelError::Io),
+                PublishOutcome::Published => {}
+                // `cleanup_backup_family` retries removal of both the final
+                // artifact and the retained temp link on the error path.
+                PublishOutcome::PublishedTempRetained => {
+                    published = true;
+                    return Err(KernelError::Io);
+                }
+            }
             published = true;
-            destination.sync_all().map_err(|_| KernelError::Io)?;
+            sync_directory_fd(&destination).map_err(|_| KernelError::Io)?;
             Ok(BackupManifest {
                 captured_commit_seq: capture.commit_seq,
                 evidence_refs: capture.evidence_refs.clone(),
@@ -215,13 +230,18 @@ impl KernelStore {
         })();
 
         if result.is_err() {
-            cleanup_backup_family(&destination, &temp_name);
+            let mut cleaned = cleanup_backup_family(&destination, &temp_name);
             if published {
-                cleanup_backup_family(&destination, &final_name);
+                cleaned &= cleanup_backup_family(&destination, &final_name);
             }
             let _ = destination.sync_all();
-            if let Some(pin_id) = capture.pin_id.as_deref() {
-                rollback_capture_pin(&mut writer, self.lease_epoch(), pin_id);
+            // Keep the pin until cleanup succeeds: retention could reap
+            // evidence still referenced by a lingering artifact. The pin's
+            // own expiry reclaims it when cleanup never succeeds.
+            if cleaned {
+                if let Some(pin_id) = capture.pin_id.as_deref() {
+                    rollback_capture_pin(&mut writer, self.lease_epoch(), pin_id);
+                }
             }
         }
         result
@@ -579,18 +599,6 @@ pub fn owner_is_current_for_test(uid: u32) -> bool {
     owner_is_current(uid)
 }
 
-fn create_private_file_at(directory: &File, name: &str) -> Result<(), KernelError> {
-    let file = rfs::openat(
-        directory,
-        name,
-        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
-    )
-    .map_err(|_| KernelError::Io)?;
-    drop(file);
-    Ok(())
-}
-
 // Reaching the file through the verified directory descriptor means a destination
 // swapped after `assert_same_file` cannot redirect this fsync.
 fn sync_child(directory: &File, name: &str) -> Result<(), KernelError> {
@@ -612,31 +620,6 @@ fn assert_same_file(directory: &File, name: &str, pathname: &Path) -> Result<(),
         return Err(KernelError::InvalidBackup);
     }
     Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn publish_noreplace(
-    directory: &File,
-    temp_name: &str,
-    final_name: &str,
-) -> Result<(), KernelError> {
-    rfs::renameat_with(
-        directory,
-        temp_name,
-        directory,
-        final_name,
-        RenameFlags::NOREPLACE,
-    )
-    .map_err(|_| KernelError::Io)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn publish_noreplace(
-    _directory: &File,
-    _temp_name: &str,
-    _final_name: &str,
-) -> Result<(), KernelError> {
-    Err(KernelError::UnsafeDestination)
 }
 
 // Reference collection, the sensitivity scan and the per-evidence inserts all
@@ -786,15 +769,17 @@ fn rollback_capture_pin(writer: &mut Connection, lease_epoch: u64, pin_id: &str)
     }
 }
 
-fn cleanup_backup_family(directory: &File, name: &str) {
+fn cleanup_backup_family(directory: &File, name: &str) -> bool {
+    let mut cleaned = true;
     for candidate in [
         name.to_string(),
         format!("{name}-journal"),
         format!("{name}-wal"),
         format!("{name}-shm"),
     ] {
-        let _ = rfs::unlinkat(directory, candidate, AtFlags::empty());
+        cleaned &= durable_unlink(directory, &candidate).is_ok();
     }
+    cleaned
 }
 
 fn sensitivity_bearing_tables(tx: &rusqlite::Transaction<'_>) -> Result<Vec<String>, KernelError> {
@@ -862,10 +847,7 @@ fn cleanup_backup_sidecars(directory: &File, name: &str) -> Result<(), KernelErr
         format!("{name}-wal"),
         format!("{name}-shm"),
     ] {
-        match rfs::unlinkat(directory, candidate, AtFlags::empty()) {
-            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-            Err(_) => return Err(KernelError::Io),
-        }
+        durable_unlink(directory, &candidate).map_err(|_| KernelError::Io)?;
     }
     Ok(())
 }
@@ -1175,15 +1157,12 @@ fn publish_restore_marker(path: &Path, recovery_dir: &Path) -> Result<(), Kernel
     };
     marker.marker_digest = restore_marker_digest(&marker);
     let marker_path = restore_marker_path(path);
-    let temp_path = suffix_path(&marker_path, &format!(".{}.tmp", next_unique()));
+    let temp_path = suffix_path(&marker_path, &format!(".{}.tmp", next_unique_id()));
     let bytes = serde_json::to_vec(&marker).map_err(|_| KernelError::Io)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
     let mut file = options.open(&temp_path).map_err(|_| KernelError::Io)?;
-    if std::io::Write::write_all(&mut file, &bytes)
-        .and_then(|()| file.sync_all())
-        .is_err()
-    {
+    if write_and_sync(&mut file, &bytes).is_err() {
         drop(file);
         let _ = fs::remove_file(&temp_path);
         return Err(KernelError::Io);
@@ -1258,12 +1237,16 @@ fn open_live_family(
 }
 
 fn allocate_recovery_dir(path: &Path) -> Result<PathBuf, KernelError> {
+    let parent_path = path.parent().ok_or(KernelError::Io)?;
+    let parent = File::open(parent_path).map_err(|_| KernelError::Io)?;
     for _ in 0..10_000 {
-        let candidate = suffix_path(path, &format!("{RESTORE_INFIX}{}", next_unique()));
-        // Create the recovery directory with mode 0700 so displaced live files are never group- or world-accessible.
-        match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+        let candidate = suffix_path(path, &format!("{RESTORE_INFIX}{}", next_unique_id()));
+        let name = candidate.file_name().ok_or(KernelError::Io)?;
+        match create_secure_directory(&parent, name) {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::EXIST.raw_os_error()) => {
+                continue;
+            }
             Err(_) => return Err(KernelError::Io),
         }
     }
@@ -1333,7 +1316,7 @@ impl Drop for StagedRestore<'_> {
 }
 
 fn restore_temp_path(path: &Path) -> PathBuf {
-    suffix_path(path, &format!(".restore-{}.tmp", next_unique()))
+    suffix_path(path, &format!(".restore-{}.tmp", next_unique_id()))
 }
 
 fn copy_to_private_temp(source: &mut File, destination: &Path) -> Result<(), KernelError> {
@@ -1352,23 +1335,4 @@ fn copy_to_private_temp(source: &mut File, destination: &Path) -> Result<(), Ker
         return Err(KernelError::Io);
     }
     Ok(())
-}
-
-fn next_unique() -> u64 {
-    let counter = UNIQUE_ID.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff;
-    (unique_prefix() << 32) | counter
-}
-
-// A PID alone repeats across restarts under namespace-local container PIDs, and a
-// repeated name makes `O_EXCL` creation and `RENAME_NOREPLACE` publication fail
-// with an opaque `EEXIST`.
-fn unique_prefix() -> u64 {
-    static PREFIX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *PREFIX.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.subsec_nanos())
-            .unwrap_or(0);
-        u64::from(nanos) ^ u64::from(std::process::id())
-    })
 }
