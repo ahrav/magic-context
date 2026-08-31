@@ -8,7 +8,11 @@ import {
     verifyDualMockResolution,
     type RolloutObservation,
 } from "../src/paired-delta/runner";
-import type { ArmId, ScenarioDeclaration } from "../src/paired-delta/contract";
+import {
+    parseScenarioDeclaration,
+    type ArmId,
+    type ScenarioDeclaration,
+} from "../src/paired-delta/contract";
 
 interface CliArgs {
     recordsPath: string;
@@ -47,11 +51,27 @@ function parseArgs(argv: string[]): CliArgs {
     return { recordsPath: resolve(recordsPath), resume, maxCostUsd, deadlineMinutes };
 }
 
+/** A resume must not skip coordinates recorded by a different checkout: `bindingMatches` compares `repoCommit`, so a constant would let a post-change smoke report success without executing the changed code. commentlint: allow(JUDGE) */
+function smokeRepoCommit(): string {
+    const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: resolve(import.meta.dir, "..") });
+    if (head.exitCode !== 0) throw new Error("cannot resolve HEAD for the smoke records binding");
+    const commit = head.stdout.toString().trim();
+    const dirty = Bun.spawnSync(["git", "status", "--porcelain"], {
+        cwd: resolve(import.meta.dir, ".."),
+    });
+    if (dirty.exitCode !== 0) throw new Error("cannot resolve the worktree state");
+    /** An uncommitted worktree shares its parent's commit, so the digest keeps a resume from reusing records written before the edit. commentlint: allow(JUDGE) */
+    const pending = dirty.stdout.toString().trim();
+    if (pending === "") return commit;
+    return `${commit}-dirty-${Bun.hash(pending).toString(16)}`;
+}
+
 function fixtureScenario(
     scenarioId: string,
     title: string,
 ): ScenarioDeclaration {
-    return {
+    /** The declaration goes through `parseScenarioDeclaration` so the smoke exercises a scenario the paired-delta contract accepts: the evidence turn precedes the R1 insertion point, no turn from that point on repeats the answer, and one R2 claim carries it. commentlint: allow(JUDGE) */
+    return parseScenarioDeclaration({
         scenarioId,
         familyId: "fam-smoke",
         title,
@@ -61,25 +81,29 @@ function fixtureScenario(
         criticalCheckIds: ["check-smoke-outcome"],
         turnScript: [
             { id: "turn-smoke-evidence", role: "user", content: "Remember smoke-id-17." },
+            { id: "turn-smoke-filler", role: "user", content: "Acknowledge the note." },
             { id: "turn-smoke-probe", role: "user", content: "Return the smoke identifier." },
         ],
         interventions: {
             r1: {
-                insertAfterTurnId: "turn-smoke-evidence",
+                insertAfterTurnId: "turn-smoke-filler",
                 locatorIds: ["mem-smoke"],
             },
             r2: {
-                memories: [{ claim: "The smoke identifier", evidence: "smoke-id-17" }],
+                memories: [{
+                    claim: "The smoke identifier is smoke-id-17",
+                    evidence: "turn-smoke-evidence",
+                }],
             },
         },
         absencePrecondition: {
             evidenceTurnId: "turn-smoke-evidence",
-            minimumBallastBytes: 1024,
+            minimumBallastBytes: 4096 * 4,
         },
         modelContextLimit: 4096,
         restartArms: [],
         verifier: () => [],
-    };
+    });
 }
 
 const SCENARIOS = [
@@ -128,7 +152,7 @@ async function main(): Promise<void> {
         {
             scenarios: SCENARIOS,
             poolManifestFingerprint: "smoke-pool-v1",
-            repoCommit: "smoke-fixture",
+            repoCommit: smokeRepoCommit(),
             pinnedProviderId: "mock-live",
             pinnedSnapshotId: "mock-snapshot-2026-08-31",
             replicateCount: 1,

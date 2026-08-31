@@ -152,6 +152,8 @@ export interface PairedDeltaRunResult {
 
 export class ProviderUnavailableError extends Error {}
 
+const LATE_DISPOSAL_GRACE_MS = 5_000;
+
 /** Thrown when an in-flight rollout outlives the run deadline. */
 export class RolloutDeadlineError extends Error {}
 
@@ -373,9 +375,9 @@ export function interventionFor(
 ): InterventionDescriptor {
     switch (armId) {
         case "r1":
-            return { kind: "scripted-retrieval", value: scenario.interventions.r1 };
+            return { kind: "scripted-retrieval", value: structuredClone(scenario.interventions.r1) };
         case "r2":
-            return { kind: "gold-memory", value: scenario.interventions.r2 };
+            return { kind: "gold-memory", value: structuredClone(scenario.interventions.r2) };
         case "r3":
             return { kind: "gold-evidence", value: r3PromptEvidence(scenario) };
         default:
@@ -399,6 +401,24 @@ function completedIdentityMatches(
             record.echoedProviderId === options.pinnedProviderId &&
             record.echoedModelId === options.pinnedSnapshotId
         );
+}
+
+/** Completed evidence must be scorable against the declaration it is standing in for, so the vector is revalidated and its aggregates recomputed rather than trusted from the file. commentlint: allow(JUDGE) */
+function resumableEvidence(record: RolloutRecord, scenario: ScenarioDeclaration): boolean {
+    try {
+        validateCheckVector(scenario, record.checks);
+    } catch (error) {
+        if (!(error instanceof PairedDeltaContractError)) throw error;
+        return false;
+    }
+    const critical = new Set(scenario.criticalCheckIds);
+    const criticalPassed = record.checks.filter(
+        ({ id, passed }) => passed && critical.has(id),
+    ).length;
+    return record.cell.checksTotal === scenario.checks.length &&
+        record.cell.checksPassed === record.checks.filter(({ passed }) => passed).length &&
+        record.cell.criticalTotal === critical.size &&
+        record.cell.criticalPassed === criticalPassed;
 }
 
 function isResumable(record: RolloutRecord, options: RunPairedDeltaOptions): boolean {
@@ -427,6 +447,8 @@ export async function runPairedDelta(
     let reserveUsd = options.deskCostCeilingUsd;
     let status: PairedDeltaRunResult["status"] = "completed";
     let startedAny = false;
+    /** A creation that lost its deadline race still yields a handle that owns a live harness. Its disposal is settled before the run returns so an unreclaimed one reaches the caller as `harness-unreclaimed` rather than as silence. commentlint: allow(JUDGE) */
+    const lateDisposals: Promise<boolean>[] = [];
     const selectedScenarioIds = new Set(options.scenarios.map(({ scenarioId }) => scenarioId));
     const inMatrix = (record: RolloutRecord): boolean =>
         record.poolManifestFingerprint === options.poolManifestFingerprint &&
@@ -489,6 +511,11 @@ export async function runPairedDelta(
                     // Completed records are immutable evidence; re-executing
                     // one would pay for a rollout whose result the store must
                     // then discard.
+                    /** A stored vector is only unique strings to the parser, which has no declaration; an id set that does not belong to this scenario would be rehydrated as evidence and can leave `score()` dividing by an empty selection. commentlint: allow(JUDGE) */
+                    if (isResumable(existing, options) && !resumableEvidence(existing, scenario)) {
+                        invalidStoredCoordinates.push(coordinate);
+                        return null;
+                    }
                     if (isResumable(existing, options)) {
                         resumedRollouts++;
                         records.push(existing);
@@ -519,13 +546,15 @@ export async function runPairedDelta(
                 let observation: RolloutObservation | null = null;
                 let failure: unknown;
                 let disposed = false;
+                let disposalFailed = false;
                 try {
                     /** Creation spawns the harness, so it is inside the deadline: a hung create would otherwise outlive `deadlineEpochMs` unbounded. The handle is captured off the promise rather than the race result, so one that arrives after the deadline is still disposed instead of leaking a live harness. commentlint: allow(JUDGE) */
                     creation = dependencies.createRollout({
                         scenario,
                         coordinate,
                         baseScriptFingerprint: fingerprint,
-                        intervention,
+                        /** The adapter resolves symbolic locator handles, so it gets its own copy: mutating the descriptor the comparison keeps would make the declaration-match check accept whatever the adapter produced. commentlint: allow(JUDGE) */
+                        intervention: structuredClone(intervention),
                     });
                     const pendingCreation = creation;
                     pendingCreation.then((created) => {
@@ -548,11 +577,13 @@ export async function runPairedDelta(
                             await handle.dispose();
                             disposed = true;
                         } catch (error) {
+                            /** A harness left running outranks whatever ended the rollout: the deadline only bounded this arm, while an unreclaimed harness threatens every arm after it. commentlint: allow(JUDGE) */
+                            disposalFailed = true;
                             failure ??= error;
                         }
                     } else {
                         /** A handle that lost the creation race still owns a harness, so it is disposed when it arrives; nothing waits on it because a hung creation is what the deadline is for. commentlint: allow(JUDGE) */
-                        if (creation) disposeLateHandle(creation);
+                        if (creation) lateDisposals.push(disposeLateHandle(creation));
                     }
                 }
                 const wallClockMs = Math.max(0, dependencies.now() - startedAt);
@@ -568,6 +599,7 @@ export async function runPairedDelta(
                         disposed,
                         reserveUsd,
                         priorAttemptsCostUsd,
+                        disposalFailed,
                     )
                     : failedRecord(
                         options,
@@ -580,6 +612,7 @@ export async function runPairedDelta(
                         failure,
                         reserveUsd,
                         priorAttemptsCostUsd,
+                        disposalFailed,
                     );
                 options.store.put(record);
                 records.push(record);
@@ -589,9 +622,9 @@ export async function runPairedDelta(
                 if (record.costSource === "observed") observedCostRollouts++;
                 else estimatedCostRollouts++;
                 if (record.cell.reasonCode) incrementExclusion(exclusionCounts, armId, record.cell.reasonCode);
-                if (failure instanceof RolloutDeadlineError) status = "deadline-reached";
                 /** A harness that would not dispose may still be holding its workspace and session, so the next arm would measure a contaminated environment; the run ends rather than producing arms whose comparison cannot be trusted. commentlint: allow(JUDGE) */
-                else if (!disposed && handle) status = "harness-unreclaimed";
+                if (disposalFailed) status = "harness-unreclaimed";
+                else if (failure instanceof RolloutDeadlineError) status = "deadline-reached";
                 return record;
             };
 
@@ -631,6 +664,11 @@ export async function runPairedDelta(
         }
     }
 
+    if (lateDisposals.length > 0) {
+        const reclaimed = await Promise.all(lateDisposals);
+        if (reclaimed.some((ok) => !ok)) status = "harness-unreclaimed";
+    }
+
     if (status === "completed" && invalidStoredCoordinates.length > 0) {
         status = "invalid-stored-records";
     }
@@ -668,6 +706,7 @@ function completedRecord(
     harnessDisposed: boolean,
     reserveUsd: number,
     priorAttemptsCostUsd: number,
+    disposalFailed: boolean,
 ): RolloutRecord {
     const identityMatches =
         observation.echoedProviderId === options.pinnedProviderId &&
@@ -680,7 +719,7 @@ function completedRecord(
         );
     const usage = finiteUsage(observation.usage);
     /** A harness that would not dispose may still be running and contaminating later arms, so its result cannot stand as evidence however well the rollout itself went. Non-finite usage is checked next because a cost derived from it would poison `spentUsd` for every later cap comparison. commentlint: allow(JUDGE) */
-    let reasonCode: ReasonCode | null = !harnessDisposed
+    let reasonCode: ReasonCode | null = disposalFailed
         ? "harness-failure"
         : usage === null
             ? "invalid-result"
@@ -762,9 +801,11 @@ function failedRecord(
     failure: unknown,
     reserveUsd: number,
     priorAttemptsCostUsd: number,
+    disposalFailed: boolean,
 ): RolloutRecord {
-    const providerUnavailable = failure instanceof ProviderUnavailableError;
-    const deadlineExceeded = failure instanceof RolloutDeadlineError;
+    /** Reported ahead of the rollout's own failure for the same reason the status is: a timeout bounded this arm, an unreclaimed harness threatens the ones after it. commentlint: allow(JUDGE) */
+    const providerUnavailable = !disposalFailed && failure instanceof ProviderUnavailableError;
+    const deadlineExceeded = !disposalFailed && failure instanceof RolloutDeadlineError;
     const worstCase = worstCaseUsd(scenario, options.pricesPerMillionTokens);
     return {
         schema: ROLLOUT_RECORD_SCHEMA,
@@ -887,12 +928,29 @@ function coordinateKey(coordinate: RolloutCoordinate): string {
     ].join(":");
 }
 
-/** A creation that lost its deadline race still resolves eventually, and the handle it yields owns a live harness that would contaminate later arms. commentlint: allow(JUDGE) */
-function disposeLateHandle(creation: Promise<RolloutHandle>): void {
-    void creation.then(
-        (handle) => handle.dispose().catch(() => {}),
-        () => {},
-    );
+/** Resolves false when a late handle could not be reclaimed. A creation that never settles is bounded by `LATE_DISPOSAL_GRACE_MS` because the deadline it already missed is the reason it is being abandoned. commentlint: allow(JUDGE) */
+async function disposeLateHandle(creation: Promise<RolloutHandle>): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const grace = new Promise<"unreclaimed">((resolve) => {
+        timer = setTimeout(() => resolve("unreclaimed"), LATE_DISPOSAL_GRACE_MS);
+    });
+    try {
+        const outcome = await Promise.race([
+            creation.then(
+                async (handle) => {
+                    await handle.dispose();
+                    return "reclaimed" as const;
+                },
+                () => "reclaimed" as const,
+            ),
+            grace,
+        ]);
+        return outcome === "reclaimed";
+    } catch {
+        return false;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 async function withRolloutDeadline<T>(

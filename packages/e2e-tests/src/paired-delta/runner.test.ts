@@ -304,43 +304,51 @@ describe("paired-delta runner", () => {
 
     it("bounds rollout creation with the run deadline and disposes a late handle", async () => {
         const disposedArms: string[] = [];
-        let released: (() => void) | null = null;
-        const result = await runPairedDelta(
+        const lateHandle = (disposeFails: boolean) =>
+            async (armId: string): Promise<RolloutHandle> => {
+                // Creation outlives the deadline, then resolves while the run is
+                // settling the handle it abandoned.
+                await new Promise((resolve) => setTimeout(resolve, 60));
+                return {
+                    async run() {
+                        throw new Error("run must not start after the deadline");
+                    },
+                    async dispose() {
+                        if (disposeFails) throw new Error("harness would not stop");
+                        disposedArms.push(armId);
+                    },
+                };
+            };
+
+        const reclaimed = await runPairedDelta(
             { ...options(), deadlineEpochMs: Date.now() + 25 },
             {
                 now: Date.now,
-                createRollout({ coordinate }): Promise<RolloutHandle> {
-                    // Creation outlives the deadline, so the handle arrives after
-                    // the runner has already given up on it.
-                    return new Promise<RolloutHandle>((resolve) => {
-                        released = () =>
-                            resolve({
-                                async run() {
-                                    throw new Error("run must not start after the deadline");
-                                },
-                                async dispose() {
-                                    disposedArms.push(coordinate.armId);
-                                },
-                            });
-                    });
-                },
+                createRollout: ({ coordinate }) => lateHandle(false)(coordinate.armId),
             },
         );
 
-        expect(result.status).toBe("deadline-reached");
-        expect(result.records[0]?.cell).toMatchObject({
+        expect(reclaimed.status).toBe("deadline-reached");
+        expect(reclaimed.records[0]?.cell).toMatchObject({
             runHealth: "timeout",
             reasonCode: "deadline-exceeded",
         });
-        expect(result.records[0]?.harnessDisposed).toBe(false);
-        expect(disposedArms).toEqual([]);
-
-        released!();
-        await Promise.resolve();
-        await Promise.resolve();
-
-        // The harness the late creation owns is still reclaimed.
+        expect(reclaimed.records[0]?.harnessDisposed).toBe(false);
+        // The harness the abandoned creation owns is still reclaimed, and the run
+        // does not report until it knows.
         expect(disposedArms).toEqual(["mc-on"]);
+
+        const unreclaimed = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                createRollout: ({ coordinate }) => lateHandle(true)(coordinate.armId),
+            },
+        );
+
+        // A late handle that will not dispose reaches the caller as contamination
+        // rather than as silence.
+        expect(unreclaimed.status).toBe("harness-unreclaimed");
     });
 
     it("gives the rollout only the deadline left after creation", async () => {
@@ -442,6 +450,108 @@ describe("paired-delta runner", () => {
         });
         expect(store.records.filter(({ armId }) => armId === "mc-off")).toHaveLength(1);
         expect(result.exclusionCounts["mc-off"]?.["invalid-result"]).toBe(1);
+    });
+
+    it("reports an unreclaimed harness even when the rollout timed out first", async () => {
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                async createRollout(): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            return await new Promise<RolloutObservation>(() => {});
+                        },
+                        async dispose() {
+                            throw new Error("harness would not stop");
+                        },
+                    };
+                },
+            },
+        );
+
+        // The deadline bounded this arm; the harness threatens the ones after it.
+        expect(result.status).toBe("harness-unreclaimed");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+        });
+        expect(result.records[0]?.harnessDisposed).toBe(false);
+    });
+
+    it("refuses a stored vector that does not fit the scenario it would stand in for", async () => {
+        const store = new MemoryStore();
+        const first = await runPairedDelta(options(store), dependencies());
+        const stored = store.records.find(({ armId }) => armId === "mc-on");
+        if (!stored || !first.records.length) throw new Error("missing fixture record");
+
+        // Unique, parser-valid ids that belong to no check the scenario declares.
+        stored.checks = stored.checks.map((check, index) => ({
+            ...check,
+            id: `check-drifted-${index}`,
+        }));
+        const events: string[] = [];
+        const result = await runPairedDelta(options(store), dependencies(undefined, events));
+
+        expect(result.status).toBe("invalid-stored-records");
+        expect(result.invalidStoredCoordinates).toContainEqual({
+            poolManifestFingerprint: "a".repeat(64),
+            scenarioId: scenario.scenarioId,
+            armId: "mc-on",
+            replicateIndex: 0,
+        });
+        expect(result.records.some(({ armId }) => armId === "mc-on")).toBe(false);
+        expect(events).not.toContain("create:mc-on");
+    });
+
+    it("refuses a stored cell whose aggregates disagree with its own vector", async () => {
+        const store = new MemoryStore();
+        await runPairedDelta(options(store), dependencies());
+        const stored = store.records.find(({ armId }) => armId === "mc-on");
+        if (!stored) throw new Error("missing fixture record");
+
+        stored.cell = { ...stored.cell, criticalPassed: 0 };
+        const result = await runPairedDelta(options(store), dependencies());
+
+        expect(result.status).toBe("invalid-stored-records");
+        expect(result.records.some(({ armId }) => armId === "mc-on")).toBe(false);
+    });
+
+    it("hands the adapter its own intervention copy", async () => {
+        const declared = structuredClone(scenario.interventions.r1);
+        const result = await runPairedDelta(
+            options(),
+            {
+                now: () => 100,
+                async createRollout({ coordinate, intervention }): Promise<RolloutHandle> {
+                    // An adapter resolving locator handles mutates what it was
+                    // given; neither the declaration nor the expected value may
+                    // follow it.
+                    if (intervention.kind === "scripted-retrieval") {
+                        (intervention.value as { locatorIds: string[] }).locatorIds =
+                            ["mcm_resolved"];
+                    }
+                    return {
+                        async run() {
+                            // mc-on fails its critical check, so the ladder runs
+                            // and R1 is actually created.
+                            const value = observation(coordinate.armId, coordinate.armId !== "mc-on");
+                            value.intervention = intervention;
+                            return value;
+                        },
+                        async dispose() {},
+                    };
+                },
+            },
+        );
+
+        expect(scenario.interventions.r1).toEqual(declared);
+        // The mutated descriptor no longer matches the declaration, so R1 is an
+        // exclusion instead of evidence.
+        expect(result.records.find(({ armId }) => armId === "r1")?.cell).toMatchObject({
+            runHealth: "malformed",
+            reasonCode: "invalid-result",
+        });
     });
 
     it("classifies a malformed check vector as an exclusion and continues", async () => {
