@@ -130,8 +130,9 @@ ever sending `Activate`.
 the host's response is to drop *its own* copies and cancel its own work
 (`connection.rs:180-185`). The peer keeps both mapping descriptors. They are
 ordinary file descriptors over ordinary memfds; the only stated containment is the
-Linux size seal, which `docs/mc-host-shm-transport.md:85` says macOS does not
-provide.
+Linux size seal. The `docs/mc-host-shm-transport.md:85` macOS caveat previously
+cited here is gone: after PR #131 (merge `5d638e3e8`) that doc states a
+`linux-x64-gnu`-only platform contract and no longer mentions macOS.
 
 **Credentials do not survive an incarnation, and that is the good news here.**
 The 32-byte key and the 16-byte daemon id are each a fresh `getrandom` inside
@@ -212,9 +213,10 @@ The exclusion is structural, and so is the inclusion. Every `-p mc-host` test
 invocation in `ci.yml` carries a `--test <name>` filter, which selects one
 integration binary and does not build the lib target, so the 386-line test module
 in `setup_socket.rs:441-826` and the other three `mc-host` modules are never
-compiled in CI. The peer half is in a different crate, and `ci.yml:177` runs
-`cargo nextest run -p mc-shm-native -p mc-shm-transport` **unfiltered** on Linux
-with `cargo nextest run -p mc-shm-native` likewise unfiltered on macOS (`:184`).
+compiled in CI. The peer half is in a different crate, and `ci.yml:167` runs
+`cargo nextest run -p mc-shm-native -p mc-shm-transport` **unfiltered** on Linux;
+the unfiltered macOS `mc-shm-native` run this preamble previously cited was
+removed with every other macOS job by PR #131 (merge `5d638e3e8`).
 So the 2 tests in the peer's `setup.rs` do run while the 11 in `auth.rs` that pin
 the same proof construction on the host side do not.
 

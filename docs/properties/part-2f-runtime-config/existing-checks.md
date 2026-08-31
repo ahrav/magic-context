@@ -328,13 +328,14 @@ Six, each held by discipline rather than by a build step.
    `serve.rs:162` and `:349` are each
    `HarnessClosureStore::open(&closure_root).ok()`. A store that fails to open is
    therefore indistinguishable from one that was never configured.
-6. **`file_mode::raw_mode`'s platform claim is prose only.** `file_mode.rs:9-15`
-   explains that `RawMode` is `u32` on Linux and `u16` on Darwin and that "leaving
-   it implicit compiles on Linux and fails on Darwin". The claim is load-bearing
-   for a cross-platform build and is verified only by the macOS CI legs compiling
-   (`ci.yml:137`'s matrix includes `macos-latest` and `macos-15-intel`), which is
-   real coverage but incidental: nothing asserts the mask `0o7777` or the value
-   range the comment argues for.
+6. **`file_mode::raw_mode`'s platform claim is prose only.** `file_mode.rs:7-8`
+   explains that `RawMode` is `u32` on Linux and `u16` on Darwin and that
+   "Without the cast, the function compiles on Linux and fails on Darwin". The
+   claim is load-bearing for a cross-platform build, and since PR #131 (merge
+   `5d638e3e8`) nothing in CI verifies it: `ci.yml` contains only
+   `ubuntu-latest` jobs, so the Darwin arm of the cast never compiles under
+   CI. The macOS matrix legs this entry previously cited are gone. Nothing
+   asserts the mask `0o7777` or the value range the comment argues for either.
 
 One further unasserted margin, recorded by lens A as an observation rather than
 promoted to a record. `config.rs:325` sizes the published connection file using a

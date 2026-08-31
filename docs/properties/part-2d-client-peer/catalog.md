@@ -203,11 +203,14 @@ builds the lib target. Re-verified at `HEAD`: the 13 `mc-host` hits are `:87`,
 `:442`, and `:461`, and `:168-169` are `cargo build`.
 
 Six integration tests in `crates/mc-host/tests/client.rs` (243 lines) do run, and
-the binary is named in CI three times: `ci.yml:132` ("Mandatory ring client
-suite", Linux, job `shm-crash-recovery`), `:179` (inside a wrapped
+the binary is named in CI twice at HEAD: `ci.yml:119` ("Mandatory ring client
+suite", Linux, job `shm-crash-recovery`) and `:168-169` (a wrapped
 `cargo nextest run -p mc-host --test client --test lifecycle`, Linux, job
-`shm-source-build`), and `:187` ("Fixed-ring contracts (macOS)"). All three
-commands were printed and confirmed. **All six exercise the client as a peer**
+`shm-source-build`). The third site this preamble previously counted, a
+"Fixed-ring contracts (macOS)" step, was removed with every other macOS job by
+PR #131 (merge `5d638e3e8`); `ci.yml` at HEAD contains only `ubuntu-latest`
+jobs. Both remaining commands were printed and confirmed. **All six exercise
+the client as a peer**
 rather than as a fixture: each constructs `Client::connect(host.publication_path())`
 and asserts on the client's own observable behaviour.
 
