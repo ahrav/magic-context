@@ -305,7 +305,9 @@ test in a binary CI does name.
 drives a `route.open` and a routed request into one draining host and asserts
 `target_unavailable` and `server_busy` respectively, which is
 [req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes](#req-a-shutdown-rejects-routed-and-control-work-under-divergent-codes)
-in full; `lifecycle` runs at `ci.yml:178-179` on Linux and `:187` on macOS. The
+in full; `lifecycle` runs at `ci.yml:168-169` on Linux. The former macOS run of
+the same pair was removed with every other macOS job by PR #131 (merge
+`5d638e3e8`); `ci.yml` at HEAD contains only `ubuntu-latest` jobs. The
 binary was excluded from the six because its *subject* is the host lifecycle
 rather than the request path, which is a defensible scope call and is exactly how
 the check went uncredited. Counting by binary subject rather than by assertion is
@@ -1055,10 +1057,10 @@ no, which the routed and control chains do differently at every level.
 Type: safety
 Reachability: default-production
 Status: active
-Exercised: yes — `tests/lifecycle.rs:576`
+Exercised: yes — `tests/lifecycle.rs:570` (re-located at HEAD)
 `shutdown_refuses_new_routes_and_new_routed_work` asserts both codes against one
-draining host, and `lifecycle` is CI-executed on Linux (`ci.yml:178-179`) and
-macOS (`:187`)
+draining host, and `lifecycle` is CI-executed on Linux (`ci.yml:168-169`);
+`ci.yml` has no macOS jobs after PR #131 (merge `5d638e3e8`)
 Guarantee: The shutdown admission fence is one condition evaluated at two call
 sites, and the two sites answer with different error codes carrying different
 client retry rules.
@@ -1085,8 +1087,9 @@ publication to be unlinked (`:614-621`), then sends a `route.open` and asserts
 request on the still-live route and asserts
 `request_error.error_code() == "server_busy"` (`:640-657`). Both codes, one
 draining host, one test. Status `unaudited`. **In CI**, unlike every other check
-this catalog cites: `ci.yml:178-179` runs `--test client --test lifecycle` on
-Linux and `:187` runs the same pair on macOS.
+this catalog cites: `ci.yml:168-169` runs `--test client --test lifecycle` on
+Linux. The former macOS run of the same pair was removed by PR #131 (merge
+`5d638e3e8`), which left `ci.yml` Linux-only.
 Impact: Protocol §10.2 tells a client to retry `target_unavailable` "with new
 correlation under bounded route deadline" and `server_busy` "with backoff". A
 draining host therefore invites un-backed-off `route.open` retries from exactly
