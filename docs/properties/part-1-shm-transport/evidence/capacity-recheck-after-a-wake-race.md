@@ -62,9 +62,11 @@ strictly before its deadline. Today
 (`crates/mc-shm-transport/tests/ring.rs:551-592`) blocks a `reserve_until`
 behind a child's held lease and converges after the child releases 50 ms
 later — it exercises the block-then-wake path but the release always lands
-well inside the block, never in the arm window. A loom model of
-`signal_wake` against the park sequence is the cheap oracle; the atomics are
-few and the state space is small.
+well inside the block, never in the arm window. A loom model is the cheap
+oracle, but it is necessarily a hand transcription of `reserve_until` and
+`signal_wake` over loom atomics — the protocol's atomics live in an mmapped
+shared page loom cannot instrument — kept in sync manually, including the
+Release-not-SeqCst parked resets.
 
 ## Investigation log
 
@@ -81,8 +83,12 @@ few and the state space is small.
 
 ### Q: are the orderings actually sufficient?
 
-- Sources examined: `:994-1000`, `:1426-1429`; both sides SeqCst on
-  generation and parked.
+- Sources examined: `:994-1000`, `:1426-1429`; generation is SeqCst on both
+  sides, but every `parked` reset on the exit paths is a `Release` store
+  (`:1004`, `:1013`, and the other exit arms through `:1042`), not SeqCst.
+  The mix is harmless on the current reading — a resetting producer is by
+  definition not blocked — but a loom model that silently "corrected" it to
+  SeqCst would validate different code.
 - Findings: the pairing argument above is by hand; no concurrency tool runs
   anywhere in the repository (existing-checks.md, concurrency section).
 - Conclusion: unresolved, needs a loom or Miri pass over the wake protocol.

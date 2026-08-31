@@ -256,8 +256,8 @@ while testing nothing.
 | attach-validates-doorbell-eventfds | F15 in a full attach: one substituted doorbell in an otherwise valid `[OwnedFd; 3]` | Partial — unit-level rejection arms exist; the attach-ordering claim (no partial state on rejection) is untested |
 | wake-published-during-readiness-callback-is-not-lost | A publication strictly inside an unacknowledged callback (F14); enabling situation `shm_publish_during_readiness_callback` | Partial — constructed at the raw-addon level (`mechanism.ts:211-278`); the `NativeChannel` wrapper and multi-channel variants are not |
 | queued-write-needs-no-second-wake | Two or more writes queued before one coalesced wake is drained, then silence; enabling situation `shm_queued_writes_exceed_one_per_wake` | **Yes** — `ring_bridge_drains_inbound_and_queued_writes` builds exactly this and bounds each completion at 250 ms |
-| released-charges-wake-blocked-readers | Read-budget exhaustion with the bridge parked in its charge poll, then a concurrent `ByteCharge` drop (F14 with a shrunken budget); enabling situation `shm_read_budget_exhausted_with_parked_bridge` | No — the blocking arm has never executed under any test |
-| capacity-recheck-after-a-wake-race | F16 against `reserve_until`'s arm ladder, plus a parked epoch the release provably hit; enabling situation `shm_capacity_signal_hit_parked_epoch` | No — the existing cross-process wake lands mid-block, three orders of magnitude away from the window |
+| released-charges-wake-blocked-readers | Read-budget exhaustion with the bridge parked in its charge poll, then a concurrent `ByteCharge` drop (F14 with a shrunken budget); enabling situation `shm_read_budget_exhausted_with_parked_bridge`, witnessed as `read_budget.used == capacity` at the moment a further frame is published, followed by bounded resumption after one `ByteCharge` drop (in-module test; `used()` is `#[cfg(test)]`) | No — the blocking arm has never executed under any test |
+| capacity-recheck-after-a-wake-race | F16 against `reserve_until`'s arm ladder, plus a parked epoch the release provably hit; enabling situation `shm_capacity_signal_hit_parked_epoch` witnesses block-then-wake coverage only — F16's arm window has no constructible runtime marker | No — the existing cross-process wake lands mid-block, three orders of magnitude away from the window |
 | reclamation-excludes-pages-with-live-wrapped-bytes | F17: a shared partial page beside a live lease, a wrap-crossing run, and the trailing-page exception under a wrapped cursor; enabling situations `shm_partial_page_shared_with_live_lease`, `shm_arena_wrap_with_live_lease` | Partial — the first two shapes are pinned by unit tests; the exception-under-wrap shape and any non-4096 page size are not |
 | reactor-callback-is-one-in-flight | Doorbell or kick edges during a pending callback, ideally from several channels at once; enabling situation `shm_kick_during_pending_callback` | Partial — single-channel deferral is pinned (`callbacks === 2`); multi-channel coalescing and a hostile double-acknowledge are not |
 
@@ -271,8 +271,8 @@ preconditions, and both are legal on a correct system.
 | --- | --- | --- |
 | `shm_publish_during_readiness_callback` | A commit landed while `pending` was true in the reactor | Both events are legal; the marker does not claim the wake was lost |
 | `shm_queued_writes_exceed_one_per_wake` | The bridge's write queue held two or more entries at one eventfd drain | Ordinary burst behavior |
-| `shm_read_budget_exhausted_with_parked_bridge` | `charge` failed and the bridge entered its poll | Backpressure is a legal state; pairs with the release that ends it |
-| `shm_capacity_signal_hit_parked_epoch` | `signal_wake` swapped a nonzero parked epoch on the capacity page | The signal side of the handshake working as designed |
+| `shm_read_budget_exhausted_with_parked_bridge` | `read_budget.used == capacity` at the moment a further frame is published, followed by bounded resumption after one `ByteCharge` drop | Backpressure is a legal state; pairs with the release that ends it |
+| `shm_capacity_signal_hit_parked_epoch` | Block-then-wake coverage: `signal_wake` swapped a nonzero parked epoch on the capacity page (fires on every ordinary mid-block wake; F16's arm window has no constructible runtime marker) | The signal side of the handshake working as designed |
 | `shm_partial_page_shared_with_live_lease` | A reclaim ran while a live lease held bytes on a page the released run touched | The exact shape the rounding protects; legal and expected |
 | `shm_kick_during_pending_callback` | `kick` was set while a callback was unacknowledged | The deferral path's precondition, not its failure |
 
@@ -282,9 +282,12 @@ bounded resumption after the witnessed precondition.
 
 ### Leverage notes (Group N)
 
-1. **F16 via a loom model of `signal_wake` against the two arm ladders** — the
-   cheapest valid oracle in this group: four atomics, two threads, no
-   process or fd machinery, and it is the only way to reach the
+1. **F16 via a loom model of a hand transcription of the wake protocol** —
+   the cheapest valid oracle in this group, but not free: the atomics live
+   in an mmapped page loom cannot instrument, so `reserve_until` and
+   `signal_wake` must be transcribed over loom atomics and kept in sync
+   manually, including the Release-not-SeqCst parked resets. Two threads,
+   no process or fd machinery, and it is the only way to reach the
    instruction-scale window deliberately. Covers
    `capacity-recheck-after-a-wake-race` and the arm half of
    `wake-published-during-readiness-callback-is-not-lost`.

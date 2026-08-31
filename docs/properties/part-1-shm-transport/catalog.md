@@ -3478,7 +3478,10 @@ Check: `always` — a bridge loop pass that completed a write re-polls the write
 queue without arming or blocking (`wrote` at `:1846`/`:1858`, checked at
 `:1913-1915`), so per-write completion latency is bounded in loop passes, not
 in external events. `always` because the property must hold on every pass;
-the bound (k passes, no second signal) is what a finite test asserts.
+the bound (k passes, no second signal) is what a finite test asserts. Harness
+proxy: per-write completion within an explicit wall-clock deadline with the
+delivered signal count pinned by the test, since loop passes are not
+externally observable.
 Fault/timing angle: eventfds coalesce. N `try_send` signals
 (`:1764-1768`) before the bridge polls collapse into one readable edge, and
 `drain_eventfd` (`:1800-1803`) consumes it whole; the window opens whenever
@@ -3517,7 +3520,10 @@ Check: `always` — every `ByteCharge::drop` that decrements a counter with a
 registered wake signals that wake's eventfd (`client.rs:1711-1725`), and a
 bridge parked in the charge loop observes it on its next poll (`:1879-1901`).
 `always` because the drop-side signal is unconditional given a registered
-wake; the bounded window is one poll wakeup plus one loop iteration.
+wake; the bounded window is one poll wakeup plus one loop iteration. Harness
+proxy: per-write completion within an explicit wall-clock deadline with the
+delivered signal count pinned by the test, since loop passes are not
+externally observable.
 Fault/timing angle: signal-before-park — the drop can land between the failed
 `charge` attempt and the bridge's `poll`. The eventfd absorbs it: the write
 leaves the counter readable, so the later poll returns immediately. No
@@ -3526,7 +3532,11 @@ the level-observable state.
 Required faults and enabling state: read-budget exhaustion with the bridge
 parked in the charge poll, then a concurrent charge drop. Needs a shrunken
 budget or frames wider than the default. Enabling situation
-`shm_read_budget_exhausted_with_parked_bridge`.
+`shm_read_budget_exhausted_with_parked_bridge`, witnessed as
+`read_budget.used == capacity` at the moment a further frame is published,
+followed by bounded resumption after one `ByteCharge` drop. The test is
+necessarily in-module — `start_ring_bridge` is private and the `used()`
+accessor exists under `#[cfg(test)]` (`client.rs:1688-1690`).
 Confidence: medium —
 [evidence](evidence/released-charges-wake-blocked-readers.md). The wiring
 (`set_wake` at `:1821`, drop-side signal, poll arm) was read directly, but no
@@ -3572,8 +3582,11 @@ otherwise be represented only by the byte just discarded. Correctness rests on
 SeqCst pairing that no tool validates (fault class F5).
 Required faults and enabling state: a parked producer plus a release racing
 the arm sequence — true concurrency (F4) or a model checker. Enabling
-situation `shm_capacity_signal_hit_parked_epoch`, witnessed on the release
-side when `signal_wake` swaps a nonzero epoch.
+situation `shm_capacity_signal_hit_parked_epoch`, which witnesses
+block-then-wake coverage only: a nonzero swap fires on every ordinary
+mid-block wake, so the marker over-approximates the arm window. F16 itself
+has no constructible runtime marker; only a loom or shuttle schedule can
+observe the window.
 Confidence: medium —
 [evidence](evidence/capacity-recheck-after-a-wake-race.md). The full loop and
 both publisher orderings were read and the interleaving case analysis is
@@ -3587,8 +3600,12 @@ draining correctly. Intermittent, load-dependent, and unreproducible by any
 lockstep test.
 Open questions:
 
-- A loom model of `signal_wake` against the park ladder is the cheapest
-  oracle; the state space is four atomics. Queue it?
+- A loom model of a hand transcription of the protocol is the cheapest
+  oracle — the atomics live in an mmapped page loom cannot instrument, so
+  `reserve_until` and `signal_wake` must be transcribed over loom atomics
+  and kept in sync manually, including the Release-not-SeqCst parked resets
+  (`ring.rs:1004`, `:1013`, and the other exit arms through `:1042`). Queue
+  it?
 
 ### reclamation-excludes-pages-with-live-wrapped-bytes
 
