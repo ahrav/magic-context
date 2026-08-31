@@ -8,6 +8,7 @@ import {
     readdirSync,
     rmSync,
     symlinkSync,
+    utimesSync,
     writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -76,6 +77,32 @@ describe("writeJsonAtomically", () => {
             expect(readFileSync(victim, "utf8")).toBe("untouched");
             expect(lstatSync(destination).isFile()).toBe(true);
             expect(JSON.parse(readFileSync(destination, "utf8"))).toEqual({ ok: true });
+        });
+    });
+
+    /** A signal that skips `finally` skips an exit hook too, so the reclaim has to happen on a later publish. commentlint: allow(JUDGE) */
+    it("reclaims an orphaned staging directory once it is stale", () => {
+        withRoot((root) => {
+            const destination = join(root, "out.json");
+            const orphan = join(root, ".atomic-json-aaaaaa");
+            mkdirSync(orphan);
+            writeFileSync(join(orphan, "out.json"), "abandoned");
+            const stale = Date.now() - 120_000;
+            utimesSync(orphan, stale / 1000, stale / 1000);
+            writeJsonAtomically(destination, { ok: true }, "manifest");
+            expect(existsSync(orphan)).toBe(false);
+        });
+    });
+
+    /** A live writer's directory is seconds old; sweeping it would recreate the collision the private directory prevents. commentlint: allow(JUDGE) */
+    it("leaves a fresh staging directory alone", () => {
+        withRoot((root) => {
+            const destination = join(root, "out.json");
+            const live = join(root, ".atomic-json-bbbbbb");
+            mkdirSync(live);
+            writeFileSync(join(live, "out.json"), "in flight");
+            writeJsonAtomically(destination, { ok: true }, "manifest");
+            expect(readFileSync(join(live, "out.json"), "utf8")).toBe("in flight");
         });
     });
 
