@@ -19,6 +19,7 @@
     "test:incident-unit": "bun run --cwd packages/e2e-tests test:incident-unit",
     "test:prospective-unit": "bun run --cwd packages/e2e-tests test:prospective-unit",
     "test:historian-eval-unit": "bun run --cwd packages/e2e-tests test:historian-eval-unit",
+    "test:metamorphic-unit": "bun run --cwd packages/e2e-tests test:metamorphic-unit",
     "test:dreamer-eval-unit": "bun run --cwd packages/e2e-tests test:dreamer-eval-unit",
     "validate:prospective-holdout": "bun run --cwd packages/e2e-tests validate:prospective-holdout",
     "test:incidents": "bun run --cwd packages/e2e-tests test:incidents",

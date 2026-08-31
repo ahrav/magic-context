@@ -10,9 +10,15 @@ build = "build.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
+getrandom = "0.2"
+libc = "0.2"
 mc-shm-transport = { path = "../../crates/mc-shm-transport", default-features = false }
 napi = { version = "=3.12.2", default-features = false, features = ["napi8"] }
 napi-derive = "=3.6.3"
+rustix = { version = "1.1.4", features = ["fs", "net"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+subtle = "2"
 
 [build-dependencies]
 napi-build = "2"

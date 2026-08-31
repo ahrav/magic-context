@@ -6,6 +6,11 @@ import {
     SCENARIO_SCHEMA,
     assertReleaseSuccession,
     assertTombstonesRetired,
+    authoredEvidenceText,
+    compactedEvidenceMessages,
+    containsCompleteValue,
+    countCompleteValues,
+    normalizedEvidenceMessages,
     parseReleaseLineage,
     MAX_EXPECTATION_ENTRIES,
     MAX_PROBE_CHOICES,
@@ -1206,6 +1211,104 @@ describe("predicate matching", () => {
             predicateMatches({ kind: "normalized-substring", value: "In-Process   LRU" }, "the in-process lru cache"),
         ).toBe(true);
         expect(predicateMatches({ kind: "normalized-substring", value: "redis" }, "no cache named")).toBe(false);
+    });
+});
+
+describe("complete-value counting", () => {
+    test("counts occurrences by starting position, including overlaps", () => {
+        // A consuming global match reports one here, which would let a caller
+        // comparing counts across a perturbation miss the loss of an occurrence.
+        expect(countCompleteValues("blue blue blue", "blue blue")).toBe(2);
+        expect(countCompleteValues("blue blue blue", "blue")).toBe(3);
+        expect(countCompleteValues("4096 entries", "4")).toBe(0);
+        expect(countCompleteValues("", "blue")).toBe(0);
+        expect(containsCompleteValue("blue blue blue", "blue blue")).toBe(true);
+    });
+
+    test("boundaries are code points, not code units", () => {
+        // A single `charAt` on an astral letter returns one surrogate half, which is
+        // not a letter under the boundary rule, so the match would have looked clean.
+        expect(containsCompleteValue("\u{10400}foo", "foo")).toBe(false);
+        expect(containsCompleteValue("foo\u{10400}", "foo")).toBe(false);
+        expect(countCompleteValues("\u{10400}foo foo", "foo")).toBe(1);
+        expect(containsCompleteValue("a foo b", "foo")).toBe(true);
+    });
+
+    test("stays linear against a repetitive haystack", () => {
+        // A regex advanced one character at a time re-derives every overlapping
+        // match, which turned a long answer against a megabyte of repetition into
+        // seconds. Both sizes are inside the contract's own limits.
+        const haystack = "a ".repeat(500_000);
+        const needle = "a ".repeat(1_000).trim();
+        const start = performance.now();
+        expect(countCompleteValues(haystack, needle)).toBeGreaterThan(0);
+        expect(containsCompleteValue(haystack, needle)).toBe(true);
+        expect(performance.now() - start).toBeLessThan(900);
+    });
+});
+
+describe("compacted evidence view", () => {
+    test("two spellings of one commit hash reach the historian identically", () => {
+        const turn = (hash: string) => ({
+            user: "Status check.",
+            assistant: `Committed ${hash} for the record.`,
+        });
+        const [upper] = compactedEvidenceMessages([turn("ABCDEF1")]).slice(-1);
+        const [lower] = compactedEvidenceMessages([turn("abcdef1")]).slice(-1);
+        expect(upper!.text).toBe(lower!.text);
+        // Ordinary identifier case is still significant.
+        expect(compactedEvidenceMessages([{ user: "MyFile.ts here.", assistant: "ok" }])[0]!.text)
+            .not.toBe(
+                compactedEvidenceMessages([{ user: "myfile.ts here.", assistant: "ok" }])[0]!.text,
+            );
+    });
+});
+
+describe("authored evidence views", () => {
+    test("the normalized messages join back to the evidence text a predicate is matched against", () => {
+        const scenario = validScenario();
+        const messages = normalizedEvidenceMessages(scenario.transcript.turns);
+        expect(messages.map((message) => message.text).join(" ")).toBe(
+            normalizeContent(authoredEvidenceText(scenario.transcript.turns)),
+        );
+    });
+
+    test("a match no single message contains is spanned by both of its messages", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[0] = { user: "Should we keep the legacy", assistant: "bridge alive for now?" };
+        const scenario = parseScenario(raw);
+        const predicate = { kind: "normalized-substring", value: "legacy bridge" } as const;
+
+        expect(predicateMatches(predicate, authoredEvidenceText(scenario.transcript.turns))).toBe(true);
+        expect(predicateMatches(predicate, turns[0]!.user)).toBe(false);
+        expect(predicateMatches(predicate, turns[0]!.assistant)).toBe(false);
+
+        const messages = normalizedEvidenceMessages(scenario.transcript.turns);
+        const evidence = messages.map((message) => message.text).join(" ");
+        const at = evidence.indexOf(normalizeContent(predicate.value));
+        let offset = 0;
+        const spanned = messages.flatMap((message) => {
+            const start = offset;
+            offset += message.text.length + 1;
+            return start < at + predicate.value.length && at < start + message.text.length
+                ? [`${message.turnIndex}:${message.role}`]
+                : [];
+        });
+        expect(spanned).toEqual(["0:user", "0:assistant"]);
+    });
+
+    test("messages production discards carry no evidence", () => {
+        const raw = validScenarioRaw();
+        const turns = (raw.transcript as { turns: Array<{ user: string; assistant: string }> }).turns;
+        turns[3]!.user = "<system-reminder>internal directive</system-reminder>";
+        const scenario = parseScenario(raw);
+
+        expect(
+            normalizedEvidenceMessages(scenario.transcript.turns).some(
+                (message) => message.turnIndex === 3 && message.role === "user",
+            ),
+        ).toBe(false);
     });
 });
 

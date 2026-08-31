@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,10 +19,12 @@ use super::durable_fs::{
     write_and_sync, PublishOutcome,
 };
 use super::envelope::check_fence;
+use crate::current_time_ms;
+
 use super::open::{
-    activate_wal, apply_preclassification_profile, current_time_ms, family_sidecars, harden_family,
-    open_reader, open_writer, restore_marker_path, stamp_writer_fence, suffix_path, sync_directory,
-    sync_parent, verify_exact_identity,
+    activate_wal, apply_preclassification_profile, family_sidecars, harden_family, open_reader,
+    open_writer, restore_marker_path, stamp_writer_fence, suffix_path, sync_directory, sync_parent,
+    verify_exact_identity,
 };
 use super::{KernelError, KernelStore, Sensitivity};
 
@@ -33,6 +36,8 @@ const DEFAULT_CAPTURE_PIN_LIFETIME_MS: i64 = 24 * 60 * 60 * 1_000;
 const BACKUP_PREFIX: &str = "core-backup-";
 const RESTORE_INFIX: &str = ".mc-restore-";
 const RESTORE_MARKER_PROTOCOL: &str = "mc-kernel-restore-marker-v1";
+/// Bound the marker read so invalid content cannot control allocation size.
+const RESTORE_MARKER_MAX_BYTES: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const LOCAL_FILESYSTEMS: &[u64] = &[
     0x0000_ef53, // ext2, ext3, ext4
@@ -123,14 +128,12 @@ impl KernelStore {
         if Instant::now() >= request.deadline {
             return Err(KernelError::Deadline);
         }
-        let mut writer = self.lock_writer()?;
-        if Instant::now() >= request.deadline {
-            return Err(KernelError::Deadline);
-        }
+        let mut writer = self.lock_writer_before(request.deadline)?;
         let capture = capture_state(
             &mut writer,
             self.lease_epoch(),
             request.capture_pin_expires_at,
+            request.deadline,
         )?;
         let unique = next_unique_id();
         let final_name = final_name_override
@@ -189,9 +192,7 @@ impl KernelStore {
             // SQLite uses a pathname, while cleanup uses the verified directory
             // descriptor; comparing identities rejects destination swaps.
             assert_same_file(&destination, &temp_name, &sqlite_temp_path)?;
-            File::open(&sqlite_temp_path)
-                .and_then(|file| file.sync_all())
-                .map_err(|_| KernelError::Io)?;
+            sync_child(&destination, &temp_name)?;
             if Instant::now() >= request.deadline {
                 return Err(KernelError::Deadline);
             }
@@ -254,6 +255,12 @@ impl KernelStore {
             return Err(KernelError::NotFound);
         }
         tx.execute(
+            "UPDATE capture_pin_refs SET released_at=?1
+             WHERE capture_pin_id=?2 AND released_at IS NULL",
+            params![released_at, capture_pin_id],
+        )
+        .map_err(|_| KernelError::Io)?;
+        tx.execute(
             "DELETE FROM capture_pin_refs WHERE capture_pin_id=?1",
             [capture_pin_id],
         )
@@ -261,7 +268,7 @@ impl KernelStore {
         tx.commit().map_err(|_| KernelError::Io)
     }
 
-    pub(super) fn run_capture_pin_maintenance(&self, now_ms: i64) -> Result<(), KernelError> {
+    pub fn run_capture_pin_maintenance(&self, now_ms: i64) -> Result<(), KernelError> {
         let mut writer = self.lock_writer()?;
         let tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -274,6 +281,14 @@ impl KernelStore {
         )
         .map_err(|_| KernelError::Io)?;
         tx.execute(
+            "UPDATE capture_pin_refs SET released_at=?1 WHERE released_at IS NULL
+             AND capture_pin_id IN (
+                 SELECT capture_pin_id FROM capture_pins WHERE released_at IS NOT NULL
+             )",
+            [now_ms],
+        )
+        .map_err(|_| KernelError::Io)?;
+        tx.execute(
             "DELETE FROM capture_pin_refs WHERE capture_pin_id IN (
                  SELECT capture_pin_id FROM capture_pins WHERE released_at IS NOT NULL
              )",
@@ -281,11 +296,6 @@ impl KernelStore {
         )
         .map_err(|_| KernelError::Io)?;
         tx.commit().map_err(|_| KernelError::Io)
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn run_capture_pin_maintenance_for_test(&self, now_ms: i64) -> Result<(), KernelError> {
-        self.run_capture_pin_maintenance(now_ms)
     }
 
     pub fn restore(&self, backup_path: impl AsRef<Path>) -> Result<i64, KernelError> {
@@ -342,7 +352,20 @@ impl KernelStore {
             (false, false, false)
         };
         let mut source = open_private_regular_nofollow(backup_path)?;
-        let source_seq = verify_database(backup_path, None, KernelError::InvalidRestore, None)?;
+        let temp_path = restore_temp_path(&self.db_path);
+        copy_to_private_temp(&mut source, &temp_path)?;
+        // Verifying the staged copy rather than the source makes the verified bytes
+        // the installed bytes, so neither a replaced pathname nor an in-place
+        // rewrite of the source can change what is installed. It also keeps the
+        // verification outside the writer lock.
+        let staged = verify_database(&temp_path, None, KernelError::InvalidRestore, None);
+        let source_seq = match staged {
+            Ok(seq) => seq,
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        };
 
         let mut writer = self.lock_writer()?;
         let mut readers = self
@@ -366,7 +389,6 @@ impl KernelStore {
             .map(|_| Connection::open_in_memory().map_err(|_| KernelError::Io))
             .collect::<Result<Vec<_>, _>>()?;
         let recovery_dir = allocate_recovery_dir(&self.db_path)?;
-        let temp_path = restore_temp_path(&self.db_path);
         if let Err(error) = publish_restore_marker(&self.db_path, &recovery_dir) {
             let _ = fs::remove_dir(&recovery_dir);
             return Err(error);
@@ -393,7 +415,6 @@ impl KernelStore {
             if fault_after_displace {
                 return Err(KernelError::Fault);
             }
-            copy_to_private_temp(&mut source, &temp_path)?;
             fs::rename(&temp_path, &self.db_path).map_err(|_| KernelError::Io)?;
             sync_parent(&self.db_path)?;
             let opened =
@@ -550,6 +571,19 @@ pub fn owner_is_current_for_test(uid: u32) -> bool {
     owner_is_current(uid)
 }
 
+// Reaching the file through the verified directory descriptor means a destination
+// swapped after `assert_same_file` cannot redirect this fsync.
+fn sync_child(directory: &File, name: &str) -> Result<(), KernelError> {
+    let file = rfs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| KernelError::Io)?;
+    File::from(file).sync_all().map_err(|_| KernelError::Io)
+}
+
 fn assert_same_file(directory: &File, name: &str, pathname: &Path) -> Result<(), KernelError> {
     let anchored = rfs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| KernelError::InvalidBackup)?;
@@ -560,7 +594,45 @@ fn assert_same_file(directory: &File, name: &str, pathname: &Path) -> Result<(),
     Ok(())
 }
 
+// Reference collection, the sensitivity scan and the per-evidence inserts all
+// scale with stored rows, so a progress handler bounds them rather than leaving
+// the writer held past the deadline.
 fn capture_state(
+    writer: &mut Connection,
+    lease_epoch: u64,
+    expires_at: Option<i64>,
+    deadline: Instant,
+) -> Result<CaptureState, KernelError> {
+    if Instant::now() >= deadline {
+        return Err(KernelError::Deadline);
+    }
+    let interrupted = Arc::new(AtomicBool::new(false));
+    {
+        let interrupted = Arc::clone(&interrupted);
+        writer
+            .progress_handler(
+                1_000,
+                Some(move || {
+                    let expired = Instant::now() >= deadline;
+                    if expired {
+                        interrupted.store(true, Ordering::Release);
+                    }
+                    expired
+                }),
+            )
+            .map_err(|_| KernelError::Io)?;
+    }
+    let captured = capture_state_inner(writer, lease_epoch, expires_at);
+    writer
+        .progress_handler(0, None::<fn() -> bool>)
+        .map_err(|_| KernelError::Io)?;
+    match captured {
+        Err(KernelError::Io) if interrupted.load(Ordering::Acquire) => Err(KernelError::Deadline),
+        other => other,
+    }
+}
+
+fn capture_state_inner(
     writer: &mut Connection,
     lease_epoch: u64,
     expires_at: Option<i64>,
@@ -589,7 +661,7 @@ fn capture_state(
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(|_| KernelError::Io)?;
-    let sensitive = any_sensitive_row(&tx)?;
+    let max_sensitivity = max_stored_sensitivity(&tx)?;
     let created_at = current_time_ms();
     let expires_at =
         expires_at.unwrap_or_else(|| created_at.saturating_add(DEFAULT_CAPTURE_PIN_LIFETIME_MS));
@@ -632,11 +704,7 @@ fn capture_state(
     Ok(CaptureState {
         commit_seq,
         evidence_refs,
-        max_sensitivity: if sensitive {
-            Sensitivity::Sensitive
-        } else {
-            Sensitivity::Normal
-        },
+        max_sensitivity,
         pin_id,
     })
 }
@@ -648,11 +716,24 @@ fn rollback_capture_pin(writer: &mut Connection, lease_epoch: u64, pin_id: &str)
     if check_fence(&tx, lease_epoch).is_err() {
         return;
     }
+    let released_at = current_time_ms();
     if tx
         .execute(
-            "DELETE FROM capture_pin_refs WHERE capture_pin_id=?1",
-            [pin_id],
+            "UPDATE capture_pin_refs SET released_at=?1 WHERE capture_pin_id=?2",
+            params![released_at, pin_id],
         )
+        .and_then(|_| {
+            tx.execute(
+                "UPDATE capture_pins SET released_at=?1 WHERE capture_pin_id=?2",
+                params![released_at, pin_id],
+            )
+        })
+        .and_then(|_| {
+            tx.execute(
+                "DELETE FROM capture_pin_refs WHERE capture_pin_id=?1",
+                [pin_id],
+            )
+        })
         .and_then(|_| tx.execute("DELETE FROM capture_pins WHERE capture_pin_id=?1", [pin_id]))
         .is_ok()
     {
@@ -693,20 +774,35 @@ fn sensitivity_bearing_tables(tx: &rusqlite::Transaction<'_>) -> Result<Vec<Stri
     Ok(names)
 }
 
-fn any_sensitive_row(tx: &rusqlite::Transaction<'_>) -> Result<bool, KernelError> {
+fn max_stored_sensitivity(tx: &rusqlite::Transaction<'_>) -> Result<Sensitivity, KernelError> {
     let names = sensitivity_bearing_tables(tx)?;
     if names.is_empty() {
-        return Ok(false);
+        return Ok(Sensitivity::Normal);
     }
-    let clauses = names
+    let selects = names
         .iter()
-        .map(|name| format!("EXISTS(SELECT 1 FROM {name} WHERE sensitivity_class<>'normal')"))
+        .map(|name| format!("SELECT 1 FROM {name} WHERE sensitivity_class='secret'"))
         .collect::<Vec<_>>()
-        .join(" OR ");
-    tx.query_row(&format!("SELECT {clauses}"), [], |row| {
-        row.get::<_, bool>(0)
+        .join(" UNION ALL ");
+    let has_secret: bool = tx
+        .query_row(&format!("SELECT EXISTS({selects})"), [], |row| row.get(0))
+        .map_err(|_| KernelError::Io)?;
+    if has_secret {
+        return Ok(Sensitivity::Secret);
+    }
+    let selects = names
+        .iter()
+        .map(|name| format!("SELECT 1 FROM {name} WHERE sensitivity_class<>'normal'"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let has_sensitive: bool = tx
+        .query_row(&format!("SELECT EXISTS({selects})"), [], |row| row.get(0))
+        .map_err(|_| KernelError::Io)?;
+    Ok(if has_sensitive {
+        Sensitivity::Sensitive
+    } else {
+        Sensitivity::Normal
     })
-    .map_err(|_| KernelError::Io)
 }
 
 #[cfg(feature = "test-support")]
@@ -801,22 +897,34 @@ pub fn verify_backup_with_deadline_for_test(
     )
 }
 
+// `serde_json` cannot round-trip a non-UTF-8 `PathBuf`, and a lossy path would
+// fail the byte-exact comparison in `resume_restore`. The raw `OsStr` bytes do
+// round-trip.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RestoreMarker {
     protocol: String,
-    database_path: PathBuf,
-    recovery_directory: PathBuf,
+    database_path: Vec<u8>,
+    recovery_directory: Vec<u8>,
     marker_digest: String,
 }
 
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
+}
+
 fn restore_marker_digest(marker: &RestoreMarker) -> String {
-    let canonical = format!(
-        "{RESTORE_MARKER_PROTOCOL}\ndatabase_path={}\nrecovery_directory={}",
-        marker.database_path.display(),
-        marker.recovery_directory.display()
-    );
-    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+    let mut hasher = Sha256::new();
+    hasher.update(RESTORE_MARKER_PROTOCOL.as_bytes());
+    hasher.update(b"\ndatabase_path=");
+    hasher.update(&marker.database_path);
+    hasher.update(b"\nrecovery_directory=");
+    hasher.update(&marker.recovery_directory);
+    format!("{:x}", hasher.finalize())
 }
 
 fn valid_recovery_path(path: &Path, recovery_dir: &Path) -> bool {
@@ -833,31 +941,97 @@ fn valid_recovery_path(path: &Path, recovery_dir: &Path) -> bool {
 // `restore` that never returned to its caller, so the displaced family is the
 // authoritative copy and a half-installed replacement is discarded.
 pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
-    let bytes = fs::read(restore_marker_path(path)).map_err(|_| KernelError::Inconclusive)?;
+    let marker_path = restore_marker_path(path);
+    let metadata = fs::symlink_metadata(&marker_path).map_err(|_| KernelError::Inconclusive)?;
+    if !metadata.is_file() || metadata.len() > RESTORE_MARKER_MAX_BYTES {
+        return Err(KernelError::Inconclusive);
+    }
+    let bytes = fs::read(&marker_path).map_err(|_| KernelError::Inconclusive)?;
     let marker: RestoreMarker =
         serde_json::from_slice(&bytes).map_err(|_| KernelError::Inconclusive)?;
+    let recovery_directory = path_from_bytes(&marker.recovery_directory);
     if marker.protocol != RESTORE_MARKER_PROTOCOL
-        || marker.database_path != path
+        || path_from_bytes(&marker.database_path) != path
         || marker.marker_digest != restore_marker_digest(&marker)
-        || !valid_recovery_path(path, &marker.recovery_directory)
-        || !marker.recovery_directory.is_dir()
+        || !valid_recovery_path(path, &recovery_directory)
+        || !recovery_directory.is_dir()
     {
         return Err(KernelError::Inconclusive);
     }
     remove_restore_scratch(path)?;
     // Only remove the live family after a displaced main file exists; otherwise it
     // remains the sole copy.
-    let displaced_main = marker
-        .recovery_directory
-        .join(path.file_name().ok_or(KernelError::Inconclusive)?);
+    let displaced_main =
+        recovery_directory.join(path.file_name().ok_or(KernelError::Inconclusive)?);
     if displaced_main.exists() {
         remove_family(path).map_err(|_| KernelError::Inconclusive)?;
+    } else if !path.exists() {
+        // The main file is in neither place, so the recovery directory cannot be
+        // trusted to hold the family. Bootstrapping here would discard it.
+        return Err(KernelError::Inconclusive);
     }
-    restore_displaced_family(path, &marker.recovery_directory)
-        .map_err(|_| KernelError::Inconclusive)?;
+    restore_displaced_family(path, &recovery_directory).map_err(|_| KernelError::Inconclusive)?;
     remove_restore_marker(path)?;
-    cleanup_recovery_dir(path, &marker.recovery_directory);
+    cleanup_recovery_dir(path, &recovery_directory);
     Ok(())
+}
+
+// A crash between removing the marker and cleaning up leaves the prior family,
+// which may hold sensitive rows, under `.mc-restore-*` with nothing to reclaim it.
+// `allocate_recovery_dir` appends only decimal digits, so anything else sharing
+// the prefix was created by someone else and is left alone.
+fn generated_recovery_suffix(name: &std::ffi::OsStr, prefix: &str) -> bool {
+    let name = name.to_string_lossy();
+    match name.strip_prefix(prefix) {
+        Some(suffix) => !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+pub(super) fn reap_orphan_restore_recovery(path: &Path) -> Result<(), KernelError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let Some(stem) = path.file_name() else {
+        return Ok(());
+    };
+    let prefix = format!("{}{RESTORE_INFIX}", stem.to_string_lossy());
+    let entries = fs::read_dir(parent).map_err(|_| KernelError::Inconclusive)?;
+    let mut reaped = false;
+    for entry in entries {
+        let entry = entry.map_err(|_| KernelError::Inconclusive)?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let candidate = entry.path();
+        if !candidate.is_dir() || !generated_recovery_suffix(&entry.file_name(), &prefix) {
+            continue;
+        }
+        // Removing only family members and then rmdir leaves any directory holding
+        // anything else intact, so an operator copy sharing the prefix survives.
+        for member in
+            std::iter::once(candidate.join(path.file_name().ok_or(KernelError::Inconclusive)?))
+                .chain(
+                    family_sidecars(path)
+                        .into_iter()
+                        .map(|sidecar| candidate.join(sidecar.file_name().unwrap_or_default())),
+                )
+        {
+            match fs::remove_file(&member) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(KernelError::Inconclusive),
+            }
+        }
+        if fs::remove_dir(&candidate).is_err() {
+            continue;
+        }
+        reaped = true;
+    }
+    if reaped {
+        sync_parent(path)?;
+    }
+    remove_restore_scratch(path)
 }
 
 fn remove_restore_scratch(path: &Path) -> Result<(), KernelError> {
@@ -882,8 +1056,8 @@ fn remove_restore_scratch(path: &Path) -> Result<(), KernelError> {
 fn publish_restore_marker(path: &Path, recovery_dir: &Path) -> Result<(), KernelError> {
     let mut marker = RestoreMarker {
         protocol: RESTORE_MARKER_PROTOCOL.to_string(),
-        database_path: path.to_path_buf(),
-        recovery_directory: recovery_dir.to_path_buf(),
+        database_path: path_bytes(path),
+        recovery_directory: path_bytes(recovery_dir),
         marker_digest: String::new(),
     };
     marker.marker_digest = restore_marker_digest(&marker);
@@ -958,6 +1132,7 @@ fn open_live_family(
     }
     activate_wal(&writer)?;
     stamp_writer_fence(&mut writer, lease_epoch)?;
+    super::envelope::strip_legacy_candidate_verifiers(&mut writer)?;
     harden_family(path)?;
     let readers = (0..reader_count)
         .map(|_| open_reader(path))
@@ -1000,14 +1175,14 @@ fn displace_family(path: &Path, recovery_dir: &Path) -> Result<(), KernelError> 
     sync_parent(path)
 }
 
+// The main file moves first; its presence in `recovery_dir` means no member has
+// been restored. Re-running after a crash then skips members already moved back
+// instead of deleting them, keeping a partial rollback idempotent.
 fn restore_displaced_family(path: &Path, recovery_dir: &Path) -> Result<(), KernelError> {
     if !recovery_dir.exists() {
         return Err(KernelError::InvalidRestore);
     }
-    for destination in family_sidecars(path)
-        .into_iter()
-        .chain(std::iter::once(path.to_path_buf()))
-    {
+    for destination in std::iter::once(path.to_path_buf()).chain(family_sidecars(path)) {
         let name = destination.file_name().ok_or(KernelError::Io)?;
         let source = recovery_dir.join(name);
         if source.exists() {

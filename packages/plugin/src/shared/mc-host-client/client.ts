@@ -18,7 +18,6 @@ import { access } from "node:fs/promises";
 import {
     type ConnectionDiagnosticEvent,
     ConnectionGeneration,
-    type ConnectionGenerationOptions,
     type JsonReceiveBody,
     type PendingRequest,
     type RequestTerminal,
@@ -40,7 +39,7 @@ import {
     SocketTimeoutError,
 } from "./errors";
 import { bytesFrameBody, type DirectFrameBody, ReceiveLease, utf8FrameBody } from "./frame-channel";
-import { flagsBinary } from "./protocol";
+import { PROTOCOL_VERSION } from "./protocol";
 import {
     belongsToConnection,
     createRouteHandle,
@@ -48,25 +47,7 @@ import {
     type RouteHandle,
     StaleRouteHandleError,
 } from "./route-handle";
-import {
-    ACTIVATION_CORRELATION,
-    commitRequestJson,
-    decodeActivateResponse,
-    decodeCommitResponse,
-    decodeNegotiateResponse,
-    encodeActivateRequest,
-    encodeNegotiateRequest,
-    type FallbackReason,
-    NEGOTIATION_VERSION,
-    type NegotiateResponse,
-    NegotiationError,
-    TRANSPORT_TCP,
-} from "./transport-negotiation";
-import {
-    type ClientTransportProvider,
-    ClientTransportRegistry,
-    sanitizedCandidateFactory,
-} from "./transport-provider";
+import { classifySharedMemoryFailure } from "./shared-memory-failure";
 import type {
     AuthenticatedPeer,
     BindIdentity,
@@ -80,8 +61,14 @@ import type {
     PublicationDiagnostics,
     RequestOptions,
     RouteTarget,
+    SharedMemoryDiagnostics,
+    SharedMemoryResourceCounts,
+    SharedMemoryTerminalClass,
 } from "./types";
 import { sameDaemonId } from "./types";
+
+const QUALIFIED_TEST_PROFILE = "mc-host-test-ring-v1" as const;
+const DESCRIPTOR_SCHEMA_VERSION = 2 as const;
 
 /** Preserves the repo's current 2-second TypeScript handshake budget. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 2_000;
@@ -91,7 +78,6 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_ROUTE_OPEN_DEADLINE_MS = 30_000;
 /** Separate bounded shutdown deadline for route and connection Goodbye. */
 const DEFAULT_SHUTDOWN_DEADLINE_MS = 5_000;
-export const DEFAULT_RECOVERY_DEADLINE_MS = 30_000;
 /** Channel-0 control bodies are capped below the frame limit (wire doc 7.1). */
 const MAX_CONTROL_BODY_LEN = 65_536;
 /**
@@ -125,10 +111,13 @@ export interface McHostDiagnosticsEvent {
     readonly daemonVer?: string;
     readonly pid?: number;
     readonly reason?: string;
-    /** Negotiated transport name on `connected` events. */
-    readonly transport?: string;
-    /** Closed-set TCP fallback reason on `connected` events, if any. */
-    readonly fallbackReason?: FallbackReason;
+    readonly health?: "healthy" | "terminal";
+    readonly errorClass?: SharedMemoryTerminalClass;
+    readonly artifact?: Readonly<{
+        profile: typeof QUALIFIED_TEST_PROFILE;
+        wireVersion: typeof PROTOCOL_VERSION;
+        descriptorSchema: typeof DESCRIPTOR_SCHEMA_VERSION;
+    }>;
 }
 
 export type McHostDiagnosticsObserver = (event: McHostDiagnosticsEvent) => void;
@@ -158,22 +147,6 @@ export interface McHostClientOptions extends ConnectOptions {
      */
     diagnostics?: McHostDiagnosticsObserver;
     maxDiagnosticEventsPerSecond?: number;
-    /** Bounded generation-policy overrides for tests (queue caps, deadlines). */
-    generationOptions?: Partial<
-        Pick<
-            ConnectionGenerationOptions,
-            | "frameDeadlineMs"
-            | "maxBodyLen"
-            | "memoryCapBytes"
-            | "maxQueuedFrames"
-            | "maxQueuedBytes"
-            | "controlReserveFrames"
-            | "cleanupTicketMs"
-            | "generateNonce"
-        >
-    >;
-    /** @internal Not part of the consumer contract. */
-    transportProviders?: readonly ClientTransportProvider[];
 }
 
 interface ActiveConnection {
@@ -182,27 +155,7 @@ interface ActiveConnection {
     readonly token: object;
     readonly snapshot: ConnectionSnapshot;
     readonly liveRoutes: Map<number, RouteHandle>;
-    /** The selected transport remains fixed from publication until retirement. */
-    transport: string;
-    /** Closed-set reason when the selection was an explicit TCP fallback. */
-    fallbackReason?: FallbackReason;
-    role?: "shadow";
 }
-
-/**
- * One client-wide re-upgrade episode: fenced to the exact source primary, bounded by one immutable deadline, and cancellable so owner close and primary retirement release every shadow connection permit (KTD5-KTD7). commentlint: allow(JUDGE)
- */
-interface RecoveryEpisode {
-    readonly source: ActiveConnection;
-    readonly deadline: Deadline;
-    cancelled: boolean;
-    readonly shadowGenerations: Set<ConnectionGeneration>;
-}
-
-type ShadowOutcome =
-    | { kind: "promote"; conn: ActiveConnection }
-    | { kind: "retry" }
-    | { kind: "stop" };
 
 interface CachedManagedRoute {
     readonly target: Extract<RouteTarget, { kind: ManagedRouteKind }>;
@@ -325,14 +278,6 @@ interface RequestParams {
     /** Retained-item ceiling for a stream-mode request. */
     maxStreamItems?: number;
     binary?: boolean;
-    /**
-     * Retain the raw wire Error terminal on the thrown failure. Only the
-     * negotiation family needs it (legacy-fallback classification reads the
-     * exact bytes); every other request leaves it off so a peer-controlled
-     * body — up to the frame limit — is not held alive by a caller's error
-     * outside the channel's released reader charge.
-     */
-    captureErrorTerminal?: boolean;
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -383,7 +328,7 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
         return err.kind === "not_sent" || err.kind === "outcome_unknown";
     }
     const name = err instanceof Error ? err.name : undefined;
-    if (name === "SocketClosedError" || name === "SocketTimeoutError" || name === "AuthError") {
+    if (name === "SocketClosedError" || name === "SocketTimeoutError") {
         return true;
     }
     if (name === "McHostCallError") {
@@ -391,26 +336,6 @@ export function isConsumerReconnectTransient(err: unknown): boolean {
         return kind === "not_sent" || kind === "outcome_unknown";
     }
     if (name === "McHostClientError" || name === "ConnectionFileError") return false;
-    const code = errorCode(err);
-    return (
-        code === "ECONNREFUSED" ||
-        code === "ECONNRESET" ||
-        code === "EPIPE" ||
-        code === "ETIMEDOUT" ||
-        code === "ENOENT"
-    );
-}
-
-/**
- * Shadow recovery retries only discovery and dial failures; authentication
- * and protocol failures stop the episode permanently. Recognition is
- * name/code-based so a different bundled copy of an error class still
- * classifies correctly.
- */
-function isShadowDialTransient(err: unknown): boolean {
-    const name = err instanceof Error ? err.name : undefined;
-    if (name === "AuthError") return false;
-    if (name === "SocketClosedError" || name === "SocketTimeoutError") return true;
     const code = errorCode(err);
     return (
         code === "ECONNREFUSED" ||
@@ -431,38 +356,24 @@ export class McHostClient {
     private readonly requestTimeoutMs: number;
     private readonly routeOpenDeadlineMs: number;
     private readonly shutdownDeadlineMs: number;
-    private readonly recoveryDeadlineMs = DEFAULT_RECOVERY_DEADLINE_MS;
     private readonly defaultIdentity: BindIdentity | undefined;
     private readonly defaultTargetKind: ManagedRouteKind;
     private readonly credentialSource: Record<string, string | undefined> | undefined;
     private readonly clock: MonotonicClock | undefined;
     private readonly sleep: (ms: number) => Promise<void>;
     private readonly connectionFileAfterOpen: (() => void | Promise<void>) | undefined;
-    private readonly generationOptions: McHostClientOptions["generationOptions"];
     private readonly diagnostics: McHostDiagnosticsObserver | undefined;
     private readonly maxDiagnosticEventsPerSecond: number;
-    private readonly transportRegistry: ClientTransportRegistry;
 
     private active: ActiveConnection | null = null;
     private connecting: SetupFlight<ActiveConnection> | null = null;
-    /** Draining generation slot; occupied from promotion until drain completes (KTD7). commentlint: allow(JUDGE) */
-    private predecessor: ActiveConnection | null = null;
-    /** At most one client-wide recovery episode (KTD5). commentlint: allow(JUDGE) */
-    private recovery: RecoveryEpisode | null = null;
-    /** RouteHandles opened by the managed-route cache, not caller-owned raw handles; the drain closes orphaned managed handles at pending-zero while raw handles wait for their caller's explicit close (R10). commentlint: allow(JUDGE) */
+    /** Route handles opened by the managed-route cache. */
     private readonly managedHandles = new WeakSet<RouteHandle>();
     private readonly routes = new Map<string, CachedManagedRoute>();
     /** In-flight route.open attempts, drained bounded during owner close. */
     private readonly pendingRouteOpens = new Set<Promise<void>>();
-    /**
-     * In-flight route.open attempts per connection. A route.open terminal
-     * empties the pending set BEFORE its awaiting continuation inserts the
-     * new handle into `liveRoutes`, so a pending-zero retirement check
-     * alone would retire a draining predecessor between those two steps
-     * and hand the caller an immediately-stale handle.
-     */
-    private readonly routeOpenCounts = new Map<ActiveConnection, number>();
     private closeStarted = false;
+    private retirementEmitted = false;
     private closePromise: Promise<void> | null = null;
 
     private diagWindowStartMs = 0;
@@ -481,11 +392,9 @@ export class McHostClient {
         this.sleep =
             options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
         this.connectionFileAfterOpen = options.connectionFileAfterOpen;
-        this.generationOptions = options.generationOptions;
         this.diagnostics = options.diagnostics;
         this.maxDiagnosticEventsPerSecond =
             options.maxDiagnosticEventsPerSecond ?? DEFAULT_MAX_DIAGNOSTIC_EVENTS_PER_SECOND;
-        this.transportRegistry = new ClientTransportRegistry(options.transportProviders ?? []);
     }
 
     /**
@@ -494,8 +403,19 @@ export class McHostClient {
      */
     static async connect(options: McHostClientOptions): Promise<McHostClient> {
         const client = new McHostClient(options);
-        await client.ensureConnection(Deadline.start(client.handshakeTimeoutMs, client.clock));
-        return client;
+        try {
+            await client.ensureConnection(Deadline.start(client.handshakeTimeoutMs, client.clock));
+            return client;
+        } catch (error) {
+            if (!client.retirementEmitted) {
+                client.emitDiagnostics({
+                    type: "retired",
+                    health: "terminal",
+                    errorClass: classifySharedMemoryFailure(error),
+                });
+            }
+            throw error;
+        }
     }
 
     /** The daemon version reported by the current connection, if any. */
@@ -516,9 +436,7 @@ export class McHostClient {
         if (daemonVer === null || daemonId === null) return null;
         return {
             daemonVer,
-            // Copied, like every other crossing of this value (`auth.ts`,
-            // `transport-provider.ts`): callers must not be able to mutate the
-            // retained identity that authorizes compatibility and fencing.
+            // Callers must not mutate the retained identity used for fencing.
             daemonId: daemonId.slice(),
             proof: "current",
         };
@@ -533,6 +451,11 @@ export class McHostClient {
         const active = this.active;
         if (!active) return null;
         return { daemonVer: active.snapshot.daemonVer, pid: active.snapshot.pid };
+    }
+
+    /** True after irreversible owner close begins. */
+    get isClosed(): boolean {
+        return this.closeStarted;
     }
 
     /**
@@ -760,7 +683,6 @@ export class McHostClient {
         }
         conn.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
         await conn.generation.flushWrites(Deadline.start(this.shutdownDeadlineMs, this.clock));
-        if (this.predecessor === conn) this.maybeRetirePredecessor();
     }
 
     /**
@@ -872,8 +794,7 @@ export class McHostClient {
         let conn: ActiveConnection | null = null;
         let retiredReason: RetirementReason | null = null;
         const generation = new ConnectionGeneration({
-            host: snapshot.endpoint.host,
-            port: snapshot.endpoint.port,
+            setupSocket: snapshot.setupSocket,
             credentials: {
                 key: snapshot.key,
                 daemonId: snapshot.daemonId,
@@ -886,24 +807,16 @@ export class McHostClient {
             onRouteGoodbye: (channel, epoch) => {
                 if (conn) this.onRouteGoodbye(conn, channel, epoch);
             },
-            onPendingZero: () => {
-                if (conn) this.onPendingDrained(conn);
-            },
-            onLeaseReleased: () => {
-                if (conn) this.onPendingDrained(conn);
-            },
             // Skip per-frame event allocation entirely when no observer is
             // configured; the generation's hook check short-circuits on
             // undefined.
             onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
-            ...this.generationOptions,
         });
         conn = {
             generation,
             token: newConnectionToken(),
             snapshot,
             liveRoutes: new Map(),
-            transport: TRANSPORT_TCP,
         };
         try {
             await generation.start(stage);
@@ -918,355 +831,56 @@ export class McHostClient {
             generation.retire("owner_close");
             throw new McHostClientError("client closed", "client_closed");
         }
-        // KTD4 stale-success: a generation that retired during its own setup
-        // (for example a Goodbye coalesced into the final handshake chunk)
-        // skips negotiation; ensureConnection re-enters recovery under the
-        // caller's unchanged stage.
+        // A generation that retires during setup is never published.
         if (generation.isRetired()) return conn;
-        // R5/KTD5: negotiate on authenticated channel 0 BEFORE publication,
-        // so no caller can observe a generation without a selection.
-        let selection: NegotiateResponse;
-        try {
-            selection = await this.negotiateTransport(generation, stage);
-        } catch (error) {
-            generation.retire("negotiation_failed", error);
-            // KTD3: negotiation that died on the owner's setup stage is
-            // owner-budget exhaustion; survivors may coalesce one
-            // replacement.
-            if (stage.isExpired()) flight.replaceable = true;
-            throw error;
-        }
-        if (this.closeStarted) {
-            generation.retire("owner_close");
-            throw new McHostClientError("client closed", "client_closed");
-        }
-        if (selection.kind === "grant") {
-            try {
-                return await this.activateCandidate(conn, selection, stage);
-            } catch (error) {
-                // KTD3: activation that died on the owner's setup stage is
-                // owner-budget exhaustion, exactly like the earlier stages;
-                // survivors may coalesce one replacement.
-                if (stage.isExpired()) flight.replaceable = true;
-                throw error;
-            }
-        }
-        // The authenticated bootstrap becomes the finalized generation with
-        // its negotiation correlation consumed; the selection stays sticky
-        // until retirement (KTD5).
-        // KTD4 stale-success: the frame pump can retire the generation in
-        // the same batch that resolved the negotiation (a coalesced Goodbye
-        // or EOF). A dead generation must not be published or reported
-        // connected; the returned stale conn re-enters recovery in
-        // ensureConnection like the pre-negotiation stale-success path.
-        if (generation.isRetired()) return conn;
-        conn.fallbackReason = selection.reason;
         this.active = conn;
-        this.emitConnected(conn, conn.fallbackReason);
-        // R11: exact `unavailable` is the only fallback that starts an automatic shared-memory recovery probe; every other reason and reasonless TCP stay sticky. commentlint: allow(JUDGE)
-        if (conn.fallbackReason === "unavailable") this.startRecovery(conn);
-        return conn;
-    }
-
-    /**
-     * Send the versioned offer as the generation's first channel-0 request.
-     * Only a strictly decoded selection continues; every failure — including
-     * any wire Error terminal — propagates so setup fails closed without
-     * same-generation TCP fallback (KTD7).
-     */
-    private async negotiateTransport(
-        generation: ConnectionGeneration,
-        stage: Deadline,
-    ): Promise<NegotiateResponse> {
-        const offers = this.transportRegistry.offers();
-        const body = encodeNegotiateRequest({ negotiationVersion: NEGOTIATION_VERSION, offers });
-        let terminal: RequestTerminal;
-        try {
-            terminal = await this.awaitRequest(generation, {
-                channel: 0,
-                epoch: 0,
-                body,
-                deadline: stage,
-                options: {},
-                captureErrorTerminal: true,
-            });
-        } catch (error) {
-            if (
-                error instanceof McHostCallError &&
-                error.kind === "terminal" &&
-                error.errorTerminal !== undefined
-            ) {
-                // Every Error terminal fails closed with a bounded error:
-                // the raw body is peer-controlled and its message must not
-                // enter caller-visible error graphs (R14). There is no
-                // `unsupported_operation` continuation. The distinct code
-                // makes version skew self-describing: a host that does not
-                // implement `transport.negotiate` answers this request with
-                // an Error terminal.
-                throw new McHostCallError(
-                    "terminal",
-                    "transport negotiation failed: host returned an error terminal (host may predate transport negotiation; restart or upgrade the mc-host daemon)",
-                    "host_negotiation_rejected",
-                );
-            }
-            throw error;
-        }
-        try {
-            // Strict decode against the sent offers: an unoffered selection
-            // or any version/field violation is malformed, never fallback
-            // evidence (R12). Negotiation-family responses must be UTF-8
-            // JSON with `binary = 0`.
-            if (flagsBinary(terminal.flags)) {
-                throw new NegotiationError("malformed_json", "flags");
-            }
-            return decodeNegotiateResponse(
-                requireJsonReceiveBody(terminal.body).text ?? "",
-                offers,
-            );
-        } catch (error) {
-            throw wrapNegotiationError(error);
-        }
-    }
-
-    /**
-     * KTD4 activate-then-commit barrier over one injected provider
-     * candidate: activation at candidate correlation 1 consumes the one-use
-     * token, commit at correlation 2 finalizes, and only then is the
-     * candidate generation published — with its application correlation
-     * allocator already at 3 — while the bootstrap retires. Any failure or
-     * uncertainty closes BOTH channels without TCP continuation (R12).
-     */
-    private async activateCandidate(
-        bootstrap: ActiveConnection,
-        grant: Extract<NegotiateResponse, { kind: "grant" }>,
-        stage: Deadline,
-    ): Promise<ActiveConnection> {
-        const conn = await this.prepareCandidate(bootstrap, grant, stage);
-        // Atomic promotion: publish the finalized candidate, then retire the
-        // bootstrap; the host already replaced it after the commit response
-        // reached local completion.
-        this.active = conn;
-        bootstrap.generation.retire("owner_close");
         this.emitConnected(conn);
         return conn;
     }
 
-    /**
-     * Run one grant through candidate construction, activation, and commit
-     * without publishing. Any failure or uncertainty retires BOTH the
-     * candidate and the bootstrap. A shadow caller passes its episode's
-     * `shadow` generation set so the candidate's retirement callbacks stay
-     * episode-internal until promotion clears the role.
-     */
-    private async prepareCandidate(
-        bootstrap: ActiveConnection,
-        grant: Extract<NegotiateResponse, { kind: "grant" }>,
-        stage: Deadline,
-        shadow?: Set<ConnectionGeneration>,
-    ): Promise<ActiveConnection> {
-        const provider = this.transportRegistry.find(
-            grant.selected.transport,
-            grant.selected.capabilityVersion,
-        );
-        if (!provider) {
-            // Unreachable through the decoder (a selection must name a sent
-            // offer), kept as a fail-closed guard.
-            const failure = new McHostCallError(
-                "terminal",
-                "host granted a transport with no installed provider",
-                "negotiation_failed",
-            );
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        const snapshot = bootstrap.snapshot;
-        // A candidate channel performs no handshake: its authority is the
-        // bootstrap's, carried across the activate-then-commit barrier. The
-        // identity is read here, before the candidate exists, so the candidate
-        // inherits it instead of adopting whatever its channel reports.
-        const inheritedDaemonVer = bootstrap.generation.daemonVer;
-        const inheritedDaemonId = bootstrap.generation.authenticatedDaemonId;
-        if (inheritedDaemonVer === null || inheritedDaemonId === null) {
-            // The bootstrap authenticates before it can negotiate, so this is
-            // unreachable; kept as a fail-closed guard because promotion off an
-            // unauthenticated generation would publish an identity that nothing
-            // proved.
-            const failure = new McHostCallError(
-                "terminal",
-                "transport promotion requires an authenticated bootstrap identity",
-                "negotiation_failed",
-            );
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        let conn: ActiveConnection | null = null;
-        let candidate: ConnectionGeneration;
-        try {
-            // The generation constructor invokes the channel factory — and
-            // therefore the provider's `connect()` — synchronously, so a
-            // throwing provider surfaces here, before the activation `try`
-            // below exists to retire the channels.
-            candidate = new ConnectionGeneration({
-                host: snapshot.endpoint.host,
-                port: snapshot.endpoint.port,
-                credentials: {
-                    key: snapshot.key,
-                    daemonId: snapshot.daemonId,
-                    daemonVer: snapshot.daemonVer,
-                },
-                channelFactory: sanitizedCandidateFactory(
-                    grant.selected.transport,
-                    provider,
-                    grant.descriptor,
-                    // The provider gets its own copy: a provider that retains
-                    // and mutates the array must not reach the identity this
-                    // candidate inherits.
-                    inheritedDaemonId.slice(),
-                ),
-                inheritedIdentity: {
-                    daemonVer: inheritedDaemonVer,
-                    daemonId: inheritedDaemonId,
-                },
-                firstCorrelation: ACTIVATION_CORRELATION,
-                onRetired: (info) => {
-                    if (conn) this.onGenerationRetired(conn, info);
-                },
-                onRouteGoodbye: (channel, epoch) => {
-                    if (conn) this.onRouteGoodbye(conn, channel, epoch);
-                },
-                onPendingZero: () => {
-                    if (conn) this.onPendingDrained(conn);
-                },
-                onLeaseReleased: () => {
-                    if (conn) this.onPendingDrained(conn);
-                },
-                onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
-                ...this.generationOptions,
-            });
-        } catch (error) {
-            const failure = wrapNegotiationError(error);
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        shadow?.add(candidate);
-        conn = {
-            generation: candidate,
-            token: newConnectionToken(),
-            snapshot,
-            liveRoutes: new Map(),
-            transport: grant.selected.transport,
-            ...(shadow !== undefined ? { role: "shadow" as const } : {}),
-        };
-        try {
-            await candidate.start(stage);
-            const activate = await this.awaitRequest(candidate, {
-                channel: 0,
-                epoch: 0,
-                body: encodeActivateRequest(grant.activationToken),
-                deadline: stage,
-                options: {},
-                captureErrorTerminal: true,
-            });
-            // Negotiation-family responses must be UTF-8 JSON with
-            // `binary = 0`; a mismatched flag is malformed, never
-            // promotion evidence.
-            if (flagsBinary(activate.flags)) {
-                throw new NegotiationError("malformed_json", "flags");
-            }
-            decodeActivateResponse(requireJsonReceiveBody(activate.body).text ?? "");
-            const commit = await this.awaitRequest(candidate, {
-                channel: 0,
-                epoch: 0,
-                body: commitRequestJson(),
-                deadline: stage,
-                options: {},
-                captureErrorTerminal: true,
-            });
-            if (flagsBinary(commit.flags)) {
-                throw new NegotiationError("malformed_json", "flags");
-            }
-            decodeCommitResponse(requireJsonReceiveBody(commit.body).text ?? "");
-        } catch (error) {
-            const failure = boundedNegotiationFailure(error);
-            candidate.retire("negotiation_failed", failure);
-            bootstrap.generation.retire("negotiation_failed", failure);
-            throw failure;
-        }
-        if (this.closeStarted || candidate.isRetired()) {
-            const failure = this.closeStarted
-                ? new McHostClientError("client closed", "client_closed")
-                : new McHostCallError(
-                      "not_sent",
-                      "candidate channel retired before promotion",
-                      "negotiation_failed",
-                  );
-            const reason = this.closeStarted ? "owner_close" : "negotiation_failed";
-            candidate.retire(reason, failure);
-            bootstrap.generation.retire(reason, failure);
-            throw failure;
-        }
-        return conn;
-    }
-
     private onGenerationRetired(conn: ActiveConnection, info: RetirementInfo): void {
-        // Shadow teardown is episode-internal; the recovery loop owns it.
-        if (conn.role === "shadow") return;
-        if (this.predecessor === conn) {
-            // Drain completion (or a failed predecessor) is internal handoff
-            // traffic under a live primary, never a client-level `retired`.
-            this.predecessor = null;
-            return;
-        }
         if (this.active === conn) {
             this.active = null;
             for (const cached of this.routes.values()) {
                 cached.handle = null;
             }
-            // The episode is fenced to this exact source primary (KTD6);
-            // cancel it so in-flight shadow permits are released promptly.
-            if (this.recovery !== null && this.recovery.source === conn) {
-                this.cancelRecovery(this.recovery);
-            }
-        } else if (this.active !== null) {
-            // A non-active generation retiring while another connection is
-            // published is internal handoff traffic — the bootstrap retiring
-            // under a freshly promoted candidate. Emitting `retired` here
-            // would interleave a spurious client-level event with the
-            // candidate's `connected`. Setup failures still emit: no
-            // connection is published while a setup flight runs.
-            return;
         }
-        this.emitDiagnostics({ type: "retired", reason: info.reason });
+        const terminalClass =
+            info.reason === "setup_failed" || info.reason === "setup_deadline"
+                ? classifySharedMemoryFailure(info.error)
+                : terminalRetirementClass(info.reason);
+        this.retirementEmitted = true;
+        this.emitDiagnostics({
+            type: "retired",
+            reason: info.reason,
+            ...(terminalClass === undefined
+                ? {}
+                : { health: "terminal" as const, errorClass: terminalClass }),
+        });
     }
 
     private onRouteGoodbye(conn: ActiveConnection, channel: number, epoch: number): void {
-        if (this.active !== conn && this.predecessor !== conn) return;
+        if (this.active !== conn) return;
         const handle = conn.liveRoutes.get(channel);
         if (!handle || handle.epoch !== epoch) return;
         conn.liveRoutes.delete(channel);
         this.detachCachedHandle(handle);
-        if (this.predecessor === conn) this.maybeRetirePredecessor();
     }
 
-    /** The live connection owning `handle`: the primary or the draining predecessor. */
+    /** Returns the live mandatory-ring connection owning `handle`. */
     private connectionFor(handle: RouteHandle): ActiveConnection | null {
-        for (const conn of [this.active, this.predecessor]) {
-            if (
-                conn !== null &&
-                !conn.generation.isRetired() &&
-                belongsToConnection(handle, conn.token) &&
-                conn.liveRoutes.get(handle.channel) === handle
-            ) {
-                return conn;
-            }
-        }
-        return null;
+        const conn = this.active;
+        return conn !== null &&
+            !conn.generation.isRetired() &&
+            belongsToConnection(handle, conn.token) &&
+            conn.liveRoutes.get(handle.channel) === handle
+            ? conn
+            : null;
     }
 
     /**
      * Managed-route cache eligibility: only the primary may serve a cached
-     * managed handle, so new managed acquisitions never land on a draining
-     * predecessor (R10).
+     * managed handle.
      */
     private isPrimaryLiveHandle(handle: RouteHandle): boolean {
         const conn = this.connectionFor(handle);
@@ -1314,252 +928,18 @@ export class McHostClient {
         return detached;
     }
 
-    private emitConnected(conn: ActiveConnection, fallbackReason?: FallbackReason): void {
+    private emitConnected(conn: ActiveConnection): void {
         this.emitDiagnostics({
             type: "connected",
             daemonVer: conn.snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
             pid: conn.snapshot.pid,
-            transport: conn.transport,
-            ...(fallbackReason !== undefined ? { fallbackReason } : {}),
-        });
-    }
-
-    // ------------------------------------------------------------------
-    // Fresh-generation TCP-to-shared-memory re-upgrade (R9-R11). commentlint: allow(JUDGE)
-    // ------------------------------------------------------------------
-
-    /**
-     * Begin one client-wide recovery episode fenced to `source`. Only an
-     * exact `unavailable` TCP fallback reaches this point; the deadline is
-     * created once here and never reset by any retry (KTD5). commentlint: allow(JUDGE)
-     */
-    private startRecovery(source: ActiveConnection): void {
-        if (this.closeStarted) return;
-        const prior = this.recovery;
-        // A prior episode is fenced to a superseded primary; cancel it so
-        // its shadow permits are released before the new episode dials.
-        if (prior !== null) this.cancelRecovery(prior);
-        const episode: RecoveryEpisode = {
-            source,
-            deadline: Deadline.start(this.recoveryDeadlineMs, this.clock),
-            cancelled: false,
-            shadowGenerations: new Set(),
-        };
-        this.recovery = episode;
-        void this.runRecoveryEpisode(episode)
-            .catch(() => {})
-            .finally(() => {
-                if (this.recovery === episode) this.recovery = null;
-            });
-    }
-
-    private cancelRecovery(episode: RecoveryEpisode): void {
-        episode.cancelled = true;
-        for (const generation of [...episode.shadowGenerations]) {
-            generation.retire("owner_close");
-        }
-    }
-
-    private recoveryStopped(episode: RecoveryEpisode): boolean {
-        return (
-            episode.cancelled ||
-            this.closeStarted ||
-            this.active !== episode.source ||
-            episode.source.generation.isRetired()
-        );
-    }
-
-    private async runRecoveryEpisode(episode: RecoveryEpisode): Promise<void> {
-        let delayMs = SETUP_RETRY_BASE_MS;
-        const pace = async (): Promise<void> => {
-            await this.sleep(episode.deadline.stageBudgetMs(delayMs));
-            delayMs = Math.min(delayMs * 2, SETUP_RETRY_CAP_MS);
-        };
-        for (;;) {
-            if (this.recoveryStopped(episode) || episode.deadline.isExpired()) return;
-            // An occupied predecessor slot defers the whole attempt: wait
-            // without creating a candidate so no third generation and no
-            // extra connection permit exist while two are still draining.
-            if (this.predecessor !== null) {
-                await pace();
-                continue;
-            }
-            const outcome = await this.shadowAttempt(episode);
-            if (outcome.kind === "promote") {
-                this.finishPromotion(episode, outcome.conn);
-                return;
-            }
-            if (outcome.kind === "stop") return;
-            await pace();
-        }
-    }
-
-    /**
-     * One full fresh setup attempt: reread the connection file, dial,
-     * authenticate, negotiate, and — on a grant — activate and commit,
-     * all bounded by the episode deadline. Retries only discovery/dial
-     * transients and repeated exact `unavailable`; every other outcome
-     * stops the episode permanently (KTD6). commentlint: allow(JUDGE)
-     */
-    private async shadowAttempt(episode: RecoveryEpisode): Promise<ShadowOutcome> {
-        const stage = episode.deadline.stage(this.handshakeTimeoutMs);
-        let snapshot: ConnectionSnapshot;
-        try {
-            snapshot = await readConnectionFile(this.connectionFile, {
-                deadline: stage,
-            });
-        } catch (error) {
-            // Only discovery churn retries: a daemon rewriting its
-            // connection file mid-restart surfaces as a briefly missing
-            // file, a replaced-during-read race, or an expired stage (the
-            // loop's episode deadline bounds repeats). Every other
-            // connection-file failure — permissions, ownership, malformed
-            // content — is permanent validation evidence and stops the
-            // episode, matching the reconnect path's terminal
-            // classification (KTD6).
-            if (
-                error instanceof ConnectionFileError &&
-                (error.code === "not_found" ||
-                    error.code === "replaced_during_read" ||
-                    error.code === "deadline_expired")
-            ) {
-                return { kind: "retry" };
-            }
-            return { kind: "stop" };
-        }
-        const generation = new ConnectionGeneration({
-            host: snapshot.endpoint.host,
-            port: snapshot.endpoint.port,
-            credentials: {
-                key: snapshot.key,
-                daemonId: snapshot.daemonId,
-                daemonVer: snapshot.daemonVer,
+            health: "healthy",
+            artifact: {
+                profile: QUALIFIED_TEST_PROFILE,
+                wireVersion: PROTOCOL_VERSION,
+                descriptorSchema: DESCRIPTOR_SCHEMA_VERSION,
             },
-            ...this.generationOptions,
         });
-        episode.shadowGenerations.add(generation);
-        try {
-            try {
-                await generation.start(stage);
-            } catch (error) {
-                return { kind: isShadowDialTransient(error) ? "retry" : "stop" };
-            }
-            if (this.recoveryStopped(episode)) {
-                generation.retire("owner_close");
-                return { kind: "stop" };
-            }
-            if (generation.isRetired()) return { kind: "retry" };
-            let selection: NegotiateResponse;
-            try {
-                selection = await this.negotiateTransport(generation, stage);
-            } catch (error) {
-                // Malformed negotiation and host error terminals stop the
-                // episode; they are never fallback or retry evidence.
-                generation.retire("negotiation_failed", error);
-                return { kind: "stop" };
-            }
-            if (selection.kind === "tcp") {
-                generation.retire("owner_close");
-                // Repeated exact `unavailable` keeps the episode alive under
-                // its ORIGINAL deadline; a reasonless selection, a legacy
-                // fallback, and every other reason stop it permanently.
-                return { kind: selection.reason === "unavailable" ? "retry" : "stop" };
-            }
-            const bootstrap: ActiveConnection = {
-                generation,
-                token: newConnectionToken(),
-                snapshot,
-                liveRoutes: new Map(),
-                transport: TRANSPORT_TCP,
-                role: "shadow",
-            };
-            let conn: ActiveConnection;
-            try {
-                conn = await this.prepareCandidate(
-                    bootstrap,
-                    selection,
-                    stage,
-                    episode.shadowGenerations,
-                );
-            } catch {
-                // Grant attachment, activation, and commit failures stop
-                // recovery; prepareCandidate already retired both channels,
-                // releasing the shadow permits.
-                return { kind: "stop" };
-            }
-            // The host replaced the bootstrap at commit; only the committed
-            // candidate survives to the promotion fence.
-            generation.retire("owner_close");
-            return { kind: "promote", conn };
-        } finally {
-            episode.shadowGenerations.delete(generation);
-        }
-    }
-
-    /**
-     * Source-fenced publication: the shadow commit becomes the primary only
-     * while the exact source primary is still published and the predecessor
-     * slot is free; any other state retires the candidate instead (KTD6). commentlint: allow(JUDGE)
-     */
-    private finishPromotion(episode: RecoveryEpisode, conn: ActiveConnection): void {
-        episode.shadowGenerations.delete(conn.generation);
-        if (
-            this.recoveryStopped(episode) ||
-            this.predecessor !== null ||
-            conn.generation.isRetired()
-        ) {
-            conn.generation.retire("owner_close");
-            return;
-        }
-        conn.role = undefined;
-        this.predecessor = episode.source;
-        this.active = conn;
-        this.emitConnected(conn);
-        this.maybeRetirePredecessor();
-    }
-
-    private onPendingDrained(conn: ActiveConnection): void {
-        if (this.predecessor === conn) this.maybeRetirePredecessor();
-    }
-
-    /**
-     * Retire the draining predecessor once no pending work AND no live
-     * route handles remain on it. Orphaned managed-cache routes close at
-     * pending-zero; caller-owned raw handles keep the drain open until
-     * their explicit close (R10). commentlint: allow(JUDGE)
-     */
-    private maybeRetirePredecessor(): void {
-        const pred = this.predecessor;
-        if (pred === null) return;
-        if (pred.generation.isRetired()) {
-            this.predecessor = null;
-            return;
-        }
-        const stats = pred.generation.stats();
-        if (stats.pendingRequests > 0) return;
-        // A route.open whose terminal already settled but whose awaiting
-        // continuation has not yet recorded the handle keeps the drain
-        // open; the continuation's completion re-invokes this check.
-        if ((this.routeOpenCounts.get(pred) ?? 0) > 0) return;
-        // A settled binary or stream terminal hands its ReceiveLease to the
-        // caller, whose storage aliases the channel until an explicit
-        // release; retirement force-releases every lease, so a drain with
-        // live leases stays open and each release re-invokes this check.
-        if (stats.activeReceiveLeases > 0) return;
-        for (const [channel, handle] of [...pred.liveRoutes]) {
-            if (!this.managedHandles.has(handle)) continue;
-            pred.liveRoutes.delete(channel);
-            pred.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
-            this.detachCachedHandle(handle);
-        }
-        if (pred.liveRoutes.size > 0) return;
-        this.predecessor = null;
-        const generation = pred.generation;
-        generation.enqueueConnectionGoodbye();
-        void generation
-            .flushWrites(Deadline.start(this.shutdownDeadlineMs, this.clock))
-            .catch(() => {})
-            .finally(() => generation.retire("owner_close"));
     }
 
     // ------------------------------------------------------------------
@@ -1607,18 +987,6 @@ export class McHostClient {
             if (terminal.kind === "error") {
                 const errorBody = requireJsonReceiveBody(terminal.body);
                 const failure = terminalFromErrorBody(errorBody);
-                if (params.captureErrorTerminal === true) {
-                    failure.errorTerminal = {
-                        bodyText: errorBody.text,
-                        flags: terminal.flags,
-                        // A stream frame ahead of the terminal means the
-                        // host produced response data, which cannot prove a
-                        // no-dispatch rejection. Read the arrival flag, not
-                        // `stream`: unary mode drains stream bodies
-                        // privately and always reports an empty array.
-                        streamed: terminal.sawStream,
-                    };
-                }
                 throw failure;
             }
             return terminal;
@@ -1697,16 +1065,8 @@ export class McHostClient {
             () => undefined,
         );
         this.pendingRouteOpens.add(tracked);
-        this.routeOpenCounts.set(active, (this.routeOpenCounts.get(active) ?? 0) + 1);
         void tracked.finally(() => {
             this.pendingRouteOpens.delete(tracked);
-            const remaining = (this.routeOpenCounts.get(active) ?? 1) - 1;
-            if (remaining <= 0) this.routeOpenCounts.delete(active);
-            else this.routeOpenCounts.set(active, remaining);
-            // The settled continuation may have been the last obligation
-            // holding a draining predecessor open (its handle is in
-            // `liveRoutes` now, or the attempt failed): re-evaluate.
-            if (this.predecessor === active) this.maybeRetirePredecessor();
         });
         return run;
     }
@@ -1725,7 +1085,7 @@ export class McHostClient {
         } catch (error) {
             // KTD9: an ambiguous channel-0 route.open (possible send, no
             // terminal) has no handle and Cancel is illegal on channel 0,
-            // so retire the generation before any recovery.
+            // so retire the generation before reconnecting.
             if (error instanceof McHostCallError && error.kind === "outcome_unknown") {
                 active.generation.retire("ambiguous_route_open", error);
             }
@@ -1809,7 +1169,7 @@ export class McHostClient {
                 };
                 this.routes.set(key, cached);
             }
-            // Only the primary serves cached managed handles: a handle left on a draining predecessor is stale for NEW managed acquisitions even while raw callers still use it (R10). commentlint: allow(JUDGE)
+            // Only the active generation serves cached managed handles.
             if (cached.handle && this.isPrimaryLiveHandle(cached.handle)) {
                 const active = this.active;
                 // Without a live connection the identity cannot be refreshed;
@@ -1996,8 +1356,6 @@ export class McHostClient {
 
     private async runClose(): Promise<void> {
         const deadline = Deadline.start(this.shutdownDeadlineMs, this.clock);
-        // Cancel shadow publication FIRST: a commit racing owner close must not publish, and every shadow connection permit is released (R11). commentlint: allow(JUDGE)
-        if (this.recovery !== null) this.cancelRecovery(this.recovery);
         if (this.connecting) {
             try {
                 await this.connecting.promise;
@@ -2020,10 +1378,8 @@ export class McHostClient {
                 cancelWait?.();
             }
         }
-        // Primary and predecessor close under the same bounded deadline.
-        const conns = [this.active, this.predecessor].filter(
-            (conn): conn is ActiveConnection => conn !== null && !conn.generation.isRetired(),
-        );
+        const conns =
+            this.active !== null && !this.active.generation.isRetired() ? [this.active] : [];
         for (const conn of conns) conn.generation.enqueueConnectionGoodbye();
         await Promise.all(conns.map((conn) => conn.generation.flushWrites(deadline)));
         for (const conn of conns) conn.generation.retire("owner_close");
@@ -2204,15 +1560,6 @@ function requireOpArray(value: unknown, field: string, allowEmpty: boolean): str
 }
 
 function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSnapshot {
-    const keys = Object.keys(parsed).sort();
-    const expected = ["health", "metrics", "op"];
-    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
-        throw new McHostCallError(
-            "terminal",
-            "host.status response rejected: unexpected shape",
-            "malformed_control_response",
-        );
-    }
     if (parsed.op !== "host.status") {
         throw new McHostCallError(
             "terminal",
@@ -2239,10 +1586,192 @@ function parseHostStatusResponse(parsed: Record<string, unknown>): HostStatusSna
             "malformed_control_response",
         );
     }
+    const sharedMemory = parsed.shared_memory;
+    if (
+        sharedMemory !== undefined &&
+        (sharedMemory === null || typeof sharedMemory !== "object" || Array.isArray(sharedMemory))
+    ) {
+        throw new McHostCallError(
+            "terminal",
+            "host.status response rejected: shared_memory is not an object",
+            "malformed_control_response",
+        );
+    }
     return {
         health,
         metrics: parsed.metrics as Record<string, unknown>,
+        sharedMemory: parseSharedMemoryDiagnostics(sharedMemory),
     };
+}
+
+const RESOURCE_FIELDS = [
+    "arena_bytes",
+    "client_instances",
+    "descriptors",
+    "file_descriptors",
+    "leases",
+    "mappings",
+    "pinned_workers",
+    "workers",
+] as const;
+
+function requireRecord(value: unknown, what: string): Record<string, unknown> {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw malformedStatus(`${what} is not an object`);
+    }
+    return value as Record<string, unknown>;
+}
+
+function exactKeys(
+    record: Record<string, unknown>,
+    expected: readonly string[],
+    what: string,
+): void {
+    const keys = Object.keys(record).sort();
+    const sorted = [...expected].sort();
+    if (keys.length !== sorted.length || keys.some((key, index) => key !== sorted[index])) {
+        throw malformedStatus(`${what} has an unexpected shape`);
+    }
+}
+
+function boundedCount(value: unknown, what: string): number {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        throw malformedStatus(`${what} is not a nonnegative safe integer`);
+    }
+    return value;
+}
+
+function parseResourceCounts(value: unknown, what: string): SharedMemoryResourceCounts {
+    const record = requireRecord(value, what);
+    exactKeys(record, RESOURCE_FIELDS, what);
+    return Object.fromEntries(
+        RESOURCE_FIELDS.map((field) => [field, boundedCount(record[field], `${what}.${field}`)]),
+    ) as unknown as SharedMemoryResourceCounts;
+}
+
+function parseCounter(value: unknown, field: "completed" | "observed", what: string) {
+    const record = requireRecord(value, what);
+    exactKeys(record, [field], what);
+    return { [field]: boundedCount(record[field], `${what}.${field}`) } as
+        | { completed: number }
+        | { observed: number };
+}
+
+function malformedStatus(detail: string): McHostCallError {
+    return new McHostCallError(
+        "terminal",
+        `host.status response rejected: ${detail}`,
+        "malformed_control_response",
+    );
+}
+
+export function parseSharedMemoryDiagnostics(value: unknown): SharedMemoryDiagnostics {
+    const record = requireRecord(value, "shared_memory");
+    exactKeys(
+        record,
+        [
+            "state",
+            "error_class",
+            "artifact",
+            "bounds",
+            "accounting",
+            "activation",
+            "peer_death",
+            "reclamation",
+            "exhaustion",
+        ],
+        "shared_memory",
+    );
+    const terminalClasses = new Set<SharedMemoryTerminalClass>([
+        "missing_addon",
+        "identity_mismatch",
+        "setup_failure",
+        "peer_death",
+        "resource_exhaustion",
+    ]);
+    const state = record.state;
+    const errorClass = record.error_class;
+    if (
+        (state !== "healthy" && state !== "terminal") ||
+        (state === "healthy" && errorClass !== null) ||
+        (state === "terminal" &&
+            (typeof errorClass !== "string" ||
+                !terminalClasses.has(errorClass as SharedMemoryTerminalClass)))
+    ) {
+        throw malformedStatus("shared_memory state contradicts its error class");
+    }
+    // Healthy is reported only after a successful accounting snapshot, and bounds
+    // are always concrete, so a healthy record withholding either describes
+    // resources it never observed.
+    if (state === "healthy" && (record.bounds === null || record.accounting === null)) {
+        throw malformedStatus("healthy shared_memory withholds observed resource data");
+    }
+    const artifact = requireRecord(record.artifact, "shared_memory.artifact");
+    exactKeys(artifact, ["profile", "wire_version", "descriptor_schema"], "shared_memory.artifact");
+    if (
+        artifact.profile !== QUALIFIED_TEST_PROFILE ||
+        artifact.wire_version !== PROTOCOL_VERSION ||
+        artifact.descriptor_schema !== DESCRIPTOR_SCHEMA_VERSION
+    ) {
+        throw malformedStatus("shared_memory artifact identity mismatch");
+    }
+    let accounting: SharedMemoryDiagnostics["accounting"] = null;
+    if (record.accounting !== null) {
+        const raw = requireRecord(record.accounting, "shared_memory.accounting");
+        exactKeys(raw, ["active", "quarantined"], "shared_memory.accounting");
+        accounting = {
+            active: parseResourceCounts(raw.active, "shared_memory.accounting.active"),
+            quarantined: parseResourceCounts(
+                raw.quarantined,
+                "shared_memory.accounting.quarantined",
+            ),
+        };
+    }
+    return {
+        state,
+        error_class: errorClass as SharedMemoryTerminalClass | null,
+        artifact: {
+            profile: QUALIFIED_TEST_PROFILE,
+            wire_version: PROTOCOL_VERSION,
+            descriptor_schema: DESCRIPTOR_SCHEMA_VERSION,
+        },
+        bounds:
+            record.bounds === null
+                ? null
+                : parseResourceCounts(record.bounds, "shared_memory.bounds"),
+        accounting,
+        activation: parseCounter(record.activation, "completed", "shared_memory.activation") as {
+            completed: number;
+        },
+        peer_death: parseCounter(record.peer_death, "observed", "shared_memory.peer_death") as {
+            observed: number;
+        },
+        reclamation: parseCounter(record.reclamation, "completed", "shared_memory.reclamation") as {
+            completed: number;
+        },
+        exhaustion: parseCounter(record.exhaustion, "observed", "shared_memory.exhaustion") as {
+            observed: number;
+        },
+    };
+}
+
+function terminalRetirementClass(reason: RetirementReason): SharedMemoryTerminalClass | undefined {
+    switch (reason) {
+        // A dead peer reaches this client as a channel EOF;
+        // `FrameChannelCloseReason` carries no socket-level variants.
+        case "eof":
+            return "peer_death";
+        // `ShmFrameChannel` retires the generation on these when ring decoding
+        // or lease cleanup fails. The closed class vocabulary has no corruption
+        // member, so they report the generic setup class rather than leaving a
+        // terminal retirement unclassified.
+        case "protocol_violation":
+        case "role_violation":
+        case "quarantined":
+            return "setup_failure";
+        default:
+            return undefined;
+    }
 }
 
 /**
@@ -2308,39 +1837,6 @@ function parseCatalogResponse(parsed: Record<string, unknown>): CatalogSnapshot 
         };
     });
     return { generation, subcOps, modules };
-}
-
-function wrapNegotiationError(error: unknown): Error {
-    if (error instanceof NegotiationError) {
-        return new McHostCallError(
-            "terminal",
-            `transport negotiation failed: ${error.message}`,
-            "negotiation_failed",
-            error,
-        );
-    }
-    return error instanceof Error ? error : new Error(String(error));
-}
-
-/**
- * Negotiation-path failure sanitizer: a wire Error terminal carries
- * peer-controlled text, so it is replaced with a bounded failure before it
- * can enter retirement info or caller-visible error graphs (R14). Every
- * other failure keeps `wrapNegotiationError` semantics.
- */
-function boundedNegotiationFailure(error: unknown): Error {
-    if (
-        error instanceof McHostCallError &&
-        error.kind === "terminal" &&
-        error.errorTerminal !== undefined
-    ) {
-        return new McHostCallError(
-            "terminal",
-            "transport negotiation failed: host error terminal",
-            "negotiation_failed",
-        );
-    }
-    return wrapNegotiationError(error);
 }
 
 function toManagedCallError(error: unknown): McHostCallError {

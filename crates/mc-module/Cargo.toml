@@ -34,7 +34,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # Provider context-overflow error patterns (scheduler unit). Plain regex (no
 # lookarounds in those patterns); fancy-regex stays confined to mc-tokenizer.
-regex = "1"
+regex = { workspace = true }
 # Prepared matchers for caveman.rs phrase scanning; both are transitive deps
 # of `regex` already, so they add no new supply-chain root.
 aho-corasick = "1"
@@ -74,8 +74,13 @@ path = "benches/hot_path.rs"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "kernels"
+harness = false
+
 [dev-dependencies]
 criterion = "=0.8.2"
+proptest = "1"
 chrono-tz = "0.10"
 tokio = { workspace = true, features = ["signal"] }
 # Enable the store's seed helpers for mc-module's compose tests (populate memories +
