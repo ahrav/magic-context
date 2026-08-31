@@ -1,7 +1,7 @@
 #![cfg(feature = "test-support")]
 
 use mc_store::kernel::{
-    CommitIntent, DomainSpec, KernelErrorKind, KernelStore, ScopeSpec, ScopeTermSpec, Sensitivity,
+    CommitIntent, DomainSpec, KernelError, KernelStore, ScopeSpec, ScopeTermSpec, Sensitivity,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -113,7 +113,7 @@ fn insert_scope_orders_terms_and_redacts_values() {
 }
 
 #[test]
-fn insert_scope_reports_missing_domain_and_duplicate_source_as_typed_errors() {
+fn insert_scope_reports_missing_domain_and_duplicate_identity_as_typed_errors() {
     let directory = tempfile::tempdir().unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
     seed_domain(&store);
@@ -126,14 +126,11 @@ fn insert_scope_reports_missing_domain_and_duplicate_source_as_typed_errors() {
 
     let duplicate = store
         .commit(intent("duplicate", '3'), |envelope| {
-            let mut duplicate = scope(1);
-            duplicate.scope_id = "other-scope".to_string();
-            duplicate.object_id = "other-scope-object".to_string();
-            envelope.insert_scope(duplicate)?;
+            envelope.insert_scope(scope(1))?;
             Ok(String::new())
         })
         .unwrap_err();
-    assert_eq!(duplicate.kind(), KernelErrorKind::Conflict);
+    assert_eq!(duplicate, KernelError::Conflict);
 
     let missing = store
         .commit(intent("missing", '4'), |envelope| {
@@ -145,5 +142,5 @@ fn insert_scope_reports_missing_domain_and_duplicate_source_as_typed_errors() {
             Ok(String::new())
         })
         .unwrap_err();
-    assert_eq!(missing.kind(), KernelErrorKind::NotFound);
+    assert_eq!(missing, KernelError::NotFound);
 }

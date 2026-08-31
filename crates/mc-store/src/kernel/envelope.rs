@@ -218,10 +218,7 @@ impl Envelope<'_> {
     ) -> Result<(), KernelError> {
         let replaced = identity(replaced_object_id)?;
         let replacement = RedactedDomain::new(replacement)?;
-        let replaced_object = self.invalidate_domain(&replaced)?;
-        if replaced_object.domain_id != replacement.domain_id {
-            return Err(KernelError::Conflict);
-        }
+        self.invalidate_domain(&replaced)?;
         insert_domain(self.tx, self.commit_seq, &replacement)?;
         self.set_domain_successor(&replaced, &replacement.object_id)?;
         self.changes.push(PendingChange {
