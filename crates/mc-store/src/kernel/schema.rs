@@ -5,6 +5,9 @@ use std::collections::BTreeSet;
 use crate::sqlite_runtime::compute_marker_digest_for_application_id;
 
 pub const KERNEL_APPLICATION_ID: u32 = 0x4D43_4B52;
+// On an epoch or digest mismatch, `open` quarantines the database and
+// bootstraps a fresh family; no in-place migration exists.
+// commentlint: allow(JUDGE)
 pub const KERNEL_FORMAT_EPOCH: i64 = 2;
 pub const KERNEL_SCHEMA_COMPONENT_NAMES: [&str; 37] = [
     "commit_log",
@@ -89,7 +92,7 @@ const COMPONENTS: [(&str, &str); KERNEL_SCHEMA_COMPONENT_NAMES.len()] = [
     ),
     (
         "capture_pins",
-        r#"CREATE TABLE capture_pins(capture_pin_id TEXT PRIMARY KEY,pin_kind TEXT NOT NULL,owner_id TEXT NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,lease_epoch INTEGER NOT NULL,writer_epoch INTEGER NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER,released_at INTEGER,purge_degraded_at INTEGER,purge_barrier_id TEXT REFERENCES deletion_backfill_barriers(barrier_id) ON DELETE RESTRICT,CHECK((purge_degraded_at IS NULL)=(purge_barrier_id IS NULL))) STRICT; CREATE INDEX idx_capture_pins_commit_fk ON capture_pins(commit_seq); CREATE INDEX idx_capture_pins_ttl ON capture_pins(released_at,expires_at,capture_pin_id); CREATE INDEX idx_capture_pins_purge_degraded ON capture_pins(purge_degraded_at,purge_barrier_id,capture_pin_id);"#,
+        r#"CREATE TABLE capture_pins(capture_pin_id TEXT PRIMARY KEY,pin_kind TEXT NOT NULL,owner_id TEXT NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,lease_epoch INTEGER NOT NULL,writer_epoch INTEGER NOT NULL,created_at INTEGER NOT NULL,expires_at INTEGER,released_at INTEGER,purge_degraded_at INTEGER,purge_barrier_id TEXT REFERENCES deletion_backfill_barriers(barrier_id) ON DELETE RESTRICT,CHECK((purge_degraded_at IS NULL)=(purge_barrier_id IS NULL))) STRICT; CREATE INDEX idx_capture_pins_commit_fk ON capture_pins(commit_seq); CREATE INDEX idx_capture_pins_ttl ON capture_pins(released_at,expires_at,capture_pin_id); CREATE INDEX idx_capture_pins_purge_degraded ON capture_pins(purge_degraded_at,purge_barrier_id,capture_pin_id); CREATE INDEX idx_capture_pins_purge_barrier_fk ON capture_pins(purge_barrier_id) WHERE purge_barrier_id IS NOT NULL;"#,
     ),
     (
         "capture_pin_refs",
@@ -105,7 +108,7 @@ const COMPONENTS: [(&str, &str); KERNEL_SCHEMA_COMPONENT_NAMES.len()] = [
     ),
     (
         "artifact_pending_unlinks",
-        r#"CREATE TABLE artifact_pending_unlinks(artifact_digest TEXT PRIMARY KEY REFERENCES artifact_purge_tombstones(artifact_digest) ON DELETE RESTRICT,artifact_reference TEXT NOT NULL,created_at INTEGER NOT NULL,last_attempt_at INTEGER,attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count>=0)) STRICT; CREATE INDEX idx_pending_unlinks_created ON artifact_pending_unlinks(created_at,artifact_digest);"#,
+        r#"CREATE TABLE artifact_pending_unlinks(artifact_digest TEXT PRIMARY KEY REFERENCES artifact_purge_tombstones(artifact_digest) ON DELETE RESTRICT,artifact_reference TEXT NOT NULL,created_at INTEGER NOT NULL,last_attempt_at INTEGER,attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count>=0)) STRICT; CREATE INDEX idx_pending_unlinks_created ON artifact_pending_unlinks(created_at,artifact_digest); CREATE TRIGGER artifact_pending_unlinks_reference_matches_tombstone BEFORE INSERT ON artifact_pending_unlinks WHEN NEW.artifact_reference IS NOT (SELECT artifact_reference FROM artifact_purge_tombstones WHERE artifact_digest=NEW.artifact_digest) BEGIN SELECT RAISE(ABORT,'pending unlink reference must match its purge tombstone'); END;"#,
     ),
     (
         "object_registry",
@@ -234,8 +237,7 @@ fn apply_schema<F: FnOnce() -> rusqlite::Result<()>>(
         KERNEL_SCHEMA_COMPONENT_NAMES,
         "kernel schema component names must stay aligned with their SQL"
     );
-    for (name, sql) in COMPONENTS {
-        assert!(KERNEL_SCHEMA_COMPONENT_NAMES.contains(&name));
+    for (_name, sql) in COMPONENTS {
         tx.execute_batch(sql)?;
     }
     tx.execute("INSERT INTO writer_fence(id) VALUES(0)", [])?;

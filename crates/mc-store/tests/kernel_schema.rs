@@ -216,10 +216,17 @@ fn cas_control_tables_and_lookup_indexes_are_frozen_into_epoch_two() {
         "idx_evidence_artifact_digest",
         "idx_evidence_artifact_reference",
         "idx_reservations_digest",
+        "idx_reservations_reference",
         "idx_reservations_reclaim",
         "idx_pending_unlinks_created",
+        "idx_purge_tombstones_reference",
+        "idx_purge_tombstones_commit_fk",
         "idx_deletion_barriers_commit",
+        "idx_deletion_barriers_incomplete",
         "idx_deletion_barrier_consumers_checkpoint",
+        "idx_abandonments_barrier_fk",
+        "idx_capture_pins_purge_degraded",
+        "idx_capture_pins_purge_barrier_fk",
     ] {
         assert!(indexes.iter().any(|name| name == index), "missing {index}");
     }
@@ -338,6 +345,35 @@ fn cas_control_rows_preserve_reclaim_purge_and_backfill_state() {
     assert!(conn
         .execute(
             "DELETE FROM artifact_purge_tombstones WHERE artifact_digest='digest'",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE artifact_purge_tombstones SET reason='rewritten' WHERE artifact_digest='digest'",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO artifact_purge_tombstones(
+                 artifact_digest,artifact_reference,operator_id,reason,purged_at,commit_seq
+             ) VALUES ('digest-2','ref','operator-1','secret',5,?1)",
+            [commit_seq],
+        )
+        .is_err());
+    conn.execute(
+        "INSERT INTO artifact_purge_tombstones(
+             artifact_digest,artifact_reference,operator_id,reason,purged_at,commit_seq
+         ) VALUES ('digest-3','ref-3','operator-1','secret',5,?1)",
+        [commit_seq],
+    )
+    .unwrap();
+    assert!(conn
+        .execute(
+            "INSERT INTO artifact_pending_unlinks(
+                 artifact_digest,artifact_reference,created_at
+             ) VALUES ('digest-3','wrong-ref',5)",
             [],
         )
         .is_err());

@@ -1,3 +1,5 @@
+//! Descriptor-anchored filesystem primitives for durable artifact publication.
+
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Write};
@@ -81,29 +83,36 @@ fn validate_name(name: &str) -> Result<(), StorageError> {
 pub(super) fn create_secure_directory(parent: &File, name: &str) -> Result<File, StorageError> {
     validate_name(name)?;
     rfs::mkdirat(parent, name, Mode::from_raw_mode(0o700)).map_err(classify_errno)?;
-    rfs::chmodat(parent, name, Mode::from_raw_mode(0o700), AtFlags::empty())
+    let secured = (|| {
+        let descriptor = rfs::openat(
+            parent,
+            name,
+            OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
         .map_err(classify_errno)?;
-    let descriptor = rfs::openat(
-        parent,
-        name,
-        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(classify_errno)?;
-    let directory = File::from(descriptor);
-    let metadata = directory.metadata().map_err(classify_io)?;
-    if !metadata.is_dir()
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.permissions().mode() & 0o777 != 0o700
-    {
-        return Err(classify_io(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "directory is not owner-only",
-        )));
+        let directory = File::from(descriptor);
+        // `fchmod` on the verified descriptor defeats the umask without ever
+        // re-resolving `name`.
+        rfs::fchmod(&directory, Mode::from_raw_mode(0o700)).map_err(classify_errno)?;
+        let metadata = directory.metadata().map_err(classify_io)?;
+        if !metadata.is_dir()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(classify_io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory is not owner-only",
+            )));
+        }
+        sync_directory(&directory)?;
+        sync_directory(parent)?;
+        Ok(directory)
+    })();
+    if secured.is_err() {
+        let _ = rfs::unlinkat(parent, name, AtFlags::REMOVEDIR);
     }
-    sync_directory(&directory)?;
-    sync_directory(parent)?;
-    Ok(directory)
+    secured
 }
 
 pub(super) fn create_new_file(directory: &File, name: &str) -> Result<File, StorageError> {
@@ -138,6 +147,8 @@ pub(super) fn sync_directory(directory: &File) -> Result<(), StorageError> {
     sync_file(directory)
 }
 
+// `_locked` requires callers to serialize publishers within this process.
+// Callers own the directory barrier.
 pub(super) fn publish_noreplace_locked(
     directory: &File,
     temp_name: &str,
@@ -155,33 +166,38 @@ pub(super) fn publish_noreplace_locked(
             final_name,
             rfs::RenameFlags::NOREPLACE,
         ) {
-            Ok(()) => {
-                sync_directory(directory)?;
-                return Ok(PublishOutcome::Published);
-            }
+            Ok(()) => return Ok(PublishOutcome::Published),
             Err(rustix::io::Errno::EXIST) | Err(rustix::io::Errno::NOTEMPTY) => {
                 return Ok(PublishOutcome::AlreadyExists);
             }
-            Err(rustix::io::Errno::INVAL)
-            | Err(rustix::io::Errno::NOSYS)
-            | Err(rustix::io::Errno::OPNOTSUPP) => {}
+            // `NOTSUP` equals `OPNOTSUPP` on Linux, so equality guards avoid
+            // duplicate or-patterns.
+            Err(error)
+                if error == rustix::io::Errno::INVAL
+                    || error == rustix::io::Errno::NOSYS
+                    || error == rustix::io::Errno::OPNOTSUPP
+                    || error == rustix::io::Errno::NOTSUP => {}
             Err(error) => return Err(classify_errno(error)),
         }
     }
 
-    match rfs::statat(directory, final_name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_) => return Ok(PublishOutcome::AlreadyExists),
-        Err(rustix::io::Errno::NOENT) => {}
-        Err(error) => return Err(classify_errno(error)),
-    }
-    match rfs::renameat(directory, temp_name, directory, final_name) {
+    // `linkat` atomically creates `final_name` or returns `EEXIST`, preventing
+    // a concurrent publisher from replacing it.
+    match rfs::linkat(
+        directory,
+        temp_name,
+        directory,
+        final_name,
+        AtFlags::empty(),
+    ) {
         Ok(()) => {
-            sync_directory(directory)?;
+            match rfs::unlinkat(directory, temp_name, AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                Err(error) => return Err(classify_errno(error)),
+            }
             Ok(PublishOutcome::Published)
         }
-        Err(rustix::io::Errno::EXIST) | Err(rustix::io::Errno::NOTEMPTY) => {
-            Ok(PublishOutcome::AlreadyExists)
-        }
+        Err(rustix::io::Errno::EXIST) => Ok(PublishOutcome::AlreadyExists),
         Err(error) => Err(classify_errno(error)),
     }
 }
@@ -201,8 +217,22 @@ pub(super) fn temp_name(stem: &str) -> String {
 }
 
 pub(super) fn next_unique_id() -> u64 {
-    let counter = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-    (u64::from(std::process::id()) << 32) | counter
+    let counter = UNIQUE_ID.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff;
+    (unique_prefix() << 32) | counter
+}
+
+// A PID alone repeats across restarts under namespace-local container PIDs, and a
+// repeated name makes `O_EXCL` creation and `RENAME_NOREPLACE` publication fail
+// with an opaque `EEXIST`.
+fn unique_prefix() -> u64 {
+    static PREFIX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PREFIX.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or(0);
+        u64::from(nanos) ^ u64::from(std::process::id())
+    })
 }
 
 #[cfg(test)]

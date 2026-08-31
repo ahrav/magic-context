@@ -8,12 +8,16 @@ mod redaction;
 mod retention;
 pub mod schema;
 
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+pub use backup::filesystem_is_unsafe_for_test;
+#[cfg(all(target_os = "macos", feature = "test-support"))]
+pub use backup::filesystem_name_is_unsafe_for_test;
 #[cfg(feature = "test-support")]
 pub use backup::{
-    filesystem_is_unsafe_for_test, filesystem_name_is_unsafe_for_test, owner_is_current_for_test,
-    verify_backup_with_deadline_for_test, BackupFault, RestoreFault,
+    owner_is_current_for_test, sensitivity_bearing_tables_for_test,
+    verify_backup_with_deadline_for_test, RestoreFault,
 };
-pub use backup::{BackupManifest, BackupRequest, BackupResult};
+pub use backup::{BackupManifest, BackupRequest};
 #[cfg(feature = "test-support")]
 pub use envelope::CommitFault;
 pub use envelope::{

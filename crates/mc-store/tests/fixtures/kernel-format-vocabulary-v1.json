@@ -3,7 +3,7 @@
   "application_id": 1296255826,
   "format_epoch": 2,
   "schema_digest_protocol": "mc-kernel-schema-v1",
-  "schema_digest": "8d8a0adebcda4d8686c351a602445fb7fe123e4e524ac4f9449524ddc0588841",
+  "schema_digest": "d34b4a363e9bf88f325447bb6dc41d0b3a967ff94087c55f1f5d7d49906ed39b",
   "ordered_components": [
     "commit_log",
     "change_event",
