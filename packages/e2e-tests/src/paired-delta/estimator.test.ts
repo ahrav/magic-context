@@ -34,10 +34,14 @@ const observations: FamilyDeltaObservation[] = [
     { coordinateId: "var-e:1", familyId: "fam-e", endpoint: "mc-on-vs-compaction", delta: 0, runHealth: "completed" },
 ];
 
+// Unsorted input order exercises the shared paired-facts sort before fingerprinting.
+const pairs = [pair("complete", 9), pair("complete", 7)];
+
 const lane = {
     poolManifestFingerprint: H1,
     pinnedSnapshotId: "fixture-model-20260830",
     policyFingerprint: H3,
+    pairedFactsFingerprint: pairedFactsFingerprint(pairs),
 };
 
 function estimate(overrides: Partial<Parameters<typeof estimateFamilyDeltas>[0]> = {}): FamilyDeltaAnalysis {
@@ -146,6 +150,24 @@ describe("family-clustered delta estimator", () => {
         expect(() => estimate({ bootstrapResamples: 1999 })).toThrow(/bootstrap-resamples-too-small/);
         expect(() => estimate({ bootstrapSeed: 2 ** 32 })).toThrow(/bootstrap-seed-invalid/);
         expect(() => estimate({ bootstrapSeed: -1 })).toThrow(/bootstrap-seed-invalid/);
+        expect(() => estimate({
+            lane: { ...lane, pairedFactsFingerprint: "not-a-hash" },
+        })).toThrow(/lane-paired-facts-fingerprint-invalid/);
+    });
+
+    it("rejects an undeclared endpoint instead of estimating and dropping it", () => {
+        expect(() => estimate({
+            observations: [
+                ...observations,
+                { ...observations[0]!, coordinateId: "var-a:z", endpoint: "latency" as never },
+            ],
+        })).toThrow(/observation: endpoint-undeclared-latency/);
+    });
+
+    it("reports a malformed noise floor as an estimator error", () => {
+        expect(() => estimate({
+            noiseFloors: [{ familyId: "fam-a", value: 0.2, interval: undefined as never }],
+        })).toThrow(PairedDeltaEstimatorError);
     });
 
     it("treats a primary endpoint without observations as zero analyzable families", () => {
@@ -188,15 +210,11 @@ describe("family-clustered delta estimator", () => {
 });
 
 describe("bound prospective estimator adapter", () => {
-    // Unsorted input order exercises the shared paired-facts sort before fingerprinting.
-    const pairs = [pair("complete", 9), pair("complete", 7)];
-    const expectedPairedFactsFingerprint = pairedFactsFingerprint(pairs);
     const adapter = (analysis = estimate({ minimumAnalyzableFamilyCount: 1 })) =>
         createFamilyEstimatorAdapter({
             poolManifestFingerprint: H1,
             pinnedSnapshotId: "fixture-model-20260830",
             policyFingerprint: H3,
-            expectedPairedFactsFingerprint,
             analysis,
         });
 
@@ -254,7 +272,6 @@ describe("bound prospective estimator adapter", () => {
             poolManifestFingerprint: H2,
             pinnedSnapshotId: "fixture-model-20260830",
             policyFingerprint: H3,
-            expectedPairedFactsFingerprint,
             analysis: estimate(),
         }).analyze(pairs, H3)).toThrow(PairedDeltaEstimatorError);
         expect(() => adapter(estimate({
@@ -262,6 +279,10 @@ describe("bound prospective estimator adapter", () => {
         })).analyze(pairs, H3)).toThrow(/lane-binding-mismatch/);
         expect(() => adapter().analyze([pair("incomplete")], H3)).toThrow(/paired-facts-fingerprint-mismatch/);
         expect(() => adapter().analyze(pairs, H2)).toThrow(/policy-fingerprint-mismatch/);
+        expect(() => adapter(estimate({
+            minimumAnalyzableFamilyCount: 1,
+            lane: { ...lane, pairedFactsFingerprint: pairedFactsFingerprint([pair("incomplete")]) },
+        })).analyze(pairs, H3)).toThrow(/paired-facts-fingerprint-mismatch/);
     });
 
     it("runs through buildProspectiveReport and fingerprints every lane record", () => {

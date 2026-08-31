@@ -18,6 +18,12 @@ export type PrimaryEndpoint = (typeof PRIMARY_ENDPOINTS)[number];
 export type RegretEndpoint = (typeof REGRET_ENDPOINTS)[number];
 export type DeltaEndpoint = PrimaryEndpoint | RegretEndpoint;
 
+// An estimate for an undeclared endpoint belongs to no output bucket and is omitted from the analysis.
+const DECLARED_ENDPOINTS: ReadonlySet<string> = new Set<string>([
+    ...PRIMARY_ENDPOINTS,
+    ...REGRET_ENDPOINTS,
+]);
+
 export class PairedDeltaEstimatorError extends Error {
     constructor(message: string) {
         super(message);
@@ -79,6 +85,7 @@ export interface LaneBinding {
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
     policyFingerprint: string;
+    pairedFactsFingerprint: string;
 }
 
 export interface FamilyDeltaAnalysis extends LaneBinding {
@@ -234,6 +241,9 @@ export function estimateFamilyDeltas(input: {
     if (!/^[0-9a-f]{64}$/.test(input.lane.policyFingerprint)) {
         throw new PairedDeltaEstimatorError("lane-policy-fingerprint-invalid");
     }
+    if (!/^[0-9a-f]{64}$/.test(input.lane.pairedFactsFingerprint)) {
+        throw new PairedDeltaEstimatorError("lane-paired-facts-fingerprint-invalid");
+    }
     if (input.lane.pinnedSnapshotId.trim().length === 0) {
         throw new PairedDeltaEstimatorError("lane-pinned-snapshot-id-invalid");
     }
@@ -243,6 +253,11 @@ export function estimateFamilyDeltas(input: {
 
     const coordinateKeys = new Set<string>();
     for (const observation of input.observations) {
+        if (!DECLARED_ENDPOINTS.has(observation.endpoint)) {
+            throw new PairedDeltaEstimatorError(
+                `observation: endpoint-undeclared-${observation.endpoint}`,
+            );
+        }
         if (observation.runHealth !== "completed") {
             throw new PairedDeltaEstimatorError(
                 `observation: unanalyzable-${observation.coordinateId}`,
@@ -262,15 +277,20 @@ export function estimateFamilyDeltas(input: {
 
     const noiseFloors = new Map<string, FamilyNoiseFloor>();
     for (const floor of input.noiseFloors ?? []) {
+        // A malformed floor must surface as a typed estimator error, not a TypeError from reading `interval`.
+        const interval: Interval | null | undefined = floor.interval;
         if (
             noiseFloors.has(floor.familyId) ||
             !Number.isFinite(floor.value) ||
             floor.value < 0 ||
-            !Number.isFinite(floor.interval.lower) ||
-            !Number.isFinite(floor.interval.upper) ||
-            floor.interval.lower < 0 ||
-            floor.interval.lower > floor.value ||
-            floor.value > floor.interval.upper
+            interval === null ||
+            interval === undefined ||
+            typeof interval !== "object" ||
+            !Number.isFinite(interval.lower) ||
+            !Number.isFinite(interval.upper) ||
+            interval.lower < 0 ||
+            interval.lower > floor.value ||
+            floor.value > interval.upper
         ) {
             throw new PairedDeltaEstimatorError(`noise-floor-invalid-${floor.familyId}`);
         }
@@ -306,6 +326,7 @@ export function estimateFamilyDeltas(input: {
         poolManifestFingerprint: input.lane.poolManifestFingerprint,
         pinnedSnapshotId: input.lane.pinnedSnapshotId,
         policyFingerprint: input.lane.policyFingerprint,
+        pairedFactsFingerprint: input.lane.pairedFactsFingerprint,
         bootstrapSeed: input.bootstrapSeed,
         bootstrapResamples: input.bootstrapResamples,
         minimumAnalyzableFamilyCount: input.minimumAnalyzableFamilyCount,
@@ -343,7 +364,6 @@ export function createFamilyEstimatorAdapter(input: {
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
     policyFingerprint: string;
-    expectedPairedFactsFingerprint: string;
     analysis: FamilyDeltaAnalysis;
 }): FamilyEstimatorAdapter {
     return {
@@ -361,7 +381,7 @@ export function createFamilyEstimatorAdapter(input: {
             ) {
                 throw new PairedDeltaEstimatorError("adapter: policy-fingerprint-mismatch");
             }
-            if (pairedFactsFingerprint(pairs) !== input.expectedPairedFactsFingerprint) {
+            if (pairedFactsFingerprint(pairs) !== input.analysis.pairedFactsFingerprint) {
                 throw new PairedDeltaEstimatorError("adapter: paired-facts-fingerprint-mismatch");
             }
             const evidenceSufficient =
@@ -375,7 +395,7 @@ export function createFamilyEstimatorAdapter(input: {
                     poolManifestFingerprint: input.poolManifestFingerprint,
                     pinnedSnapshotId: input.pinnedSnapshotId,
                     policyFingerprint: input.policyFingerprint,
-                    pairedFactsFingerprint: input.expectedPairedFactsFingerprint,
+                    pairedFactsFingerprint: input.analysis.pairedFactsFingerprint,
                     analysis: input.analysis,
                 }),
             };
