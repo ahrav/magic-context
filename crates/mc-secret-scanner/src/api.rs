@@ -125,9 +125,12 @@ pub struct ScanReport {
     pub semantic_digest: [u8; 32],
     pub candidates_evaluated: usize,
     pub work_bytes: usize,
-    /// `Some` when a bound stopped the scan early, so `findings` is a prefix of
-    /// what a complete scan would report and absence of a finding proves
-    /// nothing.
+    /// `Some` when a bound stopped the scan early, so absence of a finding
+    /// proves nothing.
+    ///
+    /// The retained findings are an arbitrary subset of a complete report, not a prefix.
+    /// Evaluation stops in rule order while `findings` is sorted by position, so a
+    /// rule that never ran could have matched ahead of everything retained.
     pub limits_hit: Option<LimitExhausted>,
 }
 
@@ -214,7 +217,7 @@ impl std::error::Error for ScanError {}
 
 pub(crate) const REVISION: ScannerRevision = ScannerRevision {
     crate_version: env!("CARGO_PKG_VERSION"),
-    semantic_digest_version: 3,
+    semantic_digest_version: 4,
     upstream_commit: "3d2869011138cd7812a12f893dc93635a961b0d7",
 };
 

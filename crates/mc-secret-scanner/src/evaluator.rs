@@ -35,6 +35,18 @@ pub(crate) fn evaluate(
     let mut work = 0usize;
     let mut limits_hit = None;
 
+    // Charge input bytes before preselection so `max_work_bytes` bounds preselection.
+    if add_work(&mut work, bytes.len(), limits.max_work_bytes).is_err() {
+        return Ok(ScanReport {
+            findings,
+            revision: REVISION,
+            semantic_digest,
+            candidates_evaluated: candidates,
+            work_bytes: work,
+            limits_hit: Some(LimitExhausted::Work),
+        });
+    }
+
     'rules: for rule in rules.preselect(profile, bytes) {
         if add_work(&mut work, bytes.len(), limits.max_work_bytes).is_err() {
             limits_hit = Some(LimitExhausted::Work);
@@ -102,11 +114,8 @@ fn evaluate_candidate(
             .get(usize::from(group))
             .filter(|value| !value.is_empty())
             .unwrap_or(full_match)
-    } else if captures.len() == 2 {
-        captures
-            .get(1)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(full_match)
+    } else if let Some(alternative) = first_unnamed_capture(rule, captures) {
+        alternative
     } else {
         full_match
     };
@@ -288,6 +297,20 @@ fn evaluate_candidate(
     }))
 }
 
+// Unnamed captures hold secrets; named captures mark header fields. Ignore named captures so header-only rules return their whole match.
+fn first_unnamed_capture<'a>(
+    rule: &Rule,
+    captures: &Captures<'a>,
+) -> Option<regex::bytes::Match<'a>> {
+    rule.regex
+        .capture_names()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, name)| name.is_none())
+        .filter_map(|(index, _)| captures.get(index))
+        .find(|value| !value.is_empty())
+}
+
 fn add_work(total: &mut usize, amount: usize, limit: usize) -> Result<(), Abort> {
     *total = total.checked_add(amount).ok_or(Abort::Work)?;
     if *total > limit {
@@ -453,12 +476,27 @@ fn entropy_allows(spec: &EntropySpec, value: &[u8]) -> EntropyOutcome {
     EntropyOutcome::Passed
 }
 
+// `is_scalar` ignores ASCII case because languages capitalize null-like and boolean values differently; otherwise `password=None` is reported as a secret.
+const SCALAR_KEYWORDS: &[&str] = &[
+    "true",
+    "false",
+    "null",
+    "undefined",
+    "none",
+    "nil",
+    "nan",
+    "~",
+];
+
 fn is_scalar(value: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(value) else {
         return false;
     };
     let text = text.trim();
-    if matches!(text, "true" | "false" | "null" | "undefined") {
+    if SCALAR_KEYWORDS
+        .iter()
+        .any(|keyword| text.eq_ignore_ascii_case(keyword))
+    {
         return true;
     }
     if text.is_empty() {
@@ -535,7 +573,7 @@ fn local_context_allows(
     }
     if let Some(keys) = &spec.key_names_any {
         for key in keys {
-            if contains_charged(before, key.as_bytes(), work, limits)? {
+            if contains_charged_ignore_case(before, key.as_bytes(), work, limits)? {
                 return Ok(true);
             }
         }
@@ -620,11 +658,11 @@ fn crc_verdict(body: &[u8], encoded: &[u8]) -> OfflineVerdict {
     checksum_verdict(body, base62_u32(encoded))
 }
 
+// A checksum that does not decode as `u32` cannot represent a CRC32, so malformed or overflowing base-62 fields are invalid rather than unverifiable.
 fn checksum_verdict(body: &[u8], expected: Option<u32>) -> OfflineVerdict {
     match expected {
         Some(expected) if crc32(body) == expected => OfflineVerdict::Valid,
-        Some(_) => OfflineVerdict::Invalid,
-        None => OfflineVerdict::Indeterminate,
+        Some(_) | None => OfflineVerdict::Invalid,
     }
 }
 

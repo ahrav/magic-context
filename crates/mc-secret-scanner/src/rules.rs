@@ -287,9 +287,14 @@ impl RuleSet {
         hash.update((limits.max_input_bytes as u64).to_le_bytes());
         hash.update((limits.max_candidates as u64).to_le_bytes());
         hash.update((limits.max_work_bytes as u64).to_le_bytes());
-        for pattern in CONTEXT_SAFELIST.iter().chain(VALUE_SAFELIST) {
-            hash.update((pattern.len() as u64).to_le_bytes());
-            hash.update(pattern.as_bytes());
+        // Tag and count each safelist so moving a pattern between them changes the digest: context patterns suppress on surrounding text and value patterns on the extracted value, so the two are not interchangeable.
+        for (tag, patterns) in [(b'c', CONTEXT_SAFELIST), (b'v', VALUE_SAFELIST)] {
+            hash.update([tag]);
+            hash.update((patterns.len() as u64).to_le_bytes());
+            for pattern in patterns {
+                hash.update((pattern.len() as u64).to_le_bytes());
+                hash.update(pattern.as_bytes());
+            }
         }
         let mut active: Vec<_> = self.active(profile).collect();
         active.sort_by(|left, right| {
@@ -627,6 +632,51 @@ mod tests {
                     .semantic_digest(ScanProfile::Comprehensive, limits)
                     .unwrap(),
                 expected
+            );
+        }
+    }
+
+    #[test]
+    fn moving_a_pattern_between_safelists_changes_the_semantic_digest() {
+        let mut hash = Sha256::new();
+        for (tag, patterns) in [(b'c', &["a", "b"][..]), (b'v', &["c"][..])] {
+            hash.update([tag]);
+            hash.update((patterns.len() as u64).to_le_bytes());
+            for pattern in patterns {
+                hash.update((pattern.len() as u64).to_le_bytes());
+                hash.update(pattern.as_bytes());
+            }
+        }
+        let before: [u8; 32] = hash.finalize().into();
+
+        let mut hash = Sha256::new();
+        for (tag, patterns) in [(b'c', &["a"][..]), (b'v', &["b", "c"][..])] {
+            hash.update([tag]);
+            hash.update((patterns.len() as u64).to_le_bytes());
+            for pattern in patterns {
+                hash.update((pattern.len() as u64).to_le_bytes());
+                hash.update(pattern.as_bytes());
+            }
+        }
+        let after: [u8; 32] = hash.finalize().into();
+
+        assert_ne!(before, after);
+    }
+
+    // A mixed rule would let a named structural group decide the reported secret span.
+    #[test]
+    fn no_rule_mixes_named_and_unnamed_undeclared_capture_groups() {
+        let rules = RuleSet::from_embedded().unwrap();
+        for rule in rules.active(ScanProfile::Comprehensive) {
+            if rule.declaration.secret_group.is_some() || rule.declaration.value_group.is_some() {
+                continue;
+            }
+            let named = rule.regex.capture_names().flatten().count();
+            let unnamed = rule.regex.captures_len() - 1 - named;
+            assert!(
+                named == 0 || unnamed == 0,
+                "{} declares {named} named and {unnamed} unnamed groups without a secret_group",
+                rule.declaration.name
             );
         }
     }

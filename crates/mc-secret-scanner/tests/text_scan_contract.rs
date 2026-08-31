@@ -44,6 +44,13 @@ fn short_quoted_values_are_kept_and_scalars_are_rejected() {
         "password=null",
         "password=undefined",
         "password=-1.5e10",
+        "password=True",
+        "password=False",
+        "password=None",
+        "password=NULL",
+        "password=nil",
+        "password=NaN",
+        "password=~",
     ] {
         assert!(scanner.scan(input).unwrap().findings.is_empty(), "{input}");
     }
@@ -293,6 +300,107 @@ fn value_span_covers_the_secret_for_multi_group_rules() {
             finding.rule_id
         );
     }
+}
+
+/// A caller redacting `value_span` must delete the credential and nothing else.
+#[test]
+fn value_span_excludes_surrounding_command_text_for_alternation_rules() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let credential = "sk9Xq2Lm7Pv4Rt8Zw1Yc6Nb3Hd5Kf0Jg";
+    let input = format!(
+        "curl -X POST https://api.corp-internal.net/v1/things -H \"Authorization: Bearer {credential}\" "
+    );
+    let finding = scanner
+        .scan(&input)
+        .unwrap()
+        .findings
+        .into_iter()
+        .find(|finding| finding.rule_id == "curl-auth-header")
+        .expect("curl-auth-header did not match");
+    assert_eq!(
+        &input[finding.value_span.start()..finding.value_span.end()],
+        credential
+    );
+}
+
+/// `Indeterminate` does not reject, so an undecodable checksum must be `Invalid`.
+#[test]
+fn checksum_backed_rules_reject_undecodable_checksums() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let payload = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5";
+    for checksum in ["zzzzzz", "q7r8s9"] {
+        let report = scanner.scan(&format!("ghp_{payload}{checksum} ")).unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "github-pat"),
+            "github-pat accepted checksum {checksum}, which exceeds u32"
+        );
+    }
+}
+
+#[test]
+fn local_context_key_names_match_case_insensitively() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let value = "sk9Xq2Lm7Pv4Rt8Zw1Yc6Nb3Hd5Kf0Jg";
+    for key in ["api_key", "API_KEY", "ApiKey", "apiKey"] {
+        let report = scanner.scan(&format!("{key}: {value}")).unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "generic-api-key"),
+            "{key} produced no generic-api-key finding"
+        );
+    }
+}
+
+#[test]
+fn anchor_preselection_honours_the_work_budget() {
+    let scanner = Scanner::with_limits(
+        ScanProfile::Comprehensive,
+        ScanLimits {
+            max_work_bytes: 1,
+            ..ScanLimits::default()
+        },
+    )
+    .unwrap();
+    let input = "curl password token secret key auth bearer credential ".repeat(4000);
+    let report = scanner.scan(&input).unwrap();
+    assert_eq!(report.limits_hit, Some(LimitExhausted::Work));
+    assert!(
+        report.work_bytes <= input.len(),
+        "charged {} bytes against a 1-byte budget",
+        report.work_bytes
+    );
+    assert_eq!(report.candidates_evaluated, 0);
+    assert!(report.findings.is_empty());
+}
+
+#[test]
+fn a_truncated_report_is_not_a_prefix_of_a_complete_one() {
+    let input =
+        "password = sk9Xq2Lm7Pv4Rt8Zw1Yc6Nb3Hd5Kf0Jg\nlater AIzaSyA1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q end";
+    let complete = comprehensive_scanner().scan(input).unwrap();
+    let truncated = Scanner::with_limits(
+        ScanProfile::Comprehensive,
+        ScanLimits {
+            max_candidates: 1,
+            ..ScanLimits::default()
+        },
+    )
+    .unwrap()
+    .scan(input)
+    .unwrap();
+    assert_eq!(truncated.limits_hit, Some(LimitExhausted::Candidates));
+    assert_eq!(truncated.findings.len(), 1);
+    assert!(complete.findings.len() > 1);
+    assert_ne!(
+        truncated.findings[0].full_span.start(),
+        complete.findings[0].full_span.start(),
+        "the counter-example stopped reproducing; re-derive it before relaxing the contract"
+    );
 }
 
 #[test]

@@ -2,12 +2,15 @@ use std::collections::BTreeSet;
 
 use mc_secret_scanner::{ScanProfile, Scanner};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Deserialize)]
 struct Manifest {
     schema: String,
     status: String,
     authority_qualified: bool,
+    fixture: String,
+    fixture_sha256: String,
     fixture_cases: usize,
     planned_scan_quota: usize,
     cells: Vec<Cell>,
@@ -44,6 +47,17 @@ fn minimal_fixture_is_truthful_and_executable() {
         .cells
         .iter()
         .all(|cell| cell.feasibility == "unassessed" && cell.quota == 0));
+
+    let fixture_bytes = include_bytes!("fixtures/qualification-v1.jsonl");
+    assert_eq!(manifest.fixture, "qualification-v1.jsonl");
+    assert_eq!(
+        manifest.fixture_sha256,
+        Sha256::digest(fixture_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        "fixture bytes changed without updating fixture_sha256"
+    );
 
     let fixtures: Vec<Fixture> = include_str!("fixtures/qualification-v1.jsonl")
         .lines()
