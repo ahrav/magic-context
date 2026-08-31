@@ -219,11 +219,13 @@ impl Envelope<'_> {
             &replacement.object_id.text,
         )?;
         let outcome = replacement.outcome();
+        let mut redactions = replacement.text_fields();
+        redactions.push(("replaced_object_id".to_string(), replaced_object_id.clone()));
         self.changes.push(PendingChange {
             object: replacement.object_row(self.commit_seq),
             kind: "decision_correct",
             replaced_object_id: Some(replaced_object_id.text),
-            redactions: replacement.text_fields(),
+            redactions,
             audit: None,
         });
         Ok(outcome)
@@ -258,11 +260,13 @@ impl Envelope<'_> {
             &replacement.object_id.text,
         )?;
         let outcome = replacement.outcome();
+        let mut redactions = replacement.text_fields();
+        redactions.push(("replaced_object_id".to_string(), replaced_object_id.clone()));
         self.changes.push(PendingChange {
             object: replacement.object_row(self.commit_seq),
             kind: "observation_correct",
             replaced_object_id: Some(replaced_object_id.text),
-            redactions: replacement.text_fields(),
+            redactions,
             audit: None,
         });
         Ok(outcome)
