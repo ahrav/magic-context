@@ -1,4 +1,5 @@
 mod backup;
+mod cas;
 mod durable_fs;
 mod envelope;
 mod facts;
@@ -18,6 +19,12 @@ pub use backup::{
     verify_backup_with_deadline_for_test, RestoreFault,
 };
 pub use backup::{BackupManifest, BackupRequest};
+#[cfg(feature = "test-support")]
+pub use cas::ArtifactIngestFault;
+pub use cas::{
+    ArtifactDestination, ArtifactEligibility, ArtifactError, ArtifactErrorKind, ArtifactHandle,
+    ArtifactIngestRequest, EligibilityDeniedReason, ProviderEgress,
+};
 pub use envelope::{
     AlignmentProjectionSpec, CommitIntent, CommitReceipt, DomainSpec, Envelope, KnownAsOf,
     ObjectRow, RemediationTarget, RepositoryProvenance, Sensitivity, StagingCandidateRow,

@@ -110,6 +110,9 @@ pub struct KernelStore {
     // Distinct from mutex poisoning, which `PoisonError::into_inner` recovers: this
     // records that an unrecoverable restore left the family unusable.
     poisoned: AtomicBool,
+    pub(super) cas_failed: AtomicBool,
+    pub(super) artifact_cap: u64,
+    pub(super) artifacts_path: PathBuf,
     lease_epoch: u64,
     pub(super) db_path: PathBuf,
     _lease: Box<dyn LeaseHandle>,
@@ -128,17 +131,18 @@ impl KernelStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, KernelError> {
         let identity =
             probe_sqlite_engine_identity_off_path().map_err(|_| KernelError::EngineUnsupported)?;
-        Self::open_with_engine_identity(root, &identity)
+        Self::open_with_engine_identity_and_cap(root, &identity, super::cas::DEFAULT_ARTIFACT_CAP)
     }
 
-    fn open_with_engine_identity(
+    fn open_with_engine_identity_and_cap(
         root: impl AsRef<Path>,
         identity: &SqliteEngineIdentity,
+        artifact_cap: u64,
     ) -> Result<Self, KernelError> {
         if !evaluate_sqlite_runtime_gate(identity).is_empty() {
             return Err(KernelError::EngineUnsupported);
         }
-        Self::open_supported(root)
+        Self::open_supported(root, artifact_cap)
     }
 
     #[cfg(feature = "test-support")]
@@ -146,16 +150,27 @@ impl KernelStore {
         root: impl AsRef<Path>,
         identity: &SqliteEngineIdentity,
     ) -> Result<Self, KernelError> {
-        Self::open_with_engine_identity(root, identity)
+        Self::open_with_engine_identity_and_cap(root, identity, super::cas::DEFAULT_ARTIFACT_CAP)
     }
 
-    fn open_supported(root: impl AsRef<Path>) -> Result<Self, KernelError> {
+    #[cfg(feature = "test-support")]
+    pub fn open_with_artifact_cap_for_test(
+        root: impl AsRef<Path>,
+        artifact_cap: u64,
+    ) -> Result<Self, KernelError> {
+        let identity =
+            probe_sqlite_engine_identity_off_path().map_err(|_| KernelError::EngineUnsupported)?;
+        Self::open_with_engine_identity_and_cap(root, &identity, artifact_cap)
+    }
+
+    fn open_supported(root: impl AsRef<Path>, artifact_cap: u64) -> Result<Self, KernelError> {
         let root = prepare_root(root.as_ref())?;
         let db_path = root.join("core.sqlite");
         let lease_store = FileLeaseStore::new(root.join("leases"));
         let lease_key = LeaseKey::new("magic-context-kernel", "sqlite", "core");
         let lease = lease_store.acquire(&lease_key).map_err(map_lease_error)?;
         let lease_epoch = lease.epoch();
+        let artifacts_path = super::cas::prepare_layout(&root)?;
 
         if entry_exists(&restore_marker_path(&db_path))? {
             super::backup::resume_restore(&db_path)?;
@@ -203,6 +218,9 @@ impl KernelStore {
             readers,
             next_reader: AtomicUsize::new(0),
             poisoned: AtomicBool::new(false),
+            cas_failed: AtomicBool::new(false),
+            artifact_cap,
+            artifacts_path,
             lease_epoch,
             db_path,
             _lease: lease,

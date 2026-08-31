@@ -1,4 +1,4 @@
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -15,7 +15,7 @@ pub enum Sensitivity {
 }
 
 impl Sensitivity {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
             Self::Sensitive => "sensitive",
@@ -24,11 +24,19 @@ impl Sensitivity {
     }
 
     /// An unrecognized stored class resolves to `Secret`, the strictest handling.
-    fn from_stored(value: &str) -> Self {
+    pub(super) fn from_stored(value: &str) -> Self {
         match value {
             "normal" => Self::Normal,
             "sensitive" => Self::Sensitive,
             _ => Self::Secret,
+        }
+    }
+
+    pub(super) fn restrictive(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Secret, _) | (_, Self::Secret) => Self::Secret,
+            (Self::Sensitive, _) | (_, Self::Sensitive) => Self::Sensitive,
+            _ => Self::Normal,
         }
     }
 }
@@ -399,176 +407,14 @@ impl KernelStore {
         let intent = RedactedIntent::new(intent)?;
         let transaction_id = operation_identity(&intent);
         let mut writer = self.lock_writer()?;
-        let tx = writer
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sqlite)?;
-        check_fence(&tx, self.lease_epoch())?;
-
-        if let Some((digest, commit_seq, result)) = tx
-            .query_row(
-                "SELECT request_digest,commit_seq,result_payload FROM operation_receipts
-                 WHERE producer=?1 AND operation_key=?2",
-                params![intent.producer, intent.operation_key],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(map_sqlite)?
-        {
-            if digest != intent.request_digest {
-                return Err(KernelError::Conflict);
-            }
-            tx.commit().map_err(map_sqlite)?;
-            return Ok(CommitReceipt {
-                commit_seq,
-                result: String::from_utf8(result).map_err(|_| KernelError::Io)?,
-                replayed: true,
-            });
-        }
-
-        let recorded_at = current_time_ms();
-        tx.execute(
-            "INSERT INTO commit_log(
-                 transaction_id,writer_epoch,producer,operation_key,request_digest,
-                 recorded_at,actor,cause
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![
-                transaction_id,
-                i64::try_from(self.lease_epoch()).map_err(|_| KernelError::InvalidInput)?,
-                intent.producer,
-                intent.operation_key,
-                intent.request_digest,
-                recorded_at,
-                intent.actor.text,
-                intent.cause.text,
-            ],
+        commit_prepared_with_writer(
+            &mut writer,
+            self.lease_epoch(),
+            intent,
+            transaction_id,
+            operation,
+            after_events,
         )
-        .map_err(map_sqlite)?;
-        let commit_seq = tx.last_insert_rowid();
-        intent.record(&tx, &transaction_id, commit_seq)?;
-
-        let mut envelope = Envelope {
-            tx: &tx,
-            commit_seq,
-            changes: Vec::new(),
-            poisoned: None,
-        };
-        let result = operation(&mut envelope)?;
-        if let Some(error) = envelope.poisoned {
-            return Err(error);
-        }
-        let result = redact(&result);
-
-        let payloads = envelope
-            .changes
-            .iter()
-            .map(|change| {
-                serde_json::to_vec(&ChangePayload {
-                    change_kind: change.kind,
-                    object: &change.object,
-                    replaced_object_id: change.replaced_object_id.as_deref(),
-                    audit: change.audit.as_ref(),
-                })
-                .map_err(|_| KernelError::InvalidInput)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for (index, change) in envelope.changes.iter().enumerate() {
-            let ordinal = i64::try_from(index).map_err(|_| KernelError::InvalidInput)?;
-            let event_id = format!("{commit_seq}:{ordinal}");
-            tx.execute(
-                "INSERT INTO change_event(
-                     commit_seq,ordinal,object_id,change_kind,idempotency_key,payload
-                 ) VALUES (?1,?2,?3,?4,?5,?6)",
-                params![
-                    commit_seq,
-                    ordinal,
-                    change.object.object_id,
-                    change.kind,
-                    transaction_id,
-                    payloads[index],
-                ],
-            )
-            .map_err(map_sqlite)?;
-            for (name, field) in &change.redactions {
-                record(
-                    &tx,
-                    "change_event",
-                    &event_id,
-                    name,
-                    field,
-                    Some(commit_seq),
-                )?;
-            }
-        }
-        after_events()?;
-        for (index, change) in envelope.changes.iter().enumerate() {
-            let ordinal = i64::try_from(index).map_err(|_| KernelError::InvalidInput)?;
-            tx.execute(
-                "INSERT INTO outbox(
-                     commit_seq,ordinal,object_id,object_kind,source_kind,source_id,
-                     source_revision,sensitivity_class,payload,created_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![
-                    commit_seq,
-                    ordinal,
-                    change.object.object_id,
-                    change.object.object_kind,
-                    change.object.source_kind,
-                    change.object.source_id,
-                    change.object.source_revision,
-                    change.object.sensitivity.as_str(),
-                    payloads[index],
-                    recorded_at,
-                ],
-            )
-            .map_err(map_sqlite)?;
-            let outbox_position = tx.last_insert_rowid().to_string();
-            for (name, field) in &change.redactions {
-                record(
-                    &tx,
-                    "outbox",
-                    &outbox_position,
-                    name,
-                    field,
-                    Some(commit_seq),
-                )?;
-            }
-        }
-        tx.execute(
-            "INSERT INTO operation_receipts(
-                 receipt_id,producer,operation_key,request_digest,commit_seq,result_payload,created_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![
-                transaction_id,
-                intent.producer,
-                intent.operation_key,
-                intent.request_digest,
-                commit_seq,
-                result.text.as_bytes(),
-                recorded_at,
-            ],
-        )
-        .map_err(map_sqlite)?;
-        record(
-            &tx,
-            "operation_receipt",
-            &transaction_id,
-            "result_payload",
-            &result,
-            Some(commit_seq),
-        )?;
-        tx.commit().map_err(map_sqlite)?;
-        Ok(CommitReceipt {
-            commit_seq,
-            result: result.text,
-            replayed: false,
-        })
     }
 
     /// `invalidated_commit_seq` and `superseded_by` are `None` for every returned row; `object_history_as_of` reads those columns.
@@ -873,6 +719,206 @@ impl KernelStore {
         tx.commit().map_err(map_sqlite)?;
         Ok(removed)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_prepared_with_writer(
+    writer: &mut Connection,
+    lease_epoch: u64,
+    intent: RedactedIntent,
+    transaction_id: String,
+    operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
+    after_events: impl FnOnce() -> Result<(), KernelError>,
+) -> Result<CommitReceipt, KernelError> {
+    let tx = writer
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite)?;
+    check_fence(&tx, lease_epoch)?;
+
+    if let Some((digest, commit_seq, result)) = tx
+        .query_row(
+            "SELECT request_digest,commit_seq,result_payload FROM operation_receipts
+             WHERE producer=?1 AND operation_key=?2",
+            params![intent.producer, intent.operation_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_sqlite)?
+    {
+        if digest != intent.request_digest {
+            return Err(KernelError::Conflict);
+        }
+        tx.commit().map_err(map_sqlite)?;
+        return Ok(CommitReceipt {
+            commit_seq,
+            result: String::from_utf8(result).map_err(|_| KernelError::Io)?,
+            replayed: true,
+        });
+    }
+
+    let recorded_at = current_time_ms();
+    tx.execute(
+        "INSERT INTO commit_log(
+             transaction_id,writer_epoch,producer,operation_key,request_digest,
+             recorded_at,actor,cause
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            transaction_id,
+            i64::try_from(lease_epoch).map_err(|_| KernelError::InvalidInput)?,
+            intent.producer,
+            intent.operation_key,
+            intent.request_digest,
+            recorded_at,
+            intent.actor.text,
+            intent.cause.text,
+        ],
+    )
+    .map_err(map_sqlite)?;
+    let commit_seq = tx.last_insert_rowid();
+    intent.record(&tx, &transaction_id, commit_seq)?;
+
+    let mut envelope = Envelope {
+        tx: &tx,
+        commit_seq,
+        changes: Vec::new(),
+        poisoned: None,
+    };
+    let result = operation(&mut envelope)?;
+    if let Some(error) = envelope.poisoned {
+        return Err(error);
+    }
+    let result = redact(&result);
+
+    let payloads = envelope
+        .changes
+        .iter()
+        .map(|change| {
+            serde_json::to_vec(&ChangePayload {
+                change_kind: change.kind,
+                object: &change.object,
+                replaced_object_id: change.replaced_object_id.as_deref(),
+                audit: change.audit.as_ref(),
+            })
+            .map_err(|_| KernelError::InvalidInput)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (index, change) in envelope.changes.iter().enumerate() {
+        let ordinal = i64::try_from(index).map_err(|_| KernelError::InvalidInput)?;
+        let event_id = format!("{commit_seq}:{ordinal}");
+        tx.execute(
+            "INSERT INTO change_event(
+                 commit_seq,ordinal,object_id,change_kind,idempotency_key,payload
+             ) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                commit_seq,
+                ordinal,
+                change.object.object_id,
+                change.kind,
+                transaction_id,
+                payloads[index],
+            ],
+        )
+        .map_err(map_sqlite)?;
+        for (name, field) in &change.redactions {
+            record(
+                &tx,
+                "change_event",
+                &event_id,
+                name,
+                field,
+                Some(commit_seq),
+            )?;
+        }
+    }
+    after_events()?;
+    for (index, change) in envelope.changes.iter().enumerate() {
+        let ordinal = i64::try_from(index).map_err(|_| KernelError::InvalidInput)?;
+        tx.execute(
+            "INSERT INTO outbox(
+                 commit_seq,ordinal,object_id,object_kind,source_kind,source_id,
+                 source_revision,sensitivity_class,payload,created_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                commit_seq,
+                ordinal,
+                change.object.object_id,
+                change.object.object_kind,
+                change.object.source_kind,
+                change.object.source_id,
+                change.object.source_revision,
+                change.object.sensitivity.as_str(),
+                payloads[index],
+                recorded_at,
+            ],
+        )
+        .map_err(map_sqlite)?;
+        let outbox_position = tx.last_insert_rowid().to_string();
+        for (name, field) in &change.redactions {
+            record(
+                &tx,
+                "outbox",
+                &outbox_position,
+                name,
+                field,
+                Some(commit_seq),
+            )?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO operation_receipts(
+             receipt_id,producer,operation_key,request_digest,commit_seq,result_payload,created_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            transaction_id,
+            intent.producer,
+            intent.operation_key,
+            intent.request_digest,
+            commit_seq,
+            result.text.as_bytes(),
+            recorded_at,
+        ],
+    )
+    .map_err(map_sqlite)?;
+    record(
+        &tx,
+        "operation_receipt",
+        &transaction_id,
+        "result_payload",
+        &result,
+        Some(commit_seq),
+    )?;
+    tx.commit().map_err(map_sqlite)?;
+    Ok(CommitReceipt {
+        commit_seq,
+        result: result.text,
+        replayed: false,
+    })
+}
+
+pub(super) fn commit_with_writer(
+    writer: &mut Connection,
+    lease_epoch: u64,
+    intent: CommitIntent,
+    operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
+    after_events: impl FnOnce() -> Result<(), KernelError>,
+) -> Result<CommitReceipt, KernelError> {
+    let intent = RedactedIntent::new(intent)?;
+    let transaction_id = operation_identity(&intent);
+    commit_prepared_with_writer(
+        writer,
+        lease_epoch,
+        intent,
+        transaction_id,
+        operation,
+        after_events,
+    )
 }
 
 /// The watermark is stored apart from the rows, so an empty rebuild still orders later replacements.
