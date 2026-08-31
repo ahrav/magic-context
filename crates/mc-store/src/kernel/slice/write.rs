@@ -606,12 +606,16 @@ fn insert_observation(
         spec.evidence_id.as_ref(),
     )?;
     for dependency in &spec.dependencies {
-        require_live(
-            tx,
-            "object_registry",
-            "object_id",
-            &dependency.object_id.text,
-        )?;
+        if dependency.kind.text == "implements" {
+            require_live_decision_object(tx, &dependency.object_id.text)?;
+        } else {
+            require_live(
+                tx,
+                "object_registry",
+                "object_id",
+                &dependency.object_id.text,
+            )?;
+        }
     }
     insert_registry(tx, commit_seq, &spec.object_row(commit_seq))?;
     record_registry_fields(
@@ -700,6 +704,22 @@ fn require_optional_live(
         Some(value) => require_live(tx, table, column, &value.text),
         None => Ok(()),
     }
+}
+
+fn require_live_decision_object(tx: &Transaction<'_>, object_id: &str) -> Result<(), KernelError> {
+    tx.query_row(
+        "SELECT 1
+         FROM decisions d
+         JOIN object_registry r ON r.object_id=d.object_id
+         WHERE r.object_id=?1 AND r.object_kind='decision'
+           AND r.invalidated_commit_seq IS NULL
+           AND d.invalidated_commit_seq IS NULL",
+        [object_id],
+        |_| Ok(()),
+    )
+    .optional()
+    .map_err(|_| KernelError::Io)?
+    .ok_or(KernelError::NotFound)
 }
 
 fn require_live(
