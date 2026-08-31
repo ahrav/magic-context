@@ -8,6 +8,8 @@ mod outbox;
 mod redaction;
 mod retention;
 pub mod schema;
+mod scope;
+mod slice;
 
 #[cfg(feature = "test-support")]
 pub use backup::{
@@ -37,3 +39,9 @@ pub use facts::{ArtifactBudgetFacts, KernelFacts, MAIN_FILE_WARN_BYTES};
 pub use open::{KernelError, KernelErrorKind, KernelStore};
 pub use outbox::{ConsumerAbandonment, OutboxPruneResult};
 pub use retention::{StagingMaintenanceResult, StagingTerminalState};
+pub use scope::{ScopeSpec, ScopeTermSpec, ScopeWriteOutcome};
+pub use slice::{
+    DecisionEventOutcome, DecisionEventPayload, DecisionEventSpec, DecisionPayload, DecisionSpec,
+    DecisionWriteOutcome, ObservationDependencySpec, ObservationPayload, ObservationSpec,
+    ObservationWriteOutcome, RetirementOutcome,
+};
