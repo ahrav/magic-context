@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "45e40ff443b4f8ce2d8ac1178187fdb158f44315be7d4c9cee14694ecab201e2";
+    "b8ff2139f24383c705a4c2c42d4ee6313fbf74cf60fd7607c2a1e27b5b8f518b";
 
 /// The enclosing query must bind `o` to `object_registry`.
 /// Serving and approval validation must agree on which decision governs an
@@ -479,11 +479,35 @@ const APPROVAL_OBJECT_PREDICATE: &str = "o.object_kind='decision'
 ///
 /// A chain is human-authored accepted decisions, so real ones are short; the bound
 /// only stops a pathological graph from making validation unbounded.
+/// Accepted decision objects one lineage may hold before a candidate-scoped
+/// decision refuses to write rather than leave an unbounded cascade unproven.
+const MAX_LINEAGE_AUTHORITY_BEARERS: usize = 64;
+
 const MAX_AUTHORITY_CHAIN_DEPTH: usize = 64;
 
 /// Whether the object named by `?1` qualifies as a live approval in its own right.
 /// Used per chain member, so it takes the id from the enclosing row rather than a
 /// bound parameter.
+/// The enclosing query must bind `o` to `object_registry`.
+/// The latest decision about the object itself. An object serves only on
+/// standing it earned, so this is a requirement, not a contribution.
+fn latest_own_decision_sql(commit_bound: &str) -> String {
+    format!(
+        "(
+    SELECT a.admission_decision_id
+    FROM admission_decisions a
+    WHERE a.subject_object_id=o.object_id
+      AND a.source_kind=o.source_kind
+      AND a.source_id=o.source_id
+      AND a.source_revision=o.source_revision
+      AND a.commit_seq IS NOT NULL
+      {commit_bound}
+    ORDER BY a.commit_seq DESC,a.admission_decision_id DESC
+    LIMIT 1
+)"
+    )
+}
+
 /// The enclosing query must bind `o` to `object_registry`.
 /// The latest source-scoped decision for an object's lineage. A rejection here
 /// binds every object on the lineage, including one whose own later decision
@@ -505,10 +529,27 @@ fn latest_lineage_decision_sql(commit_bound: &str) -> String {
     )
 }
 
+/// The field set a decision must satisfy to carry approval authority, bound to
+/// one `admission_decisions` alias.
+fn approval_row_fields(alias: &str) -> String {
+    format!(
+        "{alias}.taint_class='user_explicit'
+   AND {alias}.source_class='explicit_user'
+   AND {alias}.maturity IN ('approved','enforced')
+   AND {alias}.effective_maturity IN ('approved','enforced')
+   AND {alias}.disposition='active'
+   AND {alias}.visibility='automatic'
+   AND {alias}.sensitivity_class='normal'
+   AND {alias}.policy_revision={POLICY_REVISION}"
+    )
+}
+
 /// The enclosing query must bind `o` to `object_registry`.
 /// An object earns standing only from a decision about itself. A lineage
-/// decision can restrict it or govern it, but never stand in for one it lacks.
-fn own_decision_exists_sql(commit_bound: &str) -> String {
+/// decision can restrict it, but never supply standing the object lacks, and a
+/// row that does not qualify on its own supplies none either.
+fn own_decision_qualifies_sql() -> String {
+    let fields = approval_row_fields("own");
     format!(
         "EXISTS (
     SELECT 1 FROM admission_decisions own
@@ -517,14 +558,15 @@ fn own_decision_exists_sql(commit_bound: &str) -> String {
       AND own.source_id=o.source_id
       AND own.source_revision=o.source_revision
       AND own.commit_seq IS NOT NULL
-      {commit_bound}
+      AND {fields}
 )"
     )
 }
 
 fn approval_qualifies_predicate(object_column: &str) -> String {
     let governing = governing_decision_for_object_sql("");
-    let own_decision = own_decision_exists_sql("");
+    let own_decision = own_decision_qualifies_sql();
+    let governing_fields = approval_row_fields("a");
     format!(
         "EXISTS(
              SELECT 1
@@ -532,15 +574,8 @@ fn approval_qualifies_predicate(object_column: &str) -> String {
              JOIN decisions d ON d.object_id=o.object_id
              JOIN admission_decisions a ON a.admission_decision_id={governing}
              WHERE o.object_id={object_column} AND {APPROVAL_OBJECT_PREDICATE}
-               AND a.taint_class='user_explicit'
-               AND a.source_class='explicit_user'
-               AND a.effective_maturity IN ('approved','enforced')
-               AND a.disposition='active'
-               AND a.visibility='automatic'
-               AND a.sensitivity_class='normal'
+               AND {governing_fields}
                AND o.sensitivity_class='normal'
-               AND a.maturity IN ('approved','enforced')
-               AND a.policy_revision={POLICY_REVISION}
                AND {own_decision}
          )"
     )
@@ -639,10 +674,14 @@ impl Envelope<'_> {
             return Err(KernelError::AdmissionPolicy);
         }
         let subject_object_id = request.subject_object_id.clone();
+        let candidate_id = request.candidate_id.clone();
         let reason = request.event.reason.clone();
-        self.with_authority_cascade(subject_object_id.as_deref(), &reason, |envelope| {
-            envelope.apply_admission(request)
-        })
+        self.with_authority_cascade(
+            subject_object_id.as_deref(),
+            candidate_id.as_deref(),
+            &reason,
+            |envelope| envelope.apply_admission(request),
+        )
     }
 
     /// Writes a decision and, when it costs the subject the authority it held,
@@ -651,15 +690,64 @@ impl Envelope<'_> {
     fn with_authority_cascade(
         &mut self,
         subject_object_id: Option<&str>,
+        candidate_id: Option<&str>,
         reason: &str,
         write: impl FnOnce(&mut Self) -> Result<AdmissionDecision, KernelError>,
     ) -> Result<AdmissionDecision, KernelError> {
-        let granted_before = self.subject_grants_authority(subject_object_id)?;
+        // A candidate-scoped decision names no subject, but authority is judged
+        // against the governing decision of a lineage, so writing one can unseat
+        // every accepted decision object that shares it.
+        let bearers = match (subject_object_id, candidate_id) {
+            (Some(subject), _) if self.subject_grants_authority(Some(subject))? => {
+                vec![subject.to_string()]
+            }
+            (Some(_), _) | (None, None) => Vec::new(),
+            (None, Some(candidate)) => self.lineage_authority_bearers(candidate)?,
+        };
         let decision = write(self)?;
-        if granted_before {
-            self.demote_dependents_if_authority_lost(subject_object_id, reason)?;
+        for bearer in &bearers {
+            self.demote_dependents_if_authority_lost(Some(bearer), reason)?;
         }
         Ok(decision)
+    }
+
+    /// Accepted decision objects on a candidate's lineage that hold authority now.
+    /// Collected before the write so the comparison after it is against what was
+    /// actually granted.
+    fn lineage_authority_bearers(&self, candidate_id: &str) -> Result<Vec<String>, KernelError> {
+        let facts = load_candidate_facts(self, candidate_id)?;
+        let mut statement = self
+            .tx
+            .prepare(&format!(
+                "SELECT o.object_id
+                 FROM object_registry o
+                 JOIN decisions d ON d.object_id=o.object_id
+                 WHERE o.source_kind=?1 AND o.source_id=?2 AND o.source_revision=?3
+                   AND {APPROVAL_OBJECT_PREDICATE}
+                 ORDER BY o.object_id
+                 LIMIT {limit}",
+                limit = MAX_LINEAGE_AUTHORITY_BEARERS + 1
+            ))
+            .map_err(map_sqlite)?;
+        let candidates = statement
+            .query_map(
+                params![facts.source_kind, facts.source_id, facts.source_revision],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_sqlite)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_sqlite)?;
+        if candidates.len() > MAX_LINEAGE_AUTHORITY_BEARERS {
+            return Err(KernelError::AdmissionPolicy);
+        }
+        drop(statement);
+        let mut bearers = Vec::new();
+        for object_id in candidates {
+            if self.subject_grants_authority(Some(&object_id))? {
+                bearers.push(object_id);
+            }
+        }
+        Ok(bearers)
     }
 
     /// Most subjects are not decision objects, and the chain walk cannot make one an
@@ -833,7 +921,7 @@ impl Envelope<'_> {
                 .kind = "replace";
         }
         let reason = prepared.event.reason.clone();
-        self.with_authority_cascade(Some(&replaced_object_id), &reason, |envelope| {
+        self.with_authority_cascade(Some(&replaced_object_id), None, &reason, |envelope| {
             envelope.write_admission(prepared, None)
         })
     }
@@ -1756,7 +1844,7 @@ fn validate_trigger(
 fn decided_row(
     row: &rusqlite::Row<'_>,
     prefix: &str,
-) -> rusqlite::Result<Option<(VisibilityRow, Sensitivity)>> {
+) -> rusqlite::Result<Option<(VisibilityRow, Sensitivity, bool)>> {
     let Some(revision) = row.get::<_, Option<i64>>(&*format!("{prefix}policy_revision"))? else {
         return Ok(None);
     };
@@ -1778,7 +1866,7 @@ fn decided_row(
             _ => false,
         };
     if !interpretable {
-        return Ok(Some((VisibilityRow::AuditOnly, Sensitivity::Secret)));
+        return Ok(Some((VisibilityRow::AuditOnly, Sensitivity::Secret, false)));
     }
     let floor = taint.map_or(Sensitivity::Secret, sensitivity_floor);
     let stored = row
@@ -1805,6 +1893,7 @@ fn decided_row(
     Ok(Some((
         served_visibility_row(stored, expected),
         sensitivity.max(floor),
+        true,
     )))
 }
 
@@ -1826,9 +1915,8 @@ impl KernelStore {
         surface: Surface,
         requested: i64,
     ) -> Result<VisibleAsOf, KernelError> {
-        let governing = governing_decision_for_object_sql("AND a.commit_seq<=:governing_as_of");
+        let own = latest_own_decision_sql("AND a.commit_seq<=:governing_as_of");
         let lineage = latest_lineage_decision_sql("AND a.commit_seq<=:governing_as_of");
-        let own_decision = own_decision_exists_sql("AND own.commit_seq<=:governing_as_of");
         let (tip, rows) = self.read_snapshot(requested, |tx| {
             let mut statement = tx
                 .prepare(&format!(
@@ -1848,13 +1936,12 @@ impl KernelStore {
                             s.sensitivity_class AS s_sensitivity_class
                      FROM object_registry o
                      JOIN admission_decisions d
-                       ON d.admission_decision_id={governing}
+                       ON d.admission_decision_id={own}
                      LEFT JOIN admission_decisions s
                        ON s.admission_decision_id={lineage}
                      WHERE o.created_commit_seq<=:governing_as_of
                        AND (o.invalidated_commit_seq IS NULL
                             OR :governing_as_of<o.invalidated_commit_seq)
-                       AND {own_decision}
                      ORDER BY o.object_id"
                 ))
                 .map_err(map_sqlite)?;
@@ -1863,11 +1950,21 @@ impl KernelStore {
                     rusqlite::named_params! { ":governing_as_of": requested },
                     |row| {
                         let mut object = object_row_from(row)?;
-                        let (mut visibility_row_value, mut sensitivity) = decided_row(row, "d_")?
-                            .unwrap_or((VisibilityRow::AuditOnly, Sensitivity::Secret));
-                        // A lineage restriction outlives a newer decision about one
-                        // object, so the served surface is the stricter of the two.
-                        if let Some((lineage_row, lineage_sensitivity)) = decided_row(row, "s_")? {
+                        let (mut visibility_row_value, mut sensitivity, interpretable) =
+                            decided_row(row, "d_")?.unwrap_or((
+                                VisibilityRow::AuditOnly,
+                                Sensitivity::Secret,
+                                false,
+                            ));
+                        if !interpretable {
+                            visibility_row_value = VisibilityRow::AuditOnly;
+                            sensitivity = Sensitivity::Secret;
+                        }
+                        // Neither scope may relax the other: a restriction on one
+                        // outlives a later permissive decision on the other, so the
+                        // served surface is the stricter of the two.
+                        if let Some((lineage_row, lineage_sensitivity, _)) = decided_row(row, "s_")?
+                        {
                             visibility_row_value = served_visibility_row(
                                 Some(visibility_row_value),
                                 Some(lineage_row),
