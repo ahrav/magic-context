@@ -107,6 +107,7 @@ function dependencies(
     behavior: (armId: ArmId) => RolloutObservation | Error = (armId) =>
         observation(armId),
     events: string[] = [],
+    disposeBehavior: (armId: ArmId) => Error | void = () => {},
 ): RunnerDependencies {
     return {
         now: () => 100,
@@ -124,6 +125,8 @@ function dependencies(
                 },
                 async dispose() {
                     events.push(`dispose:${coordinate.armId}`);
+                    const failure = disposeBehavior(coordinate.armId);
+                    if (failure instanceof Error) throw failure;
                 },
             };
         },
@@ -322,8 +325,124 @@ describe("paired-delta runner", () => {
         expect(result.exclusionCounts["mc-off"]?.["invalid-result"]).toBe(1);
     });
 
-    it("floors failure cost estimates at one full-context request", async () => {
-        const expensive = {
+    it("refuses a rollout whose harness would not dispose and re-runs it on resume", async () => {
+        const store = new MemoryStore();
+        const events: string[] = [];
+        const first = await runPairedDelta(
+            options(store),
+            dependencies(undefined, events, (armId) =>
+                armId === "mc-on" ? new Error("harness still running") : undefined),
+        );
+        const undisposed = first.records.find(({ armId }) => armId === "mc-on");
+
+        expect(undisposed?.cell).toMatchObject({
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+            checksTotal: 0,
+            criticalTotal: 0,
+            invalidSuccess: false,
+        });
+        expect(undisposed?.harnessDisposed).toBe(false);
+        expect(first.coordinates[0]?.incomplete).toBe(true);
+        // A rollout that may have contaminated the arm is not evidence, so the
+        // regret ladder never scores it.
+        expect(first.coordinates[0]?.regret).toBeNull();
+
+        const resumeEvents: string[] = [];
+        const resumed = await runPairedDelta(options(store), dependencies(undefined, resumeEvents));
+
+        expect(resumeEvents).toContain("create:mc-on");
+        expect(resumed.records.find(({ armId }) => armId === "mc-on")?.cell.runHealth)
+            .toBe("completed");
+        expect(store.records.filter(({ armId }) => armId === "mc-on")).toHaveLength(1);
+    });
+
+    it("classifies a non-finite or missing usage counter as malformed and prices it", async () => {
+        for (const usage of [
+            { input: Number.NaN, output: 10, cacheCreation: 20, cacheRead: 30 },
+            { input: Number.POSITIVE_INFINITY, output: 10, cacheCreation: 20, cacheRead: 30 },
+            { input: 100, output: 10, cacheCreation: 20 } as unknown as RolloutObservation["usage"],
+            { input: -1, output: 10, cacheCreation: 20, cacheRead: 30 },
+        ]) {
+            const result = await runPairedDelta(
+                options(),
+                dependencies((armId) => {
+                    const value = observation(armId);
+                    if (armId === "mc-off") value.usage = usage;
+                    return value;
+                }),
+            );
+            const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+            expect(malformed?.cell).toMatchObject({
+                runHealth: "malformed",
+                reasonCode: "invalid-result",
+            });
+            expect(malformed?.usage).toEqual({
+                input: 0,
+                output: 0,
+                cacheCreation: 0,
+                cacheRead: 0,
+            });
+            expect(malformed?.costSource).toBe("estimated");
+            expect(Number.isFinite(malformed?.costUsd)).toBe(true);
+            // One NaN cost would make every later cap comparison false.
+            expect(Number.isFinite(result.spentUsd)).toBe(true);
+            expect(result.exclusionCounts["mc-off"]?.["invalid-result"]).toBe(1);
+        }
+    });
+
+    it("applies the cost cap to the first rollout after a resume restores spend", async () => {
+        const store = new MemoryStore();
+        const first = await runPairedDelta(options(store), dependencies());
+        const restored = store.records.filter(({ cell }) => cell.runHealth === "completed");
+
+        expect(restored.length).toBeGreaterThan(0);
+        expect(first.records).toHaveLength(3);
+
+        // Drop one coordinate so the resumed run still has an arm to execute.
+        store.records.splice(store.records.findIndex(({ armId }) => armId === "compaction"), 1);
+        const spentBefore = store.records.reduce((sum, { costUsd }) => sum + costUsd, 0);
+        const events: string[] = [];
+        const resumed = await runPairedDelta(
+            { ...options(store), maxCostUsd: spentBefore },
+            dependencies(undefined, events),
+        );
+
+        expect(resumed.status).toBe("cost-cap-reached");
+        expect(events).not.toContain("create:compaction");
+        expect(resumed.spentUsd).toBeCloseTo(spentBefore, 12);
+    });
+
+    it("charges a retried coordinate once across a resume", async () => {
+        const store = new MemoryStore();
+        await runPairedDelta(
+            options(store),
+            dependencies((armId) =>
+                armId === "mc-off" ? new Error("first attempt failed") : observation(armId)),
+        );
+        const failedEstimate = store.records.find(({ armId }) => armId === "mc-off")?.costUsd;
+        if (failedEstimate === undefined) throw new Error("missing failed record");
+
+        const resumed = await runPairedDelta(options(store), dependencies());
+        const observedCost = resumed.records.find(({ armId }) => armId === "mc-off")?.costUsd;
+
+        expect(resumed.observedCostRollouts + resumed.estimatedCostRollouts)
+            .toBe(resumed.records.length);
+        expect(resumed.spentUsd).toBeCloseTo(
+            resumed.records.reduce((sum, { costUsd }) => sum + costUsd, 0),
+            12,
+        );
+        // The retry's own cost replaces the estimate rather than stacking on it,
+        // while the estimate stays a reserve floor.
+        expect(resumed.spentUsd).toBeLessThan(
+            resumed.records.reduce((sum, { costUsd }) => sum + costUsd, 0) + failedEstimate,
+        );
+        expect(observedCost).toBeLessThan(failedEstimate);
+        expect(resumed.reserveUsd).toBeGreaterThanOrEqual(failedEstimate);
+    });
+
+    it("floors failure cost estimates at one full-context request", async () => {        const expensive = {
             ...options(),
             pricesPerMillionTokens: {
                 input: 100,

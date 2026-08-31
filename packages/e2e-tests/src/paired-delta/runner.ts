@@ -307,6 +307,31 @@ export function interventionFor(
     }
 }
 
+/** A stored record binds to the run's commit and pinned model, and a completed one also echoes them back; anything else is re-run rather than rehydrated. Pre-scan accounting and rehydration share this test so a record cannot be charged as resumed and then executed again. commentlint: allow(JUDGE) */
+function bindingMatches(record: RolloutRecord, options: RunPairedDeltaOptions): boolean {
+    return record.repoCommit === options.repoCommit &&
+        record.pinnedProviderId === options.pinnedProviderId &&
+        record.pinnedSnapshotId === options.pinnedSnapshotId;
+}
+
+function completedIdentityMatches(
+    record: RolloutRecord,
+    options: RunPairedDeltaOptions,
+): boolean {
+    return record.cell.runHealth !== "completed" ||
+        (
+            record.echoedProviderId === options.pinnedProviderId &&
+            record.echoedModelId === options.pinnedSnapshotId
+        );
+}
+
+function isResumable(record: RolloutRecord, options: RunPairedDeltaOptions): boolean {
+    return options.resume &&
+        record.cell.runHealth === "completed" &&
+        bindingMatches(record, options) &&
+        completedIdentityMatches(record, options);
+}
+
 export async function runPairedDelta(
     options: RunPairedDeltaOptions,
     dependencies: RunnerDependencies,
@@ -347,24 +372,17 @@ export async function runPairedDelta(
     }
 
     for (const record of stored) {
-        if (
-            inMatrix(record) &&
-            record.repoCommit === options.repoCommit &&
-            record.pinnedProviderId === options.pinnedProviderId &&
-            record.pinnedSnapshotId === options.pinnedSnapshotId &&
-            (
-                record.cell.runHealth !== "completed" ||
-                (
-                    record.echoedProviderId === options.pinnedProviderId &&
-                    record.echoedModelId === options.pinnedSnapshotId
-                )
-            )
-        ) {
-            spentUsd += record.costUsd;
-            reserveUsd = Math.max(reserveUsd, record.costUsd);
-            if (record.costSource === "observed") observedCostRollouts++;
-            else estimatedCostRollouts++;
-        }
+        /** A record from another commit or pinned model priced a different build, so it informs neither this run's reserve nor its spend. commentlint: allow(JUDGE) */
+        if (!inMatrix(record) || !bindingMatches(record, options)) continue;
+        /** A failed attempt on this same binding was priced by `failedRecord` at the scenario's worst case, so its cost is a valid reserve floor even though the retry replaces it. commentlint: allow(JUDGE) */
+        reserveUsd = Math.max(reserveUsd, record.costUsd);
+        /** A record that will be re-run has its cost replaced by the retry, so charging it here would count one coordinate twice and push `observedCostRollouts + estimatedCostRollouts` past `records.length`. commentlint: allow(JUDGE) */
+        if (!isResumable(record, options)) continue;
+        spentUsd += record.costUsd;
+        if (record.costSource === "observed") observedCostRollouts++;
+        else estimatedCostRollouts++;
+        /** Restored spend is billed spend, so the next rollout meets the cost cap instead of being admitted as this run's first. commentlint: allow(JUDGE) */
+        startedAny = true;
     }
 
     outer:
@@ -387,24 +405,17 @@ export async function runPairedDelta(
                 };
                 const existing = storedByCoordinate.get(coordinateKey(coordinate));
                 if (existing) {
-                    const bindingMatches =
-                        existing.repoCommit === options.repoCommit &&
-                        existing.pinnedProviderId === options.pinnedProviderId &&
-                        existing.pinnedSnapshotId === options.pinnedSnapshotId;
-                    const completedIdentityMatches =
-                        existing.cell.runHealth !== "completed" ||
-                        (
-                            existing.echoedProviderId === options.pinnedProviderId &&
-                            existing.echoedModelId === options.pinnedSnapshotId
-                        );
-                    if (!bindingMatches || !completedIdentityMatches) {
+                    if (
+                        !bindingMatches(existing, options) ||
+                        !completedIdentityMatches(existing, options)
+                    ) {
                         invalidStoredCoordinates.push(coordinate);
                         return null;
                     }
                     // Completed records are immutable evidence; re-executing
                     // one would pay for a rollout whose result the store must
                     // then discard.
-                    if (existing.cell.runHealth === "completed") {
+                    if (isResumable(existing, options)) {
                         resumedRollouts++;
                         records.push(existing);
                         coordinateResult.cells[armId] = existing;
@@ -462,6 +473,7 @@ export async function runPairedDelta(
                         intervention,
                         wallClockMs,
                         disposed,
+                        reserveUsd,
                     )
                     : failedRecord(
                         options,
@@ -549,6 +561,7 @@ function completedRecord(
     expectedIntervention: InterventionDescriptor,
     wallClockMs: number,
     harnessDisposed: boolean,
+    reserveUsd: number,
 ): RolloutRecord {
     const identityMatches =
         observation.echoedProviderId === options.pinnedProviderId &&
@@ -557,18 +570,26 @@ function completedRecord(
         observation.baseScriptFingerprint === expectedFingerprint &&
         canonicalFingerprint(observation.intervention) ===
             canonicalFingerprint(expectedIntervention);
-    let reasonCode: ReasonCode | null = !observation.absencePreconditionHeld
-        ? "absence-precondition-unmet"
-        : !observation.armIdentityMatches || !identityMatches
-            ? "arm-identity-mismatch"
-            : !declarationMatches
-                ? "invalid-result"
-                : null;
+    const usage = finiteUsage(observation.usage);
+    /** A harness that would not dispose may still be running and contaminating later arms, so its result cannot stand as evidence however well the rollout itself went. Non-finite usage is checked next because a cost derived from it would poison `spentUsd` for every later cap comparison. commentlint: allow(JUDGE) */
+    let reasonCode: ReasonCode | null = !harnessDisposed
+        ? "harness-failure"
+        : usage === null
+            ? "invalid-result"
+            : !observation.absencePreconditionHeld
+                ? "absence-precondition-unmet"
+                : !observation.armIdentityMatches || !identityMatches
+                    ? "arm-identity-mismatch"
+                    : !declarationMatches
+                        ? "invalid-result"
+                        : null;
     let runHealth: RunHealth = reasonCode === null
         ? "completed"
-        : reasonCode === "invalid-result"
-            ? "malformed"
-            : "unavailable";
+        : reasonCode === "harness-failure"
+            ? "crash"
+            : reasonCode === "invalid-result"
+                ? "malformed"
+                : "unavailable";
     let checks: CheckResult[] = [];
     if (runHealth === "completed") {
         try {
@@ -585,7 +606,6 @@ function completedRecord(
     const criticalPassed = checks.filter(
         ({ id, passed }) => passed && applicableCritical.has(id),
     ).length;
-    const usage = normalizeUsage(observation.usage);
     return {
         schema: ROLLOUT_RECORD_SCHEMA,
         ...coordinate,
@@ -610,9 +630,12 @@ function completedRecord(
             reasonCode,
         },
         checks,
-        usage,
-        costUsd: tokenCostUsd(usage, options.pricesPerMillionTokens),
-        costSource: "observed",
+        usage: usage ?? ZERO_USAGE,
+        /** Usage the provider never reported cannot be priced, so an unusable counter falls back to the same worst-case reserve a crashed rollout is charged. commentlint: allow(JUDGE) */
+        costUsd: usage === null
+            ? Math.max(reserveUsd, worstCaseUsd(scenario, options.pricesPerMillionTokens))
+            : tokenCostUsd(usage, options.pricesPerMillionTokens),
+        costSource: usage === null ? "estimated" : "observed",
         wallClockMs,
         turns: observation.turns,
         harnessDisposed,
@@ -632,15 +655,7 @@ function failedRecord(
 ): RolloutRecord {
     const providerUnavailable = failure instanceof ProviderUnavailableError;
     const deadlineExceeded = failure instanceof RolloutDeadlineError;
-    const worstCaseUsd = tokenCostUsd(
-        {
-            input: scenario.modelContextLimit,
-            output: scenario.modelContextLimit,
-            cacheCreation: 0,
-            cacheRead: 0,
-        },
-        options.pricesPerMillionTokens,
-    );
+    const worstCase = worstCaseUsd(scenario, options.pricesPerMillionTokens);
     return {
         schema: ROLLOUT_RECORD_SCHEMA,
         ...coordinate,
@@ -670,8 +685,8 @@ function failedRecord(
                     : "harness-failure",
         },
         checks: [],
-        usage: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
-        costUsd: providerUnavailable ? reserveUsd : Math.max(reserveUsd, worstCaseUsd),
+        usage: ZERO_USAGE,
+        costUsd: providerUnavailable ? reserveUsd : Math.max(reserveUsd, worstCase),
         costSource: "estimated",
         wallClockMs,
         turns: 0,
@@ -714,10 +729,33 @@ export function computeRegretRungs(
     };
 }
 
-function normalizeUsage(usage: TokenUsage): TokenUsage {
-    return Object.fromEntries(
-        Object.entries(usage).map(([key, value]) => [key, Math.max(0, value)]),
-    ) as unknown as TokenUsage;
+const ZERO_USAGE: TokenUsage = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
+
+/** An observation crosses a process boundary, so its counters are untrusted: a missing field or a `NaN` makes `tokenCostUsd` return `NaN`, which turns `spentUsd` into `NaN` and makes every later cost-cap comparison false. JSON also serializes a non-finite number as `null`, so the corruption would survive into the next resume. commentlint: allow(JUDGE) */
+function finiteUsage(usage: TokenUsage): TokenUsage | null {
+    const counters = [usage?.input, usage?.output, usage?.cacheCreation, usage?.cacheRead];
+    if (counters.some((value) => typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
+        return null;
+    }
+    return {
+        input: usage.input,
+        output: usage.output,
+        cacheCreation: usage.cacheCreation,
+        cacheRead: usage.cacheRead,
+    };
+}
+
+/** Prices a rollout whose real usage is unknown at the scenario's context limit in and out. commentlint: allow(JUDGE) */
+function worstCaseUsd(scenario: ScenarioDeclaration, prices: TokenPrices): number {
+    return tokenCostUsd(
+        {
+            input: scenario.modelContextLimit,
+            output: scenario.modelContextLimit,
+            cacheCreation: 0,
+            cacheRead: 0,
+        },
+        prices,
+    );
 }
 
 function incrementExclusion(
