@@ -667,7 +667,9 @@ impl KernelStore {
         spec: StagingCandidateSpec,
     ) -> Result<StagingCandidateRow, KernelError> {
         let spec = RedactedCandidate::new(spec)?;
-        let sensitivity = if spec.provenance.is_some() {
+        let sensitivity = if spec.has_detections() {
+            Sensitivity::Secret
+        } else if spec.provenance.is_some() {
             Sensitivity::Normal
         } else {
             Sensitivity::Sensitive
@@ -1033,6 +1035,20 @@ impl RedactedCandidate {
             recorded_at: spec.recorded_at,
             lease_expires_at: spec.lease_expires_at,
         })
+    }
+
+    fn has_detections(&self) -> bool {
+        [
+            &self.extraction_run_id,
+            &self.candidate_id,
+            &self.extractor,
+            &self.source_kind,
+            &self.source_id,
+            &self.candidate_kind,
+            &self.payload,
+        ]
+        .into_iter()
+        .any(|field| !field.detections.is_empty())
     }
 
     fn provenance_json(&self) -> Result<Vec<u8>, KernelError> {

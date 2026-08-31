@@ -955,3 +955,56 @@ fn detection_dense_payload_is_rejected_before_staging() {
     assert_eq!(published_objects(root.path()), Vec::<String>::new());
     assert_eq!(reservation_count(root.path()), 0);
 }
+
+#[test]
+fn fifo_at_the_digest_destination_does_not_block_ingest() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"fifo bait".to_vec();
+    let digest = format!("{:x}", Sha256::digest(&payload));
+
+    let shard = root.path().join("artifacts/objects").join(&digest[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    fs::set_permissions(&shard, fs::Permissions::from_mode(0o700)).unwrap();
+    let fifo = shard.join(&digest[2..]);
+    let made = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo failed");
+
+    let error = store.ingest_artifact(request("fifo", payload)).unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::MissingObject);
+    assert_eq!(reservation_count(root.path()), 0);
+    assert_eq!(staged_entries(root.path()), 0);
+}
+
+#[test]
+fn symlinked_directory_under_objects_is_not_followed_when_totaling_usage() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let first = store
+        .ingest_artifact(request("usage-base", b"usage base".to_vec()))
+        .unwrap();
+
+    let objects = root.path().join("artifacts/objects");
+    std::os::unix::fs::symlink(&objects, objects.join("zz")).unwrap();
+    let outside = root.path().join("outside-bulk");
+    fs::write(&outside, vec![b'q'; 4096]).unwrap();
+    std::os::unix::fs::symlink(&outside, objects.join("zy")).unwrap();
+
+    let second = store
+        .ingest_artifact(request("usage-after", b"usage after".to_vec()))
+        .unwrap();
+
+    assert_ne!(first.digest, second.digest);
+    assert_eq!(
+        store.read_artifact(&second).unwrap(),
+        b"usage after".to_vec()
+    );
+}
