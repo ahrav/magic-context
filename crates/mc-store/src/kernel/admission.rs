@@ -3,7 +3,7 @@ use super::{KernelError, Sensitivity};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "e13f10ddbe6a243a5e6424c66933122dfa0d6664c3023ad7d3f89bd33b4030a6";
+    "80b81b2481ca58d9c45e910d38fe6eb8424b1bac973bee1d80616e186aa85a3c";
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -189,6 +189,9 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
     }) {
         return Err(KernelError::AdmissionPolicy);
     }
+    if input.event == EventKind::Enforce && !input.has_evidence {
+        return Err(KernelError::AdmissionPolicy);
+    }
 
     let current = input
         .prior
@@ -208,7 +211,8 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         disposition_restrictiveness(requested) < disposition_restrictiveness(current_disposition)
     });
     let requires_approval = (raises_support
-        && (!auto_admit_event(input.event) || requested.rank() > ceiling.rank()))
+        && (!auto_admit_event(input.event)
+            || requested.rank() > admission_ceiling(input.event, ceiling).rank()))
         || relaxes_disposition;
     let denied = requires_approval && !input.approval_valid;
     let disposition = match requested_disposition {
@@ -251,11 +255,6 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
             .then_some(prior.outcome)
     });
     let no_op = unchanged_outcome.is_some();
-
-    // An enforcement that establishes new state must carry evidence.
-    if input.event == EventKind::Enforce && !input.has_evidence && !no_op {
-        return Err(KernelError::AdmissionPolicy);
-    }
 
     let outcome = if let Some(prior_outcome) = unchanged_outcome {
         prior_outcome
@@ -412,6 +411,17 @@ const fn automatic_ceiling(source: SourceClass, taint: TaintClass) -> Maturity {
             | TaintClass::Unclassifiable,
         ) => Maturity::Candidate,
         _ => Maturity::Candidate,
+    }
+}
+
+/// An accepted ADR with verified-or-higher automatic maturity reaches `Approved`
+/// without a separate approval object.
+const fn admission_ceiling(event: EventKind, automatic: Maturity) -> Maturity {
+    match event {
+        EventKind::AcceptedAdr if automatic.rank() >= Maturity::Verified.rank() => {
+            Maturity::Approved
+        }
+        _ => automatic,
     }
 }
 
@@ -584,13 +594,49 @@ mod tests {
                 has_evidence: true,
             });
             let result = result.unwrap();
-            let admitted = matches!(event, EventKind::CodeObserved | EventKind::ConfigObserved);
+            let admitted = matches!(
+                event,
+                EventKind::CodeObserved | EventKind::ConfigObserved | EventKind::AcceptedAdr
+            );
             assert_eq!(
                 result.historical_maturity.rank() > Maturity::Candidate.rank(),
                 admitted,
                 "{event:?}"
             );
         }
+    }
+
+    #[test]
+    fn accepted_adr_admits_deterministic_sources_without_a_separate_approval() {
+        let deterministic = evaluate_admission(EvaluationInputs {
+            source_class: SourceClass::TrustedLocalCode,
+            taint_class: TaintClass::CurrentCode,
+            prior: None,
+            candidate_sensitivity: Sensitivity::Normal,
+            predecessor_sensitivity: None,
+            approval_valid: false,
+            event: EventKind::AcceptedAdr,
+            has_evidence: true,
+        })
+        .unwrap();
+        assert_eq!(deterministic.historical_maturity, Maturity::Approved);
+        assert_eq!(deterministic.effective_maturity.get(), Maturity::Approved);
+        assert_eq!(deterministic.outcome, Outcome::Admit);
+
+        // A source held to `Candidate` still requires an approval object.
+        let inferred = evaluate_admission(EvaluationInputs {
+            source_class: SourceClass::ModelInference,
+            taint_class: TaintClass::AssistantInference,
+            prior: None,
+            candidate_sensitivity: Sensitivity::Normal,
+            predecessor_sensitivity: None,
+            approval_valid: false,
+            event: EventKind::AcceptedAdr,
+            has_evidence: true,
+        })
+        .unwrap();
+        assert_eq!(inferred.historical_maturity, Maturity::Candidate);
+        assert_eq!(inferred.outcome, Outcome::Deny);
     }
 
     #[test]
@@ -953,26 +999,35 @@ mod tests {
             );
         }
 
-        let replay = evaluate_admission(EvaluationInputs {
+        let enforced = PriorDecision {
+            historical_maturity: Maturity::Enforced,
+            effective_maturity: Maturity::Enforced,
+            disposition: Disposition::Active,
+            outcome: Outcome::Promote,
             source_class: SourceClass::TrustedLocalCode,
             taint_class: TaintClass::CurrentCode,
-            prior: Some(PriorDecision {
-                historical_maturity: Maturity::Enforced,
-                effective_maturity: Maturity::Enforced,
-                disposition: Disposition::Active,
-                outcome: Outcome::Promote,
-                source_class: SourceClass::TrustedLocalCode,
-                taint_class: TaintClass::CurrentCode,
-                sensitivity: Sensitivity::Normal,
-            }),
+            sensitivity: Sensitivity::Normal,
+        };
+        let replay = EvaluationInputs {
+            source_class: SourceClass::TrustedLocalCode,
+            taint_class: TaintClass::CurrentCode,
+            prior: Some(enforced),
             candidate_sensitivity: Sensitivity::Normal,
             predecessor_sensitivity: None,
             approval_valid: true,
             event: EventKind::Enforce,
-            has_evidence: false,
-        })
-        .unwrap();
-        assert!(replay.no_op);
+            has_evidence: true,
+        };
+        assert!(evaluate_admission(replay).unwrap().no_op);
+
+        // An already-enforced record whose artifact is gone must not replay as a no-op.
+        assert_eq!(
+            evaluate_admission(EvaluationInputs {
+                has_evidence: false,
+                ..replay
+            }),
+            Err(KernelError::AdmissionPolicy)
+        );
     }
 
     #[test]
@@ -1011,7 +1066,8 @@ mod tests {
                 .map(|(section, _)| section)
                 .unwrap()
         }
-        let source = include_str!("admission.rs");
+        let source = include_str!("admission.rs").replace("\r\n", "\n");
+        let source = source.as_str();
         let mut policy = [
             Maturity::ALL
                 .iter()
