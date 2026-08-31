@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "test-support")]
 use super::ArtifactIngestFault;
 use super::{
-    ArtifactError, ArtifactErrorKind, ArtifactHandle, ArtifactIngestRequest, ProviderEgress,
-    MAX_PAYLOAD_BYTES,
+    is_artifact_digest, ArtifactError, ArtifactErrorKind, ArtifactHandle, ArtifactIngestRequest,
+    ProviderEgress, MAX_PAYLOAD_BYTES,
 };
 use crate::current_time_ms;
 use crate::kernel::durable_fs::{
@@ -57,6 +57,9 @@ impl PreparedArtifact {
     fn new(mut request: ArtifactIngestRequest) -> Result<Self, ArtifactError> {
         if request.payload.len() > MAX_PAYLOAD_BYTES {
             return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
+        }
+        if !is_artifact_digest(&request.intent.request_digest) {
+            return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
         if request.evidence_id.trim().is_empty()
             || request.object_id.trim().is_empty()

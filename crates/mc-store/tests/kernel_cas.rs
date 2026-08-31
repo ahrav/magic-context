@@ -690,3 +690,19 @@ fn invalidated_classification_still_restricts_re_admission_of_identical_bytes() 
         ArtifactEligibility::Denied(EligibilityDeniedReason::Secret)
     );
 }
+
+#[test]
+fn malformed_intent_digest_is_rejected_before_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    let mut malformed = request("malformed-intent", b"payload".to_vec());
+    malformed.intent.request_digest = "not-a-digest".to_string();
+    let error = store.ingest_artifact(malformed).unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::InvalidInput);
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
+}
