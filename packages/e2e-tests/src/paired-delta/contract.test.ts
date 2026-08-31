@@ -26,11 +26,12 @@ function scenario(overrides: Partial<ScenarioDeclaration> = {}): ScenarioDeclara
         criticalCheckIds: ["check-shared"],
         turnScript: [
             { id: "turn-evidence", role: "user", content: "Remember ID alpha-17." },
+            { id: "turn-burial", role: "user", content: "Continue after the ballast." },
             { id: "turn-probe", role: "user", content: "Write the remembered ID." },
         ],
         interventions: {
             r1: {
-                insertAfterTurnId: "turn-evidence",
+                insertAfterTurnId: "turn-burial",
                 query: "mem-alpha",
                 locatorIds: ["mem-alpha"],
             },
@@ -110,6 +111,59 @@ describe("paired-delta scenario contract", () => {
                 },
             })),
         ).toThrow(/r1\.locatorIds: empty/);
+    });
+
+    it("rejects an R1 query that leaks the expected answer in any casing", () => {
+        const base = scenario();
+        for (const query of ["find alpha-17 now", "find ALPHA-17 now"]) {
+            expect(() =>
+                parseScenarioDeclaration(scenario({
+                    interventions: { ...base.interventions, r1: { ...base.interventions.r1, query } },
+                })),
+            ).toThrow(/r1\.query: contains-answer/);
+        }
+    });
+
+    it("requires the evidence turn to precede the R1 insertion point", () => {
+        const base = scenario();
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r1: { ...base.interventions.r1, insertAfterTurnId: "turn-evidence" },
+                },
+                absencePrecondition: {
+                    ...base.absencePrecondition,
+                    evidenceTurnId: "turn-probe",
+                },
+            })),
+        ).toThrow(/evidenceTurnId: not-before-r1-insertion/);
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r1: { ...base.interventions.r1, insertAfterTurnId: "turn-evidence" },
+                },
+            })),
+        ).toThrow(/evidenceTurnId: not-before-r1-insertion/);
+    });
+
+    it("rejects duplicate R2 gold claims", () => {
+        const base = scenario();
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r1: { ...base.interventions.r1, locatorIds: ["mem-alpha", "mem-beta"] },
+                    r2: {
+                        memories: [
+                            { claim: "The ID is alpha-17.", evidence: "First sighting." },
+                            { claim: "The ID is alpha-17.", evidence: "Second sighting." },
+                        ],
+                    },
+                },
+            })),
+        ).toThrow(/r2\.memories: duplicate/);
     });
 
     it("requires one declared gold memory per R1 locator handle", () => {

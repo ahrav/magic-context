@@ -245,8 +245,8 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     p.exact(r1, ["insertAfterTurnId", "query", "locatorIds"], "scenario.interventions.r1");
     const expectedAnswer = p.string(root.expectedAnswer, "scenario.expectedAnswer");
     const r1Query = p.string(r1.query, "scenario.interventions.r1.query");
-    /** `scriptedCtxSearchTurn` interpolates the query into the model-visible prompt, so a query containing the expected answer lets R1 pass its critical check with no retrieval. commentlint: allow(JUDGE) */
-    if (r1Query.includes(expectedAnswer)) {
+    /** `scriptedCtxSearchTurn` interpolates the query into the model-visible prompt, so a query containing the expected answer lets R1 pass its critical check with no retrieval. Case-folded because a model reads `sqlite` and `SQLite` as the same token. commentlint: allow(JUDGE) */
+    if (r1Query.toLowerCase().includes(expectedAnswer.toLowerCase())) {
         p.fail("scenario.interventions.r1.query: contains-answer");
     }
     const insertAfterTurnId = p.staticId(
@@ -283,6 +283,8 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     if (memories.length === 0) {
         p.fail("scenario.interventions.r2.memories: empty");
     }
+    /** The seeder resolves rows with identical normalized content onto one claim and attaches the rest as extra provenance, so repeated claims collapse to a single `publicClaimId`: R1 would satisfy several handles from one delivered row while R2 exercised fewer gold memories than declared. Exact duplicates only — the seeder's normalization is not reproduced here. commentlint: allow(JUDGE) */
+    p.unique(memories.map(({ claim }) => claim), "scenario.interventions.r2.memories");
     const r3 = p.record(interventions.r3, "scenario.interventions.r3");
     /** `r2.memories` is the declaration's only gold, so it is also what a runner seeds and resolves `r1.locatorIds` against. Unequal lengths leave a handle with no `publicClaimId` to map to and make R1 and R2 compare different gold sets; pairing is positional. commentlint: allow(JUDGE) */
     if (locatorIds.length !== memories.length) {
@@ -303,6 +305,13 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     );
     if (!turnIds.has(evidenceTurnId)) {
         p.fail("scenario.absencePrecondition.evidenceTurnId: unknown-turn");
+    }
+    /** Ballast can only bury evidence that already entered the transcript. Evidence supplied at or after the R1 insertion point stays directly available to the probe in every arm, so the baseline answers without retrieval and the absence comparison the lane exists to measure collapses. commentlint: allow(JUDGE) */
+    if (
+        turnScript.findIndex(({ id }) => id === evidenceTurnId) >=
+            turnScript.findIndex(({ id }) => id === insertAfterTurnId)
+    ) {
+        p.fail("scenario.absencePrecondition.evidenceTurnId: not-before-r1-insertion");
     }
     const minimumBallastBytes = p.integer(
         absence.minimumBallastBytes,
