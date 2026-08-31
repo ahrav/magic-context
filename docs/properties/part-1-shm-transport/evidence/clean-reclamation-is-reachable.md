@@ -181,3 +181,7 @@ after an unclean close.
 quarantine as two distinct outcomes with distinct test experiments. As of this
 commit it describes no code at all, which is a larger documentation defect than
 the scoping problem this record originally recorded.
+
+Status note, 2026-08-31: the catalog status for this record is now
+`invalidated` (vocabulary normalization); the `superseded-by-refactor` wording
+above is retained as history.
