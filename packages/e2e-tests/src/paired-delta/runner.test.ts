@@ -65,6 +65,13 @@ class MemoryStore implements RolloutStore {
     }
 }
 
+/** `findIndex` returns -1 for an absent arm and `splice(-1, 1)` then removes the last record, so the test would exercise a different arm and could pass for the wrong reason. commentlint: allow(JUDGE) */
+function dropRecord(store: MemoryStore, armId: ArmId): void {
+    const index = store.records.findIndex((record) => record.armId === armId);
+    if (index < 0) throw new Error(`missing ${armId} record`);
+    store.records.splice(index, 1);
+}
+
 function options(store = new MemoryStore()): RunPairedDeltaOptions {
     return {
         scenarios: [scenario],
@@ -394,7 +401,7 @@ describe("paired-delta runner", () => {
 
         // Drop the first arm so the resumed run must execute before it reaches
         // the two stored coordinates behind it.
-        store.records.splice(store.records.findIndex(({ armId }) => armId === "mc-on"), 1);
+        dropRecord(store, "mc-on");
         const spentBefore = store.records.reduce((sum, { costUsd }) => sum + costUsd, 0);
         const resumed = await runPairedDelta(
             { ...options(store), maxCostUsd: spentBefore },
@@ -910,7 +917,7 @@ describe("paired-delta runner", () => {
 
         // Drop one arm so the resumed run has work, and give it a reserve the cap
         // cannot accommodate.
-        store.records.splice(store.records.findIndex(({ armId }) => armId === "compaction"), 1);
+        dropRecord(store, "compaction");
         const events: string[] = [];
         const resumed = await runPairedDelta(
             { ...free, deskCostCeilingUsd: 5, maxCostUsd: 1 },
@@ -1214,7 +1221,7 @@ describe("paired-delta runner", () => {
         expect(first.records).toHaveLength(3);
 
         // Drop one coordinate so the resumed run still has an arm to execute.
-        store.records.splice(store.records.findIndex(({ armId }) => armId === "compaction"), 1);
+        dropRecord(store, "compaction");
         const spentBefore = store.records.reduce((sum, { costUsd }) => sum + costUsd, 0);
         const events: string[] = [];
         const resumed = await runPairedDelta(
@@ -1261,7 +1268,8 @@ describe("paired-delta runner", () => {
         expect(third.observedCostRollouts + third.estimatedCostRollouts)
             .toBe(third.records.length);
     });
-    it("floors failure cost estimates at one full-context request", async () => {        const expensive = {
+    it("floors failure cost estimates at one full-context request", async () => {
+        const expensive = {
             ...options(),
             pricesPerMillionTokens: {
                 input: 100,

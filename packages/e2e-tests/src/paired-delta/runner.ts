@@ -1009,6 +1009,8 @@ function failedRecord(
             ? "deadline-exceeded"
             : "harness-failure";
     const worstCase = worstCaseUsd(scenario, options.pricesPerMillionTokens);
+    /** One expression, because `costUsd` and `maxAttemptCostUsd` have to agree for a first attempt: computing it twice lets a later edit to one branch part them silently. commentlint: allow(JUDGE) */
+    const attemptCostUsd = providerUnavailable ? reserveUsd : Math.max(reserveUsd, worstCase);
     return {
         schema: ROLLOUT_RECORD_SCHEMA,
         ...coordinate,
@@ -1034,12 +1036,9 @@ function failedRecord(
         },
         checks: [],
         usage: ZERO_USAGE,
-        costUsd: providerUnavailable ? reserveUsd : Math.max(reserveUsd, worstCase),
+        costUsd: attemptCostUsd,
         priorAttemptsCostUsd,
-        maxAttemptCostUsd: Math.max(
-            priorMaxAttemptCostUsd,
-            providerUnavailable ? reserveUsd : Math.max(reserveUsd, worstCase),
-        ),
+        maxAttemptCostUsd: Math.max(priorMaxAttemptCostUsd, attemptCostUsd),
         costSource: "estimated",
         wallClockMs,
         turns: 0,
