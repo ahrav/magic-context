@@ -15,6 +15,10 @@ current location. A `former` line number is never a claim about the tree today.
 Every `provider_recovery.rs` reference is `former` by definition: that module has
 no successor. See the refresh note in [../catalog.md](../catalog.md).
 
+Citations below were re-verified 2026-08-31 against post-#131 HEAD (merge
+`5d638e3e8`, eventfd doorbell rewrite of `ring.rs` and the native addon); stale
+pre-rewrite line numbers were corrected in place.
+
 ## Discovery trigger
 
 Reading the two signatures next to each other. `ProducerReservation::commit`
@@ -28,47 +32,47 @@ complete a frame is therefore carried by a value, not by ownership of the lease.
 Both signatures confirmed by direct read at this commit:
 
 ```rust
-// crates/mc-shm-transport/src/backend/ring.rs:849
+// crates/mc-shm-transport/src/backend/ring.rs:1175
 pub fn release(&self, identity: ReleaseIdentity) -> Result<(), LeaseError>
 ```
 
 ```rust
-// crates/mc-shm-transport/src/backend/ring.rs:1354
+// crates/mc-shm-transport/src/backend/ring.rs:1769
 pub fn commit(mut self, body_len: usize) -> Result<ReleaseIdentity, ProducerError>
 ```
 
-- `ring.rs:849-911` — the whole of `release`. Its checks are: quarantine (`:850`),
-  `identity.incarnation() != self.grant.incarnation` (`:853`),
-  `identity.lane() != self.grant.lane` (`:856`), `sequence == 0` (`:860`),
-  `sequence > consumed` (`:868`), and three descriptor-versus-identity comparisons
-  (`:876`, `:879`, `:882`). Then the arbitrating compare-exchange
-  `SLOT_RECEIVER_LEASED → SLOT_RELEASE_PENDING` at `:886-893`. There is no role
+- `ring.rs:1175-1247` — the whole of `release`. Its checks are: quarantine (`:1176`),
+  `identity.incarnation() != self.grant.incarnation` (`:1179`),
+  `identity.lane() != self.grant.lane` (`:1182`), `sequence == 0` (`:1186`),
+  `sequence > consumed` (`:1194`), and three descriptor-versus-identity comparisons
+  (`:1202`, `:1205`, `:1208`). Then the arbitrating compare-exchange
+  `SLOT_RECEIVER_LEASED → SLOT_RELEASE_PENDING` at `:1212-1219`. There is no role
   check, no owner check, and no lease token — the `&self` receiver is the only
   capability required.
-- `ring.rs:1183` — `commit_reservation` builds
+- `ring.rs:1594` — `commit_reservation` builds
   `ReleaseIdentity::new(self.grant.incarnation, self.grant.lane, sequence)` and
-  returns it (`:1209`), so the identity the producer receives is byte-identical to
-  the one `try_receive` derives for the receiver at `:805`.
-- `ring.rs:904-908` — a successful release stores `completion_sequence` and
+  returns it (`:1626`), so the identity the producer receives is byte-identical to
+  the one `try_receive` derives for the receiver at `:1094`.
+- `ring.rs:1229-1234` — a successful release stores `completion_sequence` and
   decrements `active_leases` while the receiver's `ReceiveLease` is still alive and
   still holds `LeaseSpan` pointers into the arena.
-- `ring.rs:1108-1154` `reclaim_completed` — the producer's next `try_reserve` calls
-  it first (`:675`), and it advances `arena_reclaimed` (`:1142-1145`) and sets the
-  slot `SLOT_FREE` (`:1148`) for any slot whose `completion_sequence` matches. So a
+- `ring.rs:1470-1566` `reclaim_completed` — the producer's next `try_reserve` calls
+  it first (`:916`), and it advances `arena_reclaimed` (`:1558-1561`) and sets the
+  slot `SLOT_FREE` (`:1554`) for any slot whose `completion_sequence` matches. So a
   premature release makes those exact bytes reservable.
-- `crates/mc-shm-transport/src/lease.rs:215-221` — the receiver's own `Drop` then
+- `crates/mc-shm-transport/src/lease.rs:201-207` — the receiver's own `Drop` then
   calls `release_once()` and `let _ = ...` discards the `DuplicateRelease`
-  (`:218`), so the legitimate holder is never told its lease was completed by
+  (`:204`), so the legitimate holder is never told its lease was completed by
   someone else. This is the same discard site as `release-failure-is-observable`.
 - Existing checks, corrected: the identity-validation ladder is
-  `crates/mc-shm-transport/tests/ring.rs:163-187`, not `:164-189` as the catalog
-  records — lines `:188-191` are the following `ProducerError::Exhausted` assert.
-  Within that ladder, `first_id` comes from `first.commit(first_len)` (`:151`) and
-  the lease over that sequence is live from `:152` until `:202`; the test calls
-  `ring.release` at `:164`, `:172`, and `:180` with *mutated* copies of `first_id`
+  `crates/mc-shm-transport/tests/ring.rs:152-175`; lines `:177-180` are the
+  following `ProducerError::Exhausted` assert.
+  Within that ladder, `first_id` comes from `first.commit(first_len)` (`:140`) and
+  the lease over that sequence is live from `:141` until `:192`; the test calls
+  `ring.release` at `:153`, `:161`, and `:169` with *mutated* copies of `first_id`
   to elicit `WrongIncarnation`, `WrongLane`, and `InvalidSequence`. The violating
   call is one unmutated argument away from an existing test.
-  `tests/ring.rs:212` `stale_lap_release_cannot_complete_recycled_slot` is
+  `tests/ring.rs:206` `stale_lap_release_cannot_complete_recycled_slot` is
   confirmed and is a genuine full-lap test.
 
 ## Failure scenario
@@ -76,27 +80,27 @@ pub fn commit(mut self, body_len: usize) -> Result<ReleaseIdentity, ProducerErro
 Within one process holding a single `Ring` used in both directions:
 
 1. Producer: `try_reserve`, write, `let id = reservation.commit(n)?` — `id` is now
-   in producer-side hands (`ring.rs:1209`).
+   in producer-side hands (`ring.rs:1626`).
 2. Receiver: `let lease = ring.try_receive()?` — the slot is `RECEIVER_LEASED`,
    `active_leases` is 1, and `lease` holds raw `LeaseSpan` pointers
-   (`ring.rs:814-829`).
-3. Producer: `ring.release(id)`. Every check at `:853-882` passes, because the
+   (`ring.rs:1097-1120`).
+3. Producer: `ring.release(id)`. Every check at `:1179-1208` passes, because the
    descriptor genuinely carries that incarnation, lane, and sequence. The CAS at
-   `:886-893` sees `SLOT_RECEIVER_LEASED` and succeeds. `completion_sequence` is
-   published and `active_leases` drops to 0 (`:904-908`).
-4. Producer: `try_reserve` again. `reclaim_completed` (`:675`, `:1108-1154`) sees
+   `:1212-1219` sees `SLOT_RECEIVER_LEASED` and succeeds. `completion_sequence` is
+   published and `active_leases` drops to 0 (`:1229-1234`).
+4. Producer: `try_reserve` again. `reclaim_completed` (`:916`, `:1470-1566`) sees
    the matching `completion_sequence`, advances `arena_reclaimed`, frees the slot.
 5. Producer writes the new frame's body into the reclaimed span
-   (`write_reservation`, `:1214-1246`) — the same bytes the live lease still points
+   (`write_reservation`, `:1629-1668`) — the same bytes the live lease still points
    at.
 6. Receiver reads through `lease.segment(i).read_byte(..)` or `to_vec()` and
    observes the new frame's bytes, or a torn mixture.
 7. `lease` drops; `release_once` returns `DuplicateRelease`, discarded at
-   `lease.rs:218`. Nothing anywhere reports that anything went wrong.
+   `lease.rs:204`. Nothing anywhere reports that anything went wrong.
 
 ## Timing windows and dependencies
 
-The window opens when `try_receive` sets `SLOT_RECEIVER_LEASED` (`ring.rs:826`) and
+The window opens when `try_receive` sets `SLOT_RECEIVER_LEASED` (`ring.rs:1115`) and
 closes when the lease's own release runs. Within it, one call — `Ring::release` with
 a value the API returned to the producer — is sufficient; no race, no malformed
 input, no memory corruption. The read-after-recycle needs one further step, the
@@ -117,29 +121,30 @@ serves as both producer and receiver, which today means the transport's own test
 Three independent facts establish this:
 
 1. **No non-test caller retains the identity `commit` returns.** Every non-test
-   `commit` call site discards it: `crates/mc-host/src/ring_transport.rs:591` and
-   `:604` (`reservation.commit(body_len).map_err(|_| ())?;`),
-   `packages/mc-shm-native/src/lib.rs:771-772` and `:885-886`
+   `commit` call site discards it: `crates/mc-host/src/ring_transport.rs:615` and
+   `:628` (`reservation.commit(body_len).map_err(|_| ())?;`),
+   `packages/mc-shm-native/src/lib.rs:929-932` and `:1043-1046`
    (`.map_err(|_| error(...))?;` followed by `Ok(())`), and the public-but-test-only
-   `TestShmPeer::send` at `ring_transport.rs:670`.
+   client endpoint (formerly `TestShmPeer::send`, now `RingClientEndpoint::send`)
+   at `ring_transport.rs:684` (commit at `:696`).
 2. **The only non-test direct `Ring::release` call is a receiver's own.** A search
    of `crates/` and `packages/` for `Ring::release` call sites yields exactly two
-   outside tests and benches: `ring.rs:1261` inside `ring_release_callback`
-   (`:1255-1262`), which is the lease's own release path, and
-   `packages/mc-shm-native/src/lib.rs:309-313`,
+   outside tests and benches: `ring.rs:1676` inside `ring_release_callback`
+   (`:1670-1677`), which is the lease's own release path, and
+   `packages/mc-shm-native/src/lib.rs:327-331`,
    `channel.from_host.release(active.identity)` inside `detach_active`
-   (`:296-316`). The second is on the addon's *receive* ring, with an identity
-   captured from `lease.identity()` at `:979` and stored in the addon's `active`
-   table because `poll` calls `std::mem::forget(lease)` at `:999`. That is the
+   (`:314-334`). The second is on the addon's *receive* ring, with an identity
+   captured from `lease.identity()` at `:1188` and stored in the addon's `active`
+   table because `poll` calls `std::mem::forget(lease)` at `:1208`. That is the
    legitimate holder completing its own lease through a different bookkeeping
    route. The addon never calls `release` on `to_host`.
 3. **The two directions are separate objects with separate identities.**
-   `DuplexRing::create` (`ring.rs:1419-1428`) builds `first` with lane 0 and
+   `DuplexRing::create` (`ring.rs:1834-1843`) builds `first` with lane 0 and
    `second` with lane 1, each through `Ring::create_in`, which draws
-   `incarnation = Incarnation::random()` at `:564`. So even a producer that did
+   `incarnation = Incarnation::random()` at `:757`. So even a producer that did
    retain an identity from `commit` on its send ring would be rejected on its
-   receive ring by `ring.rs:853-858` with `WrongIncarnation` or `WrongLane`. The
-   addon's `to_host`/`from_host` (`lib.rs:62-63`) and the host's
+   receive ring by `ring.rs:1179-1184` with `WrongIncarnation` or `WrongLane`. The
+   addon's `to_host`/`from_host` (`lib.rs:75-76`) and the host's
    `rings.first`/`rings.second` (former `shm_provider.rs:597`, former `:555-557`) both follow this
    split, and no non-test path reserves and receives on the same `Ring`.
 
@@ -169,19 +174,19 @@ should not be public, the test becomes a compile-fail assertion instead.
 
 ### Q: Is `Ring::release` intended to be public at all, or should completion be reachable only through `ReceiveLease`?
 
-- Sources examined: `ring.rs:849-911` (`release`), `:1255-1262`
-  (`ring_release_callback`), `:1354-1382` (`commit`), `:1419-1428`
-  (`DuplexRing::create`), `:536-562` (`create`/`create_in` and the random
-  incarnation); `crates/mc-shm-transport/src/lease.rs:173-221`
+- Sources examined: `ring.rs:1175-1247` (`release`), `:1670-1677`
+  (`ring_release_callback`), `:1769-1811` (`commit`), `:1834-1843`
+  (`DuplexRing::create`), `:731-772` (`create`/`create_in` and the random
+  incarnation); `crates/mc-shm-transport/src/lease.rs:159-207`
   (`ReceiveLease::release`, `release_once`, `Drop`);
-  `packages/mc-shm-native/src/lib.rs:68-69`, `:296-316`, `:954-1011`;
-  `crates/mc-host/src/ring_transport.rs:455-534`, `:665-691`, `:711-777`; a
+  `packages/mc-shm-native/src/lib.rs:75-76`, `:314-334`, `:1160-1230`;
+  `crates/mc-host/src/ring_transport.rs:492-571`, `:651-738`; a
   repository-wide search of `crates/` and `packages/` for `.release(` call sites.
 - Findings: the reachability half is resolved — see the section above. The
   *reason* the method is public is also established: the addon needs a
   lease-independent completion path because `poll` `mem::forget`s the
-  `ReceiveLease` at `lib.rs:878` and re-derives completion from its own `active`
-  table at `:303-307`, so making completion reachable only through `ReceiveLease`
+  `ReceiveLease` at `lib.rs:1208` and re-derives completion from its own `active`
+  table at `:314-334`, so making completion reachable only through `ReceiveLease`
   would require the addon to keep the Rust lease alive across the N-API boundary.
   That is a real design constraint, not an accident.
 - Missing evidence: whether the public method is *intended* as a general
@@ -189,7 +194,7 @@ should not be public, the test becomes a compile-fail assertion instead.
   `docs/mc-host-shm-transport.md` describes the ownership contract in terms of
   leases and does not mention a direct release entry point. No commit message,
   plan requirement (R1-R19, AE1-AE15), or doc comment states an intended caller
-  set; the doc comment at `ring.rs:848` reads only "Validates and records one
+  set; the doc comment at `ring.rs:1174` reads only "Validates and records one
   explicit completion", which does not name a caller.
 - Conclusion: partially resolved. The reachability sub-question is answered with
   evidence: producer-side release is not reachable in the shipped two-process

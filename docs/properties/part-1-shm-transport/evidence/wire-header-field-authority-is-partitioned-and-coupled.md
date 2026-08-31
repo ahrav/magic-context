@@ -119,7 +119,7 @@ of the two 64 MiB constants is a one-line static assertion in `mc-host`.
 ### Q: Is the partition actually total, or is some field unchecked by both layers?
 
 - Sources examined: `descriptor.rs:207-298` in full; `wire.rs:306-368` in full;
-  `frame_channel.rs:58-76` in full; `ring_transport.rs:471-485`.
+  `frame_channel.rs:58-76` in full; `ring_transport.rs:503-505`.
 - Findings: total except `corr`, which is unchecked by design and documented as
   such at `connection.rs:418-420`. Every other field has at least one owner. No
   field has an owner in the transport beyond `len` and `ver`.

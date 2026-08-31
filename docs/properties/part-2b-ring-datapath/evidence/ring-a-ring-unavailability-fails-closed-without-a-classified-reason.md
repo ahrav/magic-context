@@ -13,18 +13,18 @@ confirms the fail-closed half and disproves the reportable half.
 ## Evidence trail
 
 **Five distinct producers of `RingUnavailable`, in `prepare`
-(`crates/mc-host/src/ring_transport.rs:233-313`).**
+(`crates/mc-host/src/ring_transport.rs:217-303`).**
 
 | Cause | Site | Counter |
 | --- | --- | --- |
-| Admission exhausted | `:239-242` | `exhaustions.fetch_add(1, Relaxed)` at `:240` |
-| Tokio runtime build or `DuplexRing::create` failure | `:260-270` | none |
-| `worker_descriptor` failure | `:271-275` | none |
-| `std::thread::Builder::spawn` failure | `:294-296` | none |
-| Init channel `recv` failure | `:297` | none |
+| Admission exhausted | `:223-226` | `exhaustions.fetch_add(1, Relaxed)` at `:224` |
+| Tokio runtime build or `DuplexRing::create` failure | `:242-255` | none |
+| `worker_descriptor` failure | `:256-259` | none |
+| `std::thread::Builder::spawn` failure | `:279-281` | none |
+| Init channel `recv` failure | `:282` | none |
 
-`RingUnavailable` itself (`:113-122`) is a unit struct. Its `Display` is the
-fixed string "shared-memory ring is unavailable" (`:118`) and it carries no
+`RingUnavailable` itself (`:103-112`) is a unit struct. Its `Display` is the
+fixed string "shared-memory ring is unavailable" (`:108`) and it carries no
 cause field, so the five causes are indistinguishable to the caller by
 construction, not by accident of handling.
 
@@ -60,8 +60,8 @@ nothing, and touches no counter. The peer observes only a closed setup socket:
 other distinct setup failures at `client.rs:372` and `:375`, so the client
 cannot distinguish either.
 
-Host-side, `diagnostics()` (`:153-207`) reports `state: "healthy"` whenever
-`accounting()` succeeds (`:176-184`), regardless of `exhaustion.observed`. So a
+Host-side, `diagnostics()` (`:142-196`) reports `state: "healthy"` whenever
+`accounting()` succeeds (`:165-173`), regardless of `exhaustion.observed`. So a
 host that has refused every connection for capacity reports healthy with a
 non-zero exhaustion count, and a host that cannot create shared-memory objects
 at all reports healthy with every counter at zero.
@@ -72,19 +72,19 @@ keeps running, `prepare` eventually succeeds, and the resulting `PreparedRing` i
 dropped inside the blocking task. Dropping a `CancellationToken` does not cancel
 it, so neither `root` nor `read_cancel` fires. Teardown of the abandoned endpoint
 thread therefore falls to sender-drop: dropping `PreparedRing.sender`
-(`:106`) closes the mpsc, and `run_endpoint`'s `queue.recv()` yields `None` and
-returns at `:436-439`. That arm lives inside the `select!` at `:422-442`, which
+(`:96`) closes the mpsc, and `run_endpoint`'s `queue.recv()` yields `None` and
+returns at `:455-458`. That arm lives inside the `select!` at `:441-474`, which
 `run_endpoint` only reaches when the previous `receive_one` returned `Ok(false)`.
 Since the peer never attached on this path, `try_receive` returns `Ok(None)`
-immediately (`:464-470`), so `Ok(false)` is the first outcome and the thread does
+immediately (`:496-501`), so `Ok(false)` is the first outcome and the thread does
 exit promptly. The dependency is real but not triggered here; it is triggered in
 `ring-a-cancellation-close-requires-an-empty-inbound-observation`.
 
 ## Failure scenario
 
 Total silent outage. A host is deployed where `/dev/shm` is unavailable, or the
-per-process fd limit is below the two mappings plus two grant descriptors a
-connection needs, so `DuplexRing::create` fails at `:263` every time.
+per-process fd limit is below the mapping and doorbell descriptors a
+connection needs, so `DuplexRing::create` fails at `:248` every time.
 
 Every client connect authenticates successfully (auth is
 `connection.rs:120-131`, entirely before `prepare`), acquires a connection permit
@@ -106,9 +106,9 @@ The reportability half has no window either. It is a static absence of counters
 and messages.
 
 The timeout path has a window: `transport_setup_deadline` versus the real
-duration of `prepare`. `prepare` blocks on `initialized_rx.recv()` at `:297`,
-which waits for the endpoint thread to build a Tokio runtime (`:257-259`), create
-two shared-memory objects (`:263`), and marshal two descriptors (`:271`). Under
+duration of `prepare`. `prepare` blocks on `initialized_rx.recv()` at `:282`,
+which waits for the endpoint thread to build a Tokio runtime (`:242-246`), create
+two shared-memory objects (`:248`), and marshal the descriptors (`:256`). Under
 memory pressure or fd pressure that can be slow, and the timeout would fire on a
 `prepare` that is going to succeed.
 
@@ -122,7 +122,7 @@ the charge comes back on each of these paths.
 Fail-closed half, cheap and worth having: a test that forces `prepare` to fail
 and asserts that `activate_server` was never called and the peer received no
 `ServerMessage`. The cheapest forcing function is admission exhaustion, since
-`per_connection_limits()` (`:61-73`) times one connection is exactly what
+`per_connection_limits()` (`:44-57`) times one connection is exactly what
 `RingFactory` uses (`frame_channel/contract_tests.rs:501-503`): prepare once,
 then prepare again on the same transport and require `Err`.
 
@@ -139,8 +139,8 @@ Timeout path: set `transport_setup_deadline` very low in `HostConfig` and assert
 that the abandoned endpoint thread terminates and its charge returns within a
 bounded interval.
 
-Existing checks: `ring_transport.rs:805` asserts
-`diagnostics["exhaustion"]["observed"] == 0` on a fresh transport, which does not
+Existing checks: `ring_transport.rs:884` asserts
+`diagnostics["exhaustion"]["observed"] == 0` on a transport with no admissions, which does not
 exercise the increment. Nothing covers the other four causes.
 `tests/shm_failure_modes` is named in CI (`ci.yml:133`), so it is the right home
 for whatever is added; I did not read it in this pass, which is why the record's
@@ -150,7 +150,7 @@ for whatever is added; I did not read it in this pass, which is why the record's
 
 ### Q: Should `RingUnavailable` carry a closed cause class matching the doctor's five terminal classes?
 
-- Sources examined: `ring_transport.rs:113-122` (the unit struct and its fixed
+- Sources examined: `ring_transport.rs:103-112` (the unit struct and its fixed
   `Display`), the five producer sites, `docs/mc-host-shm-transport.md:53-59` (the
   five doctor classes), `packages/plugin/src/shared/mc-host-client/types.ts:69-73`
   (the same five as a TypeScript union).
@@ -172,10 +172,10 @@ for whatever is added; I did not read it in this pass, which is why the record's
 
 ### Q: On the `prepare` timeout path, should the connection task cancel the ring it abandoned?
 
-- Sources examined: `connection.rs:147-162`; `ring_transport.rs:304-312` (what
+- Sources examined: `connection.rs:147-162`; `ring_transport.rs:289-297` (what
   `PreparedRing` carries); `tokio_util::sync::CancellationToken` drop semantics
-  (dropping does not cancel); `ring_transport.rs:436-439` (the `queue.recv()`
-  arm); `:464-470` (`try_receive` on an unattached ring).
+  (dropping does not cancel); `ring_transport.rs:455-458` (the `queue.recv()`
+  arm); `:496-501` (`try_receive` on an unattached ring).
 - Findings: on this specific path the abandoned thread does exit promptly,
   because an unattached ring makes `receive_one` return `Ok(false)` on the first
   pass, which reaches the `select!` where the closed-sender arm lives. So there

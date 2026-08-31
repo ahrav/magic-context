@@ -50,7 +50,9 @@ runtime invariant guards belong to
 ### `crates/mc-shm-transport/tests/iceoryx.rs` — 7 tests, requires the `iceoryx` feature
 
 **Gone at `e447c927`.** `0f336d3c` deleted this suite, the `iceoryx` backend, and
-the `iceoryx` Cargo feature. The entry is kept as a record of what used to be
+the `iceoryx` Cargo feature; the removal holds at HEAD `46278f47a` after PR #131
+(merge `5d638e3e8`), and the five Group K catalog records covering this backend
+are `Status: invalidated`. The entry is kept as a record of what used to be
 checked; everything in it resolves against `9c1eb4d1`. Covered allocation slack never reaching the decoder, stale-node observation
 without disturbing a live backend, exact sequence progression, producer
 rejection of oversized and underfilled commits, decoder rejection of truncation
@@ -188,7 +190,8 @@ Code with no executed check:
    validation rejects.
 9. Runtime-directory revalidation is never negative-tested.
 10. The iceoryx segment-growth path never executed; every test wrote tiny
-    payloads. Moot at `e447c927`: `0f336d3c` deleted the backend.
+    payloads. Invalidated at `e447c927`: `0f336d3c` deleted the backend, and the
+    covering catalog records are `Status: invalidated`.
 11. Fuzzing never runs in normal CI.
 12. Three hand-synchronised copies of the ring geometry with no cross-check.
 13. `docs/AUDIT-KNOWN-ISSUES.md` contains no shared-memory entries. The only
@@ -215,3 +218,79 @@ all edited after Part 1 was written; the `tests/iceoryx.rs` entry is marked gone
 because `0f336d3c` deleted that suite, the iceoryx backend, and the `iceoryx`
 Cargo feature. No check was added, removed, or re-audited. Statuses remain
 `unaudited`.
+
+## Eventfd delivery checks, merge `5d638e3e8` (2026-08-31)
+
+PR #131 replaced polling with sparse eventfd delivery and added the checks
+below. All statuses are unaudited. Two corrections to the inventory above,
+both verified at HEAD:
+
+- The "In-crate unit tests: exactly one" claim is stale. The `#[cfg(test)]`
+  module in `crates/mc-shm-transport/src/backend/ring.rs` now holds seven
+  tests, and `packages/mc-shm-native/src/scheduling.rs` holds three.
+- Two `tests/ring.rs` names in the table above moved:
+  `sealed_object_prefault_repeated_setup_and_stress_conservation` is now
+  `sealed_sparse_object_repeated_setup_and_stress_conservation` (`:309`), and
+  `attach_rejects_unsealed_objects_and_tampered_grants` is now part of
+  `artifact_mismatch_fails_before_mapping_and_unsealed_objects_are_rejected`
+  (`:360`). Their verdicts were not re-derived.
+
+### `crates/mc-shm-transport/src/backend/ring.rs` unit tests — 6 new
+
+| Test | Claim asserted | Status |
+| --- | --- | --- |
+| `doorbell_attachment_requires_nonblocking_eventfd` (`:2248`) | A blocking eventfd and a nonblocking non-eventfd are both rejected as `DoorbellFailed` | unaudited — exercises `Doorbell::from_fd` directly, never a full `Ring::attach` |
+| `removal_ranges_exclude_partial_pages_and_split_once_at_wrap` (`:2279`) | Across 4/16/64 KiB pages: a sub-page run removes nothing, an unaligned run removes only its interior page, a wrapping run splits into two exact ranges | unaudited |
+| `reclaimed_pages_leave_residency_and_reuse_as_zeroes` (`:2300`, Linux) | After release and reclaim, residency drops to zero and reused bytes read as zeros | unaudited |
+| `repeated_subpage_releases_eventually_remove_complete_pages` (`:2319`, Linux) | Sub-page releases converge to whole-page removal at exactly the page boundary | unaudited |
+| `partial_page_reclaim_preserves_live_neighbor` (`:2337`, Linux) | Reclaiming one frame leaves a live lease's bytes on the shared page intact | unaudited |
+| `page_removal_failure_quarantines_before_capacity_publication` (`:2355`, Linux) | A failed `madvise` quarantines with `completed` and `arena_reclaimed` still zero | unaudited — uses the test-only `FAIL_NEXT_PAGE_REMOVAL` failpoint (`:276-283`) |
+
+(`residency_vector_tracks_runtime_page_size`, `:2272`, predates the merge and
+is inventoried above.)
+
+### `crates/mc-shm-transport/tests/ring.rs` — rewritten by the merge
+
+| Test | Claim asserted | Status |
+| --- | --- | --- |
+| `two_process_zero_copy_exchange_uses_authenticated_grant` (`:551-592`) | Now transfers three descriptors (`[OwnedFd; 3]`, mapping plus both doorbells), blocks a `reserve_until` behind the child's held lease with a 5 s deadline, and requires 25 ms minimum elapsed | unaudited — still lockstep; the release always lands mid-block, never in the arm window |
+| `ring_child_exchange` (`:597-626`) | Child attaches by descriptor, blocks in `wait_for_data` on the data doorbell, verifies payload, releases | unaudited |
+
+### `packages/mc-shm-native/src/scheduling.rs` unit tests — 3 new
+
+| Test | Claim asserted | Status |
+| --- | --- | --- |
+| `pending_callback_waits_for_acknowledgement` (`:320`) | `wait_until_handled` does not return on a control write while `pending` holds, and returns true once cleared | unaudited |
+| `setup_socket_eof_is_reactor_readiness` (`:351`) | A dropped setup peer surfaces as an epoll event with the registered channel data | unaudited |
+| `interrupted_wait_retries_until_success_or_close` (`:369`) | `EINTR` retries; a set `closing` flag short-circuits to `None` | unaudited |
+
+### `crates/mc-host/src/client.rs` bridge tests — 2 relevant
+
+| Test | Claim asserted | Status |
+| --- | --- | --- |
+| `ring_bridge_drains_inbound_and_queued_writes` (`:4003`) | Eight writes queued with no per-write wake all complete within 250 ms each after one edge; the inbound frame is not starved behind them | unaudited |
+| `ring_bridge_retires_when_host_drops_setup_socket` (`:4079`) | A dropped setup socket terminates the bridge | unaudited |
+
+### `packages/mc-shm-native/tests/mechanism.ts` — 2 new readiness suites
+
+| Test | Claim asserted | Status |
+| --- | --- | --- |
+| `one channel handler failure does not starve later channels` (`:168-205`) | A throwing handler on channel 1 does not prevent delivery on channel 2, within a 1 s bound | unaudited — self-skips when the addon is absent |
+| `readiness acknowledgement preserves a frame published during callback` (`:211-278`) | A frame published inside callback 1 arrives via exactly one further callback (`callbacks === 2`, `received == [1, 2]`) | unaudited — raw addon; the `NativeChannel` wrapper path is untested for this race |
+
+### `packages/plugin/src/shared/mc-host-client/shm-frame-channel.test.ts`
+
+| Test | Claim asserted | Status |
+| --- | --- | --- |
+| `production shared-memory delivery has no timer polling` (`:35`) | The channel source contains neither `setInterval` nor `.poll(` | unaudited — a source-text grep, not a behavioral check; it cannot see polling hidden behind a helper |
+
+### Still quiet after the merge
+
+1. `released-charges-wake-blocked-readers` has no check at any level: nothing
+   exhausts the client read budget with the bridge parked and releases a
+   charge from another thread.
+2. No test lands a capacity or data signal inside the arm window
+   (generation-read to poll entry); every existing wake test releases
+   mid-block.
+3. The concurrency-tooling verdict above is unchanged by the merge: the new
+   SeqCst wake protocol has no loom, shuttle, Miri, or TSan coverage.
