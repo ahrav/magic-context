@@ -2,7 +2,7 @@
 //! patch identity, and the exact-OID → ancestry → patch-ID → tree-hash
 //! fallback ladder with stop-on-ambiguity.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use gix::ObjectId;
@@ -58,6 +58,7 @@ pub struct ResolutionLadder<'s> {
     budget: &'s EvalBudget,
     ancestry_cache: RefCell<HashMap<(ObjectId, ObjectId), Option<bool>>>,
     window: RefCell<Option<Vec<ObjectId>>>,
+    graph_operations: Cell<u64>,
 }
 
 impl<'s> ResolutionLadder<'s> {
@@ -67,7 +68,23 @@ impl<'s> ResolutionLadder<'s> {
             budget,
             ancestry_cache: RefCell::new(HashMap::new()),
             window: RefCell::new(None),
+            graph_operations: Cell::new(0),
         }
+    }
+
+    /// Object-database operations performed so far: ancestry walks,
+    /// candidate-window builds, and patch-ID computations. The zero-IO
+    /// cache-hit proof asserts this stays flat on hits.
+    pub fn graph_operations(&self) -> u64 {
+        self.graph_operations.get()
+    }
+
+    pub fn budget_was_exhausted(&self) -> bool {
+        self.budget.is_exhausted()
+    }
+
+    fn count_graph_operation(&self) {
+        self.graph_operations.set(self.graph_operations.get() + 1);
     }
 
     /// Evaluates a git anchor condition via independent ancestry tests —
@@ -211,6 +228,7 @@ impl<'s> ResolutionLadder<'s> {
         if let Some(window) = self.window.borrow().as_ref() {
             return Some(window.clone());
         }
+        self.count_graph_operation();
         let repo = self.snapshot.repo();
         let head = ObjectId::from_hex(self.snapshot.head().as_bytes()).ok()?;
         let walk = repo.rev_walk([head]).first_parent_only().all().ok()?;
@@ -278,6 +296,7 @@ impl<'s> ResolutionLadder<'s> {
     /// per commit, so a stale graph never renders a reachable commit
     /// unreachable. Budget exhaustion or missing objects answer unknown.
     fn walk_ancestry(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
+        self.count_graph_operation();
         let repo = self.snapshot.repo();
         if repo.find_commit(descendant).is_err() || repo.find_commit(ancestor).is_err() {
             return None;
