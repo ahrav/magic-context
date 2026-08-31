@@ -497,13 +497,46 @@ fn projection_replace_repeats_when_a_field_carries_a_detected_secret() {
         1
     );
 
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let redactions = connection
+        .prepare(
+            "SELECT owner_id,field_name,secret_type FROM durable_text_redactions
+             WHERE owner_kind='alignment_projection' ORDER BY detection_ordinal",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(redactions.len(), 1);
+    let (owner_id, field_name, secret_type) = &redactions[0];
+    // owner_id is generation-prefixed, so match the row identity and require the prefix to be
+    // a number rather than pinning the generation the fixture happens to reach.
+    let (generation, row_identity) = owner_id.split_once(':').unwrap();
+    assert!(generation.parse::<i64>().is_ok(), "{owner_id}");
+    assert_eq!(row_identity, "decision:observation");
+    assert_eq!(field_name, "alignment_payload");
+    assert_eq!(secret_type, "anthropic_api_key");
+    let stored: Vec<u8> = connection
+        .query_row(
+            "SELECT alignment_payload FROM alignment_projection",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(
-        inspect(
-            directory.path(),
-            "SELECT COUNT(*) FROM durable_text_redactions
-             WHERE owner_kind='alignment_projection'"
-        ),
-        1
+        String::from_utf8(stored).unwrap(),
+        "second <ANTHROPIC_API_KEY_REDACTED>"
     );
 }
 
