@@ -634,6 +634,68 @@ describe("paired-delta runner", () => {
         }
     });
 
+    it("refuses stored evidence whose declaration or disposal cannot be trusted", async () => {
+        const seed = async () => {
+            const store = new MemoryStore();
+            await runPairedDelta(options(store), dependencies());
+            return store;
+        };
+
+        for (const corrupt of [
+            (record: RolloutRecord) => {
+                record.baseScriptFingerprint = "f".repeat(64);
+            },
+            (record: RolloutRecord) => {
+                record.intervention = { kind: "gold-memory", value: null };
+            },
+            (record: RolloutRecord) => {
+                record.harnessDisposed = false;
+            },
+        ]) {
+            const store = await seed();
+            const stored = store.records.find(({ armId }) => armId === "mc-on");
+            if (!stored) throw new Error("missing fixture record");
+            corrupt(stored);
+            const events: string[] = [];
+
+            const result = await runPairedDelta(options(store), dependencies(undefined, events));
+
+            expect(result.status).toBe("invalid-stored-records");
+            expect(result.records.some(({ armId }) => armId === "mc-on")).toBe(false);
+            expect(events).not.toContain("create:mc-on");
+        }
+    });
+
+    it("classifies an arm identity mismatch as malformed", async () => {
+        const result = await runPairedDelta(
+            options(),
+            dependencies((armId) => {
+                const value = observation(armId);
+                if (armId === "mc-off") value.armIdentityMatches = false;
+                return value;
+            }),
+        );
+
+        // The contract admits this reason only with a malformed health.
+        expect(result.records.find(({ armId }) => armId === "mc-off")?.cell).toMatchObject({
+            runHealth: "malformed",
+            reasonCode: "arm-identity-mismatch",
+        });
+    });
+
+    it("refuses a live route that duplicates the fixture route", async () => {
+        await expect(
+            verifyDualMockResolution({
+                liveProviderId: "mock-anthropic",
+                liveModelId: "mock-sonnet",
+                modelContextLimit: 4096,
+                async sendPrompt(route) {
+                    return { ...route, contextLimit: 4096 };
+                },
+            }),
+        ).rejects.toThrow(/duplicates the fixture route/);
+    });
+
     it("classifies a malformed check vector as an exclusion and continues", async () => {
         const result = await runPairedDelta(
             options(),

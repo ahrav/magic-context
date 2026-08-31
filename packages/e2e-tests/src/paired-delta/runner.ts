@@ -166,8 +166,19 @@ export async function verifyDualMockResolution(input: {
         modelId: string;
     }): Promise<{ providerId: string; modelId: string; contextLimit: number }>;
 }): Promise<void> {
+    const fixtureRoute = { providerId: "mock-anthropic", modelId: "mock-sonnet" };
+    /** The gate exists to prove two distinct routes resolve independently. A live route equal to the fixture route makes the check pass while every supposedly live rollout can run on the fixture provider. commentlint: allow(JUDGE) */
+    if (
+        input.liveProviderId === fixtureRoute.providerId &&
+        input.liveModelId === fixtureRoute.modelId
+    ) {
+        throw new Error(
+            "dual-mock live route duplicates the fixture route " +
+                `${fixtureRoute.providerId}/${fixtureRoute.modelId}`,
+        );
+    }
     const routes = [
-        { providerId: "mock-anthropic", modelId: "mock-sonnet" },
+        fixtureRoute,
         { providerId: input.liveProviderId, modelId: input.liveModelId },
     ];
     const resolved = await Promise.all(routes.map((route) => input.sendPrompt(route)));
@@ -257,6 +268,9 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
             armedCell.criticalPassed > armedCell.criticalTotal
         ) {
             fail("cell-invalid");
+        }
+        if (typeof record.harnessDisposed !== "boolean") {
+            fail("harness-disposed-invalid");
         }
         if (
             armedCell.reasonCode !== null &&
@@ -403,8 +417,14 @@ function completedIdentityMatches(
         );
 }
 
-/** Completed evidence must be scorable against the declaration it is standing in for, so the vector is revalidated and its aggregates recomputed rather than trusted from the file. commentlint: allow(JUDGE) */
+/** Completed evidence must be scorable against the declaration it is standing in for, so the vector is revalidated and its aggregates recomputed rather than trusted from the file. The script fingerprint and intervention are compared here as well: only the regret ladder reaches `computeRegretRungs`, so a primary record would otherwise carry a drifted declaration straight into the analysis. A record that cannot show its harness was reclaimed is refused for the same reason a live one is. commentlint: allow(JUDGE) */
 function resumableEvidence(record: RolloutRecord, scenario: ScenarioDeclaration): boolean {
+    if (record.harnessDisposed !== true) return false;
+    if (record.baseScriptFingerprint !== baseScriptFingerprint(scenario)) return false;
+    const declared = interventionFingerprint(interventionFor(scenario, record.armId));
+    if (declared === null || interventionFingerprint(record.intervention) !== declared) {
+        return false;
+    }
     try {
         validateCheckVector(scenario, record.checks);
     } catch (error) {
@@ -733,11 +753,12 @@ function completedRecord(
                     : !declarationMatches
                         ? "invalid-result"
                         : null;
+    /** `REASON_CODE_HEALTHS` admits `arm-identity-mismatch` only with `malformed`; pairing it with `unavailable` emits a cell the contract's own parser rejects and reads as a provider-availability failure. commentlint: allow(JUDGE) */
     let runHealth: RunHealth = reasonCode === null
         ? "completed"
         : reasonCode === "harness-failure"
             ? "crash"
-            : reasonCode === "invalid-result"
+            : reasonCode === "invalid-result" || reasonCode === "arm-identity-mismatch"
                 ? "malformed"
                 : "unavailable";
     let checks: CheckResult[] = [];
