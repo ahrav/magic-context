@@ -1,4 +1,5 @@
 mod admission;
+mod anchor;
 mod backup;
 mod cas;
 mod durable_fs;
@@ -19,6 +20,11 @@ pub use admission::{
     Evaluation, EvaluationInputs, EventKind, Maturity, Outcome, PriorDecision, SourceClass,
     Surface, SurfaceVisibility, TaintClass, VisibilityRow, VisibleAsOf, VisibleRow,
     POLICY_REVISION,
+};
+pub use anchor::{
+    encode_anchor_captures, evaluate_non_git, AnchorCapture, AnchorCondition, AnchorDecodeError,
+    AnchorEvaluation, AnchorKind, AnchorRowSpec, GitCondition, PatchIdCapture, QueryContext,
+    ANCHOR_CAPTURE_SCHEMA,
 };
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 pub use backup::filesystem_is_unsafe_for_test;
@@ -50,7 +56,11 @@ pub use facts::{ArtifactBudgetFacts, KernelFacts, MAIN_FILE_WARN_BYTES};
 pub use open::{KernelError, KernelStore};
 pub use outbox::{ConsumerAbandonment, OutboxPruneResult};
 pub use retention::{StagingMaintenanceResult, StagingTerminalState, STAGING_RETENTION_MS};
-pub use scope::{ScopeSpec, ScopeTermSpec, ScopeWriteOutcome};
+pub use scope::{
+    coerce_version, scope_equivalent, scope_matches, scope_overlaps, scope_subsumes,
+    CanonicalScope, Dimension, GraphOracle, MatchOutcome, ScopeFormError, ScopeMatchContext,
+    ScopeSpec, ScopeTermSpec, ScopeWriteOutcome, TermValue, UnknownGraph, VersionSpec,
+};
 pub use slice::{
     AlignmentRebuild, AlignmentRow, AlignmentSnapshot, DecisionEventOutcome, DecisionEventPayload,
     DecisionEventSpec, DecisionPayload, DecisionRow, DecisionSpec, DecisionWriteOutcome,

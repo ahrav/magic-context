@@ -383,6 +383,11 @@ pub fn redact_secret_text(input: &str) -> Redaction {
     Redaction { text, detections }
 }
 
+#[must_use]
+pub fn contains_redaction_token(text: &str) -> bool {
+    text.contains("_REDACTED>") || text.contains("<REDACTED:")
+}
+
 fn render(input: &str, pieces: &[Piece]) -> (String, Vec<usize>) {
     let mut text = String::with_capacity(input.len());
     let mut starts = Vec::with_capacity(pieces.len());
@@ -692,6 +697,22 @@ mod tests {
                 .detections
                 .iter()
                 .all(|detection| detection.detector_id == DETECTOR_ID));
+        }
+    }
+
+    #[test]
+    fn every_fixture_replacement_is_detected_as_a_redaction_token() {
+        for fixture in vocabulary().cases {
+            let result = redact_secret_text(&fixture.input);
+            if result.detections.is_empty() {
+                continue;
+            }
+            assert!(
+                contains_redaction_token(&result.text),
+                "{}: redacted output {:?} not recognized as a placeholder",
+                fixture.name,
+                result.text
+            );
         }
     }
 

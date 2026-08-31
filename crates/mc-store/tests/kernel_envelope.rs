@@ -497,13 +497,43 @@ fn projection_replace_repeats_when_a_field_carries_a_detected_secret() {
         1
     );
 
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let redactions = connection
+        .prepare(
+            "SELECT owner_id,field_name,secret_type FROM durable_text_redactions
+             WHERE owner_kind='alignment_projection' ORDER BY detection_ordinal",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(redactions.len(), 1);
+    let (owner_id, field_name, secret_type) = &redactions[0];
+    // Prefixing `decision_id` with its length disambiguates ':' in either ID; the prefix does not affect ordering.
+    assert_eq!(owner_id, "8:decision:observation");
+    assert_eq!(field_name, "alignment_payload");
+    assert_eq!(secret_type, "anthropic_api_key");
+    let stored: Vec<u8> = connection
+        .query_row(
+            "SELECT alignment_payload FROM alignment_projection",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(
-        inspect(
-            directory.path(),
-            "SELECT COUNT(*) FROM durable_text_redactions
-             WHERE owner_kind='alignment_projection'"
-        ),
-        1
+        String::from_utf8(stored).unwrap(),
+        "second <ANTHROPIC_API_KEY_REDACTED>"
     );
 }
 
