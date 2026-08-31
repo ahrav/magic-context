@@ -146,9 +146,6 @@ fn evaluate_candidate(
         .as_bytes()
         .get(value_span.start()..value_span.end())
         .ok_or(ScanError::InvalidSpan)?;
-    if value.is_empty() {
-        return Ok(None);
-    }
     if let Some(key) = key_span {
         let key = input
             .as_bytes()
@@ -566,22 +563,21 @@ fn is_scalar(value: &[u8]) -> bool {
     }
     let bytes = text.as_bytes();
     let mut index = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
-    let integer_start = index;
+    // Digits are counted across the point rather than required on its left, because `.5` and `5.` are decimal literals a configuration file can hold.
+    let mut digits = 0usize;
     while bytes.get(index).is_some_and(u8::is_ascii_digit) {
         index += 1;
-    }
-    if index == integer_start {
-        return false;
+        digits += 1;
     }
     if bytes.get(index) == Some(&b'.') {
         index += 1;
-        let fraction_start = index;
         while bytes.get(index).is_some_and(u8::is_ascii_digit) {
             index += 1;
+            digits += 1;
         }
-        if index == fraction_start {
-            return false;
-        }
+    }
+    if digits == 0 {
+        return false;
     }
     if matches!(bytes.get(index), Some(b'e' | b'E')) {
         index += 1;
@@ -905,6 +901,12 @@ mod tests {
             "0",
             "-1.5",
             "+2e10",
+            ".5",
+            "-.25",
+            "+.5",
+            ".5e3",
+            "5.",
+            "-5.",
             "true",
             "false",
             "null",
@@ -931,6 +933,10 @@ mod tests {
             "true-blue",
             "nilpotent",
             "nonement",
+            ".",
+            "-.",
+            ".x",
+            "5.5.5",
             "\\\\",
             "\\nhunter2",
             "\\x",

@@ -1,8 +1,10 @@
+mod common;
+
 use std::collections::BTreeSet;
 
+use common::digest_hex;
 use mc_secret_scanner::{ScanProfile, Scanner};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -52,10 +54,7 @@ fn minimal_fixture_is_truthful_and_executable() {
     assert_eq!(manifest.fixture, "qualification-v1.jsonl");
     assert_eq!(
         manifest.fixture_sha256,
-        Sha256::digest(fixture_bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>(),
+        digest_hex(fixture_bytes),
         "fixture bytes changed without updating fixture_sha256"
     );
 

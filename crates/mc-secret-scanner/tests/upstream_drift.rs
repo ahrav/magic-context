@@ -1,9 +1,6 @@
-use sha2::{Digest, Sha256};
+mod common;
 
-fn digest_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
+use common::digest_hex;
 
 #[test]
 fn pinned_corpus_and_overlay_match_reviewed_sources() {
