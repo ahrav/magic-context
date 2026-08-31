@@ -57,6 +57,7 @@ impl Envelope<'_> {
         let audit_owner_id = consumer_id.text.clone();
         self.push_control_change(
             &audit_owner_id,
+            "outbox_consumer",
             "consumer_register",
             serde_json::json!({
                 "consumer_id": consumer_id.text.clone(),
@@ -89,6 +90,7 @@ impl Envelope<'_> {
         let audit_owner_id = consumer_id.text.clone();
         self.push_control_change(
             &audit_owner_id,
+            "outbox_consumer",
             "consumer_deregister",
             serde_json::json!({
                 "consumer_id": consumer_id.text.clone(),
@@ -186,6 +188,7 @@ impl Envelope<'_> {
         complete_satisfied_barriers(self.tx, abandonment.abandoned_at)?;
         self.push_control_change(
             &audit_owner_id,
+            "outbox_consumer",
             "consumer_abandon",
             serde_json::json!({
                 "consumer_id": consumer_id.text.clone(),
@@ -247,6 +250,7 @@ impl Envelope<'_> {
         let audit_owner_id = barrier_id.text.clone();
         self.push_control_change(
             &audit_owner_id,
+            "deletion_backfill_barrier",
             "deletion_barrier_abandon",
             serde_json::json!({
                 "barrier_id": barrier_id.text.clone(),
@@ -298,6 +302,7 @@ impl Envelope<'_> {
     fn push_control_change(
         &mut self,
         object_id: &str,
+        object_kind: &'static str,
         kind: &'static str,
         audit: serde_json::Value,
         redactions: Vec<(String, RedactedField)>,
@@ -305,7 +310,7 @@ impl Envelope<'_> {
         self.changes.push(PendingChange {
             object: ObjectRow {
                 object_id: object_id.to_string(),
-                object_kind: "outbox_consumer".to_string(),
+                object_kind: object_kind.to_string(),
                 domain_id: "kernel-control".to_string(),
                 source_kind: "kernel-control".to_string(),
                 source_id: object_id.to_string(),

@@ -10,6 +10,7 @@ use crate::kernel::durable_fs::{
 use crate::kernel::envelope::{
     check_fence, commit_with_writer, CommitIntent, ObjectRow, PendingChange, Sensitivity,
 };
+use crate::kernel::redaction::{redact, RedactedField};
 use crate::kernel::{KernelError, KernelStore};
 
 const PROPAGATION_TARGETS: [&str; 4] = [
@@ -100,6 +101,23 @@ struct PurgeIntentLine<'a> {
     timestamp: i64,
 }
 
+/// Operator-supplied purge audit text after secret redaction.
+struct PurgeAuditFields {
+    operator_id: RedactedField,
+    target_locator: RedactedField,
+    reason: RedactedField,
+}
+
+impl PurgeAuditFields {
+    fn new(request: &ArtifactDeletionRequest) -> Self {
+        Self {
+            operator_id: redact(request.operator_id.as_deref().unwrap_or_default()),
+            target_locator: redact(request.target_locator.as_deref().unwrap_or_default()),
+            reason: redact(request.reason.as_deref().unwrap_or_default()),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ArtifactState {
     digest: String,
@@ -119,8 +137,8 @@ struct Propagation<'a> {
     affected_object_ids: &'a [String],
     barrier_id: &'a str,
     sensitivity: Sensitivity,
-    operator_id: Option<&'a str>,
-    target_locator: Option<&'a str>,
+    operator_id: &'a str,
+    target_locator: &'a str,
     deleted_at: i64,
 }
 
@@ -147,6 +165,7 @@ impl KernelStore {
         fault: Option<ArtifactDeletionFault>,
     ) -> Result<ArtifactDeletionResult, ArtifactError> {
         validate_request(&request)?;
+        let redacted = PurgeAuditFields::new(&request);
         let mut writer = self
             .lock_writer()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
@@ -183,18 +202,10 @@ impl KernelStore {
                 };
                 return Err(self.map_cas_storage_error(error, ArtifactErrorKind::PurgeIntent));
             }
-            let operator_id = request
-                .operator_id
-                .as_deref()
-                .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::InvalidInput))?;
-            let target_locator = request
-                .target_locator
-                .as_deref()
-                .ok_or_else(|| ArtifactError::new(ArtifactErrorKind::InvalidInput))?;
             let mut line = serde_json::to_vec(&PurgeIntentLine {
                 digest: &state.digest,
-                target_locator,
-                operator_id,
+                target_locator: &redacted.target_locator.text,
+                operator_id: &redacted.operator_id.text,
                 timestamp: request.deleted_at,
             })
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::InvalidInput))?;
@@ -216,8 +227,9 @@ impl KernelStore {
         let sensitivity = state.sensitivity;
         let kind = request.kind;
         let deleted_at = request.deleted_at;
-        let operator_id = request.operator_id.clone();
-        let reason = request.reason.clone();
+        let operator_id = redacted.operator_id.text.clone();
+        let reason = redacted.reason.text.clone();
+        let target_locator = redacted.target_locator.text.clone();
         let receipt = commit_with_writer(
             &mut writer,
             self.lease_epoch(),
@@ -258,8 +270,8 @@ impl KernelStore {
                             params![
                                 digest,
                                 artifact_reference,
-                                operator_id.as_deref().ok_or(KernelError::InvalidInput)?,
-                                reason.as_deref().ok_or(KernelError::InvalidInput)?,
+                                operator_id,
+                                reason,
                                 deleted_at,
                                 envelope.commit_seq,
                             ],
@@ -294,8 +306,8 @@ impl KernelStore {
                     affected_object_ids: &event_object_ids,
                     barrier_id: &barrier_id,
                     sensitivity,
-                    operator_id: operator_id.as_deref(),
-                    target_locator: request.target_locator.as_deref(),
+                    operator_id: &operator_id,
+                    target_locator: &target_locator,
                     deleted_at,
                 });
                 Ok(barrier_id.clone())
@@ -400,8 +412,15 @@ impl KernelStore {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let file_type = entry.file_type().map_err(classify_io)?;
-            if name.starts_with(&prefix) && (file_type.is_file() || file_type.is_symlink()) {
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(classify_io(error)),
+            };
+            if file_type.is_file() || file_type.is_symlink() {
                 durable_unlink(&tmp, &name)?;
             }
         }

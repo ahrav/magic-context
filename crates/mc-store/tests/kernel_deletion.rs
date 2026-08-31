@@ -935,3 +935,53 @@ fn abandonment_does_not_satisfy_a_later_deletion_of_the_same_digest() {
         .unwrap();
     assert!(store.deletion_barrier(&second.barrier_id).unwrap().cleared);
 }
+
+#[test]
+fn purge_audit_fields_are_redacted_in_every_durable_sink() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "redact-purge", b"redact-purge");
+    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let mut request = delete_request("redact", &handle.digest, ArtifactDeletionKind::Purge);
+    request.operator_id = Some(format!("operator {secret}"));
+    request.target_locator = Some(format!("incident://{secret}"));
+    request.reason = Some(format!("leaked {secret}"));
+
+    store.delete_artifact(request).unwrap();
+
+    let intent_log = fs::read_to_string(root.path().join("purge-intent.jsonl")).unwrap();
+    assert!(
+        !intent_log.contains(secret),
+        "purge intent log retained the raw credential"
+    );
+    assert!(intent_log.contains(&handle.digest));
+
+    let connection = inspect(root.path());
+    let (operator_id, reason): (String, String) = connection
+        .query_row(
+            "SELECT operator_id,reason FROM artifact_purge_tombstones WHERE artifact_digest=?1",
+            [&handle.digest],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        !operator_id.contains(secret),
+        "tombstone kept the credential"
+    );
+    assert!(!reason.contains(secret), "tombstone kept the credential");
+
+    let audits: Vec<Vec<u8>> = connection
+        .prepare("SELECT payload FROM change_event")
+        .unwrap()
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for payload in audits {
+        assert!(
+            !String::from_utf8_lossy(&payload).contains(secret),
+            "change_event payload retained the raw credential"
+        );
+    }
+}
