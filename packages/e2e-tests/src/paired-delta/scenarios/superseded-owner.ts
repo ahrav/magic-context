@@ -1,0 +1,11 @@
+import { defineScenario } from "./support";
+
+export const supersededOwner = defineScenario({
+    scenarioId: "var-superseded-owner",
+    familyId: "fam-superseded-current",
+    title: "Prefer the current owner over a stale owner",
+    evidence: "Ownership moved from RuntimeCore to StorageReliability; StorageReliability is authoritative.",
+    answer: "StorageReliability",
+    answerMatch: "case-insensitive",
+    locatorId: "mem-current-owner",
+});

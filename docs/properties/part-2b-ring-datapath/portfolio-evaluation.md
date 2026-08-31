@@ -251,15 +251,21 @@ questions. In `fault-map.md`: that record's map row.
 
 The check asserted exit "within one `POLL_INTERVAL` of the first empty inbound
 observation and within the connection's `frame_deadline` overall", and defended
-itself with "the bound is stated in the units the code bounds". It is not.
-`frame_deadline` bounds exactly one construct: the ingress-charge loop inside
+itself with "the bound is stated in the units the code bounds". It was not.
+(The code quoted in this section is the polling-era `ring_transport.rs` at
+`e447c927`; PR #131, merge `5d638e3e8`, later removed `POLL_INTERVAL` outright
+and replaced the sleeps with eventfd waits, so the line numbers here are
+historical. The finding itself carries over: the post-#131 record keeps the
+frame-count bound and the undeadlined-send residual, re-anchored in
+`catalog.md`.) In that code, `frame_deadline` bounded exactly one construct:
+the ingress-charge loop inside
 `receive_one`, where `let deadline = StdInstant::now() + frame_deadline` at `:487`
-is tested at `:495` and exits `Overloaded` at `:499`. Nothing else in the endpoint
-loop consults it. The cancellation report specifically does not:
-`:395-397` is `inbound.send(Err(ReadClose::Cancelled)).await` on a bounded `mpsc`
-channel of `queue_frames` capacity, with no deadline, so if the connection task is
-not draining, the report parks indefinitely. The two frame-delivery sends at
-`:478-482` and `:525-530` have the same shape. And `POLL_INTERVAL` is the sleep in
+was tested at `:495` and exited `Overloaded` at `:499`. Nothing else in the endpoint
+loop consulted it. The cancellation report specifically did not:
+`:395-397` was `inbound.send(Err(ReadClose::Cancelled)).await` on a bounded `mpsc`
+channel of `queue_frames` capacity, with no deadline, so if the connection task was
+not draining, the report parked indefinitely. The two frame-delivery sends at
+`:478-482` and `:525-530` had the same shape. And `POLL_INTERVAL` was the sleep in
 the empty-queue arms (`:511-514`, `:442`), not a bound on reporting.
 
 **The choice made.** The evaluation allowed either a frame-count bound or an

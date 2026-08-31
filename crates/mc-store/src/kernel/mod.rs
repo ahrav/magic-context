@@ -1,5 +1,6 @@
 mod admission;
 mod backup;
+mod cas;
 mod durable_fs;
 mod envelope;
 mod facts;
@@ -24,14 +25,25 @@ pub use backup::{
     verify_backup_with_deadline_for_test, RestoreFault,
 };
 pub use backup::{BackupManifest, BackupRequest};
+#[cfg(feature = "test-support")]
+pub use cas::{
+    ArtifactDeletionFault, ArtifactDeletionHook, ArtifactGcFault, ArtifactIngestFault,
+    ArtifactIngestHook,
+};
+pub use cas::{
+    ArtifactDeletionIdentity, ArtifactDeletionKind, ArtifactDeletionRequest,
+    ArtifactDeletionResult, ArtifactDestination, ArtifactEligibility, ArtifactError,
+    ArtifactErrorKind, ArtifactGcResult, ArtifactHandle, ArtifactIngestRequest,
+    BarrierConsumerStatus, DeletionBarrierStatus, EligibilityDeniedReason, ProviderEgress,
+};
 pub use envelope::{
     AlignmentProjectionSpec, CommitIntent, CommitReceipt, DomainSpec, Envelope, KnownAsOf,
     ObjectRow, RemediationTarget, RepositoryProvenance, Sensitivity, StagingCandidateRow,
     StagingCandidateSpec, OPERATOR_REDACTION_PLACEHOLDER,
 };
-pub use facts::{KernelFacts, MAIN_FILE_WARN_BYTES};
+pub use facts::{ArtifactBudgetFacts, KernelFacts, MAIN_FILE_WARN_BYTES};
 pub use open::{KernelError, KernelStore};
-pub use outbox::OutboxPruneResult;
+pub use outbox::{ConsumerAbandonment, OutboxPruneResult};
 pub use retention::{StagingMaintenanceResult, StagingTerminalState, STAGING_RETENTION_MS};
 
 /// A constraint violation is permanent and a lock wait is retryable, so collapsing both into `Io` would make either untreatable.

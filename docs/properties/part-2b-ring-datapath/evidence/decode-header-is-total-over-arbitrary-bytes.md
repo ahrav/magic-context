@@ -53,17 +53,17 @@ a `Copy` enum (`:219-220`). No `Vec`,
 
 **Reachability.** Three production call sites, all ungated:
 
-- `ring_transport.rs:471`, in `receive_one`, paired with
-  `validate_inbound_header` at `:473`. Reached because `RingTransport` is
+- `ring_transport.rs:503`, in `receive_one`, paired with
+  `validate_inbound_header` at `:505`. Reached because `RingTransport` is
   constructed unconditionally at `runtime.rs:876`, stored non-optionally as
   `HostShared.ring` (`:104`), and `ring.prepare(...)` is called by every
   authenticated connection at `connection.rs:148`.
-- `ring_transport.rs:701`, in `RingClientEndpoint::try_recv_with`, reached in
-  production from `client.rs:1880`.
-- `client.rs:1908`, in `decode_outbound`.
+- `ring_transport.rs:730`, in `RingClientEndpoint::try_recv_with` (declared at
+  `:723`), reached in production from `client.rs:1903`.
+- `client.rs:1978`, in `decode_outbound` (declared at `:1973`).
 
-A fourth site, `ring_transport.rs:569`, sits inside `if let Some(hook)` at
-`:568` and is reached only through the test-only `PublishHook`. `wire.rs` has
+A fourth site, `ring_transport.rs:593`, sits inside `if let Some(hook)` at
+`:592` and is reached only through the test-only `PublishHook`. `wire.rs` has
 exactly two `#[cfg]` attributes, `:541` and `:646`, and neither is on this path.
 
 **Existing coverage.** Two in-file tests, both table-driven over hand-picked
@@ -99,10 +99,10 @@ that no check would catch.
 
 Step one: a caller starts passing a slice whose length is not statically 21.
 Today all three production callers pass an exactly-21-byte array —
-`ring_transport.rs:471` and `:701` pass `&lease.wire_header()`, typed
-`[u8; WIRE_V2_HEADER_BYTES]` at `crates/mc-shm-transport/src/lease.rs:163` with
-that constant equal to 21 at `descriptor.rs:10`, and `client.rs:1908` passes
-`header_bytes: &[u8; HEADER_LEN]` narrowed by the `try_into` at `:1907`. A
+`ring_transport.rs:503` and `:730` pass `&lease.wire_header()`, typed
+`[u8; WIRE_V2_HEADER_BYTES]` at `crates/mc-shm-transport/src/lease.rs:152` with
+that constant equal to 21 at `descriptor.rs:10`, and `client.rs:1978` passes
+`header_bytes: &[u8; HEADER_LEN]` narrowed by the `try_into` at `:1977`. A
 coalescing reader that hands `decode_header` its whole buffer, or a batched
 descriptor that yields a short tail, breaks that.
 
@@ -110,8 +110,8 @@ Step two: a version 3 whose `header_len_for_version` returns anything below 21,
 or a narrowing of `HEADER_LEN` itself. Gate 3 then admits a slice shorter than
 the largest constant index and `:355-357` panics inside the read loop on
 peer-controlled input. Because `run_endpoint`'s outer `catch_unwind` result is
-discarded with `let _ =` (`ring_transport.rs:279`) and `admission.release()`
-(`:291`) runs regardless, the panic is reported to the connection engine as
+discarded with `let _ =` (`ring_transport.rs:264`) and `admission.release()`
+(`:276`) runs regardless, the panic is reported to the connection engine as
 orderly completion — which is this sub-part's own
 `ring-a-endpoint-thread-panic-is-reported-as-orderly-completion`. So a decoder
 panic would surface as an unattributable peer close, not as a crash.

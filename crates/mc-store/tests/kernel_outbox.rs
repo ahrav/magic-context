@@ -281,7 +281,15 @@ fn deregistration_uses_commit_tip_without_publication_and_abandonment_records_fo
         .unwrap();
     store
         .commit(intent("abandon"), |envelope| {
-            envelope.abandon_outbox_consumer("abandoned", "operator-1", "retired", 42)?;
+            envelope.abandon_outbox_consumer(
+                "abandoned",
+                mc_store::kernel::ConsumerAbandonment {
+                    operator_id: "operator-1".to_string(),
+                    reason: "retired".to_string(),
+                    abandoned_at: 42,
+                    barrier_id: None,
+                },
+            )?;
             Ok("abandoned".to_string())
         })
         .unwrap();
