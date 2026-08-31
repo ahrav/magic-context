@@ -547,10 +547,7 @@ export async function runPairedDelta(
     const records: RolloutRecord[] = [];
     const coordinates: CoordinateResult[] = [];
     const invalidStoredCoordinates: RolloutCoordinate[] = [];
-    const exclusionCounts: PairedDeltaRunResult["exclusionCounts"] = {};
     let spentUsd = 0;
-    let observedCostRollouts = 0;
-    let estimatedCostRollouts = 0;
     let resumedRollouts = 0;
     let reserveUsd = options.deskCostCeilingUsd;
     let status: PairedDeltaRunResult["status"] = "completed";
@@ -636,8 +633,6 @@ export async function runPairedDelta(
                     if (boundToRun && isResumable(existing, options)) {
                         resumedRollouts++;
                         records.push(existing);
-                        if (existing.costSource === "observed") observedCostRollouts++;
-                        else estimatedCostRollouts++;
                         coordinateResult.cells[armId] = existing;
                         return existing;
                     }
@@ -742,9 +737,6 @@ export async function runPairedDelta(
                 coordinateResult.cells[armId] = record;
                 spentUsd += record.costUsd;
                 reserveUsd = Math.max(reserveUsd, record.costUsd);
-                if (record.costSource === "observed") observedCostRollouts++;
-                else estimatedCostRollouts++;
-                if (record.cell.reasonCode) incrementExclusion(exclusionCounts, armId, record.cell.reasonCode);
                 /** A harness that would not dispose may still be holding its workspace and session, so the next arm would measure a contaminated environment; the run ends rather than producing arms whose comparison cannot be trusted. commentlint: allow(JUDGE) */
                 if (disposalFailed) status = "harness-unreclaimed";
                 else if (failure instanceof RolloutDeadlineError) status = "deadline-reached";
@@ -812,17 +804,18 @@ export async function runPairedDelta(
         status = "invalid-stored-records";
     }
 
+    /** Derived from `records` at the end rather than counted along the way: every field they summarize already lives on each record, and a future path that pushes one — a new arm, another resume branch — cannot forget to update a counter it does not touch. commentlint: allow(JUDGE) */
     return {
         status,
         records,
         coordinates,
         spentUsd,
         reserveUsd,
-        observedCostRollouts,
-        estimatedCostRollouts,
+        observedCostRollouts: records.filter(({ costSource }) => costSource === "observed").length,
+        estimatedCostRollouts: records.filter(({ costSource }) => costSource === "estimated").length,
         resumedRollouts,
         invalidStoredCoordinates,
-        exclusionCounts,
+        exclusionCounts: exclusionCountsOf(records),
     };
 }
 
@@ -1111,13 +1104,16 @@ function worstCaseUsd(scenario: ScenarioDeclaration, prices: TokenPrices): numbe
     );
 }
 
-function incrementExclusion(
-    counts: PairedDeltaRunResult["exclusionCounts"],
-    armId: ArmId,
-    reasonCode: ReasonCode,
-): void {
-    const byReason = counts[armId] ??= {};
-    byReason[reasonCode] = (byReason[reasonCode] ?? 0) + 1;
+function exclusionCountsOf(
+    records: readonly RolloutRecord[],
+): PairedDeltaRunResult["exclusionCounts"] {
+    const counts: PairedDeltaRunResult["exclusionCounts"] = {};
+    for (const { armId, cell } of records) {
+        if (cell.reasonCode === null) continue;
+        const byReason = counts[armId] ??= {};
+        byReason[cell.reasonCode] = (byReason[cell.reasonCode] ?? 0) + 1;
+    }
+    return counts;
 }
 
 function coordinateKey(coordinate: RolloutCoordinate): string {

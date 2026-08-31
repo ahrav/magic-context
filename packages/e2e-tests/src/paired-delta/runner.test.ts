@@ -996,6 +996,34 @@ describe("paired-delta runner", () => {
         expect(result.coordinates[0]?.incomplete).toBe(true);
     });
 
+    it("derives the summary counters from the records it reports", async () => {
+        const store = new MemoryStore();
+        await runPairedDelta(
+            options(store),
+            dependencies((armId) =>
+                armId === "mc-off" ? new Error("first attempt failed") : observation(armId)),
+        );
+
+        const resumed = await runPairedDelta(options(store), dependencies());
+        const observed = resumed.records.filter(({ costSource }) => costSource === "observed");
+        const estimated = resumed.records.filter(({ costSource }) => costSource === "estimated");
+
+        // Counters that summarize `records` are read off `records`, so a resumed
+        // record and a freshly run one cannot be counted by different rules.
+        expect(resumed.observedCostRollouts).toBe(observed.length);
+        expect(resumed.estimatedCostRollouts).toBe(estimated.length);
+        expect(resumed.observedCostRollouts + resumed.estimatedCostRollouts)
+            .toBe(resumed.records.length);
+        expect(resumed.exclusionCounts).toEqual(
+            resumed.records.reduce<Record<string, Record<string, number>>>((counts, record) => {
+                if (record.cell.reasonCode === null) return counts;
+                const byReason = counts[record.armId] ??= {};
+                byReason[record.cell.reasonCode] = (byReason[record.cell.reasonCode] ?? 0) + 1;
+                return counts;
+            }, {}),
+        );
+    });
+
     it("classifies a malformed check vector as an exclusion and continues", async () => {
         const result = await runPairedDelta(
             options(),
