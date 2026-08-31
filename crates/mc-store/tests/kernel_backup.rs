@@ -898,7 +898,14 @@ fn threshold_size_restore_rto() {
     drop(connection);
     assert!(fs::metadata(root.path().join("core.sqlite")).unwrap().len() >= 1024 * 1024 * 1024);
     let store = KernelStore::open(root.path()).unwrap();
-    let backup = store.backup(request(destination.path())).unwrap();
+    // The shared `request` helper allows 30 s, which a 1 GiB copy plus a full
+    // integrity check can exceed on constrained I/O.
+    let rto_request = BackupRequest {
+        destination_directory: destination.path().to_path_buf(),
+        deadline: Instant::now() + Duration::from_secs(300),
+        capture_pin_expires_at: None,
+    };
+    let backup = store.backup(rto_request).unwrap();
     let started = Instant::now();
     store.restore(&backup.destination_path).unwrap();
     // `restore_elapsed` excludes backup time and the post-restore assertions.
@@ -1041,4 +1048,58 @@ fn sensitivity_classification_scans_every_table_carrying_the_column() {
             "{required} missing from the sensitivity scan"
         );
     }
+}
+
+#[test]
+fn restore_interrupted_before_displacement_keeps_the_live_family() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // A process killed here leaves the marker published, the recovery directory
+    // empty, and the live family as the only copy of the data.
+    let recovery_dir = store.abandon_restore_marker_for_test().unwrap();
+    assert!(recovery_dir.is_dir());
+    assert_eq!(fs::read_dir(&recovery_dir).unwrap().count(), 0);
+    assert!(root.path().join("core.sqlite").exists());
+    drop(store);
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
+    assert!(!root.path().join("core.sqlite.mc-restore").exists());
+    assert!(!recovery_dir.exists());
+    assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
+}
+
+#[test]
+fn restore_interrupted_after_sidecars_move_keeps_the_live_main_file() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // `displace_family` moves sidecars before the main file, so a kill mid-way
+    // leaves the main file live and its sidecars in the recovery directory.
+    let recovery_dir = store.abandon_restore_marker_for_test().unwrap();
+    drop(store);
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!(
+            "{}{suffix}",
+            root.path().join("core.sqlite").to_str().unwrap()
+        ));
+        if sidecar.exists() {
+            fs::rename(&sidecar, recovery_dir.join(sidecar.file_name().unwrap())).unwrap();
+        }
+    }
+    assert!(root.path().join("core.sqlite").exists());
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
+    assert!(!recovery_dir.exists());
+    assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
 }

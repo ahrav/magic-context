@@ -23,6 +23,9 @@ use super::open::{
 use super::{KernelError, KernelStore, Sensitivity};
 
 const BACKUP_PAGES_PER_STEP: i32 = 128;
+// `Busy` and `Locked` mean the step made no progress, so yielding alone spins a
+// core flat until the deadline when another connection holds the source lock.
+const BACKUP_CONTENTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
 const DEFAULT_CAPTURE_PIN_LIFETIME_MS: i64 = 24 * 60 * 60 * 1_000;
 const BACKUP_PREFIX: &str = "core-backup-";
 const RESTORE_INFIX: &str = ".mc-restore-";
@@ -64,6 +67,7 @@ pub struct BackupManifest {
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreFault {
+    BeforeDisplace,
     AfterDisplace,
     RecoveryFailure,
 }
@@ -158,7 +162,9 @@ impl KernelStore {
                     {
                         StepResult::Done => break,
                         StepResult::More => {}
-                        StepResult::Busy | StepResult::Locked => std::thread::yield_now(),
+                        StepResult::Busy | StepResult::Locked => {
+                            std::thread::sleep(BACKUP_CONTENTION_BACKOFF);
+                        }
                         _ => return Err(KernelError::InvalidBackup),
                     }
                 }
@@ -178,6 +184,9 @@ impl KernelStore {
                 return Err(KernelError::Deadline);
             }
             cleanup_backup_sidecars(&destination, &temp_name)?;
+            // SQLite uses a pathname, while cleanup uses the verified directory
+            // descriptor; comparing identities rejects destination swaps.
+            assert_same_file(&destination, &temp_name, &sqlite_temp_path)?;
             File::open(&sqlite_temp_path)
                 .and_then(|file| file.sync_all())
                 .map_err(|_| KernelError::Io)?;
@@ -271,7 +280,7 @@ impl KernelStore {
     }
 
     pub fn restore(&self, backup_path: impl AsRef<Path>) -> Result<i64, KernelError> {
-        self.restore_inner(backup_path.as_ref(), false, false, None)
+        self.restore_inner(backup_path.as_ref(), None, None)
     }
 
     #[cfg(feature = "test-support")]
@@ -280,7 +289,17 @@ impl KernelStore {
         backup_path: impl AsRef<Path>,
         mut hook: impl FnMut(),
     ) -> Result<i64, KernelError> {
-        self.restore_inner(backup_path.as_ref(), false, false, Some(&mut hook))
+        self.restore_inner(backup_path.as_ref(), None, Some(&mut hook))
+    }
+
+    // Leaves the on-disk state a process killed between publishing the marker and
+    // displacing the family would leave: marker present, recovery directory empty,
+    // live family untouched.
+    #[cfg(feature = "test-support")]
+    pub fn abandon_restore_marker_for_test(&self) -> Result<PathBuf, KernelError> {
+        let recovery_dir = allocate_recovery_dir(&self.db_path)?;
+        publish_restore_marker(&self.db_path, &recovery_dir)?;
+        Ok(recovery_dir)
     }
 
     #[cfg(feature = "test-support")]
@@ -289,21 +308,30 @@ impl KernelStore {
         backup_path: impl AsRef<Path>,
         fault: RestoreFault,
     ) -> Result<i64, KernelError> {
-        self.restore_inner(
-            backup_path.as_ref(),
-            true,
-            fault == RestoreFault::RecoveryFailure,
-            None,
-        )
+        self.restore_inner(backup_path.as_ref(), Some(fault), None)
     }
 
     fn restore_inner(
         &self,
         backup_path: &Path,
-        fault_after_displace: bool,
-        force_recovery_failure: bool,
+        #[cfg(feature = "test-support")] fault: Option<RestoreFault>,
+        #[cfg(not(feature = "test-support"))] fault: Option<std::convert::Infallible>,
         mut hook: Option<&mut dyn FnMut()>,
     ) -> Result<i64, KernelError> {
+        #[cfg(feature = "test-support")]
+        let fault_before_displace = fault == Some(RestoreFault::BeforeDisplace);
+        #[cfg(feature = "test-support")]
+        let fault_after_displace = matches!(
+            fault,
+            Some(RestoreFault::AfterDisplace) | Some(RestoreFault::RecoveryFailure)
+        );
+        #[cfg(feature = "test-support")]
+        let force_recovery_failure = fault == Some(RestoreFault::RecoveryFailure);
+        #[cfg(not(feature = "test-support"))]
+        let (fault_before_displace, fault_after_displace, force_recovery_failure) = {
+            let _ = fault;
+            (false, false, false)
+        };
         let mut source = open_private_regular_nofollow(backup_path)?;
         let source_seq = verify_database(backup_path, None, KernelError::InvalidRestore, None)?;
 
@@ -345,6 +373,9 @@ impl KernelStore {
         drop(old_writer);
         let mut displaced = false;
         let restore_result = (|| {
+            if fault_before_displace {
+                return Err(KernelError::Fault);
+            }
             displace_family(&self.db_path, &recovery_dir)?;
             displaced = true;
             if let Some(callback) = hook.as_mut() {
@@ -519,6 +550,16 @@ fn create_private_file_at(directory: &File, name: &str) -> Result<(), KernelErro
     )
     .map_err(|_| KernelError::Io)?;
     drop(file);
+    Ok(())
+}
+
+fn assert_same_file(directory: &File, name: &str, pathname: &Path) -> Result<(), KernelError> {
+    let anchored = rfs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| KernelError::InvalidBackup)?;
+    let resolved = fs::symlink_metadata(pathname).map_err(|_| KernelError::InvalidBackup)?;
+    if anchored.st_dev != resolved.dev() || anchored.st_ino != resolved.ino() {
+        return Err(KernelError::InvalidBackup);
+    }
     Ok(())
 }
 
@@ -835,7 +876,14 @@ pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
         return Err(KernelError::Inconclusive);
     }
     remove_restore_scratch(path)?;
-    remove_family(path).map_err(|_| KernelError::Inconclusive)?;
+    // Only remove the live family after a displaced main file exists; otherwise it
+    // remains the sole copy.
+    let displaced_main = marker
+        .recovery_directory
+        .join(path.file_name().ok_or(KernelError::Inconclusive)?);
+    if displaced_main.exists() {
+        remove_family(path).map_err(|_| KernelError::Inconclusive)?;
+    }
     restore_displaced_family(path, &marker.recovery_directory)
         .map_err(|_| KernelError::Inconclusive)?;
     remove_restore_marker(path)?;
