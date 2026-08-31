@@ -377,6 +377,19 @@ fn cas_control_rows_preserve_reclaim_purge_and_backfill_state() {
             [],
         )
         .is_err());
+    assert!(conn
+        .execute(
+            "UPDATE artifact_pending_unlinks SET artifact_reference='retargeted'
+             WHERE artifact_digest='digest'",
+            [],
+        )
+        .is_err());
+    conn.execute(
+        "UPDATE artifact_pending_unlinks SET last_attempt_at=9,attempt_count=1
+         WHERE artifact_digest='digest'",
+        [],
+    )
+    .unwrap();
 }
 
 #[test]

@@ -192,21 +192,27 @@ pub(super) fn publish_noreplace_locked(
     ) {
         Ok(()) => {
             match rfs::unlinkat(directory, temp_name, AtFlags::empty()) {
-                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-                Err(error) => return Err(classify_errno(error)),
+                Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(PublishOutcome::Published),
+                // When rollback of `final_name` also fails, the publication
+                // stands and the stale temp link is benign residue.
+                Err(unlink_error) => match rfs::unlinkat(directory, final_name, AtFlags::empty()) {
+                    Ok(()) | Err(rustix::io::Errno::NOENT) => Err(classify_errno(unlink_error)),
+                    Err(_) => Ok(PublishOutcome::Published),
+                },
             }
-            Ok(PublishOutcome::Published)
         }
         Err(rustix::io::Errno::EXIST) => Ok(PublishOutcome::AlreadyExists),
         Err(error) => Err(classify_errno(error)),
     }
 }
 
+// Retrying after a failed post-unlink sync can observe `NOENT`; sync again so
+// the unlink reaches the durability boundary.
 pub(super) fn durable_unlink(directory: &File, name: &str) -> Result<(), StorageError> {
     validate_name(name)?;
     match rfs::unlinkat(directory, name, AtFlags::empty()) {
         Ok(()) => sync_directory(directory),
-        Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(rustix::io::Errno::NOENT) => sync_directory(directory),
         Err(error) => Err(classify_errno(error)),
     }
 }
