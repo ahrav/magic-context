@@ -14,7 +14,14 @@ export const MIN_BOOTSTRAP_RESAMPLES = 2000;
 // `splitmix32` consumes a 32-bit state, so wider seeds would silently alias.
 export const MAX_BOOTSTRAP_SEED = 0xFFFFFFFF;
 export const PRIMARY_ENDPOINTS = ["mc-on-vs-mc-off", "mc-on-vs-compaction"] as const;
-export const REGRET_ENDPOINTS = ["retrieval", "formation", "representation"] as const;
+// The intervention arm behind the retrieval rung is mock-served, so its estimate is provider-mixed rather than live.
+export const PROVIDER_MIXED_REGRET_ENDPOINTS = ["retrieval"] as const;
+export const LIVE_REGRET_ENDPOINTS = ["formation", "representation"] as const;
+// Composing the regret set from the two partitions keeps a new rung from landing in neither aggregate bucket.
+export const REGRET_ENDPOINTS = [
+    ...PROVIDER_MIXED_REGRET_ENDPOINTS,
+    ...LIVE_REGRET_ENDPOINTS,
+] as const;
 export type PrimaryEndpoint = (typeof PRIMARY_ENDPOINTS)[number];
 export type RegretEndpoint = (typeof REGRET_ENDPOINTS)[number];
 export type DeltaEndpoint = PrimaryEndpoint | RegretEndpoint;
@@ -341,8 +348,10 @@ export function estimateFamilyDeltas(input: {
         evidenceSufficient: analyzableFamilyCount >= input.minimumAnalyzableFamilyCount,
         endpoints,
         liveRegret: estimates.filter(({ endpoint }) =>
-            endpoint === "formation" || endpoint === "representation"),
-        providerMixedRegret: estimates.filter(({ endpoint }) => endpoint === "retrieval"),
+            LIVE_REGRET_ENDPOINTS.includes(endpoint as (typeof LIVE_REGRET_ENDPOINTS)[number])),
+        providerMixedRegret: estimates.filter(({ endpoint }) =>
+            PROVIDER_MIXED_REGRET_ENDPOINTS.includes(
+                endpoint as (typeof PROVIDER_MIXED_REGRET_ENDPOINTS)[number])),
         rawRegretRecords: sorted.flatMap((observation) =>
             REGRET_ENDPOINTS.includes(observation.endpoint as RegretEndpoint)
                 ? [{

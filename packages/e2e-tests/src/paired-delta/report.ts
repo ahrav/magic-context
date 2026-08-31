@@ -1,7 +1,9 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
 import { compareCodeUnits } from "../code-unit-order";
+import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import { parsePolicyOwnerDocument } from "../prospective-holdout/contract";
+import { pairedFactsFingerprint } from "../prospective-holdout/report";
 import { ARM_IDS, REASON_CODES, type ArmId, type ReasonCode } from "./contract";
 import type { EndpointEstimate, FamilyDeltaAnalysis, RawRegretRecord } from "./estimator";
 
@@ -106,13 +108,22 @@ function requirePolicyBoundEstimatorSettings(
     policyPayload: unknown,
     analysis: FamilyDeltaAnalysis,
 ): void {
-    const declared = (policyPayload as { minimumAnalyzableFamilyCount?: unknown } | null)
-        ?.minimumAnalyzableFamilyCount;
+    const payload = policyPayload as {
+        minimumAnalyzableFamilyCount?: unknown;
+        targetMinimumDetectableDelta?: unknown;
+    } | null;
+    const declared = payload?.minimumAnalyzableFamilyCount;
     if (!Number.isSafeInteger(declared) || (declared as number) < 1) {
         throw new Error("paired-delta-report: policy-minimum-family-count-missing");
     }
     if (declared !== analysis.minimumAnalyzableFamilyCount) {
         throw new Error("paired-delta-report: policy-minimum-family-count-mismatch");
+    }
+    // The declared delta sizes the cohort during calibration rather than filtering an observed estimate, so this checks its shape and leaves resolution to the interval rule.
+    const detectableDelta = payload?.targetMinimumDetectableDelta;
+    if (typeof detectableDelta !== "number" || !Number.isFinite(detectableDelta) ||
+        detectableDelta <= 0) {
+        throw new Error("paired-delta-report: policy-detectable-delta-invalid");
     }
 }
 
@@ -120,6 +131,7 @@ export function buildPairedDeltaReport(input: {
     poolManifestFingerprint: string;
     pinnedSnapshotId: string;
     policyDocument: unknown;
+    pairs: readonly PairedCaseFact[];
     analysis: FamilyDeltaAnalysis;
     exclusions: readonly ExclusionCount[];
     secondaryMetrics: SecondaryMetrics;
@@ -141,6 +153,10 @@ export function buildPairedDeltaReport(input: {
         input.analysis.policyFingerprint !== policy.policyFingerprint
     ) {
         throw new Error("paired-delta-report: analysis-lane-binding-mismatch");
+    }
+    // The estimator adapter proves this against the pairs it analyzes; the report path proves it too rather than trusting the stamped value.
+    if (pairedFactsFingerprint(input.pairs) !== input.analysis.pairedFactsFingerprint) {
+        throw new Error("paired-delta-report: analysis-paired-facts-mismatch");
     }
     requirePolicyBoundEstimatorSettings(policy.policy, input.analysis);
     const exclusions = [...input.exclusions].sort((left, right) => compareCodeUnits(

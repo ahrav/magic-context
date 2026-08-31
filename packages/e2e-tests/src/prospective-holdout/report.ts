@@ -1,7 +1,6 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
-import { compareCodeUnits } from "../code-unit-order";
 import { HoldoutContractError, array, enumeration, exact, fail, hex64, integer, record, staticId } from "./contract";
-import type { PairedCaseFact } from "./comparison";
+import { comparePairedFacts, type PairedCaseFact } from "./comparison";
 import type { LifecycleState } from "./lifecycle";
 
 export const PROSPECTIVE_REPORT_SCHEMA = "prospective-release-report/v1";
@@ -72,16 +71,9 @@ export function completeFamilyCount(pairs: readonly PairedCaseFact[]): number {
     ).length;
 }
 
-function comparePairKeys(left: PairedCaseFact, right: PairedCaseFact): number {
-    return compareCodeUnits(
-        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`,
-        `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
-    );
-}
-
 // Fingerprint inputs use this sort order to produce a stable canonical order.
 export function sortPairedFacts(pairs: readonly PairedCaseFact[]): PairedCaseFact[] {
-    return [...pairs].sort(comparePairKeys);
+    return [...pairs].sort(comparePairedFacts);
 }
 
 export function pairedFactsFingerprint(pairs: readonly PairedCaseFact[]): string {

@@ -5,6 +5,7 @@ import type { ProspectiveCellResult } from "../prospective-holdout/runner";
 import { cellResultFixture, H1, H2, H3 } from "../prospective-holdout/test-fixtures";
 import {
     PairedDeltaEstimatorError,
+    REGRET_ENDPOINTS,
     createFamilyEstimatorAdapter,
     estimateFamilyDeltas,
     type FamilyDeltaAnalysis,
@@ -172,6 +173,23 @@ describe("family-clustered delta estimator", () => {
         expect(reversed).toEqual(forward);
         expect(forward.rawRegretRecords.map(({ familyId, coordinateId }) => [familyId, coordinateId]))
             .toEqual([["a", "b:c"], ["a:b", "c"]]);
+    });
+
+    it("partitions every declared regret endpoint into exactly one aggregate bucket", () => {
+        const result = estimate({
+            observations: [
+                ...observations,
+                { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "retrieval", delta: 0.2, runHealth: "completed" },
+                { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "formation", delta: 0.3, runHealth: "completed" },
+                { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "representation", delta: 0.4, runHealth: "completed" },
+            ],
+        });
+        const bucketed = [
+            ...result.liveRegret.map(({ endpoint }) => endpoint),
+            ...result.providerMixedRegret.map(({ endpoint }) => endpoint),
+        ];
+        expect([...bucketed].sort()).toEqual([...REGRET_ENDPOINTS].sort());
+        expect(new Set(bucketed).size).toBe(bucketed.length);
     });
 
     it("rejects an undeclared endpoint instead of estimating and dropping it", () => {

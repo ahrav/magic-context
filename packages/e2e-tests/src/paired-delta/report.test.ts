@@ -3,7 +3,10 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import { POLICY_OWNER_SCHEMA } from "../prospective-holdout/contract";
+import { pairedFactsFingerprint } from "../prospective-holdout/report";
+import { cellResultFixture } from "../prospective-holdout/test-fixtures";
 import { estimateFamilyDeltas } from "./estimator";
 import {
     PAIRED_DELTA_REPORT_SCHEMA,
@@ -13,6 +16,23 @@ import {
 
 const H1 = "1".repeat(64);
 const H2 = "2".repeat(64);
+
+function pair(seed: number): PairedCaseFact {
+    return {
+        caseId: `case-${"a".repeat(32)}`,
+        familyId: "fam-a",
+        implementationFingerprint: H2,
+        model: "fixture/model",
+        seed,
+        platform: "linux-x64",
+        releaseN: cellResultFixture("release-n"),
+        releaseNMinus1: cellResultFixture("release-n-minus-1"),
+        status: "complete",
+    };
+}
+
+const pairs = [pair(9), pair(7)];
+const PAIRED_FACTS = pairedFactsFingerprint(pairs);
 
 function policyDocument(minimumAnalyzableFamilyCount = 2) {
     const payload = { minimumAnalyzableFamilyCount, targetMinimumDetectableDelta: 0.1 };
@@ -42,7 +62,7 @@ function analysisFixture(policyFingerprint: string) {
             poolManifestFingerprint: H1,
             pinnedSnapshotId: "anthropic-model-20260830",
             policyFingerprint,
-            pairedFactsFingerprint: H2,
+            pairedFactsFingerprint: PAIRED_FACTS,
         },
     });
 }
@@ -53,6 +73,7 @@ function report(overrides: Partial<Parameters<typeof buildPairedDeltaReport>[0]>
         poolManifestFingerprint: H1,
         pinnedSnapshotId: "anthropic-model-20260830",
         policyDocument: policy,
+        pairs,
         analysis: analysisFixture(policy.policyFingerprint),
         exclusions: [
             { armId: "mc-off", reasonCode: "provider-unavailable", count: 2 },
@@ -107,7 +128,7 @@ describe("paired-delta report", () => {
                 poolManifestFingerprint: H1,
                 pinnedSnapshotId: "anthropic-model-20260830",
                 policyFingerprint: policy.policyFingerprint,
-                pairedFactsFingerprint: H2,
+                pairedFactsFingerprint: PAIRED_FACTS,
             },
         });
         const built = report({ policyDocument: policy, analysis });
@@ -150,6 +171,7 @@ describe("paired-delta report", () => {
                 policy: { minimumAnalyzableFamilyCount: 2, targetMinimumDetectableDelta: 0.1 },
                 policyFingerprint: built.body.policyFingerprint,
             },
+            pairs,
             analysis: built.body.analysis,
             exclusions: [],
             secondaryMetrics: {
@@ -173,6 +195,7 @@ describe("paired-delta report", () => {
                 policy: {},
                 policyFingerprint: H2,
             },
+            pairs,
             analysis: built.body.analysis,
             exclusions: [],
             secondaryMetrics: {
@@ -201,7 +224,7 @@ describe("paired-delta report", () => {
                 poolManifestFingerprint: H1,
                 pinnedSnapshotId: "anthropic-model-20260830",
                 policyFingerprint: policy.policyFingerprint,
-                pairedFactsFingerprint: H2,
+                pairedFactsFingerprint: PAIRED_FACTS,
             },
         });
         const built = report({ policyDocument: policy, analysis });
@@ -233,6 +256,25 @@ describe("paired-delta report", () => {
         })).toThrow(/policy-minimum-family-count-missing/);
         expect(report({ policyDocument: policy, analysis: analysisFixture(policy.policyFingerprint) })
             .body.analysis.minimumAnalyzableFamilyCount).toBe(2);
+    });
+
+    it("rejects an analysis stamped for a different cohort than the supplied pairs", () => {
+        expect(() => report({ pairs: [pair(9)] }))
+            .toThrow(/analysis-paired-facts-mismatch/);
+    });
+
+    it("rejects a ready policy whose detectable delta is unusable", () => {
+        const payload = { minimumAnalyzableFamilyCount: 2, targetMinimumDetectableDelta: 0 };
+        expect(() => report({
+            policyDocument: {
+                schema: POLICY_OWNER_SCHEMA,
+                owner: "magic-context-x4l.14",
+                status: "ready",
+                policy: payload,
+                policyFingerprint: canonicalFingerprint(payload),
+            },
+            analysis: analysisFixture(canonicalFingerprint(payload)),
+        })).toThrow(/policy-detectable-delta-invalid/);
     });
 
     it("rejects arm and reason identifiers outside the declared contract", () => {
