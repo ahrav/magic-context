@@ -30,13 +30,6 @@ const OPERATION_KEYS: [&str; 7] = [
     "fixture/accept-redis",
 ];
 
-// Acceptance clause map:
-// R6, R20 -> staged_candidate_never_enters_canonical_state.
-// R16, R17, KTD6, KTD7 -> branch_alignment_then_main_acceptance_supersedes_lru_decision.
-// R18 -> false_lru_classification_is_corrected_append_only.
-// R19 -> canonical_slice_and_projection_are_restart_identical.
-// Deterministic rebuild acceptance -> canonical_slice_and_projection_are_restart_identical.
-
 struct Fixture {
     store: KernelStore,
     pre_correction: i64,
@@ -462,6 +455,23 @@ fn query_count_matching(root: &std::path::Path, sql: &str, pattern: &str) -> i64
 fn branch_alignment_then_main_acceptance_supersedes_lru_decision() {
     let root = tempfile::tempdir().unwrap();
     let fixture = build_fixture(root.path());
+
+    assert_eq!(
+        query_count(root.path(), "SELECT count(*) FROM scope_term"),
+        3
+    );
+    assert_eq!(
+        query_strings(
+            root.path(),
+            "SELECT scope_id || '|' || dimension || '|' || operator || '|' || exact_value
+             FROM scope_term ORDER BY scope_id,ordinal",
+        ),
+        BTreeSet::from([
+            format!("{AUDIT_SCOPE}|git_branch|exact|audit"),
+            format!("{BRANCH_SCOPE}|git_branch|exact|feature/redis"),
+            format!("{MAIN_SCOPE}|git_branch|exact|main"),
+        ])
+    );
 
     let main = alignment_in_scope(&fixture.store, fixture.pre_acceptance, MAIN_SCOPE);
     assert_eq!(
