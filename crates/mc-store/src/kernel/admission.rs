@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "335e3c5a6dc20a8ce2e2a65da5fdb9d0d753d46097c29dbf45db551dfaedcd47";
+    "bc2eeb9e60399154fda6092475aadbf65653b25c447ec237c1a64cd018e19b6e";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -219,10 +219,6 @@ pub struct Evaluation {
     pub visibility: VisibilityRow,
     pub sensitivity: Sensitivity,
     pub outcome: Outcome,
-    /// The request was refused for want of authority. `Outcome::Deny` alone cannot
-    /// express this: `Other`, `MarkStale`, and `MarkDisputed` also resolve to it
-    /// while retaining the support their prior decision already held.
-    pub denied: bool,
 }
 
 // policy-digest:evaluator-start
@@ -347,7 +343,6 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         visibility,
         sensitivity,
         outcome,
-        denied,
     })
 }
 // policy-digest:evaluator-end
@@ -422,9 +417,15 @@ const APPROVAL_OBJECT_PREDICATE: &str = "o.object_kind='decision'
 
 /// Longest authority chain [`validate_approval`] walks, counted in hops from the
 /// approval to its root. A chain of this many hops holds this many plus one members,
-/// which is what the walk's row count is compared against. A chain is human-authored
-/// accepted decisions, so real ones are short; the bound only stops a pathological
-/// graph from making validation unbounded.
+/// which is what the walk's row count is compared against.
+///
+/// The walk deliberately expands one hop past this bound so an over-long chain
+/// produces one row more than the count permits. Stopping the expansion exactly at
+/// the bound would cap the row count at the permitted value, leaving the gate unable
+/// to fire and validating a long chain on a truncated prefix of its ancestors.
+///
+/// A chain is human-authored accepted decisions, so real ones are short; the bound
+/// only stops a pathological graph from making validation unbounded.
 const MAX_AUTHORITY_CHAIN_DEPTH: usize = 64;
 
 /// Whether the object named by `?1` qualifies as a live approval in its own right.
@@ -1546,7 +1547,7 @@ fn validate_approval(
                        AND a.commit_seq IS NOT NULL
                        AND a.policy_revision={POLICY_REVISION}
                        AND {LATEST_SUBJECT_DECISION_PREDICATE}
-                       AND chain.depth<{MAX_AUTHORITY_CHAIN_DEPTH}
+                       AND chain.depth<={MAX_AUTHORITY_CHAIN_DEPTH}
                        AND {qualifies}
                  )
                  SELECT (SELECT COUNT(*) FROM chain)<={MAX_AUTHORITY_CHAIN_DEPTH}+1

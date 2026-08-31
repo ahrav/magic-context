@@ -2622,3 +2622,81 @@ fn an_inert_citation_does_not_consume_approval_capacity() {
         })
         .unwrap();
 }
+
+/// The chain walk expands one hop past `MAX_AUTHORITY_CHAIN_DEPTH` so the member
+/// count can exceed what the gate permits. Stopping exactly at the bound caps the
+/// count at the permitted value, and the gate then never fires — an over-long chain
+/// would validate on a truncated prefix, leaving ancestors past the bound unchecked.
+#[test]
+fn an_authority_chain_past_the_depth_bound_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    let hops = 70;
+    {
+        let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        // Each link is a live accepted decision approved by the previous one, so every
+        // member qualifies on its own and only the chain's length can refuse it.
+        for hop in 0..hops {
+            let object = format!("chain-{hop:03}");
+            let parent = if hop == 0 {
+                "approval".to_string()
+            } else {
+                format!("chain-{:03}", hop - 1)
+            };
+            connection
+                .execute(
+                    "INSERT INTO object_registry(
+                         object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                         created_commit_seq,sensitivity_class
+                     ) VALUES (?1,'decision','approval-domain','fixture',?1,1,1,'normal')",
+                    rusqlite::params![object],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO decisions(
+                         decision_id,object_id,decision_kind,decision_payload,
+                         created_commit_seq,sensitivity_class
+                     ) VALUES (?1,?1,'adr_accepted',X'7b7d',1,'normal')",
+                    rusqlite::params![object],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO admission_decisions(
+                         admission_decision_id,subject_object_id,source_kind,source_id,
+                         source_revision,source_class,taint_class,event_kind,maturity,
+                         effective_maturity,disposition,visibility,outcome,sensitivity_class,
+                         policy_revision,reason,approval_object_id,elevated_support,commit_seq,
+                         decided_at
+                     ) VALUES (?1,?1,'fixture',?1,1,'explicit_user','user_explicit','approve',
+                               'approved','approved','active','automatic','admit','normal',1,
+                               'fixture',?2,1,1,1)",
+                    rusqlite::params![object, parent],
+                )
+                .unwrap();
+        }
+    }
+
+    // A link inside the bound still authorizes.
+    stage(&store, "shallow");
+    let mut shallow = request("shallow");
+    shallow.source_class = Some(SourceClass::ModelInference);
+    shallow.taint_class = Some(TaintClass::AssistantInference);
+    shallow.event.kind = EventKind::Verify;
+    shallow.event.trigger_object_id = None;
+    shallow.event.approval_object_id = Some("chain-000".to_string());
+    assert_eq!(admit(&store, shallow, "shallow", "shallow"), "admit");
+
+    // The deepest link sits past the bound, so its chain cannot be proven.
+    stage(&store, "deep");
+    let mut deep = request("deep");
+    deep.source_class = Some(SourceClass::ModelInference);
+    deep.taint_class = Some(TaintClass::AssistantInference);
+    deep.event.kind = EventKind::Verify;
+    deep.event.trigger_object_id = None;
+    deep.event.approval_object_id = Some(format!("chain-{:03}", hops - 1));
+    assert_eq!(admit(&store, deep, "deep", "deep"), "deny");
+}
