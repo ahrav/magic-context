@@ -1376,3 +1376,34 @@ fn a_dangling_reference_is_refused_even_when_integrity_check_passes() {
     assert_eq!(restore_oracle(root.path()), live_oracle);
     assert_eq!(insert_domain(&store, 3, Sensitivity::Normal), 3);
 }
+
+#[test]
+fn a_lone_wal_mode_main_file_is_refused_as_a_restore_source() {
+    let root = private_dir();
+    let source_root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // A byte-copy of a live main file keeps the WAL header while its committed pages
+    // may live only in a `-wal` that was not copied.
+    let other = KernelStore::open(source_root.path()).unwrap();
+    insert_domain(&other, 9, Sensitivity::Normal);
+    let bare = root.path().join("bare-main.sqlite");
+    fs::copy(source_root.path().join("core.sqlite"), &bare).unwrap();
+    fs::set_permissions(&bare, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(header_write_read_versions(&bare), (2, 2));
+
+    assert_eq!(
+        store.restore(&bare).unwrap_err(),
+        KernelError::InvalidRestore
+    );
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+
+    // A sealed artifact from `backup` is accepted, so the check is not rejecting
+    // every source.
+    let destination = private_dir();
+    let sealed = store.backup(request(destination.path())).unwrap();
+    assert_eq!(header_write_read_versions(&sealed.destination_path), (1, 1));
+    assert_eq!(store.restore(&sealed.destination_path).unwrap(), 1);
+}

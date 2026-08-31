@@ -354,7 +354,8 @@ impl KernelStore {
         // the installed bytes, so neither a replaced pathname nor an in-place
         // rewrite of the source can change what is installed. It also keeps the
         // verification outside the writer lock.
-        let staged = verify_database(&temp_path, None, KernelError::InvalidRestore, None);
+        let staged = assert_self_contained(&temp_path)
+            .and_then(|()| verify_database(&temp_path, None, KernelError::InvalidRestore, None));
         let source_seq = match staged {
             Ok(seq) => seq,
             Err(error) => {
@@ -871,6 +872,21 @@ fn cleanup_backup_sidecars(directory: &File, name: &str) -> Result<(), KernelErr
 
 // SQLite refuses to open a read-only artifact whose header declares WAL but
 // lacks a `-wal` sidecar, which is the state the backup copy leaves behind.
+// `backup` seals its artifacts into rollback-journal mode, so a source still
+// declaring WAL is a bare copy of a live main file whose committed pages may sit
+// in a `-wal` that was never copied. SQLite would open it and silently read the
+// older checkpointed state.
+fn assert_self_contained(path: &Path) -> Result<(), KernelError> {
+    let mut header = [0u8; 20];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|_| KernelError::InvalidRestore)?;
+    if header[18] != 1 || header[19] != 1 {
+        return Err(KernelError::InvalidRestore);
+    }
+    Ok(())
+}
+
 fn seal_artifact_journal(target: &Connection) -> Result<(), KernelError> {
     let mode: String = target
         .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
@@ -1058,42 +1074,53 @@ pub(super) fn reap_orphan_restore_recovery(path: &Path) -> Result<(), KernelErro
         return Ok(());
     };
     let prefix = format!("{}{RESTORE_INFIX}", stem.to_string_lossy());
+    // Every removal is relative to a descriptor opened with `NOFOLLOW`, so a
+    // candidate renamed and replaced by a symlink after enumeration cannot redirect
+    // an unlink outside this directory.
+    let parent_dir = rfs::open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| KernelError::Inconclusive)?;
+    let mut members = vec![path
+        .file_name()
+        .ok_or(KernelError::Inconclusive)?
+        .to_os_string()];
+    for sidecar in family_sidecars(path) {
+        members.push(
+            sidecar
+                .file_name()
+                .ok_or(KernelError::Inconclusive)?
+                .to_os_string(),
+        );
+    }
     let entries = fs::read_dir(parent).map_err(|_| KernelError::Inconclusive)?;
     let mut reaped = false;
     for entry in entries {
         let entry = entry.map_err(|_| KernelError::Inconclusive)?;
-        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+        let name = entry.file_name();
+        if !generated_recovery_suffix(&name, &prefix) {
             continue;
         }
-        let candidate = entry.path();
-        if !generated_recovery_suffix(&entry.file_name(), &prefix) {
-            continue;
-        }
-        // `is_dir` follows symlinks, so a symlinked candidate would redirect the
-        // unlinks below at whatever it points to.
-        let Ok(candidate_meta) = fs::symlink_metadata(&candidate) else {
+        let Ok(candidate) = rfs::openat(
+            &parent_dir,
+            &name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
             continue;
         };
-        if !candidate_meta.is_dir() {
-            continue;
-        }
-        // Removing only family members and then rmdir leaves any directory holding
-        // anything else intact, so an operator copy sharing the prefix survives.
-        for member in
-            std::iter::once(candidate.join(path.file_name().ok_or(KernelError::Inconclusive)?))
-                .chain(
-                    family_sidecars(path)
-                        .into_iter()
-                        .map(|sidecar| candidate.join(sidecar.file_name().unwrap_or_default())),
-                )
-        {
-            match fs::remove_file(&member) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        let candidate = File::from(candidate);
+        for member in &members {
+            match rfs::unlinkat(&candidate, member.as_os_str(), AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
                 Err(_) => return Err(KernelError::Inconclusive),
             }
         }
-        if fs::remove_dir(&candidate).is_err() {
+        drop(candidate);
+        if rfs::unlinkat(&parent_dir, &name, AtFlags::REMOVEDIR).is_err() {
             continue;
         }
         reaped = true;
