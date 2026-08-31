@@ -4844,3 +4844,156 @@ fn a_newer_own_decision_does_not_outrank_a_lineage_rejection_for_authority() {
         0
     );
 }
+
+#[test]
+fn support_above_the_automatic_ceiling_needs_an_approval_to_serve() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let seq = insert_subject(
+        &store,
+        "unbacked",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    drop(store);
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // `model_inference`/`assistant_inference` has an automatic ceiling of
+    // `candidate`, so `verified` support is a level the evaluator only reaches on a
+    // valid approval. This row names none.
+    connection
+        .execute(
+            "UPDATE admission_decisions
+             SET source_class='model_inference',taint_class='assistant_inference',
+                 maturity='verified',effective_maturity='verified',
+                 disposition='active',visibility='automatic',approval_object_id=NULL
+             WHERE subject_object_id='object-unbacked'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT disposition||'/'||visibility||'/'||effective_maturity
+             FROM admission_decisions WHERE subject_object_id='object-unbacked'"
+        ),
+        "active/automatic/verified"
+    );
+    for surface in [Surface::AutoInject, Surface::ExplicitSearch] {
+        assert!(
+            store.visible_as_of(surface, seq).unwrap().rows.is_empty(),
+            "support above the ceiling with no approval must fail closed"
+        );
+    }
+}
+
+#[test]
+fn a_failed_domain_admission_still_cascades_authority_loss() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    // Something promoted on the seeded approval's authority.
+    stage(&store, "rests-on-approval");
+    let mut approved = request("rests-on-approval");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("approval".to_string());
+    store
+        .commit(intent("promote-on-approval"), |envelope| {
+            envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "resting-domain".to_string(),
+                    object_id: "resting-object".to_string(),
+                    name: "name-rests-on-approval".to_string(),
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT effective_maturity FROM admission_decisions
+             WHERE subject_object_id='resting-object'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "verified"
+    );
+
+    // A rejection on the approval's lineage that never materializes an object still
+    // writes a lineage decision, so it must run the same cascade.
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    store
+        .stage_candidate(StagingCandidateSpec {
+            extraction_run_id: "run-reject-via-domain".to_string(),
+            candidate_id: "reject-via-domain".to_string(),
+            extractor: "fixture".to_string(),
+            source_kind: "fixture".to_string(),
+            source_id: "approval".to_string(),
+            source_revision: 1,
+            candidate_kind: "domain".to_string(),
+            payload: "name-reject-via-domain".to_string(),
+            provenance: Some(RepositoryProvenance {
+                repository_id: "repo".to_string(),
+                revision: "abc123".to_string(),
+            }),
+            recorded_at: now,
+            lease_expires_at: now + 60_000,
+        })
+        .unwrap();
+    store
+        .commit(intent("reject-via-domain"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                AdmissionRequest {
+                    candidate_id: Some("reject-via-domain".to_string()),
+                    subject_object_id: None,
+                    source_class: Some(SourceClass::TrustedLocalCode),
+                    taint_class: Some(TaintClass::CurrentCode),
+                    event: AdmissionEvent {
+                        kind: EventKind::ExplicitReject,
+                        trigger_object_id: None,
+                        approval_object_id: None,
+                        evidence_id: None,
+                        reason: "reject the approval's lineage".to_string(),
+                    },
+                },
+                AdmissionDomainSpec {
+                    domain_id: "never-made-domain".to_string(),
+                    object_id: "never-made-object".to_string(),
+                    name: "name-reject-via-domain".to_string(),
+                },
+            )?;
+            assert_eq!(decision.outcome.as_str(), "reject");
+            Ok(String::new())
+        })
+        .unwrap();
+    drop(store);
+
+    // No object was materialized, and the demotion still reached the dependent.
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='never-made-object'"
+        ),
+        0
+    );
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT effective_maturity FROM admission_decisions
+             WHERE subject_object_id='resting-object'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "candidate"
+    );
+}

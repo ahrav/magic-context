@@ -798,6 +798,20 @@ impl Envelope<'_> {
         ) {
             return Err(KernelError::AdmissionPolicy);
         }
+        let candidate_id = request.candidate_id.clone();
+        let reason = request.event.reason.clone();
+        // Both writes below land a candidate-scoped decision on the lineage, which
+        // can unseat an accepted decision that shares it.
+        self.with_authority_cascade(None, candidate_id.as_deref(), &reason, |envelope| {
+            envelope.admit_domain_candidate_write(request, domain)
+        })
+    }
+
+    fn admit_domain_candidate_write(
+        &mut self,
+        request: AdmissionRequest,
+        domain: AdmissionDomainSpec,
+    ) -> Result<AdmissionDecision, KernelError> {
         let prepared = self.prepare_admission(request)?;
         if prepared.facts.candidate_id().is_none() {
             return Err(KernelError::AdmissionPolicy);
@@ -1818,6 +1832,7 @@ struct DecidedColumns {
     source_class: &'static str,
     sensitivity_class: &'static str,
     policy_revision: &'static str,
+    approval_object_id: &'static str,
 }
 
 const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
@@ -1829,6 +1844,7 @@ const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
     source_class: "d_source_class",
     sensitivity_class: "d_sensitivity_class",
     policy_revision: "d_policy_revision",
+    approval_object_id: "d_approval_object_id",
 };
 
 const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
@@ -1840,6 +1856,7 @@ const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
     source_class: "s_source_class",
     sensitivity_class: "s_sensitivity_class",
     policy_revision: "s_policy_revision",
+    approval_object_id: "s_approval_object_id",
 };
 
 /// The strongest surface a single stored decision can justify, its sensitivity
@@ -1879,6 +1896,7 @@ fn decided_row(
     let historical = row
         .get::<_, Option<String>>(columns.maturity)?
         .and_then(|value| Maturity::try_from(value.as_str()).ok());
+    let approval = row.get::<_, Option<String>>(columns.approval_object_id)?;
     let expected = match (
         row.get::<_, Option<String>>(columns.effective_maturity)?
             .map(|value| Maturity::try_from(value.as_str())),
@@ -1886,9 +1904,18 @@ fn decided_row(
             .map(|value| Disposition::try_from(value.as_str())),
     ) {
         // Support can only clamp what history earned, so effective above
-        // historical is a state the evaluator cannot produce.
+        // historical is a state the evaluator cannot produce. Support above the
+        // pairing's automatic ceiling is one the evaluator only reaches on a valid
+        // approval, so a row that names none never earned it.
         (Some(Ok(effective)), Some(Ok(disposition)))
-            if historical.is_some_and(|historical| effective.rank() <= historical.rank()) =>
+            if historical.is_some_and(|historical| effective.rank() <= historical.rank())
+                && match (source, taint) {
+                    (Some(source), Some(taint)) => {
+                        effective.rank() <= automatic_ceiling(source, taint).rank()
+                            || approval.is_some()
+                    }
+                    _ => false,
+                } =>
         {
             Some(visibility_row(effective, disposition))
         }
@@ -1932,12 +1959,14 @@ impl KernelStore {
                             d.taint_class AS d_taint_class,d.source_class AS d_source_class,
                             d.policy_revision AS d_policy_revision,
                             d.sensitivity_class AS d_sensitivity_class,
+                            d.approval_object_id AS d_approval_object_id,
                             s.maturity AS s_maturity,
                             s.effective_maturity AS s_effective_maturity,
                             s.disposition AS s_disposition,s.visibility AS s_visibility,
                             s.taint_class AS s_taint_class,s.source_class AS s_source_class,
                             s.policy_revision AS s_policy_revision,
-                            s.sensitivity_class AS s_sensitivity_class
+                            s.sensitivity_class AS s_sensitivity_class,
+                            s.approval_object_id AS s_approval_object_id
                      FROM object_registry o
                      JOIN admission_decisions d
                        ON d.admission_decision_id={own}
