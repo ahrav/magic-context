@@ -695,3 +695,83 @@ fn resumed_purge_sweeps_digest_temps() {
         "resumed purge left plaintext under artifacts/tmp"
     );
 }
+
+#[test]
+fn released_pin_references_are_pruned_after_the_reclaim_grace() {
+    const GRACE_MS: i64 = 14 * 24 * HOUR_MS;
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = store.ingest_artifact(request("pinned", b"pinned")).unwrap();
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    let commit_seq: i64 = connection
+        .query_row("SELECT MAX(commit_seq) FROM commit_log", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO capture_pins(capture_pin_id,pin_kind,owner_id,commit_seq,lease_epoch,writer_epoch,created_at,expires_at)
+             VALUES ('pin-1','backup','owner',?1,1,1,0,1)",
+            params![commit_seq],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO capture_pin_refs(capture_pin_id,evidence_id) VALUES ('pin-1',?1)",
+            params![handle.evidence_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    // Expiry releases the pin, but the artifact stays live so reclamation never
+    // touches its references.
+    store.run_capture_pin_maintenance_for_test(2).unwrap();
+    let inspect = || {
+        Connection::open(root.path().join("core.sqlite"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM capture_pin_refs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(inspect(), 1);
+
+    store
+        .run_capture_pin_maintenance_for_test(GRACE_MS)
+        .unwrap();
+    assert_eq!(inspect(), 1, "pruned inside the grace window");
+
+    store
+        .run_capture_pin_maintenance_for_test(GRACE_MS + 3)
+        .unwrap();
+    assert_eq!(inspect(), 0, "released reference outlived the grace window");
+    assert!(object_path(root.path(), &handle.digest).exists());
+    // The pin row itself is the durable audit record and survives the prune.
+    assert_eq!(
+        Connection::open(root.path().join("core.sqlite"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM capture_pins", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn a_full_artifact_cap_is_reported_as_retriable() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open_with_artifact_cap_for_test(root.path(), 4).unwrap();
+    seed_domain(&store);
+    let old = store.ingest_artifact(request("cap-full", b"1234")).unwrap();
+    invalidate(root.path(), &old.evidence_id, 0);
+
+    let error = store
+        .ingest_artifact(request("cap-blocked", b"x"))
+        .unwrap_err();
+    assert_eq!(error.kind(), ArtifactErrorKind::Capacity);
+    // Reclamation frees the bytes, so the caller retrying after maintenance succeeds.
+    assert!(error.is_retriable());
+    store.run_staging_maintenance(15 * DAY_MS).unwrap();
+    store.ingest_artifact(request("cap-retry", b"x")).unwrap();
+}

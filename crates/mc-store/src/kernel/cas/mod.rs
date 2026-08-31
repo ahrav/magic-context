@@ -142,7 +142,8 @@ impl ArtifactError {
     pub fn is_retriable(&self) -> bool {
         matches!(
             self.kind,
-            ArtifactErrorKind::StorageExhausted
+            ArtifactErrorKind::Capacity
+                | ArtifactErrorKind::StorageExhausted
                 | ArtifactErrorKind::ReclaimInProgress
                 | ArtifactErrorKind::PurgeUnlinkPending
         )

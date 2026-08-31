@@ -10,7 +10,7 @@ use crate::kernel::envelope::check_fence;
 use crate::kernel::{KernelError, KernelStore};
 
 const HOUR_MS: i64 = 60 * 60 * 1_000;
-const REFERENCED_GRACE_MS: i64 = 14 * 24 * HOUR_MS;
+pub(in crate::kernel) const REFERENCED_GRACE_MS: i64 = 14 * 24 * HOUR_MS;
 const ORPHAN_GRACE_MS: i64 = HOUR_MS;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
