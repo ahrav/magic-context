@@ -124,6 +124,34 @@ describe("paired-delta scenario contract", () => {
         }
     });
 
+    it("requires the gold answer wherever an arm must derive it", () => {
+        const base = scenario();
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r2: { memories: [{ claim: "Unrelated note.", evidence: "Remember ID alpha-17." }] },
+                },
+            })),
+        ).toThrow(/r2\.memories: answer-absent/);
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r3: { evidence: "Some unrelated context." },
+                },
+            })),
+        ).toThrow(/r3\.evidence: answer-absent/);
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                turnScript: [
+                    { id: "turn-evidence", role: "user", content: "Consult the memo." },
+                    ...base.turnScript.slice(1),
+                ],
+            })),
+        ).toThrow(/evidenceTurnId: answer-absent/);
+    });
+
     it("requires the evidence turn to precede the R1 insertion point", () => {
         const base = scenario();
         /** Answer-free turns so the ordering rule is what fires, not the post-insertion leak scan. commentlint: allow(JUDGE) */
@@ -229,7 +257,7 @@ describe("paired-delta scenario contract", () => {
                 },
                 r2: {
                     memories: Array.from({ length: count }, (_, i) => ({
-                        claim: `Gold claim ${i}.`,
+                        claim: `Gold claim ${i} names alpha-17.`,
                         evidence: `Gold evidence ${i}.`,
                     })),
                 },

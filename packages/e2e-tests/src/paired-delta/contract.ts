@@ -248,6 +248,9 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     if (expectedAnswer !== expectedAnswer.trim()) {
         p.fail("scenario.expectedAnswer: not-trimmed");
     }
+    /** Case-folded for the same reason the query guard is: a model reads `sqlite` and `SQLite` as the same token, so gold supplied in either casing is gold supplied. commentlint: allow(JUDGE) */
+    const answerBearing = (text: string): boolean =>
+        text.toLowerCase().includes(expectedAnswer.toLowerCase());
     const r1Query = p.string(r1.query, "scenario.interventions.r1.query");
     /** `scriptedCtxSearchTurn` interpolates the query into the model-visible prompt, so a query containing the expected answer lets R1 pass its critical check with no retrieval. Case-folded because a model reads `sqlite` and `SQLite` as the same token. commentlint: allow(JUDGE) */
     if (r1Query.toLowerCase().includes(expectedAnswer.toLowerCase())) {
@@ -266,13 +269,15 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     if (!turnScript.slice(insertIndex + 1).some(({ role }) => role === "user")) {
         p.fail("scenario.interventions.r1.insertAfterTurnId: no-following-probe");
     }
-    /** From the insertion turn inclusive: the ballast precedes that turn, so an answer repeated there is not buried either and stays visible to every arm. The evidence turn carries the answer by design and is required to sit strictly earlier, so it is outside this range. commentlint: allow(JUDGE) */
-    if (
-        turnScript.slice(insertIndex).some(({ content }) =>
-            content.toLowerCase().includes(expectedAnswer.toLowerCase()))
-    ) {
-        p.fail("scenario.turnScript: post-insertion-answer-leak");
-    }
+    /** From the insertion turn inclusive: the ballast precedes that turn, so an answer repeated there is not buried either and stays visible to every arm. Runs after the ordering and evidence-gold rules so a misplaced evidence turn reports its own diagnostic instead of surfacing here. commentlint: allow(JUDGE) */
+    const postInsertionLeak = (): void => {
+        if (
+            turnScript.slice(insertIndex).some(({ content }) =>
+                content.toLowerCase().includes(expectedAnswer.toLowerCase()))
+        ) {
+            p.fail("scenario.turnScript: post-insertion-answer-leak");
+        }
+    };
     const locatorIds = parseStringArray(
         r1.locatorIds,
         MEMORY_ID_RE,
@@ -304,12 +309,21 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         memories.map(({ claim }) => normalizeMemoryContent(claim)),
         "scenario.interventions.r2.memories",
     );
+    /** R2 seeds these as verified project memory and the `<project-memory>` renderer exposes the claim, not this declaration's `evidence` provenance. With no claim carrying the answer the arm receives no gold and reproduces R1, so `R2 - R1` and `R3 - R2` describe a malformed intervention. One claim suffices: gold may be spread across a multi-locator set. commentlint: allow(JUDGE) */
+    if (!memories.some(({ claim }) => answerBearing(claim))) {
+        p.fail("scenario.interventions.r2.memories: answer-absent");
+    }
     const r3 = p.record(interventions.r3, "scenario.interventions.r3");
     /** `r2.memories` is the declaration's only gold, so it is also what a runner seeds and resolves `r1.locatorIds` against. Unequal lengths leave a handle with no `publicClaimId` to map to and make R1 and R2 compare different gold sets; pairing is positional. commentlint: allow(JUDGE) */
     if (locatorIds.length !== memories.length) {
         p.fail("scenario.interventions.r1.locatorIds: memory-cardinality-mismatch");
     }
     p.exact(r3, ["evidence"], "scenario.interventions.r3");
+    const r3Evidence = p.string(r3.evidence, "scenario.interventions.r3.evidence");
+    /** R3 is the oracle upper bound and this string is the only gold it receives verbatim. Without the answer in it the arm cannot produce `expectedAnswer` at all, so `R3 - R2` would report missing gold as representation regret. commentlint: allow(JUDGE) */
+    if (!answerBearing(r3Evidence)) {
+        p.fail("scenario.interventions.r3.evidence: answer-absent");
+    }
 
     const absence = p.record(root.absencePrecondition, "scenario.absencePrecondition");
     p.exact(
@@ -326,12 +340,15 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         p.fail("scenario.absencePrecondition.evidenceTurnId: unknown-turn");
     }
     /** Ballast can only bury evidence that already entered the transcript. Evidence supplied at or after the R1 insertion point stays directly available to the probe in every arm, so the baseline answers without retrieval and the absence comparison the lane exists to measure collapses. commentlint: allow(JUDGE) */
-    if (
-        turnScript.findIndex(({ id }) => id === evidenceTurnId) >=
-            turnScript.findIndex(({ id }) => id === insertAfterTurnId)
-    ) {
+    const evidenceIndex = turnScript.findIndex(({ id }) => id === evidenceTurnId);
+    if (evidenceIndex >= insertIndex) {
         p.fail("scenario.absencePrecondition.evidenceTurnId: not-before-r1-insertion");
     }
+    /** The mc-on arm forms and later retrieves memory from this turn alone, so an evidence turn that does not carry the answer leaves it nothing to preserve — its failures would measure a missing premise rather than preservation or retrieval. commentlint: allow(JUDGE) */
+    if (!answerBearing(turnScript[evidenceIndex]!.content)) {
+        p.fail("scenario.absencePrecondition.evidenceTurnId: answer-absent");
+    }
+    postInsertionLeak();
     const minimumBallastBytes = p.integer(
         absence.minimumBallastBytes,
         "scenario.absencePrecondition.minimumBallastBytes",
@@ -373,7 +390,7 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
                 locatorIds,
             },
             r2: { memories },
-            r3: { evidence: p.string(r3.evidence, "scenario.interventions.r3.evidence") },
+            r3: { evidence: r3Evidence },
         },
         absencePrecondition: {
             evidenceTurnId,

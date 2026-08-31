@@ -11,10 +11,14 @@ interface ScenarioSpec {
     locatorId: string;
 }
 
-/** A validity gate, not a scored check: `ArmedCellResult` keeps only aggregate counts, so scoring this on R1 alone would give R1 a larger denominator than the arms it is subtracted from and manufacture a retrieval delta. A runner calls this and, on false, records the R1 cell as not completed instead of letting it contribute a score. Matches the delivered memory-row marker (`[memory] ... id=<publicClaimId>`), not a bare id: the empty-results renderer echoes the query back, and a locator query *is* the resolved ids, so a bare substring test passes on zero retrieval. commentlint: allow(JUDGE) */
-export function r1WireDelivered(context: VerifierContext): boolean {
+/** A validity gate, not a scored check: `ArmedCellResult` keeps only aggregate counts, so scoring this on R1 alone would give R1 a larger denominator than the arms it is subtracted from and manufacture a retrieval delta. A runner calls this and, on false, records the R1 cell as not completed instead of letting it contribute a score. Keyed on the declaration's full handle set, because a runner that resolves only some handles would otherwise pass while R1 held less gold than R2. Matches the delivered memory-row marker (`[memory] ... id=<publicClaimId>`), not a bare id: the empty-results renderer echoes the query back, and a locator query *is* the resolved ids, so a bare substring test passes on zero retrieval. commentlint: allow(JUDGE) */
+export function r1WireDelivered(
+    declaration: ScenarioDeclaration,
+    context: VerifierContext,
+): boolean {
     const resolved = context.resolvedLocatorIds ?? [];
-    if (resolved.length === 0) return false;
+    if (resolved.length !== declaration.interventions.r1.locatorIds.length) return false;
+    if (new Set(resolved).size !== resolved.length) return false;
     const wire = context.scriptedTurnText ?? "";
     return resolved.every((id) => wire.includes(`id=${id}`));
 }

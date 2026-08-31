@@ -72,21 +72,28 @@ describe("paired-delta authored scenarios", () => {
                 expect(checks.every(({ passed }) => passed)).toBe(true);
                 expect(checks.some(({ id }) => id === "check-r1-wire")).toBe(false);
 
-                expect(r1WireDelivered({
+                expect(r1WireDelivered(scenario, {
                     armId: "r1",
                     workspacePath: root,
                     scriptedTurnText: `Found 1 results:\n${deliveredRows}`,
                     resolvedLocatorIds,
                 })).toBe(true);
+                /** A runner that resolves only some handles would otherwise pass while R1 held less gold than R2. commentlint: allow(JUDGE) */
+                expect(r1WireDelivered(scenario, {
+                    armId: "r1",
+                    workspacePath: root,
+                    scriptedTurnText: `Found 1 results:\n${deliveredRows}`,
+                    resolvedLocatorIds: resolvedLocatorIds.slice(0, -1),
+                })).toBe(false);
                 /** The empty-results renderer echoes the query, and a locator query is the resolved ids, so a bare substring test would treat zero retrieval as delivery. commentlint: allow(JUDGE) */
-                expect(r1WireDelivered({
+                expect(r1WireDelivered(scenario, {
                     armId: "r1",
                     workspacePath: root,
                     scriptedTurnText: `No results found for "${resolvedLocatorIds.join(" ")}" `
                         + "across notes, memories, primers, git commits, or message history.",
                     resolvedLocatorIds,
                 })).toBe(false);
-                expect(r1WireDelivered({
+                expect(r1WireDelivered(scenario, {
                     armId: "r1",
                     workspacePath: root,
                     scriptedTurnText: scenario.interventions.r1.locatorIds.join(" "),
