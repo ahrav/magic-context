@@ -3134,21 +3134,26 @@ product-context section above, which predates the ring-transport refactor.
 Status: active
 Exercised: not yet — no test has ever had frames in flight in both directions at
 once, so the alternation machinery is dead code under the existing traffic shape.
-Guarantee: Under simultaneous load in both directions, each direction keeps making
-progress, and once the offered load stops both directions drain.
+Guarantee: Given an application that drains the inbound channel, then under
+simultaneous load in both directions each direction keeps making progress, and
+once the offered load stops both directions drain. The draining precondition is
+load-bearing, not decorative: without it the inbound lane has no stall bound at
+all (see Fault/timing angle).
 Check: `always`, in two arms. Ratio: while both directions are offered
 continuously, neither may complete fewer than one frame per K completions of the
 other, with K pinned by the test from its own configuration and recorded in the
-test. The only per-lane stall bound the code enforces is `frame_deadline`: the
-outbound `reserve_until` deadline (`ring_transport.rs:583`, `ring.rs:980`) and
-the inbound sender's admission timeout (`frame_channel.rs:640-652`). The
-former `frame_deadline / POLL_INTERVAL` derivation is void: waits park on
-eventfd doorbells with no retry quantum, and `POLL_INTERVAL` survives only in
-`crates/mc-host/tests/support/process_resources.rs`. Bounded drain: stop
+test. The only per-lane stall bound the code enforces is `frame_deadline` on the
+**outbound** lane: the `reserve_until` deadline (`ring_transport.rs:583`,
+`ring.rs:980`). The inbound lane has no equivalent bound — see the
+Fault/timing angle — so the ratio arm holds only while the application drains
+inbound. The former `frame_deadline / POLL_INTERVAL` derivation is void: waits
+park on eventfd doorbells with no retry quantum, and `POLL_INTERVAL` survives
+only in `crates/mc-host/tests/support/process_resources.rs`. Bounded drain: stop
 offering both ways, poll until stable within an explicit bound, then require
 both queues empty, all descriptors free on both rings, and no close reported,
-strictly inside the bound. The stalls below are bounded rather than deadlocks,
-so an unbounded formulation would be both weaker and unrefutable.
+strictly inside the bound. The outbound stall below is bounded rather than a
+deadlock, so an unbounded formulation of that lane would be both weaker and
+unrefutable; the inbound stall is bounded only by the draining precondition.
 Fault/timing angle: two asymmetric mechanisms, both on one task on one dedicated
 thread with its own current-thread runtime. Outbound blocks inbound:
 `publish_one` (`ring_transport.rs:560`, called at `:479` and `:535`) is
@@ -3157,8 +3162,16 @@ doorbell (`ring.rs:1035`) with no await point, for up to `frame_deadline`,
 during which no receive runs. Inbound blocks outbound: the inbound send is
 awaited with no timeout and no enclosing select
 (`ring_transport.rs:551-556`), so it parks until the application drains.
-Neither is infinite: the first ends in an unclean close, the second in the
-sender's own admission timeout.
+**These are not symmetric in boundedness.** The outbound stall ends in an
+unclean close at its deadline. The inbound stall has no bound at all: the
+timeout at `frame_channel.rs:640-652` governs *callers submitting outbound
+frames* into the channel (`timeout_at(deadline, self.tx.send(queued))`), not
+this inbound send, and cancelling its tokens does not interrupt it. Nor can
+channel closure release it — `serve_generation` moves the receiver into
+`read_loop` (`connection.rs:239`, `:250`) and awaits it at `:274`, so the
+receiver stays alive inside the very loop that is parked. An application that
+stops draining inbound therefore hangs this lane past `frame_deadline`
+indefinitely.
 Required faults and enabling state: genuine overlap, plus capacity pressure on one
 lane. The peer harness cannot produce overlap today: `RingClientEndpoint::send`
 blocks in `reserve_until` (`ring_transport.rs:692`) and `recv` blocks in
@@ -3615,17 +3628,27 @@ Exercised: partial — `two_process_zero_copy_exchange_uses_authenticated_grant`
 (`crates/mc-shm-transport/tests/ring.rs:551-592`) parks a `reserve_until`
 behind a child's held lease and converges after the release, exercising the
 block-then-wake path; nothing lands a release inside the arm window itself.
-Guarantee: capacity freed at any point after a producer's failed reservation
-is consumed without waiting out the deadline — before blocking by the in-loop
-rechecks, during blocking by the doorbell.
+Guarantee: capacity freed at any point after a producer's failed reservation is
+consumed without waiting out the deadline — before blocking by the in-loop
+rechecks, during blocking by the doorbell. "Consumed" means the freed capacity is
+observed by a recheck, not that the reservation necessarily succeeds: success
+additionally requires the release to leave enough *reclaimable, contiguous*
+capacity to satisfy this reservation's `bound`.
 Check: `always` — a `reserve_until` iteration reaches
 `capacity_ready.wait_until` (`ring.rs:1035`) only after a post-park
 `try_reserve` (`:1001`), a generation recheck (`:1012`), a doorbell drain
 (`:1016`), a second `try_reserve` (`:1020`), and a second generation recheck
 (`:1031`) all found no progress; assert that a release completing before the
-block yields success in the same iteration. `always` because the recheck
-ladder must hold on every iteration; the bounded window (one iteration) is
-what a racing test can refute.
+block is *observed* by that ladder in the same iteration, and that it yields
+success in the same iteration **when the released run leaves enough reclaimable
+contiguous capacity for the pending reservation**. Do not assert
+same-iteration success unconditionally: at `:1020` an
+`Err(Exhausted)` with time left on the deadline falls through to `:1031` and
+re-parks, so a release that frees fewer bytes than `bound` — or whose bytes
+cannot yet join the contiguous reclaimed prefix — correctly produces another
+park, and an unconditional oracle would reject a correct implementation.
+`always` because the recheck ladder must hold on every iteration; the bounded
+window (one iteration) is what a racing test can refute.
 Fault/timing angle: the vulnerable window is generation-read (`:994`) to poll
 entry, a few dozen instructions. The publisher bumps the generation SeqCst and
 writes the eventfd only when it swapped a parked epoch
