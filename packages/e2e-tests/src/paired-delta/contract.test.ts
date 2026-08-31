@@ -75,6 +75,23 @@ describe("paired-delta scenario contract", () => {
         ).toThrow(/criticalCheckIds: unknown-check/);
     });
 
+    it("applies the declared casing policy when checking supplied gold", () => {
+        const base = scenario();
+        const miscased = (): Partial<ScenarioDeclaration> => ({
+            turnScript: [
+                { id: "turn-evidence", role: "user", content: "Remember ID ALPHA-17." },
+                ...base.turnScript.slice(1),
+            ],
+        });
+        /** Under `exact` the verifier rejects a differently-cased answer, so miscased evidence is not gold. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario({ answerMatch: "exact", ...miscased() })),
+        ).toThrow(/evidenceTurnId: answer-absent/);
+        expect(() =>
+            parseScenarioDeclaration(scenario({ answerMatch: "case-insensitive", ...miscased() })),
+        ).not.toThrow();
+    });
+
     it("requires the gold answer as a complete value, not a substring", () => {
         const base = scenario();
         /** `alpha-17` inside `alpha-170` must not count as gold. commentlint: allow(JUDGE) */

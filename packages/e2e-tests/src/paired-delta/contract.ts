@@ -5,7 +5,9 @@ import { normalizeMemoryContent } from "../../../plugin/src/features/magic-conte
 
 export const ARM_IDS = ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"] as const;
 export type ArmId = (typeof ARM_IDS)[number];
+/** The arms of the primary comparison: memory on, memory off, and native compaction. */
 export const PRIMARY_ARM_IDS = ["mc-on", "mc-off", "compaction"] as const;
+/** The arms of the regret ladder, in ascending order of oracle assistance. */
 export const REGRET_ARM_IDS = ["mc-on", "r1", "r2", "r3"] as const;
 
 export const RUN_HEALTHS = ["completed", "timeout", "crash", "malformed", "unavailable"] as const;
@@ -217,11 +219,13 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     /** Deliberately the opposite bound from `suppliesAnswer` below, because the two guards fail safe in opposite directions. A leak asks "could the model read the gold here", so any occurrence counts and a wider match is the conservative one: `alpha-170` exposes `alpha-17`. commentlint: allow(JUDGE) */
     const revealsAnswer = (text: string): boolean =>
         text.toLowerCase().includes(expectedAnswer.toLowerCase());
-    /** Gold presence asks "can the arm derive the exact answer here", so only a complete value counts and a narrower match is the conservative one: `147` does not supply `47`. Letters, digits, underscore, and hyphen are value characters; `.`, `;`, and `,` are not, so a trailing sentence period still matches. commentlint: allow(JUDGE) */
+    /** Gold presence asks "can the arm derive the exact answer here", so only a complete value counts and a narrower match is the conservative one: `147` does not supply `47`. It also honors the declared casing policy, unlike the leak guard: under `exact` the verifier rejects a differently-cased answer, so folding here would certify gold the arm can never produce. Boundaries use Unicode letter and number properties, so a non-ASCII neighbour is not mistaken for a separator; `.`, `;`, and `,` are not value characters, so a trailing sentence period still matches. commentlint: allow(JUDGE) */
     const suppliesAnswer = (text: string): boolean => {
-        const haystack = text.toLowerCase();
-        const needle = expectedAnswer.toLowerCase();
-        const valueChar = /[0-9a-z_-]/;
+        const fold = (value: string): string =>
+            answerMatch === "exact" ? value : value.toLowerCase();
+        const haystack = fold(text);
+        const needle = fold(expectedAnswer);
+        const valueChar = /[\p{L}\p{N}_-]/u;
         for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
             const before = at === 0 ? "" : haystack[at - 1]!;
             const after = haystack[at + needle.length] ?? "";
