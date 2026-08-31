@@ -5,13 +5,25 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+// A macro, not a `const`, because the `domains` DDL needs the value as a literal.
+// One definition keeps the schema digest moving with any edit to it.
+macro_rules! operator_redaction_placeholder {
+    () => {
+        "[redacted:operator]"
+    };
+}
+pub(super) use operator_redaction_placeholder;
+
 pub const KERNEL_APPLICATION_ID: u32 = MC_APPLICATION_ID;
 pub const KERNEL_FORMAT_EPOCH: i64 = DIRECT_FORMAT_EPOCH;
 pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
     "commit_log",
     "change_event",
     "outbox",
+    "outbox_publication",
     "operation_receipts",
+    "durable_text_redactions",
+    "alignment_projection_state",
     "writer_fence",
     "outbox_consumers",
     "consumer_abandonments",
@@ -44,7 +56,7 @@ pub const KERNEL_SCHEMA_COMPONENT_NAMES: &[&str] = &[
 const COMPONENTS: &[(&str, &str)] = &[
     (
         "commit_log",
-        r#"CREATE TABLE commit_log(commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,transaction_id TEXT NOT NULL UNIQUE,writer_epoch INTEGER NOT NULL,recorded_at INTEGER NOT NULL,actor TEXT NOT NULL,cause TEXT NOT NULL) STRICT; CREATE TRIGGER commit_log_no_update BEFORE UPDATE ON commit_log BEGIN SELECT RAISE(ABORT,'commit_log is append-only'); END; CREATE TRIGGER commit_log_no_delete BEFORE DELETE ON commit_log BEGIN SELECT RAISE(ABORT,'commit_log is append-only'); END;"#,
+        r#"CREATE TABLE commit_log(commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,transaction_id TEXT NOT NULL UNIQUE,writer_epoch INTEGER NOT NULL,producer TEXT NOT NULL,operation_key TEXT NOT NULL,request_digest TEXT NOT NULL,recorded_at INTEGER NOT NULL,actor TEXT NOT NULL,cause TEXT NOT NULL) STRICT; CREATE UNIQUE INDEX idx_commit_operation ON commit_log(producer,operation_key); CREATE TRIGGER commit_log_no_update BEFORE UPDATE ON commit_log BEGIN SELECT RAISE(ABORT,'commit_log is append-only'); END; CREATE TRIGGER commit_log_no_delete BEFORE DELETE ON commit_log BEGIN SELECT RAISE(ABORT,'commit_log is append-only'); END;"#,
     ),
     (
         "change_event",
@@ -55,20 +67,32 @@ const COMPONENTS: &[(&str, &str)] = &[
         r#"CREATE TABLE outbox(outbox_position INTEGER PRIMARY KEY AUTOINCREMENT,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,ordinal INTEGER NOT NULL,object_id TEXT NOT NULL,object_kind TEXT NOT NULL,source_kind TEXT NOT NULL,source_id TEXT NOT NULL,source_revision INTEGER NOT NULL,sensitivity_class TEXT NOT NULL,payload BLOB NOT NULL,created_at INTEGER NOT NULL,published_at INTEGER,UNIQUE(commit_seq,ordinal)) STRICT; CREATE INDEX idx_outbox_poll ON outbox(published_at,outbox_position); CREATE INDEX idx_outbox_prune ON outbox(published_at,created_at,outbox_position);"#,
     ),
     (
+        "outbox_publication",
+        r#"CREATE TABLE outbox_publication(id INTEGER PRIMARY KEY CHECK(id=0),published_through_position INTEGER NOT NULL CHECK(published_through_position>=0),published_at INTEGER NOT NULL CHECK(published_at>=0)) STRICT;"#,
+    ),
+    (
         "operation_receipts",
         r#"CREATE TABLE operation_receipts(receipt_id TEXT PRIMARY KEY,producer TEXT NOT NULL,operation_key TEXT NOT NULL,request_digest TEXT NOT NULL,commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,result_payload BLOB NOT NULL,created_at INTEGER NOT NULL,UNIQUE(producer,operation_key)) STRICT; CREATE INDEX idx_receipts_commit_fk ON operation_receipts(commit_seq); CREATE TRIGGER operation_receipts_identity_immutable BEFORE UPDATE OF receipt_id,producer,operation_key,request_digest,commit_seq ON operation_receipts BEGIN SELECT RAISE(ABORT,'operation_receipts identity is immutable'); END; CREATE TRIGGER operation_receipts_no_delete BEFORE DELETE ON operation_receipts BEGIN SELECT RAISE(ABORT,'operation_receipts survive for the database incarnation'); END;"#,
     ),
     (
+        "durable_text_redactions",
+        r#"CREATE TABLE durable_text_redactions(owner_kind TEXT NOT NULL,owner_id TEXT NOT NULL,field_name TEXT NOT NULL,detection_ordinal INTEGER NOT NULL,detector_id TEXT NOT NULL,secret_type TEXT NOT NULL,source_utf8_offset INTEGER NOT NULL,source_utf8_length INTEGER NOT NULL,commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,PRIMARY KEY(owner_kind,owner_id,field_name,detection_ordinal)) STRICT; CREATE INDEX idx_text_redactions_commit_fk ON durable_text_redactions(commit_seq);"#,
+    ),
+    (
+        "alignment_projection_state",
+        r#"CREATE TABLE alignment_projection_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),built_through_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT) STRICT;"#,
+    ),
+    (
         "writer_fence",
-        r#"CREATE TABLE writer_fence(id INTEGER PRIMARY KEY CHECK(id=0),writer_epoch INTEGER) STRICT; CREATE TRIGGER writer_fence_no_delete BEFORE DELETE ON writer_fence BEGIN SELECT RAISE(ABORT,'writer_fence is a declared singleton'); END;"#,
+        r#"CREATE TABLE writer_fence(id INTEGER PRIMARY KEY CHECK(id=0),writer_epoch INTEGER NOT NULL DEFAULT -1 CHECK(writer_epoch>=-1)) STRICT; CREATE TRIGGER writer_fence_no_delete BEFORE DELETE ON writer_fence BEGIN SELECT RAISE(ABORT,'writer_fence is a declared singleton'); END;"#,
     ),
     (
         "outbox_consumers",
-        r#"CREATE TABLE outbox_consumers(consumer_id TEXT PRIMARY KEY,checkpoint_outbox_position INTEGER NOT NULL DEFAULT 0,updated_at INTEGER NOT NULL) STRICT; CREATE INDEX idx_consumers_checkpoint ON outbox_consumers(checkpoint_outbox_position,consumer_id); CREATE TRIGGER outbox_consumers_checkpoint_monotonic BEFORE UPDATE OF checkpoint_outbox_position ON outbox_consumers WHEN NEW.checkpoint_outbox_position<OLD.checkpoint_outbox_position BEGIN SELECT RAISE(ABORT,'checkpoint_outbox_position must not move backward'); END;"#,
+        r#"CREATE TABLE outbox_consumers(consumer_id TEXT PRIMARY KEY,checkpoint_commit_seq INTEGER NOT NULL DEFAULT 0 CHECK(checkpoint_commit_seq>=0),updated_at INTEGER NOT NULL) STRICT; CREATE INDEX idx_consumers_checkpoint ON outbox_consumers(checkpoint_commit_seq,consumer_id); CREATE TRIGGER outbox_consumers_checkpoint_monotonic BEFORE UPDATE OF checkpoint_commit_seq ON outbox_consumers WHEN NEW.checkpoint_commit_seq<OLD.checkpoint_commit_seq BEGIN SELECT RAISE(ABORT,'checkpoint_commit_seq must not move backward'); END;"#,
     ),
     (
         "consumer_abandonments",
-        r#"CREATE TABLE consumer_abandonments(abandonment_id TEXT PRIMARY KEY,consumer_id TEXT NOT NULL,operator_id TEXT NOT NULL,last_checkpoint_outbox_position INTEGER NOT NULL,reason TEXT NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,abandoned_at INTEGER NOT NULL) STRICT; CREATE INDEX idx_abandonments_consumer ON consumer_abandonments(consumer_id,abandoned_at); CREATE INDEX idx_abandonments_commit_fk ON consumer_abandonments(commit_seq); CREATE TRIGGER consumer_abandonments_identity_immutable BEFORE UPDATE OF abandonment_id,consumer_id,operator_id,last_checkpoint_outbox_position,commit_seq,abandoned_at ON consumer_abandonments BEGIN SELECT RAISE(ABORT,'consumer_abandonments identity is immutable'); END; CREATE TRIGGER consumer_abandonments_no_delete BEFORE DELETE ON consumer_abandonments BEGIN SELECT RAISE(ABORT,'consumer_abandonments are retained audit facts'); END;"#,
+        r#"CREATE TABLE consumer_abandonments(abandonment_id TEXT PRIMARY KEY,consumer_id TEXT NOT NULL,operator_id TEXT NOT NULL,last_checkpoint_commit_seq INTEGER NOT NULL CHECK(last_checkpoint_commit_seq>=0),reason TEXT NOT NULL,commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,abandoned_at INTEGER NOT NULL) STRICT; CREATE INDEX idx_abandonments_consumer ON consumer_abandonments(consumer_id,abandoned_at); CREATE INDEX idx_abandonments_commit_fk ON consumer_abandonments(commit_seq); CREATE TRIGGER consumer_abandonments_identity_immutable BEFORE UPDATE OF abandonment_id,consumer_id,operator_id,last_checkpoint_commit_seq,commit_seq,abandoned_at ON consumer_abandonments BEGIN SELECT RAISE(ABORT,'consumer_abandonments identity is immutable'); END; CREATE TRIGGER consumer_abandonments_no_delete BEFORE DELETE ON consumer_abandonments BEGIN SELECT RAISE(ABORT,'consumer_abandonments are retained audit facts'); END;"#,
     ),
     (
         "capture_pins",
@@ -80,11 +104,19 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "object_registry",
-        r#"CREATE TABLE object_registry(object_id TEXT PRIMARY KEY,object_kind TEXT NOT NULL,domain_id TEXT NOT NULL REFERENCES domains(domain_id) DEFERRABLE INITIALLY DEFERRED,source_kind TEXT NOT NULL,source_id TEXT NOT NULL,source_revision INTEGER NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,superseded_by TEXT REFERENCES object_registry(object_id) DEFERRABLE INITIALLY DEFERRED,sensitivity_class TEXT NOT NULL,CHECK(invalidated_commit_seq IS NULL OR invalidated_commit_seq>created_commit_seq)) STRICT; CREATE INDEX idx_objects_known_as_of ON object_registry(created_commit_seq,invalidated_commit_seq,object_id); CREATE INDEX idx_objects_domain_fk ON object_registry(domain_id,object_id); CREATE INDEX idx_objects_superseded_fk ON object_registry(superseded_by); CREATE INDEX idx_objects_source ON object_registry(source_kind,source_id,source_revision,object_kind);"#,
+        r#"CREATE TABLE object_registry(object_id TEXT PRIMARY KEY,object_kind TEXT NOT NULL,domain_id TEXT NOT NULL REFERENCES domains(domain_id) DEFERRABLE INITIALLY DEFERRED,source_kind TEXT NOT NULL,source_id TEXT NOT NULL,source_revision INTEGER NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq) ON DELETE RESTRICT,superseded_by TEXT REFERENCES object_registry(object_id) DEFERRABLE INITIALLY DEFERRED,sensitivity_class TEXT NOT NULL,CHECK(invalidated_commit_seq IS NULL OR invalidated_commit_seq>created_commit_seq)) STRICT; CREATE INDEX idx_objects_known_as_of ON object_registry(created_commit_seq,invalidated_commit_seq,object_id); CREATE INDEX idx_objects_domain_fk ON object_registry(domain_id,object_id); CREATE INDEX idx_objects_superseded_fk ON object_registry(superseded_by); CREATE INDEX idx_objects_source ON object_registry(source_kind,source_id,source_revision,object_kind); CREATE TRIGGER object_registry_append_only_update BEFORE UPDATE ON object_registry WHEN NOT (((OLD.invalidated_commit_seq IS NULL AND NEW.invalidated_commit_seq IS NOT NULL) AND NEW.superseded_by IS OLD.superseded_by AND NEW.object_id IS OLD.object_id AND NEW.object_kind IS OLD.object_kind AND NEW.domain_id IS OLD.domain_id AND NEW.source_kind IS OLD.source_kind AND NEW.source_id IS OLD.source_id AND NEW.source_revision IS OLD.source_revision AND NEW.created_commit_seq IS OLD.created_commit_seq AND NEW.sensitivity_class IS OLD.sensitivity_class) OR ((OLD.superseded_by IS NULL AND NEW.superseded_by IS NOT NULL) AND NEW.invalidated_commit_seq IS OLD.invalidated_commit_seq AND NEW.object_id IS OLD.object_id AND NEW.object_kind IS OLD.object_kind AND NEW.domain_id IS OLD.domain_id AND NEW.source_kind IS OLD.source_kind AND NEW.source_id IS OLD.source_id AND NEW.source_revision IS OLD.source_revision AND NEW.created_commit_seq IS OLD.created_commit_seq AND NEW.sensitivity_class IS OLD.sensitivity_class)) BEGIN SELECT RAISE(ABORT,'object_registry is append-only'); END; CREATE TRIGGER object_registry_append_only_delete BEFORE DELETE ON object_registry BEGIN SELECT RAISE(ABORT,'object_registry is append-only'); END;"#,
     ),
     (
         "domains",
-        r#"CREATE TABLE domains(domain_id TEXT PRIMARY KEY,object_id TEXT NOT NULL UNIQUE REFERENCES object_registry(object_id) DEFERRABLE INITIALLY DEFERRED,name TEXT NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL,CHECK(invalidated_commit_seq IS NULL OR invalidated_commit_seq>created_commit_seq)) STRICT; CREATE INDEX idx_domains_known_as_of ON domains(created_commit_seq,invalidated_commit_seq,domain_id); CREATE INDEX idx_domains_superseded_fk ON domains(superseded_by); CREATE UNIQUE INDEX idx_domains_active_name ON domains(name) WHERE invalidated_commit_seq IS NULL; CREATE INDEX idx_domains_name ON domains(name,domain_id);"#,
+        concat!(
+            r#"CREATE TABLE domains(domain_id TEXT PRIMARY KEY,object_id TEXT NOT NULL UNIQUE REFERENCES object_registry(object_id) DEFERRABLE INITIALLY DEFERRED,name TEXT NOT NULL,created_commit_seq INTEGER NOT NULL REFERENCES commit_log(commit_seq),invalidated_commit_seq INTEGER REFERENCES commit_log(commit_seq),superseded_by TEXT REFERENCES object_registry(object_id),sensitivity_class TEXT NOT NULL,CHECK(invalidated_commit_seq IS NULL OR invalidated_commit_seq>created_commit_seq)) STRICT; CREATE INDEX idx_domains_known_as_of ON domains(created_commit_seq,invalidated_commit_seq,domain_id); CREATE INDEX idx_domains_superseded_fk ON domains(superseded_by); CREATE UNIQUE INDEX idx_domains_active_name ON domains(name) WHERE invalidated_commit_seq IS NULL AND name<>'"#,
+            operator_redaction_placeholder!(),
+            r#"'; CREATE INDEX idx_domains_name ON domains(name,domain_id); CREATE TRIGGER domains_append_only_update BEFORE UPDATE ON domains WHEN NOT (((OLD.invalidated_commit_seq IS NULL AND NEW.invalidated_commit_seq IS NOT NULL) AND NEW.superseded_by IS OLD.superseded_by AND NEW.domain_id IS OLD.domain_id AND NEW.object_id IS OLD.object_id AND NEW.name IS OLD.name AND NEW.created_commit_seq IS OLD.created_commit_seq AND NEW.sensitivity_class IS OLD.sensitivity_class) OR ((OLD.superseded_by IS NULL AND NEW.superseded_by IS NOT NULL) AND NEW.invalidated_commit_seq IS OLD.invalidated_commit_seq AND NEW.domain_id IS OLD.domain_id AND NEW.object_id IS OLD.object_id AND NEW.name IS OLD.name AND NEW.created_commit_seq IS OLD.created_commit_seq AND NEW.sensitivity_class IS OLD.sensitivity_class) OR (NEW.name='"#,
+            operator_redaction_placeholder!(),
+            r#"' AND OLD.name<>'"#,
+            operator_redaction_placeholder!(),
+            r#"' AND NEW.domain_id IS OLD.domain_id AND NEW.object_id IS OLD.object_id AND NEW.created_commit_seq IS OLD.created_commit_seq AND NEW.invalidated_commit_seq IS OLD.invalidated_commit_seq AND NEW.superseded_by IS OLD.superseded_by AND NEW.sensitivity_class IS OLD.sensitivity_class)) BEGIN SELECT RAISE(ABORT,'domains is append-only'); END; CREATE TRIGGER domains_append_only_delete BEFORE DELETE ON domains BEGIN SELECT RAISE(ABORT,'domains is append-only'); END;"#
+        ),
     ),
     (
         "entities",
@@ -128,11 +160,11 @@ const COMPONENTS: &[(&str, &str)] = &[
     ),
     (
         "extraction_runs",
-        r#"CREATE TABLE extraction_runs(extraction_run_id TEXT PRIMARY KEY,extractor TEXT NOT NULL,source_kind TEXT,source_id TEXT,source_revision INTEGER,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,started_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at),CHECK((terminal_state IS NULL)=(terminal_at IS NULL)),CHECK(heartbeat_at>=started_at),CHECK(terminal_at IS NULL OR terminal_at>=heartbeat_at)) STRICT; CREATE INDEX idx_runs_ttl ON extraction_runs(terminal_at,lease_expires_at,extraction_run_id); CREATE INDEX idx_runs_heartbeat ON extraction_runs(terminal_at,heartbeat_at,extraction_run_id);"#,
+        r#"CREATE TABLE extraction_runs(extraction_run_id TEXT PRIMARY KEY,extractor TEXT NOT NULL,source_kind TEXT,source_id TEXT,source_revision INTEGER,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,started_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT CHECK(terminal_state IS NULL OR terminal_state IN ('completed','failed','canceled','abandoned')),terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at),CHECK((terminal_state IS NULL)=(terminal_at IS NULL)),CHECK(heartbeat_at>=started_at),CHECK(terminal_at IS NULL OR terminal_at>=heartbeat_at)) STRICT; CREATE INDEX idx_runs_active_lease ON extraction_runs(lease_expires_at,extraction_run_id) WHERE terminal_state IS NULL; CREATE INDEX idx_runs_ttl ON extraction_runs(terminal_at,lease_expires_at,extraction_run_id); CREATE INDEX idx_runs_heartbeat ON extraction_runs(terminal_at,heartbeat_at,extraction_run_id);"#,
     ),
     (
         "candidates",
-        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload BLOB NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT,terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at),CHECK((terminal_state IS NULL)=(terminal_at IS NULL)),CHECK(heartbeat_at>=created_at),CHECK(terminal_at IS NULL OR terminal_at>=heartbeat_at)) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
+        r#"CREATE TABLE candidates(candidate_id TEXT PRIMARY KEY,extraction_run_id TEXT NOT NULL REFERENCES extraction_runs(extraction_run_id) ON DELETE CASCADE,candidate_kind TEXT NOT NULL,payload BLOB NOT NULL,sensitivity_class TEXT NOT NULL,provenance_witness BLOB NOT NULL,redaction_metadata BLOB NOT NULL,detector_id TEXT,secret_type TEXT,utf8_offset INTEGER,utf8_length INTEGER,created_at INTEGER NOT NULL,heartbeat_at INTEGER NOT NULL,lease_expires_at INTEGER NOT NULL,terminal_state TEXT CHECK(terminal_state IS NULL OR terminal_state IN ('completed','failed','canceled','abandoned')),terminal_at INTEGER,CHECK(lease_expires_at>heartbeat_at),CHECK((terminal_state IS NULL)=(terminal_at IS NULL)),CHECK(heartbeat_at>=created_at),CHECK(terminal_at IS NULL OR terminal_at>=heartbeat_at)) STRICT; CREATE INDEX idx_candidates_run_fk ON candidates(extraction_run_id,candidate_id); CREATE INDEX idx_candidates_ttl ON candidates(terminal_at,lease_expires_at,candidate_id);"#,
     ),
     (
         "candidate_scores",

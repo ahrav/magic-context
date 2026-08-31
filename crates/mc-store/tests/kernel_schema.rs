@@ -12,7 +12,10 @@ const EXPECTED_COMPONENTS: &[&str] = &[
     "commit_log",
     "change_event",
     "outbox",
+    "outbox_publication",
     "operation_receipts",
+    "durable_text_redactions",
+    "alignment_projection_state",
     "writer_fence",
     "outbox_consumers",
     "consumer_abandonments",
@@ -52,8 +55,10 @@ fn open_profiled() -> (tempfile::TempDir, Connection) {
 /// Append a `commit_log` row and return its allocated `commit_seq`.
 fn next_commit(conn: &Connection, transaction_id: &str) -> i64 {
     conn.execute(
-        "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
-         VALUES (?1, 1, 1, 'test', 'fixture')",
+        "INSERT INTO commit_log(
+             transaction_id, writer_epoch, producer, operation_key, request_digest,
+             recorded_at, actor, cause
+         ) VALUES (?1, 1, 'fixture', ?1, '', 1, 'test', 'fixture')",
         [transaction_id],
     )
     .unwrap();
@@ -66,8 +71,10 @@ fn seed_root_domain(conn: &mut Connection) -> i64 {
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
     tx.execute(
-        "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
-         VALUES ('tx-root', 1, 1, 'test', 'root')",
+        "INSERT INTO commit_log(
+             transaction_id, writer_epoch, producer, operation_key, request_digest,
+             recorded_at, actor, cause
+         ) VALUES ('tx-root', 1, 'fixture', 'tx-root', '', 1, 'test', 'root')",
         [],
     )
     .unwrap();
@@ -132,7 +139,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "92e7c76e51e721720c2123e0bba45ea41995545b308f9767c64c7aef0fe7a9e6";
+    "3948a2bdbb2e33aa9a44bf48da144b1754f607e620eaf431ca15f6bfad1463c6";
 
 #[test]
 fn kernel_schema_digest_is_pinned_to_the_frozen_v1_shape() {
@@ -157,8 +164,10 @@ fn first_root_transaction_resolves_deferred_registry_cycle() {
 
     let tx = conn.transaction().unwrap();
     tx.execute(
-        "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
-         VALUES ('tx-1', 7, 1000, 'test', 'root')",
+        "INSERT INTO commit_log(
+             transaction_id, writer_epoch, producer, operation_key, request_digest,
+             recorded_at, actor, cause
+         ) VALUES ('tx-1', 7, 'fixture', 'tx-1', '', 1000, 'test', 'root')",
         [],
     )
     .unwrap();
@@ -264,8 +273,10 @@ fn consumers_checkpoint_independent_outbox_positions() {
     let (_dir, mut conn) = open_profiled();
     apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     conn.execute(
-        "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
-         VALUES ('tx-1', 7, 1, 'test', 'outbox')",
+        "INSERT INTO commit_log(
+             transaction_id, writer_epoch, producer, operation_key, request_digest,
+             recorded_at, actor, cause
+         ) VALUES ('tx-1', 7, 'fixture', 'tx-1', '', 1, 'test', 'outbox')",
         [],
     )
     .unwrap();
@@ -282,14 +293,14 @@ fn consumers_checkpoint_independent_outbox_positions() {
     }
     let latest_position = conn.last_insert_rowid();
     conn.execute(
-        "INSERT INTO outbox_consumers(consumer_id, checkpoint_outbox_position, updated_at)
+        "INSERT INTO outbox_consumers(consumer_id, checkpoint_commit_seq, updated_at)
          VALUES ('search', ?1, 3), ('mirror', 0, 3)",
         params![latest_position - 1],
     )
     .unwrap();
 
     conn.execute(
-        "UPDATE outbox_consumers SET checkpoint_outbox_position = ?1
+        "UPDATE outbox_consumers SET checkpoint_commit_seq = ?1
          WHERE consumer_id = 'search'",
         params![latest_position],
     )
@@ -297,7 +308,7 @@ fn consumers_checkpoint_independent_outbox_positions() {
 
     let checkpoint = |conn: &Connection, consumer: &str| -> i64 {
         conn.query_row(
-            "SELECT checkpoint_outbox_position FROM outbox_consumers WHERE consumer_id = ?1",
+            "SELECT checkpoint_commit_seq FROM outbox_consumers WHERE consumer_id = ?1",
             [consumer],
             |row| row.get(0),
         )
@@ -307,7 +318,7 @@ fn consumers_checkpoint_independent_outbox_positions() {
     assert_eq!(checkpoint(&conn, "mirror"), 0);
     assert_eq!(
         conn.query_row(
-            "SELECT MIN(checkpoint_outbox_position) FROM outbox_consumers",
+            "SELECT MIN(checkpoint_commit_seq) FROM outbox_consumers",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -382,8 +393,9 @@ fn commit_receipt_and_change_identity_shapes_are_not_overconstrained() {
     apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     conn.execute(
         "INSERT INTO commit_log(
-             transaction_id, writer_epoch, recorded_at, actor, cause
-         ) VALUES ('tx-identity', 42, 1, 'test', 'identity')",
+             transaction_id, writer_epoch, producer, operation_key, request_digest,
+             recorded_at, actor, cause
+         ) VALUES ('tx-identity', 42, 'fixture', 'tx-identity', '', 1, 'test', 'identity')",
         [],
     )
     .unwrap();
@@ -429,21 +441,23 @@ fn abandonment_audit_survives_consumer_deletion() {
     let (_dir, mut conn) = open_profiled();
     apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     conn.execute(
-        "INSERT INTO outbox_consumers(consumer_id, checkpoint_outbox_position, updated_at)
+        "INSERT INTO outbox_consumers(consumer_id, checkpoint_commit_seq, updated_at)
          VALUES ('search', 9, 10)",
         [],
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO commit_log(transaction_id, writer_epoch, recorded_at, actor, cause)
-         VALUES ('tx-abandon', 7, 10, 'operator-1', 'abandonment')",
+        "INSERT INTO commit_log(
+             transaction_id, writer_epoch, producer, operation_key, request_digest,
+             recorded_at, actor, cause
+         ) VALUES ('tx-abandon', 7, 'fixture', 'tx-abandon', '', 10, 'operator-1', 'abandonment')",
         [],
     )
     .unwrap();
     let commit_seq = conn.last_insert_rowid();
     conn.execute(
         "INSERT INTO consumer_abandonments(
-             abandonment_id, consumer_id, operator_id, last_checkpoint_outbox_position,
+             abandonment_id, consumer_id, operator_id, last_checkpoint_commit_seq,
              reason, commit_seq, abandoned_at
          ) VALUES ('abandon-1', 'search', 'operator-1', 9, 'retired', ?1, 11)",
         [commit_seq],
@@ -740,34 +754,34 @@ fn consumer_checkpoints_advance_but_never_retreat() {
     let (_dir, mut conn) = open_profiled();
     apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
     conn.execute(
-        "INSERT INTO outbox_consumers(consumer_id, checkpoint_outbox_position, updated_at)
+        "INSERT INTO outbox_consumers(consumer_id, checkpoint_commit_seq, updated_at)
          VALUES ('search', 5, 1)",
         [],
     )
     .unwrap();
 
     conn.execute(
-        "UPDATE outbox_consumers SET checkpoint_outbox_position = 9 WHERE consumer_id = 'search'",
+        "UPDATE outbox_consumers SET checkpoint_commit_seq = 9 WHERE consumer_id = 'search'",
         [],
     )
     .expect("forward advance is legal");
     assert!(conn
         .execute(
-            "UPDATE outbox_consumers SET checkpoint_outbox_position = 4
+            "UPDATE outbox_consumers SET checkpoint_commit_seq = 4
               WHERE consumer_id = 'search'",
             [],
         )
         .is_err());
     // Re-acknowledging the same position stays legal.
     conn.execute(
-        "UPDATE outbox_consumers SET checkpoint_outbox_position = 9, updated_at = 2
+        "UPDATE outbox_consumers SET checkpoint_commit_seq = 9, updated_at = 2
           WHERE consumer_id = 'search'",
         [],
     )
     .expect("idempotent re-acknowledgement is legal");
     assert_eq!(
         conn.query_row(
-            "SELECT checkpoint_outbox_position FROM outbox_consumers WHERE consumer_id = 'search'",
+            "SELECT checkpoint_commit_seq FROM outbox_consumers WHERE consumer_id = 'search'",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -1174,7 +1188,7 @@ fn audit_and_event_identity_are_immutable_and_undeletable() {
     let created = seed_root_domain(&mut conn);
     conn.execute(
         "INSERT INTO consumer_abandonments(
-             abandonment_id, consumer_id, operator_id, last_checkpoint_outbox_position,
+             abandonment_id, consumer_id, operator_id, last_checkpoint_commit_seq,
              reason, commit_seq, abandoned_at
          ) VALUES ('abandon-1', 'search', 'operator-1', 9, 'retired', ?1, 11)",
         [created],
@@ -1199,7 +1213,7 @@ fn audit_and_event_identity_are_immutable_and_undeletable() {
 
     for sql in [
         "UPDATE consumer_abandonments SET consumer_id = 'other'",
-        "UPDATE consumer_abandonments SET last_checkpoint_outbox_position = 0",
+        "UPDATE consumer_abandonments SET last_checkpoint_commit_seq = 0",
         "UPDATE consumer_abandonments SET commit_seq = NULL",
         "DELETE FROM consumer_abandonments",
         "UPDATE decision_events SET event_kind = 'closed'",
@@ -1324,6 +1338,105 @@ fn staging_timestamps_must_be_chronological() {
                  lease_expires_at
              ) VALUES ('candidate-1', 'run-c', 'proposition', X'02', 'internal', X'03',
                        X'7b7d', 100, 50, 9999)",
+            [],
+        )
+        .is_err());
+}
+
+#[test]
+fn commit_log_requires_an_explicit_operation_identity() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
+
+    let omitted = conn.execute(
+        "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
+         VALUES ('tx-omitted',1,1,'test','omitted')",
+        [],
+    );
+    assert!(
+        omitted.is_err(),
+        "producer and operation_key must have no default that two writers can share"
+    );
+
+    for (transaction_id, operation_key) in [("tx-a", "op-a"), ("tx-b", "op-b")] {
+        conn.execute(
+            "INSERT INTO commit_log(
+                 transaction_id,writer_epoch,producer,operation_key,request_digest,
+                 recorded_at,actor,cause
+             ) VALUES (?1,1,'fixture',?2,'',1,'test','explicit')",
+            params![transaction_id, operation_key],
+        )
+        .unwrap();
+    }
+    let repeated = conn.execute(
+        "INSERT INTO commit_log(
+             transaction_id,writer_epoch,producer,operation_key,request_digest,
+             recorded_at,actor,cause
+         ) VALUES ('tx-c',1,'fixture','op-a','',1,'test','repeat')",
+        [],
+    );
+    assert!(repeated.is_err(), "idx_commit_operation must stay unique");
+}
+
+#[test]
+fn an_unstamped_writer_fence_reads_as_a_typed_epoch() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).unwrap();
+
+    let epoch: i64 = conn
+        .query_row(
+            "SELECT writer_epoch FROM writer_fence WHERE id=0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(epoch, -1, "bootstrap must seed a sentinel, not NULL");
+}
+
+#[test]
+fn the_domains_ddl_spells_the_same_placeholder_the_code_compares_against() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).expect("bootstrap");
+
+    // The index and the trigger carry the placeholder as SQL text, so a change to the
+    // constant that missed the DDL would leave remediation exempt from neither.
+    let sites = conn
+        .prepare(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE tbl_name='domains' AND sql LIKE '%' || ?1 || '%'",
+        )
+        .unwrap()
+        .query_row([mc_store::kernel::OPERATOR_REDACTION_PLACEHOLDER], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(sites, 2);
+}
+
+#[test]
+fn staging_terminal_state_columns_reject_values_outside_the_vocabulary() {
+    let (_dir, mut conn) = open_profiled();
+    apply_kernel_schema(&mut conn, INCARNATION, 1_000).expect("bootstrap");
+    conn.execute_batch(
+        "INSERT INTO commit_log(commit_seq,transaction_id,writer_epoch,producer,operation_key,request_digest,recorded_at,actor,cause)
+         VALUES(1,'t1',1,'p','k','',1,'test','proof');
+         INSERT INTO extraction_runs(
+             extraction_run_id,extractor,sensitivity_class,provenance_witness,
+             redaction_metadata,started_at,heartbeat_at,lease_expires_at
+         ) VALUES('run','fixture','normal',x'00',x'00',1,1,2);",
+    )
+    .unwrap();
+
+    for state in ["completed", "failed", "canceled", "abandoned"] {
+        conn.execute(
+            "UPDATE extraction_runs SET terminal_state=?1,terminal_at=5",
+            [state],
+        )
+        .unwrap();
+    }
+    assert!(conn
+        .execute(
+            "UPDATE extraction_runs SET terminal_state='done',terminal_at=5",
             [],
         )
         .is_err());
