@@ -3033,3 +3033,163 @@ fn retiring_a_dependent_releases_approval_capacity() {
         .unwrap();
     assert_eq!(counted(directory.path()), 0);
 }
+
+#[test]
+fn a_sensitive_trigger_classifies_the_object_it_admits() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(
+        &store,
+        "classified",
+        "code_present",
+        1,
+        "classified-trigger",
+    );
+    // The candidate is normal but its supporting observation is not.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "UPDATE observations SET sensitivity_class='secret'
+             WHERE observation_id='observation-classified';",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        admit(&store, request("classified"), "classified", "classified"),
+        "admit"
+    );
+    // Both the decision and the object it materialized carry the trigger's class, so
+    // the admitted content is not exposed below the classification that supported it.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT sensitivity_class FROM admission_decisions
+             WHERE subject_object_id='object-classified'"
+        ),
+        "secret"
+    );
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT sensitivity_class FROM object_registry
+             WHERE object_id='object-classified'"
+        ),
+        "secret"
+    );
+}
+
+#[test]
+fn a_trigger_whose_evidence_is_gone_cannot_admit() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "unbacked", "code_present", 1, "unbacked-trigger");
+
+    // Back the observation with evidence, then invalidate the evidence while leaving
+    // the observation live — the state a deletion or purge leaves behind.
+    store
+        .commit(intent("unbacked-evidence"), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "unbacked-ev".to_string(),
+                object_id: "unbacked-ev-object".to_string(),
+                name: "unbacked ev".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "unbacked-ev".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=ON;
+             INSERT INTO object_registry(
+                 object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                 created_commit_seq,sensitivity_class
+             ) VALUES ('ev-object','evidence','trigger-unbacked','repo','ev',1,1,'normal');
+             INSERT INTO evidence_meta(
+                 evidence_id,object_id,artifact_reference,artifact_digest,byte_length,media_type,
+                 retention_class,provider_egress_class,redaction_metadata,created_commit_seq,
+                 sensitivity_class
+             ) VALUES ('ev-1','ev-object','local','digest',1,'text/plain','durable','local',X'',
+                       1,'normal');
+             UPDATE observations SET evidence_id='ev-1'
+             WHERE observation_id='observation-unbacked';
+             UPDATE evidence_meta
+             SET invalidated_commit_seq=(SELECT MAX(commit_seq) FROM commit_log)
+             WHERE evidence_id='ev-1';",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        admit(&store, request("unbacked"), "unbacked", "unbacked"),
+        "deny"
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='object-unbacked'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_self_admitting_record_does_not_inherit_a_revoked_approval() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    seed_dependent_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    // `approval-b` drew its support from `approval`; revoking the root demotes it.
+    store
+        .commit(intent("revoke-root-for-self"), |envelope| {
+            envelope.revoke_approval("approval", "root withdrawn")?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT effective_maturity FROM admission_decisions
+             WHERE subject_object_id='approval-b'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "verified"
+    );
+
+    // A self-admitting AcceptedAdr must not inherit the revoked approval, or its own
+    // root authority would stay hostage to an ancestor it no longer needs.
+    store
+        .commit(intent("self-admit"), |envelope| {
+            let mut self_admit = subject_request("approval-b", EventKind::AcceptedAdr);
+            self_admit.source_class = Some(SourceClass::ExplicitUser);
+            self_admit.taint_class = Some(TaintClass::UserExplicit);
+            let decision = envelope.record_admission(self_admit)?;
+            assert_eq!(decision.effective_maturity, Maturity::Approved);
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT COALESCE(approval_object_id,'none') FROM admission_decisions
+             WHERE subject_object_id='approval-b'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "none"
+    );
+
+    // Having regained root authority on its own, it can grant again.
+    stage(&store, "regranted");
+    let mut granted = request("regranted");
+    granted.source_class = Some(SourceClass::ModelInference);
+    granted.taint_class = Some(TaintClass::AssistantInference);
+    granted.event.kind = EventKind::Verify;
+    granted.event.trigger_object_id = None;
+    granted.event.approval_object_id = Some("approval-b".to_string());
+    assert_eq!(admit(&store, granted, "regranted", "regranted"), "admit");
+}
