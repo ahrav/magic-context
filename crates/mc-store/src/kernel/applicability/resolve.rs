@@ -172,7 +172,7 @@ impl<'s> ResolutionLadder<'s> {
         };
         // A patch ID using a different algorithm cannot establish anchor movement.
         // The algorithm-independent tree rung can still establish anchor movement.
-        let patch_unreadable = capture
+        let mut patch_unreadable = capture
             .patch_id
             .as_ref()
             .is_some_and(|patch| patch.algorithm != PATCH_ID_ALGORITHM);
@@ -190,6 +190,10 @@ impl<'s> ResolutionLadder<'s> {
                     .is_some_and(|patch_id| patch_id == stored.value))
             }) {
                 WindowMatch::None => {}
+                // The tree rung needs only a commit and its root tree, so an commentlint: allow(JUDGE)
+                // unreadable blob here does not bar an independent match commentlint: allow(JUDGE)
+                // there; it only rules out concluding a miss. commentlint: allow(JUDGE)
+                WindowMatch::Unreadable => patch_unreadable = true,
                 decided => return decided,
             }
         }
@@ -427,17 +431,19 @@ pub fn compute_patch_id(
     commit: ObjectId,
     budget: &EvalBudget,
 ) -> Result<Option<String>, ResolveObstacle> {
-    let Some(changes) = first_parent_blob_changes(repo, commit, budget)? else {
-        return Ok(None);
+    budget_gate(budget)?;
+    let changes = match first_parent_blob_changes(repo, commit, budget)? {
+        Some(changes) if !changes.is_empty() => changes,
+        // A merge returns before the diff callback and an empty diff invokes commentlint: allow(JUDGE)
+        // none, so neither path has polled since the gate above. commentlint: allow(JUDGE)
+        _ => {
+            budget_gate(budget)?;
+            return Ok(None);
+        }
     };
-    if changes.is_empty() {
-        return Ok(None);
-    }
     let mut file_hashes = Vec::with_capacity(changes.len());
     for change in &changes {
-        if budget.is_exhausted() {
-            return Err(ResolveObstacle::BudgetExhausted);
-        }
+        budget_gate(budget)?;
         let Some(file_hash) = file_change_hash(repo, change, budget)? else {
             return Ok(None);
         };
@@ -445,9 +451,7 @@ pub fn compute_patch_id(
     }
     // Loading, decompressing, and hashing the last blob runs after the final commentlint: allow(JUDGE)
     // poll, and callers persist or cache what this returns. commentlint: allow(JUDGE)
-    if budget.is_exhausted() {
-        return Err(ResolveObstacle::BudgetExhausted);
-    }
+    budget_gate(budget)?;
     // Hashing all file hashes together prevents linear cancellation.
     file_hashes.sort_unstable();
     let mut combined = Sha256::new();
@@ -540,6 +544,14 @@ impl std::fmt::Display for ResolveObstacle {
 }
 
 impl std::error::Error for ResolveObstacle {}
+
+fn budget_gate(budget: &EvalBudget) -> Result<(), ResolveObstacle> {
+    if budget.is_exhausted() {
+        Err(ResolveObstacle::BudgetExhausted)
+    } else {
+        Ok(())
+    }
+}
 
 fn file_change_hash(
     repo: &gix::Repository,

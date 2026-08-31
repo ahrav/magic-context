@@ -1268,3 +1268,120 @@ fn shallow_ancestry_still_reaches_the_fallback_rungs() {
         GitConditionOutcome::Uncertain
     );
 }
+
+#[test]
+fn patchless_commits_still_honor_exhaustion() {
+    use mc_store::kernel::applicability::ResolveObstacle;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "base", 1);
+    let side = commit_snapshot(repo, "side", &[], &[("g.txt", "two\n")], "side", 2);
+    // A merge leaves `first_parent_blob_changes` before its diff callback.
+    let merge = commit_snapshot(
+        repo,
+        "main",
+        &[base, side],
+        &[("f.txt", "one\n"), ("g.txt", "two\n")],
+        "merge",
+        3,
+    );
+    // An empty diff invokes no callback at all.
+    let empty = commit_snapshot(
+        repo,
+        "main",
+        &[merge],
+        &[("f.txt", "one\n"), ("g.txt", "two\n")],
+        "empty",
+        4,
+    );
+
+    let budget = EvalBudget::unbounded();
+    assert_eq!(compute_patch_id(repo, merge, &budget), Ok(None));
+    assert_eq!(compute_patch_id(repo, empty, &budget), Ok(None));
+
+    let exhausted = EvalBudget::unbounded();
+    exhausted
+        .interrupt_flag()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    for patchless in [merge, empty] {
+        assert_eq!(
+            compute_patch_id(repo, patchless, &exhausted),
+            Err(ResolveObstacle::BudgetExhausted),
+            "a commit with no patch identity must not answer past exhaustion"
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_patch_rung_still_reaches_the_tree_rung() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("a.txt", "a\n")], "base", 1);
+    // Anchor and rewrite share a parent and content, so they share a root
+    // tree while remaining distinct commits.
+    let anchored = commit_snapshot(
+        repo,
+        "topic",
+        &[base],
+        &[("a.txt", "a\nb\n")],
+        "anchored",
+        2,
+    );
+    let rebased = commit_snapshot(repo, "main", &[base], &[("a.txt", "a\nb\n")], "replayed", 3);
+    let captures = captures_for(repo, &[anchored]);
+    let capture = &captures[&anchored.to_string()];
+    assert!(capture.patch_id.is_some(), "the capture carries a patch id");
+    assert_eq!(
+        capture.tree_oid.as_deref(),
+        Some(
+            repo.find_commit(rebased)
+                .unwrap()
+                .tree_id()
+                .unwrap()
+                .detach()
+                .to_string()
+                .as_str()
+        ),
+        "the rewrite has the anchor's root tree"
+    );
+
+    let budget = EvalBudget::unbounded();
+    let intact = checkout(&fixture, rebased);
+    assert_eq!(
+        ResolutionLadder::new(&intact, &budget)
+            .evaluate(&reachable_from(anchored, captures.clone())),
+        GitConditionOutcome::Holds
+    );
+
+    // Drop the parent-side blob the patch rung needs. HEAD's tree does not
+    // reference it, so the checkout snapshot is unaffected while
+    // `file_change_hash` can no longer read the previous content.
+    let stale_blob = repo
+        .find_commit(base)
+        .unwrap()
+        .tree()
+        .unwrap()
+        .lookup_entry_by_path("a.txt")
+        .unwrap()
+        .unwrap()
+        .object_id();
+    let hex = stale_blob.to_string();
+    std::fs::remove_file(
+        fixture
+            .root
+            .join(".git/objects")
+            .join(&hex[..2])
+            .join(&hex[2..]),
+    )
+    .unwrap();
+
+    let snapshot = snapshot_checkout(&fixture.root, &budget).expect("snapshot succeeds");
+    assert_eq!(
+        ResolutionLadder::new(&snapshot, &budget).evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::Holds,
+        "an unreadable patch rung must not suppress a tree-rung match"
+    );
+}
