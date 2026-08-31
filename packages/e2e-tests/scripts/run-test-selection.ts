@@ -143,7 +143,7 @@ export function rustStandaloneFiles(root: string = E2E_ROOT): string[] {
 }
 
 /**
- * `src/**/*.test.ts` files must be claimed by at least one selection.
+ * `src/**\/*.test.ts` files must be claimed by at least one selection.
  * A new `src/` test file that no selection claims runs in no selection.
  */
 export function assertSrcTestsClassified(root: string = E2E_ROOT): void {

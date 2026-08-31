@@ -8,7 +8,6 @@ import {
     tier,
 } from "./decay-curve";
 
-
 describe("decay-curve — tier boundaries", () => {
     it("newest compartment at importance 50 renders P1", () => {
         expect(tier(1, 50, 1)).toBe(1);

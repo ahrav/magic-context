@@ -255,8 +255,7 @@ export function collectAliasesForTargets(
             if (targetSet.has(terminal) && oldIdentity !== terminal) {
                 result.set(oldIdentity, terminal);
             }
-        } catch {
-        }
+        } catch {}
     }
 
     if (tableExists(db, "project_aliases")) {

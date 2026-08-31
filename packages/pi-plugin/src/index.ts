@@ -1396,8 +1396,7 @@ async function startPiMagicContextRuntime(
 					try {
 						const id = getId.call(sm);
 						if (typeof id === "string" && id.length > 0) sessionId = id;
-					} catch {
-					}
+					} catch {}
 				}
 			}
 			if (sessionId) {
@@ -1967,8 +1966,7 @@ async function startPiMagicContextRuntime(
 				promptSurfaceGuidanceEpochs.clear(outgoingSessionId);
 				clearContextHandlerSession(outgoingSessionId);
 			}
-		} catch {
-		}
+		} catch {}
 	});
 }
 

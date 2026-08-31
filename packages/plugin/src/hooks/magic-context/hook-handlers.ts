@@ -341,7 +341,6 @@ export function createEventHook(args: {
         if (input.event.type !== "session.deleted") {
             await flushIgnoredMessages(sessionId);
         }
-
     };
 }
 

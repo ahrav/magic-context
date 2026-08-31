@@ -212,7 +212,6 @@ describe("buildMagicContextSection — caveman compression warning", () => {
 });
 
 describe("buildMagicContextSection — compaction-off guidance variant (#266 S4)", () => {
-
     it("the compaction-off variant is byte-identical to the existing no-reduce variant", () => {
         const existingNoReduce = buildMagicContextSection(null, 20, false, false, false, false);
         const compactionOff = buildMagicContextSection(null, 20, false, false, false, false);

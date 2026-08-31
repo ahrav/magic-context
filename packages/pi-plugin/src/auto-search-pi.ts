@@ -47,7 +47,6 @@ import type {
 	UnifiedSearchOptions,
 	UnifiedSearchResult,
 } from "@magic-context/core/features/magic-context/search";
-import { unifiedSearch } from "@magic-context/core/features/magic-context/search";
 import {
 	type AutoSearchHintDecision,
 	type AutoSearchHintNoHintReason,
@@ -370,5 +369,4 @@ export async function runAutoSearchHintForPi(args: {
  * Session cleanup hook. No-op: auto-search decisions live in `session_meta`
  * and are cleared by `clearSession()`.
  */
-export function clearAutoSearchForPiSession(_sessionId: string): void {
-}
+export function clearAutoSearchForPiSession(_sessionId: string): void {}

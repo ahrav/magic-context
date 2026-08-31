@@ -1509,8 +1509,7 @@ export function materializeM0Pi(
 	} catch (error) {
 		try {
 			db.exec("ROLLBACK");
-		} catch {
-		}
+		} catch {}
 		throw error;
 	}
 }
@@ -1925,8 +1924,7 @@ function softRefreshCachedM1Pi(args: {
 	} catch (error) {
 		try {
 			args.db.exec("ROLLBACK");
-		} catch {
-		}
+		} catch {}
 		throw error;
 	}
 }

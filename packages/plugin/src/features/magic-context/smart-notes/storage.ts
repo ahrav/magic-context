@@ -60,8 +60,7 @@ export function commitSmartNoteState(
     } catch (error) {
         try {
             db.exec("ROLLBACK");
-        } catch {
-        }
+        } catch {}
         throw error;
     }
     if (leaseLost) {

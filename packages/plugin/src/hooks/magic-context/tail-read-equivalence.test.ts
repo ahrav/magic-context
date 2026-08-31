@@ -1,4 +1,3 @@
-
 import { describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -8,7 +7,6 @@ import {
     readRawSessionTailFromDb,
 } from "./read-session-raw";
 import { buildTrueRawTokenIndex, computeRawRangeFingerprint } from "./read-session-true-raw-tokens";
-
 
 function makeDb(): Database {
     const db = new Database(":memory:");

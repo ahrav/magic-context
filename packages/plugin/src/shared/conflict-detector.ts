@@ -159,7 +159,6 @@ export function detectConflicts(
     };
 }
 
-
 /**
  * The SDK-generated `Config` type omits `compaction`; read it from the runtime response.
  */
@@ -276,11 +275,9 @@ function readUserCompaction(): { auto: boolean; prune: boolean; resolved: boolea
                 return { auto: c.auto === true, prune: c.prune === true, resolved: true };
             }
         }
-    } catch {
-    }
+    } catch {}
     return { auto: false, prune: false, resolved: false };
 }
-
 
 /**
  * `DCP_PACKAGE_NAMES` lists canonical npm package names for the conflicting DCP plugin.
@@ -363,7 +360,6 @@ function collectPluginEntries(directory: string): string[] {
 
     return plugins;
 }
-
 
 /**
  *

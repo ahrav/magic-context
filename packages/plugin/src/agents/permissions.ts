@@ -151,7 +151,6 @@ export function applyDisallowedTools(
     return defaults.filter((t) => !disallowed.includes(t));
 }
 
-
 /**
  *
  *

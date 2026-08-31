@@ -970,8 +970,7 @@ export class ConnectionGeneration {
         }
         try {
             this.onRouteGoodbyeHook?.(channel, epoch);
-        } catch {
-        }
+        } catch {}
     }
 
     /* */
@@ -1010,8 +1009,7 @@ export class ConnectionGeneration {
         if (this.pending.size === 0 && this.retiredInfo === null) {
             try {
                 this.onPendingZeroHook?.();
-            } catch {
-            }
+            } catch {}
         }
     }
 
@@ -1152,8 +1150,7 @@ export class ConnectionGeneration {
                 corr: meta.corr,
                 len: meta.len,
             });
-        } catch {
-        }
+        } catch {}
     }
 
     // ------------------------------------------------------------------

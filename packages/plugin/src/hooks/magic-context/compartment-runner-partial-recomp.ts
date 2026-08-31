@@ -183,7 +183,6 @@ export async function executePartialRecompInternal(
         // ── Resolve project memories for historian fact dedup context ─────
         const sessionDirectory = await resolveSessionDirectory(client, sessionId, directory);
 
-
         //
         // Staging layout for partial recomp: [priorCompartments, ...newBuiltSoFar]
         //   - priorCompartments always carried through unchanged

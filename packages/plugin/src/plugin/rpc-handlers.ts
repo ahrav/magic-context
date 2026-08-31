@@ -289,8 +289,7 @@ export function buildSidebarSnapshot(
                 )
                 .get(sessionId);
             sessionNoteCount = noteRow?.count ?? 0;
-        } catch {
-        }
+        } catch {}
 
         let readySmartNoteCount = 0;
         if (projectIdentity) {
@@ -652,8 +651,7 @@ export function buildStatusDetail(
                 .get(sessionId);
             detail.droppedTags = droppedRow?.count ?? 0;
             detail.totalTags = detail.activeTags + detail.droppedTags;
-        } catch {
-        }
+        } catch {}
 
         // Because the dialog displays only pendingOpsCount, status polls limit pendingOps to 100 rows and avoid serializing unused rows.
         try {
@@ -760,8 +758,7 @@ export function buildStatusDetail(
                 detail.compressionBudget = budget;
                 detail.compressionUsage = `${((histTokens / budget) * 100).toFixed(0)}%`;
             }
-        } catch {
-        }
+        } catch {}
     } catch (err) {
         log("[rpc] status-detail error:", err);
     }
@@ -1009,7 +1006,6 @@ export function registerRpcHandlers(
                 : 5000;
         return { toastDurationMs: resolved };
     });
-
 
     rpcServer.handle("get-announcement", async () => {
         if (!shouldShowAnnouncement()) {

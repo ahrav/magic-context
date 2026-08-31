@@ -2732,8 +2732,7 @@ export function createRustModeTransform(
                 try {
                     casChannel2NudgeState(deps.db, sessionId, "pending", "");
                     deps.channel2DirectiveTextBySession?.delete(sessionId);
-                } catch {
-                }
+                } catch {}
             } else if (directiveText) {
                 try {
                     casChannel2NudgeState(deps.db, sessionId, "", "pending");
@@ -2765,8 +2764,7 @@ export function createRustModeTransform(
                         sessionId,
                         `rust pass disarmed emergency recovery via ${disarmEvidence} after ${materializeReason} at ${passUsageSnapshot.percentage.toFixed(1)}% usage`,
                     );
-                } catch {
-                }
+                } catch {}
             }
             wireCaches.set(sessionId, pendingWireCache);
             appliedAt = performance.now();

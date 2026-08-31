@@ -339,7 +339,11 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         readiness = {};
         for (const [component, value] of Object.entries(rawReadiness)) {
             const normalized = component === "shared_memory" ? "transport" : component;
-            if (normalized !== "transport" && normalized !== "storage" && normalized !== "synapse") {
+            if (
+                normalized !== "transport" &&
+                normalized !== "storage" &&
+                normalized !== "synapse"
+            ) {
                 fail("readiness carries an unknown component");
             }
             if (readiness[normalized] !== undefined) {

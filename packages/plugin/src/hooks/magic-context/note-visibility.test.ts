@@ -1,4 +1,3 @@
-
 import { describe, expect, it } from "bun:test";
 import { hasVisibleNoteReadCall } from "./note-visibility";
 import { makeSentinel } from "./sentinel";

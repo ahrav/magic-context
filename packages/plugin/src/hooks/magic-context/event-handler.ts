@@ -635,7 +635,6 @@ export function createEventHandler(deps: EventHandlerDeps) {
                             `event message.updated: cleared historian failure state at ${percentage.toFixed(1)}%`,
                         );
                     }
-
                 }
 
                 updateSessionMeta(deps.db, info.sessionID, updates);

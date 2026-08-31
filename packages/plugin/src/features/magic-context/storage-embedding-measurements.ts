@@ -697,8 +697,7 @@ export function applySynapseReceiptGroup(
             if (!row || row.state === "complete" || row.state === "obsolete") continue;
             try {
                 markSynapseLedgerObsolete(db, { rowId, expectedStateVersion: row.stateVersion });
-            } catch {
-            }
+            } catch {}
         }
         throw error;
     }

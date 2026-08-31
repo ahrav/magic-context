@@ -745,8 +745,7 @@ function updateSessionProjectTracking(
 	if (db && prev !== projectIdentity) {
 		try {
 			recordSessionProjectIdentity(db, sessionId, projectIdentity);
-		} catch {
-		}
+		} catch {}
 	}
 	trackSessionForProject(projectIdentity, sessionId);
 	lastSeenProjectIdentityBySession.set(sessionId, projectIdentity);
@@ -2388,8 +2387,7 @@ export function registerPiContextHandler(
 							sessionId,
 							"EMERGENCY: historian wait completed (or timed out)",
 						);
-					} catch {
-					}
+					} catch {}
 				}
 
 				// Clearing `emergencyRecoveryArmed` while the session remains oversized can cause the next send to overflow.
@@ -3056,8 +3054,7 @@ function sendPiIgnoredNotification(
 				);
 			}
 			return;
-		} catch {
-		}
+		} catch {}
 	}
 	sessionLog("pi", message);
 }
@@ -3286,8 +3283,7 @@ function maybeFireHistorian(args: {
 					overflowState.detectedContextLimit,
 				);
 			}
-		} catch {
-		}
+		} catch {}
 		usageContextLimit = resolvePiUsableContextLimit({
 			rawContextWindow: usageContextLimit,
 			model: ctx.model,
@@ -3863,8 +3859,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				let piTtlMs = 5 * 60 * 1000;
 				try {
 					piTtlMs = parseCacheTtl(hardMeta.cacheTtl);
-				} catch {
-				}
+				} catch {}
 				return {
 					systemHash:
 						typeof hardMeta.systemPromptHash === "string"

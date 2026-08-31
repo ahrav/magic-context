@@ -786,7 +786,6 @@ describe("loadPluginConfig — project compaction trust boundary", () => {
 });
 
 describe("loadPluginConfig — raw merge preserves user fields not set in project", () => {
-
     it("user embedding survives when project config omits embedding", () => {
         const userConfig = JSON.stringify({
             embedding: {

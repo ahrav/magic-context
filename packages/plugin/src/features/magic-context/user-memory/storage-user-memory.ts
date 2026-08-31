@@ -31,7 +31,6 @@ export interface UserMemory {
     updatedAt: number;
 }
 
-
 export function insertUserMemoryCandidates(
     db: Database,
     candidates: Array<{
@@ -128,7 +127,6 @@ export function pruneExpiredUserMemoryCandidates(
         .run(cutoff);
     return Number(result.changes ?? 0);
 }
-
 
 function loadUserMemorySourceProvenance(
     db: Database,

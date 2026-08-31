@@ -1999,8 +1999,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     } catch (error) {
         try {
             options.db.exec("ROLLBACK");
-        } catch {
-        }
+        } catch {}
         throw error;
     }
 
@@ -2296,8 +2295,7 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
     } catch (error) {
         try {
             options.db.exec("ROLLBACK");
-        } catch {
-        }
+        } catch {}
         throw error;
     }
 }

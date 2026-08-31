@@ -26,8 +26,7 @@ afterEach(() => {
     for (const dir of tempDirs) {
         try {
             chmodSync(dir, 0o755);
-        } catch {
-        }
+        } catch {}
         rmSync(dir, { recursive: true, force: true });
     }
     tempDirs.length = 0;

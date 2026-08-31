@@ -229,8 +229,8 @@ describe("write path — comment-json full round-trip", () => {
         await queueTuiPreferenceUpdate(PLUGIN_KEY, ["collapsed"], true);
 
         const text = await readFile(file, "utf8");
-        expect(text).toContain("anthropic-auth section — DO NOT lose this BLOCK comment");
-        expect(text).toContain("bar appearance knobs MC has no schema for");
+        expect(text).toContain("Magic Context must preserve anthropic-auth's leading comment");
+        expect(text).toContain("Magic Context must preserve anthropic-auth.appearance");
         expect(text).toContain("INLINE trailing comment — must survive too");
 
         const root = parse(text) as Record<string, Record<string, unknown>>;

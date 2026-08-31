@@ -342,8 +342,7 @@ function nearestLastKnownGitIdentity(
     try {
         const realCanonical = realpathSync.native(canonical);
         if (realCanonical !== canonical) return walk(realCanonical);
-    } catch {
-    }
+    } catch {}
     return undefined;
 }
 

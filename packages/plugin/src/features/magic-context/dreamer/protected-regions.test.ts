@@ -1,4 +1,3 @@
-
 import { describe, expect, it } from "bun:test";
 import { enforceProtectedRegions, extractProtectedBlocks } from "./protected-regions";
 

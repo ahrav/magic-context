@@ -472,8 +472,7 @@ export async function runPiWrapup(
 			}
 			try {
 				clearEmergencyRecovery(deps.db, sessionId);
-			} catch {
-			}
+			} catch {}
 			return `## Magic Wrapup\n\nWrapped up ${messagesWrapped} messages into ${compartmentsCreated} compartments. The compacted history is queued and materializes on your next message.`;
 		} finally {
 			clearInterval(renewal);
@@ -494,8 +493,7 @@ function resolvePiContextLimit(
 	try {
 		const detected = getOverflowState(db, sessionId).detectedContextLimit;
 		if (detected > 0) detectedContextLimit = detected;
-	} catch {
-	}
+	} catch {}
 	return (
 		resolvePiUsableContextLimit({
 			rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,

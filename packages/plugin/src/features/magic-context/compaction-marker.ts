@@ -26,7 +26,6 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { tableColumnSet } from "./storage-schema-helpers";
 
-
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const ID_PREFIX_HEX_LENGTH = 12;
 const ID_SUFFIX_LENGTH = 14;
@@ -64,7 +63,6 @@ export function generateMessageId(timestampMs: number, counter = 0n, identity = 
 export function generatePartId(timestampMs: number, counter = 0n, identity = ""): string {
     return generateId("prt", timestampMs, counter, identity);
 }
-
 
 export function getOpenCodeDbPath(): string {
     return join(getDataDir(), "opencode", "opencode.db");
@@ -163,7 +161,6 @@ export function closeCompactionMarkerDb(): void {
     // Reset the schema-probe cache because the next open can use a different `opencode.db` path.
     cachedSchemaCompatible = null;
 }
-
 
 export interface BoundaryUserMessage {
     id: string;
@@ -271,7 +268,6 @@ export function getOpenCodeMessageById(
     return row ?? null;
 }
 
-
 interface CompactionMarkerState {
     /* */
     boundaryMessageId: string;
@@ -282,7 +278,6 @@ interface CompactionMarkerState {
     /* */
     summaryPartId: string;
 }
-
 
 export interface InjectCompactionMarkerArgs {
     sessionId: string;
@@ -593,7 +588,6 @@ export function removeForeignCompactionMarker(
         return false;
     }
 }
-
 
 /**
  * Result of the compaction-off flip cleanup over one session's opencode.db

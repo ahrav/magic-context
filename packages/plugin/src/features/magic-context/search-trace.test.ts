@@ -1,4 +1,3 @@
-
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";

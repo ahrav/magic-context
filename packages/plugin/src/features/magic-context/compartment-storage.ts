@@ -377,8 +377,7 @@ export function replaceAllCompartmentStateAndBumpDepth(
         if (!finished) {
             try {
                 db.exec("ROLLBACK");
-            } catch {
-            }
+            } catch {}
         }
     }
 }
@@ -429,7 +428,6 @@ export function buildCompartmentBlock(
 
     return lines.join("\n").trimEnd();
 }
-
 
 export interface RecompStaging {
     compartments: CompartmentInput[];
@@ -585,8 +583,7 @@ export function promoteRecompStaging(
         if (!finished) {
             try {
                 db.exec("ROLLBACK");
-            } catch {
-            }
+            } catch {}
         }
     }
 }
@@ -600,11 +597,9 @@ export function clearRecompStaging(db: Database, sessionId: string): void {
             db.prepare(
                 "UPDATE session_meta SET recomp_partial_range_start = 0, recomp_partial_range_end = 0 WHERE session_id = ?",
             ).run(sessionId);
-        } catch {
-        }
+        } catch {}
     })();
 }
-
 
 /**
  *

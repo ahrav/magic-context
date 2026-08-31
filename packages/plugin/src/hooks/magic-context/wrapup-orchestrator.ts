@@ -379,8 +379,7 @@ export async function runManagedWrapup(
             }
             try {
                 pushNotification("action", { action: "wrapup-progress-kick" }, sessionId);
-            } catch {
-            }
+            } catch {}
         }
 
         if (!stoppedForFailure && ownershipLost) {
@@ -509,8 +508,7 @@ export async function runManagedWrapup(
 
     try {
         clearEmergencyRecovery(ctx.db, sessionId);
-    } catch {
-    }
+    } catch {}
     const base = `Wrapped up ${messagesWrapped} messages into ${compartmentsCreated} compartments. The compacted history is queued and materializes on your next message.`;
     const message = appendFlushHint(ctx, sessionId, base);
     setRecompTerminal(ctx.liveSessionState, sessionId, "done", message);

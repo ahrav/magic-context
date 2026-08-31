@@ -333,7 +333,6 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
 
     let awaitedCompartmentRun = false;
 
-
     if (
         historianRunnable &&
         args.canRunCompartments &&

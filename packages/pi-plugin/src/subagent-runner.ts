@@ -795,8 +795,7 @@ export class PiSubagentRunner implements SubagentRunner {
 				if (!options.onProgress) return;
 				try {
 					options.onProgress(event);
-				} catch {
-				}
+				} catch {}
 			};
 
 			let child: ReturnType<typeof childProcess.spawn>;
@@ -846,8 +845,7 @@ export class PiSubagentRunner implements SubagentRunner {
 				// Stream write failures emit asynchronous `error` events rather than throwing from `.end()`.
 				// An `error` listener prevents EPIPE from becoming an unhandled stream error.
 				// The runner attaches the `error` listener before `.end()` because write failures are asynchronous.
-				child.stdin.on("error", () => {
-				});
+				child.stdin.on("error", () => {});
 				try {
 					child.stdin.end(options.userMessage, "utf8");
 				} catch {
