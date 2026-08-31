@@ -144,7 +144,7 @@ fn measure(arm: &str, iterations: u64, payload: usize) -> Measurement {
                 counters.generic_queue_hops = 1;
                 counters.scheduler_handoffs = 1;
             }
-            let disqualifications = counters.disqualifications(false);
+            let disqualifications = counters.disqualifications(true);
             let reason = if disqualifications.is_empty() {
                 "smoke evidence is never designated-host qualification".to_owned()
             } else {
@@ -267,12 +267,28 @@ fn run_ring(
     let profile = ring_profile()?;
     let ring = Ring::create(&profile, 0).map_err(|_| "ring setup")?;
     let body = vec![0x5a; payload_len];
+    let mapped = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        return Err("ring counter mapping");
+    }
+    let park_wakes = mapped.cast::<AtomicU64>();
+    unsafe { park_wakes.write(AtomicU64::new(0)) };
     let child = unsafe { libc::fork() };
     if child < 0 {
+        unsafe { libc::munmap(mapped, 4096) };
         return Err("ring peer fork");
     }
     if child == 0 {
-        let status = ring_consumer(&ring, iterations, copied_receiver);
+        let status = ring_consumer(&ring, iterations, copied_receiver, unsafe { &*park_wakes });
         unsafe { libc::_exit(status) };
     }
 
@@ -299,8 +315,10 @@ fn run_ring(
         reservation.write(source).map_err(|_| "write")?;
         reservation.commit(payload_len).map_err(|_| "commit")?;
     }
-    let status = wait_child(child)?;
-    if status != 0 {
+    let status = wait_child(child);
+    let park_wakes = unsafe { (*park_wakes).load(Ordering::Relaxed) };
+    unsafe { libc::munmap(mapped, 4096) };
+    if status? != 0 {
         return Err("ring peer failed");
     }
     if copied_receiver {
@@ -316,18 +334,24 @@ fn run_ring(
         copies,
         allocations,
         0,
-        iterations,
+        park_wakes,
         checksum,
     ))
 }
 
-fn ring_consumer(ring: &Ring, iterations: u64, copied_receiver: bool) -> i32 {
+fn ring_consumer(
+    ring: &Ring,
+    iterations: u64,
+    copied_receiver: bool,
+    park_wakes: &AtomicU64,
+) -> i32 {
     for _ in 0..iterations {
         let deadline = Instant::now() + Duration::from_secs(2);
         let lease = loop {
             match ring.try_receive() {
                 Ok(Some(lease)) => break lease,
                 Ok(None) if Instant::now() < deadline => {
+                    park_wakes.fetch_add(1, Ordering::Relaxed);
                     if ring.wait_for_data(deadline).is_err() {
                         return 2;
                     }

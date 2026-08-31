@@ -151,6 +151,7 @@ struct Layout {
 
 impl Layout {
     fn new(depth: usize, arena_bytes: usize) -> Result<Self, RingError> {
+        let page_size = system_page_size();
         let producer = 0usize;
         let consumer = align_up(size_of::<ProducerPage>(), CACHELINE)?;
         let reclaim = align_up(
@@ -184,16 +185,16 @@ impl Layout {
             slots
                 .checked_add(slot_bytes)
                 .ok_or(RingError::ArithmeticOverflow)?,
-            PAGE_SIZE,
+            page_size,
         )?;
         let lifecycle = align_up(
             arena
                 .checked_add(arena_bytes)
                 .ok_or(RingError::ArithmeticOverflow)?,
-            PAGE_SIZE,
+            page_size,
         )?;
         let total = lifecycle
-            .checked_add(PAGE_SIZE)
+            .checked_add(page_size)
             .ok_or(RingError::ArithmeticOverflow)?;
         Ok(Self {
             producer,
@@ -830,21 +831,21 @@ impl Ring {
         }
         let wake = self.data_wake_ptr()?;
         // SAFETY: wake page remains mapped and atomics were initialized before activation.
-        let generation = unsafe { (*wake).generation.load(Ordering::Acquire) };
+        let generation = unsafe { (*wake).generation.load(Ordering::SeqCst) };
         unsafe {
             (*wake)
                 .parked
-                .store(generation.wrapping_add(1), Ordering::Release)
+                .store(generation.wrapping_add(1), Ordering::SeqCst)
         };
         if self.data_available()?
-            || unsafe { (*wake).generation.load(Ordering::Acquire) } != generation
+            || unsafe { (*wake).generation.load(Ordering::SeqCst) } != generation
         {
             unsafe { (*wake).parked.store(0, Ordering::Release) };
             return Ok(false);
         }
         self.data_ready.drain()?;
         if self.data_available()?
-            || unsafe { (*wake).generation.load(Ordering::Acquire) } != generation
+            || unsafe { (*wake).generation.load(Ordering::SeqCst) } != generation
         {
             unsafe { (*wake).parked.store(0, Ordering::Release) };
             return Ok(false);
@@ -990,12 +991,12 @@ impl Ring {
             }
             let wake = self.capacity_wake_ptr().map_err(ProducerError::Ring)?;
             // SAFETY: wake page remains mapped and atomics were initialized before activation.
-            let generation = unsafe { (*wake).generation.load(Ordering::Acquire) };
+            let generation = unsafe { (*wake).generation.load(Ordering::SeqCst) };
             // A nonzero parked value identifies this generation-bound park epoch.
             unsafe {
                 (*wake)
                     .parked
-                    .store(generation.wrapping_add(1), Ordering::Release)
+                    .store(generation.wrapping_add(1), Ordering::SeqCst)
             };
             match self.try_reserve(bound, wire_header) {
                 Err(ProducerError::Exhausted) if Instant::now() < deadline => {}
@@ -1008,7 +1009,7 @@ impl Ring {
                     return result;
                 }
             }
-            if unsafe { (*wake).generation.load(Ordering::Acquire) } != generation {
+            if unsafe { (*wake).generation.load(Ordering::SeqCst) } != generation {
                 unsafe { (*wake).parked.store(0, Ordering::Release) };
                 continue;
             }
@@ -1027,7 +1028,7 @@ impl Ring {
                     return result;
                 }
             }
-            if unsafe { (*wake).generation.load(Ordering::Acquire) } != generation {
+            if unsafe { (*wake).generation.load(Ordering::SeqCst) } != generation {
                 unsafe { (*wake).parked.store(0, Ordering::Release) };
                 continue;
             }
@@ -1422,8 +1423,8 @@ impl Ring {
         let wake = wake?;
         // SAFETY: wake page remains mapped and is shared through atomics.
         unsafe {
-            (*wake).generation.fetch_add(1, Ordering::Release);
-            if (*wake).parked.swap(0, Ordering::AcqRel) != 0 {
+            (*wake).generation.fetch_add(1, Ordering::SeqCst);
+            if (*wake).parked.swap(0, Ordering::SeqCst) != 0 {
                 doorbell.signal()?;
             }
         }

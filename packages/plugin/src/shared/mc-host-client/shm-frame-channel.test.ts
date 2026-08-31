@@ -588,7 +588,7 @@ describe("mandatory shared-memory channel", () => {
         });
         channel.beginFrames();
         const body = { byteLength: 0, fill: () => {} };
-        for (let index = 0; index < pair.first.descriptorDepth; index++) {
+        for (let index = 0; index < pair.descriptorDepth; index++) {
             channel.produce(responseHeader(FrameType.Request, BigInt(index + 1), 0), body);
         }
         publish(pair.second, responseHeader(FrameType.Response, 99n, 0), new Uint8Array());

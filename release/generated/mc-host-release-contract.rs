@@ -13,7 +13,7 @@ pub const RELEASE_CONTRACT_JSON: &str = "{\n  \"cli\": {\n    \"check_ids\": [\n
 /// SHA-256 hex digest of `RELEASE_CONTRACT_JSON`.
 pub const RELEASE_CONTRACT_SHA256: &str = "ab3b41c0f4f99f917dc4ac03515a2a36f50d5cb0dde603b4518cf47480e975e2";
 
-/// Synchronized release version, unpublished across all six package names at freeze.
+/// Synchronized release version at freeze.
 pub const RELEASE_VERSION: &str = "0.38.0";
 
 /// Bounded daemon version string authenticated by ServerProof.

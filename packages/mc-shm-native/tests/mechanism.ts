@@ -90,7 +90,12 @@ function loadRawAddon(): RawAttachAddon | null {
         dirname(fileURLToPath(import.meta.url)),
         "../mc_shm_native.node",
     );
-    if (!existsSync(path)) return null;
+    if (!existsSync(path)) {
+        if (process.env.MC_SHM_NATIVE_CLAIMED_TARGET === "1") {
+            throw new Error("claimed native addon is missing");
+        }
+        return null;
+    }
     return createRequire(import.meta.url)(path) as RawAttachAddon;
 }
 

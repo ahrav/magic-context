@@ -60,8 +60,8 @@ shm_run() {
   }
   shm_build
   "$SHM_BENCH" "${args[@]}" >"$evidence"
-  grep -q '"local_verdict": "MECHANISM_SMOKE_ONLY"' "$evidence" &&
-    grep -q '"designated_host_verdict": "BLOCKED"' "$evidence" || {
+  grep -Eq '"local_verdict"[[:space:]]*:[[:space:]]*"MECHANISM_SMOKE_ONLY"' "$evidence" &&
+    grep -Eq '"designated_host_verdict"[[:space:]]*:[[:space:]]*"BLOCKED"' "$evidence" || {
     echo "shared-memory harness did not retain separate local/designated verdicts" >&2
     exit 1
   }

@@ -33,7 +33,7 @@ import { fileURLToPath } from "node:url";
 // Contract literal: the single pre-build source of truth.
 // ---------------------------------------------------------------------------
 
-/** The synchronized release version, unpublished across all six package names (R50). */
+/** Synchronized release version (R50). */
 const RELEASE_VERSION = "0.38.0";
 
 const PARENT_PACKAGES = [
@@ -1589,7 +1589,7 @@ pub const RELEASE_CONTRACT_JSON: &str = "${escapeRustString(canonical)}";
 /// SHA-256 hex digest of \`RELEASE_CONTRACT_JSON\`.
 pub const RELEASE_CONTRACT_SHA256: &str = "${digest}";
 
-/// Synchronized release version, unpublished across all six package names at freeze.
+/// Synchronized release version at freeze.
 pub const RELEASE_VERSION: &str = "${contract.release.version}";
 
 /// Bounded daemon version string authenticated by ServerProof.

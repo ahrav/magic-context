@@ -1337,12 +1337,12 @@ export class McHostModuleTransport {
             const stops: Promise<CertifiedConnection>[] = [shared];
             if (deadline) {
                 if (deadline.remainingMs() <= 0) {
-                    throw this.deadlineError("waiting for the shared connection");
+                    throw new WaiterDetachedError("deadline");
                 }
                 stops.push(
                     new Promise((_resolve, reject) => {
                         cancelTimer = armExpiryTimer(deadline, () =>
-                            reject(this.deadlineError("waiting for the shared connection")),
+                            reject(new WaiterDetachedError("deadline")),
                         );
                     }),
                 );
