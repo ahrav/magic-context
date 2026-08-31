@@ -112,7 +112,7 @@ pub(crate) fn rebuild_alignment_tx(tx: &Transaction<'_>) -> Result<AlignmentRebu
             published: false,
         });
     }
-    let rows = derive_alignment(load_alignment_input(&tx, tip)?)?.rows;
+    let rows = derive_alignment(load_alignment_input(tx, tip)?)?.rows;
     let specs = rows
         .into_iter()
         .map(|row| AlignmentProjectionSpec {
