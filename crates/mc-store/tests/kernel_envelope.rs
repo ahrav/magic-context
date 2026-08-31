@@ -146,6 +146,10 @@ fn fault_after_events_rolls_back_canonical_rows_events_outbox_and_receipt() {
         "change_event",
         "outbox",
         "operation_receipts",
+        "scan_batches",
+        "field_scans",
+        "scan_owner_copies",
+        "scan_detections",
     ] {
         assert_eq!(
             inspect(directory.path(), &format!("SELECT COUNT(*) FROM {table}")),
@@ -166,6 +170,13 @@ fn receipt_replay_is_effect_free_and_digest_conflict_is_typed() {
         })
         .unwrap();
     let called = Cell::new(false);
+    let audit_counts = [
+        "scan_batches",
+        "field_scans",
+        "scan_owner_copies",
+        "scan_detections",
+    ]
+    .map(|table| inspect(directory.path(), &format!("SELECT COUNT(*) FROM {table}")));
     let replay = store
         .commit(intent("replay", 'c'), |_| {
             called.set(true);
@@ -181,6 +192,16 @@ fn receipt_replay_is_effect_free_and_digest_conflict_is_typed() {
         1
     );
     assert_eq!(inspect(directory.path(), "SELECT COUNT(*) FROM outbox"), 1);
+    assert_eq!(
+        audit_counts,
+        [
+            "scan_batches",
+            "field_scans",
+            "scan_owner_copies",
+            "scan_detections",
+        ]
+        .map(|table| inspect(directory.path(), &format!("SELECT COUNT(*) FROM {table}")))
+    );
 
     let conflict = store
         .commit(intent("replay", 'd'), |_| Ok(String::new()))
@@ -484,9 +505,9 @@ fn projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events()
     assert_eq!(
         inspect(
             directory.path(),
-            "SELECT COUNT(*) FROM durable_text_redactions WHERE owner_kind='alignment_projection'"
+            "SELECT COUNT(*) FROM scan_owner_copies WHERE owner_kind='alignment_projection'"
         ),
-        1
+        2
     );
     let second = AlignmentProjectionSpec {
         decision_id: "decision".to_string(),
@@ -530,7 +551,8 @@ fn projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events()
     );
     let redactions = connection
         .prepare(
-            "SELECT owner_id,field_name,secret_type FROM durable_text_redactions
+            "SELECT owner_copy_id,field_id,label_id FROM scan_owner_copies
+             JOIN scan_detections USING(scan_id)
              WHERE owner_kind='alignment_projection' ORDER BY detection_ordinal",
         )
         .unwrap()
@@ -544,12 +566,9 @@ fn projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events()
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(
-        redactions,
-        [(
-            "decision:observation".to_string(),
-            "alignment_payload".to_string(),
-            "password".to_string()
-        )]
-    );
+    assert_eq!(redactions.len(), 1);
+    assert_eq!(redactions[0].0.len(), 32);
+    assert_ne!(redactions[0].0, "decision:observation");
+    assert_eq!(redactions[0].1, "alignment_payload");
+    assert_eq!(redactions[0].2, "password");
 }

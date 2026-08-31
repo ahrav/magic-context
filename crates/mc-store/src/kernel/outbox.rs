@@ -1,7 +1,7 @@
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use super::envelope::{check_fence, Envelope, ObjectRow, PendingChange, Sensitivity};
-use super::redaction::{redact, RedactedField};
+use super::redaction::{exact_unscanned, redact, reject, RedactedField};
 use super::{KernelError, KernelStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +19,7 @@ impl Envelope<'_> {
         if recorded_at < 0 || consumer_id.trim().is_empty() {
             return Err(KernelError::InvalidInput);
         }
-        let consumer_id = redact(consumer_id);
+        let consumer_id = reject(consumer_id)?;
         let oldest_commit = self
             .tx
             .query_row("SELECT MIN(commit_seq) FROM outbox", [], |row| {
@@ -100,8 +100,8 @@ impl Envelope<'_> {
         if operator_id.trim().is_empty() || reason.trim().is_empty() {
             return Err(KernelError::InvalidInput);
         }
-        let operator_id = redact(operator_id);
-        let reason = redact(reason);
+        let operator_id = reject(operator_id)?;
+        let reason = redact(reason)?;
         let abandonment_id = format!("{}:{}", self.commit_seq, consumer_id.text);
         self.tx
             .execute(
@@ -154,7 +154,7 @@ impl Envelope<'_> {
         if recorded_at < 0 || consumer_id.trim().is_empty() {
             return Err(KernelError::InvalidInput);
         }
-        let consumer_id = redact(consumer_id);
+        let consumer_id = exact_unscanned(consumer_id);
         let checkpoint = self
             .tx
             .query_row(
@@ -241,7 +241,7 @@ impl KernelStore {
         if consumer_id.trim().is_empty() || checkpoint_commit_seq < 0 || updated_at < 0 {
             return Err(KernelError::InvalidCheckpoint);
         }
-        let consumer_id = redact(consumer_id);
+        let consumer_id = exact_unscanned(consumer_id);
         let mut writer = self.lock_writer()?;
         let tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -298,17 +298,19 @@ impl KernelStore {
             )
             .map_err(|_| KernelError::Io)?
             .ok_or(KernelError::NoRequiredConsumers)?;
-        tx.execute(
-            "DELETE FROM durable_text_redactions
-             WHERE owner_kind='outbox' AND owner_id IN (
-                 SELECT CAST(outbox_position AS TEXT) FROM outbox WHERE commit_seq<=?1
-             )",
-            [horizon],
-        )
-        .map_err(|_| KernelError::Io)?;
         let deleted = tx
             .execute("DELETE FROM outbox WHERE commit_seq<=?1", [horizon])
             .map_err(|_| KernelError::Io)?;
+        tx.execute(
+            "DELETE FROM scan_owner_copies
+             WHERE owner_kind='outbox'
+               AND NOT EXISTS (
+                   SELECT 1 FROM outbox
+                    WHERE outbox.commit_seq=scan_owner_copies.owner_commit_seq
+               )",
+            [],
+        )
+        .map_err(|_| KernelError::Io)?;
         tx.commit().map_err(|_| KernelError::Io)?;
         Ok(OutboxPruneResult { horizon, deleted })
     }

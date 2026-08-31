@@ -60,6 +60,16 @@ fn first_day_31_sweep_abandons_incomplete_run_without_deleting_it() {
         .stage_candidate(candidate("run", "candidate", 0))
         .unwrap();
     assert_eq!(
+        inspect(directory.path())
+            .query_row(
+                "SELECT COUNT(*) FROM scan_batches WHERE commit_seq IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
         store
             .renew_staging_run("run", 2, 2 + HOUR_MS + 1)
             .unwrap_err()
@@ -72,6 +82,16 @@ fn first_day_31_sweep_abandons_incomplete_run_without_deleting_it() {
     assert_eq!(result.abandoned, 1);
     assert_eq!(result.deleted_runs, 0);
     let connection = inspect(directory.path());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM scan_batches WHERE commit_seq IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
     let run: (String, i64) = connection
         .query_row(
             "SELECT terminal_state,terminal_at FROM extraction_runs WHERE extraction_run_id='run'",
@@ -319,6 +339,16 @@ fn halted_consumer_does_not_block_staging_cleanup_or_lose_unacked_outbox_rows() 
     );
 
     let connection = inspect(directory.path());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM scan_batches WHERE commit_seq IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
     let after = connection
         .prepare("SELECT outbox_position,commit_seq,payload FROM outbox ORDER BY outbox_position")
         .unwrap()

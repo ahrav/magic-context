@@ -8,13 +8,25 @@ use mc_store::sqlite_runtime::compute_marker_digest_for_application_id;
 use mc_store::sqlite_runtime::SqliteEngineIdentity;
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::{collections::BTreeMap, fs};
 
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 fn core_path(root: &Path) -> PathBuf {
     root.join("core.sqlite")
+}
+
+fn database_family(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(root)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.starts_with("core.sqlite") && entry.file_type().unwrap().is_file())
+                .then(|| (name, fs::read(entry.path()).unwrap()))
+        })
+        .collect()
 }
 
 fn inspect<T>(root: &Path, query: impl FnOnce(&Connection) -> T) -> T {
@@ -124,12 +136,12 @@ fn fresh_open_and_exact_reopen_preserve_identity_and_advance_fence() {
 fn second_opener_is_held_without_touching_database_family() {
     let dir = tempfile::tempdir().unwrap();
     let first = KernelStore::open(dir.path()).unwrap();
-    let before = fs::read(core_path(dir.path())).unwrap();
+    let before = database_family(dir.path());
     assert_eq!(
         KernelStore::open(dir.path()).unwrap_err(),
         KernelError::Held
     );
-    assert_eq!(fs::read(core_path(dir.path())).unwrap(), before);
+    assert_eq!(database_family(dir.path()), before);
     drop(first);
 }
 
@@ -167,6 +179,22 @@ fn every_conclusive_kernel_mismatch_is_quarantined_and_rebuilt() {
             1
         );
     }
+}
+
+#[test]
+fn old_epoch_with_old_digest_is_refused_without_rewriting_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = seed_kernel(dir.path());
+    replace_marker(&conn, 0, &"b".repeat(64));
+    drop(conn);
+    let before = database_family(dir.path());
+
+    assert_eq!(
+        KernelStore::open(dir.path()).unwrap_err(),
+        KernelError::Inconclusive
+    );
+    assert_eq!(database_family(dir.path()), before);
+    assert!(quarantine_dirs(dir.path()).is_empty());
 }
 
 #[test]

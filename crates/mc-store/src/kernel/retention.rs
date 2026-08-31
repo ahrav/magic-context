@@ -136,6 +136,15 @@ impl KernelStore {
                 [cutoff],
             )
             .map_err(|_| KernelError::Io)?;
+        tx.execute(
+            "DELETE FROM scan_batches
+             WHERE commit_seq IS NULL
+               AND NOT EXISTS(SELECT 1 FROM extraction_runs WHERE extraction_runs.scan_batch_id=scan_batches.scan_batch_id)
+               AND NOT EXISTS(SELECT 1 FROM candidates WHERE candidates.scan_batch_id=scan_batches.scan_batch_id)
+               AND NOT EXISTS(SELECT 1 FROM alignment_projection WHERE alignment_projection.scan_batch_id=scan_batches.scan_batch_id)",
+            [],
+        )
+        .map_err(|_| KernelError::Io)?;
         tx.commit().map_err(|_| KernelError::Io)?;
         Ok(StagingMaintenanceResult {
             abandoned,

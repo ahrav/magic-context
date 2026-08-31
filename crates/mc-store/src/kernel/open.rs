@@ -1,6 +1,7 @@
 use cortexkit_lease::{
     protect_file, FileLeaseStore, LeaseError, LeaseHandle, LeaseKey, LeaseStore,
 };
+use mc_core::redaction::RedactionErrorKind;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,6 +40,7 @@ pub enum KernelError {
     FenceLost,
     Conflict,
     InvalidInput,
+    Redaction(RedactionErrorKind),
     FutureSnapshot,
     NotFound,
     InvalidCheckpoint,
@@ -62,6 +64,7 @@ pub enum KernelErrorKind {
     FenceLost,
     Conflict,
     InvalidInput,
+    Redaction(RedactionErrorKind),
     FutureSnapshot,
     NotFound,
     InvalidCheckpoint,
@@ -86,6 +89,7 @@ impl KernelError {
             Self::FenceLost => KernelErrorKind::FenceLost,
             Self::Conflict => KernelErrorKind::Conflict,
             Self::InvalidInput => KernelErrorKind::InvalidInput,
+            Self::Redaction(kind) => KernelErrorKind::Redaction(kind),
             Self::FutureSnapshot => KernelErrorKind::FutureSnapshot,
             Self::NotFound => KernelErrorKind::NotFound,
             Self::InvalidCheckpoint => KernelErrorKind::InvalidCheckpoint,
@@ -112,6 +116,7 @@ impl fmt::Display for KernelError {
             Self::FenceLost => "kernel store writer fence was lost",
             Self::Conflict => "kernel operation conflicts with an existing receipt",
             Self::InvalidInput => "kernel operation input is invalid",
+            Self::Redaction(_) => "kernel transaction result failed secret scanning",
             Self::FutureSnapshot => "kernel snapshot is newer than the committed tip",
             Self::NotFound => "kernel object was not found",
             Self::InvalidCheckpoint => "outbox checkpoint is invalid",

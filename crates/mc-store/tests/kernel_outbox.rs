@@ -3,8 +3,6 @@
 use mc_store::kernel::{CommitIntent, DomainSpec, KernelErrorKind, KernelStore, Sensitivity};
 use rusqlite::{Connection, OpenFlags};
 
-const SECRET: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyzABCDEFGH12345678";
-
 fn intent(key: &str) -> CommitIntent {
     CommitIntent {
         producer: "kernel-outbox-test".to_string(),
@@ -19,11 +17,7 @@ fn domain(index: usize) -> DomainSpec {
     DomainSpec {
         domain_id: format!("domain-{index}"),
         object_id: format!("object-{index}"),
-        name: if index == 1 {
-            format!("name-{SECRET}")
-        } else {
-            format!("name-{index}")
-        },
+        name: format!("name-{index}"),
         source_kind: "fixture".to_string(),
         source_id: format!("source-{index}"),
         source_revision: i64::try_from(index).unwrap(),
@@ -197,11 +191,9 @@ fn slow_consumer_sets_commit_prune_horizon_and_registration_sees_oldest_retained
     assert_eq!(
         connection
             .query_row(
-                "SELECT COUNT(*) FROM durable_text_redactions r
-                 WHERE r.owner_kind='outbox' AND NOT EXISTS (
-                     SELECT 1 FROM outbox o WHERE CAST(o.outbox_position AS TEXT)=r.owner_id
-                 )",
-                [],
+                "SELECT COUNT(*) FROM scan_owner_copies
+                 WHERE owner_kind='outbox' AND owner_commit_seq<=?1",
+                [first],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
@@ -292,24 +284,33 @@ fn deregistration_uses_commit_tip_without_publication_and_abandonment_records_fo
         .unwrap();
     store
         .commit(intent("abandon"), |envelope| {
-            envelope.abandon_outbox_consumer("abandoned", "operator-1", "retired", 42)?;
+            envelope.abandon_outbox_consumer("abandoned", "operator-1", "password=retired", 42)?;
             Ok("abandoned".to_string())
         })
         .unwrap();
 
     let connection = inspect(directory.path());
-    let facts: (String, i64, String, i64) = connection
+    let facts: (String, i64, String, String, i64) = connection
         .query_row(
-            "SELECT consumer_id,last_checkpoint_commit_seq,operator_id,abandoned_at
+            "SELECT consumer_id,last_checkpoint_commit_seq,operator_id,reason,abandoned_at
              FROM consumer_abandonments",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(facts.0, "abandoned");
     assert!(facts.1 > 0);
     assert_eq!(facts.2, "operator-1");
-    assert_eq!(facts.3, 42);
+    assert_eq!(facts.3, "password=<REDACTED:password>");
+    assert_eq!(facts.4, 42);
     let payload: String = connection
         .query_row(
             "SELECT CAST(payload AS TEXT) FROM change_event
@@ -324,6 +325,7 @@ fn deregistration_uses_commit_tip_without_publication_and_abandonment_records_fo
     );
     assert!(payload.contains(&format!("\"checkpoint_commit_seq\":{}", facts.1)));
     assert!(payload.contains("\"operator_id\":\"operator-1\""));
+    assert!(payload.contains("\"reason\":\"password=<REDACTED:password>\""));
     assert!(payload.contains("\"abandoned_at\":42"));
 }
 
@@ -364,9 +366,17 @@ fn derived_projection_discard_preserves_exact_checkpoints_and_receipts() {
         .unwrap();
     connection
         .execute(
+            "INSERT INTO scan_batches(scan_batch_id,created_at)
+             VALUES ('0123456789abcdef0123456789abcdef',1)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
             "INSERT INTO alignment_projection(
-                 decision_id,observation_id,alignment_kind,built_through_commit_seq
-             ) VALUES ('derived-decision','derived-observation','derived',1)",
+                 decision_id,observation_id,alignment_kind,scan_batch_id,built_through_commit_seq
+              ) VALUES ('derived-decision','derived-observation','derived',
+                        '0123456789abcdef0123456789abcdef',1)",
             [],
         )
         .unwrap();

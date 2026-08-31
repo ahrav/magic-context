@@ -131,6 +131,10 @@ struct RestoreOracle {
     outbox: String,
     receipts: String,
     consumers: String,
+    scan_batches: String,
+    field_scans: String,
+    scan_owner_copies: String,
+    scan_detections: String,
     commit_tip: i64,
 }
 
@@ -205,6 +209,51 @@ fn restore_oracle(root: &Path) -> RestoreOracle {
                 "SELECT COALESCE(group_concat(row_value, ','),'') FROM (
                      SELECT consumer_id || ':' || checkpoint_commit_seq || ':' || updated_at AS row_value
                      FROM outbox_consumers ORDER BY consumer_id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        scan_batches: connection
+            .query_row(
+                "SELECT COALESCE(group_concat(row_value, ','),'') FROM (
+                     SELECT scan_batch_id || ':' || IFNULL(commit_seq,'null') || ':' || created_at AS row_value
+                     FROM scan_batches ORDER BY scan_batch_id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        field_scans: connection
+            .query_row(
+                "SELECT COALESCE(group_concat(row_value, ','),'') FROM (
+                     SELECT scan_id || ':' || scan_batch_id || ':' || detector_id || ':' ||
+                            detector_revision || ':' || IFNULL(semantic_digest,'null') || ':' ||
+                            finding_count AS row_value
+                     FROM field_scans ORDER BY scan_id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        scan_owner_copies: connection
+            .query_row(
+                "SELECT COALESCE(group_concat(row_value, ','),'') FROM (
+                     SELECT owner_copy_id || ':' || scan_id || ':' || owner_kind || ':' ||
+                            field_id || ':' || IFNULL(owner_commit_seq,'null') AS row_value
+                     FROM scan_owner_copies ORDER BY owner_copy_id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        scan_detections: connection
+            .query_row(
+                "SELECT COALESCE(group_concat(row_value, ','),'') FROM (
+                     SELECT scan_id || ':' || detection_ordinal || ':' || rule_id || ':' ||
+                            detector_revision || ':' || exactness || ':' || label_id || ':' ||
+                            span_kind || ':' || action AS row_value
+                     FROM scan_detections ORDER BY scan_id,detection_ordinal
                  )",
                 [],
                 |row| row.get(0),

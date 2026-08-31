@@ -1,9 +1,15 @@
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use mc_core::redaction::RedactionErrorKind;
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::redaction::{record, redact, RedactedField};
+use super::redaction::{
+    create_batch, create_standalone_batch, exact_unscanned, record, redact, redact_transaction,
+    reject, RedactedField,
+};
 use super::{KernelError, KernelStore};
+
+const MAX_OPERATION_RESULT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -175,7 +181,7 @@ impl Envelope<'_> {
         replaced_object_id: &str,
         replacement: DomainSpec,
     ) -> Result<(), KernelError> {
-        let replaced = redact(replaced_object_id);
+        let replaced = exact_unscanned(replaced_object_id);
         let replacement = RedactedDomain::new(replacement)?;
         let changed = self
             .tx
@@ -198,10 +204,10 @@ impl Envelope<'_> {
         record(
             self.tx,
             "change_event",
-            &replaced.text,
             "replaced_object_id",
             &replaced,
             Some(self.commit_seq),
+            None,
         )?;
         insert_domain(self.tx, self.commit_seq, &replacement)?;
         self.tx
@@ -227,7 +233,7 @@ impl Envelope<'_> {
     }
 
     pub fn retire_domain(&mut self, object_id: &str) -> Result<(), KernelError> {
-        let object_id = redact(object_id);
+        let object_id = exact_unscanned(object_id);
         let mut object = load_object(self.tx, &object_id.text)?.ok_or(KernelError::NotFound)?;
         let changed = self
             .tx
@@ -250,10 +256,10 @@ impl Envelope<'_> {
         record(
             self.tx,
             "change_event",
-            &object_id.text,
             "retired_object_id",
             &object_id,
             Some(self.commit_seq),
+            None,
         )?;
         object.invalidated_commit_seq = Some(self.commit_seq);
         self.changes.push(PendingChange {
@@ -275,10 +281,10 @@ impl Envelope<'_> {
         if operator_id.trim().is_empty() || remediated_at < 0 {
             return Err(KernelError::InvalidInput);
         }
-        let operator_id = redact(operator_id);
+        let operator_id = reject(operator_id)?;
         match target {
             RemediationTarget::CanonicalDomainName { object_id } => {
-                let object_id = redact(&object_id);
+                let object_id = exact_unscanned(&object_id);
                 let object = load_object(self.tx, &object_id.text)?.ok_or(KernelError::NotFound)?;
                 if object.object_kind != "domain"
                     || self
@@ -340,7 +346,7 @@ impl KernelStore {
         operation: impl FnOnce(&mut Envelope<'_>) -> Result<String, KernelError>,
         fault_after_events: bool,
     ) -> Result<CommitReceipt, KernelError> {
-        let intent = RedactedIntent::new(intent)?;
+        let mut intent = RedactedIntent::new(intent)?;
         let transaction_id = operation_identity(&intent);
         let mut writer = self.lock_writer()?;
         let tx = writer
@@ -348,32 +354,12 @@ impl KernelStore {
             .map_err(|_| KernelError::Io)?;
         check_fence(&tx, self.lease_epoch())?;
 
-        if let Some((digest, commit_seq, result)) = tx
-            .query_row(
-                "SELECT request_digest,commit_seq,result_payload FROM operation_receipts
-                 WHERE producer=?1 AND operation_key=?2",
-                params![intent.producer.text, intent.operation_key.text],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|_| KernelError::Io)?
-        {
-            if digest != intent.request_digest {
-                return Err(KernelError::Conflict);
-            }
+        if let Some(receipt) = operation_receipt(&tx, &intent)? {
             tx.commit().map_err(|_| KernelError::Io)?;
-            return Ok(CommitReceipt {
-                commit_seq,
-                result,
-                replayed: true,
-            });
+            return Ok(receipt);
         }
+        intent.prepare_caller_fields()?;
+        intent.prepare_new_identity()?;
 
         tx.execute(
             "INSERT INTO commit_log(
@@ -393,7 +379,8 @@ impl KernelStore {
         )
         .map_err(|_| KernelError::Io)?;
         let commit_seq = tx.last_insert_rowid();
-        intent.record(&tx, &transaction_id, commit_seq)?;
+        create_batch(&tx, commit_seq)?;
+        intent.record(&tx, commit_seq)?;
 
         let mut envelope = Envelope {
             tx: &tx,
@@ -401,11 +388,13 @@ impl KernelStore {
             changes: Vec::new(),
         };
         let result = operation(&mut envelope)?;
-        let result = redact(&result);
+        if result.len() > MAX_OPERATION_RESULT_BYTES {
+            return Err(KernelError::Redaction(RedactionErrorKind::InputLimit));
+        }
+        let result = redact_transaction(&result)?;
 
         for (ordinal, change) in envelope.changes.iter().enumerate() {
             let ordinal = i64::try_from(ordinal).map_err(|_| KernelError::InvalidInput)?;
-            let event_id = format!("{commit_seq}:{ordinal}");
             let payload = ChangePayload {
                 change_kind: change.kind,
                 object: &change.object,
@@ -427,22 +416,15 @@ impl KernelStore {
             )
             .map_err(|_| KernelError::Io)?;
             for (name, field) in &change.redactions {
-                record(
-                    &tx,
-                    "change_event",
-                    &event_id,
-                    name,
-                    field,
-                    Some(commit_seq),
-                )?;
+                record(&tx, "change_event", name, field, Some(commit_seq), None)?;
             }
             record(
                 &tx,
                 "change_event",
-                &event_id,
                 "operation_key",
                 &intent.operation_key,
                 Some(commit_seq),
+                None,
             )?;
         }
         if fault_after_events {
@@ -476,16 +458,8 @@ impl KernelStore {
                 ],
             )
             .map_err(|_| KernelError::Io)?;
-            let outbox_position = tx.last_insert_rowid().to_string();
             for (name, field) in &change.redactions {
-                record(
-                    &tx,
-                    "outbox",
-                    &outbox_position,
-                    name,
-                    field,
-                    Some(commit_seq),
-                )?;
+                record(&tx, "outbox", name, field, Some(commit_seq), None)?;
             }
         }
         tx.execute(
@@ -506,10 +480,10 @@ impl KernelStore {
         record(
             &tx,
             "operation_receipt",
-            &transaction_id,
             "result_payload",
             &result,
             Some(commit_seq),
+            None,
         )?;
         tx.commit().map_err(|_| KernelError::Io)?;
         Ok(CommitReceipt {
@@ -637,7 +611,7 @@ impl KernelStore {
         &self,
         spec: StagingCandidateSpec,
     ) -> Result<StagingCandidateRow, KernelError> {
-        let spec = RedactedCandidate::new(spec)?;
+        let mut spec = RedactedCandidate::new(spec)?;
         let sensitivity = if spec.provenance.is_some() {
             Sensitivity::Normal
         } else {
@@ -648,6 +622,7 @@ impl KernelStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| KernelError::Io)?;
         check_fence(&tx, self.lease_epoch())?;
+        let scan_batch_id = create_standalone_batch(&tx)?;
         let provenance = spec.provenance_json()?;
         let run_metadata = spec.run_detection_json()?;
         let existing = tx
@@ -670,7 +645,7 @@ impl KernelStore {
             )
             .optional()
             .map_err(|_| KernelError::Io)?;
-        if let Some(existing) = existing {
+        if let Some(ref existing) = existing {
             let expected = (
                 spec.extractor.text.clone(),
                 Some(spec.source_kind.text.clone()),
@@ -680,7 +655,7 @@ impl KernelStore {
                 provenance.clone(),
                 run_metadata.clone(),
             );
-            if existing != expected {
+            if *existing != expected {
                 return Err(KernelError::Conflict);
             }
             if tx
@@ -700,12 +675,15 @@ impl KernelStore {
                 return Err(KernelError::Conflict);
             }
         } else {
+            spec.prepare_new_run()?;
+            let provenance = spec.provenance_json()?;
+            let run_metadata = spec.run_detection_json()?;
             tx.execute(
                 "INSERT INTO extraction_runs(
                      extraction_run_id,extractor,source_kind,source_id,source_revision,
-                     sensitivity_class,provenance_witness,redaction_metadata,started_at,
-                     heartbeat_at,lease_expires_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10)",
+                     sensitivity_class,provenance_witness,redaction_metadata,scan_batch_id,
+                     started_at,heartbeat_at,lease_expires_at
+                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10,?11)",
                 params![
                     spec.extraction_run_id.text,
                     spec.extractor.text,
@@ -715,19 +693,25 @@ impl KernelStore {
                     sensitivity.as_str(),
                     provenance,
                     run_metadata,
+                    scan_batch_id,
                     spec.recorded_at,
                     spec.lease_expires_at,
                 ],
             )
             .map_err(|_| KernelError::Io)?;
-            spec.record_run(&tx)?;
         }
+        spec.prepare_new_candidate()?;
+        if existing.is_none() {
+            spec.record_run(&tx, &scan_batch_id)?;
+        }
+        let provenance = spec.provenance_json()?;
         let candidate_metadata = spec.candidate_detection_json()?;
         tx.execute(
             "INSERT INTO candidates(
                  candidate_id,extraction_run_id,candidate_kind,payload,sensitivity_class,
-                 provenance_witness,redaction_metadata,created_at,heartbeat_at,lease_expires_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)",
+                 provenance_witness,redaction_metadata,scan_batch_id,created_at,heartbeat_at,
+                 lease_expires_at
+              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10)",
             params![
                 spec.candidate_id.text,
                 spec.extraction_run_id.text,
@@ -736,12 +720,13 @@ impl KernelStore {
                 sensitivity.as_str(),
                 provenance,
                 candidate_metadata,
+                scan_batch_id,
                 spec.recorded_at,
                 spec.lease_expires_at,
             ],
         )
         .map_err(|_| KernelError::Io)?;
-        spec.record(&tx)?;
+        spec.record(&tx, &scan_batch_id)?;
         tx.commit().map_err(|_| KernelError::Io)?;
         Ok(StagingCandidateRow {
             candidate_id: spec.candidate_id.text,
@@ -763,29 +748,35 @@ impl KernelStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| KernelError::Io)?;
         check_fence(&tx, self.lease_epoch())?;
+        tx.execute("DELETE FROM alignment_projection", [])
+            .map_err(|_| KernelError::Io)?;
         tx.execute(
-            "DELETE FROM durable_text_redactions WHERE owner_kind='alignment_projection'",
+            "DELETE FROM scan_batches
+             WHERE commit_seq IS NULL
+               AND NOT EXISTS(SELECT 1 FROM extraction_runs WHERE extraction_runs.scan_batch_id=scan_batches.scan_batch_id)
+               AND NOT EXISTS(SELECT 1 FROM candidates WHERE candidates.scan_batch_id=scan_batches.scan_batch_id)
+               AND NOT EXISTS(SELECT 1 FROM alignment_projection WHERE alignment_projection.scan_batch_id=scan_batches.scan_batch_id)",
             [],
         )
         .map_err(|_| KernelError::Io)?;
-        tx.execute("DELETE FROM alignment_projection", [])
-            .map_err(|_| KernelError::Io)?;
+        let scan_batch_id = create_standalone_batch(&tx)?;
         for row in &rows {
             tx.execute(
                 "INSERT INTO alignment_projection(
                      decision_id,observation_id,alignment_kind,alignment_payload,
-                     built_through_commit_seq
-                 ) VALUES (?1,?2,?3,?4,?5)",
+                     scan_batch_id,built_through_commit_seq
+                  ) VALUES (?1,?2,?3,?4,?5,?6)",
                 params![
                     row.decision_id.text,
                     row.observation_id.text,
                     row.alignment_kind.text,
                     row.alignment_payload.as_ref().map(|field| &field.text),
+                    scan_batch_id,
                     row.built_through_commit_seq,
                 ],
             )
             .map_err(|_| KernelError::Io)?;
-            row.record(&tx)?;
+            row.record(&tx, &scan_batch_id)?;
         }
         tx.commit().map_err(|_| KernelError::Io)?;
         Ok(ProjectionReplaceResult { rows: rows.len() })
@@ -806,27 +797,34 @@ impl RedactedIntent {
             return Err(KernelError::InvalidInput);
         }
         Ok(Self {
-            producer: redact(&intent.producer),
-            operation_key: redact(&intent.operation_key),
+            producer: exact_unscanned(&intent.producer),
+            operation_key: exact_unscanned(&intent.operation_key),
             request_digest: intent.request_digest,
-            actor: redact(&intent.actor),
-            cause: redact(&intent.cause),
+            actor: exact_unscanned(&intent.actor),
+            cause: exact_unscanned(&intent.cause),
         })
     }
 
-    fn record(
-        &self,
-        tx: &Transaction<'_>,
-        owner_id: &str,
-        commit_seq: i64,
-    ) -> Result<(), KernelError> {
+    fn prepare_caller_fields(&mut self) -> Result<(), KernelError> {
+        self.actor = reject(&self.actor.text)?;
+        self.cause = redact(&self.cause.text)?;
+        Ok(())
+    }
+
+    fn prepare_new_identity(&mut self) -> Result<(), KernelError> {
+        self.producer = reject(&self.producer.text)?;
+        self.operation_key = reject(&self.operation_key.text)?;
+        Ok(())
+    }
+
+    fn record(&self, tx: &Transaction<'_>, commit_seq: i64) -> Result<(), KernelError> {
         for (name, field) in [
             ("producer", &self.producer),
             ("operation_key", &self.operation_key),
             ("actor", &self.actor),
             ("cause", &self.cause),
         ] {
-            record(tx, "commit_log", owner_id, name, field, Some(commit_seq))?;
+            record(tx, "commit_log", name, field, Some(commit_seq), None)?;
         }
         Ok(())
     }
@@ -848,11 +846,11 @@ impl RedactedDomain {
             return Err(KernelError::InvalidInput);
         }
         Ok(Self {
-            domain_id: redact(&spec.domain_id),
-            object_id: redact(&spec.object_id),
-            name: redact(&spec.name),
-            source_kind: redact(&spec.source_kind),
-            source_id: redact(&spec.source_id),
+            domain_id: reject(&spec.domain_id)?,
+            object_id: reject(&spec.object_id)?,
+            name: reject(&spec.name)?,
+            source_kind: reject(&spec.source_kind)?,
+            source_id: reject(&spec.source_id)?,
             source_revision: spec.source_revision,
             sensitivity: spec.sensitivity,
         })
@@ -925,14 +923,7 @@ fn insert_domain(
         ("source_kind", &spec.source_kind),
         ("source_id", &spec.source_id),
     ] {
-        record(
-            tx,
-            "object_registry",
-            &spec.object_id.text,
-            name,
-            field,
-            Some(commit_seq),
-        )?;
+        record(tx, "object_registry", name, field, Some(commit_seq), None)?;
     }
     Ok(())
 }
@@ -987,23 +978,48 @@ impl RedactedCandidate {
             return Err(KernelError::InvalidInput);
         }
         Ok(Self {
-            extraction_run_id: redact(&spec.extraction_run_id),
-            candidate_id: redact(&spec.candidate_id),
-            extractor: redact(&spec.extractor),
-            source_kind: redact(&spec.source_kind),
-            source_id: redact(&spec.source_id),
+            extraction_run_id: exact_unscanned(&spec.extraction_run_id),
+            candidate_id: exact_unscanned(&spec.candidate_id),
+            extractor: exact_unscanned(&spec.extractor),
+            source_kind: exact_unscanned(&spec.source_kind),
+            source_id: exact_unscanned(&spec.source_id),
             source_revision: spec.source_revision,
-            candidate_kind: redact(&spec.candidate_kind),
-            payload: redact(&spec.payload),
+            candidate_kind: exact_unscanned(&spec.candidate_kind),
+            payload: exact_unscanned(&spec.payload),
             provenance: spec
                 .provenance
                 .filter(|value| {
                     !value.repository_id.trim().is_empty() && !value.revision.trim().is_empty()
                 })
-                .map(|value| (redact(&value.repository_id), redact(&value.revision))),
+                .map(|value| {
+                    Ok::<_, KernelError>((
+                        exact_unscanned(&value.repository_id),
+                        exact_unscanned(&value.revision),
+                    ))
+                })
+                .transpose()?,
             recorded_at: spec.recorded_at,
             lease_expires_at: spec.lease_expires_at,
         })
+    }
+
+    fn prepare_new_run(&mut self) -> Result<(), KernelError> {
+        self.extraction_run_id = reject(&self.extraction_run_id.text)?;
+        self.extractor = reject(&self.extractor.text)?;
+        self.source_kind = reject(&self.source_kind.text)?;
+        self.source_id = reject(&self.source_id.text)?;
+        if let Some((repository_id, revision)) = &mut self.provenance {
+            *repository_id = reject(&repository_id.text)?;
+            *revision = reject(&revision.text)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_new_candidate(&mut self) -> Result<(), KernelError> {
+        self.candidate_id = reject(&self.candidate_id.text)?;
+        self.candidate_kind = reject(&self.candidate_kind.text)?;
+        self.payload = redact(&self.payload.text)?;
+        Ok(())
     }
 
     fn provenance_json(&self) -> Result<Vec<u8>, KernelError> {
@@ -1049,22 +1065,33 @@ impl RedactedCandidate {
         struct Metadata<'a> {
             field: &'a str,
             detector_id: &'a str,
-            secret_type: &'a str,
-            utf8_offset: usize,
-            utf8_length: usize,
+            detector_revision: &'a str,
+            rule_id: &'a str,
+            exactness: &'static str,
+            label_id: &'a str,
+            span_kind: &'static str,
+            action: &'static str,
+            detection_ordinal: usize,
         }
-        let metadata = fields
-            .into_iter()
-            .flat_map(|(name, field)| {
-                field.detections.iter().map(move |detection| Metadata {
-                    field: name,
-                    detector_id: detection.detector_id,
-                    secret_type: &detection.secret_type,
-                    utf8_offset: detection.offset,
-                    utf8_length: detection.length,
+        let metadata =
+            fields
+                .into_iter()
+                .flat_map(|(name, field)| {
+                    field.detections.iter().enumerate().map(
+                        move |(detection_ordinal, detection)| Metadata {
+                            field: name,
+                            detector_id: detection.detector_id,
+                            detector_revision: &detection.detector_revision,
+                            rule_id: &detection.rule_id,
+                            exactness: "exact",
+                            label_id: &detection.secret_type,
+                            span_kind: "value",
+                            action: "substitute",
+                            detection_ordinal,
+                        },
+                    )
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
         serde_json::to_vec(&metadata).map_err(|_| KernelError::InvalidInput)
     }
 
@@ -1076,30 +1103,16 @@ impl RedactedCandidate {
         self.detection_json(self.candidate_fields())
     }
 
-    fn record_run(&self, tx: &Transaction<'_>) -> Result<(), KernelError> {
+    fn record_run(&self, tx: &Transaction<'_>, batch_id: &str) -> Result<(), KernelError> {
         for (name, field) in self.run_fields() {
-            record(
-                tx,
-                "extraction_run",
-                &self.extraction_run_id.text,
-                name,
-                field,
-                None,
-            )?;
+            record(tx, "extraction_run", name, field, None, Some(batch_id))?;
         }
         Ok(())
     }
 
-    fn record(&self, tx: &Transaction<'_>) -> Result<(), KernelError> {
+    fn record(&self, tx: &Transaction<'_>, batch_id: &str) -> Result<(), KernelError> {
         for (name, field) in self.candidate_fields() {
-            record(
-                tx,
-                "staging_candidate",
-                &self.candidate_id.text,
-                name,
-                field,
-                None,
-            )?;
+            record(tx, "staging_candidate", name, field, None, Some(batch_id))?;
         }
         Ok(())
     }
@@ -1119,31 +1132,37 @@ impl RedactedProjection {
             return Err(KernelError::InvalidInput);
         }
         Ok(Self {
-            decision_id: redact(&spec.decision_id),
-            observation_id: redact(&spec.observation_id),
-            alignment_kind: redact(&spec.alignment_kind),
-            alignment_payload: spec.alignment_payload.as_deref().map(redact),
+            decision_id: exact_unscanned(&spec.decision_id),
+            observation_id: exact_unscanned(&spec.observation_id),
+            alignment_kind: reject(&spec.alignment_kind)?,
+            alignment_payload: spec.alignment_payload.as_deref().map(redact).transpose()?,
             built_through_commit_seq: spec.built_through_commit_seq,
         })
     }
 
-    fn record(&self, tx: &Transaction<'_>) -> Result<(), KernelError> {
-        let owner_id = format!("{}:{}", self.decision_id.text, self.observation_id.text);
+    fn record(&self, tx: &Transaction<'_>, batch_id: &str) -> Result<(), KernelError> {
         for (name, field) in [
             ("decision_id", &self.decision_id),
             ("observation_id", &self.observation_id),
             ("alignment_kind", &self.alignment_kind),
         ] {
-            record(tx, "alignment_projection", &owner_id, name, field, None)?;
+            record(
+                tx,
+                "alignment_projection",
+                name,
+                field,
+                None,
+                Some(batch_id),
+            )?;
         }
         if let Some(payload) = &self.alignment_payload {
             record(
                 tx,
                 "alignment_projection",
-                &owner_id,
                 "alignment_payload",
                 payload,
                 None,
+                Some(batch_id),
             )?;
         }
         Ok(())
@@ -1175,6 +1194,38 @@ fn operation_identity(intent: &RedactedIntent) -> String {
     format!("{:x}", hash.finalize())
 }
 
+fn operation_receipt(
+    connection: &Connection,
+    intent: &RedactedIntent,
+) -> Result<Option<CommitReceipt>, KernelError> {
+    let stored = connection
+        .query_row(
+            "SELECT request_digest,commit_seq,result_payload FROM operation_receipts
+             WHERE producer=?1 AND operation_key=?2",
+            params![intent.producer.text, intent.operation_key.text],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| KernelError::Io)?;
+    let Some((digest, commit_seq, result)) = stored else {
+        return Ok(None);
+    };
+    if digest != intent.request_digest {
+        return Err(KernelError::Conflict);
+    }
+    Ok(Some(CommitReceipt {
+        commit_seq,
+        result,
+        replayed: true,
+    }))
+}
+
 fn is_lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
@@ -1182,7 +1233,7 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn current_time_ms() -> i64 {
+pub(super) fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
