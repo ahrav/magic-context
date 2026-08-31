@@ -571,7 +571,7 @@ fn every_outbox_and_retention_entry_point_checks_the_writer_fence() {
 
 #[test]
 fn a_lookup_id_that_redaction_rewrites_cannot_alias_onto_another_consumer() {
-    const AWS_KEY: &str = "AKIAFFFFFFFFFFFFFFFF";
+    const AWS_KEY: &str = "AKIAQ7RSTUVWXYZ23456";
     const REPLACEMENT: &str = "<AWS_ACCESS_KEY_ID_REDACTED>";
 
     let directory = tempfile::tempdir().unwrap();

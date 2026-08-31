@@ -2,7 +2,6 @@
   "schema": "magic-context.secret-scanner-qualification-manifest/v1",
   "status": "tooling_only",
   "authority_qualified": false,
-  "mode": "legacy_comparison",
   "fixture": "qualification-v1.jsonl",
   "fixture_sha256": "6b7d2cfc1d74ce42b4ab152ef51a2c2656388b014292f3cda4524460c5544b4a",
   "fixture_cases": 1,

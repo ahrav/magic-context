@@ -1,6 +1,6 @@
 rules:
 - name: magic-anthropic-api-key
-  regex: '\bsk-ant-(?:api03|admin01)-[A-Za-z0-9_-]{93}AA\b'
+  regex: '\bsk-ant-(?:api03-|admin01-)?[A-Za-z0-9_-]{32,}\b'
   anchors: [sk-ant-]
   radius: 256
   entropy:

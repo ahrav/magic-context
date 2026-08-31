@@ -159,7 +159,7 @@ fn ingest_publishes_sharded_redacted_bytes_and_commits_live_reference() {
         (
             1,
             0,
-            "redaction-vocabulary-v1".to_string(),
+            "mc-secret-scanner".to_string(),
             "anthropic_api_key".to_string()
         )
     );

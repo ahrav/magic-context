@@ -427,7 +427,7 @@ fn remediation_supports_two_live_domains_and_keeps_receipt_as_caller_result() {
     );
 }
 
-const AWS_KEY: &str = "AKIAFFFFFFFFFFFFFFFF";
+const AWS_KEY: &str = "AKIAQ7RSTUVWXYZ23456";
 
 fn secret_candidate(recorded_at: i64) -> StagingCandidateSpec {
     let mut spec = candidate("run", "cand", recorded_at);

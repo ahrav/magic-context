@@ -2,6 +2,7 @@
 
 use std::fs;
 
+use mc_core::redaction::DETECTOR_ID;
 use mc_store::kernel::{
     CommitIntent, DomainSpec, KernelError, KernelStore, RepositoryProvenance, Sensitivity,
     StagingCandidateSpec,
@@ -108,7 +109,7 @@ fn envelope_redacts_before_bind_and_never_leaks_secret_to_storage_or_errors() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
-    assert_eq!(metadata.0, "redaction-vocabulary-v1");
+    assert_eq!(metadata.0, DETECTOR_ID);
     assert_eq!(metadata.1, "anthropic_api_key");
     // The span indexes the pre-redaction input: "actor " is 6 bytes, then the secret.
     assert_eq!(
