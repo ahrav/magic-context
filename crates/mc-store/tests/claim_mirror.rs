@@ -10,6 +10,7 @@ use mc_store::claim_mirror::{
     ClaimMirrorReceiptGroup, ClaimMirrorSnapshot, CommittedClaimMirrorRow, CLAIM_MIRROR_VERSION,
 };
 use mc_store::McStore;
+use rusqlite::Connection;
 use serde_json::{json, Value};
 
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
@@ -130,6 +131,95 @@ fn result(outcome: &str) -> String {
         "generations": {},
     }))
     .unwrap()
+}
+
+fn active_audit_counts(root: &std::path::Path) -> (i64, i64, i64, i64) {
+    Connection::open(root.join("store.db"))
+        .unwrap()
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM mc_scan_batches),
+                 (SELECT COUNT(*) FROM mc_field_scans),
+                 (SELECT COUNT(*) FROM mc_scan_owner_copies),
+                 (SELECT COUNT(*) FROM mc_scan_detections)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn claim_json_fields_are_scanned_once_without_rewriting_escaped_quotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let mut row = claim(CLAIM_A, 41, 1, "plain content", 1);
+    row.attributes = json!({"quoted": "say \\\"hello\\\"", "nested": {"displayName": "value"}});
+
+    store
+        .replace_claim_mirror_snapshot(
+            &snapshot(INCARNATION, &[(41, 1)], &[(41, 0)], vec![row.clone()]),
+            1,
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.list_claim_mirror(INCARNATION, Some(41)).unwrap()[0].attributes,
+        row.attributes
+    );
+    let connection = Connection::open(dir.path().join("store.db")).unwrap();
+    let per_field: Vec<(String, i64)> = connection
+        .prepare(
+            "SELECT field_id,COUNT(*) FROM mc_scan_owner_copies
+             WHERE field_id LIKE 'claim_%' GROUP BY field_id ORDER BY field_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        per_field,
+        vec![
+            ("claim_applicability".to_string(), 1),
+            ("claim_attributes".to_string(), 1),
+            ("claim_content".to_string(), 1),
+            ("claim_policy".to_string(), 1),
+        ]
+    );
+}
+
+#[test]
+fn protected_claim_json_key_rejects_atomically_with_exact_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    for protected_key in ["apiToken", "encryptionKey", "signingKeys", "clientSecret"] {
+        let mut row = claim(CLAIM_A, 41, 1, "plain content", 1);
+        row.policy = Value::Object(serde_json::Map::from_iter([(
+            protected_key.to_string(),
+            Value::String("value with quotes".to_string()),
+        )]));
+        let error = store
+            .replace_claim_mirror_snapshot(
+                &snapshot(INCARNATION, &[(41, 1)], &[(41, 0)], vec![row]),
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClaimMirrorError::Redaction(mc_core::redaction::RedactionErrorKind::SecretDetected)
+        ));
+        assert!(store.claim_mirror_state().unwrap().is_none());
+        assert_eq!(active_audit_counts(dir.path()), (0, 0, 0, 0));
+    }
+
+    let mut benign = claim(CLAIM_A, 41, 1, "plain content", 1);
+    benign.policy = json!({"key": "display selector", "keys": ["left", "right"]});
+    store
+        .replace_claim_mirror_snapshot(
+            &snapshot(INCARNATION, &[(41, 1)], &[(41, 0)], vec![benign]),
+            2,
+        )
+        .unwrap();
 }
 
 #[test]

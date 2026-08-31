@@ -1,0 +1,14 @@
+{
+  "schema": "magic-context.durable-field-policy/v1",
+  "content": [
+    {
+      "input": "π password=hunter-two",
+      "stored": "π password=<REDACTED:password>"
+    },
+    {
+      "input": "tokens.input=45000",
+      "stored": "tokens.input=45000"
+    }
+  ],
+  "integrity_reject": "password=integrity-sentinel"
+}

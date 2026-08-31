@@ -27,7 +27,14 @@ use mc_core::claim_operation::{
     ClaimIntentBinding, ClaimIntentState, ClaimResultOutcome, SnapshotVector,
     CLAIM_REQUEST_ENCODING_VERSION,
 };
-use rusqlite::{functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension};
+use mc_core::redaction::{
+    label_for_secret_key, redact_durable_text, redact_transaction_durable_text, reject_secret_text,
+    reject_transaction_secret_text, DetectionAction, DetectionExactness, DetectionSpanKind,
+    Redaction, RedactionErrorKind,
+};
+use rusqlite::{
+    functions::FunctionFlags, params, types::Value as SqlValue, OptionalExtension, Transaction,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -403,6 +410,7 @@ const NS: &str = "mc_cache";
 
 /// Sentinel row_version meaning "no row present" (COALESCE default inside the txn).
 const NO_ROW: i64 = -1;
+const MAX_DURABLE_TEXT_BYTES: usize = 512 * 1024;
 const MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES: usize = 256 * 1024;
 /// Cap decompression so a small compressed row cannot allocate an unbounded transcript.
 const MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES: usize = 512 * 1024;
@@ -1308,6 +1316,76 @@ CREATE TABLE mc_claim_mirror_receipts (
             generation_vector_json TEXT NOT NULL CHECK (json_valid(generation_vector_json)),
             applied_at_ms INTEGER NOT NULL,
             PRIMARY KEY (database_incarnation_id, receipt_id)
+        ) WITHOUT ROWID;
+
+CREATE TABLE mc_scan_batches (
+            scan_batch_id TEXT PRIMARY KEY CHECK (length(scan_batch_id) = 32),
+            owner_kind TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+
+CREATE TABLE mc_scan_owner_scopes (
+            owner_scope_id TEXT PRIMARY KEY CHECK (length(owner_scope_id) = 32),
+            scope_kind TEXT NOT NULL CHECK (length(scope_kind) > 0),
+            scope_key TEXT NOT NULL CHECK (length(scope_key) = 64),
+            UNIQUE (scope_kind, scope_key)
+        );
+
+CREATE TABLE mc_scan_domain_owners (
+            domain_owner_id TEXT PRIMARY KEY CHECK (length(domain_owner_id) = 32),
+            owner_scope_id TEXT NOT NULL
+                REFERENCES mc_scan_owner_scopes(owner_scope_id) ON DELETE CASCADE,
+            owner_kind TEXT NOT NULL,
+            owner_key TEXT NOT NULL CHECK (length(owner_key) = 64),
+            UNIQUE (owner_scope_id, owner_kind, owner_key)
+        );
+
+CREATE INDEX idx_mc_scan_domain_owners_scope
+            ON mc_scan_domain_owners(owner_scope_id, owner_kind, owner_key);
+
+CREATE TABLE mc_field_scans (
+            scan_id TEXT PRIMARY KEY CHECK (length(scan_id) = 32),
+            scan_batch_id TEXT NOT NULL REFERENCES mc_scan_batches(scan_batch_id)
+                ON DELETE CASCADE,
+            detector_id TEXT NOT NULL,
+            detector_revision TEXT NOT NULL,
+            semantic_digest TEXT CHECK (semantic_digest IS NULL OR length(semantic_digest) = 64),
+            finding_count INTEGER NOT NULL CHECK (finding_count >= 0)
+        );
+
+CREATE INDEX idx_mc_field_scans_batch
+            ON mc_field_scans(scan_batch_id, scan_id);
+
+CREATE TABLE mc_scan_owner_copies (
+            owner_copy_id TEXT PRIMARY KEY CHECK (length(owner_copy_id) = 32),
+            scan_id TEXT NOT NULL REFERENCES mc_field_scans(scan_id) ON DELETE CASCADE,
+            domain_owner_id TEXT NOT NULL
+                REFERENCES mc_scan_domain_owners(domain_owner_id) ON DELETE CASCADE,
+            owner_kind TEXT NOT NULL,
+            field_id TEXT NOT NULL CHECK (length(field_id) > 0)
+        );
+
+CREATE INDEX idx_mc_scan_owner_copies_scan
+            ON mc_scan_owner_copies(scan_id, owner_copy_id);
+
+CREATE INDEX idx_mc_scan_owner_copies_domain_owner
+            ON mc_scan_owner_copies(domain_owner_id, owner_copy_id);
+
+CREATE TABLE mc_scan_detections (
+            scan_id TEXT NOT NULL REFERENCES mc_field_scans(scan_id) ON DELETE CASCADE,
+            detection_ordinal INTEGER NOT NULL CHECK (detection_ordinal >= 0),
+            rule_id TEXT NOT NULL,
+            detector_revision TEXT NOT NULL,
+            exactness TEXT NOT NULL CHECK (exactness = 'exact'),
+            label_id TEXT NOT NULL CHECK (label_id IN (
+                'anthropic_api_key', 'openai_api_key', 'github_pat', 'github_token',
+                'huggingface_token', 'aws_access_key_id', 'slack_token',
+                'google_api_key', 'bearer', 'jwt', 'api_key', 'auth_token',
+                'password', 'key', 'token', 'secret'
+            )),
+            span_kind TEXT NOT NULL CHECK (span_kind = 'value'),
+            action TEXT NOT NULL CHECK (action IN ('substitute', 'reject')),
+            PRIMARY KEY (scan_id, detection_ordinal)
         ) WITHOUT ROWID;
     "#,
 }];
@@ -2818,6 +2896,1216 @@ pub struct NoteInput<'a> {
     pub now_ms: i64,
 }
 
+#[derive(Debug)]
+struct PreparedFieldScan {
+    field_id: &'static str,
+    redaction: Redaction,
+    owners: Vec<PreparedDomainOwner>,
+}
+
+#[derive(Debug)]
+struct PreparedWrite {
+    owner_kind: &'static str,
+    scans: Vec<PreparedFieldScan>,
+    domain_owners: Vec<PreparedDomainOwner>,
+    existing_scan_links: Vec<PreparedExistingScanLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedDomainOwner {
+    scope_kind: &'static str,
+    scope_key: String,
+    owner_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedExistingScanLink {
+    scan_id: String,
+    owner: PreparedDomainOwner,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedScanLayer {
+    Durable,
+    Transaction,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedFieldPolicy {
+    Content,
+    NewIdentity,
+    ExistingIdentity,
+}
+
+enum WriteDisposition<T> {
+    Applied(T),
+    Replay(T),
+}
+
+struct ActiveWriteTransaction<'tx> {
+    tx: &'tx Transaction<'tx>,
+    prepared: std::cell::RefCell<PreparedWrite>,
+}
+
+impl PreparedWrite {
+    fn new(family: DurableWriteFamily) -> Self {
+        Self {
+            owner_kind: family.owner_kind(),
+            scans: Vec::new(),
+            domain_owners: Vec::new(),
+            existing_scan_links: Vec::new(),
+        }
+    }
+
+    fn domain_owner(
+        &mut self,
+        scope_kind: &'static str,
+        scope_key: impl Into<String>,
+        owner_key: impl Into<String>,
+    ) {
+        let owner = PreparedDomainOwner {
+            scope_kind,
+            scope_key: scope_key.into(),
+            owner_key: owner_key.into(),
+        };
+        if !self.domain_owners.contains(&owner) {
+            for scan in self.scans.iter_mut().filter(|scan| scan.owners.is_empty()) {
+                scan.owners.push(owner.clone());
+            }
+            self.domain_owners.push(owner);
+        }
+    }
+
+    fn domain_owner_for_scans_since(
+        &mut self,
+        first_scan: usize,
+        scope_kind: &'static str,
+        scope_key: impl Into<String>,
+        owner_key: impl Into<String>,
+    ) {
+        let owner = PreparedDomainOwner {
+            scope_kind,
+            scope_key: scope_key.into(),
+            owner_key: owner_key.into(),
+        };
+        if !self.domain_owners.contains(&owner) {
+            self.domain_owners.push(owner.clone());
+        }
+        for scan in &mut self.scans[first_scan..] {
+            if !scan.owners.contains(&owner) {
+                scan.owners.push(owner.clone());
+            }
+        }
+    }
+
+    fn link_existing_scans(
+        &mut self,
+        scope_kind: &'static str,
+        scope_key: impl Into<String>,
+        owner_key: impl Into<String>,
+        scan_ids: impl IntoIterator<Item = String>,
+    ) {
+        let owner = PreparedDomainOwner {
+            scope_kind,
+            scope_key: scope_key.into(),
+            owner_key: owner_key.into(),
+        };
+        if !self.domain_owners.contains(&owner) {
+            self.domain_owners.push(owner.clone());
+        }
+        for scan_id in scan_ids {
+            let link = PreparedExistingScanLink {
+                scan_id,
+                owner: owner.clone(),
+            };
+            if !self.existing_scan_links.contains(&link) {
+                self.existing_scan_links.push(link);
+            }
+        }
+    }
+
+    fn content(&mut self, field_id: &'static str, input: &str) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Durable,
+            PreparedFieldPolicy::Content,
+        )
+    }
+
+    fn record_content(&mut self, field_id: &'static str, input: &str) -> Result<(), McStoreError> {
+        self.content(field_id, input).map(drop)
+    }
+
+    fn bytes(&mut self, field_id: &'static str, input: &[u8]) -> Result<Vec<u8>, McStoreError> {
+        if input.len() > MAX_DURABLE_TEXT_BYTES {
+            return Err(McStoreError::Redaction(RedactionErrorKind::InputLimit));
+        }
+        let text = std::str::from_utf8(input)
+            .map_err(|_| McStoreError::Serde("durable text bytes are not UTF-8".to_string()))?;
+        Ok(self.content(field_id, text)?.into_bytes())
+    }
+
+    fn identity(&mut self, field_id: &'static str, input: &str) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Durable,
+            PreparedFieldPolicy::NewIdentity,
+        )
+    }
+
+    fn existing_identity(
+        &mut self,
+        field_id: &'static str,
+        input: &str,
+    ) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Durable,
+            PreparedFieldPolicy::ExistingIdentity,
+        )
+    }
+
+    fn reject_recorded_identities(&self, field_ids: &[&str]) -> Result<(), McStoreError> {
+        if self
+            .scans
+            .iter()
+            .any(|scan| field_ids.contains(&scan.field_id) && !scan.redaction.detections.is_empty())
+        {
+            Err(McStoreError::Redaction(RedactionErrorKind::SecretDetected))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn transaction_content(
+        &mut self,
+        field_id: &'static str,
+        input: &str,
+    ) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Transaction,
+            PreparedFieldPolicy::Content,
+        )
+    }
+
+    fn transaction_identity(
+        &mut self,
+        field_id: &'static str,
+        input: &str,
+    ) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Transaction,
+            PreparedFieldPolicy::NewIdentity,
+        )
+    }
+
+    fn transaction_existing_identity(
+        &mut self,
+        field_id: &'static str,
+        input: &str,
+    ) -> Result<String, McStoreError> {
+        self.prepare_field(
+            field_id,
+            input,
+            PreparedScanLayer::Transaction,
+            PreparedFieldPolicy::ExistingIdentity,
+        )
+    }
+
+    fn prepare_field(
+        &mut self,
+        field_id: &'static str,
+        input: &str,
+        layer: PreparedScanLayer,
+        policy: PreparedFieldPolicy,
+    ) -> Result<String, McStoreError> {
+        ensure_durable_text_bound(input)?;
+        let redaction = match layer {
+            PreparedScanLayer::Durable => redact_durable_text(input)?,
+            PreparedScanLayer::Transaction => redact_transaction_durable_text(input)?,
+        };
+        if matches!(policy, PreparedFieldPolicy::NewIdentity) && !redaction.detections.is_empty() {
+            return Err(McStoreError::Redaction(RedactionErrorKind::SecretDetected));
+        }
+        let output = match policy {
+            PreparedFieldPolicy::Content => redaction.text.clone(),
+            PreparedFieldPolicy::NewIdentity | PreparedFieldPolicy::ExistingIdentity => {
+                input.to_owned()
+            }
+        };
+        self.scans.push(PreparedFieldScan {
+            field_id,
+            redaction,
+            owners: self.domain_owners.clone(),
+        });
+        Ok(output)
+    }
+
+    fn execute<T>(
+        self,
+        store: &SqliteStore,
+        operation: impl FnOnce(&mut ActiveWriteTransaction<'_>) -> rusqlite::Result<WriteDisposition<T>>,
+    ) -> Result<T, McStoreError> {
+        let redaction_failure = std::cell::Cell::new(None);
+        let redaction_failure_in_tx = &redaction_failure;
+        let result = store.with_conn_fenced(move |tx| {
+            let mut coordinated = ActiveWriteTransaction {
+                tx,
+                prepared: std::cell::RefCell::new(self),
+            };
+            let disposition = operation(&mut coordinated).inspect_err(|error| {
+                redaction_failure_in_tx.set(sqlite_redaction_kind(error));
+            })?;
+            match disposition {
+                WriteDisposition::Applied(value) => {
+                    coordinated.persist_audit()?;
+                    Ok(value)
+                }
+                WriteDisposition::Replay(value) => Ok(value),
+            }
+        });
+        match redaction_failure.get() {
+            Some(kind) => Err(McStoreError::Redaction(kind)),
+            None => result.map_err(Into::into),
+        }
+    }
+}
+
+impl ActiveWriteTransaction<'_> {
+    fn tx(&self) -> &Transaction<'_> {
+        self.tx
+    }
+
+    fn domain_owner(
+        &self,
+        scope_kind: &'static str,
+        scope_key: impl Into<String>,
+        owner_key: impl Into<String>,
+    ) {
+        self.prepared
+            .borrow_mut()
+            .domain_owner(scope_kind, scope_key, owner_key);
+    }
+
+    fn persist_audit(&self) -> rusqlite::Result<()> {
+        let prepared = self.prepared.borrow();
+        if prepared.scans.is_empty() {
+            return Ok(());
+        }
+        if prepared.domain_owners.is_empty() {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                McStoreError::Serde("scan audit write has no domain owner".to_string()),
+            )));
+        }
+        let mut domain_owner_ids = Vec::with_capacity(prepared.domain_owners.len());
+        for owner in &prepared.domain_owners {
+            let private_scope_key = active_scan_private_key(owner.scope_kind, &owner.scope_key);
+            let private_owner_key = active_scan_private_key(prepared.owner_kind, &owner.owner_key);
+            let proposed_scope_id = opaque_sqlite_id(self.tx)?;
+            self.tx.execute(
+                "INSERT OR IGNORE INTO mc_scan_owner_scopes(
+                     owner_scope_id,scope_kind,scope_key
+                 ) VALUES (?1,?2,?3)",
+                params![proposed_scope_id, owner.scope_kind, private_scope_key],
+            )?;
+            let owner_scope_id: String = self.tx.query_row(
+                "SELECT owner_scope_id FROM mc_scan_owner_scopes
+                  WHERE scope_kind = ?1 AND scope_key = ?2",
+                params![owner.scope_kind, private_scope_key],
+                |row| row.get(0),
+            )?;
+            let proposed_owner_id = opaque_sqlite_id(self.tx)?;
+            self.tx.execute(
+                "INSERT OR IGNORE INTO mc_scan_domain_owners(
+                     domain_owner_id,owner_scope_id,owner_kind,owner_key
+                 ) VALUES (?1,?2,?3,?4)",
+                params![
+                    proposed_owner_id,
+                    owner_scope_id,
+                    prepared.owner_kind,
+                    private_owner_key
+                ],
+            )?;
+            let domain_owner_id = self.tx.query_row(
+                "SELECT domain_owner_id FROM mc_scan_domain_owners
+                  WHERE owner_scope_id = ?1 AND owner_kind = ?2 AND owner_key = ?3",
+                params![owner_scope_id, prepared.owner_kind, private_owner_key],
+                |row| row.get::<_, String>(0),
+            )?;
+            domain_owner_ids.push((owner.clone(), domain_owner_id));
+        }
+        let batch_id = opaque_sqlite_id(self.tx)?;
+        self.tx.execute(
+            "INSERT INTO mc_scan_batches(scan_batch_id,owner_kind,created_at_ms)
+             VALUES (?1,?2,?3)",
+            params![batch_id, prepared.owner_kind, current_time_ms()],
+        )?;
+        for field in &prepared.scans {
+            if field.owners.is_empty() {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    McStoreError::Serde(format!(
+                        "scan field {} has no durable owner",
+                        field.field_id
+                    )),
+                )));
+            }
+            let scan_id = opaque_sqlite_id(self.tx)?;
+            let semantic_digest = field.redaction.provenance.semantic_digest.map(hex_digest);
+            self.tx.execute(
+                "INSERT INTO mc_field_scans(
+                     scan_id,scan_batch_id,detector_id,detector_revision,
+                     semantic_digest,finding_count
+                 ) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    scan_id,
+                    batch_id,
+                    field.redaction.provenance.detector_id,
+                    field.redaction.provenance.detector_revision,
+                    semantic_digest,
+                    i64::try_from(field.redaction.detections.len()).unwrap_or(i64::MAX),
+                ],
+            )?;
+            for owner in &field.owners {
+                let domain_owner_id = domain_owner_ids
+                    .iter()
+                    .find_map(|(candidate, id)| (candidate == owner).then_some(id))
+                    .ok_or_else(|| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(McStoreError::Serde(
+                            "scan field references an unregistered durable owner".to_string(),
+                        )))
+                    })?;
+                self.tx.execute(
+                    "INSERT INTO mc_scan_owner_copies(
+                         owner_copy_id,scan_id,domain_owner_id,owner_kind,field_id
+                     ) VALUES (?1,?2,?3,?4,?5)",
+                    params![
+                        opaque_sqlite_id(self.tx)?,
+                        scan_id,
+                        domain_owner_id,
+                        prepared.owner_kind,
+                        field.field_id,
+                    ],
+                )?;
+            }
+            for (ordinal, detection) in field.redaction.detections.iter().enumerate() {
+                let exactness = match detection.exactness {
+                    DetectionExactness::Exact => "exact",
+                };
+                let span_kind = match detection.span_kind {
+                    DetectionSpanKind::Value => "value",
+                };
+                let action = match detection.action {
+                    DetectionAction::Substitute => "substitute",
+                };
+                self.tx.execute(
+                    "INSERT INTO mc_scan_detections(
+                         scan_id,detection_ordinal,rule_id,detector_revision,exactness,
+                         label_id,span_kind,action
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        scan_id,
+                        i64::try_from(ordinal).unwrap_or(i64::MAX),
+                        detection.rule_id,
+                        detection.detector_revision,
+                        exactness,
+                        detection.secret_type,
+                        span_kind,
+                        action,
+                    ],
+                )?;
+            }
+        }
+        for link in &prepared.existing_scan_links {
+            let domain_owner_id = domain_owner_ids
+                .iter()
+                .find_map(|(candidate, id)| (candidate == &link.owner).then_some(id))
+                .ok_or_else(|| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(McStoreError::Serde(
+                        "existing scan link references an unregistered durable owner".to_string(),
+                    )))
+                })?;
+            self.tx.execute(
+                "INSERT INTO mc_scan_owner_copies(
+                     owner_copy_id,scan_id,domain_owner_id,owner_kind,field_id
+                 )
+                 SELECT ?1,scan_id,?2,?3,field_id
+                   FROM mc_scan_owner_copies
+                  WHERE scan_id=?4
+                  GROUP BY scan_id,field_id",
+                params![
+                    opaque_sqlite_id(self.tx)?,
+                    domain_owner_id,
+                    prepared.owner_kind,
+                    link.scan_id,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn opaque_sqlite_id(tx: &Transaction<'_>) -> rusqlite::Result<String> {
+    tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
+}
+
+fn prune_orphan_active_scan_audit(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM mc_field_scans
+          WHERE NOT EXISTS (
+              SELECT 1 FROM mc_scan_owner_copies
+               WHERE mc_scan_owner_copies.scan_id = mc_field_scans.scan_id
+          )",
+        [],
+    )?;
+    tx.execute(
+        "DELETE FROM mc_scan_batches
+          WHERE NOT EXISTS (
+              SELECT 1 FROM mc_field_scans
+               WHERE mc_field_scans.scan_batch_id = mc_scan_batches.scan_batch_id
+          )",
+        [],
+    )?;
+    tx.execute(
+        "DELETE FROM mc_scan_owner_scopes
+          WHERE NOT EXISTS (
+              SELECT 1 FROM mc_scan_domain_owners
+               WHERE mc_scan_domain_owners.owner_scope_id = mc_scan_owner_scopes.owner_scope_id
+          )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn retire_active_scan_domain_owner(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_key: &str,
+    owner_kind: &str,
+    owner_key: &str,
+) -> rusqlite::Result<()> {
+    let scope_key = active_scan_private_key(scope_kind, scope_key);
+    let owner_key = active_scan_private_key(owner_kind, owner_key);
+    tx.execute(
+        "DELETE FROM mc_scan_domain_owners
+          WHERE owner_scope_id IN (
+              SELECT owner_scope_id FROM mc_scan_owner_scopes
+               WHERE scope_kind = ?1 AND scope_key = ?2
+          ) AND owner_kind = ?3 AND owner_key = ?4",
+        params![scope_kind, scope_key, owner_kind, owner_key],
+    )?;
+    prune_orphan_active_scan_audit(tx)
+}
+
+fn retire_active_scan_owner_kind(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_key: &str,
+    owner_kind: &str,
+) -> rusqlite::Result<()> {
+    let scope_key = active_scan_private_key(scope_kind, scope_key);
+    tx.execute(
+        "DELETE FROM mc_scan_domain_owners
+          WHERE owner_scope_id IN (
+              SELECT owner_scope_id FROM mc_scan_owner_scopes
+               WHERE scope_kind = ?1 AND scope_key = ?2
+          ) AND owner_kind = ?3",
+        params![scope_kind, scope_key, owner_kind],
+    )?;
+    prune_orphan_active_scan_audit(tx)
+}
+
+fn retire_active_scan_scope(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_key: &str,
+) -> rusqlite::Result<()> {
+    let scope_key = active_scan_private_key(scope_kind, scope_key);
+    tx.execute(
+        "DELETE FROM mc_scan_owner_scopes WHERE scope_kind = ?1 AND scope_key = ?2",
+        params![scope_kind, scope_key],
+    )?;
+    prune_orphan_active_scan_audit(tx)
+}
+
+fn active_scan_owner_key(parts: &[&str]) -> String {
+    let mut key = String::new();
+    for part in parts {
+        use std::fmt::Write;
+        let _ = write!(key, "{}:{part}", part.len());
+    }
+    key
+}
+
+fn active_scan_private_key(kind: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"magic-context-active-scan-owner-v1\0");
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn hex_digest(bytes: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+struct PreparedNoteFields {
+    content: String,
+    surface_condition: Option<String>,
+    anchor_block_id: Option<String>,
+}
+
+struct PreparedNoteUpdate<'a> {
+    content: Option<String>,
+    surface_condition: Option<Option<String>>,
+    condition_compile: Option<NoteConditionCompile<'a>>,
+}
+
+fn prepare_note_update<'a>(
+    prepared: &mut PreparedWrite,
+    content: Option<&str>,
+    surface_condition: Option<Option<&str>>,
+    condition_compile: Option<NoteConditionCompile<'a>>,
+) -> Result<PreparedNoteUpdate<'a>, McStoreError> {
+    prepare_note_update_with(
+        prepared,
+        PreparedScanLayer::Durable,
+        content,
+        surface_condition,
+        condition_compile,
+    )
+}
+
+fn prepare_note_update_with<'a>(
+    prepared: &mut PreparedWrite,
+    layer: PreparedScanLayer,
+    content: Option<&str>,
+    surface_condition: Option<Option<&str>>,
+    condition_compile: Option<NoteConditionCompile<'a>>,
+) -> Result<PreparedNoteUpdate<'a>, McStoreError> {
+    if let Some(compile) = condition_compile {
+        for (field_id, value) in [
+            ("compiled_provider", compile.compiled_provider),
+            ("compiled_config", compile.compiled_config),
+            ("compile_status", compile.compile_status),
+        ] {
+            if let Some(value) = value {
+                prepared.prepare_field(field_id, value, layer, PreparedFieldPolicy::NewIdentity)?;
+            }
+        }
+    }
+    Ok(PreparedNoteUpdate {
+        content: content
+            .map(|value| {
+                prepared.prepare_field("content", value, layer, PreparedFieldPolicy::Content)
+            })
+            .transpose()?,
+        surface_condition: surface_condition
+            .map(|value| {
+                value
+                    .map(|value| {
+                        prepared.prepare_field(
+                            "surface_condition",
+                            value,
+                            layer,
+                            PreparedFieldPolicy::Content,
+                        )
+                    })
+                    .transpose()
+            })
+            .transpose()?,
+        condition_compile,
+    })
+}
+
+fn prepare_transaction_note_update<'a>(
+    prepared: &std::cell::RefCell<PreparedWrite>,
+    content: Option<&str>,
+    surface_condition: Option<Option<&str>>,
+    condition_compile: Option<NoteConditionCompile<'a>>,
+) -> Result<PreparedNoteUpdate<'a>, McStoreError> {
+    let mut prepared = prepared.borrow_mut();
+    prepare_note_update_with(
+        &mut prepared,
+        PreparedScanLayer::Transaction,
+        content,
+        surface_condition,
+        condition_compile,
+    )
+}
+
+fn prepare_note_fields(
+    prepared: &mut PreparedWrite,
+    content: &str,
+    surface_condition: Option<&str>,
+    anchor_block_id: Option<&str>,
+) -> Result<PreparedNoteFields, McStoreError> {
+    prepare_note_fields_with(
+        prepared,
+        PreparedScanLayer::Durable,
+        content,
+        surface_condition,
+        anchor_block_id,
+    )
+}
+
+fn prepare_note_fields_with(
+    prepared: &mut PreparedWrite,
+    layer: PreparedScanLayer,
+    content: &str,
+    surface_condition: Option<&str>,
+    anchor_block_id: Option<&str>,
+) -> Result<PreparedNoteFields, McStoreError> {
+    Ok(PreparedNoteFields {
+        content: prepared.prepare_field("content", content, layer, PreparedFieldPolicy::Content)?,
+        surface_condition: surface_condition
+            .map(|value| {
+                prepared.prepare_field(
+                    "surface_condition",
+                    value,
+                    layer,
+                    PreparedFieldPolicy::Content,
+                )
+            })
+            .transpose()?,
+        anchor_block_id: anchor_block_id
+            .map(|value| {
+                prepared.prepare_field(
+                    "anchor_block_id",
+                    value,
+                    layer,
+                    PreparedFieldPolicy::NewIdentity,
+                )
+            })
+            .transpose()?,
+    })
+}
+
+fn prepare_transaction_note_fields(
+    prepared: &std::cell::RefCell<PreparedWrite>,
+    content: &str,
+    surface_condition: Option<&str>,
+    anchor_block_id: Option<&str>,
+) -> Result<PreparedNoteFields, McStoreError> {
+    let mut prepared = prepared.borrow_mut();
+    prepare_note_fields_with(
+        &mut prepared,
+        PreparedScanLayer::Transaction,
+        content,
+        surface_condition,
+        anchor_block_id,
+    )
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableFieldPolicy {
+    Redact,
+    Reject,
+    Mixed,
+    NoUntrustedText,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DurableWriteFamily {
+    CacheState,
+    TransformDiagnostics,
+    TransformOverlays,
+    CommandLedgers,
+    Notes,
+    NoteEvaluationLedgers,
+    Compartments,
+    ChunkTranscripts,
+    Tags,
+    HistorianSideChannels,
+    WorkspaceProfileMemory,
+    AuthorityRoutes,
+    AuthorityControl,
+    AuthoritySeedRows,
+    ProjectMuralArtifacts,
+    ClaimIntents,
+    ClaimMirror,
+    FacadeMutationLedger,
+    LineageCopies,
+    KernelCommitEnvelope,
+    KernelDomainsRegistry,
+    KernelStaging,
+    KernelAlignmentProjection,
+    KernelConsumerControl,
+    RedactionReceipts,
+}
+
+impl DurableWriteFamily {
+    pub const fn owner_kind(self) -> &'static str {
+        match self {
+            Self::CacheState => "cache_state",
+            Self::TransformDiagnostics => "transform_diagnostics",
+            Self::TransformOverlays => "transform_overlays",
+            Self::CommandLedgers => "command_ledgers",
+            Self::Notes => "notes",
+            Self::NoteEvaluationLedgers => "note_evaluation_ledgers",
+            Self::Compartments => "compartments",
+            Self::ChunkTranscripts => "chunk_transcripts",
+            Self::Tags => "tags",
+            Self::HistorianSideChannels => "historian_side_channels",
+            Self::WorkspaceProfileMemory => "workspace_profile_memory",
+            Self::AuthorityRoutes => "authority_routes",
+            Self::AuthorityControl => "authority_control",
+            Self::AuthoritySeedRows => "authority_seed_rows",
+            Self::ProjectMuralArtifacts => "project_mural_artifacts",
+            Self::ClaimIntents => "claim_intents",
+            Self::ClaimMirror => "claim_mirror",
+            Self::FacadeMutationLedger => "facade_mutation",
+            Self::LineageCopies => "lineage_copies",
+            Self::KernelCommitEnvelope => "kernel_commit_envelope",
+            Self::KernelDomainsRegistry => "kernel_domains_registry",
+            Self::KernelStaging => "kernel_staging",
+            Self::KernelAlignmentProjection => "kernel_alignment_projection",
+            Self::KernelConsumerControl => "kernel_consumer_control",
+            Self::RedactionReceipts => "redaction_receipts",
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableWriteRegistration {
+    pub family: DurableWriteFamily,
+    pub policy: DurableFieldPolicy,
+    pub preparation: &'static str,
+    pub test: &'static str,
+}
+
+#[doc(hidden)]
+pub const DURABLE_WRITE_REGISTRY: &[DurableWriteRegistration] = &[
+    DurableWriteRegistration { family: DurableWriteFamily::CacheState, policy: DurableFieldPolicy::Mixed, preparation: "prepare_core_state + prepare_json_content", test: "production_redaction::cache_state_redacts_payloads_preserves_existing_ids_and_rejects_integrity" },
+    DurableWriteRegistration { family: DurableWriteFamily::TransformDiagnostics, policy: DurableFieldPolicy::Redact, preparation: "prepare_content / prepare_json_content", test: "production_redaction::transform_diagnostics_redact_before_persistence" },
+    DurableWriteRegistration { family: DurableWriteFamily::TransformOverlays, policy: DurableFieldPolicy::Mixed, preparation: "prepared overlay fields", test: "lib::tags_mint_monotonically_and_channel1_appends_are_idempotent" },
+    DurableWriteRegistration { family: DurableWriteFamily::CommandLedgers, policy: DurableFieldPolicy::Mixed, preparation: "exact replay then integrity rejection / prepare_json_content", test: "production_redaction::new_idempotency_identities_reject_without_substitution_or_collapse" },
+    DurableWriteRegistration { family: DurableWriteFamily::Notes, policy: DurableFieldPolicy::Mixed, preparation: "prepared note content and integrity metadata", test: "production_redaction::note_fields_follow_content_and_integrity_policy" },
+    DurableWriteRegistration { family: DurableWriteFamily::NoteEvaluationLedgers, policy: DurableFieldPolicy::Mixed, preparation: "exact replay then bounded prepared response", test: "lib::note_evaluation_callback_errors_are_redacted" },
+    DurableWriteRegistration { family: DurableWriteFamily::Compartments, policy: DurableFieldPolicy::Mixed, preparation: "prepare_compartment", test: "production_redaction::compartment_content_redacts_and_new_message_identities_reject" },
+    DurableWriteRegistration { family: DurableWriteFamily::ChunkTranscripts, policy: DurableFieldPolicy::Redact, preparation: "prepare_content / prepare_json_content before compression", test: "lib::publish_historian_chunk_persists_transcript_inside_cas" },
+    DurableWriteRegistration { family: DurableWriteFamily::Tags, policy: DurableFieldPolicy::Mixed, preparation: "exact replay then identity rejection and prepare_transaction_bytes", test: "lib::tags_mint_monotonically_and_channel1_appends_are_idempotent" },
+    DurableWriteRegistration { family: DurableWriteFamily::HistorianSideChannels, policy: DurableFieldPolicy::Mixed, preparation: "prepare_json_content", test: "lib::historian_side_channel_outbox_recovers_after_restart" },
+    DurableWriteRegistration { family: DurableWriteFamily::WorkspaceProfileMemory, policy: DurableFieldPolicy::Redact, preparation: "typed prepared state-sync rows", test: "lib::state_sync_sections_distinguish_absent_empty_and_legacy_always_present" },
+    DurableWriteRegistration { family: DurableWriteFamily::AuthorityRoutes, policy: DurableFieldPolicy::Reject, preparation: "exact binding lookup then structural validation or identity rejection", test: "production_redaction::authority_routes_reject_new_secret_identities_and_preserve_exact_existing_bindings" },
+    DurableWriteRegistration { family: DurableWriteFamily::AuthorityControl, policy: DurableFieldPolicy::Reject, preparation: "structural existing authority keys and rejected new identities/checksums", test: "production_redaction::authority_creation_and_checksums_reject_secret_material" },
+    DurableWriteRegistration { family: DurableWriteFamily::AuthoritySeedRows, policy: DurableFieldPolicy::Mixed, preparation: "prepare_json_content and bind prepared snapshot", test: "lib::authority_note_seed_frame_uses_one_fenced_transaction_and_is_idempotent" },
+    DurableWriteRegistration { family: DurableWriteFamily::ProjectMuralArtifacts, policy: DurableFieldPolicy::Reject, preparation: "identity, data URL, and hash rejection before transaction", test: "production_redaction::mural_artifacts_reject_secret_bytes_hashes_and_new_identity" },
+    DurableWriteRegistration { family: DurableWriteFamily::ClaimIntents, policy: DurableFieldPolicy::Reject, preparation: "integrity rejection and canonical integrity JSON", test: "production_redaction::fresh_claim_intent_identities_and_integrity_payloads_reject" },
+    DurableWriteRegistration { family: DurableWriteFamily::ClaimMirror, policy: DurableFieldPolicy::Reject, preparation: "exact receipt replay then whole-value integrity scan", test: "production_redaction::integrity_bound_claim_content_rejects_without_identity_collapse" },
+    DurableWriteRegistration { family: DurableWriteFamily::FacadeMutationLedger, policy: DurableFieldPolicy::Mixed, preparation: "exact command replay then prepared tags and bounded transaction result", test: "production_redaction::transaction_produced_facade_text_is_redacted_and_bounded" },
+    DurableWriteRegistration { family: DurableWriteFamily::LineageCopies, policy: DurableFieldPolicy::Mixed, preparation: "link existing source scan receipts to copied rows", test: "production_redaction::lineage_copy_links_source_scans_without_rescanning_and_survives_source_deletion" },
+    DurableWriteRegistration { family: DurableWriteFamily::KernelCommitEnvelope, policy: DurableFieldPolicy::Mixed, preparation: "caller intent before lock and transaction-budget result", test: "kernel_redaction::envelope_redacts_before_bind_and_never_leaks_secret_to_storage_or_errors" },
+    DurableWriteRegistration { family: DurableWriteFamily::KernelDomainsRegistry, policy: DurableFieldPolicy::Reject, preparation: "RedactedDomain", test: "kernel_redaction::new_kernel_identities_reject_instead_of_collapsing" },
+    DurableWriteRegistration { family: DurableWriteFamily::KernelStaging, policy: DurableFieldPolicy::Mixed, preparation: "exact run lookup then prepared run and candidate fields", test: "kernel_redaction::staging_run_reuse_with_changed_immutable_metadata_is_a_typed_conflict" },
+    DurableWriteRegistration { family: DurableWriteFamily::KernelAlignmentProjection, policy: DurableFieldPolicy::Mixed, preparation: "exact existing foreign keys plus prepared kind and payload", test: "kernel_envelope::projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events" },
+    DurableWriteRegistration { family: DurableWriteFamily::KernelConsumerControl, policy: DurableFieldPolicy::Mixed, preparation: "exact consumer lookup then prepared operator and reason", test: "kernel_outbox::deregistration_uses_commit_tip_without_publication_and_abandonment_records_four_facts" },
+    DurableWriteRegistration { family: DurableWriteFamily::RedactionReceipts, policy: DurableFieldPolicy::NoUntrustedText, preparation: "opaque batch, child scan, and owner-copy IDs with normalized detector metadata only", test: "kernel_schema::scan_audit_is_digest_covered_and_contains_no_secret_shape" },
+];
+
+fn prepare_content(input: &str) -> Result<String, McStoreError> {
+    prepare_content_with(input, PreparedScanLayer::Durable)
+}
+
+fn prepare_content_with(input: &str, layer: PreparedScanLayer) -> Result<String, McStoreError> {
+    ensure_durable_text_bound(input)?;
+    match layer {
+        PreparedScanLayer::Durable => redact_durable_text(input),
+        PreparedScanLayer::Transaction => redact_transaction_durable_text(input),
+    }
+    .map(|redaction| redaction.text)
+    .map_err(McStoreError::from)
+}
+
+fn prepare_transaction_content(input: &str) -> Result<String, McStoreError> {
+    prepare_content_with(input, PreparedScanLayer::Transaction)
+}
+
+fn prepare_json_content(input: &str) -> Result<String, McStoreError> {
+    prepare_json_content_with(input, JsonScanPolicy::DurableRejectProtected)
+}
+
+fn prepare_json_content_preserving_identities(input: &str) -> Result<String, McStoreError> {
+    prepare_json_content_with(input, JsonScanPolicy::DurablePreserveIdentities)
+}
+
+fn prepare_transaction_json_preserving_identities(input: &str) -> Result<String, McStoreError> {
+    prepare_json_content_with(input, JsonScanPolicy::TransactionPreserveIdentities)
+}
+
+fn prepare_transaction_response(input: &str) -> Result<String, McStoreError> {
+    if serde_json::from_str::<Value>(input).is_ok() {
+        prepare_json_content_with(input, JsonScanPolicy::TransactionPreserveIdentities)
+    } else {
+        prepare_transaction_content(input)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum JsonScanPolicy {
+    DurableRejectProtected,
+    DurablePreserveIdentities,
+    TransactionRejectProtected,
+    TransactionPreserveIdentities,
+}
+
+impl JsonScanPolicy {
+    fn transaction(self) -> bool {
+        matches!(
+            self,
+            Self::TransactionRejectProtected | Self::TransactionPreserveIdentities
+        )
+    }
+
+    fn reject_protected(self) -> bool {
+        matches!(
+            self,
+            Self::DurableRejectProtected | Self::TransactionRejectProtected
+        )
+    }
+}
+
+fn prepare_json_content_with(input: &str, policy: JsonScanPolicy) -> Result<String, McStoreError> {
+    ensure_durable_text_bound(input)?;
+    fn identity_json_field(key: &str) -> bool {
+        matches!(key, "id" | "key" | "locator" | "revision")
+            || key.ends_with("_id")
+            || key.ends_with("_ids")
+            || key.ends_with("_key")
+            || key.ends_with("_keys")
+            || key.ends_with("_locator")
+            || key.ends_with("_revision")
+    }
+
+    fn integrity_json_field(key: &str) -> bool {
+        let key = key.to_ascii_lowercase();
+        [
+            "password",
+            "secret",
+            "token",
+            "signature",
+            "integrity",
+            "signed",
+            "digest",
+            "hash",
+            "fingerprint",
+        ]
+        .iter()
+        .any(|marker| key.contains(marker))
+    }
+
+    fn validate_existing_value(value: &Value) -> Result<(), McStoreError> {
+        match value {
+            Value::String(text) => ensure_durable_text_bound(text),
+            Value::Array(values) => values.iter().try_for_each(validate_existing_value),
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    ensure_durable_text_bound(key)?;
+                    validate_existing_value(value)?;
+                }
+                Ok(())
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+        }
+    }
+
+    fn validate_json_keys(value: &Value) -> Result<(), McStoreError> {
+        match value {
+            Value::Array(values) => values.iter().try_for_each(validate_json_keys),
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    ensure_durable_text_bound(key)?;
+                    reject_secret_text(key)?;
+                    validate_json_keys(value)?;
+                }
+                Ok(())
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(()),
+        }
+    }
+
+    fn contains_nonempty_text(value: &Value) -> bool {
+        match value {
+            Value::String(text) => !text.is_empty(),
+            Value::Array(values) => values.iter().any(contains_nonempty_text),
+            Value::Object(fields) => fields.values().any(contains_nonempty_text),
+            Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        }
+    }
+
+    fn prepare_value(
+        value: &mut Value,
+        key: Option<&str>,
+        policy: JsonScanPolicy,
+    ) -> Result<(), McStoreError> {
+        if let Some(key) = key.filter(|key| identity_json_field(key) || integrity_json_field(key)) {
+            if identity_json_field(key) && !integrity_json_field(key) && !policy.reject_protected()
+            {
+                ensure_durable_text_bound(key)?;
+                validate_existing_value(value)?;
+            } else if contains_nonempty_text(value) {
+                let encoded = canonical_json_encode(value)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                let redaction = if policy.transaction() {
+                    redact_transaction_durable_text(&encoded)?
+                } else {
+                    redact_durable_text(&encoded)?
+                };
+                if !redaction.detections.is_empty() || label_for_secret_key(key).is_some() {
+                    return Err(McStoreError::Redaction(RedactionErrorKind::SecretDetected));
+                }
+            }
+            return Ok(());
+        }
+        match value {
+            Value::String(text) => {
+                let redaction = if policy.transaction() {
+                    redact_transaction_durable_text(text)?.text
+                } else {
+                    redact_durable_text(text)?.text
+                };
+                *text = match key.and_then(label_for_secret_key) {
+                    Some(label) if !text.is_empty() => label.marker().to_string(),
+                    _ => redaction,
+                };
+            }
+            Value::Array(values) => {
+                for value in values {
+                    prepare_value(value, key, policy)?;
+                }
+            }
+            Value::Object(fields) => {
+                for (field, value) in fields {
+                    ensure_durable_text_bound(field)?;
+                    reject_secret_text(field)?;
+                    prepare_value(value, Some(field), policy)?;
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+        Ok(())
+    }
+
+    let mut value: Value =
+        serde_json::from_str(input).map_err(|error| McStoreError::Serde(error.to_string()))?;
+    validate_json_keys(&value)?;
+    let original = value.clone();
+    prepare_value(&mut value, None, policy)?;
+    if value == original {
+        Ok(input.to_string())
+    } else {
+        serde_json::to_string(&value).map_err(|error| McStoreError::Serde(error.to_string()))
+    }
+}
+
+fn ensure_durable_text_bound(input: &str) -> Result<(), McStoreError> {
+    if input.len() > MAX_DURABLE_TEXT_BYTES {
+        Err(McStoreError::Redaction(RedactionErrorKind::InputLimit))
+    } else {
+        Ok(())
+    }
+}
+
+fn prepare_core_state(core: &CoreState) -> Result<CoreState, McStoreError> {
+    fn prepare_unit(unit: &FrozenUnit) -> Result<FrozenUnit, McStoreError> {
+        ensure_durable_text_bound(&unit.key)?;
+        ensure_durable_text_bound(&unit.kind)?;
+        ensure_durable_text_bound(&unit.reset_rule)?;
+        Ok(FrozenUnit {
+            key: unit.key.clone(),
+            kind: unit.kind.clone(),
+            frozen_payload: prepare_content(&unit.frozen_payload)?,
+            durability_class: unit.durability_class,
+            reset_rule: unit.reset_rule.clone(),
+        })
+    }
+
+    ensure_durable_text_bound(&core.boundary_id)?;
+    Ok(CoreState {
+        version: core.version,
+        boundary_id: core.boundary_id.clone(),
+        frozen_units: core
+            .frozen_units
+            .iter()
+            .map(prepare_unit)
+            .collect::<Result<Vec<_>, _>>()?,
+        pending_changes: core
+            .pending_changes
+            .iter()
+            .map(prepare_unit)
+            .collect::<Result<Vec<_>, _>>()?,
+        reconcile_pending: core.reconcile_pending,
+    })
+}
+
+fn prepare_core_state_for_write(
+    write: &mut PreparedWrite,
+    core: &CoreState,
+) -> Result<CoreState, McStoreError> {
+    write.existing_identity("boundary_id", &core.boundary_id)?;
+    for unit in core.frozen_units.iter().chain(&core.pending_changes) {
+        write.existing_identity("unit_key", &unit.key)?;
+        write.existing_identity("unit_kind", &unit.kind)?;
+        write.existing_identity("reset_rule", &unit.reset_rule)?;
+        write.record_content("frozen_payload", &unit.frozen_payload)?;
+    }
+    prepare_core_state(core)
+}
+
+fn prepare_transaction_core_state_for_write(
+    write: &mut PreparedWrite,
+    core: &CoreState,
+) -> Result<CoreState, McStoreError> {
+    fn prepare_unit(
+        write: &mut PreparedWrite,
+        unit: &FrozenUnit,
+    ) -> Result<FrozenUnit, McStoreError> {
+        Ok(FrozenUnit {
+            key: write.transaction_existing_identity("unit_key", &unit.key)?,
+            kind: write.transaction_existing_identity("unit_kind", &unit.kind)?,
+            frozen_payload: write.transaction_content("frozen_payload", &unit.frozen_payload)?,
+            durability_class: unit.durability_class,
+            reset_rule: write.transaction_existing_identity("reset_rule", &unit.reset_rule)?,
+        })
+    }
+
+    Ok(CoreState {
+        version: core.version,
+        boundary_id: write.transaction_existing_identity("boundary_id", &core.boundary_id)?,
+        frozen_units: core
+            .frozen_units
+            .iter()
+            .map(|unit| prepare_unit(write, unit))
+            .collect::<Result<Vec<_>, _>>()?,
+        pending_changes: core
+            .pending_changes
+            .iter()
+            .map(|unit| prepare_unit(write, unit))
+            .collect::<Result<Vec<_>, _>>()?,
+        reconcile_pending: core.reconcile_pending,
+    })
+}
+
+fn sqlite_redaction_kind(error: &rusqlite::Error) -> Option<RedactionErrorKind> {
+    let rusqlite::Error::ToSqlConversionFailure(source) = error else {
+        return None;
+    };
+    source
+        .downcast_ref::<McStoreError>()
+        .and_then(|error| match error {
+            McStoreError::Redaction(kind) => Some(*kind),
+            _ => None,
+        })
+}
+
+fn prepare_compartment(
+    write: &mut PreparedWrite,
+    compartment: &StoredCompartment,
+) -> Result<StoredCompartment, McStoreError> {
+    write.identity("start_message_id", &compartment.start_message_id)?;
+    write.identity("end_message_id", &compartment.end_message_id)?;
+    if let Some(episode_type) = &compartment.episode_type {
+        write.identity("episode_type", episode_type)?;
+    }
+    Ok(StoredCompartment {
+        sequence: compartment.sequence,
+        start_message: compartment.start_message,
+        end_message: compartment.end_message,
+        start_message_id: compartment.start_message_id.clone(),
+        end_message_id: compartment.end_message_id.clone(),
+        start_date: compartment
+            .start_date
+            .as_deref()
+            .map(|value| write.content("start_date", value))
+            .transpose()?,
+        end_date: compartment
+            .end_date
+            .as_deref()
+            .map(|value| write.content("end_date", value))
+            .transpose()?,
+        title: write.content("title", &compartment.title)?,
+        content: write.content("content", &compartment.content)?,
+        p1: compartment
+            .p1
+            .as_deref()
+            .map(|value| write.content("p1", value))
+            .transpose()?,
+        p2: compartment
+            .p2
+            .as_deref()
+            .map(|value| write.content("p2", value))
+            .transpose()?,
+        p3: compartment
+            .p3
+            .as_deref()
+            .map(|value| write.content("p3", value))
+            .transpose()?,
+        p4: compartment
+            .p4
+            .as_deref()
+            .map(|value| write.content("p4", value))
+            .transpose()?,
+        importance: compartment.importance,
+        episode_type: compartment.episode_type.clone(),
+        legacy: compartment.legacy,
+        created_at: compartment.created_at,
+    })
+}
+
+fn prepare_compartments(
+    write: &mut PreparedWrite,
+    compartments: &[StoredCompartment],
+) -> Result<Vec<StoredCompartment>, McStoreError> {
+    compartments
+        .iter()
+        .map(|compartment| prepare_compartment(write, compartment))
+        .collect()
+}
+
+fn prepare_workspace(
+    write: &mut PreparedWrite,
+    workspace: &ModuleWorkspaceRow,
+) -> Result<ModuleWorkspaceRow, McStoreError> {
+    write.identity("workspace_name", &workspace.name)?;
+    for category in &workspace.share_categories {
+        write.identity("workspace_share_category", category)?;
+    }
+    let members = workspace
+        .members
+        .iter()
+        .map(|member| {
+            write.identity("workspace_project_path", &member.project_path)?;
+            write.identity("workspace_display_path", &member.display_path)?;
+            Ok(ModuleWorkspaceMemberRow {
+                project_path: member.project_path.clone(),
+                display_name: write.content("workspace_display_name", &member.display_name)?,
+                display_path: member.display_path.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, McStoreError>>()?;
+    Ok(ModuleWorkspaceRow {
+        name: workspace.name.clone(),
+        share_categories: workspace.share_categories.clone(),
+        members,
+    })
+}
+
 /// Full module-side note write input. `surface_condition` selects the pending smart-note
 /// state; an absent condition creates an ordinary active note for legacy callers, while the
 /// Rust-mode adapter keeps session-only notes on the TypeScript-owned path.
@@ -3358,9 +4646,164 @@ pub enum ModuleStateSyncError {
     Serde(String),
 }
 
+struct PreparedStateSync {
+    drop_seeds: Vec<ModuleDropSeedRow>,
+    pending_agent_drops: Vec<PendingAgentDropSeedRow>,
+    compartments: Vec<StoredCompartment>,
+    user_profile: Vec<String>,
+    user_hint_seeds: Vec<UserHintSeedRow>,
+    workspace: Option<ModuleWorkspaceRow>,
+    note_nudge_anchors: Option<Vec<NoteNudgeAnchorSeed>>,
+    pending_compaction_marker: Option<Option<PendingCompactionMarkerState>>,
+    deferred_execute_state: Option<Option<DeferredExecuteState>>,
+    channel2_nudge_state: Option<String>,
+    strip_seeds: Vec<ModuleStripSeedRow>,
+    last_todo_state: Option<String>,
+}
+
+fn prepare_state_sync(
+    write: &mut PreparedWrite,
+    request: &ModuleStateSyncRequest<'_>,
+) -> Result<PreparedStateSync, ModuleStateSyncError> {
+    write.domain_owner("session", request.session_id, "authority_state_sync");
+    write.existing_identity("session_id", request.session_id)?;
+    if let Some(boundary_id) = request.seed_boundary_id {
+        write.identity("seed_boundary_id", boundary_id)?;
+    }
+    let drop_seeds = request
+        .drop_seeds
+        .iter()
+        .map(|seed| {
+            write.identity("drop_seed_block_id", &seed.block_id)?;
+            for related in &seed.related_block_ids {
+                write.identity("related_block_id", related)?;
+            }
+            write.identity("drop_mode", &seed.drop_mode)?;
+            Ok(ModuleDropSeedRow {
+                block_id: seed.block_id.clone(),
+                related_block_ids: seed.related_block_ids.clone(),
+                drop_mode: seed.drop_mode.clone(),
+                payload: seed
+                    .payload
+                    .as_deref()
+                    .map(|value| write.content("drop_seed_payload", value))
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, McStoreError>>()?;
+    let pending_agent_drops = request
+        .pending_agent_drops
+        .iter()
+        .map(|seed| {
+            write.identity("pending_drop_block_id", &seed.block_id)?;
+            Ok(seed.clone())
+        })
+        .collect::<Result<Vec<_>, McStoreError>>()?;
+    let compartments = prepare_compartments(write, request.compartments)?;
+    let user_profile = request
+        .user_profile
+        .iter()
+        .map(|line| write.content("user_profile", line))
+        .collect::<Result<Vec<_>, _>>()?;
+    let user_hint_seeds = request
+        .user_hint_seeds
+        .iter()
+        .map(|seed| {
+            write.identity("user_hint_block_id", &seed.block_id)?;
+            Ok(UserHintSeedRow {
+                block_id: seed.block_id.clone(),
+                hint_text: write.content("user_hint_text", &seed.hint_text)?,
+            })
+        })
+        .collect::<Result<Vec<_>, McStoreError>>()?;
+    let workspace = request
+        .workspace
+        .map(|workspace| prepare_workspace(write, workspace))
+        .transpose()?;
+    let note_nudge_anchors = request
+        .note_nudge_anchors
+        .map(|anchors| {
+            anchors
+                .iter()
+                .map(|anchor| {
+                    write.identity("note_nudge_message_id", &anchor.message_id)?;
+                    Ok(NoteNudgeAnchorSeed {
+                        message_id: anchor.message_id.clone(),
+                        text: write.content("note_nudge_text", &anchor.text)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, McStoreError>>()
+        })
+        .transpose()?;
+    if let Some(pair) = request.todo_synthetic_anchor {
+        let pair_json = serde_json::to_string(pair)
+            .map_err(|error| ModuleStateSyncError::Serde(error.to_string()))?;
+        write.identity("todo_synthetic_anchor", &pair_json)?;
+    }
+    let pending_compaction_marker = request
+        .pending_compaction_marker
+        .map(|marker| {
+            marker
+                .map(|marker| {
+                    write.identity("compaction_end_message_id", &marker.end_message_id)?;
+                    Ok::<_, McStoreError>(marker.clone())
+                })
+                .transpose()
+        })
+        .transpose()?;
+    let deferred_execute_state = request
+        .deferred_execute_state
+        .map(|state| {
+            state
+                .map(|state| {
+                    Ok::<_, McStoreError>(DeferredExecuteState {
+                        reason: write.content("deferred_execute_reason", &state.reason)?,
+                    })
+                })
+                .transpose()
+        })
+        .transpose()?;
+    let channel2_nudge_state = request
+        .channel2_nudge_state
+        .map(|value| write.content("channel2_nudge_state", value))
+        .transpose()?;
+    let strip_seeds = request
+        .strip_seeds
+        .iter()
+        .map(|seed| {
+            write.identity("strip_message_id", &seed.message_id)?;
+            write.identity("strip_kind", &seed.strip_kind)?;
+            Ok(seed.clone())
+        })
+        .collect::<Result<Vec<_>, McStoreError>>()?;
+    let last_todo_state = request
+        .last_todo_state
+        .as_deref()
+        .map(|value| write.content("last_todo_state", value))
+        .transpose()?;
+    let acked_watermarks_json = serde_json::to_string(&request.acked_watermarks)
+        .map_err(|error| ModuleStateSyncError::Serde(error.to_string()))?;
+    write.identity("acked_watermarks", &acked_watermarks_json)?;
+    Ok(PreparedStateSync {
+        drop_seeds,
+        pending_agent_drops,
+        compartments,
+        user_profile,
+        user_hint_seeds,
+        workspace,
+        note_nudge_anchors,
+        pending_compaction_marker,
+        deferred_execute_state,
+        channel2_nudge_state,
+        strip_seeds,
+        last_todo_state,
+    })
+}
+
 #[derive(Debug)]
 pub enum McStoreError {
     Store(StoreError),
+    Redaction(RedactionErrorKind),
     /// `store.db` carries `mc_cache` history older than the consolidated
     /// bootstrap, so this binary cannot adopt it and does not migrate it.
     PreCutoverModuleStore {
@@ -3449,6 +4892,7 @@ impl std::fmt::Display for McStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             McStoreError::Store(e) => write!(f, "store: {e}"),
+            McStoreError::Redaction(kind) => write!(f, "durable text rejected: {kind:?}"),
             McStoreError::PreCutoverModuleStore {
                 recorded_version,
                 bootstrap_version,
@@ -3552,8 +4996,24 @@ impl std::fmt::Display for McStoreError {
     }
 }
 impl std::error::Error for McStoreError {}
+
+impl From<mc_core::redaction::RedactionError> for McStoreError {
+    fn from(error: mc_core::redaction::RedactionError) -> Self {
+        Self::Redaction(error.kind())
+    }
+}
 impl From<StoreError> for McStoreError {
     fn from(e: StoreError) -> Self {
+        let mut source: &dyn std::error::Error = &e;
+        loop {
+            if let Some(McStoreError::Redaction(kind)) = source.downcast_ref::<McStoreError>() {
+                return McStoreError::Redaction(*kind);
+            }
+            let Some(next) = source.source() else {
+                break;
+            };
+            source = next;
+        }
         McStoreError::Store(e)
     }
 }
@@ -4024,6 +5484,13 @@ fn map_authority_sql_error(error: StoreError) -> McStoreError {
     McStoreError::Store(error)
 }
 
+fn map_prepared_authority_error(error: McStoreError) -> McStoreError {
+    match error {
+        McStoreError::Store(error) => map_authority_sql_error(error),
+        error => error,
+    }
+}
+
 fn validate_authority_domain(domain: &str) -> Result<(), McStoreError> {
     if matches!(domain, "memories" | "notes") {
         Ok(())
@@ -4401,6 +5868,8 @@ pub enum FacadeMutationOutcome {
 /// owned by `with_facade_command`, so the mutation and its response ledger row commit together.
 pub struct FacadeMutationTxn<'a> {
     tx: &'a rusqlite::Transaction<'a>,
+    audit: &'a std::cell::RefCell<PreparedWrite>,
+    redaction_failure: &'a std::cell::Cell<Option<RedactionErrorKind>>,
 }
 
 impl<'a> FacadeMutationTxn<'a> {
@@ -4409,7 +5878,32 @@ impl<'a> FacadeMutationTxn<'a> {
         if content.is_empty() {
             return Err("note content must not be empty".to_string());
         }
-        insert_note_tx(self.tx, &input, content).map_err(|error| error.to_string())
+        let first_scan = self.audit.borrow().scans.len();
+        let prepared = prepare_transaction_note_fields(
+            self.audit,
+            content,
+            input.surface_condition,
+            input.anchor_block_id,
+        )
+        .map_err(|error| {
+            if let McStoreError::Redaction(kind) = error {
+                self.redaction_failure.set(Some(kind));
+            }
+            error.to_string()
+        })?;
+        let note = insert_note_tx(self.tx, &input, &prepared).map_err(|error| {
+            if let Some(kind) = sqlite_redaction_kind(&error) {
+                self.redaction_failure.set(Some(kind));
+            }
+            error.to_string()
+        })?;
+        self.audit.borrow_mut().domain_owner_for_scans_since(
+            first_scan,
+            "project",
+            input.project_path,
+            note.id.to_string(),
+        );
+        Ok(note)
     }
 
     pub fn insert_project_note(&self, input: NoteWriteInput<'_>) -> Result<StoredNote, String> {
@@ -4417,7 +5911,50 @@ impl<'a> FacadeMutationTxn<'a> {
         if content.is_empty() {
             return Err("note content must not be empty".to_string());
         }
-        insert_project_note_tx(self.tx, &input, content).map_err(|error| error.to_string())
+        let surface_condition = input
+            .surface_condition
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let first_scan = self.audit.borrow().scans.len();
+        let prepared = prepare_transaction_note_fields(
+            self.audit,
+            content,
+            surface_condition,
+            input.anchor_block_id,
+        )
+        .map_err(|error| {
+            if let McStoreError::Redaction(kind) = error {
+                self.redaction_failure.set(Some(kind));
+            }
+            error.to_string()
+        })?;
+        {
+            let mut audit = self.audit.borrow_mut();
+            for (field_id, value) in [
+                ("compiled_provider", input.compiled_provider),
+                ("compiled_config", input.compiled_config),
+                ("compile_status", input.compile_status),
+            ] {
+                if let Some(value) = value {
+                    audit
+                        .transaction_identity(field_id, value)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        let note = insert_project_note_tx(self.tx, &input, &prepared).map_err(|error| {
+            if let Some(kind) = sqlite_redaction_kind(&error) {
+                self.redaction_failure.set(Some(kind));
+            }
+            error.to_string()
+        })?;
+        self.audit.borrow_mut().domain_owner_for_scans_since(
+            first_scan,
+            "project",
+            input.project_path,
+            note.id.to_string(),
+        );
+        Ok(note)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4432,15 +5969,32 @@ impl<'a> FacadeMutationTxn<'a> {
         condition_compile: Option<NoteConditionCompile<'_>>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, String> {
+        let first_scan = self.audit.borrow().scans.len();
+        let prepared = prepare_transaction_note_update(
+            self.audit,
+            content,
+            surface_condition,
+            condition_compile,
+        )
+        .map_err(|error| {
+            if let McStoreError::Redaction(kind) = error {
+                self.redaction_failure.set(Some(kind));
+            }
+            error.to_string()
+        })?;
+        self.audit.borrow_mut().domain_owner_for_scans_since(
+            first_scan,
+            "project",
+            project_path,
+            note_id.to_string(),
+        );
         update_note_cas_tx(
             self.tx,
             project_path,
             note_id,
             expected_status,
             expected_version,
-            content,
-            surface_condition,
-            condition_compile,
+            &prepared,
             now_ms,
         )
         .map_err(|error| error.to_string())
@@ -4454,8 +6008,12 @@ impl<'a> FacadeMutationTxn<'a> {
         resolution: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, String> {
+        self.audit
+            .borrow_mut()
+            .domain_owner("project", project_path, note_id.to_string());
         dismiss_note_tx(
             self.tx,
+            self.audit,
             project_path,
             Some(session_id),
             note_id,
@@ -4683,6 +6241,14 @@ fn commit_lineage_disposition(
     acknowledge: bool,
 ) -> rusqlite::Result<LineageDescentTxnOutcome> {
     let next_version = current_target_version.max(0) as u64 + 1;
+    let target_core = match prepare_core_state(&target_core) {
+        Ok(core) => core,
+        Err(_) => {
+            return Ok(LineageDescentTxnOutcome::Invalid(
+                "lineage core state failed secret scanning".to_string(),
+            ))
+        }
+    };
     let core_json = match serde_json::to_string(&target_core) {
         Ok(json) => json,
         Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
@@ -4690,6 +6256,14 @@ fn commit_lineage_disposition(
     let meta_json = match serde_json::to_string(&target_meta) {
         Ok(json) => json,
         Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+    };
+    let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
+        Ok(json) => json,
+        Err(_) => {
+            return Ok(LineageDescentTxnOutcome::Invalid(
+                "lineage metadata failed secret scanning".to_string(),
+            ))
+        }
     };
     tx.execute(
         "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
@@ -4782,7 +6356,72 @@ impl McStore {
                         .map(|scope| scope.route_project_root.clone())
                         .unwrap_or_default())
                 },
-            )
+            )?;
+            conn.create_scalar_function(
+                "mc_redact_transaction_text",
+                1,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |context| {
+                    let input = context.get::<String>(0)?;
+                    prepare_transaction_content(&input)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+                },
+            )?;
+            conn.create_scalar_function(
+                "mc_redact_transaction_json",
+                1,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |context| {
+                    let input = context.get::<String>(0)?;
+                    prepare_json_content_with(&input, JsonScanPolicy::TransactionRejectProtected)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+                },
+            )?;
+            conn.create_scalar_function(
+                "mc_reject_transaction_text",
+                1,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |context| {
+                    let input = context.get::<String>(0)?;
+                    reject_transaction_secret_text(&input)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                    Ok(input)
+                },
+            )?;
+            conn.create_scalar_function(
+                "mc_redact_transaction_transcript",
+                1,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |context| {
+                    let blob = context.get::<Vec<u8>>(0)?;
+                    let input =
+                        decompress_durable_text_exact(&blob, MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES)
+                            .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                    let prepared = prepare_transaction_content(&input)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                    compress_transcript(&prepared)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+                },
+            )?;
+            conn.create_scalar_function(
+                "mc_redact_transaction_raw_messages",
+                1,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |context| {
+                    let blob = context.get::<Vec<u8>>(0)?;
+                    let input =
+                        decompress_durable_text_exact(&blob, MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES)
+                            .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                    let prepared = prepare_json_content_with(
+                        &input,
+                        JsonScanPolicy::TransactionRejectProtected,
+                    )
+                    .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                    compress_raw_messages(&prepared)
+                        .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+                },
+            )?;
+            Ok(())
         })?;
         refuse_pre_cutover_store(&inner)?;
         inner.migrate(NS, MIGRATIONS)?;
@@ -4888,10 +6527,68 @@ impl McStore {
         command_id: Option<&str>,
         mutation: impl FnOnce(&FacadeMutationTxn<'_>) -> Result<Vec<u8>, String>,
     ) -> Result<FacadeMutationOutcome, McStoreError> {
+        for value in [
+            route_project_root,
+            caller_project,
+            identity_scope,
+            tool,
+            action,
+        ] {
+            ensure_durable_text_bound(value)?;
+        }
+        let mut write = PreparedWrite::new(DurableWriteFamily::FacadeMutationLedger);
+        write.domain_owner(
+            "facade",
+            identity_scope,
+            active_scan_owner_key(&[tool, action, command_id.unwrap_or("")]),
+        );
+        let domain = write.identity("domain", domain)?;
+        if let Some(command_id) = command_id {
+            ensure_durable_text_bound(command_id)?;
+            let replay = self.inner.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT response_json
+                       FROM mc_facade_mutation_ledger
+                      WHERE identity_scope = ?1 AND tool = ?2
+                        AND action = ?3 AND command_id = ?4",
+                    params![identity_scope, tool, action, command_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .optional()
+            })?;
+            if let Some(response) = replay {
+                return Ok(FacadeMutationOutcome::Duplicate(response));
+            }
+        }
+        let existing_identity = self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM mc_facade_mutation_ledger
+                      WHERE identity_scope = ?1 AND tool = ?2 AND action = ?3
+                 )",
+                params![identity_scope, tool, action],
+                |row| row.get::<_, i64>(0),
+            )
+        })? != 0;
+        let tool = if existing_identity {
+            write.existing_identity("tool", tool)?
+        } else {
+            write.identity("tool", tool)?
+        };
+        let action = if existing_identity {
+            write.existing_identity("action", action)?
+        } else {
+            write.identity("action", action)?
+        };
+        if let Some(command_id) = command_id {
+            write.identity("command_id", command_id)?;
+        }
+        write.identity("identity_scope", identity_scope)?;
         let _mutation_guard = self
             .facade_mutation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let identity_scope = identity_scope.to_string();
         let previous_note_scope = self
             .note_caller_project
             .lock()
@@ -4909,14 +6606,15 @@ impl McStore {
             *scope = Some(FacadeAuthorityScope {
                 owner: std::thread::current().id(),
                 route_project_root: route_project_root.to_string(),
-                domain: domain.to_string(),
+                domain,
             });
         }
         let _scope_guard = FacadeMutationScopeGuard {
             scope: &self.facade_authority_scope,
         };
-        self.inner
-            .with_conn_fenced(|tx| {
+        let redaction_failure = std::cell::Cell::new(None);
+        let outcome = write.execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 if let Some(command_id) = command_id {
                     let stored = tx
                         .query_row(
@@ -4929,15 +6627,49 @@ impl McStore {
                         )
                         .optional()?;
                     if let Some(response) = stored {
-                        return Ok(FacadeMutationOutcome::Duplicate(response));
+                        return Ok(WriteDisposition::Replay(
+                            FacadeMutationOutcome::Duplicate(response),
+                        ));
                     }
                 }
 
-                let response = mutation(&FacadeMutationTxn { tx }).map_err(|error| {
+                let response = mutation(&FacadeMutationTxn {
+                    tx,
+                    audit: &coordinated.prepared,
+                    redaction_failure: &redaction_failure,
+                })
+                .map_err(|error| {
                     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
                         error,
                     )))
                 })?;
+                let response_text = std::str::from_utf8(&response).map_err(|_| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                        "facade response is not UTF-8",
+                    )))
+                })?;
+                let response = prepare_transaction_response(response_text)
+                    .map_err(|error| {
+                        if let McStoreError::Redaction(kind) = error {
+                            redaction_failure.set(Some(kind));
+                        }
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                            "facade response failed secret scanning",
+                        )))
+                    })?
+                    .into_bytes();
+                coordinated
+                    .prepared
+                    .borrow_mut()
+                    .transaction_content("response_json", response_text)
+                    .map_err(|error| {
+                        if let McStoreError::Redaction(kind) = error {
+                            redaction_failure.set(Some(kind));
+                        }
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                            "facade response audit failed secret scanning",
+                        )))
+                    })?;
                 if let Some(command_id) = command_id {
                     let created_at_ms = current_time_ms();
                     tx.execute(
@@ -4956,6 +6688,38 @@ impl McStore {
                     // Keep only the newest 512 commands for each session identity. The command
                     // key remains unique while it is retained; old outcomes are intentionally
                     // forgettable because the host session has a bounded replay horizon.
+                    let expired_commands = {
+                        let mut statement = tx.prepare(
+                            "SELECT tool, action, command_id
+                               FROM mc_facade_mutation_ledger
+                              WHERE identity_scope = ?1
+                              ORDER BY created_at_ms DESC, tool DESC, action DESC, command_id DESC
+                              LIMIT -1 OFFSET 512",
+                        )?;
+                        let rows = statement
+                            .query_map(params![identity_scope], |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                ))
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        rows
+                    };
+                    for (expired_tool, expired_action, expired_command_id) in expired_commands {
+                        retire_active_scan_domain_owner(
+                            tx,
+                            "facade",
+                            &identity_scope,
+                            "facade_mutation",
+                            &active_scan_owner_key(&[
+                                &expired_tool,
+                                &expired_action,
+                                &expired_command_id,
+                            ]),
+                        )?;
+                    }
                     tx.execute(
                         "DELETE FROM mc_facade_mutation_ledger
                           WHERE identity_scope = ?1
@@ -4969,9 +6733,14 @@ impl McStore {
                         params![identity_scope],
                     )?;
                 }
-                Ok(FacadeMutationOutcome::Applied(response))
-            })
-            .map_err(Into::into)
+                Ok(WriteDisposition::Applied(FacadeMutationOutcome::Applied(
+                    response,
+                )))
+            });
+        match (outcome, redaction_failure.get()) {
+            (Err(_), Some(kind)) => Err(McStoreError::Redaction(kind)),
+            (result, _) => result,
+        }
     }
 
     /// Complete route normalization after schema upgrades using the same caller-identity
@@ -5035,7 +6804,33 @@ impl McStore {
         project: &str,
         route_project_root: &str,
     ) -> Result<(), McStoreError> {
-        self.with_note_conn_fenced(route_project_root, |tx| {
+        let exact_binding = self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT context_store_uuid, project FROM mc_authority_route_bindings
+                  WHERE route_project_root = ?1",
+                params![route_project_root],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+        })?;
+        let is_replay = exact_binding.as_ref().is_some_and(|(uuid, bound_project)| {
+            uuid == context_store_uuid && bound_project == project
+        });
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityRoutes);
+        write.domain_owner("route", route_project_root, "binding");
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("route_project_root", route_project_root),
+        ] {
+            if is_replay {
+                write.existing_identity(field_id, value)?;
+            } else {
+                write.identity(field_id, value)?;
+            }
+        }
+        self.with_prepared_note_conn_fenced(route_project_root, write, |coordinated| {
+            let tx = coordinated.tx();
             tx.execute(
                 "INSERT INTO mc_authority_route_bindings(route_project_root, context_store_uuid, project)
                  VALUES (?1, ?2, ?3)
@@ -5049,7 +6844,11 @@ impl McStore {
             // by the cached authority-status path. Running it after every upsert makes
             // the vocabulary law independent of write ordering.
             normalize_authority_note_route_tx(tx, context_store_uuid, project, route_project_root)?;
-            Ok(())
+            Ok(if is_replay {
+                WriteDisposition::Replay(())
+            } else {
+                WriteDisposition::Applied(())
+            })
         })
     }
 
@@ -5256,6 +7055,27 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    fn with_prepared_note_conn_fenced<T>(
+        &self,
+        caller_project: &str,
+        prepared: PreparedWrite,
+        operation: impl FnOnce(&mut ActiveWriteTransaction<'_>) -> rusqlite::Result<WriteDisposition<T>>,
+    ) -> Result<T, McStoreError> {
+        let caller_project = caller_project.to_string();
+        let caller_scope = Arc::clone(&self.note_caller_project);
+        prepared.execute(&self.inner, |coordinated| {
+            let previous = caller_scope
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .replace(caller_project);
+            let result = operation(coordinated);
+            *caller_scope
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous;
+            result
+        })
+    }
+
     /// The applied schema version of this store's `mc_cache` migration chain:
     /// MAX(version) recorded in the shared `cortexkit_schema_version` table for this
     /// namespace. Read-only probe for status surfaces; it never writes.
@@ -5322,10 +7142,22 @@ impl McStore {
         content_hash: &str,
         updated_at: i64,
     ) -> Result<bool, McStoreError> {
-        self.inner
-            .with_conn_fenced(|tx| {
-                let changed = tx.execute(
-                    "INSERT INTO mc_project_mural_artifacts(
+        let existing = self.load_project_mural_artifact(project_path)?.is_some();
+        let mut write = PreparedWrite::new(DurableWriteFamily::ProjectMuralArtifacts);
+        write.domain_owner("project", project_path, "mural");
+        if existing {
+            write.existing_identity("project_path", project_path)?;
+        } else {
+            write.identity("project_path", project_path)?;
+        }
+        let data_url_text = std::str::from_utf8(data_url)
+            .map_err(|_| McStoreError::Serde("mural data URL is not UTF-8".to_string()))?;
+        write.identity("data_url", data_url_text)?;
+        write.identity("content_hash", content_hash)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let changed = tx.execute(
+                "INSERT INTO mc_project_mural_artifacts(
                          project_path, data_url, content_hash, updated_at
                      ) VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(project_path) DO UPDATE SET
@@ -5333,11 +7165,15 @@ impl McStore {
                          content_hash = excluded.content_hash,
                          updated_at = excluded.updated_at
                      WHERE mc_project_mural_artifacts.content_hash <> excluded.content_hash",
-                    params![project_path, data_url, content_hash, updated_at],
-                )?;
-                Ok(changed != 0)
+                params![project_path, data_url, content_hash, updated_at],
+            )?;
+            let changed = changed != 0;
+            Ok(if changed {
+                WriteDisposition::Applied(true)
+            } else {
+                WriteDisposition::Replay(false)
             })
-            .map_err(Into::into)
+        })
     }
 
     /// Delete every row whose ownership is expressed by an exact `session_id` column.
@@ -5349,6 +7185,26 @@ impl McStore {
         project_path: &str,
     ) -> Result<usize, McStoreError> {
         self.with_note_conn_fenced(project_path, |tx| {
+            let note_ids = {
+                let mut statement = tx.prepare_cached(
+                    "SELECT id FROM mc_notes
+                      WHERE session_id = ?1 AND project_path = ?2 AND type = 'session'",
+                )?;
+                let rows = statement
+                    .query_map(params![session_id, project_path], |row| row.get::<_, i64>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            for note_id in note_ids {
+                retire_active_scan_domain_owner(
+                    tx,
+                    "project",
+                    project_path,
+                    "notes",
+                    &note_id.to_string(),
+                )?;
+            }
+            retire_active_scan_scope(tx, "session", session_id)?;
             let tables = {
                 let mut stmt = tx.prepare_cached(
                     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -5817,9 +7673,13 @@ impl McStore {
         error: &str,
         now_ms: i64,
     ) -> Result<(), McStoreError> {
-        let error = capped_trace_error(error);
-        self.inner.with_conn(|conn| {
-            conn.execute(
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformDiagnostics);
+        write.domain_owner("session", session_id, "pass_trace");
+        write.existing_identity("session_id", session_id)?;
+        let error = write.content("last_reject_error", error)?;
+        let error = capped_trace_error(&error);
+        write.execute(&self.inner, |coordinated| {
+            coordinated.tx().execute(
                 "INSERT INTO mc_pass_trace (
                      session_id,
                      last_received_at_ms,
@@ -5836,7 +7696,7 @@ impl McStore {
                      reject_count = mc_pass_trace.reject_count + 1",
                 params![session_id, error, now_ms],
             )?;
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
@@ -6057,7 +7917,36 @@ impl McStore {
         queued_at_ms: i64,
         zero_targets: bool,
     ) -> Result<AppendOutcome, McStoreError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::CommandLedgers);
+        write.domain_owner(
+            "session",
+            session_id,
+            active_scan_owner_key(&["reduce", command_id.unwrap_or("pending_drops")]),
+        );
+        write.existing_identity("session_id", session_id)?;
+        if let Some(command_id) = command_id {
+            let duplicate = self.inner.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mc_reduce_command_ledger WHERE session_id = ?1 AND command_id = ?2)",
+                    params![session_id, command_id],
+                    |row| row.get::<_, bool>(0),
+                )
+            })?;
+            if duplicate {
+                return Ok(AppendOutcome {
+                    queued: 0,
+                    duplicate: true,
+                    disposition: None,
+                });
+            }
+            write.identity("command_id", command_id)?;
+        }
+        for target_id in target_ids {
+            write.identity("target_id", target_id.trim())?;
+        }
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let mut recorded_command = false;
             if let Some(command_id) = command_id {
                 let recorded = tx.execute(
                     "INSERT OR IGNORE INTO mc_reduce_command_ledger
@@ -6066,12 +7955,13 @@ impl McStore {
                     params![session_id, command_id, queued_at_ms],
                 )?;
                 if recorded == 0 {
-                    return Ok(AppendOutcome {
+                    return Ok(WriteDisposition::Replay(AppendOutcome {
                         queued: 0,
                         duplicate: true,
                         disposition: None,
-                    });
+                    }));
                 }
+                recorded_command = true;
             }
 
             let mut queued = 0u64;
@@ -6106,7 +7996,7 @@ impl McStore {
                 }
             }
 
-            Ok(AppendOutcome {
+            let outcome = AppendOutcome {
                 queued,
                 duplicate: false,
                 disposition: if zero_targets {
@@ -6114,6 +8004,11 @@ impl McStore {
                 } else {
                     None
                 },
+            };
+            Ok(if recorded_command || queued != 0 {
+                WriteDisposition::Applied(outcome)
+            } else {
+                WriteDisposition::Replay(outcome)
             })
         })?;
         Ok(outcome)
@@ -6163,9 +8058,48 @@ impl McStore {
         inputs: &[TagMintInput],
         created_at_ms: i64,
     ) -> Result<Vec<McTagRow>, McStoreError> {
-        Ok(self.inner.with_conn_fenced(|tx| {
-            let mut out = Vec::with_capacity(inputs.len());
+        let mut write = PreparedWrite::new(DurableWriteFamily::Tags);
+        write.domain_owner("session", session_id, "tags");
+        write.existing_identity("session_id", session_id)?;
+        let existing_ids = self.inner.with_conn(|conn| {
+            let mut ids = HashSet::new();
             for input in inputs {
+                let block_id = input.block_id.trim();
+                if conn
+                    .query_row(
+                        "SELECT 1 FROM mc_tags WHERE session_id = ?1 AND block_id = ?2",
+                        params![session_id, block_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some()
+                {
+                    ids.insert(block_id.to_string());
+                }
+            }
+            Ok(ids)
+        })?;
+        let mut prepared_inputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let block_id = input.block_id.trim();
+            if block_id.is_empty() || existing_ids.contains(block_id) {
+                prepared_inputs.push(input.clone());
+                continue;
+            }
+            write.identity("block_id", block_id)?;
+            write.identity("kind", &input.kind)?;
+            prepared_inputs.push(TagMintInput {
+                block_id: input.block_id.clone(),
+                kind: input.kind.clone(),
+                token_count: input.token_count,
+                source_bytes: write.bytes("source_bytes", &input.source_bytes)?,
+            });
+        }
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let mut out = Vec::with_capacity(inputs.len());
+            let mut inserted = false;
+            for input in &prepared_inputs {
                 let block_id = input.block_id.trim();
                 if block_id.is_empty() {
                     continue;
@@ -6200,7 +8134,7 @@ impl McStore {
                         input.kind.as_str(),
                         input.token_count.max(0),
                         created_at_ms,
-                        input.source_bytes.as_slice(),
+                        input.source_bytes,
                     ],
                 )?;
                 out.push(McTagRow {
@@ -6211,9 +8145,14 @@ impl McStore {
                     created_at_ms,
                     source_bytes: input.source_bytes.clone(),
                 });
+                inserted = true;
             }
-            Ok(out)
-        })?)
+            Ok(if inserted {
+                WriteDisposition::Applied(out)
+            } else {
+                WriteDisposition::Replay(out)
+            })
+        })
     }
 
     /// Load all minted tags for a session in tag-number order. This is the cold baseline fill.
@@ -6367,15 +8306,35 @@ impl McStore {
         reminder_text: &str,
         fired_at_ms: i64,
     ) -> Result<bool, McStoreError> {
-        Ok(self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformOverlays);
+        write.domain_owner("session", session_id, "channel1_appends");
+        write.existing_identity("session_id", session_id)?;
+        write.existing_identity("channel1_block_id", block_id)?;
+        let reminder_text = write.content("reminder_text", reminder_text)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let exists = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mc_channel1_appends
+                  WHERE session_id = ?1 AND block_id = ?2)",
+                params![session_id, block_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if exists {
+                return Ok(WriteDisposition::Replay(false));
+            }
+            coordinated
+                .prepared
+                .borrow()
+                .reject_recorded_identities(&["channel1_block_id"])
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO mc_channel1_appends
                      (session_id, block_id, reminder_text, fired_at_ms)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![session_id, block_id, reminder_text, fired_at_ms],
             )?;
-            Ok(inserted > 0)
-        })?)
+            Ok(WriteDisposition::Applied(inserted > 0))
+        })
     }
 
     /// Load stored Channel-1 append bytes in deterministic order.
@@ -6445,7 +8404,7 @@ impl McStore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let hint_ordinal = user_hint
-            .map(|hint| {
+            .map(|hint| -> Result<_, McStoreError> {
                 i64::try_from(hint.ordinal).map_err(|_| {
                     McStoreError::Serde("message ordinal exceeds SQLite range".to_string())
                 })
@@ -6541,15 +8500,35 @@ impl McStore {
         hint_text: &str,
         created_at: i64,
     ) -> Result<bool, McStoreError> {
-        Ok(self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::TransformOverlays);
+        write.domain_owner("session", session_id, "user_hints");
+        write.existing_identity("session_id", session_id)?;
+        write.existing_identity("user_hint_block_id", block_id)?;
+        let hint_text = write.content("user_hint_text", hint_text)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let exists = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mc_user_hints
+                  WHERE session_id = ?1 AND block_id = ?2)",
+                params![session_id, block_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if exists {
+                return Ok(WriteDisposition::Replay(false));
+            }
+            coordinated
+                .prepared
+                .borrow()
+                .reject_recorded_identities(&["user_hint_block_id"])
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO mc_user_hints
                      (session_id, block_id, hint_text, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![session_id, block_id, hint_text, created_at],
             )?;
-            Ok(inserted > 0)
-        })?)
+            Ok(WriteDisposition::Applied(inserted > 0))
+        })
     }
 
     /// Canonical test descriptor: an `mc_cache`-namespace module store on
@@ -6656,6 +8635,9 @@ impl McStore {
         owner_message_id: &str,
         state_hash: &str,
     ) -> Result<TodoStateSetOutcome, McStoreError> {
+        ensure_durable_text_bound(state_json)?;
+        reject_secret_text(owner_message_id)?;
+        reject_secret_text(state_hash)?;
         let mut last_conflict = None;
         for _ in 0..8 {
             let loaded = self.load(session_id)?;
@@ -6738,14 +8720,26 @@ impl McStore {
                 "invalid recomp disposition {disposition:?}"
             )));
         }
-        Ok(self.inner.with_conn_fenced(|tx| {
-            tx.execute(
+        if let Some(existing) = self.load_recomp_command(session_id, command_id)? {
+            return Ok(existing);
+        }
+        let mut write = PreparedWrite::new(DurableWriteFamily::CommandLedgers);
+        write.domain_owner(
+            "session",
+            session_id,
+            active_scan_owner_key(&["recomp", command_id]),
+        );
+        write.existing_identity("session_id", session_id)?;
+        write.identity("command_id", command_id)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO mc_recomp_commands
                  (session_id, command_id, disposition, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![session_id, command_id, disposition, created_at],
             )?;
-            tx.query_row(
+            let row = tx.query_row(
                 "SELECT disposition, created_at FROM mc_recomp_commands
                  WHERE session_id = ?1 AND command_id = ?2",
                 params![session_id, command_id],
@@ -6755,8 +8749,13 @@ impl McStore {
                         created_at: row.get(1)?,
                     })
                 },
-            )
-        })?)
+            )?;
+            Ok(if inserted == 0 {
+                WriteDisposition::Replay(row)
+            } else {
+                WriteDisposition::Applied(row)
+            })
+        })
     }
 
     pub fn load_wrapup_command(
@@ -6801,10 +8800,23 @@ impl McStore {
             )));
         }
         debug_assert!(valid_disposition);
+        if let Some(existing) = self.load_wrapup_command(session_id, command_id)? {
+            return Ok(existing);
+        }
+        let mut write = PreparedWrite::new(DurableWriteFamily::CommandLedgers);
+        write.domain_owner(
+            "session",
+            session_id,
+            active_scan_owner_key(&["wrapup", command_id]),
+        );
+        write.existing_identity("session_id", session_id)?;
+        write.identity("command_id", command_id)?;
+        let summary = write.content("summary", summary)?;
         let rounds = i64::try_from(rounds)
             .map_err(|_| McStoreError::Serde("wrapup rounds exceed SQLite range".to_string()))?;
-        Ok(self.inner.with_conn_fenced(|tx| {
-            tx.execute(
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO mc_wrapup_commands
                      (session_id, command_id, disposition, rounds, summary, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -6817,7 +8829,7 @@ impl McStore {
                     created_at
                 ],
             )?;
-            tx.query_row(
+            let row = tx.query_row(
                 "SELECT disposition, rounds, summary, created_at
                  FROM mc_wrapup_commands
                  WHERE session_id = ?1 AND command_id = ?2",
@@ -6831,8 +8843,13 @@ impl McStore {
                         created_at: row.get(3)?,
                     })
                 },
-            )
-        })?)
+            )?;
+            Ok(if inserted == 0 {
+                WriteDisposition::Replay(row)
+            } else {
+                WriteDisposition::Applied(row)
+            })
+        })
     }
 
     /// Return a recorded dream-task result for command-id retry deduplication.
@@ -6867,14 +8884,28 @@ impl McStore {
         response_json: &str,
         created_at: i64,
     ) -> Result<DreamTaskCommandRow, McStoreError> {
-        Ok(self.inner.with_conn_fenced(|tx| {
-            tx.execute(
+        if let Some(existing) = self.load_dream_task_command(session_id, command_id)? {
+            return Ok(existing);
+        }
+        let mut write = PreparedWrite::new(DurableWriteFamily::CommandLedgers);
+        write.domain_owner(
+            "session",
+            session_id,
+            active_scan_owner_key(&["dream", command_id]),
+        );
+        write.existing_identity("session_id", session_id)?;
+        write.identity("command_id", command_id)?;
+        write.record_content("response_json", response_json)?;
+        let response_json = prepare_json_content(response_json)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO mc_dream_task_commands
                      (session_id, command_id, response_json, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![session_id, command_id, response_json, created_at],
             )?;
-            tx.query_row(
+            let row = tx.query_row(
                 "SELECT response_json, created_at
                    FROM mc_dream_task_commands
                   WHERE session_id = ?1 AND command_id = ?2",
@@ -6885,8 +8916,13 @@ impl McStore {
                         created_at: row.get(1)?,
                     })
                 },
-            )
-        })?)
+            )?;
+            Ok(if inserted == 0 {
+                WriteDisposition::Replay(row)
+            } else {
+                WriteDisposition::Applied(row)
+            })
+        })
     }
 
     /// Apply classifier metadata under the memories authority, updating each row only when its
@@ -6911,9 +8947,31 @@ impl McStore {
             )));
         }
         debug_assert!(valid_disposition);
+        let existing = self.load_wrapup_command(record.session_id, record.command_id)?;
+        let mut write = PreparedWrite::new(DurableWriteFamily::CommandLedgers);
+        write.domain_owner(
+            "session",
+            record.session_id,
+            active_scan_owner_key(&["wrapup", record.command_id]),
+        );
+        write.existing_identity("session_id", record.session_id)?;
+        let writes_terminal = existing
+            .as_ref()
+            .is_none_or(|row| row.disposition == "failed");
+        if existing.is_none() {
+            write.identity("command_id", record.command_id)?;
+        } else {
+            write.existing_identity("command_id", record.command_id)?;
+        }
+        let summary = if !writes_terminal {
+            record.summary.to_string()
+        } else {
+            write.content("summary", record.summary)?
+        };
         let rounds = i64::try_from(record.rounds)
             .map_err(|_| McStoreError::Serde("wrapup rounds exceed SQLite range".to_string()))?;
-        Ok(self.inner.with_conn_fenced(|transaction| {
+        write.execute(&self.inner, |coordinated| {
+            let transaction = coordinated.tx();
             let current = transaction
                 .query_row(CACHE_STATE_META_SELECT, params![record.session_id], |row| {
                     Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
@@ -6935,10 +8993,12 @@ impl McStore {
             if found_row_version != record.expected_row_version
                 || found_revert_epoch != record.expected_revert_epoch
             {
-                return Ok(RecordWrapupCommandOutcome::Stale {
-                    found_row_version,
-                    found_revert_epoch,
-                });
+                return Ok(WriteDisposition::Replay(
+                    RecordWrapupCommandOutcome::Stale {
+                        found_row_version,
+                        found_revert_epoch,
+                    },
+                ));
             }
             let legacy_failure_created_at = transaction
                 .query_row(
@@ -6954,7 +9014,7 @@ impl McStore {
             if let Some(failed_created_at) = legacy_failure_created_at {
                 // A failed audit row is not replayable. Replace it in this fenced
                 // transaction so a lost successful response becomes durable idempotency.
-                let summary = wrapup_replaced_failure_summary(record.summary, failed_created_at);
+                let summary = wrapup_replaced_failure_summary(&summary, failed_created_at);
                 transaction.execute(
                     "UPDATE mc_wrapup_commands
                      SET disposition = ?3, rounds = ?4, summary = ?5, created_at = ?6
@@ -6979,7 +9039,7 @@ impl McStore {
                     record.command_id,
                     record.disposition,
                     rounds,
-                    record.summary,
+                    summary,
                     record.created_at
                 ],
             )?;
@@ -6998,8 +9058,13 @@ impl McStore {
                     })
                 },
             )?;
-            Ok(RecordWrapupCommandOutcome::Recorded(row))
-        })?)
+            let outcome = RecordWrapupCommandOutcome::Recorded(row);
+            Ok(if writes_terminal {
+                WriteDisposition::Applied(outcome)
+            } else {
+                WriteDisposition::Replay(outcome)
+            })
+        })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -7072,7 +9137,22 @@ impl McStore {
         compartments: &[StoredCompartment],
         completed_at_ms: i64,
     ) -> Result<StateImportResult, StateImportError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        match self.preflight_state_import(session_id, import_id)? {
+            StateImportPreflight::Duplicate { imported } => {
+                return Ok(StateImportResult {
+                    imported,
+                    duplicate: true,
+                });
+            }
+            StateImportPreflight::Ready => {}
+        }
+        let mut write = PreparedWrite::new(DurableWriteFamily::Compartments);
+        write.domain_owner("session", session_id, "state_import");
+        write.identity("session_id", session_id)?;
+        write.identity("import_id", import_id)?;
+        let compartments = prepare_compartments(&mut write, compartments)?;
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
             let completed = tx
                 .query_row(
                     "SELECT import_id, imported_count FROM mc_state_imports WHERE session_id = ?1",
@@ -7082,22 +9162,30 @@ impl McStore {
                 .optional()?;
             if let Some((completed_id, imported)) = completed {
                 if completed_id == import_id {
-                    return Ok(StateImportTxnOutcome::Duplicate(imported.max(0) as usize));
+                    return Ok(WriteDisposition::Replay(StateImportTxnOutcome::Duplicate(
+                        imported.max(0) as usize,
+                    )));
                 }
-                return Ok(StateImportTxnOutcome::SessionNotEmpty);
+                return Ok(WriteDisposition::Replay(
+                    StateImportTxnOutcome::SessionNotEmpty,
+                ));
             }
 
             // This is the fresh-row form of the cache-state CAS. The predicate and all
             // compartment writes share one fenced transaction, so a racing bootstrap
             // cannot slip state between the emptiness check and the imported rows.
             if session_has_durable_state(tx, session_id)? {
-                return Ok(StateImportTxnOutcome::SessionNotEmpty);
+                return Ok(WriteDisposition::Replay(
+                    StateImportTxnOutcome::SessionNotEmpty,
+                ));
             }
-            if let Err(error) = validate_state_import_compartments(compartments) {
-                return Ok(StateImportTxnOutcome::Validation(error));
+            if let Err(error) = validate_state_import_compartments(&compartments) {
+                return Ok(WriteDisposition::Replay(StateImportTxnOutcome::Validation(
+                    error,
+                )));
             }
 
-            for compartment in compartments {
+            for compartment in &compartments {
                 insert_compartment_tx(tx, session_id, compartment.sequence, compartment)?;
             }
             tx.execute(
@@ -7111,7 +9199,9 @@ impl McStore {
                     completed_at_ms
                 ],
             )?;
-            Ok(StateImportTxnOutcome::Imported(compartments.len()))
+            Ok(WriteDisposition::Applied(StateImportTxnOutcome::Imported(
+                compartments.len(),
+            )))
         })?;
 
         match outcome {
@@ -7185,6 +9275,21 @@ impl McStore {
         session_id: &str,
         request: TransformCommit<'_>,
     ) -> Result<u64, McStoreError> {
+        ensure_durable_text_bound(session_id)?;
+        let existing_session = self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+        })? != 0;
+        let mut write = PreparedWrite::new(DurableWriteFamily::CacheState);
+        write.domain_owner("session", session_id, "cache_state");
+        if existing_session {
+            write.existing_identity("session_id", session_id)?;
+        } else {
+            write.identity("session_id", session_id)?;
+        }
         let TransformCommit {
             expected,
             core,
@@ -7205,16 +9310,79 @@ impl McStore {
             scheduler_applied_reductions,
             overlays,
         } = request;
-        let max_seen_ordinal = overlays
-            .max_seen_ordinal
+        let TransformOverlayBatch {
+            max_seen_ordinal,
+            tag_mints,
+            temporal_marks,
+            user_hint,
+            channel1_append,
+            created_at_ms,
+        } = overlays;
+        if let Some(project_root) = project_root {
+            write.identity("project_root", project_root)?;
+        }
+        if let Some(fingerprint) = scheduler_full_array_fingerprint {
+            write.identity("scheduler_full_array_fingerprint", fingerprint)?;
+        }
+        if let Some(value) = first_divergence {
+            write.record_content("first_divergence", value)?;
+        }
+        let first_divergence = first_divergence.map(prepare_json_content).transpose()?;
+        let tag_mints = tag_mints
+            .iter()
+            .map(|input| {
+                let block_id = input.block_id.trim();
+                if !block_id.is_empty() {
+                    write.identity("tag_block_id", block_id)?;
+                    write.identity("tag_kind", &input.kind)?;
+                }
+                Ok(TagMintInput {
+                    block_id: input.block_id.clone(),
+                    kind: input.kind.clone(),
+                    token_count: input.token_count,
+                    source_bytes: write.bytes("tag_source_bytes", &input.source_bytes)?,
+                })
+            })
+            .collect::<Result<Vec<_>, McStoreError>>()?;
+        let temporal_marks = temporal_marks
+            .iter()
+            .map(|mark| {
+                write.identity("temporal_mark_block_id", &mark.block_id)?;
+                Ok(TemporalMarkInput {
+                    ordinal: mark.ordinal,
+                    block_id: mark.block_id.clone(),
+                    marker_text: write.content("marker_text", &mark.marker_text)?,
+                })
+            })
+            .collect::<Result<Vec<_>, McStoreError>>()?;
+        let user_hint = user_hint
+            .map(|hint| -> Result<_, McStoreError> {
+                write.identity("user_hint_block_id", &hint.block_id)?;
+                Ok(UserHintDecisionInput {
+                    ordinal: hint.ordinal,
+                    block_id: hint.block_id.clone(),
+                    hint_text: write.content("hint_text", &hint.hint_text)?,
+                })
+            })
+            .transpose()?;
+        let channel1_append = channel1_append
+            .map(|append| -> Result<_, McStoreError> {
+                write.identity("channel1_block_id", &append.block_id)?;
+                Ok(Channel1AppendRow {
+                    block_id: append.block_id.clone(),
+                    reminder_text: write.content("reminder_text", &append.reminder_text)?,
+                    fired_at_ms: append.fired_at_ms,
+                })
+            })
+            .transpose()?;
+        let max_seen_ordinal = max_seen_ordinal
             .map(|ordinal| {
                 i64::try_from(ordinal).map_err(|_| {
                     McStoreError::Serde("message ordinal exceeds SQLite range".to_string())
                 })
             })
             .transpose()?;
-        let temporal_marks = overlays
-            .temporal_marks
+        let temporal_marks = temporal_marks
             .iter()
             .map(|mark| {
                 i64::try_from(mark.ordinal)
@@ -7224,20 +9392,28 @@ impl McStore {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let hint_ordinal = overlays
-            .user_hint
+        let hint_ordinal = user_hint
+            .as_ref()
             .map(|hint| {
                 i64::try_from(hint.ordinal).map_err(|_| {
                     McStoreError::Serde("message ordinal exceeds SQLite range".to_string())
                 })
             })
             .transpose()?;
+        let core = prepare_core_state_for_write(&mut write, core)?;
         let core_json =
-            serde_json::to_string(core).map_err(|e| McStoreError::Serde(e.to_string()))?;
+            serde_json::to_string(&core).map_err(|e| McStoreError::Serde(e.to_string()))?;
         let meta_json =
             serde_json::to_string(meta).map_err(|e| McStoreError::Serde(e.to_string()))?;
+        write.record_content("meta", &meta_json)?;
+        let meta_json = prepare_json_content_preserving_identities(&meta_json)?;
         let scheduler_observation_json = scheduler_observation
             .map(serialize_scheduler_observation)
+            .transpose()?
+            .map(|value| {
+                write.record_content("scheduler_observation", &value)?;
+                prepare_json_content(&value)
+            })
             .transpose()?;
         let next = expected.unwrap_or(0) + 1;
         let scheduler_interesting_json = scheduler_observation
@@ -7258,6 +9434,11 @@ impl McStore {
                     scheduler_applied_supersession_count,
                 )
             })
+            .transpose()?
+            .map(|value| {
+                write.record_content("scheduler_interesting", &value)?;
+                prepare_json_content(&value)
+            })
             .transpose()?;
         let canonical_project_root = project_root
             .filter(|root| !root.is_empty())
@@ -7266,13 +9447,14 @@ impl McStore {
         // divergence. Overlay timestamps are the request clock when available; direct callers
         // that omit one still receive a real commit timestamp.
         let divergence_pass_id = next as i64;
-        let divergence_at_ms = if overlays.created_at_ms > 0 {
-            overlays.created_at_ms
+        let divergence_at_ms = if created_at_ms > 0 {
+            created_at_ms
         } else {
             current_time_ms()
         };
 
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
             // Read the current row_version inside the fenced txn; NO_ROW when absent.
             let current: i64 = tx.query_row(
                 "SELECT COALESCE((SELECT row_version FROM mc_cache_state WHERE session_id = ?1), ?2)",
@@ -7286,7 +9468,9 @@ impl McStore {
             };
             if !cas_ok {
                 // Empty txn (commits nothing); the caller re-loads and re-steps.
-                return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
+                return Ok(WriteDisposition::Replay(CommitOutcome::CasConflict(
+                    current.max(0) as u64,
+                )));
             }
             if let Some(expected_vector) = claim_snapshot_vector {
                 let current_vector = claim_mirror::snapshot_vector_from_connection(tx)?;
@@ -7295,7 +9479,9 @@ impl McStore {
                     .and_then(|vector| canonical_snapshot_vector(vector).ok())
                     == canonical_snapshot_vector(expected_vector).ok();
                 if !vector_matches {
-                    return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
+                    return Ok(WriteDisposition::Replay(CommitOutcome::CasConflict(
+                        current.max(0) as u64,
+                    )));
                 }
             }
             if let Some(expected_seq) = compartment_max_seq {
@@ -7305,7 +9491,9 @@ impl McStore {
                     |row| row.get(0),
                 )?;
                 if current_seq != expected_seq {
-                    return Ok(CommitOutcome::CasConflict(current.max(0) as u64));
+                    return Ok(WriteDisposition::Replay(CommitOutcome::CasConflict(
+                        current.max(0) as u64,
+                    )));
                 }
             }
 
@@ -7399,11 +9587,11 @@ impl McStore {
                      ) VALUES (?1, ?2, ?3)
                      ON CONFLICT(session_id, project_root) DO UPDATE SET
                          observed_at = excluded.observed_at",
-                    params![session_id, project_root, overlays.created_at_ms],
+                    params![session_id, project_root, created_at_ms],
                 )?;
             }
 
-            for input in overlays.tag_mints {
+            for input in &tag_mints {
                 let block_id = input.block_id.trim();
                 if block_id.is_empty() {
                     continue;
@@ -7433,7 +9621,7 @@ impl McStore {
                         block_id,
                         input.kind,
                         input.token_count.max(0),
-                        overlays.created_at_ms,
+                            created_at_ms,
                         input.source_bytes,
                     ],
                 )?;
@@ -7456,12 +9644,12 @@ impl McStore {
                             session_id,
                             mark.block_id,
                             mark.marker_text,
-                            overlays.created_at_ms
+                            created_at_ms
                         ],
                     )?;
                 }
             }
-            if let Some(hint) = overlays.user_hint {
+            if let Some(hint) = user_hint.as_ref() {
                 let eligible = hint_ordinal.is_some_and(|ordinal| {
                     previous_frontier.is_none_or(|frontier| ordinal > frontier)
                 });
@@ -7474,12 +9662,12 @@ impl McStore {
                             session_id,
                             hint.block_id,
                             hint.hint_text,
-                            overlays.created_at_ms
+                            created_at_ms
                         ],
                     )?;
                 }
             }
-            if let Some(append) = overlays.channel1_append {
+            if let Some(append) = channel1_append.as_ref() {
                 tx.execute(
                     "INSERT OR IGNORE INTO mc_channel1_appends
                          (session_id, block_id, reminder_text, fired_at_ms)
@@ -7509,7 +9697,7 @@ impl McStore {
                      WHERE session_id = ?1
                        AND command_id = ?2
                        AND first_applied_at_ms IS NULL",
-                    params![session_id, command_id, overlays.created_at_ms],
+                    params![session_id, command_id, created_at_ms],
                 )?;
             }
             for drop_id in consumed_drop_ids {
@@ -7518,7 +9706,7 @@ impl McStore {
                     params![session_id, drop_id],
                 )?;
             }
-            Ok(CommitOutcome::Committed(next))
+            Ok(WriteDisposition::Applied(CommitOutcome::Committed(next)))
         })?;
 
         match outcome {
@@ -7541,9 +9729,23 @@ impl McStore {
         &self,
         request: ModuleStateSyncRequest<'_>,
     ) -> Result<ModuleStateSyncResult, ModuleStateSyncError> {
-        let default_core_json = serde_json::to_string(&CoreState::default())
-            .map_err(|e| ModuleStateSyncError::Serde(e.to_string()))?;
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthoritySeedRows);
+        let PreparedStateSync {
+            drop_seeds,
+            pending_agent_drops,
+            compartments,
+            user_profile,
+            user_hint_seeds,
+            workspace,
+            note_nudge_anchors,
+            pending_compaction_marker,
+            deferred_execute_state,
+            channel2_nudge_state,
+            strip_seeds,
+            last_todo_state,
+        } = prepare_state_sync(&mut write, &request)?;
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx;
             let row = tx
                 .query_row(
                     CACHE_STATE_FULL_SELECT,
@@ -7562,50 +9764,44 @@ impl McStore {
                 Some((row_version, core_state_json, meta_json)) => {
                     let core = match serde_json::from_str::<CoreState>(&core_state_json) {
                         Ok(core) => core,
-                        Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
+                        Err(e) => return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(e.to_string()))),
                     };
                     let meta = match serde_json::from_str::<ModuleMeta>(&meta_json) {
                         Ok(meta) => meta,
-                        Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
+                        Err(e) => return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(e.to_string()))),
                     };
                     (row_version, core, meta)
                 }
-                None => {
-                    let core = match serde_json::from_str::<CoreState>(&default_core_json) {
-                        Ok(core) => core,
-                        Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
-                    };
-                    (NO_ROW, core, ModuleMeta::default())
-                }
+                None => (NO_ROW, CoreState::default(), ModuleMeta::default()),
             };
             let initialized_before_sync = meta.initialized;
 
             if !request.compartments.is_empty()
                 && meta.historian.state != HistorianPhase::Idle
             {
-                return Ok(ModuleStateSyncTxnOutcome::HistorianBusy {
+                return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::HistorianBusy {
                     phase: meta.historian.state,
-                });
+                }));
             }
             if meta.shadow_generation != request.shadow_generation {
-                return Ok(ModuleStateSyncTxnOutcome::GenerationMismatch {
+                return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::GenerationMismatch {
                     found: meta.shadow_generation,
-                });
+                }));
             }
             if meta.shadow_seq != request.expected_shadow_seq {
-                return Ok(ModuleStateSyncTxnOutcome::AuthoritySeqMismatch {
+                return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::AuthoritySeqMismatch {
                     found: meta.shadow_seq,
-                });
+                }));
             }
 
             if let Some(declared) = request.seed_boundary_id {
                 let adoption = match validated_seed_boundary(declared, request.compartments) {
                     Ok(adoption) => adoption,
                     Err(detail) => {
-                        return Ok(ModuleStateSyncTxnOutcome::InvalidSeedBoundary {
+                        return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::InvalidSeedBoundary {
                             declared: declared.to_string(),
                             detail,
-                        })
+                        }))
                     }
                 };
                 if meta.initialized {
@@ -7633,12 +9829,12 @@ impl McStore {
             let drop_seeds_skipped = materialize_drop_seed_units(
                 &mut core,
                 request.session_id,
-                request.drop_seeds,
+                &drop_seeds,
                 request.drop_seed_skipped,
             );
             let mut pending_agent_drops_seeded = 0usize;
             let mut pending_agent_drops_skipped = request.pending_agent_drops_skipped;
-            for seed in request.pending_agent_drops {
+            for seed in &pending_agent_drops {
                 if !valid_drop_seed_block_id(&seed.block_id) {
                     pending_agent_drops_skipped = pending_agent_drops_skipped.saturating_add(1);
                     eprintln!(
@@ -7681,7 +9877,7 @@ impl McStore {
                     )?;
                 }
             }
-            for seed in request.user_hint_seeds {
+            for seed in &user_hint_seeds {
                 if !valid_drop_seed_block_id(&seed.block_id) {
                     auto_search_hint_skipped = auto_search_hint_skipped.saturating_add(1);
                     continue;
@@ -7700,8 +9896,8 @@ impl McStore {
                     params![request.session_id, seed.block_id, seed.hint_text, current_time_ms()],
                 )?;
             }
-            let note_nudge_anchors_seeded = request
-                .note_nudge_anchors
+            let note_nudge_anchors_seeded = note_nudge_anchors
+                .as_deref()
                 .map(|anchors| {
                     meta.note_nudge_anchors = anchors.to_vec();
                     anchors.len()
@@ -7721,24 +9917,24 @@ impl McStore {
             } else {
                 false
             };
-            if let Some(marker) = request.pending_compaction_marker {
-                meta.pending_compaction_marker = marker.cloned();
+            if let Some(marker) = pending_compaction_marker.as_ref() {
+                meta.pending_compaction_marker = marker.clone();
             }
-            if let Some(deferred) = request.deferred_execute_state {
-                meta.deferred_execute_state = deferred.cloned();
+            if let Some(deferred) = deferred_execute_state.as_ref() {
+                meta.deferred_execute_state = deferred.clone();
             }
-            if let Some(state) = request.channel2_nudge_state {
+            if let Some(state) = channel2_nudge_state.as_deref() {
                 meta.channel2_nudge_state = state.to_string();
             }
             let strip_seeds_skipped = materialize_strip_seed_units(
                 &mut core,
                 request.session_id,
-                request.strip_seeds,
+                &strip_seeds,
                 request.strip_seed_skipped,
             );
 
             let mut compartment_overwrites_skipped = 0usize;
-            for compartment in request.compartments {
+            for compartment in &compartments {
                 if initialized_before_sync {
                     let retained_sequence = meta.folded_compartment_seq;
                     if compartment.sequence <= retained_sequence
@@ -7765,14 +9961,14 @@ impl McStore {
                 );
             }
             if request.workspace_present {
-                replace_workspace_tx(tx, request.project_path, request.workspace)?;
+                replace_workspace_tx(tx, request.project_path, workspace.as_ref())?;
             }
             if request.user_profile_present {
-                replace_authority_user_profile_tx(tx, request.user_profile)?;
+                replace_authority_user_profile_tx(tx, &user_profile)?;
             }
 
             let in_session_watermark_changed = meta.shadow_acked_watermarks != request.acked_watermarks;
-            meta.last_todo_state = request.last_todo_state.clone();
+            meta.last_todo_state = last_todo_state.clone();
             if in_session_watermark_changed && meta.m1_pending_since_ms.is_none() {
                 meta.m1_pending_since_ms = Some(current_time_ms());
             }
@@ -7796,13 +9992,42 @@ impl McStore {
             meta.shadow_acked_watermarks = request.acked_watermarks.clone();
 
             let next = current.max(0) as u64 + 1;
+            core = match prepare_transaction_core_state_for_write(
+                &mut coordinated.prepared.borrow_mut(),
+                &core,
+            ) {
+                Ok(core) => core,
+                Err(_) => {
+                    return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(
+                        "cache core state failed secret scanning".to_string(),
+                    )))
+                }
+            };
             let core_json = match serde_json::to_string(&core) {
                 Ok(json) => json,
-                Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
+                Err(e) => return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(e.to_string()))),
             };
             let meta_json = match serde_json::to_string(&meta) {
                 Ok(json) => json,
-                Err(e) => return Ok(ModuleStateSyncTxnOutcome::Serde(e.to_string())),
+                Err(e) => return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(e.to_string()))),
+            };
+            if coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("meta", &meta_json)
+                .is_err()
+            {
+                return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(
+                    "cache metadata failed secret scanning".to_string(),
+                )));
+            }
+            let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(WriteDisposition::Replay(ModuleStateSyncTxnOutcome::Serde(
+                        "cache metadata failed secret scanning".to_string(),
+                    )))
+                }
             };
             tx.execute(
                 "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at)
@@ -7815,7 +10040,7 @@ impl McStore {
                 params![request.session_id, next as i64, core_json, meta_json, current_time_ms()],
             )?;
 
-            Ok(ModuleStateSyncTxnOutcome::Committed(ModuleStateSyncResult {
+            Ok(WriteDisposition::Applied(ModuleStateSyncTxnOutcome::Committed(ModuleStateSyncResult {
                 shadow_generation: meta.shadow_generation,
                 shadow_seq: meta.shadow_seq,
                 row_version: next,
@@ -7828,7 +10053,7 @@ impl McStore {
                 todo_synthetic_anchor_seeded,
                 emergency_latches_seeded,
                 strip_seeds_skipped,
-            }))
+            })))
         })?;
 
         match outcome {
@@ -8050,6 +10275,42 @@ impl McStore {
         Ok(exists != 0)
     }
 
+    fn link_lineage_copy_scans(
+        coordinated: &ActiveWriteTransaction<'_>,
+        source_key: &str,
+        target_key: &str,
+    ) -> rusqlite::Result<()> {
+        const MAX_LINKED_SCANS_PER_DESCENT: usize = 100_000;
+        let source_scope_key = active_scan_private_key("session", source_key);
+        let mut statement = coordinated.tx.prepare_cached(
+            "SELECT DISTINCT copies.scan_id
+               FROM mc_scan_owner_copies copies
+               JOIN mc_scan_domain_owners owners USING(domain_owner_id)
+               JOIN mc_scan_owner_scopes scopes USING(owner_scope_id)
+              WHERE scopes.scope_kind='session' AND scopes.scope_key=?1
+              ORDER BY copies.scan_id LIMIT ?2",
+        )?;
+        let scan_ids = statement
+            .query_map(
+                params![
+                    source_scope_key,
+                    i64::try_from(MAX_LINKED_SCANS_PER_DESCENT + 1).unwrap_or(i64::MAX)
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if scan_ids.len() > MAX_LINKED_SCANS_PER_DESCENT {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                McStoreError::Serde("lineage scan-link limit exceeded".to_string()),
+            )));
+        }
+        coordinated
+            .prepared
+            .borrow_mut()
+            .link_existing_scans("session", target_key, "lineage", scan_ids);
+        Ok(())
+    }
+
     /// Resolve and persist one fake-compaction lineage edge under the store's writer fence.
     /// The method owns every row participating in adoption so callers cannot observe a copied
     /// compartment set without its marker, anchor, ordinal base, or prior-lineage publish fence.
@@ -8057,8 +10318,28 @@ impl McStore {
         &self,
         request: LineageDescentRequest<'_>,
     ) -> Result<LineageDescentOutcome, McStoreError> {
+        let mut write = PreparedWrite::new(DurableWriteFamily::LineageCopies);
+        write.domain_owner("session", request.target_key, "lineage");
+        for (field_id, value) in [
+            ("target_key", request.target_key),
+            ("prior_key", request.prior_key),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        for constituent in request.constituents {
+            write.existing_identity("constituent_prior_key", &constituent.prior_key)?;
+            write.existing_identity("constituent_new_key", &constituent.new_key)?;
+        }
+        if let Some(anchor) = request.anchor {
+            write.existing_identity("anchor_block_id", &anchor.block_id)?;
+            write.existing_identity("anchor_message_id", &anchor.message_id)?;
+            write.existing_identity("anchor_content_hash", &anchor.content_hash)?;
+        }
         let note_caller_project = Arc::clone(&self.note_caller_project);
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx;
+            let before = tx.total_changes();
+            let outcome = (|| -> rusqlite::Result<LineageDescentTxnOutcome> {
             let current_target = tx
                 .query_row(
                     CACHE_STATE_FULL_SELECT,
@@ -8121,6 +10402,19 @@ impl McStore {
                     },
                 }));
             }
+            coordinated
+                .prepared
+                .borrow()
+                .reject_recorded_identities(&[
+                    "target_key",
+                    "prior_key",
+                    "constituent_prior_key",
+                    "constituent_new_key",
+                    "anchor_block_id",
+                    "anchor_message_id",
+                    "anchor_content_hash",
+                ])
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
 
             let mut path_is_cycle = request.new_epoch <= request.prior_epoch;
             let mut path_is_contiguous = true;
@@ -8391,6 +10685,19 @@ impl McStore {
                 Ok(json) => json,
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
             };
+            coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("prior_meta", &prior_meta_json)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let prior_meta_json = match prepare_transaction_json_preserving_identities(&prior_meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(LineageDescentTxnOutcome::Invalid(
+                        "prior lineage metadata failed secret scanning".to_string(),
+                    ))
+                }
+            };
 
             target_core = source_core;
             target_core.boundary_id = anchor.block_id.clone();
@@ -8419,6 +10726,23 @@ impl McStore {
                 true,
             );
             let next_target_version = current_target_version.max(0) as u64 + 1;
+            let unprepared_target_core_json = match serde_json::to_string(&target_core) {
+                Ok(json) => json,
+                Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
+            };
+            coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("target_core_state", &unprepared_target_core_json)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            target_core = match prepare_core_state(&target_core) {
+                Ok(core) => core,
+                Err(_) => {
+                    return Ok(LineageDescentTxnOutcome::Invalid(
+                        "target lineage core state failed secret scanning".to_string(),
+                    ))
+                }
+            };
             let target_core_json = match serde_json::to_string(&target_core) {
                 Ok(json) => json,
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
@@ -8427,7 +10751,35 @@ impl McStore {
                 Ok(json) => json,
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
             };
+            coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("target_meta", &target_meta_json)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let target_meta_json = match prepare_transaction_json_preserving_identities(&target_meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(LineageDescentTxnOutcome::Invalid(
+                        "target lineage metadata failed secret scanning".to_string(),
+                    ))
+                }
+            };
 
+            Self::link_lineage_copy_scans(coordinated, &source_key, request.target_key)?;
+
+            for owner_kind in [
+                "compartments",
+                "historian_side_channels",
+                "authority_seed_rows",
+                "lineage_copies",
+            ] {
+                retire_active_scan_owner_kind(
+                    tx,
+                    "session",
+                    request.target_key,
+                    owner_kind,
+                )?;
+            }
             for table in [
                 "mc_chunk_transcripts",
                 "mc_compartments",
@@ -8460,6 +10812,27 @@ impl McStore {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .replace(note_project.clone());
                 let copy_result = (|| -> rusqlite::Result<()> {
+                    let note_ids = {
+                        let mut statement = tx.prepare_cached(
+                            "SELECT id FROM mc_notes
+                              WHERE session_id = ?1 AND project_path = ?2 AND type = 'session'",
+                        )?;
+                        let rows = statement
+                            .query_map(params![request.target_key, note_project], |row| {
+                                row.get::<_, i64>(0)
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        rows
+                    };
+                    for note_id in note_ids {
+                        retire_active_scan_domain_owner(
+                            tx,
+                            "project",
+                            &note_project,
+                            "notes",
+                            &note_id.to_string(),
+                        )?;
+                    }
                     tx.execute(
                         "DELETE FROM mc_notes
                           WHERE session_id = ?1 AND project_path = ?2 AND type = 'session'",
@@ -8468,17 +10841,46 @@ impl McStore {
                     tx.execute(
                         &format!(
                             "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS})
-                             SELECT type, project_path, ?1, content, status, surface_condition,
-                                    ready_at, ready_reason, manifest_json, compiled_check, check_hash,
-                                    check_cron, check_failure_count, check_network_failure_count,
+                             SELECT mc_reject_transaction_text(type),
+                                    mc_reject_transaction_text(project_path), ?1,
+                                    mc_redact_transaction_text(content),
+                                    mc_reject_transaction_text(status),
+                                    CASE WHEN surface_condition IS NULL THEN NULL
+                                         ELSE mc_redact_transaction_text(surface_condition) END,
+                                    ready_at,
+                                    CASE WHEN ready_reason IS NULL THEN NULL
+                                         ELSE mc_redact_transaction_text(ready_reason) END,
+                                    CASE WHEN manifest_json IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(manifest_json) END,
+                                    CASE WHEN compiled_check IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(compiled_check) END,
+                                    CASE WHEN check_hash IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(check_hash) END,
+                                    CASE WHEN check_cron IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(check_cron) END,
+                                    check_failure_count, check_network_failure_count,
                                     check_quarantined_until, check_next_due_at, check_compiled_at,
                                     check_false_since_at, check_last_liveness_at, last_checked_at,
-                                    check_status, check_version, policy_version, harness,
-                                    anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution,
+                                    CASE WHEN check_status IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(check_status) END,
+                                    check_version, policy_version,
+                                    mc_reject_transaction_text(harness),
+                                    CASE WHEN anchor_block_id IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(anchor_block_id) END,
+                                    anchor_ordinal, dismissed_at,
+                                    CASE WHEN dismissal_resolution IS NULL THEN NULL
+                                         ELSE mc_redact_transaction_text(dismissal_resolution) END,
                                     status_version, created_at_ms, updated_at_ms, NULL, NULL,
                                     source_revision, state_version, compiled_source_revision,
-                                    compiled_project_path, compiled_provider, compiled_config,
-                                    compiled_at, compile_status
+                                    CASE WHEN compiled_project_path IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(compiled_project_path) END,
+                                    CASE WHEN compiled_provider IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(compiled_provider) END,
+                                    CASE WHEN compiled_config IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(compiled_config) END,
+                                    compiled_at,
+                                    CASE WHEN compile_status IS NULL THEN NULL
+                                         ELSE mc_reject_transaction_text(compile_status) END
                                FROM mc_notes
                               WHERE session_id = ?2 AND project_path = ?3 AND type = 'session'"
                         ),
@@ -8497,9 +10899,23 @@ impl McStore {
                      end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
                      importance, episode_type, legacy, created_at
                  )
-                 SELECT ?1, sequence, start_message, end_message, start_message_id,
-                        end_message_id, start_date, end_date, title, content, p1, p2, p3, p4,
-                        importance, episode_type, legacy, created_at
+                  SELECT ?1, sequence, start_message, end_message,
+                         mc_reject_transaction_text(start_message_id),
+                         mc_reject_transaction_text(end_message_id),
+                         CASE WHEN start_date IS NULL THEN NULL
+                              ELSE mc_redact_transaction_text(start_date) END,
+                         CASE WHEN end_date IS NULL THEN NULL
+                              ELSE mc_redact_transaction_text(end_date) END,
+                         mc_redact_transaction_text(title),
+                         mc_redact_transaction_text(content),
+                         CASE WHEN p1 IS NULL THEN NULL ELSE mc_redact_transaction_text(p1) END,
+                         CASE WHEN p2 IS NULL THEN NULL ELSE mc_redact_transaction_text(p2) END,
+                         CASE WHEN p3 IS NULL THEN NULL ELSE mc_redact_transaction_text(p3) END,
+                         CASE WHEN p4 IS NULL THEN NULL ELSE mc_redact_transaction_text(p4) END,
+                         importance,
+                         CASE WHEN episode_type IS NULL THEN NULL
+                              ELSE mc_reject_transaction_text(episode_type) END,
+                         legacy, created_at
                    FROM mc_compartments WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
@@ -8508,8 +10924,11 @@ impl McStore {
                      session_id, compartment_seq, start_ordinal, end_ordinal,
                      transcript_deflate, raw_messages_deflate, created_at_ms
                  )
-                 SELECT ?1, compartment_seq, start_ordinal, end_ordinal,
-                        transcript_deflate, raw_messages_deflate, created_at_ms
+                  SELECT ?1, compartment_seq, start_ordinal, end_ordinal,
+                         mc_redact_transaction_transcript(transcript_deflate),
+                         CASE WHEN raw_messages_deflate IS NULL THEN NULL
+                              ELSE mc_redact_transaction_raw_messages(raw_messages_deflate) END,
+                         created_at_ms
                    FROM mc_chunk_transcripts WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
@@ -8517,25 +10936,32 @@ impl McStore {
                 "INSERT INTO mc_tags (
                      session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes
                  )
-                 SELECT ?1, tag_number, block_id, kind, token_count, created_at_ms, source_bytes
+                  SELECT ?1, tag_number,
+                         mc_reject_transaction_text(block_id),
+                         mc_reject_transaction_text(kind),
+                         token_count, created_at_ms,
+                         CAST(mc_redact_transaction_text(CAST(source_bytes AS TEXT)) AS BLOB)
                    FROM mc_tags WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
             tx.execute(
                 "INSERT INTO mc_temporal_marks (session_id, block_id, marker_text, created_at)
-                 SELECT ?1, block_id, marker_text, created_at
+                  SELECT ?1, mc_reject_transaction_text(block_id),
+                         mc_redact_transaction_text(marker_text), created_at
                    FROM mc_temporal_marks WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
             tx.execute(
                 "INSERT INTO mc_user_hints (session_id, block_id, hint_text, created_at)
-                 SELECT ?1, block_id, hint_text, created_at
+                  SELECT ?1, mc_reject_transaction_text(block_id),
+                         mc_redact_transaction_text(hint_text), created_at
                    FROM mc_user_hints WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
             tx.execute(
                 "INSERT INTO mc_channel1_appends (session_id, block_id, reminder_text, fired_at_ms)
-                 SELECT ?1, block_id, reminder_text, fired_at_ms
+                  SELECT ?1, mc_reject_transaction_text(block_id),
+                         mc_redact_transaction_text(reminder_text), fired_at_ms
                    FROM mc_channel1_appends WHERE session_id = ?2",
                 params![request.target_key, source_key],
             )?;
@@ -8626,6 +11052,12 @@ impl McStore {
                 materialization_required: true,
                 acknowledge: true,
             }))
+            })()?;
+            Ok(if tx.total_changes() > before {
+                WriteDisposition::Applied(outcome)
+            } else {
+                WriteDisposition::Replay(outcome)
+            })
         })?;
 
         match outcome {
@@ -8678,7 +11110,16 @@ impl McStore {
         session_id: &str,
         compartments: &[StoredCompartment],
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Compartments);
+        write.domain_owner("session", session_id, "compartments");
+        write.existing_identity("session_id", session_id)?;
+        let compartments = prepare_compartments(&mut write, compartments)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            retire_active_scan_owner_kind(tx, "session", session_id, "compartments")?;
+            retire_active_scan_owner_kind(tx, "session", session_id, "historian_side_channels")?;
+            retire_active_scan_owner_kind(tx, "session", session_id, "authority_seed_rows")?;
+            retire_active_scan_owner_kind(tx, "session", session_id, "lineage_copies")?;
             tx.execute(
                 "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1",
                 params![session_id],
@@ -8687,10 +11128,10 @@ impl McStore {
                 "DELETE FROM mc_compartments WHERE session_id = ?1",
                 params![session_id],
             )?;
-            for c in compartments {
+            for c in &compartments {
                 insert_compartment_tx(tx, session_id, c.sequence, c)?;
             }
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
@@ -8743,6 +11184,14 @@ impl McStore {
                 Ok(json) => json,
                 Err(error) => return Ok(TruncateTxnOutcome::Serde(error.to_string())),
             };
+            for owner_kind in [
+                "compartments",
+                "historian_side_channels",
+                "authority_seed_rows",
+                "lineage_copies",
+            ] {
+                retire_active_scan_owner_kind(tx, "session", session_id, owner_kind)?;
+            }
             tx.execute(
                 "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1",
                 params![session_id],
@@ -8888,6 +11337,14 @@ impl McStore {
                 Ok(json) => json,
                 Err(e) => return Ok(TruncateTxnOutcome::Serde(e.to_string())),
             };
+            let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(TruncateTxnOutcome::Serde(
+                        "cache metadata failed secret scanning".to_string(),
+                    ))
+                }
+            };
 
             tx.execute(
                 "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq > ?2",
@@ -8956,9 +11413,17 @@ impl McStore {
         session_id: &str,
         compartments: &[StoredCompartment],
     ) -> Result<(), McStoreError> {
-        let outcome = self
-            .inner
-            .with_conn_fenced(|tx| append_compartments_tx(tx, session_id, compartments))?;
+        let mut write = PreparedWrite::new(DurableWriteFamily::Compartments);
+        write.domain_owner("session", session_id, "compartments");
+        write.existing_identity("session_id", session_id)?;
+        let compartments = prepare_compartments(&mut write, compartments)?;
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let outcome = append_compartments_tx(coordinated.tx(), session_id, &compartments)?;
+            Ok(match outcome {
+                AppendCompartmentsTxnOutcome::Appended => WriteDisposition::Applied(outcome),
+                AppendCompartmentsTxnOutcome::Overlap { .. } => WriteDisposition::Replay(outcome),
+            })
+        })?;
         match outcome {
             AppendCompartmentsTxnOutcome::Appended => Ok(()),
             AppendCompartmentsTxnOutcome::Overlap {
@@ -9005,18 +11470,31 @@ impl McStore {
         detail: Option<&str>,
         count_publish_failure: bool,
     ) -> Result<Option<u64>, McStoreError> {
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::HistorianSideChannels);
+        write.domain_owner("session", session_id, "historian");
+        write.existing_identity("session_id", session_id)?;
+        let detail = detail
+            .map(|value| write.content("last_failure", value))
+            .transpose()?;
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx;
             let row = tx
                 .query_row(CACHE_STATE_META_SELECT, params![session_id], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })
                 .optional()?;
             let Some((current, meta_json)) = row else {
-                return Ok(AbandonHistorianTxnOutcome::Unchanged);
+                return Ok(WriteDisposition::Replay(
+                    AbandonHistorianTxnOutcome::Unchanged,
+                ));
             };
             let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
                 Ok(meta) => meta,
-                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+                Err(error) => {
+                    return Ok(WriteDisposition::Replay(AbandonHistorianTxnOutcome::Serde(
+                        error.to_string(),
+                    )))
+                }
             };
             let historian = &meta.historian;
             let predicate_matches = historian.firing_seq == predicate.firing_seq
@@ -9025,7 +11503,9 @@ impl McStore {
                 && historian.selected_range_identities == predicate.selected_range_identities
                 && historian.compartment_set_generation == predicate.compartment_set_generation;
             if !predicate_matches || historian.state == HistorianPhase::Idle {
-                return Ok(AbandonHistorianTxnOutcome::Unchanged);
+                return Ok(WriteDisposition::Replay(
+                    AbandonHistorianTxnOutcome::Unchanged,
+                ));
             }
 
             #[cfg(any(test, feature = "test-support"))]
@@ -9038,9 +11518,7 @@ impl McStore {
                 hook();
             }
 
-            let last_failure = detail
-                .map(str::to_string)
-                .or_else(|| historian.last_failure.clone());
+            let last_failure = detail.clone().or_else(|| historian.last_failure.clone());
             meta.historian = HistorianDurableState {
                 state: HistorianPhase::Idle,
                 firing_seq: historian.firing_seq,
@@ -9056,14 +11534,38 @@ impl McStore {
             let next = current.max(0) as u64 + 1;
             let meta_json = match serde_json::to_string(&meta) {
                 Ok(json) => json,
-                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+                Err(error) => {
+                    return Ok(WriteDisposition::Replay(AbandonHistorianTxnOutcome::Serde(
+                        error.to_string(),
+                    )))
+                }
+            };
+            if coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("meta", &meta_json)
+                .is_err()
+            {
+                return Ok(WriteDisposition::Replay(AbandonHistorianTxnOutcome::Serde(
+                    "historian metadata failed secret scanning".to_string(),
+                )));
+            }
+            let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(WriteDisposition::Replay(AbandonHistorianTxnOutcome::Serde(
+                        "historian metadata failed secret scanning".to_string(),
+                    )))
+                }
             };
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
                  WHERE session_id = ?1 AND row_version = ?4",
                 params![session_id, next as i64, meta_json, current],
             )?;
-            Ok(AbandonHistorianTxnOutcome::Committed(next))
+            Ok(WriteDisposition::Applied(
+                AbandonHistorianTxnOutcome::Committed(next),
+            ))
         })?;
 
         match outcome {
@@ -9114,6 +11616,14 @@ impl McStore {
                 Ok(json) => json,
                 Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
             };
+            let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(AbandonHistorianTxnOutcome::Serde(
+                        "historian metadata failed secret scanning".to_string(),
+                    ))
+                }
+            };
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3 WHERE session_id = ?1 AND row_version = ?4",
                 params![session_id, next as i64, meta_json, current],
@@ -9140,9 +11650,30 @@ impl McStore {
         let session_id = request.session_id;
         let expected_row_version = request.expected_row_version;
         let predicate = request.predicate;
-        let side_channel_items =
+        let mut write = PreparedWrite::new(DurableWriteFamily::HistorianSideChannels);
+        write.domain_owner("session", session_id, "historian");
+        write.existing_identity("session_id", session_id)?;
+        let compartments = prepare_compartments(&mut write, request.compartments)?;
+        let chunk_transcript = request
+            .chunk_transcript
+            .map(|value| write.content("chunk_transcript", value))
+            .transpose()?;
+        let raw_chunk_messages = request
+            .raw_chunk_messages
+            .map(|value| {
+                write.record_content("raw_chunk_messages", value)?;
+                prepare_json_content(value)
+            })
+            .transpose()?;
+        let mut side_channel_items =
             historian_side_channel_pending_items(&request).map_err(HistorianPublishError::Serde)?;
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        for item in &mut side_channel_items {
+            write.record_content("side_channel_payload", &item.payload_json)?;
+            item.payload_json = prepare_json_content(&item.payload_json)?;
+        }
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx;
+            let outcome = (|| -> rusqlite::Result<PublishTxnOutcome> {
             let row = tx
                 .query_row(
                     CACHE_STATE_META_SELECT,
@@ -9240,7 +11771,7 @@ impl McStore {
             }
 
             let first_appended_sequence = next_compartment_sequence_tx(tx, session_id)?;
-            match append_compartments_tx(tx, session_id, request.compartments)? {
+            match append_compartments_tx(tx, session_id, &compartments)? {
                 AppendCompartmentsTxnOutcome::Appended => {}
                 AppendCompartmentsTxnOutcome::Overlap {
                     existing_sequence,
@@ -9254,14 +11785,14 @@ impl McStore {
                     });
                 }
             }
-            if request.chunk_transcript.is_some() || request.raw_chunk_messages.is_some() {
+            if chunk_transcript.is_some() || raw_chunk_messages.is_some() {
                 insert_chunk_transcripts_tx(
                     tx,
                     session_id,
                     first_appended_sequence,
-                    request.compartments,
-                    request.chunk_transcript,
-                    request.raw_chunk_messages,
+                    &compartments,
+                    chunk_transcript.as_deref(),
+                    raw_chunk_messages.as_deref(),
                 )?;
             }
             enqueue_historian_side_channels_tx(tx, session_id, &side_channel_items)?;
@@ -9278,6 +11809,24 @@ impl McStore {
                 Ok(json) => json,
                 Err(e) => return Ok(PublishTxnOutcome::Serde(e.to_string())),
             };
+            if coordinated
+                .prepared
+                .borrow_mut()
+                .transaction_content("meta", &meta_json)
+                .is_err()
+            {
+                return Ok(PublishTxnOutcome::Serde(
+                    "historian metadata failed secret scanning".to_string(),
+                ));
+            }
+            let meta_json = match prepare_transaction_json_preserving_identities(&meta_json) {
+                Ok(json) => json,
+                Err(_) => {
+                    return Ok(PublishTxnOutcome::Serde(
+                        "historian metadata failed secret scanning".to_string(),
+                    ))
+                }
+            };
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
                  WHERE session_id = ?1 AND row_version = ?4",
@@ -9287,6 +11836,11 @@ impl McStore {
             Ok(PublishTxnOutcome::Committed(HistorianPublishResult {
                 row_version: next,
             }))
+            })()?;
+            Ok(match outcome {
+                PublishTxnOutcome::Committed(_) => WriteDisposition::Applied(outcome),
+                _ => WriteDisposition::Replay(outcome),
+            })
         })?;
 
         match outcome {
@@ -9926,10 +12480,21 @@ impl McStore {
                 "note content must not be empty".to_string(),
             ));
         }
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        let prepared = prepare_note_fields(
+            &mut write,
+            content,
+            input.surface_condition,
+            input.anchor_block_id,
+        )?;
         // This compatibility entry point keeps legacy callers on the active-status path
         // used by the previous context-note surface; the full project smart-note writer
         // below deliberately uses pending instead while still recording condition text.
-        self.with_note_conn_fenced(input.project_path, |tx| insert_note_tx(tx, &input, content))
+        self.with_prepared_note_conn_fenced(input.project_path, write, |coordinated| {
+            let note = insert_note_tx(coordinated.tx(), &input, &prepared)?;
+            coordinated.domain_owner("project", input.project_path, note.id.to_string());
+            Ok(WriteDisposition::Applied(note))
+        })
     }
 
     pub fn insert_project_note(
@@ -9949,8 +12514,30 @@ impl McStore {
                 "note content must not be empty".to_string(),
             ));
         }
-        self.with_note_conn_fenced(input.project_path, |tx| {
-            insert_project_note_tx(tx, &input, content)
+        let surface_condition = input
+            .surface_condition
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        let prepared = prepare_note_fields(
+            &mut write,
+            content,
+            surface_condition,
+            input.anchor_block_id,
+        )?;
+        for (field_id, value) in [
+            ("compiled_provider", input.compiled_provider),
+            ("compiled_config", input.compiled_config),
+            ("compile_status", input.compile_status),
+        ] {
+            if let Some(value) = value {
+                write.identity(field_id, value)?;
+            }
+        }
+        self.with_prepared_note_conn_fenced(input.project_path, write, |coordinated| {
+            let note = insert_project_note_tx(coordinated.tx(), &input, &prepared)?;
+            coordinated.domain_owner("project", input.project_path, note.id.to_string());
+            Ok(WriteDisposition::Applied(note))
         })
     }
 
@@ -10155,18 +12742,25 @@ impl McStore {
         now_ms: i64,
     ) -> Result<NoteCasOutcome, McStoreError> {
         self.require_note_project(project_path, note_id)?;
-        let result = self.with_note_conn_fenced(project_path, |tx| {
-            update_note_cas_tx(
-                tx,
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("project", project_path, note_id.to_string());
+        write.existing_identity("project_path", project_path)?;
+        let prepared =
+            prepare_note_update(&mut write, content, surface_condition, condition_compile)?;
+        let result = self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let outcome = update_note_cas_tx(
+                coordinated.tx(),
                 project_path,
                 note_id,
                 expected_status,
                 expected_version,
-                content,
-                surface_condition,
-                condition_compile,
+                &prepared,
                 now_ms,
-            )
+            )?;
+            Ok(match outcome {
+                NoteCasOutcome::Applied(_) => WriteDisposition::Applied(outcome),
+                NoteCasOutcome::Conflict { .. } => WriteDisposition::Replay(outcome),
+            })
         })?;
         Ok(result)
     }
@@ -10179,14 +12773,24 @@ impl McStore {
         resolution: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
-        if self
-            .get_note_by_id(project_path, session_id, note_id)?
-            .is_none()
-        {
-            return Ok(None);
-        }
-        self.with_note_conn_fenced(project_path, |tx| {
-            dismiss_note_tx(tx, project_path, None, note_id, resolution, now_ms)
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("project", project_path, note_id.to_string());
+        write.existing_identity("project_path", project_path)?;
+        write.existing_identity("session_id", session_id)?;
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let outcome = dismiss_note_tx(
+                coordinated.tx,
+                &coordinated.prepared,
+                project_path,
+                Some(session_id),
+                note_id,
+                resolution,
+                now_ms,
+            )?;
+            Ok(match outcome {
+                Some(note) => WriteDisposition::Applied(Some(note)),
+                None => WriteDisposition::Replay(None),
+            })
         })
     }
 
@@ -10239,16 +12843,33 @@ impl McStore {
         &self,
         input: NoteEvaluationInput<'_>,
     ) -> Result<NoteCasOutcome, McStoreError> {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("project", input.project_path, input.note_id.to_string());
+        write.existing_identity("project_path", input.project_path)?;
+        for (field_id, value) in [
+            ("compiled_check", input.compiled_check),
+            ("manifest_json", input.manifest_json),
+            ("check_hash", input.check_hash),
+        ] {
+            if let Some(value) = value {
+                write.identity(field_id, value)?;
+            }
+        }
         self.require_note_project(input.project_path, input.note_id)?;
-        self.with_note_conn_fenced(input.project_path, |tx| {
+        self.with_prepared_note_conn_fenced(input.project_path, write, |coordinated| {
+            let tx = coordinated.tx();
             let Some(current) = load_note_tx(tx, input.note_id).optional()? else {
-                return Ok(NoteCasOutcome::Conflict { current: None });
+                return Ok(WriteDisposition::Replay(NoteCasOutcome::Conflict {
+                    current: None,
+                }));
             };
             if current.project_path != input.project_path
                 || current.status != "pending"
                 || current.status_version != input.source_revision
             {
-                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+                return Ok(WriteDisposition::Replay(NoteCasOutcome::Conflict {
+                    current: Some(current),
+                }));
             }
             let status = if input.verdict { "ready" } else { "pending" };
             tx.execute(
@@ -10272,7 +12893,9 @@ impl McStore {
                     input.source_revision,
                 ],
             )?;
-            Ok(NoteCasOutcome::Applied(load_note_tx(tx, input.note_id)?))
+            Ok(WriteDisposition::Applied(NoteCasOutcome::Applied(
+                load_note_tx(tx, input.note_id)?,
+            )))
         })
     }
 
@@ -10302,6 +12925,12 @@ impl McStore {
         result: Option<&str>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, McStoreError> {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("project", project_path, note_id.to_string());
+        write.existing_identity("project_path", project_path)?;
+        let result = result
+            .map(|value| write.content("transition_result", value))
+            .transpose()?;
         self.require_note_project(project_path, note_id)?;
         if !matches!(
             to_status,
@@ -10311,15 +12940,20 @@ impl McStore {
                 "invalid note transition target {to_status}"
             )));
         }
-        self.with_note_conn_fenced(project_path, |tx| {
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let tx = coordinated.tx();
             let Some(current) = load_note_tx(tx, note_id).optional()? else {
-                return Ok(NoteCasOutcome::Conflict { current: None });
+                return Ok(WriteDisposition::Replay(NoteCasOutcome::Conflict {
+                    current: None,
+                }));
             };
             if current.project_path != project_path
                 || current.status != expected_status
                 || current.status_version != expected_version
             {
-                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+                return Ok(WriteDisposition::Replay(NoteCasOutcome::Conflict {
+                    current: Some(current),
+                }));
             }
             tx.execute(
                 "UPDATE mc_notes SET status = ?1, status_version = status_version + 1,
@@ -10332,7 +12966,9 @@ impl McStore {
                   WHERE id = ?4 AND project_path = ?5 AND status = ?6 AND status_version = ?7",
                 params![to_status, now_ms, result, note_id, project_path, expected_status, expected_version],
             )?;
-            Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
+            Ok(WriteDisposition::Applied(NoteCasOutcome::Applied(
+                load_note_tx(tx, note_id)?,
+            )))
         })
     }
 
@@ -10344,7 +12980,10 @@ impl McStore {
         project_path: &str,
         now_ms: i64,
     ) -> Result<Option<StoredNote>, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.existing_identity("project_path", project_path)?;
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let tx = coordinated.tx();
             let note = tx
                 .query_row(
                     &format!(
@@ -10358,19 +12997,25 @@ impl McStore {
                     stored_note_from_row,
                 )
                 .optional()?;
-            let Some(note) = note else { return Ok(None) };
+            let Some(note) = note else {
+                return Ok(WriteDisposition::Replay(None));
+            };
             let changed = tx.execute(
                 "UPDATE mc_notes SET status_version = status_version + 1,
                     state_version = state_version + 1, updated_at_ms = ?1
                    WHERE id = ?2 AND project_path = ?3 AND status = 'pending' AND status_version = ?4",
                 params![now_ms, note.id, project_path, note.status_version],
             )?;
-            if changed == 0 { return Ok(None); }
-            tx.query_row(
+            if changed == 0 {
+                return Ok(WriteDisposition::Replay(None));
+            }
+            let stored = tx.query_row(
                 &format!("SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes WHERE id = ?1"),
                 params![note.id],
                 stored_note_from_row,
-            ).map(Some)
+            )?;
+            coordinated.domain_owner("project", project_path, note.id.to_string());
+            Ok(WriteDisposition::Applied(Some(stored)))
         })
     }
 
@@ -10382,7 +13027,19 @@ impl McStore {
         transform_pass_id: &str,
         now_ms: i64,
     ) -> Result<Vec<(StoredNote, NoteDelivery)>, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("session", session_id, "note_deliveries");
+        for (field_id, value) in [
+            ("project_path", project_path),
+            ("session_id", session_id),
+            ("delivered_pass_fingerprint", delivered_pass_fingerprint),
+            ("transform_pass_id", transform_pass_id),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let tx = coordinated.tx;
+            let before = tx.total_changes();
             let notes = {
                 let mut stmt = tx.prepare_cached(&format!(
                     "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
@@ -10397,6 +13054,7 @@ impl McStore {
             };
             let mut candidates = Vec::new();
             for note in notes {
+                coordinated.domain_owner("project", project_path, note.id.to_string());
                 let unacked = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM mc_note_deliveries
                        WHERE project_path = ?1 AND note_id = ?2 AND session_id = ?3 AND disposition IS NULL)",
@@ -10431,6 +13089,18 @@ impl McStore {
                     }
                     continue;
                 }
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&[
+                        "project_path",
+                        "session_id",
+                        "delivered_pass_fingerprint",
+                        "transform_pass_id",
+                    ])
+                    .map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?;
                 if note.status == "ready" {
                     let changed = tx.execute(
                         "UPDATE mc_notes SET status = 'surfacing', status_version = status_version + 1,
@@ -10449,6 +13119,11 @@ impl McStore {
                     session_id.len(),
                     note.id
                 );
+                coordinated
+                    .prepared
+                    .borrow_mut()
+                    .transaction_identity("delivery_id", &delivery_id)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                 tx.execute(
                     "INSERT INTO mc_note_deliveries
                        (delivery_id, note_id, session_id, delivered_pass_fingerprint,
@@ -10477,7 +13152,11 @@ impl McStore {
                     },
                 ));
             }
-            Ok(candidates)
+            Ok(if tx.total_changes() > before {
+                WriteDisposition::Applied(candidates)
+            } else {
+                WriteDisposition::Replay(candidates)
+            })
         })
     }
 
@@ -10488,7 +13167,17 @@ impl McStore {
         transform_pass_id: &str,
         now_ms: i64,
     ) -> Result<usize, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("session", session_id, "note_deliveries");
+        for (field_id, value) in [
+            ("project_path", project_path),
+            ("session_id", session_id),
+            ("transform_pass_id", transform_pass_id),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let tx = coordinated.tx();
             let ids = tx
                 .prepare(
                     "SELECT DISTINCT note_id FROM mc_note_deliveries
@@ -10507,6 +13196,7 @@ impl McStore {
                 params![now_ms, project_path, session_id, transform_pass_id],
             )?;
             for id in ids {
+                coordinated.domain_owner("project", project_path, id.to_string());
                 tx.execute(
                     "UPDATE mc_note_deliveries SET disposition = 'superseded'
                        WHERE project_path = ?1 AND note_id = ?2 AND session_id = ?3
@@ -10520,7 +13210,11 @@ impl McStore {
                     params![now_ms, id, project_path],
                 )?;
             }
-            Ok(changed)
+            Ok(if changed == 0 {
+                WriteDisposition::Replay(changed)
+            } else {
+                WriteDisposition::Applied(changed)
+            })
         })
     }
 
@@ -10531,7 +13225,17 @@ impl McStore {
         transform_pass_id: &str,
         now_ms: i64,
     ) -> Result<usize, McStoreError> {
-        self.with_note_conn_fenced(project_path, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::Notes);
+        write.domain_owner("session", session_id, "note_deliveries");
+        for (field_id, value) in [
+            ("project_path", project_path),
+            ("session_id", session_id),
+            ("transform_pass_id", transform_pass_id),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project_path, write, |coordinated| {
+            let tx = coordinated.tx();
             let ids = tx
                 .prepare(
                     "SELECT DISTINCT note_id FROM mc_note_deliveries
@@ -10549,6 +13253,7 @@ impl McStore {
                 params![project_path, session_id, transform_pass_id],
             )?;
             for id in &ids {
+                coordinated.domain_owner("project", project_path, id.to_string());
                 tx.execute(
                     "UPDATE mc_notes SET status = 'ready', status_version = status_version + 1,
                         state_version = state_version + 1, updated_at_ms = ?1
@@ -10556,7 +13261,11 @@ impl McStore {
                     params![now_ms, id, project_path],
                 )?;
             }
-            Ok(changed)
+            Ok(if changed == 0 {
+                WriteDisposition::Replay(changed)
+            } else {
+                WriteDisposition::Applied(changed)
+            })
         })
     }
 
@@ -10624,7 +13333,14 @@ impl McStore {
         project_path: &str,
         share_categories_json: &str,
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::WorkspaceProfileMemory);
+        write.domain_owner("project", project_path, "workspace_profile_memory");
+        let workspace = write.identity("workspace_name", workspace)?;
+        let project_path = write.identity("workspace_project_path", project_path)?;
+        let share_categories_json =
+            write.content("workspace_share_category", share_categories_json)?;
+        write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
             tx.execute(
                 "INSERT INTO mc_workspaces (name, share_categories) VALUES (?1, ?2)
                  ON CONFLICT(name) DO NOTHING",
@@ -10640,7 +13356,7 @@ impl McStore {
                  VALUES (?1, ?2, ?2, ?2, 0)",
                 params![ws_id, project_path],
             )?;
-            Ok(())
+            Ok(WriteDisposition::Applied(()))
         })?;
         Ok(())
     }
@@ -10659,91 +13375,132 @@ impl McStore {
         now_ms: i64,
     ) -> Result<ClaimIntentMutationOutcome, McStoreError> {
         validate_claim_intent_fields(binding, command)?;
+        let mut write = PreparedWrite::new(DurableWriteFamily::ClaimIntents);
+        write.domain_owner(
+            "project",
+            &binding.authority_project,
+            active_scan_owner_key(&[&command.producer, &command.operation_key]),
+        );
+        for (field_id, identity) in [
+            ("producer", command.producer.as_str()),
+            ("operation_key", command.operation_key.as_str()),
+            (
+                "database_incarnation_id",
+                binding.database_incarnation_id.as_str(),
+            ),
+            ("authority_project", binding.authority_project.as_str()),
+        ] {
+            write.existing_identity(field_id, identity)?;
+        }
+        let request_json = serde_json::to_string(request)
+            .map_err(|error| McStoreError::ClaimIntentInvalid(error.to_string()))?;
+        write.existing_identity("request", &request_json)?;
         let request_digest = compute_claim_operation_request_digest(request)
             .map_err(|error| McStoreError::ClaimIntentInvalid(error.to_string()))?;
         let authority_generation = i64::try_from(binding.authority_generation).map_err(|_| {
             McStoreError::ClaimIntentInvalid("authority generation exceeds SQLite i64".to_string())
         })?;
-        let outcome = self.inner.with_conn_fenced(|tx| {
-            let existing = tx
-                .query_row(
-                    &format!(
-                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let outcome = (|| -> rusqlite::Result<ClaimIntentTxnOutcome> {
+                let existing = tx
+                    .query_row(
+                        &format!(
+                            "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
                           WHERE producer = ?1 AND operation_key = ?2"
-                    ),
-                    params![command.producer, command.operation_key],
-                    claim_intent_record_from_row,
-                )
-                .optional()?;
-            if let Some(record) = existing {
-                if record.request_digest != request_digest {
-                    return Ok(ClaimIntentTxnOutcome::IdentityConflict);
-                }
-                if let Err(McStoreError::ClaimIntentBindingMismatch {
-                    field,
-                    expected,
-                    found,
-                }) = require_claim_intent_binding(&record, binding)
-                {
-                    return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                        ),
+                        params![command.producer, command.operation_key],
+                        claim_intent_record_from_row,
+                    )
+                    .optional()?;
+                if let Some(record) = existing {
+                    if record.request_digest != request_digest {
+                        return Ok(ClaimIntentTxnOutcome::IdentityConflict);
+                    }
+                    if let Err(McStoreError::ClaimIntentBindingMismatch {
                         field,
                         expected,
                         found,
-                    });
-                }
-                // A staged replay goes on to execute the context mutation, so it has to
-                // clear the same live fence as a fresh stage. The stored binding proves
-                // only what was true when the row was written: a drain committed since
-                // then has already moved the authority to DRAINING and bumped the
-                // generation, and returning here would commit under the obsolete one.
-                // Terminal and already-committed records are recovery reads and stay
-                // idempotent so a crashed attempt can still be resolved.
-                if record.state == ClaimIntentState::Staged {
-                    if let Some(rejection) =
-                        claim_intent_stage_fence(tx, route_project_root, binding)?
+                    }) = require_claim_intent_binding(&record, binding)
                     {
-                        return Ok(rejection);
+                        return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                            field,
+                            expected,
+                            found,
+                        });
                     }
+                    // A staged replay goes on to execute the context mutation, so it has to
+                    // clear the same live fence as a fresh stage. The stored binding proves
+                    // only what was true when the row was written: a drain committed since
+                    // then has already moved the authority to DRAINING and bumped the
+                    // generation, and returning here would commit under the obsolete one.
+                    // Terminal and already-committed records are recovery reads and stay
+                    // idempotent so a crashed attempt can still be resolved.
+                    if record.state == ClaimIntentState::Staged {
+                        if let Some(rejection) =
+                            claim_intent_stage_fence(tx, route_project_root, binding)?
+                        {
+                            return Ok(rejection);
+                        }
+                    }
+                    return Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                        record,
+                        replayed: true,
+                    }));
                 }
-                return Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
-                    record,
-                    replayed: true,
-                }));
-            }
 
-            if let Some(rejection) = claim_intent_stage_fence(tx, route_project_root, binding)? {
-                return Ok(rejection);
-            }
-            tx.execute(
-                "INSERT INTO mc_claim_intents(
+                if let Some(rejection) = claim_intent_stage_fence(tx, route_project_root, binding)?
+                {
+                    return Ok(rejection);
+                }
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&[
+                        "producer",
+                        "operation_key",
+                        "database_incarnation_id",
+                        "authority_project",
+                        "request",
+                    ])
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                tx.execute(
+                    "INSERT INTO mc_claim_intents(
                     producer, operation_key, database_incarnation_id, format_epoch,
                     authority_project, authority_generation, request_encoding_version,
                     request_digest, state, result_json, created_at_ms, updated_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'staged', NULL, ?9, ?9)",
-                params![
-                    command.producer,
-                    command.operation_key,
-                    binding.database_incarnation_id,
-                    binding.format_epoch,
-                    binding.authority_project,
-                    authority_generation,
-                    CLAIM_REQUEST_ENCODING_VERSION,
-                    request_digest,
-                    now_ms,
-                ],
-            )?;
-            let record = tx.query_row(
-                &format!(
-                    "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+                    params![
+                        command.producer,
+                        command.operation_key,
+                        binding.database_incarnation_id,
+                        binding.format_epoch,
+                        binding.authority_project,
+                        authority_generation,
+                        CLAIM_REQUEST_ENCODING_VERSION,
+                        request_digest,
+                        now_ms,
+                    ],
+                )?;
+                let record = tx.query_row(
+                    &format!(
+                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
                       WHERE producer = ?1 AND operation_key = ?2"
-                ),
-                params![command.producer, command.operation_key],
-                claim_intent_record_from_row,
-            )?;
-            Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
-                record,
-                replayed: false,
-            }))
+                    ),
+                    params![command.producer, command.operation_key],
+                    claim_intent_record_from_row,
+                )?;
+                Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                    record,
+                    replayed: false,
+                }))
+            })()?;
+            Ok(match &outcome {
+                ClaimIntentTxnOutcome::Applied(result) if !result.replayed => {
+                    WriteDisposition::Applied(outcome)
+                }
+                _ => WriteDisposition::Replay(outcome),
+            })
         })?;
         claim_intent_mutation_result(outcome, command)
     }
@@ -10821,98 +13578,139 @@ impl McStore {
                 ));
             }
         }
+        let mut write = PreparedWrite::new(DurableWriteFamily::ClaimIntents);
+        write.domain_owner(
+            "project",
+            &binding.authority_project,
+            active_scan_owner_key(&[&command.producer, &command.operation_key]),
+        );
+        for (field_id, value) in [
+            ("producer", command.producer.as_str()),
+            ("operation_key", command.operation_key.as_str()),
+            (
+                "database_incarnation_id",
+                binding.database_incarnation_id.as_str(),
+            ),
+            ("authority_project", binding.authority_project.as_str()),
+            ("request_digest", request_digest),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        if let Some(result) = result_json {
+            write.existing_identity("result_json", result)?;
+        }
 
-        let outcome = self.inner.with_conn_fenced(|tx| {
-            let Some(record) = tx
-                .query_row(
-                    &format!(
-                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let outcome = (|| -> rusqlite::Result<ClaimIntentTxnOutcome> {
+                let Some(record) = tx
+                    .query_row(
+                        &format!(
+                            "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
                           WHERE producer = ?1 AND operation_key = ?2"
-                    ),
-                    params![command.producer, command.operation_key],
-                    claim_intent_record_from_row,
-                )
-                .optional()?
-            else {
-                return Ok(ClaimIntentTxnOutcome::NotFound);
-            };
-            if record.request_digest != request_digest {
-                return Ok(ClaimIntentTxnOutcome::IdentityConflict);
-            }
-            if let Err(McStoreError::ClaimIntentBindingMismatch {
-                field,
-                expected,
-                found,
-            }) = require_claim_intent_binding(&record, binding)
-            {
-                return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                        ),
+                        params![command.producer, command.operation_key],
+                        claim_intent_record_from_row,
+                    )
+                    .optional()?
+                else {
+                    return Ok(ClaimIntentTxnOutcome::NotFound);
+                };
+                if record.request_digest != request_digest {
+                    return Ok(ClaimIntentTxnOutcome::IdentityConflict);
+                }
+                if let Err(McStoreError::ClaimIntentBindingMismatch {
                     field,
                     expected,
                     found,
-                });
-            }
-
-            let next_state = match (kind, record.state) {
-                (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::Staged) => {
-                    Some(ClaimIntentState::ContextCommitted)
-                }
-                (ClaimIntentAckKind::TerminalRejected, ClaimIntentState::Staged) => {
-                    Some(ClaimIntentState::TerminalRejected)
-                }
-                (ClaimIntentAckKind::Acknowledged, ClaimIntentState::ContextCommitted) => {
-                    Some(ClaimIntentState::Acknowledged)
-                }
-                (ClaimIntentAckKind::Acknowledged, ClaimIntentState::Acknowledged)
-                | (ClaimIntentAckKind::Acknowledged, ClaimIntentState::TerminalRejected) => None,
-                (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::ContextCommitted)
-                | (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::Acknowledged)
-                | (ClaimIntentAckKind::TerminalRejected, ClaimIntentState::TerminalRejected)
-                    if record.result_json.as_deref() == result_json =>
+                }) = require_claim_intent_binding(&record, binding)
                 {
-                    None
-                }
-                _ => {
-                    return Ok(ClaimIntentTxnOutcome::Transition {
-                        expected: match kind {
-                            ClaimIntentAckKind::ContextCommitted
-                            | ClaimIntentAckKind::TerminalRejected => "staged",
-                            ClaimIntentAckKind::Acknowledged => "context-committed",
-                        }
-                        .to_string(),
-                        found: record.state.as_str().to_string(),
+                    return Ok(ClaimIntentTxnOutcome::BindingMismatch {
+                        field,
+                        expected,
+                        found,
                     });
                 }
-            };
-            if let Some(next_state) = next_state {
-                tx.execute(
-                    "UPDATE mc_claim_intents
+
+                let next_state = match (kind, record.state) {
+                    (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::Staged) => {
+                        Some(ClaimIntentState::ContextCommitted)
+                    }
+                    (ClaimIntentAckKind::TerminalRejected, ClaimIntentState::Staged) => {
+                        Some(ClaimIntentState::TerminalRejected)
+                    }
+                    (ClaimIntentAckKind::Acknowledged, ClaimIntentState::ContextCommitted) => {
+                        Some(ClaimIntentState::Acknowledged)
+                    }
+                    (ClaimIntentAckKind::Acknowledged, ClaimIntentState::Acknowledged)
+                    | (ClaimIntentAckKind::Acknowledged, ClaimIntentState::TerminalRejected) => {
+                        None
+                    }
+                    (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::ContextCommitted)
+                    | (ClaimIntentAckKind::ContextCommitted, ClaimIntentState::Acknowledged)
+                    | (ClaimIntentAckKind::TerminalRejected, ClaimIntentState::TerminalRejected)
+                        if record.result_json.as_deref() == result_json =>
+                    {
+                        None
+                    }
+                    _ => {
+                        return Ok(ClaimIntentTxnOutcome::Transition {
+                            expected: match kind {
+                                ClaimIntentAckKind::ContextCommitted
+                                | ClaimIntentAckKind::TerminalRejected => "staged",
+                                ClaimIntentAckKind::Acknowledged => "context-committed",
+                            }
+                            .to_string(),
+                            found: record.state.as_str().to_string(),
+                        });
+                    }
+                };
+                if let Some(next_state) = next_state {
+                    if record.result_json.as_deref() != result_json {
+                        coordinated
+                            .prepared
+                            .borrow()
+                            .reject_recorded_identities(&["result_json"])
+                            .map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?;
+                    }
+                    tx.execute(
+                        "UPDATE mc_claim_intents
                         SET state = ?1, result_json = COALESCE(?2, result_json), updated_at_ms = ?3
                       WHERE producer = ?4 AND operation_key = ?5",
-                    params![
-                        next_state.as_str(),
-                        result_json,
-                        now_ms,
-                        command.producer,
-                        command.operation_key,
-                    ],
-                )?;
-                let record = tx.query_row(
-                    &format!(
-                        "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
+                        params![
+                            next_state.as_str(),
+                            result_json,
+                            now_ms,
+                            command.producer,
+                            command.operation_key,
+                        ],
+                    )?;
+                    let record = tx.query_row(
+                        &format!(
+                            "SELECT {CLAIM_INTENT_COLUMNS} FROM mc_claim_intents
                           WHERE producer = ?1 AND operation_key = ?2"
-                    ),
-                    params![command.producer, command.operation_key],
-                    claim_intent_record_from_row,
-                )?;
-                return Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                        ),
+                        params![command.producer, command.operation_key],
+                        claim_intent_record_from_row,
+                    )?;
+                    return Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
+                        record,
+                        replayed: false,
+                    }));
+                }
+                Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
                     record,
-                    replayed: false,
-                }));
-            }
-            Ok(ClaimIntentTxnOutcome::Applied(ClaimIntentMutationOutcome {
-                record,
-                replayed: true,
-            }))
+                    replayed: true,
+                }))
+            })()?;
+            Ok(match &outcome {
+                ClaimIntentTxnOutcome::Applied(result) if !result.replayed => {
+                    WriteDisposition::Applied(outcome)
+                }
+                _ => WriteDisposition::Replay(outcome),
+            })
         })?;
         claim_intent_mutation_result(outcome, command)
     }
@@ -10945,7 +13743,12 @@ impl McStore {
         let generation = i64::try_from(authority_generation).map_err(|_| {
             McStoreError::ClaimIntentInvalid("authority generation exceeds SQLite i64".to_string())
         })?;
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::ClaimIntents);
+        write.domain_owner("database", database_incarnation_id, "claim_intent_control");
+        let database_incarnation_id =
+            write.identity("database_incarnation_id", database_incarnation_id)?;
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
             let unresolved: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM mc_claim_intents
                   WHERE state IN ('staged', 'context-committed')",
@@ -10953,7 +13756,9 @@ impl McStore {
                 |row| row.get(0),
             )?;
             if unresolved > 0 {
-                return Ok(ClaimIntentTxnOutcome::ResetBlocked(unresolved as usize));
+                return Ok(WriteDisposition::Replay(
+                    ClaimIntentTxnOutcome::ResetBlocked(unresolved as usize),
+                ));
             }
             tx.execute(
                 "INSERT INTO mc_claim_intent_controls(
@@ -10966,7 +13771,9 @@ impl McStore {
                     transition_state = 'resetting', updated_at_ms = excluded.updated_at_ms",
                 params![database_incarnation_id, generation, now_ms],
             )?;
-            Ok(ClaimIntentTxnOutcome::ResetGranted)
+            Ok(WriteDisposition::Applied(
+                ClaimIntentTxnOutcome::ResetGranted,
+            ))
         })?;
         match outcome {
             ClaimIntentTxnOutcome::ResetGranted => Ok(()),
@@ -11006,7 +13813,39 @@ impl McStore {
         domain: &str,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        self.with_note_conn_fenced(project, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+                let tx = coordinated.tx;
+                let exists = tx
+                    .query_row(
+                        "SELECT 1 FROM mc_authority
+                          WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
+                        params![context_store_uuid, project, domain],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    coordinated
+                        .prepared
+                        .borrow()
+                        .reject_recorded_identities(&["context_store_uuid", "project", "domain"])
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
                 tx.execute(
                     "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
                      VALUES (?1, ?2, ?3, 'TS') ON CONFLICT(context_store_uuid, project, domain) DO NOTHING",
@@ -11017,13 +13856,42 @@ impl McStore {
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
                 )?;
-                if current.state == "TS" {
+                let applied = current.state == "TS";
+                if applied {
                     if domain == "notes" {
+                        let note_ids = {
+                            let mut statement = tx.prepare_cached(
+                                "SELECT id FROM mc_notes
+                                  WHERE context_store_uuid = ?1 AND project_path = ?2",
+                            )?;
+                            let rows = statement
+                                .query_map(params![context_store_uuid, project], |row| {
+                                    row.get::<_, i64>(0)
+                                })?
+                                .collect::<Result<Vec<_>, _>>()?;
+                            rows
+                        };
+                        for note_id in note_ids {
+                            retire_active_scan_domain_owner(
+                                tx,
+                                "project",
+                                project,
+                                "notes",
+                                &note_id.to_string(),
+                            )?;
+                        }
                         tx.execute(
                             "DELETE FROM mc_notes WHERE context_store_uuid = ?1 AND project_path = ?2",
                             params![context_store_uuid, project],
                         )?;
                     }
+                    retire_active_scan_domain_owner(
+                        tx,
+                        "project",
+                        project,
+                        "authority_seed_rows",
+                        &active_scan_owner_key(&["authority", context_store_uuid, domain]),
+                    )?;
                     tx.execute(
                         "DELETE FROM mc_authority_seed_rows WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
                         params![context_store_uuid, project, domain],
@@ -11068,7 +13936,11 @@ impl McStore {
                         "resetting",
                     )?;
                 }
-                Ok(row)
+                Ok(if applied {
+                    WriteDisposition::Applied(row)
+                } else {
+                    WriteDisposition::Replay(row)
+                })
             })
     }
 
@@ -11083,8 +13955,24 @@ impl McStore {
         checksum_actual: &str,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write.identity("checksum_expected", checksum_expected)?;
+        write.identity("checksum_actual", checksum_actual)?;
+        write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -11110,13 +13998,14 @@ impl McStore {
                         domain
                     ],
                 )?;
-                tx.query_row(
+                let row = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
-                )
+                )?;
+                Ok(WriteDisposition::Applied(row))
             })
-            .map_err(map_authority_sql_error)
+            .map_err(map_prepared_authority_error)
     }
 
     pub fn authority_ack_prepare(
@@ -11127,8 +14016,22 @@ impl McStore {
         expected_generation: u64,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -11172,8 +14075,9 @@ impl McStore {
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
                 )
+                .map(WriteDisposition::Applied)
             })
-            .map_err(map_authority_sql_error)
+            .map_err(map_prepared_authority_error)
     }
 
     /// Record seed verification and complete TS -> MODULE. The host keeps its
@@ -11192,8 +14096,24 @@ impl McStore {
         verified: bool,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write.identity("checksum_expected", checksum_expected)?;
+        write.identity("checksum_actual", checksum_actual)?;
+        write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -11278,9 +14198,9 @@ impl McStore {
                         },
                     )?;
                 }
-                Ok(row)
+                Ok(WriteDisposition::Applied(row))
             })
-            .map_err(map_authority_sql_error)
+            .map_err(map_prepared_authority_error)
     }
 
     /// Abort a failed preparation without erasing the diagnostic checksum.
@@ -11312,8 +14232,23 @@ impl McStore {
         now_ms: i64,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        self.inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+            ("coordinator_lease", lease),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -11321,6 +14256,15 @@ impl McStore {
                 )?;
                 if current.state == "DRAINING" {
                     let held_by_other = current.coordinator_lease.as_deref() != Some(lease);
+                    if held_by_other {
+                        coordinated
+                            .prepared
+                            .borrow()
+                            .reject_recorded_identities(&["coordinator_lease"])
+                            .map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?;
+                    }
                     let lease_live = current.lease_expires_at.unwrap_or(0) > now_ms;
                     if held_by_other && lease_live {
                         return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
@@ -11335,6 +14279,13 @@ impl McStore {
                     // coordinator cannot keep journaling with a stale attempt identity. It also
                     // captures a new feed head after a finish fence reports a late append.
                     let token = mint_coordinator_token(lease, lease_expires_at, current.generation);
+                    coordinated
+                        .prepared
+                        .borrow_mut()
+                        .transaction_identity("coordinator_token", &token)
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
                     let feed_head: i64 = tx.query_row(
                         "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
                         params![domain],
@@ -11372,7 +14323,7 @@ impl McStore {
                             "draining",
                         )?;
                     }
-                    return Ok(row);
+                    return Ok(WriteDisposition::Applied(row));
                 }
                 if current.state != "MODULE" {
                     return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
@@ -11392,6 +14343,20 @@ impl McStore {
                 }
                 let next_generation = current.generation + 1;
                 let token = mint_coordinator_token(lease, lease_expires_at, next_generation);
+                coordinated
+                    .prepared
+                    .borrow()
+                    .reject_recorded_identities(&["coordinator_lease"])
+                    .map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?;
+                coordinated
+                    .prepared
+                    .borrow_mut()
+                    .transaction_identity("coordinator_token", &token)
+                    .map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?;
                 tx.execute(
                     "UPDATE mc_authority
                         SET state = 'DRAINING', generation = generation + 1,
@@ -11424,9 +14389,9 @@ impl McStore {
                         "draining",
                     )?;
                 }
-                Ok(row)
+                Ok(WriteDisposition::Applied(row))
             })
-            .map_err(map_authority_sql_error)
+            .map_err(map_prepared_authority_error)
     }
 
     /// Advance one idempotent DRAINING journal bit or its feed cursor.
@@ -11453,8 +14418,23 @@ impl McStore {
             "flip" => "step_flip",
             _ => return Err(McStoreError::Serde(format!("unknown drain step {step}"))),
         };
-        self.inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+            ("coordinator_token", coordinator_token),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -11486,8 +14466,9 @@ impl McStore {
                     params![context_store_uuid, project, domain],
                     authority_row_from_sql,
                 )
+                .map(WriteDisposition::Applied)
             })
-            .map_err(map_authority_sql_error)
+            .map_err(map_prepared_authority_error)
     }
 
     /// Complete DRAINING after the host has verified every journal step.
@@ -11507,9 +14488,25 @@ impl McStore {
         now_ms: i64,
     ) -> Result<AuthorityRow, McStoreError> {
         validate_authority_domain(domain)?;
-        let outcome = self
-            .inner
-            .with_conn_fenced(|tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthorityControl);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, domain]),
+        );
+        for (field_id, value) in [
+            ("context_store_uuid", context_store_uuid),
+            ("project", project),
+            ("domain", domain),
+            ("coordinator_token", coordinator_token),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        write.identity("checksum_expected", checksum_expected)?;
+        write.identity("checksum_actual", checksum_actual)?;
+        let outcome = write
+            .execute(&self.inner, |coordinated| {
+                let tx = coordinated.tx();
                 let current = tx.query_row(
                     AUTHORITY_SELECT_SQL,
                     params![context_store_uuid, project, domain],
@@ -11555,10 +14552,12 @@ impl McStore {
                 if feed_head != captured {
                     // This comparison shares the transaction with the ownership flip. A writer
                     // either commits before the flip and forces replay, or after TypeScript owns the domain.
-                    return Ok(AuthorityFinishDrainOutcome::FeedHeadAdvanced {
-                        captured,
-                        found: feed_head,
-                    });
+                    return Ok(WriteDisposition::Replay(
+                        AuthorityFinishDrainOutcome::FeedHeadAdvanced {
+                            captured,
+                            found: feed_head,
+                        },
+                    ));
                 }
                 tx.execute(
                     "UPDATE mc_authority SET state = 'TS', generation = generation + 1,
@@ -11582,8 +14581,9 @@ impl McStore {
                 )
                 .map(Box::new)
                 .map(AuthorityFinishDrainOutcome::Finished)
+                .map(WriteDisposition::Applied)
             })
-            .map_err(map_authority_sql_error)?;
+            .map_err(map_prepared_authority_error)?;
         match outcome {
             AuthorityFinishDrainOutcome::Finished(row) => Ok(*row),
             AuthorityFinishDrainOutcome::FeedHeadAdvanced { captured, found } => {
@@ -11661,10 +14661,24 @@ impl McStore {
         project: &str,
         rows: &[AuthoritySeedRow],
     ) -> Result<Vec<i64>, McStoreError> {
+        let mut write = PreparedWrite::new(DurableWriteFamily::AuthoritySeedRows);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["authority", context_store_uuid, "notes"]),
+        );
+        write.existing_identity("context_store_uuid", context_store_uuid)?;
+        write.existing_identity("project", project)?;
         let prepared = rows
             .iter()
             .map(|row| {
-                let object = row.snapshot.as_object().ok_or_else(|| {
+                let snapshot_json = serde_json::to_string(&row.snapshot)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                write.record_content("snapshot_json", &snapshot_json)?;
+                let snapshot_json = prepare_json_content(&snapshot_json)?;
+                let snapshot: Value = serde_json::from_str(&snapshot_json)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                let object = snapshot.as_object().ok_or_else(|| {
                     McStoreError::Serde("note seed snapshot must be an object".to_string())
                 })?;
                 if object.get("project_path").and_then(Value::as_str) != Some(project) {
@@ -11673,9 +14687,7 @@ impl McStore {
                             .to_string(),
                     ));
                 }
-                let snapshot_json = serde_json::to_string(&row.snapshot)
-                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
-                Ok((row.source_row_id, snapshot_json))
+                Ok((row.source_row_id, snapshot, snapshot_json))
             })
             .collect::<Result<Vec<_>, McStoreError>>()?;
 
@@ -11683,7 +14695,8 @@ impl McStore {
         self.authority_seed_transaction_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        self.with_note_conn_fenced(project, |tx| {
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+            let tx = coordinated.tx();
             let mut note_upsert = tx.prepare_cached(&format!(
                 "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
@@ -11730,8 +14743,8 @@ impl McStore {
             )?;
             let mut module_row_ids = Vec::with_capacity(rows.len());
 
-            for ((source_row_id, snapshot_json), row) in prepared.iter().zip(rows) {
-                let object = row.snapshot.as_object().expect("validated note seed object");
+            for (source_row_id, snapshot, snapshot_json) in &prepared {
+                let object = snapshot.as_object().expect("validated note seed object");
                 let text = |name: &str| object.get(name).and_then(Value::as_str);
                 let integer = |name: &str| object.get(name).and_then(Value::as_i64);
                 note_upsert.execute(params![
@@ -11803,7 +14816,7 @@ impl McStore {
                     break;
                 }
             }
-            Ok(module_row_ids)
+            Ok(WriteDisposition::Applied(module_row_ids))
         })
     }
 
@@ -12405,6 +15418,25 @@ fn compress_raw_messages(raw_messages: &str) -> std::io::Result<Vec<u8>> {
     encoder.finish()
 }
 
+fn decompress_durable_text_exact(blob: &[u8], limit: usize) -> std::io::Result<String> {
+    let decoder = DeflateDecoder::new(blob);
+    let mut limited = decoder.take((limit + 1) as u64);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "durable compressed text exceeds the scan limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "durable compressed text is not UTF-8",
+        )
+    })
+}
+
 fn decompress_raw_messages(blob: &[u8]) -> std::io::Result<String> {
     let mut decoder = DeflateDecoder::new(blob);
     let mut raw_messages = String::new();
@@ -12569,7 +15601,7 @@ fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<Sto
 fn insert_note_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &NoteInput<'_>,
-    content: &str,
+    prepared: &PreparedNoteFields,
 ) -> rusqlite::Result<StoredNote> {
     tx.execute(
         "INSERT INTO mc_notes
@@ -12579,9 +15611,9 @@ fn insert_note_tx(
         params![
             input.project_path,
             input.session_id,
-            content,
-            input.surface_condition,
-            input.anchor_block_id,
+            prepared.content,
+            prepared.surface_condition,
+            prepared.anchor_block_id,
             input.now_ms,
         ],
     )?;
@@ -12595,12 +15627,9 @@ fn insert_note_tx(
 fn insert_project_note_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &NoteWriteInput<'_>,
-    content: &str,
+    prepared: &PreparedNoteFields,
 ) -> rusqlite::Result<StoredNote> {
-    let status = if input
-        .surface_condition
-        .is_some_and(|condition| !condition.trim().is_empty())
-    {
+    let status = if prepared.surface_condition.is_some() {
         "pending"
     } else {
         "active"
@@ -12614,13 +15643,10 @@ fn insert_project_note_tx(
         params![
             input.project_path,
             input.session_id,
-            content,
+            prepared.content,
             status,
-            input
-                .surface_condition
-                .map(str::trim)
-                .filter(|value| !value.is_empty()),
-            input.anchor_block_id,
+            prepared.surface_condition,
+            prepared.anchor_block_id,
             input.anchor_ordinal,
             input.compiled_provider,
             input.compiled_config,
@@ -12641,9 +15667,7 @@ fn update_note_cas_tx(
     note_id: i64,
     expected_status: &str,
     expected_version: i64,
-    content: Option<&str>,
-    surface_condition: Option<Option<&str>>,
-    condition_compile: Option<NoteConditionCompile<'_>>,
+    prepared: &PreparedNoteUpdate<'_>,
     now_ms: i64,
 ) -> rusqlite::Result<NoteCasOutcome> {
     let current = load_note_tx(tx, note_id).optional()?;
@@ -12658,14 +15682,20 @@ fn update_note_cas_tx(
             current: Some(current),
         });
     }
-    let next_content = content.map(str::trim).unwrap_or(&current.content);
+    let next_content = prepared
+        .content
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(&current.content);
     if next_content.is_empty() {
         return Ok(NoteCasOutcome::Conflict {
             current: Some(current),
         });
     }
-    let next_condition = surface_condition
-        .flatten()
+    let next_condition = prepared
+        .surface_condition
+        .as_ref()
+        .and_then(|value| value.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let current_condition = current
@@ -12676,7 +15706,8 @@ fn update_note_cas_tx(
     // Presence alone is not an edit: an update that re-supplies the
     // existing condition unchanged must not invalidate the compiled
     // artifact, reset a ready note to pending, or fence active claims.
-    let condition_changed = surface_condition.is_some() && next_condition != current_condition;
+    let condition_changed =
+        prepared.surface_condition.is_some() && next_condition != current_condition;
     let content_changed = next_content != current.content;
     let compiler_edit = condition_changed || content_changed;
     if !compiler_edit {
@@ -12695,7 +15726,7 @@ fn update_note_cas_tx(
     } else {
         current.status.as_str()
     };
-    let compile = condition_compile.unwrap_or_default();
+    let compile = prepared.condition_compile.unwrap_or_default();
     let changed = tx.execute(
         NOTE_CAS_UPDATE_SQL,
         params![
@@ -12733,6 +15764,7 @@ fn update_note_cas_tx(
 /// session-scoped precheck.
 fn dismiss_note_tx(
     tx: &rusqlite::Transaction<'_>,
+    audit: &std::cell::RefCell<PreparedWrite>,
     project_path: &str,
     session_id: Option<&str>,
     note_id: i64,
@@ -12751,10 +15783,24 @@ fn dismiss_note_tx(
     {
         return Ok(None);
     }
-    let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
+    let resolution = resolution
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            audit
+                .borrow_mut()
+                .transaction_content("dismissal_resolution", value)
+        })
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let content = resolution
+        .as_deref()
         .map(|value| format!("{}\n\nResolution: {value}", current.content))
         .unwrap_or_else(|| current.content.clone());
+    let content = audit
+        .borrow_mut()
+        .transaction_content("content", &content)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let changed = tx.execute(
         "UPDATE mc_notes
             SET status = 'dismissed', content = ?1,
@@ -12998,11 +16044,56 @@ fn collect_note_eval_ledgers_tx(
     // ledgers would grow without bound - one acquisition row per poll, including
     // every idle no-work poll - and the per-poll GC and cap counts would degrade
     // into ever-longer scans.
+    let expired_acquisitions = {
+        let mut statement = tx.prepare(
+            "SELECT acquisition_id FROM mc_note_eval_acquisitions
+              WHERE project = ?1 AND decision = '' AND expires_at <= ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![project, now_ms - NOTE_EVAL_NO_WORK_RETENTION_MS],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for acquisition_id in expired_acquisitions {
+        retire_active_scan_domain_owner(
+            tx,
+            "project",
+            project,
+            "note_evaluation_ledgers",
+            &active_scan_owner_key(&["acquisition", &acquisition_id]),
+        )?;
+    }
     tx.execute(
         "DELETE FROM mc_note_eval_acquisitions
           WHERE project = ?1 AND decision = '' AND expires_at <= ?2",
         params![project, now_ms - NOTE_EVAL_NO_WORK_RETENTION_MS],
     )?;
+    let expired_claims = {
+        let mut statement = tx.prepare(
+            "SELECT claim_id FROM mc_note_eval_claims
+              WHERE project = ?1 AND terminal_kind IS NOT NULL
+                AND terminal_at_ms IS NOT NULL AND terminal_at_ms <= ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![project, now_ms - NOTE_EVAL_TERMINAL_RETENTION_MS],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for claim_id in expired_claims {
+        retire_active_scan_domain_owner(
+            tx,
+            "project",
+            project,
+            "note_evaluation_ledgers",
+            &active_scan_owner_key(&["claim", &claim_id]),
+        )?;
+    }
     tx.execute(
         "DELETE FROM mc_note_eval_claims
           WHERE project = ?1 AND terminal_kind IS NOT NULL
@@ -13061,7 +16152,12 @@ impl McStore {
         {
             return Ok(NoteEvalAcquireOutcome::Invalid);
         }
-        self.with_note_conn_fenced(project, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::NoteEvaluationLedgers);
+        write.existing_identity("project", project)?;
+        write.identity("acquisition_id", acquisition_id)?;
+        write.identity("evaluator_instance", evaluator_instance)?;
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+            let tx = coordinated.tx;
             collect_note_eval_ledgers_tx(tx, project, now_ms)?;
             let replayed_claim = tx
                 .query_row(
@@ -13075,15 +16171,15 @@ impl McStore {
                 .optional()?;
             if let Some(row) = replayed_claim {
                 if let Some(kind) = row.terminal_kind {
-                    return Ok(NoteEvalAcquireOutcome::Terminal {
+                    return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Terminal {
                         kind,
                         response: row.terminal_response,
-                    });
+                    }));
                 }
                 if row.claim.evaluator_instance != evaluator_instance
                     || row.claim.evaluator_slot != evaluator_slot
                 {
-                    return Ok(NoteEvalAcquireOutcome::Invalid);
+                    return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Invalid));
                 }
                 return rebind_note_eval_claim_tx(
                     tx,
@@ -13092,7 +16188,8 @@ impl McStore {
                     acquisition_id,
                     registration_generation,
                     now_ms,
-                );
+                )
+                .map(WriteDisposition::Replay);
             }
             let replayed_decision = tx
                 .query_row(
@@ -13103,7 +16200,7 @@ impl McStore {
                 )
                 .optional()?;
             if let Some(decision) = replayed_decision {
-                return Ok(if decision.is_empty() {
+                return Ok(WriteDisposition::Replay(if decision.is_empty() {
                     NoteEvalAcquireOutcome::Expired
                 } else {
                     // Replay the full recorded decision: a client only sees a
@@ -13114,12 +16211,14 @@ impl McStore {
                         replayed: true,
                         cycle_exhausted: decision == "no_work_exhausted",
                     }
-                });
+                }));
             }
             let Some((authority_generation, protocol_epoch)) =
                 note_eval_module_authority_tx(tx, project)?
             else {
-                return Ok(NoteEvalAcquireOutcome::AuthorityChanged);
+                return Ok(WriteDisposition::Replay(
+                    NoteEvalAcquireOutcome::AuthorityChanged,
+                ));
             };
             let slot_claim = tx
                 .query_row(
@@ -13133,6 +16232,11 @@ impl McStore {
                 )
                 .optional()?;
             if let Some(row) = slot_claim {
+                coordinated.domain_owner(
+                    "project",
+                    project,
+                    active_scan_owner_key(&["claim", &row.claim.claim_id]),
+                );
                 return rebind_note_eval_claim_tx(
                     tx,
                     project,
@@ -13140,7 +16244,8 @@ impl McStore {
                     acquisition_id,
                     registration_generation,
                     now_ms,
-                );
+                )
+                .map(WriteDisposition::Applied);
             }
             let candidates = {
                 let mut stmt = tx.prepare_cached(&format!(
@@ -13165,7 +16270,7 @@ impl McStore {
                         |row| row.get(0),
                     )?;
                     if live >= ledger_cap {
-                        return Ok(NoteEvalAcquireOutcome::Busy);
+                        return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Busy));
                     }
                     tx.execute(
                         "INSERT INTO mc_note_eval_acquisitions(
@@ -13183,17 +16288,22 @@ impl McStore {
                             now_ms + NOTE_EVAL_NO_WORK_RETENTION_MS
                         ],
                     )?;
-                    return Ok(NoteEvalAcquireOutcome::NoWork {
+                    coordinated.domain_owner(
+                        "project",
+                        project,
+                        active_scan_owner_key(&["acquisition", acquisition_id]),
+                    );
+                    return Ok(WriteDisposition::Applied(NoteEvalAcquireOutcome::NoWork {
                         replayed: false,
                         cycle_exhausted,
-                    });
+                    }));
                 }
             };
             if !matches!(phase.as_str(), "compile" | "due" | "liveness" | "fallback") {
-                return Ok(NoteEvalAcquireOutcome::Invalid);
+                return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Invalid));
             }
             let Some(candidate) = candidates.into_iter().find(|note| note.id == note_id) else {
-                return Ok(NoteEvalAcquireOutcome::Invalid);
+                return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Invalid));
             };
             // Selection ran on the narrow projection; load the full row once for
             // the note that actually won so the claim snapshot has content,
@@ -13213,7 +16323,7 @@ impl McStore {
                 |row| row.get(0),
             )?;
             if live >= ledger_cap {
-                return Ok(NoteEvalAcquireOutcome::Busy);
+                return Ok(WriteDisposition::Replay(NoteEvalAcquireOutcome::Busy));
             }
             let claim = NoteEvalClaim {
                 // The module's wire protocol caps id fields at 128 bytes and
@@ -13242,6 +16352,16 @@ impl McStore {
                 authority_generation,
                 expires_at: now_ms + NOTE_EVAL_CLAIM_LEASE_MS,
             };
+            for (field_id, value) in [
+                ("claim_id", claim.claim_id.as_str()),
+                ("phase", claim.phase.as_str()),
+            ] {
+                coordinated
+                    .prepared
+                    .borrow_mut()
+                    .transaction_identity(field_id, value)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            }
             tx.execute(
                 "INSERT INTO mc_note_eval_claims(
                      claim_id, project, note_id, phase, acquisition_id, evaluator_instance,
@@ -13267,11 +16387,16 @@ impl McStore {
                     now_ms,
                 ],
             )?;
-            Ok(NoteEvalAcquireOutcome::Claim {
+            coordinated.domain_owner(
+                "project",
+                project,
+                active_scan_owner_key(&["claim", &claim.claim_id]),
+            );
+            Ok(WriteDisposition::Applied(NoteEvalAcquireOutcome::Claim {
                 claim,
                 note,
                 replayed: false,
-            })
+            }))
         })
     }
 
@@ -13285,45 +16410,67 @@ impl McStore {
         registration_generation: i64,
         now_ms: i64,
     ) -> Result<NoteEvalRenewOutcome, McStoreError> {
-        self.with_note_conn_fenced(project, |tx| {
-            let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
-                return Ok(NoteEvalRenewOutcome::UnknownClaim);
-            };
-            if let Some(kind) = row.terminal_kind {
-                return Ok(NoteEvalRenewOutcome::TerminalReplay {
-                    kind,
-                    response: row.terminal_response,
-                });
-            }
-            if row.claim.evaluator_instance != evaluator_instance
-                || row.claim.evaluator_slot != evaluator_slot
-            {
-                return Ok(NoteEvalRenewOutcome::Invalid);
-            }
-            if row.claim.expires_at <= now_ms {
-                mark_note_eval_claim_terminal_tx(
-                    tx,
-                    project,
-                    claim_id,
-                    "expired",
-                    None,
-                    &note_eval_kind_response("expired"),
-                    now_ms,
-                )?;
-                return Ok(NoteEvalRenewOutcome::Expired);
-            }
-            match note_eval_module_authority_tx(tx, project)? {
-                Some((generation, _)) if generation == row.claim.authority_generation => {}
-                _ => return Ok(NoteEvalRenewOutcome::AuthorityChanged),
-            }
-            let expires_at = now_ms + NOTE_EVAL_CLAIM_LEASE_MS;
-            tx.execute(
-                "UPDATE mc_note_eval_claims
+        let mut write = PreparedWrite::new(DurableWriteFamily::NoteEvaluationLedgers);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["claim", claim_id]),
+        );
+        for (field_id, value) in [
+            ("project", project),
+            ("claim_id", claim_id),
+            ("evaluator_instance", evaluator_instance),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+            let tx = coordinated.tx;
+            let before = tx.total_changes();
+            let outcome = (|| -> rusqlite::Result<NoteEvalRenewOutcome> {
+                let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
+                    return Ok(NoteEvalRenewOutcome::UnknownClaim);
+                };
+                if let Some(kind) = row.terminal_kind {
+                    return Ok(NoteEvalRenewOutcome::TerminalReplay {
+                        kind,
+                        response: row.terminal_response,
+                    });
+                }
+                if row.claim.evaluator_instance != evaluator_instance
+                    || row.claim.evaluator_slot != evaluator_slot
+                {
+                    return Ok(NoteEvalRenewOutcome::Invalid);
+                }
+                if row.claim.expires_at <= now_ms {
+                    mark_note_eval_claim_terminal_tx(
+                        tx,
+                        project,
+                        claim_id,
+                        "expired",
+                        None,
+                        &note_eval_kind_response("expired"),
+                        now_ms,
+                    )?;
+                    return Ok(NoteEvalRenewOutcome::Expired);
+                }
+                match note_eval_module_authority_tx(tx, project)? {
+                    Some((generation, _)) if generation == row.claim.authority_generation => {}
+                    _ => return Ok(NoteEvalRenewOutcome::AuthorityChanged),
+                }
+                let expires_at = now_ms + NOTE_EVAL_CLAIM_LEASE_MS;
+                tx.execute(
+                    "UPDATE mc_note_eval_claims
                     SET expires_at = ?1, registration_generation = ?2
                   WHERE project = ?3 AND claim_id = ?4 AND terminal_kind IS NULL",
-                params![expires_at, registration_generation, project, claim_id],
-            )?;
-            Ok(NoteEvalRenewOutcome::Renewed { expires_at })
+                    params![expires_at, registration_generation, project, claim_id],
+                )?;
+                Ok(NoteEvalRenewOutcome::Renewed { expires_at })
+            })()?;
+            Ok(if tx.total_changes() > before {
+                WriteDisposition::Applied(outcome)
+            } else {
+                WriteDisposition::Replay(outcome)
+            })
         })
     }
 
@@ -13345,121 +16492,193 @@ impl McStore {
         if !note_eval_valid_id(completion_id) {
             return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
         }
-        self.with_note_conn_fenced(project, |tx| {
-            let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
-                return Ok(NoteEvalCompleteOutcome::Conflict {
-                    kind: "unknown_claim",
-                });
-            };
-            if let Some(kind) = row.terminal_kind {
-                return Ok(match row.completion_id {
-                    Some(stored) if stored == completion_id => match row.terminal_response {
-                        Some(response_json) => NoteEvalCompleteOutcome::Replayed { response_json },
-                        None => NoteEvalCompleteOutcome::Conflict { kind: "expired" },
-                    },
-                    Some(_) => NoteEvalCompleteOutcome::Conflict {
-                        kind: "completion_conflict",
-                    },
-                    None => NoteEvalCompleteOutcome::Conflict {
-                        kind: match kind.as_str() {
-                            "stale" => "stale",
-                            "expired" => "expired",
-                            "authority_changed" => "authority_changed",
-                            _ => "invalid",
+        let mut write = PreparedWrite::new(DurableWriteFamily::NoteEvaluationLedgers);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["claim", claim_id]),
+        );
+        for (field_id, value) in [
+            ("project", project),
+            ("claim_id", claim_id),
+            ("completion_id", completion_id),
+            ("evaluator_instance", evaluator_instance),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+            let tx = coordinated.tx;
+            let before = tx.total_changes();
+            let outcome = (|| -> rusqlite::Result<NoteEvalCompleteOutcome> {
+                let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
+                    return Ok(NoteEvalCompleteOutcome::Conflict {
+                        kind: "unknown_claim",
+                    });
+                };
+                if let Some(kind) = row.terminal_kind {
+                    return Ok(match row.completion_id {
+                        Some(stored) if stored == completion_id => match row.terminal_response {
+                            Some(response_json) => {
+                                NoteEvalCompleteOutcome::Replayed { response_json }
+                            }
+                            None => NoteEvalCompleteOutcome::Conflict { kind: "expired" },
                         },
-                    },
-                });
-            }
-            if row.claim.evaluator_instance != evaluator_instance
-                || row.claim.evaluator_slot != evaluator_slot
-            {
-                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
-            }
-            if row.claim.expires_at <= now_ms {
-                mark_note_eval_claim_terminal_tx(
-                    tx,
-                    project,
-                    claim_id,
-                    "expired",
-                    None,
-                    &note_eval_kind_response("expired"),
-                    now_ms,
-                )?;
-                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "expired" });
-            }
-            match note_eval_module_authority_tx(tx, project)? {
-                Some((generation, _)) if generation == row.claim.authority_generation => {}
-                _ => {
+                        Some(_) => NoteEvalCompleteOutcome::Conflict {
+                            kind: "completion_conflict",
+                        },
+                        None => NoteEvalCompleteOutcome::Conflict {
+                            kind: match kind.as_str() {
+                                "stale" => "stale",
+                                "expired" => "expired",
+                                "authority_changed" => "authority_changed",
+                                _ => "invalid",
+                            },
+                        },
+                    });
+                }
+                if row.claim.evaluator_instance != evaluator_instance
+                    || row.claim.evaluator_slot != evaluator_slot
+                {
+                    return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+                }
+                if row.claim.expires_at <= now_ms {
                     mark_note_eval_claim_terminal_tx(
                         tx,
                         project,
                         claim_id,
-                        "authority_changed",
+                        "expired",
                         None,
-                        &note_eval_kind_response("authority_changed"),
+                        &note_eval_kind_response("expired"),
                         now_ms,
                     )?;
-                    return Ok(NoteEvalCompleteOutcome::Conflict {
-                        kind: "authority_changed",
-                    });
+                    return Ok(NoteEvalCompleteOutcome::Conflict { kind: "expired" });
                 }
-            }
-            let stale = |tx: &rusqlite::Transaction<'_>| -> rusqlite::Result<_> {
-                mark_note_eval_claim_terminal_tx(
-                    tx,
-                    project,
-                    claim_id,
-                    "stale",
-                    None,
-                    &note_eval_kind_response("stale"),
-                    now_ms,
-                )?;
-                Ok(NoteEvalCompleteOutcome::Conflict { kind: "stale" })
-            };
-            let note = load_note_tx(tx, row.claim.note_id).optional()?;
-            let Some(note) = note.filter(|note| note.project_path == project) else {
-                return stale(tx);
-            };
-            if note.source_revision != row.claim.source_revision
-                || note.state_version != row.claim.state_version
-                || note.status != "pending"
-            {
-                return stale(tx);
-            }
-            let reduced = match apply(&row.claim, &note) {
-                Ok(reduced) => reduced,
-                Err(message) => {
-                    let response = serde_json::json!({
-                        "result": "invalid",
-                        "error": note_eval_bound_response(&message),
-                    })
-                    .to_string();
+                match note_eval_module_authority_tx(tx, project)? {
+                    Some((generation, _)) if generation == row.claim.authority_generation => {}
+                    _ => {
+                        mark_note_eval_claim_terminal_tx(
+                            tx,
+                            project,
+                            claim_id,
+                            "authority_changed",
+                            None,
+                            &note_eval_kind_response("authority_changed"),
+                            now_ms,
+                        )?;
+                        return Ok(NoteEvalCompleteOutcome::Conflict {
+                            kind: "authority_changed",
+                        });
+                    }
+                }
+                let stale = |tx: &rusqlite::Transaction<'_>| -> rusqlite::Result<_> {
+                    mark_note_eval_claim_terminal_tx(
+                        tx,
+                        project,
+                        claim_id,
+                        "stale",
+                        None,
+                        &note_eval_kind_response("stale"),
+                        now_ms,
+                    )?;
+                    Ok(NoteEvalCompleteOutcome::Conflict { kind: "stale" })
+                };
+                let note = load_note_tx(tx, row.claim.note_id).optional()?;
+                let Some(note) = note.filter(|note| note.project_path == project) else {
+                    return stale(tx);
+                };
+                coordinated.domain_owner("project", project, note.id.to_string());
+                if note.source_revision != row.claim.source_revision
+                    || note.state_version != row.claim.state_version
+                    || note.status != "pending"
+                {
+                    return stale(tx);
+                }
+                let mut reduced = match apply(&row.claim, &note) {
+                    Ok(reduced) => reduced,
+                    Err(message) => {
+                        let message = coordinated
+                            .prepared
+                            .borrow_mut()
+                            .transaction_content("evaluation_error", &message)
+                            .map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?;
+                        let response = serde_json::json!({
+                            "result": "invalid",
+                            "error": note_eval_bound_response(&message),
+                        })
+                        .to_string();
+                        mark_note_eval_claim_terminal_tx(
+                            tx,
+                            project,
+                            claim_id,
+                            "invalid",
+                            None,
+                            &note_eval_bound_response(&response),
+                            now_ms,
+                        )?;
+                        return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+                    }
+                };
+                if !matches!(reduced.status.as_str(), "pending" | "ready") {
                     mark_note_eval_claim_terminal_tx(
                         tx,
                         project,
                         claim_id,
                         "invalid",
                         None,
-                        &note_eval_bound_response(&response),
+                        &note_eval_kind_response("invalid"),
                         now_ms,
                     )?;
                     return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
                 }
-            };
-            if !matches!(reduced.status.as_str(), "pending" | "ready") {
-                mark_note_eval_claim_terminal_tx(
-                    tx,
-                    project,
-                    claim_id,
-                    "invalid",
-                    None,
-                    &note_eval_kind_response("invalid"),
-                    now_ms,
-                )?;
-                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
-            }
-            let changed = tx.execute(
-                "UPDATE mc_notes SET status = ?1, ready_at = ?2, ready_reason = ?3,
+                reduced.ready_reason = reduced
+                    .ready_reason
+                    .as_deref()
+                    .map(|value| {
+                        coordinated
+                            .prepared
+                            .borrow_mut()
+                            .transaction_content("ready_reason", value)
+                    })
+                    .transpose()
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                reduced
+                    .manifest_json
+                    .as_deref()
+                    .map(|value| {
+                        coordinated
+                            .prepared
+                            .borrow_mut()
+                            .transaction_identity("manifest_json", value)
+                            .map(drop)
+                    })
+                    .transpose()
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                for (field_id, value) in [
+                    ("compiled_check", reduced.compiled_check.as_deref()),
+                    ("check_hash", reduced.check_hash.as_deref()),
+                    ("check_cron", reduced.check_cron.as_deref()),
+                    (
+                        "compiled_project_path",
+                        reduced.compiled_project_path.as_deref(),
+                    ),
+                ] {
+                    value
+                        .map(|value| {
+                            coordinated
+                                .prepared
+                                .borrow_mut()
+                                .transaction_identity(field_id, value)
+                                .map(drop)
+                        })
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                }
+                let changed = tx.execute(
+                    "UPDATE mc_notes SET status = ?1, ready_at = ?2, ready_reason = ?3,
                     last_checked_at = ?4, updated_at_ms = ?5, compiled_check = ?6,
                     manifest_json = ?7, check_hash = ?8, check_cron = ?9, check_version = ?10,
                     check_status = ?11, check_failure_count = ?12,
@@ -13471,57 +16690,68 @@ impl McStore {
                     status_version = status_version + 1, state_version = state_version + 1
                   WHERE id = ?22 AND project_path = ?23 AND status = 'pending'
                     AND state_version = ?24",
-                params![
-                    reduced.status,
-                    reduced.ready_at,
-                    reduced.ready_reason,
-                    reduced.last_checked_at,
-                    reduced.updated_at_ms,
-                    reduced.compiled_check,
-                    reduced.manifest_json,
-                    reduced.check_hash,
-                    reduced.check_cron,
-                    reduced.check_version.unwrap_or(0),
-                    reduced.check_status,
-                    reduced.check_failure_count,
-                    reduced.check_network_failure_count,
-                    reduced.check_quarantined_until,
-                    reduced.check_next_due_at,
-                    reduced.check_compiled_at,
-                    reduced.check_false_since_at,
-                    reduced.check_last_liveness_at,
-                    reduced.policy_version.unwrap_or(1),
-                    reduced.compiled_source_revision,
-                    reduced.compiled_project_path,
-                    row.claim.note_id,
+                    params![
+                        reduced.status,
+                        reduced.ready_at,
+                        reduced.ready_reason,
+                        reduced.last_checked_at,
+                        reduced.updated_at_ms,
+                        reduced.compiled_check,
+                        reduced.manifest_json,
+                        reduced.check_hash,
+                        reduced.check_cron,
+                        reduced.check_version.unwrap_or(0),
+                        reduced.check_status,
+                        reduced.check_failure_count,
+                        reduced.check_network_failure_count,
+                        reduced.check_quarantined_until,
+                        reduced.check_next_due_at,
+                        reduced.check_compiled_at,
+                        reduced.check_false_since_at,
+                        reduced.check_last_liveness_at,
+                        reduced.policy_version.unwrap_or(1),
+                        reduced.compiled_source_revision,
+                        reduced.compiled_project_path,
+                        row.claim.note_id,
+                        project,
+                        row.claim.state_version,
+                    ],
+                )?;
+                if changed == 0 {
+                    return stale(tx);
+                }
+                // Every response field is already known locally (the CAS above
+                // asserted `state_version = row.claim.state_version`), so no
+                // re-read of the row is needed.
+                let response_json = serde_json::json!({
+                    "result": "applied",
+                    "note_id": row.claim.note_id,
+                    "status": reduced.status,
+                    "state_version": row.claim.state_version + 1,
+                    "check_status": reduced.check_status,
+                })
+                .to_string();
+                coordinated
+                    .prepared
+                    .borrow_mut()
+                    .transaction_content("terminal_response", &response_json)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                mark_note_eval_claim_terminal_tx(
+                    tx,
                     project,
-                    row.claim.state_version,
-                ],
-            )?;
-            if changed == 0 {
-                return stale(tx);
-            }
-            // Every response field is already known locally (the CAS above
-            // asserted `state_version = row.claim.state_version`), so no
-            // re-read of the row is needed.
-            let response_json = serde_json::json!({
-                "result": "applied",
-                "note_id": row.claim.note_id,
-                "status": reduced.status,
-                "state_version": row.claim.state_version + 1,
-                "check_status": reduced.check_status,
+                    claim_id,
+                    "applied",
+                    Some(completion_id),
+                    &response_json,
+                    now_ms,
+                )?;
+                Ok(NoteEvalCompleteOutcome::Applied { response_json })
+            })()?;
+            Ok(if tx.total_changes() > before {
+                WriteDisposition::Applied(outcome)
+            } else {
+                WriteDisposition::Replay(outcome)
             })
-            .to_string();
-            mark_note_eval_claim_terminal_tx(
-                tx,
-                project,
-                claim_id,
-                "applied",
-                Some(completion_id),
-                &response_json,
-                now_ms,
-            )?;
-            Ok(NoteEvalCompleteOutcome::Applied { response_json })
         })
     }
 
@@ -13535,17 +16765,35 @@ impl McStore {
         evaluator_slot: i64,
         now_ms: i64,
     ) -> Result<NoteEvalAbandonOutcome, McStoreError> {
-        self.with_note_conn_fenced(project, |tx| {
+        let mut write = PreparedWrite::new(DurableWriteFamily::NoteEvaluationLedgers);
+        write.domain_owner(
+            "project",
+            project,
+            active_scan_owner_key(&["claim", claim_id]),
+        );
+        for (field_id, value) in [
+            ("project", project),
+            ("claim_id", claim_id),
+            ("evaluator_instance", evaluator_instance),
+        ] {
+            write.existing_identity(field_id, value)?;
+        }
+        self.with_prepared_note_conn_fenced(project, write, |coordinated| {
+            let tx = coordinated.tx();
             let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
-                return Ok(NoteEvalAbandonOutcome::UnknownClaim);
+                return Ok(WriteDisposition::Replay(
+                    NoteEvalAbandonOutcome::UnknownClaim,
+                ));
             };
             if let Some(kind) = row.terminal_kind {
-                return Ok(NoteEvalAbandonOutcome::Replayed { kind });
+                return Ok(WriteDisposition::Replay(NoteEvalAbandonOutcome::Replayed {
+                    kind,
+                }));
             }
             if row.claim.evaluator_instance != evaluator_instance
                 || row.claim.evaluator_slot != evaluator_slot
             {
-                return Ok(NoteEvalAbandonOutcome::Invalid);
+                return Ok(WriteDisposition::Replay(NoteEvalAbandonOutcome::Invalid));
             }
             mark_note_eval_claim_terminal_tx(
                 tx,
@@ -13556,7 +16804,7 @@ impl McStore {
                 &note_eval_kind_response("abandoned"),
                 now_ms,
             )?;
-            Ok(NoteEvalAbandonOutcome::Abandoned)
+            Ok(WriteDisposition::Applied(NoteEvalAbandonOutcome::Abandoned))
         })
     }
 }
@@ -13791,6 +17039,24 @@ mod tests {
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         McStore::test_descriptor(dir, "magic-context-test")
+    }
+
+    #[test]
+    fn preserved_json_identities_do_not_exempt_integrity_fields() {
+        let content = prepare_json_content_preserving_identities(
+            r#"{"content":"password=content-secret","block_id":"password=legacy-id"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            content,
+            r#"{"block_id":"password=legacy-id","content":"password=<REDACTED:password>"}"#
+        );
+        for field in ["password", "token", "signature", "integrity"] {
+            let input = format!(r#"{{"{field}":"password=protected-secret"}}"#);
+            let error = prepare_json_content_preserving_identities(&input).unwrap_err();
+            assert!(matches!(error, McStoreError::Redaction(_)), "{field}");
+            assert!(!error.to_string().contains("protected-secret"));
+        }
     }
 
     /// A "nothing happened" commit: every optional effect empty. Tests
@@ -14824,7 +18090,7 @@ mod tests {
                 block_id: "m1#0".to_string(),
                 kind: "message".to_string(),
                 token_count: 11,
-                source_bytes: b"message source".to_vec(),
+                source_bytes: b"password=tag-secret".to_vec(),
             },
             TagMintInput {
                 block_id: "m2#0".to_string(),
@@ -14844,13 +18110,13 @@ mod tests {
                 block_id: "m1#0".to_string(),
                 kind: "message".to_string(),
                 token_count: 999,
-                source_bytes: b"changed source must not overwrite".to_vec(),
+                source_bytes: vec![b'x'; 512 * 1024 + 1],
             },
             TagMintInput {
                 block_id: "m3#0".to_string(),
                 kind: "tool_call".to_string(),
                 token_count: 33,
-                source_bytes: b"new source".to_vec(),
+                source_bytes: b"password=new-tag-secret".to_vec(),
             },
         ];
         let rows = store.mint_or_get_tags("ses", &second, 200).unwrap();
@@ -14861,6 +18127,14 @@ mod tests {
         );
         let all = store.load_tags_for_session("ses").unwrap();
         assert_eq!(all.len(), 3);
+        assert_eq!(
+            all[0].source_bytes,
+            b"password=<REDACTED:password>".to_vec()
+        );
+        assert_eq!(
+            all[2].source_bytes,
+            b"password=<REDACTED:password>".to_vec()
+        );
         assert_eq!(store.tag_number_query_count_for_test(), 0);
         assert_eq!(
             store.load_tag_numbers_for_session("ses").unwrap(),
@@ -14925,7 +18199,7 @@ mod tests {
             "token count is computed once at mint"
         );
         assert_eq!(
-            all[0].source_bytes, b"message source",
+            all[0].source_bytes, b"password=<REDACTED:password>",
             "pre-overlay provenance is immutable after the first mint"
         );
         let token_sum_ids = ["m1#0".to_string(), "m3#0".to_string()]
@@ -16774,7 +20048,7 @@ mod tests {
                 primer_candidates: &[],
                 user_memory_candidates: &[],
                 publication_floor_ordinal: 21,
-                chunk_transcript: Some("U: hello\nA: world"),
+                chunk_transcript: Some("U: password=transcript-secret"),
                 raw_chunk_messages: None,
             })
             .unwrap();
@@ -16784,7 +20058,10 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].compartment_seq, 1);
-        assert_eq!(rows[0].transcript.as_deref(), Some("U: hello\nA: world"));
+        assert_eq!(
+            rows[0].transcript.as_deref(),
+            Some("U: password=<REDACTED:password>")
+        );
     }
 
     #[test]
@@ -16832,7 +20109,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_chunk_transcript_is_evicted_as_unrecoverable() {
+    fn oversized_chunk_transcript_is_rejected_before_publish() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         store
@@ -16845,7 +20122,7 @@ mod tests {
             compress_transcript(&transcript).unwrap().len() > MAX_CHUNK_TRANSCRIPT_COMPRESSED_BYTES
         );
         let expected = store.load("ses").unwrap().row_version;
-        store
+        let error = store
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
                 expected_row_version: expected,
@@ -16860,7 +20137,11 @@ mod tests {
                 chunk_transcript: Some(&transcript),
                 raw_chunk_messages: None,
             })
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianPublishError::Store(McStoreError::Redaction(RedactionErrorKind::InputLimit))
+        ));
         assert!(store
             .load_chunk_transcripts_for_range("ses", 10, 21)
             .unwrap()
@@ -16936,7 +20217,7 @@ mod tests {
             compartment_set_generation: replay_meta.historian.compartment_set_generation,
             ..publish_predicate()
         };
-        store
+        let error = store
             .publish_historian_chunk(HistorianPublishRequest {
                 session_id: "ses",
                 expected_row_version: expected,
@@ -16958,19 +20239,15 @@ mod tests {
                 chunk_transcript: Some(&oversized),
                 raw_chunk_messages: None,
             })
-            .unwrap();
-        let transcript = store
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianPublishError::Store(McStoreError::Redaction(RedactionErrorKind::InputLimit))
+        ));
+        assert!(store
             .load_chunk_transcripts_for_range("ses", 100, 101)
             .unwrap()
-            .pop()
-            .unwrap()
-            .transcript
-            .unwrap();
-        assert!(transcript.contains(CHUNK_TRANSCRIPT_TRUNCATION_MARKER.trim()));
-        assert!(
-            transcript.len()
-                <= MAX_CHUNK_TRANSCRIPT_INFLATED_BYTES + CHUNK_TRANSCRIPT_TRUNCATION_MARKER.len()
-        );
+            .is_empty());
     }
 
     #[test]
@@ -19041,6 +22318,39 @@ mod tests {
     }
 
     #[test]
+    fn note_evaluation_callback_errors_are_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let _note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-error", 0, 0);
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-error",
+                    "eval-a",
+                    0,
+                    50,
+                    |_, _| Err("password=callback-secret".to_string()),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict { kind: "invalid" }
+        );
+        let NoteEvalRenewOutcome::TerminalReplay {
+            response: Some(response),
+            ..
+        } = store
+            .renew_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 1, 60)
+            .unwrap()
+        else {
+            panic!("invalid callback result must be replayable");
+        };
+        assert!(response.contains("password=<REDACTED:password>"));
+        assert!(!response.contains("callback-secret"));
+    }
+
+    #[test]
     fn note_eval_edit_and_dismissal_fence_active_claims() {
         let dir = tempfile::tempdir().unwrap();
         let store = note_eval_store(dir.path());
@@ -19473,7 +22783,7 @@ mod shadow_tests {
                     "id": source_row_id,
                     "project_path": "project",
                     "session_id": format!("session-{source_row_id}"),
-                    "content": format!("note {source_row_id}"),
+                    "content": format!("note {source_row_id} password=seed-secret"),
                     "status": "active"
                 }),
             })
@@ -19508,6 +22818,12 @@ mod shadow_tests {
             state_before_retry,
             "re-seeding the same frame must be a no-op"
         );
+        assert!(store
+            .read_project_notes("project", None, &["active"], 20, 0)
+            .unwrap()
+            .iter()
+            .all(|note| note.content.contains("password=<REDACTED:password>")
+                && !note.content.contains("seed-secret")));
     }
 
     #[test]
@@ -20009,14 +23325,25 @@ mod lineage_descent_tests {
             .inner
             .with_conn(|conn| {
                 conn.execute(
-                    "INSERT INTO mc_tags
-                         (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
-                      VALUES ('A', 1, 'm2#0', 'message', 7, 1, X'61')",
+                    "UPDATE mc_notes SET content = 'password=legacy-note-secret' WHERE id = ?1",
+                    [source_note.id],
+                )?;
+                conn.execute(
+                    "UPDATE mc_compartments
+                        SET title = 'password=legacy-title-secret',
+                            content = 'password=legacy-content-secret'
+                      WHERE session_id = 'A'",
                     [],
                 )?;
                 conn.execute(
+                    "INSERT INTO mc_tags
+                         (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
+                      VALUES ('A', 1, 'm2#0', 'message', 7, 1, ?1)",
+                    params![b"password=legacy-tag-secret".as_slice()],
+                )?;
+                conn.execute(
                     "INSERT INTO mc_temporal_marks(session_id, block_id, marker_text, created_at)
-                     VALUES ('A', 'm2#0', '<!-- +1m -->', 1)",
+                     VALUES ('A', 'm2#0', 'password=legacy-marker-secret', 1)",
                     [],
                 )?;
                 conn.execute(
@@ -20024,7 +23351,7 @@ mod lineage_descent_tests {
                          session_id, compartment_seq, start_ordinal, end_ordinal,
                          transcript_deflate, created_at_ms
                      ) VALUES ('A', 1, 1, 3, ?1, 1)",
-                    params![compress_transcript("U: pre-compaction transcript").unwrap()],
+                    params![compress_transcript("U: password=legacy-transcript-secret").unwrap()],
                 )?;
                 Ok(())
             })
@@ -20080,17 +23407,38 @@ mod lineage_descent_tests {
                 conn.query_row(
                     "SELECT
                          (SELECT COUNT(*) FROM mc_tags WHERE session_id = 'B'),
-                         (SELECT COUNT(*) FROM mc_temporal_marks WHERE session_id = 'B')",
+                         (SELECT COUNT(*) FROM mc_temporal_marks WHERE session_id = 'B'),
+                         (SELECT CAST(source_bytes AS TEXT) FROM mc_tags WHERE session_id = 'B'),
+                         (SELECT marker_text FROM mc_temporal_marks WHERE session_id = 'B')",
                     [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
                 )
             })
             .unwrap();
-        assert_eq!(copied_markers, (1, 1));
+        assert_eq!(
+            copied_markers,
+            (
+                1,
+                1,
+                "password=<REDACTED:password>".to_string(),
+                "password=<REDACTED:password>".to_string(),
+            )
+        );
+        assert!(copied[..copied.len() - 1].iter().all(|row| {
+            row.title == "password=<REDACTED:password>"
+                && row.content == "password=<REDACTED:password>"
+        }));
         let inherited_notes = store.read_notes("git:project", "B", 10, 0).unwrap();
         assert_eq!(inherited_notes.len(), 1);
         assert_ne!(inherited_notes[0].id, source_note.id);
-        assert_eq!(inherited_notes[0].content, source_note.content);
+        assert_eq!(inherited_notes[0].content, "password=<REDACTED:password>");
         assert_eq!(
             inherited_notes[0].anchor_block_id.as_deref(),
             source_note.anchor_block_id.as_deref()
@@ -20099,7 +23447,7 @@ mod lineage_descent_tests {
         assert_eq!(transcript.len(), 1);
         assert_eq!(
             transcript[0].transcript.as_deref(),
-            Some("U: pre-compaction transcript")
+            Some("U: password=<REDACTED:password>")
         );
         assert_eq!(
             (transcript[0].start_ordinal, transcript[0].end_ordinal),

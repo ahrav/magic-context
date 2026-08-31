@@ -11,11 +11,14 @@ use mc_core::claim_operation::{
     canonical_json_encode, canonical_snapshot_vector, is_lower_hex, is_valid_public_claim_id,
     parse_revision_locator, sha256_hex_utf8, SnapshotVector, MAX_SAFE_INTEGER,
 };
+use mc_core::redaction::{label_for_secret_key, RedactionErrorKind, RedactionLabel};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::McStore;
+use crate::{
+    retire_active_scan_owner_kind, DurableWriteFamily, McStore, PreparedWrite, WriteDisposition,
+};
 
 /// Version of full-snapshot and receipt-group inputs accepted by this mirror.
 pub const CLAIM_MIRROR_VERSION: u32 = 1;
@@ -157,6 +160,7 @@ pub struct ClaimMirrorApplyResult {
 pub enum ClaimMirrorError {
     Store(cortexkit_store::StoreError),
     Invalid(String),
+    Redaction(mc_core::redaction::RedactionErrorKind),
     NotSeeded,
     IncarnationMismatch {
         expected: String,
@@ -186,6 +190,7 @@ impl std::fmt::Display for ClaimMirrorError {
         match self {
             Self::Store(error) => write!(f, "store: {error}"),
             Self::Invalid(reason) => write!(f, "invalid claim mirror input: {reason}"),
+            Self::Redaction(kind) => write!(f, "claim mirror durable text rejected: {kind:?}"),
             Self::NotSeeded => write!(f, "claim mirror has not been seeded"),
             Self::IncarnationMismatch { expected, found } => write!(
                 f,
@@ -228,6 +233,83 @@ impl From<cortexkit_store::StoreError> for ClaimMirrorError {
     fn from(error: cortexkit_store::StoreError) -> Self {
         Self::Store(error)
     }
+}
+
+impl From<crate::McStoreError> for ClaimMirrorError {
+    fn from(error: crate::McStoreError) -> Self {
+        match error {
+            crate::McStoreError::Redaction(kind) => Self::Redaction(kind),
+            _ => Self::Invalid("claim mirror preparation failed".to_string()),
+        }
+    }
+}
+
+fn prepare_claim_text(
+    write: &mut PreparedWrite,
+    claim: &CommittedClaimMirrorRow,
+) -> Result<(), ClaimMirrorError> {
+    write.identity("claim_content", &claim.content)?;
+    prepare_integrity_json(write, "claim_attributes", &claim.attributes)?;
+    prepare_integrity_json(write, "claim_applicability", &claim.applicability)?;
+    prepare_integrity_json(write, "claim_policy", &claim.policy)?;
+    if let Some(label) = &claim.provenance_label {
+        write.identity("provenance_label", label)?;
+    }
+    Ok(())
+}
+
+fn prepare_integrity_json(
+    write: &mut PreparedWrite,
+    field_id: &'static str,
+    value: &Value,
+) -> Result<(), ClaimMirrorError> {
+    fn collect_scan_text(value: &Value, scan_text: &mut String) -> Result<(), ClaimMirrorError> {
+        match value {
+            Value::String(value) => {
+                scan_text.push_str(value);
+                scan_text.push('\0');
+                Ok(())
+            }
+            Value::Array(values) => values
+                .iter()
+                .try_for_each(|value| collect_scan_text(value, scan_text)),
+            Value::Object(fields) => fields.iter().try_for_each(|(key, value)| {
+                let protected = match label_for_secret_key(key) {
+                    Some(RedactionLabel::Key) => {
+                        let normalized = key.to_ascii_lowercase();
+                        !matches!(normalized.as_str(), "key" | "keys")
+                    }
+                    Some(_) => true,
+                    None => false,
+                };
+                if protected {
+                    return Err(ClaimMirrorError::Redaction(
+                        RedactionErrorKind::SecretDetected,
+                    ));
+                }
+                scan_text.push_str(key);
+                scan_text.push('\0');
+                collect_scan_text(value, scan_text)
+            }),
+            Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+        }
+    }
+
+    let mut scan_text = String::new();
+    collect_scan_text(value, &mut scan_text)?;
+    write.identity(field_id, &scan_text)?;
+    Ok(())
+}
+
+fn read_claims_for_preparation(
+    store: &McStore,
+    incarnation: &str,
+) -> Result<BTreeSet<String>, ClaimMirrorError> {
+    Ok(store
+        .list_claim_mirror(incarnation, None)?
+        .into_iter()
+        .map(|claim| claim.public_claim_id)
+        .collect())
 }
 
 fn valid_project_id(project_id: i64) -> bool {
@@ -759,13 +841,56 @@ impl McStore {
         now_ms: i64,
     ) -> Result<(), ClaimMirrorError> {
         validate_snapshot(snapshot)?;
+        let (unresolved, control) = self
+            .inner
+            .with_conn(|conn| Ok((unresolved_claim_intents(conn)?, claim_intent_control(conn)?)))?;
+        if unresolved > 0 {
+            return Err(ClaimMirrorError::ResetBlocked {
+                unresolved: unresolved as usize,
+            });
+        }
+        if let Some((control_incarnation, _)) = control {
+            if control_incarnation != snapshot.vector.database_incarnation_id {
+                return Err(ClaimMirrorError::IncarnationMismatch {
+                    expected: control_incarnation,
+                    found: snapshot.vector.database_incarnation_id.clone(),
+                });
+            }
+        }
+        let mut write = PreparedWrite::new(DurableWriteFamily::ClaimMirror);
+        write.domain_owner(
+            "database",
+            &snapshot.vector.database_incarnation_id,
+            "claim_mirror",
+        );
+        write.identity("workspace_epoch", &snapshot.vector.workspace_epoch)?;
+        write.identity(
+            "database_incarnation_id",
+            &snapshot.vector.database_incarnation_id,
+        )?;
+        let existing_ids = self
+            .claim_mirror_state()?
+            .map(|state| read_claims_for_preparation(self, &state.database_incarnation_id))
+            .transpose()?
+            .unwrap_or_default();
+        for claim in &snapshot.claims {
+            prepare_claim_text(&mut write, claim)?;
+            if !existing_ids.contains(&claim.public_claim_id) {
+                write.identity("public_claim_id", &claim.public_claim_id)?;
+            } else {
+                write.existing_identity("public_claim_id", &claim.public_claim_id)?;
+            }
+        }
         let incarnation = &snapshot.vector.database_incarnation_id;
-        let outcome = self.inner.with_conn_fenced(|tx| {
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
             let unresolved = unresolved_claim_intents(tx)?;
             if unresolved > 0 {
-                return Ok(Err(ClaimMirrorError::ResetBlocked {
-                    unresolved: unresolved as usize,
-                }));
+                return Ok(WriteDisposition::Replay(Err(
+                    ClaimMirrorError::ResetBlocked {
+                        unresolved: unresolved as usize,
+                    },
+                )));
             }
             let existing: Option<String> = tx
                 .query_row(
@@ -777,10 +902,12 @@ impl McStore {
             let control = claim_intent_control(tx)?;
             if let Some((control_incarnation, _)) = control.as_ref() {
                 if control_incarnation != incarnation {
-                    return Ok(Err(ClaimMirrorError::IncarnationMismatch {
-                        expected: control_incarnation.clone(),
-                        found: incarnation.clone(),
-                    }));
+                    return Ok(WriteDisposition::Replay(Err(
+                        ClaimMirrorError::IncarnationMismatch {
+                            expected: control_incarnation.clone(),
+                            found: incarnation.clone(),
+                        },
+                    )));
                 }
             }
             if existing.is_some() {
@@ -801,18 +928,30 @@ impl McStore {
                     && checkpoints_match
                     && read_claims(tx, incarnation, None)? == expected_claims
                 {
-                    return Ok(Ok(()));
+                    return Ok(WriteDisposition::Replay(Ok(())));
                 }
                 if !matches!(control.as_ref(), Some((_, state)) if state == "resetting") {
-                    return Ok(Err(ClaimMirrorError::ResetRequired));
+                    return Ok(WriteDisposition::Replay(Err(
+                        ClaimMirrorError::ResetRequired,
+                    )));
                 }
             }
             if existing.is_none()
                 && matches!(control.as_ref(), Some((_, state)) if state == "draining")
             {
-                return Ok(Err(ClaimMirrorError::ResetRequired));
+                return Ok(WriteDisposition::Replay(Err(
+                    ClaimMirrorError::ResetRequired,
+                )));
             }
 
+            if let Some(existing_incarnation) = existing.as_deref() {
+                retire_active_scan_owner_kind(
+                    tx,
+                    "database",
+                    existing_incarnation,
+                    "claim_mirror",
+                )?;
+            }
             clear_claim_mirror(tx)?;
             tx.execute(
                 "INSERT INTO mc_claim_mirror_state(
@@ -854,7 +993,7 @@ impl McStore {
                     [now_ms],
                 )?;
             }
-            Ok(Ok(()))
+            Ok(WriteDisposition::Applied(Ok(())))
         })?;
         outcome
     }
@@ -866,9 +1005,36 @@ impl McStore {
         now_ms: i64,
     ) -> Result<ClaimMirrorApplyResult, ClaimMirrorError> {
         let group_digest = validate_group(group)?;
+        let existing_ids = self
+            .claim_mirror_state()?
+            .map(|state| read_claims_for_preparation(self, &state.database_incarnation_id))
+            .transpose()?
+            .unwrap_or_default();
+        let mut write = PreparedWrite::new(DurableWriteFamily::ClaimMirror);
+        write.domain_owner(
+            "database",
+            &group.vector.database_incarnation_id,
+            "claim_mirror",
+        );
+        write.existing_identity(
+            "database_incarnation_id",
+            &group.vector.database_incarnation_id,
+        )?;
+        write.existing_identity("workspace_epoch", &group.vector.workspace_epoch)?;
+        for effect in &group.effects {
+            if !existing_ids.contains(&effect.public_claim_id) {
+                write.identity("public_claim_id", &effect.public_claim_id)?;
+            } else {
+                write.existing_identity("public_claim_id", &effect.public_claim_id)?;
+            }
+            if let Some(claim) = &effect.claim {
+                prepare_claim_text(&mut write, claim)?;
+            }
+        }
         let incarnation = &group.vector.database_incarnation_id;
         let generation_vector_json = canonical_snapshot_vector(&group.vector)
             .map_err(|error| ClaimMirrorError::Invalid(error.to_string()))?;
+        write.identity("generation_vector", &generation_vector_json)?;
         let effect_count = i64::try_from(group.expected_effect_count).map_err(|_| {
             ClaimMirrorError::Invalid("receipt effect count exceeds SQLite i64".to_string())
         })?;
@@ -882,243 +1048,258 @@ impl McStore {
             .last()
             .ok_or_else(|| ClaimMirrorError::Invalid("receipt has no effects".to_string()))?
             .effect_id;
-        let outcome = self.inner.with_conn_fenced(|tx| {
-            let state: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT database_incarnation_id, workspace_epoch
+        let outcome = write.execute(&self.inner, |coordinated| {
+            let tx = coordinated.tx();
+            let outcome =
+                (|| -> rusqlite::Result<Result<ClaimMirrorApplyResult, ClaimMirrorError>> {
+                    let state: Option<(String, String)> = tx
+                        .query_row(
+                            "SELECT database_incarnation_id, workspace_epoch
                        FROM mc_claim_mirror_state WHERE id = 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            let Some((stored_incarnation, workspace_epoch)) = state else {
-                return Ok(Err(ClaimMirrorError::NotSeeded));
-            };
-            if stored_incarnation != *incarnation {
-                return Ok(Err(ClaimMirrorError::IncarnationMismatch {
-                    expected: stored_incarnation,
-                    found: incarnation.clone(),
-                }));
-            }
-            if workspace_epoch != group.vector.workspace_epoch {
-                return Ok(Err(ClaimMirrorError::Invalid(
-                    "receipt workspace epoch does not match mirror".to_string(),
-                )));
-            }
-            let control = claim_intent_control(tx)?;
-            if let Some((control_incarnation, state)) = control {
-                if control_incarnation != *incarnation {
-                    return Ok(Err(ClaimMirrorError::IncarnationMismatch {
-                        expected: control_incarnation,
-                        found: incarnation.clone(),
-                    }));
-                }
-                if state != "accepting" {
-                    return Ok(Err(ClaimMirrorError::ResetRequired));
-                }
-            }
+                            [],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    let Some((stored_incarnation, workspace_epoch)) = state else {
+                        return Ok(Err(ClaimMirrorError::NotSeeded));
+                    };
+                    if stored_incarnation != *incarnation {
+                        return Ok(Err(ClaimMirrorError::IncarnationMismatch {
+                            expected: stored_incarnation,
+                            found: incarnation.clone(),
+                        }));
+                    }
+                    if workspace_epoch != group.vector.workspace_epoch {
+                        return Ok(Err(ClaimMirrorError::Invalid(
+                            "receipt workspace epoch does not match mirror".to_string(),
+                        )));
+                    }
+                    let control = claim_intent_control(tx)?;
+                    if let Some((control_incarnation, state)) = control {
+                        if control_incarnation != *incarnation {
+                            return Ok(Err(ClaimMirrorError::IncarnationMismatch {
+                                expected: control_incarnation,
+                                found: incarnation.clone(),
+                            }));
+                        }
+                        if state != "accepting" {
+                            return Ok(Err(ClaimMirrorError::ResetRequired));
+                        }
+                    }
 
-            let replay: Option<String> = tx
-                .query_row(
-                    "SELECT group_digest FROM mc_claim_mirror_receipts
+                    let replay: Option<String> = tx
+                        .query_row(
+                            "SELECT group_digest FROM mc_claim_mirror_receipts
                       WHERE database_incarnation_id = ?1 AND receipt_id = ?2",
-                    params![incarnation, group.receipt_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(stored_digest) = replay {
-                return if stored_digest == group_digest {
-                    Ok(Ok(ClaimMirrorApplyResult {
-                        replayed: true,
-                        applied_effect_count: 0,
-                    }))
-                } else {
-                    Ok(Err(ClaimMirrorError::ReceiptConflict {
-                        receipt_id: group.receipt_id,
-                    }))
-                };
-            }
+                            params![incarnation, group.receipt_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(stored_digest) = replay {
+                        return if stored_digest == group_digest {
+                            Ok(Ok(ClaimMirrorApplyResult {
+                                replayed: true,
+                                applied_effect_count: 0,
+                            }))
+                        } else {
+                            Ok(Err(ClaimMirrorError::ReceiptConflict {
+                                receipt_id: group.receipt_id,
+                            }))
+                        };
+                    }
 
-            let stored_projects = read_project_states(tx, incarnation)?;
+                    let stored_projects = read_project_states(tx, incarnation)?;
 
-            let vector_projects = group
-                .vector
-                .project_generations
-                .keys()
-                .map(|key| {
-                    key.parse::<i64>()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)
-                })
-                .collect::<Result<BTreeSet<_>, _>>()?;
-            if vector_projects != stored_projects.keys().copied().collect() {
-                return Ok(Err(ClaimMirrorError::Invalid(
-                    "receipt generation vector project set does not match mirror".to_string(),
-                )));
-            }
-            let touched = group
-                .effects
-                .iter()
-                .map(|effect| effect.project_id)
-                .collect::<BTreeSet<_>>();
-            for (project_id, stored) in &stored_projects {
-                let key = project_id.to_string();
-                let found = group.vector.project_generations[&key];
-                let found_policy = group.vector.policy_generations[&key];
-                let increment = i64::from(touched.contains(project_id));
-                let expected = stored
-                    .project_generation
-                    .checked_add(increment)
-                    .ok_or(rusqlite::Error::InvalidQuery)?;
-                let expected_policy = stored
-                    .policy_generation
-                    .checked_add(increment)
-                    .ok_or(rusqlite::Error::InvalidQuery)?;
-                if found != expected {
-                    return Ok(Err(ClaimMirrorError::GenerationMismatch {
-                        project_id: *project_id,
-                        expected,
-                        found,
-                    }));
-                }
-                if found_policy != expected_policy {
-                    return Ok(Err(ClaimMirrorError::GenerationMismatch {
-                        project_id: *project_id,
-                        expected: expected_policy,
-                        found: found_policy,
-                    }));
-                }
-            }
+                    let vector_projects = group
+                        .vector
+                        .project_generations
+                        .keys()
+                        .map(|key| {
+                            key.parse::<i64>()
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        })
+                        .collect::<Result<BTreeSet<_>, _>>()?;
+                    if vector_projects != stored_projects.keys().copied().collect() {
+                        return Ok(Err(ClaimMirrorError::Invalid(
+                            "receipt generation vector project set does not match mirror"
+                                .to_string(),
+                        )));
+                    }
+                    let touched = group
+                        .effects
+                        .iter()
+                        .map(|effect| effect.project_id)
+                        .collect::<BTreeSet<_>>();
+                    for (project_id, stored) in &stored_projects {
+                        let key = project_id.to_string();
+                        let found = group.vector.project_generations[&key];
+                        let found_policy = group.vector.policy_generations[&key];
+                        let increment = i64::from(touched.contains(project_id));
+                        let expected = stored
+                            .project_generation
+                            .checked_add(increment)
+                            .ok_or(rusqlite::Error::InvalidQuery)?;
+                        let expected_policy = stored
+                            .policy_generation
+                            .checked_add(increment)
+                            .ok_or(rusqlite::Error::InvalidQuery)?;
+                        if found != expected {
+                            return Ok(Err(ClaimMirrorError::GenerationMismatch {
+                                project_id: *project_id,
+                                expected,
+                                found,
+                            }));
+                        }
+                        if found_policy != expected_policy {
+                            return Ok(Err(ClaimMirrorError::GenerationMismatch {
+                                project_id: *project_id,
+                                expected: expected_policy,
+                                found: found_policy,
+                            }));
+                        }
+                    }
 
-            let mut checkpoints = stored_projects
-                .iter()
-                .map(|(project_id, state)| (*project_id, state.acked_effect_id))
-                .collect::<BTreeMap<_, _>>();
-            for effect in &group.effects {
-                let expected = checkpoints[&effect.project_id];
-                if effect.previous_project_effect_id != expected {
-                    return Ok(Err(ClaimMirrorError::CheckpointMismatch {
-                        project_id: effect.project_id,
-                        expected,
-                        found: effect.previous_project_effect_id,
-                    }));
-                }
-                checkpoints.insert(effect.project_id, effect.effect_id);
-            }
+                    let mut checkpoints = stored_projects
+                        .iter()
+                        .map(|(project_id, state)| (*project_id, state.acked_effect_id))
+                        .collect::<BTreeMap<_, _>>();
+                    for effect in &group.effects {
+                        let expected = checkpoints[&effect.project_id];
+                        if effect.previous_project_effect_id != expected {
+                            return Ok(Err(ClaimMirrorError::CheckpointMismatch {
+                                project_id: effect.project_id,
+                                expected,
+                                found: effect.previous_project_effect_id,
+                            }));
+                        }
+                        checkpoints.insert(effect.project_id, effect.effect_id);
+                    }
 
-            for effect in &group.effects {
-                let existing: Option<(i64, String, i64)> = tx
-                    .query_row(
-                        "SELECT project_id, revision_locator, revision
+                    for effect in &group.effects {
+                        let existing: Option<(i64, String, i64)> = tx
+                            .query_row(
+                                "SELECT project_id, revision_locator, revision
                            FROM mc_claim_mirror_claims
                           WHERE database_incarnation_id = ?1 AND public_claim_id = ?2",
-                        params![incarnation, effect.public_claim_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .optional()?;
-                if let Some((project_id, locator, revision)) = existing.as_ref() {
-                    if *project_id != effect.project_id {
-                        return Ok(Err(ClaimMirrorError::Invalid(format!(
-                            "public claim {} changed projects",
-                            effect.public_claim_id
-                        ))));
-                    }
-                    let incoming_revision = parse_revision_locator(&effect.revision_locator)
-                        .ok_or(rusqlite::Error::InvalidQuery)?
-                        .revision;
-                    if incoming_revision < *revision {
-                        return Ok(Err(ClaimMirrorError::Invalid(format!(
-                            "public claim {} revision regressed",
-                            effect.public_claim_id
-                        ))));
-                    }
-                    // A revision locator embeds the content digest, so the same
-                    // revision arriving with a different locator means the same
-                    // revision carries different content. Without this the upsert
-                    // below would silently replace the stored content.
-                    if incoming_revision == *revision && locator != &effect.revision_locator {
-                        return Ok(Err(ClaimMirrorError::Invalid(format!(
-                            "public claim {} revision {} does not match the stored locator",
-                            effect.public_claim_id, incoming_revision
-                        ))));
-                    }
-                    if effect.claim.is_none() && locator != &effect.revision_locator {
-                        return Ok(Err(ClaimMirrorError::Invalid(format!(
-                            "revocation for {} does not match current revision",
-                            effect.public_claim_id
-                        ))));
-                    }
-                }
-                if let Some(claim) = &effect.claim {
-                    insert_claim(tx, incarnation, claim)?;
-                } else {
-                    tx.execute(
-                        "DELETE FROM mc_claim_mirror_claims
+                                params![incarnation, effect.public_claim_id],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                            )
+                            .optional()?;
+                        if let Some((project_id, locator, revision)) = existing.as_ref() {
+                            if *project_id != effect.project_id {
+                                return Ok(Err(ClaimMirrorError::Invalid(format!(
+                                    "public claim {} changed projects",
+                                    effect.public_claim_id
+                                ))));
+                            }
+                            let incoming_revision =
+                                parse_revision_locator(&effect.revision_locator)
+                                    .ok_or(rusqlite::Error::InvalidQuery)?
+                                    .revision;
+                            if incoming_revision < *revision {
+                                return Ok(Err(ClaimMirrorError::Invalid(format!(
+                                    "public claim {} revision regressed",
+                                    effect.public_claim_id
+                                ))));
+                            }
+                            // A revision locator embeds the content digest, so the same
+                            // revision arriving with a different locator means the same
+                            // revision carries different content. Without this the upsert
+                            // below would silently replace the stored content.
+                            if incoming_revision == *revision && locator != &effect.revision_locator
+                            {
+                                return Ok(Err(ClaimMirrorError::Invalid(format!(
+                                    "public claim {} revision {} does not match the stored locator",
+                                    effect.public_claim_id, incoming_revision
+                                ))));
+                            }
+                            if effect.claim.is_none() && locator != &effect.revision_locator {
+                                return Ok(Err(ClaimMirrorError::Invalid(format!(
+                                    "revocation for {} does not match current revision",
+                                    effect.public_claim_id
+                                ))));
+                            }
+                        }
+                        if let Some(claim) = &effect.claim {
+                            insert_claim(tx, incarnation, claim)?;
+                        } else {
+                            tx.execute(
+                                "DELETE FROM mc_claim_mirror_claims
                           WHERE database_incarnation_id = ?1
                             AND public_claim_id = ?2
                             AND revision_locator = ?3",
-                        params![incarnation, effect.public_claim_id, effect.revision_locator],
-                    )?;
-                }
-            }
+                                params![
+                                    incarnation,
+                                    effect.public_claim_id,
+                                    effect.revision_locator
+                                ],
+                            )?;
+                        }
+                    }
 
-            for project_id in &touched {
-                let key = project_id.to_string();
-                // Every retained row in a touched project takes the receipt's
-                // generations, not just the rows an effect names. The host stamps
-                // its full snapshot from the current vector, and row equality
-                // includes these fields, so leaving untouched rows on the previous
-                // generation makes the next full replacement compare unequal and
-                // return `ResetRequired`.
-                tx.execute(
-                    "UPDATE mc_claim_mirror_claims
+                    for project_id in &touched {
+                        let key = project_id.to_string();
+                        // Every retained row in a touched project takes the receipt's
+                        // generations, not just the rows an effect names. The host stamps
+                        // its full snapshot from the current vector, and row equality
+                        // includes these fields, so leaving untouched rows on the previous
+                        // generation makes the next full replacement compare unequal and
+                        // return `ResetRequired`.
+                        tx.execute(
+                            "UPDATE mc_claim_mirror_claims
                         SET project_generation = ?1, policy_generation = ?2
                       WHERE database_incarnation_id = ?3 AND project_id = ?4",
-                    params![
-                        group.vector.project_generations[&key],
-                        group.vector.policy_generations[&key],
-                        incarnation,
-                        project_id,
-                    ],
-                )?;
-                tx.execute(
-                    "UPDATE mc_claim_mirror_projects
+                            params![
+                                group.vector.project_generations[&key],
+                                group.vector.policy_generations[&key],
+                                incarnation,
+                                project_id,
+                            ],
+                        )?;
+                        tx.execute(
+                            "UPDATE mc_claim_mirror_projects
                         SET project_generation = ?1, policy_generation = ?2,
                             acked_effect_id = ?3
                       WHERE database_incarnation_id = ?4 AND project_id = ?5",
-                    params![
-                        group.vector.project_generations[&key],
-                        group.vector.policy_generations[&key],
-                        checkpoints[project_id],
-                        incarnation,
-                        project_id,
-                    ],
-                )?;
-            }
-            tx.execute(
-                "INSERT INTO mc_claim_mirror_receipts(
+                            params![
+                                group.vector.project_generations[&key],
+                                group.vector.policy_generations[&key],
+                                checkpoints[project_id],
+                                incarnation,
+                                project_id,
+                            ],
+                        )?;
+                    }
+                    tx.execute(
+                        "INSERT INTO mc_claim_mirror_receipts(
                     database_incarnation_id, receipt_id, expected_effect_count,
                     first_effect_id, last_effect_id, group_digest,
                     generation_vector_json, applied_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    incarnation,
-                    group.receipt_id,
-                    effect_count,
-                    first_effect_id,
-                    last_effect_id,
-                    group_digest,
-                    generation_vector_json,
-                    now_ms,
-                ],
-            )?;
-            tx.execute(
-                "UPDATE mc_claim_mirror_state SET updated_at_ms = ?1 WHERE id = 1",
-                [now_ms],
-            )?;
-            Ok(Ok(ClaimMirrorApplyResult {
-                replayed: false,
-                applied_effect_count: group.effects.len(),
-            }))
+                        params![
+                            incarnation,
+                            group.receipt_id,
+                            effect_count,
+                            first_effect_id,
+                            last_effect_id,
+                            group_digest,
+                            generation_vector_json,
+                            now_ms,
+                        ],
+                    )?;
+                    tx.execute(
+                        "UPDATE mc_claim_mirror_state SET updated_at_ms = ?1 WHERE id = 1",
+                        [now_ms],
+                    )?;
+                    Ok(Ok(ClaimMirrorApplyResult {
+                        replayed: false,
+                        applied_effect_count: group.effects.len(),
+                    }))
+                })()?;
+            Ok(match &outcome {
+                Ok(result) if !result.replayed => WriteDisposition::Applied(outcome),
+                _ => WriteDisposition::Replay(outcome),
+            })
         })?;
         outcome
     }
@@ -1144,6 +1325,21 @@ impl McStore {
                 .unwrap_or(false);
             if !resetting {
                 return Ok(Err(ClaimMirrorError::ResetRequired));
+            }
+            if let Some(database_incarnation_id) = tx
+                .query_row(
+                    "SELECT database_incarnation_id FROM mc_claim_mirror_state WHERE id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                retire_active_scan_owner_kind(
+                    tx,
+                    "database",
+                    &database_incarnation_id,
+                    "claim_mirror",
+                )?;
             }
             clear_claim_mirror(tx)?;
             Ok(Ok(()))
