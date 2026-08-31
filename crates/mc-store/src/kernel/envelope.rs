@@ -1,7 +1,9 @@
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
+use super::admission::{AdmissionKey, StoredAdmission};
 use super::redaction::{clear_owner, clear_owner_kind, identity, record, redact, RedactedField};
 use super::{map_sqlite, KernelError, KernelStore};
 use crate::current_time_ms;
@@ -157,6 +159,8 @@ pub struct Envelope<'tx> {
     pub(super) tx: &'tx Transaction<'tx>,
     pub(super) commit_seq: i64,
     pub(super) changes: Vec<PendingChange>,
+    pub(super) admission_ordinal: usize,
+    pub(super) admission_latest: HashMap<AdmissionKey, StoredAdmission>,
     poisoned: Option<KernelError>,
 }
 
@@ -456,6 +460,8 @@ impl KernelStore {
             tx: &tx,
             commit_seq,
             changes: Vec::new(),
+            admission_ordinal: 0,
+            admission_latest: HashMap::new(),
             poisoned: None,
         };
         let result = operation(&mut envelope)?;
@@ -1043,7 +1049,7 @@ fn insert_domain(
     Ok(())
 }
 
-fn object_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRow> {
+pub(super) fn object_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRow> {
     let sensitivity: String = row.get(9)?;
     Ok(ObjectRow {
         object_id: row.get(0)?,
