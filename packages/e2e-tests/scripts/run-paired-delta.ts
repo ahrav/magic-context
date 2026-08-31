@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
     FileRolloutStore,
@@ -53,16 +54,33 @@ function parseArgs(argv: string[]): CliArgs {
 
 /** A resume must not skip coordinates recorded by a different checkout: `bindingMatches` compares `repoCommit`, so a constant would let a post-change smoke report success without executing the changed code. commentlint: allow(JUDGE) */
 function smokeRepoCommit(): string {
-    const head = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: resolve(import.meta.dir, "..") });
-    if (head.exitCode !== 0) throw new Error("cannot resolve HEAD for the smoke records binding");
-    const commit = head.stdout.toString().trim();
-    const dirty = Bun.spawnSync(["git", "status", "--porcelain"], {
-        cwd: resolve(import.meta.dir, ".."),
+    const started = resolve(import.meta.dir, "..");
+    const at = (cwd: string) => (args: string[]): string => {
+        const run = Bun.spawnSync(["git", ...args], { cwd });
+        if (run.exitCode !== 0) {
+            throw new Error(`cannot resolve the smoke records binding: git ${args.join(" ")}`);
+        }
+        return run.stdout.toString();
+    };
+    /** Run from the worktree root: `git ls-files --others` and the paths `git status` prints are both relative to the working directory, so a package-local cwd would miss a change made anywhere else in the repository. commentlint: allow(JUDGE) */
+    const root = at(started)(["rev-parse", "--show-toplevel"]).trim();
+    const git = at(root);
+    const commit = git(["rev-parse", "HEAD"]).trim();
+    const status = git(["status", "--porcelain", "--untracked-files=all"]).trim();
+    if (status === "") return commit;
+    /** An uncommitted worktree shares its parent's commit, so the digest covers the working content itself: paths and status codes alone stay identical when a file's bytes change, and a resume would reuse records written before the edit. commentlint: allow(JUDGE) */
+    const untracked = git(["ls-files", "--others", "--exclude-standard", "-z"])
+        .split("\0")
+        .filter(Boolean);
+    const contents = untracked.map((path) => {
+        try {
+            return `${path}\n${readFileSync(resolve(root, path), "utf8")}`;
+        } catch {
+            /** An unreadable path still changes the digest through its own name. commentlint: allow(JUDGE) */
+            return `${path}\n<unreadable>`;
+        }
     });
-    if (dirty.exitCode !== 0) throw new Error("cannot resolve the worktree state");
-    /** An uncommitted worktree shares its parent's commit, so the digest keeps a resume from reusing records written before the edit. commentlint: allow(JUDGE) */
-    const pending = dirty.stdout.toString().trim();
-    if (pending === "") return commit;
+    const pending = [status, git(["diff", "HEAD"]), ...contents].join("\n");
     return `${commit}-dirty-${Bun.hash(pending).toString(16)}`;
 }
 

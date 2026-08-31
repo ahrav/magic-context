@@ -573,13 +573,13 @@ export async function runPairedDelta(
                     failure = error;
                 } finally {
                     if (handle) {
-                        try {
-                            await handle.dispose();
-                            disposed = true;
-                        } catch (error) {
+                        /** A `dispose()` that never settles would hold the run open with the paid record unwritten, so cleanup is bounded like a late handle's and a hang is reported as an unreclaimed harness rather than waited on. commentlint: allow(JUDGE) */
+                        const outcome = await settleDisposal(handle);
+                        if (outcome === "reclaimed") disposed = true;
+                        else {
                             /** A harness left running outranks whatever ended the rollout: the deadline only bounded this arm, while an unreclaimed harness threatens every arm after it. commentlint: allow(JUDGE) */
                             disposalFailed = true;
-                            failure ??= error;
+                            failure ??= outcome.error;
                         }
                     } else {
                         /** A handle that lost the creation race still owns a harness, so it is disposed when it arrives; nothing waits on it because a hung creation is what the deadline is for. commentlint: allow(JUDGE) */
@@ -687,11 +687,11 @@ export async function runPairedDelta(
     };
 }
 
-function canonicalizes(observed: unknown, expected: InterventionDescriptor): boolean {
+function interventionFingerprint(value: unknown): string | null {
     try {
-        return canonicalFingerprint(observed) === canonicalFingerprint(expected);
+        return canonicalFingerprint(value);
     } catch {
-        return false;
+        return null;
     }
 }
 
@@ -712,16 +712,19 @@ function completedRecord(
         observation.echoedProviderId === options.pinnedProviderId &&
         observation.echoedModelId === options.pinnedSnapshotId;
     /** The intervention comes back from the rollout adapter, so it can hold a value `canonicalFingerprint` refuses; a throw here would escape `runArm` after the provider call and lose the paid coordinate instead of recording it. commentlint: allow(JUDGE) */
+    const observedInterventionFingerprint = interventionFingerprint(observation.intervention);
     const declarationMatches = observation.baseScriptFingerprint === expectedFingerprint &&
-        canonicalizes(
-            observation.intervention,
-            expectedIntervention,
-        );
+        observedInterventionFingerprint !== null &&
+        observedInterventionFingerprint === interventionFingerprint(expectedIntervention);
     const usage = finiteUsage(observation.usage);
+    /** These gates decide whether the rollout counts as evidence, and a JSON-derived `"false"` is truthy, so a non-boolean would pass the exclusion it is supposed to trip. commentlint: allow(JUDGE) */
+    const gatesAreBoolean = typeof observation.absencePreconditionHeld === "boolean" &&
+        typeof observation.armIdentityMatches === "boolean" &&
+        typeof observation.claimedDone === "boolean";
     /** A harness that would not dispose may still be running and contaminating later arms, so its result cannot stand as evidence however well the rollout itself went. Non-finite usage is checked next because a cost derived from it would poison `spentUsd` for every later cap comparison. commentlint: allow(JUDGE) */
     let reasonCode: ReasonCode | null = disposalFailed
         ? "harness-failure"
-        : usage === null
+        : usage === null || !gatesAreBoolean
             ? "invalid-result"
             : !observation.absencePreconditionHeld
                 ? "absence-precondition-unmet"
@@ -762,7 +765,10 @@ function completedRecord(
         echoedProviderId: observation.echoedProviderId,
         echoedModelId: observation.echoedModelId,
         baseScriptFingerprint: observation.baseScriptFingerprint,
-        intervention: observation.intervention,
+        /** A descriptor the canonicalizer refuses is also one `JSON.stringify` refuses, and the store must be able to write this record: an unwritable malformed record loses the paid coordinate. It is never read as evidence, because only completed records reach the regret comparison. commentlint: allow(JUDGE) */
+        intervention: observedInterventionFingerprint === null
+            ? expectedIntervention
+            : observation.intervention,
         cell: {
             armId: coordinate.armId,
             checksPassed,
@@ -926,6 +932,27 @@ function coordinateKey(coordinate: RolloutCoordinate): string {
         coordinate.armId,
         coordinate.replicateIndex,
     ].join(":");
+}
+
+/** Resolves `"reclaimed"`, or the failure that prevented it, bounded by `LATE_DISPOSAL_GRACE_MS` so a `dispose()` that never settles cannot hold the run open. commentlint: allow(JUDGE) */
+async function settleDisposal(
+    handle: RolloutHandle,
+): Promise<"reclaimed" | { error: unknown }> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const grace = new Promise<{ error: unknown }>((resolve) => {
+        timer = setTimeout(
+            () => resolve({ error: new Error("harness disposal did not settle") }),
+            LATE_DISPOSAL_GRACE_MS,
+        );
+    });
+    try {
+        return await Promise.race([
+            handle.dispose().then(() => "reclaimed" as const, (error: unknown) => ({ error })),
+            grace,
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 /** Resolves false when a late handle could not be reclaimed. A creation that never settles is bounded by `LATE_DISPOSAL_GRACE_MS` because the deadline it already missed is the reason it is being abandoned. commentlint: allow(JUDGE) */

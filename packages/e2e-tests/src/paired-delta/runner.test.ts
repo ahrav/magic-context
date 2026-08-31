@@ -554,6 +554,86 @@ describe("paired-delta runner", () => {
         });
     });
 
+    it("reports an unreclaimed harness when disposal never settles", async () => {
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async run() {
+                            return observation(coordinate.armId);
+                        },
+                        async dispose() {
+                            // Never settles; the run must not wait on it forever.
+                            await new Promise<void>(() => {});
+                        },
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("harness-unreclaimed");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "crash",
+            reasonCode: "harness-failure",
+        });
+        // The paid record is still written rather than lost to the hang.
+        expect(result.records).toHaveLength(1);
+    }, 20_000);
+
+    it("persists a malformed rollout whose intervention cannot be serialized", async () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-unserializable-"));
+        try {
+            const path = join(root, "records.json");
+            const store = new FileRolloutStore(path);
+            const result = await runPairedDelta(
+                { ...options(), store },
+                dependencies((armId) => {
+                    const value = observation(armId);
+                    if (armId === "mc-off") {
+                        value.intervention = { kind: "none", value: 1n as unknown as null };
+                    }
+                    return value;
+                }),
+            );
+            const malformed = result.records.find(({ armId }) => armId === "mc-off");
+
+            expect(malformed?.cell).toMatchObject({
+                runHealth: "malformed",
+                reasonCode: "invalid-result",
+            });
+            // The store had to be able to write it, or the paid coordinate is
+            // repeated on the next resume.
+            expect(new FileRolloutStore(path).list().filter(({ armId }) => armId === "mc-off"))
+                .toHaveLength(1);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("refuses non-boolean observation gates", async () => {
+        for (const patch of [
+            { absencePreconditionHeld: "false" as unknown as boolean },
+            { armIdentityMatches: "false" as unknown as boolean },
+            { claimedDone: "yes" as unknown as boolean },
+        ]) {
+            const result = await runPairedDelta(
+                options(),
+                dependencies((armId) => {
+                    const value = observation(armId);
+                    if (armId === "mc-off") Object.assign(value, patch);
+                    return value;
+                }),
+            );
+
+            expect(result.records.find(({ armId }) => armId === "mc-off")?.cell).toMatchObject({
+                runHealth: "malformed",
+                reasonCode: "invalid-result",
+            });
+        }
+    });
+
     it("classifies a malformed check vector as an exclusion and continues", async () => {
         const result = await runPairedDelta(
             options(),
