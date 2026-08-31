@@ -359,6 +359,8 @@ export function estimateFamilyDeltas(input: {
 }
 
 function projectedDirection(analysis: FamilyDeltaAnalysis): Direction {
+    // A directional verdict requires the family minimum, so the gate holds for every consumer of `EstimatorOutcome` rather than for callers that recheck it.
+    if (!analysis.evidenceSufficient) return "no-change";
     // Opposite-signed resolved endpoints are a heterogeneous outcome, not an
     // impossible state, and project as "no-change".
     const resolved = analysis.endpoints.filter(({ resolution }) => resolution === "resolved");

@@ -284,6 +284,17 @@ describe("bound prospective estimator adapter", () => {
         expect(mixed.direction).toBe("no-change");
     });
 
+    it("never projects a direction on insufficient evidence", () => {
+        // Resolved positive endpoints plus a family minimum the cohort misses.
+        const analysis = estimate({
+            minimumAnalyzableFamilyCount: 6,
+            observations: observations.map((row) => ({ ...row, delta: Math.abs(row.delta) + 0.2 })),
+        });
+        expect(analysis.endpoints.some(({ interval }) => interval.lower > 0)).toBe(true);
+        expect(analysis.evidenceSufficient).toBe(false);
+        expect(adapter(analysis).analyze(pairs, H3).direction).toBe("no-change");
+    });
+
     it("reports the analysis gate verbatim", () => {
         const analysis = estimate({ minimumAnalyzableFamilyCount: 1 });
         expect(adapter(analysis).analyze(pairs, H3).evidenceSufficient)
