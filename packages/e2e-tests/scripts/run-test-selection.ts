@@ -107,6 +107,18 @@ export function dreamerEvalUnitFiles(root: string = E2E_ROOT): string[] {
     return files;
 }
 
+/** Credential-free paired-delta contract, runner, estimator, and pool tests. */
+export function pairedDeltaUnitFiles(root: string = E2E_ROOT): string[] {
+    const files = [
+        ...new Glob("src/paired-delta/**/*.test.ts").scanSync({
+            cwd: root,
+            onlyFiles: true,
+        }),
+    ].sort();
+    if (files.length === 0) throw new Error("paired delta unit selection is empty");
+    return files;
+}
+
 /**
  * Historian-eval tests that boot the TestHarness (`opencode serve` + mock
  * provider). TS-mode only: `mc-module`'s Rust historian producer does not
@@ -182,6 +194,7 @@ export function assertSrcTestsClassified(root: string = E2E_ROOT): void {
         ...historianEvalUnitFiles(root),
         ...metamorphicEvalUnitFiles(root),
         ...dreamerEvalUnitFiles(root),
+        ...pairedDeltaUnitFiles(root),
         ...standaloneUnitFiles(root),
         ...tsOpenCodeStandaloneFiles(root),
         ...rustStandaloneFiles(root),
@@ -241,6 +254,7 @@ const UNIT_SELECTIONS = {
     "--historian-eval-unit": historianEvalUnitFiles,
     "--metamorphic-eval-unit": metamorphicEvalUnitFiles,
     "--dreamer-eval-unit": dreamerEvalUnitFiles,
+    "--paired-delta-unit": pairedDeltaUnitFiles,
 } as const;
 
 type UnitSelectionFlag = keyof typeof UNIT_SELECTIONS;
@@ -300,7 +314,7 @@ export function parseArgs(args: string[]): CliArgs {
             maxConcurrency = value;
         } else if (arg === "--help" || arg === "-h") {
             console.log(
-                "Usage: run-test-selection.ts (--incident-unit | --prospective-unit | --historian-eval-unit | --metamorphic-eval-unit | --dreamer-eval-unit | --mode ts|rust [--harness all|opencode|pi]) [--timeout <ms>] [--max-concurrency <n>]",
+                "Usage: run-test-selection.ts (--incident-unit | --prospective-unit | --historian-eval-unit | --metamorphic-eval-unit | --dreamer-eval-unit | --paired-delta-unit | --mode ts|rust [--harness all|opencode|pi]) [--timeout <ms>] [--max-concurrency <n>]",
             );
             process.exit(0);
         } else {
@@ -309,7 +323,7 @@ export function parseArgs(args: string[]): CliArgs {
     }
     if (selection === null || selectionConflict) {
         throw new Error(
-            "select exactly one of --incident-unit, --prospective-unit, --historian-eval-unit, --metamorphic-eval-unit, --dreamer-eval-unit, or --mode",
+            "select exactly one of --incident-unit, --prospective-unit, --historian-eval-unit, --metamorphic-eval-unit, --dreamer-eval-unit, --paired-delta-unit, or --mode",
         );
     }
     if (selection.kind === "unit" && harness !== "all") {
