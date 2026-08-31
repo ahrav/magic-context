@@ -5731,3 +5731,135 @@ fn a_relabelled_latest_row_cannot_launder_an_earlier_classification() {
         );
     }
 }
+
+#[test]
+fn a_stored_automatic_token_does_not_override_derived_lineage_visibility() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // `visibility_row` derives `explicit_labeled` from candidate support, so this
+    // row withholds automatic serving however its `visibility` token reads.
+    connection
+        .execute(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,visibility,
+                 outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'approval-lineage-candidate',NULL,'fixture','approval',1,'explicit_user',
+                 'user_explicit','approve','candidate','candidate','active','automatic',
+                 'admit','normal',1,'fixture',1,2
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert!(
+        store
+            .visible_as_of(Surface::AutoInject, 1)
+            .unwrap()
+            .rows
+            .iter()
+            .all(|row| row.object.object_id != "approval"),
+        "candidate lineage support keeps the approval off automatic surfaces"
+    );
+
+    stage(&store, "promoted-by-candidate-lineage");
+    let mut approved = request("promoted-by-candidate-lineage");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("approval".to_string());
+    store
+        .commit(intent("promoted-by-candidate-lineage"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "candidate-lineage-domain".to_string(),
+                    object_id: "candidate-lineage-object".to_string(),
+                    name: "name-promoted-by-candidate-lineage".to_string(),
+                },
+            )?;
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='candidate-lineage-object'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_taint_sensitivity_floor_applies_to_lineage_rows_that_store_normal() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    seed_dependent_approval(directory.path());
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // `trusted_local_code`/`personal` is a legal pairing whose `sensitivity_floor` is
+    // `sensitive`, so the stored `normal` understates what the row carries. Naming an
+    // approval satisfies the support-backing test, leaving the floor as the only
+    // restriction this row still carries.
+    connection
+        .execute(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,visibility,
+                 outcome,sensitivity_class,policy_revision,reason,approval_object_id,
+                 commit_seq,decided_at
+             ) VALUES (
+                 'approval-lineage-personal',NULL,'fixture','approval',1,'trusted_local_code',
+                 'personal','code_observed','verified','verified','active','automatic',
+                 'admit','normal',1,'fixture','approval-b',1,2
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert!(
+        store
+            .visible_as_of(Surface::AutoInject, 1)
+            .unwrap()
+            .rows
+            .iter()
+            .all(|row| row.object.object_id != "approval"),
+        "the taint floor keeps the approval off automatic surfaces"
+    );
+
+    stage(&store, "promoted-by-personal-lineage");
+    let mut approved = request("promoted-by-personal-lineage");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("approval".to_string());
+    store
+        .commit(intent("promoted-by-personal-lineage"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "personal-lineage-domain".to_string(),
+                    object_id: "personal-lineage-object".to_string(),
+                    name: "name-promoted-by-personal-lineage".to_string(),
+                },
+            )?;
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='personal-lineage-object'"
+        ),
+        0
+    );
+}

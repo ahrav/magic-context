@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "c9be43a21a71d211fd2d0df9a9bb75f770e75d49c72a0da19bf0434681ba0493";
+    "6aa0938dcc5e4c81f37fbdd9652bf50600d46a48c64b70dda47e99a1d8ef1374";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -445,15 +445,47 @@ fn latest_lineage_decision_sql(alias: &str, commit_bound: &str) -> String {
     )
 }
 
+/// Ranks `expr` as `Sensitivity::restrictive` orders it. Unrecognized values rank 2.
+fn sensitivity_rank_sql(expr: &str) -> String {
+    format!(
+        "CASE {expr} WHEN '{normal}' THEN 0 WHEN '{sensitive}' THEN 1 ELSE 2 END",
+        normal = Sensitivity::Normal.as_str(),
+        sensitive = Sensitivity::Sensitive.as_str(),
+    )
+}
+
+/// Maps `alias.taint_class` to the class `sensitivity_floor` gives it.
+/// An unrecognized taint maps to the strictest class.
+fn taint_floor_class_sql(alias: &str) -> String {
+    let arms = TaintClass::ALL
+        .iter()
+        .map(|taint| {
+            format!(
+                "WHEN '{}' THEN '{}'",
+                taint.as_str(),
+                sensitivity_floor(*taint).as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "CASE {alias}.taint_class {arms} ELSE '{secret}' END",
+        secret = Sensitivity::Secret.as_str(),
+    )
+}
+
 /// Returns the strictest sensitivity from decisions visible at the snapshot.
+/// Each row contributes the greater of its stored class and its taint floor.
 /// An unrecognized class sorts strictest, so it fails closed.
 fn strictest_sensitivity_sql(commit_bound: &str) -> String {
     let lineage = same_lineage_as_object("h");
-    let normal = Sensitivity::Normal.as_str();
-    let sensitive = Sensitivity::Sensitive.as_str();
+    let floor_class = taint_floor_class_sql("h");
+    let stored_rank = sensitivity_rank_sql("h.sensitivity_class");
+    let floor_rank = sensitivity_rank_sql(&floor_class);
     format!(
         "(
-    SELECT h.sensitivity_class
+    SELECT CASE WHEN {floor_rank}>{stored_rank} THEN {floor_class}
+                ELSE h.sensitivity_class END
     FROM admission_decisions h
     WHERE (
             (h.subject_object_id=o.object_id AND h.commit_seq>=o.created_commit_seq)
@@ -462,8 +494,7 @@ fn strictest_sensitivity_sql(commit_bound: &str) -> String {
       AND {lineage}
       AND h.commit_seq IS NOT NULL
       {commit_bound}
-    ORDER BY CASE h.sensitivity_class
-                 WHEN '{normal}' THEN 0 WHEN '{sensitive}' THEN 1 ELSE 2 END DESC
+    ORDER BY MAX({floor_rank},{stored_rank}) DESC
     LIMIT 1
 )"
     )
@@ -609,6 +640,7 @@ fn non_restrictive_row_fields(alias: &str) -> String {
     let effective = maturity_rank_sql(&format!("{alias}.effective_maturity"));
     let historical = maturity_rank_sql(&format!("{alias}.maturity"));
     let ceiling = automatic_ceiling_rank_sql(alias);
+    let verified = Maturity::Verified.rank();
     format!(
         "{alias}.disposition='active'
    AND {alias}.visibility='automatic'
@@ -616,6 +648,7 @@ fn non_restrictive_row_fields(alias: &str) -> String {
    AND {alias}.policy_revision={POLICY_REVISION}
    AND {pairs}
    AND {effective}<={historical}
+   AND {effective}>={verified}
    AND ({effective}<={ceiling} OR {alias}.approval_object_id IS NOT NULL)"
     )
 }
