@@ -1,0 +1,20 @@
+[package]
+name = "mc-secret-scanner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+publish = false
+license = "MIT"
+description = "Private direct-text secret scanner for Magic Context"
+
+[dependencies]
+aho-corasick = "1"
+memchr = "2"
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_norway = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.7"

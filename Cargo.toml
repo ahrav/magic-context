@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mc-core", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer", "crates/mc-shm-transport", "packages/mc-shm-native"]
+members = ["crates/mc-core", "crates/mc-secret-scanner", "crates/mc-store", "crates/mc-host", "crates/mc-module", "crates/mc-tokenizer", "crates/mc-shm-transport", "packages/mc-shm-native"]
 # Exclude docs/evidence/subc-surface-probe because it uses published subc crates from crates.io rather than sibling sources.
 # Exclude crates/mc-shm-transport/fuzz because it declares its own [workspace].
 exclude = ["docs/evidence/subc-surface-probe", "crates/mc-shm-transport/fuzz"]
@@ -14,6 +14,7 @@ cortexkit-lease = { path = "../commons/crates/cortexkit-lease" }
 
 # Internal crates.
 mc-core = { path = "crates/mc-core" }
+mc-secret-scanner = { path = "crates/mc-secret-scanner" }
 mc-store = { path = "crates/mc-store" }
 
 # Pin rusqlite to cortexkit-store's version and features so Connection and Transaction types unify across with_conn.
@@ -28,6 +29,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 rusqlite = { version = "0.39", features = ["bundled"] }
 regex = "1"
 sha2 = "0.10"
+serde_norway = "0.9.42"
 semver = "1"
 # `default-features = false` excludes network transports, credential helpers, and filter-driver command execution from the dependency graph.
 gix = { version = "0.87", default-features = false, features = ["revision", "status", "sha1", "parallel"] }

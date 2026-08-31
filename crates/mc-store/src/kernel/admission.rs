@@ -3,7 +3,7 @@ use super::envelope::{
 };
 use super::object_write;
 use super::redaction::{identity, record, redact};
-use super::{map_sqlite, KernelError, Sensitivity};
+use super::{map_sqlite, KernelError, KernelStore, Sensitivity};
 use crate::current_time_ms;
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "ca04cce59998b992c65f31d4e2c2281b72e224853b6aa656058d6df2673a50d8";
+    "6aa0938dcc5e4c81f37fbdd9652bf50600d46a48c64b70dda47e99a1d8ef1374";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -169,6 +169,20 @@ pub struct AdmissionDecision {
     pub visibility: VisibilityRow,
     pub sensitivity: Sensitivity,
     pub outcome: Outcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleRow {
+    pub object: ObjectRow,
+    pub visibility: SurfaceVisibility,
+    pub labeled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleAsOf {
+    pub known_as_of: i64,
+    pub tip: i64,
+    pub rows: Vec<VisibleRow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,6 +403,161 @@ struct PreparedDecision {
     evaluation: Evaluation,
 }
 
+// policy-digest:serving-start
+/// The enclosing query must bind `o` to `object_registry`.
+/// The latest decision about the object itself. An object serves only on
+/// standing it earned, so this is a requirement, not a contribution. A decision
+/// older than the object cannot be about it, whatever it names.
+fn latest_own_decision_sql(alias: &str, commit_bound: &str) -> String {
+    let lineage = same_lineage_as_object(alias);
+    format!(
+        "(
+    SELECT {alias}.admission_decision_id
+    FROM admission_decisions {alias}
+    WHERE {alias}.subject_object_id=o.object_id
+      AND {lineage}
+      AND {alias}.commit_seq IS NOT NULL
+      AND {alias}.commit_seq>=o.created_commit_seq
+      {commit_bound}
+    ORDER BY {alias}.commit_seq DESC,{alias}.admission_decision_id DESC
+    LIMIT 1
+)"
+    )
+}
+
+/// The enclosing query must bind `o` to `object_registry`.
+/// The latest source-scoped decision for an object's lineage. A rejection here
+/// binds every object on the lineage, including one whose own later decision
+/// would otherwise serve.
+fn latest_lineage_decision_sql(alias: &str, commit_bound: &str) -> String {
+    let lineage = same_lineage_as_object(alias);
+    format!(
+        "(
+    SELECT {alias}.admission_decision_id
+    FROM admission_decisions {alias}
+    WHERE {alias}.subject_object_id IS NULL
+      AND {lineage}
+      AND {alias}.commit_seq IS NOT NULL
+      {commit_bound}
+    ORDER BY {alias}.commit_seq DESC,{alias}.admission_decision_id DESC
+    LIMIT 1
+)"
+    )
+}
+
+/// Ranks `expr` as `Sensitivity::restrictive` orders it. Unrecognized values rank 2.
+fn sensitivity_rank_sql(expr: &str) -> String {
+    format!(
+        "CASE {expr} WHEN '{normal}' THEN 0 WHEN '{sensitive}' THEN 1 ELSE 2 END",
+        normal = Sensitivity::Normal.as_str(),
+        sensitive = Sensitivity::Sensitive.as_str(),
+    )
+}
+
+/// Maps `alias.taint_class` to the class `sensitivity_floor` gives it.
+/// An unrecognized taint maps to the strictest class.
+fn taint_floor_class_sql(alias: &str) -> String {
+    let arms = TaintClass::ALL
+        .iter()
+        .map(|taint| {
+            format!(
+                "WHEN '{}' THEN '{}'",
+                taint.as_str(),
+                sensitivity_floor(*taint).as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "CASE {alias}.taint_class {arms} ELSE '{secret}' END",
+        secret = Sensitivity::Secret.as_str(),
+    )
+}
+
+/// Returns the strictest sensitivity from decisions visible at the snapshot.
+/// Each row contributes the greater of its stored class and its taint floor.
+/// An unrecognized class sorts strictest, so it fails closed.
+fn strictest_sensitivity_sql(commit_bound: &str) -> String {
+    let lineage = same_lineage_as_object("h");
+    let floor_class = taint_floor_class_sql("h");
+    let stored_rank = sensitivity_rank_sql("h.sensitivity_class");
+    let floor_rank = sensitivity_rank_sql(&floor_class);
+    format!(
+        "(
+    SELECT CASE WHEN {floor_rank}>{stored_rank} THEN {floor_class}
+                ELSE h.sensitivity_class END
+    FROM admission_decisions h
+    WHERE (
+            (h.subject_object_id=o.object_id AND h.commit_seq>=o.created_commit_seq)
+            OR h.subject_object_id IS NULL
+          )
+      AND {lineage}
+      AND h.commit_seq IS NOT NULL
+      {commit_bound}
+    ORDER BY MAX({floor_rank},{stored_rank}) DESC
+    LIMIT 1
+)"
+    )
+}
+
+/// Ranks `column` as `Maturity::rank` does. Unrecognized values rank 99.
+fn maturity_rank_sql(column: &str) -> String {
+    let arms = Maturity::ALL
+        .iter()
+        .map(|maturity| format!("WHEN '{}' THEN {}", maturity.as_str(), maturity.rank()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("CASE {column} {arms} ELSE 99 END")
+}
+
+/// A pairing outside `source_allows_taint` ranks -1.
+fn automatic_ceiling_rank_sql(alias: &str) -> String {
+    let arms = SourceClass::ALL
+        .iter()
+        .flat_map(|source| {
+            TaintClass::ALL
+                .iter()
+                .filter(|taint| source_allows_taint(*source, **taint))
+                .map(move |taint| {
+                    format!(
+                        "WHEN ('{}','{}') THEN {}",
+                        source.as_str(),
+                        taint.as_str(),
+                        automatic_ceiling(*source, *taint).rank()
+                    )
+                })
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("CASE ({alias}.source_class,{alias}.taint_class) {arms} ELSE -1 END")
+}
+
+/// Returns whether a same-lineage object decision differs from `latest` in source
+/// or taint class, or has an effective maturity above its recorded maturity.
+fn own_history_inconsistent_sql(latest: &str, commit_bound: &str) -> String {
+    let lineage = same_lineage_as_object("p");
+    let effective = maturity_rank_sql("p.effective_maturity");
+    let historical = maturity_rank_sql("p.maturity");
+    format!(
+        "EXISTS(
+    SELECT 1
+    FROM admission_decisions p
+    WHERE p.subject_object_id=o.object_id
+      AND {lineage}
+      AND p.commit_seq IS NOT NULL
+      AND p.commit_seq>=o.created_commit_seq
+      {commit_bound}
+      AND (
+            p.source_class<>{latest}.source_class
+         OR p.taint_class<>{latest}.taint_class
+         OR {effective}>{historical}
+          )
+)"
+    )
+}
+
+// policy-digest:serving-end
+
 // policy-digest:authority-start
 /// Each approval may support at most 1,024 distinct subjects.
 const MAX_APPROVAL_DEPENDENTS: usize = 1_024;
@@ -421,6 +590,10 @@ const APPROVAL_OBJECT_PREDICATE: &str = "o.object_kind='decision'
    AND d.decision_kind='adr_accepted'
    AND d.invalidated_commit_seq IS NULL";
 
+/// Accepted decision objects one lineage may hold before a candidate-scoped
+/// decision refuses to write rather than leave an unbounded cascade unproven.
+const MAX_LINEAGE_AUTHORITY_BEARERS: usize = 64;
+
 /// Longest authority chain [`validate_approval`] walks, counted in hops from the
 /// approval to its root. A chain of this many hops holds this many plus one members,
 /// which is what the walk's row count is compared against.
@@ -434,27 +607,102 @@ const APPROVAL_OBJECT_PREDICATE: &str = "o.object_kind='decision'
 /// only stops a pathological graph from making validation unbounded.
 const MAX_AUTHORITY_CHAIN_DEPTH: usize = 64;
 
-/// Whether the object named by `?1` qualifies as a live approval in its own right.
-/// Used per chain member, so it takes the id from the enclosing row rather than a
-/// bound parameter.
+/// Ties a decision to the registry row's lineage. The enclosing query must bind
+/// `o` to `object_registry`; `alias` binds the decision side.
+fn same_lineage_as_object(alias: &str) -> String {
+    format!(
+        "{alias}.source_kind=o.source_kind
+      AND {alias}.source_id=o.source_id
+      AND {alias}.source_revision=o.source_revision"
+    )
+}
+
+/// Derives allowed pairs from `source_allows_taint` to prevent SQL policy drift.
+fn allowed_classification_pairs(alias: &str) -> String {
+    let pairs = SourceClass::ALL
+        .iter()
+        .flat_map(|source| {
+            TaintClass::ALL
+                .iter()
+                .filter(|taint| source_allows_taint(*source, **taint))
+                .map(move |taint| format!("('{}','{}')", source.as_str(), taint.as_str()))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("({alias}.source_class,{alias}.taint_class) IN (VALUES {pairs})")
+}
+
+/// What a lineage decision must look like to leave an object's own standing
+/// intact. It only has to withhold nothing; carrying authority is the own row's
+/// job. `alias` binds it to `admission_decisions`.
+fn non_restrictive_row_fields(alias: &str) -> String {
+    let pairs = allowed_classification_pairs(alias);
+    let effective = maturity_rank_sql(&format!("{alias}.effective_maturity"));
+    let historical = maturity_rank_sql(&format!("{alias}.maturity"));
+    let ceiling = automatic_ceiling_rank_sql(alias);
+    let verified = Maturity::Verified.rank();
+    format!(
+        "{alias}.disposition='active'
+   AND {alias}.visibility='automatic'
+   AND {alias}.sensitivity_class='normal'
+   AND {alias}.policy_revision={POLICY_REVISION}
+   AND {pairs}
+   AND {effective}<={historical}
+   AND {effective}>={verified}
+   AND ({effective}<={ceiling} OR {alias}.approval_object_id IS NOT NULL)"
+    )
+}
+
+fn approval_row_fields(alias: &str) -> String {
+    format!(
+        "{alias}.taint_class='user_explicit'
+   AND {alias}.source_class='explicit_user'
+   AND {alias}.maturity IN ('approved','enforced')
+   AND {alias}.effective_maturity IN ('approved','enforced')
+   AND ({alias}.maturity='enforced' OR {alias}.effective_maturity='approved')
+   AND {alias}.disposition='active'
+   AND {alias}.visibility='automatic'
+   AND {alias}.sensitivity_class='normal'
+   AND {alias}.policy_revision={POLICY_REVISION}
+"
+    )
+}
+
+/// Whether the object named by `object_column` qualifies as a live approval in its
+/// own right. Used per chain member, so it takes the id from the enclosing row
+/// rather than a bound parameter.
 fn approval_qualifies_predicate(object_column: &str) -> String {
+    let own = latest_own_decision_sql("own", "");
+    let lineage = latest_lineage_decision_sql("lin", "");
+    let own_fields = approval_row_fields("a");
+    let lineage_fields = non_restrictive_row_fields("l");
+    let history_sensitivity = strictest_sensitivity_sql("");
+    let own_history_inconsistent = own_history_inconsistent_sql("a", "");
     format!(
         "EXISTS(
              SELECT 1
              FROM object_registry o
              JOIN decisions d ON d.object_id=o.object_id
-             JOIN admission_decisions a ON a.subject_object_id=o.object_id
+             JOIN admission_decisions a ON a.admission_decision_id={own}
              WHERE o.object_id={object_column} AND {APPROVAL_OBJECT_PREDICATE}
-               AND a.taint_class='user_explicit'
-               AND a.effective_maturity IN ('approved','enforced')
-               AND a.disposition='active'
-               AND a.visibility='automatic'
-               AND a.policy_revision={POLICY_REVISION}
-               AND a.commit_seq IS NOT NULL
-               AND {LATEST_SUBJECT_DECISION_PREDICATE}
+               AND {own_fields}
+               AND o.sensitivity_class='normal'
+               AND COALESCE({history_sensitivity},'secret')='normal'
+               AND NOT {own_history_inconsistent}
+               AND (
+                   NOT EXISTS(
+                       SELECT 1 FROM admission_decisions l
+                       WHERE l.admission_decision_id={lineage}
+                   )
+                   OR EXISTS(
+                       SELECT 1 FROM admission_decisions l
+                       WHERE l.admission_decision_id={lineage} AND {lineage_fields}
+                   )
+               )
          )"
     )
 }
+
 // policy-digest:authority-end
 
 impl Envelope<'_> {
@@ -549,10 +797,14 @@ impl Envelope<'_> {
             return Err(KernelError::AdmissionPolicy);
         }
         let subject_object_id = request.subject_object_id.clone();
+        let candidate_id = request.candidate_id.clone();
         let reason = request.event.reason.clone();
-        self.with_authority_cascade(subject_object_id.as_deref(), &reason, |envelope| {
-            envelope.apply_admission(request)
-        })
+        self.with_authority_cascade(
+            subject_object_id.as_deref(),
+            candidate_id.as_deref(),
+            &reason,
+            |envelope| envelope.apply_admission(request),
+        )
     }
 
     /// Writes a decision and, when it costs the subject the authority it held,
@@ -561,15 +813,64 @@ impl Envelope<'_> {
     fn with_authority_cascade(
         &mut self,
         subject_object_id: Option<&str>,
+        candidate_id: Option<&str>,
         reason: &str,
         write: impl FnOnce(&mut Self) -> Result<AdmissionDecision, KernelError>,
     ) -> Result<AdmissionDecision, KernelError> {
-        let granted_before = self.subject_grants_authority(subject_object_id)?;
+        // A candidate-scoped decision names no subject, but authority is judged
+        // against the governing decision of a lineage, so writing one can unseat
+        // every accepted decision object that shares it.
+        let bearers = match (subject_object_id, candidate_id) {
+            (Some(subject), _) if self.subject_grants_authority(Some(subject))? => {
+                vec![subject.to_string()]
+            }
+            (Some(_), _) | (None, None) => Vec::new(),
+            (None, Some(candidate)) => self.lineage_authority_bearers(candidate)?,
+        };
         let decision = write(self)?;
-        if granted_before {
-            self.demote_dependents_if_authority_lost(subject_object_id, reason)?;
+        for bearer in &bearers {
+            self.demote_dependents_if_authority_lost(Some(bearer), reason)?;
         }
         Ok(decision)
+    }
+
+    /// Accepted decision objects on a candidate's lineage that hold authority now.
+    /// Collected before the write so the comparison after it is against what was
+    /// actually granted.
+    fn lineage_authority_bearers(&self, candidate_id: &str) -> Result<Vec<String>, KernelError> {
+        let facts = load_candidate_facts(self, candidate_id)?;
+        let mut statement = self
+            .tx
+            .prepare(&format!(
+                "SELECT o.object_id
+                 FROM object_registry o
+                 JOIN decisions d ON d.object_id=o.object_id
+                 WHERE o.source_kind=?1 AND o.source_id=?2 AND o.source_revision=?3
+                   AND {APPROVAL_OBJECT_PREDICATE}
+                 ORDER BY o.object_id
+                 LIMIT {limit}",
+                limit = MAX_LINEAGE_AUTHORITY_BEARERS + 1
+            ))
+            .map_err(map_sqlite)?;
+        let candidates = statement
+            .query_map(
+                params![facts.source_kind, facts.source_id, facts.source_revision],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_sqlite)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_sqlite)?;
+        if candidates.len() > MAX_LINEAGE_AUTHORITY_BEARERS {
+            return Err(KernelError::AdmissionPolicy);
+        }
+        drop(statement);
+        let mut bearers = Vec::new();
+        for object_id in candidates {
+            if self.subject_grants_authority(Some(&object_id))? {
+                bearers.push(object_id);
+            }
+        }
+        Ok(bearers)
     }
 
     /// Most subjects are not decision objects, and the chain walk cannot make one an
@@ -652,14 +953,21 @@ impl Envelope<'_> {
         ) {
             return Err(KernelError::AdmissionPolicy);
         }
+        let reason = request.event.reason.clone();
         let prepared = self.prepare_admission(request)?;
-        if prepared.facts.candidate_id().is_none() {
-            return Err(KernelError::AdmissionPolicy);
-        }
+        let candidate_id = prepared
+            .facts
+            .candidate_id()
+            .ok_or(KernelError::AdmissionPolicy)?
+            .to_string();
         if prepared.evaluation.outcome == Outcome::Deny
             || prepared.evaluation.disposition != Disposition::Active
         {
-            return self.write_admission(prepared, None);
+            // This write materializes nothing, so its decision stays candidate-scoped
+            // and can unseat an accepted decision sharing the lineage.
+            return self.with_authority_cascade(None, Some(&candidate_id), &reason, |envelope| {
+                envelope.write_admission(prepared, None)
+            });
         }
         if prepared.facts.candidate_kind.as_deref() != Some("domain")
             || prepared.facts.candidate_payload.as_deref() != Some(domain.name.as_str())
@@ -743,7 +1051,7 @@ impl Envelope<'_> {
                 .kind = "replace";
         }
         let reason = prepared.event.reason.clone();
-        self.with_authority_cascade(Some(&replaced_object_id), &reason, |envelope| {
+        self.with_authority_cascade(Some(&replaced_object_id), None, &reason, |envelope| {
             envelope.write_admission(prepared, None)
         })
     }
@@ -1329,6 +1637,9 @@ fn load_subject_facts(
         .ok_or(KernelError::NotFound)
 }
 
+/// Object subjects include source history because `visible_as_of` evaluates both
+/// histories. Skipping source history lets a later object decision override a
+/// newer source rejection and restore visibility. commentlint: allow(JUDGE)
 fn load_prior_decision(
     envelope: &Envelope<'_>,
     facts: &SubjectFacts,
@@ -1658,6 +1969,245 @@ fn validate_trigger(
     }
 }
 
+// policy-digest:serving-start
+/// Column names for one decision's group in the serving read, so `decided_row`
+/// does not rebuild them per row.
+struct DecidedColumns {
+    maturity: &'static str,
+    effective_maturity: &'static str,
+    disposition: &'static str,
+    visibility: &'static str,
+    taint_class: &'static str,
+    source_class: &'static str,
+    sensitivity_class: &'static str,
+    policy_revision: &'static str,
+    approval_object_id: &'static str,
+}
+
+const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
+    maturity: "d_maturity",
+    effective_maturity: "d_effective_maturity",
+    disposition: "d_disposition",
+    visibility: "d_visibility",
+    taint_class: "d_taint_class",
+    source_class: "d_source_class",
+    sensitivity_class: "d_sensitivity_class",
+    policy_revision: "d_policy_revision",
+    approval_object_id: "d_approval_object_id",
+};
+
+const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
+    maturity: "s_maturity",
+    effective_maturity: "s_effective_maturity",
+    disposition: "s_disposition",
+    visibility: "s_visibility",
+    taint_class: "s_taint_class",
+    source_class: "s_source_class",
+    sensitivity_class: "s_sensitivity_class",
+    policy_revision: "s_policy_revision",
+    approval_object_id: "s_approval_object_id",
+};
+
+/// The strongest surface a single stored decision can justify, its sensitivity
+/// ceiling, and whether the row could be interpreted at all. `None` when the
+/// decision is absent.
+fn decided_row(
+    row: &rusqlite::Row<'_>,
+    columns: &DecidedColumns,
+) -> rusqlite::Result<Option<(VisibilityRow, Sensitivity, bool)>> {
+    let accepted_decision = row.get::<_, bool>("accepted_decision")?;
+    let Some(revision) = row.get::<_, Option<i64>>(columns.policy_revision)? else {
+        return Ok(None);
+    };
+    let taint = row
+        .get::<_, Option<String>>(columns.taint_class)?
+        .and_then(|value| TaintClass::try_from(value.as_str()).ok());
+    let source = row
+        .get::<_, Option<String>>(columns.source_class)?
+        .and_then(|value| SourceClass::try_from(value.as_str()).ok());
+    let sensitivity = Sensitivity::from_stored(
+        &row.get::<_, Option<String>>(columns.sensitivity_class)?
+            .unwrap_or_default(),
+    );
+    // A newer revision may attach meanings this binary cannot see, and a pairing
+    // the evaluator forbids can only be corruption or an out-of-band write.
+    let interpretable = revision <= POLICY_REVISION
+        && match (source, taint) {
+            (Some(source), Some(taint)) => source_allows_taint(source, taint),
+            _ => false,
+        };
+    if !interpretable {
+        return Ok(Some((VisibilityRow::AuditOnly, Sensitivity::Secret, false)));
+    }
+    let floor = taint.map_or(Sensitivity::Secret, sensitivity_floor);
+    let stored = row
+        .get::<_, Option<String>>(columns.visibility)?
+        .and_then(|value| VisibilityRow::try_from(value.as_str()).ok());
+    let historical = row
+        .get::<_, Option<String>>(columns.maturity)?
+        .and_then(|value| Maturity::try_from(value.as_str()).ok());
+    let approval = row.get::<_, Option<String>>(columns.approval_object_id)?;
+    let expected = match (
+        row.get::<_, Option<String>>(columns.effective_maturity)?
+            .map(|value| Maturity::try_from(value.as_str())),
+        row.get::<_, Option<String>>(columns.disposition)?
+            .map(|value| Disposition::try_from(value.as_str())),
+    ) {
+        // Support can only clamp what history earned, so effective above
+        // historical is a state the evaluator cannot produce. Support above the
+        // pairing's automatic ceiling is one the evaluator only reaches on a valid
+        // approval, so a row that names none never earned it.
+        (Some(Ok(effective)), Some(Ok(disposition)))
+            if historical.is_some_and(|historical| effective.rank() <= historical.rank())
+                && match (source, taint) {
+                    (Some(source), Some(taint)) => {
+                        effective.rank()
+                            <= admission_ceiling(
+                                EventKind::AcceptedAdr,
+                                automatic_ceiling(source, taint),
+                                accepted_decision,
+                            )
+                            .rank()
+                            || approval.is_some()
+                    }
+                    _ => false,
+                } =>
+        {
+            Some(visibility_row(effective, disposition))
+        }
+        _ => None,
+    };
+    Ok(Some((
+        served_visibility_row(stored, expected),
+        sensitivity.restrictive(floor),
+        true,
+    )))
+}
+
+// policy-digest:serving-end
+impl KernelStore {
+    /// Serving reads must use this filtered view; `known_as_of` remains an audit/replay view.
+    ///
+    /// An object serves only after it has its own committed decision.
+    /// Visibility uses the latest committed object- or source-level decision
+    /// at or before the snapshot — the same prior the writer evaluates against
+    /// — so a newer source-level rejection overrides an earlier object-level
+    /// admission.
+    ///
+    /// Rows fail closed when the classification pairing is rejected.
+    /// Rows fail closed when `policy_revision` exceeds `POLICY_REVISION`.
+    /// Rows fail closed when the decision's source lineage differs from the registry.
+    /// Lower revisions keep the current surface mapping.
+    pub fn visible_as_of(
+        &self,
+        surface: Surface,
+        requested: i64,
+    ) -> Result<VisibleAsOf, KernelError> {
+        let own = latest_own_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
+        let lineage = latest_lineage_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
+        let history = strictest_sensitivity_sql("AND h.commit_seq<=:governing_as_of");
+        let own_history_inconsistent =
+            own_history_inconsistent_sql("d", "AND p.commit_seq<=:governing_as_of");
+        let (tip, rows) = self.read_snapshot(requested, |tx| {
+            let mut statement = tx
+                .prepare(&format!(
+                    "SELECT o.object_id,o.object_kind,o.domain_id,o.source_kind,o.source_id,
+                            o.source_revision,o.created_commit_seq,NULL,NULL,o.sensitivity_class,
+                            d.maturity AS d_maturity,
+                            d.effective_maturity AS d_effective_maturity,
+                            d.disposition AS d_disposition,d.visibility AS d_visibility,
+                            d.taint_class AS d_taint_class,d.source_class AS d_source_class,
+                            d.policy_revision AS d_policy_revision,
+                            d.sensitivity_class AS d_sensitivity_class,
+                            d.approval_object_id AS d_approval_object_id,
+                            s.maturity AS s_maturity,
+                            s.effective_maturity AS s_effective_maturity,
+                            s.disposition AS s_disposition,s.visibility AS s_visibility,
+                            s.taint_class AS s_taint_class,s.source_class AS s_source_class,
+                            s.policy_revision AS s_policy_revision,
+                            s.sensitivity_class AS s_sensitivity_class,
+                            s.approval_object_id AS s_approval_object_id,
+                            EXISTS(
+                                SELECT 1 FROM decisions ad
+                                WHERE ad.object_id=o.object_id
+                                  AND o.object_kind='decision'
+                                  AND ad.decision_kind='adr_accepted'
+                                  AND ad.created_commit_seq<=:governing_as_of
+                                  AND (ad.invalidated_commit_seq IS NULL
+                                       OR :governing_as_of<ad.invalidated_commit_seq)
+                            ) AS accepted_decision,
+                            {history} AS history_sensitivity_class,
+                            {own_history_inconsistent} AS own_history_inconsistent
+                     FROM object_registry o
+                     JOIN admission_decisions d
+                       ON d.admission_decision_id={own}
+                     LEFT JOIN admission_decisions s
+                       ON s.admission_decision_id={lineage}
+                     WHERE o.created_commit_seq<=:governing_as_of
+                       AND (o.invalidated_commit_seq IS NULL
+                            OR :governing_as_of<o.invalidated_commit_seq)
+                     ORDER BY o.object_id"
+                ))
+                .map_err(map_sqlite)?;
+            let rows = statement
+                .query_map(
+                    rusqlite::named_params! { ":governing_as_of": requested },
+                    |row| {
+                        let mut object = object_row_from(row)?;
+                        let (mut visibility_row_value, mut sensitivity, interpretable) =
+                            decided_row(row, &OWN_DECISION_COLUMNS)?.unwrap_or((
+                                VisibilityRow::AuditOnly,
+                                Sensitivity::Secret,
+                                false,
+                            ));
+                        if !interpretable || row.get::<_, bool>("own_history_inconsistent")? {
+                            visibility_row_value = VisibilityRow::AuditOnly;
+                            sensitivity = Sensitivity::Secret;
+                        }
+                        // Neither scope may relax the other: a restriction on one
+                        // outlives a later permissive decision on the other, so the
+                        // served surface is the stricter of the two.
+                        if let Some((lineage_row, lineage_sensitivity, _)) =
+                            decided_row(row, &LINEAGE_DECISION_COLUMNS)?
+                        {
+                            visibility_row_value = served_visibility_row(
+                                Some(visibility_row_value),
+                                Some(lineage_row),
+                            );
+                            sensitivity = sensitivity.restrictive(lineage_sensitivity);
+                        }
+                        sensitivity = sensitivity.restrictive(Sensitivity::from_stored(
+                            &row.get::<_, Option<String>>("history_sensitivity_class")?
+                                .unwrap_or_default(),
+                        ));
+                        object.sensitivity = object.sensitivity.restrictive(sensitivity);
+                        let visibility =
+                            surface_visibility(visibility_row_value, surface, object.sensitivity);
+                        Ok((object, visibility))
+                    },
+                )
+                .map_err(map_sqlite)?
+                .filter_map(|row| match row {
+                    Ok((_object, SurfaceVisibility::Hidden)) => None,
+                    Ok((object, visibility)) => Some(Ok(VisibleRow {
+                        object,
+                        visibility,
+                        labeled: visibility == SurfaceVisibility::Labeled,
+                    })),
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_sqlite)?;
+            Ok(rows)
+        })?;
+        Ok(VisibleAsOf {
+            known_as_of: requested,
+            tip,
+            rows,
+        })
+    }
+}
+
 // policy-digest:tables-start
 impl Maturity {
     const fn rank(self) -> u8 {
@@ -1684,6 +2234,27 @@ impl Maturity {
         } else {
             other
         }
+    }
+}
+
+pub const fn served_visibility_row(
+    stored: Option<VisibilityRow>,
+    expected: Option<VisibilityRow>,
+) -> VisibilityRow {
+    match (stored, expected) {
+        (None, _) | (_, None) => VisibilityRow::AuditOnly,
+        (Some(stored), Some(expected)) => match (stored, expected) {
+            (VisibilityRow::AuditOnly, _) | (_, VisibilityRow::AuditOnly) => {
+                VisibilityRow::AuditOnly
+            }
+            (VisibilityRow::ReviewOnly, _) | (_, VisibilityRow::ReviewOnly) => {
+                VisibilityRow::ReviewOnly
+            }
+            (VisibilityRow::ExplicitLabeled, _) | (_, VisibilityRow::ExplicitLabeled) => {
+                VisibilityRow::ExplicitLabeled
+            }
+            (VisibilityRow::Automatic, VisibilityRow::Automatic) => VisibilityRow::Automatic,
+        },
     }
 }
 
@@ -3040,6 +3611,17 @@ mod tests {
 
     #[test]
     fn policy_revision_matches_policy_content() {
+        fn sections<'a>(source: &'a str, start: &str, end: &str) -> Vec<&'a str> {
+            let mut found = Vec::new();
+            let mut rest = source;
+            while let Some((_, tail)) = rest.split_once(start) {
+                let (body, remainder) = tail.split_once(end).expect("unterminated section");
+                found.push(body);
+                rest = remainder;
+            }
+            assert!(!found.is_empty(), "no sections found");
+            found
+        }
         fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
             source
                 .split_once(start)
@@ -3113,6 +3695,15 @@ mod tests {
             "// policy-digest:chain-start",
             "// policy-digest:chain-end",
         ));
+        // How persisted rows are interpreted for serving decides what a binary
+        // claiming this revision will show for the same ledger.
+        for serving in sections(
+            source,
+            "// policy-digest:serving-start",
+            "// policy-digest:serving-end",
+        ) {
+            policy.push_str(serving);
+        }
         let digest = format!("{:x}", Sha256::digest(policy));
         assert_eq!(POLICY_REVISION, 1);
         assert_eq!(digest, REVISION_1_SOURCE_DIGEST);

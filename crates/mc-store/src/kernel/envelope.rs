@@ -17,6 +17,8 @@ pub enum Sensitivity {
 }
 
 impl Sensitivity {
+    // Only the policy digest enumerates the vocabulary.
+    #[cfg(test)]
     pub(super) const ALL: &'static [Self] = &[Self::Normal, Self::Sensitive, Self::Secret];
 
     pub(super) fn as_str(self) -> &'static str {
@@ -452,6 +454,27 @@ impl KernelStore {
     }
 
     fn snapshot(&self, requested: i64, sql: &str) -> Result<KnownAsOf, KernelError> {
+        let (tip, objects) = self.read_snapshot(requested, |tx| {
+            let mut statement = tx.prepare(sql).map_err(map_sqlite)?;
+            let objects = statement
+                .query_map([requested], object_row_from)
+                .map_err(map_sqlite)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_sqlite)?;
+            Ok(objects)
+        })?;
+        Ok(KnownAsOf {
+            known_as_of: requested,
+            tip,
+            objects,
+        })
+    }
+
+    pub(super) fn read_snapshot<T>(
+        &self,
+        requested: i64,
+        read: impl FnOnce(&Transaction<'_>) -> Result<T, KernelError>,
+    ) -> Result<(i64, T), KernelError> {
         if requested < 0 {
             return Err(KernelError::InvalidInput);
         }
@@ -469,19 +492,9 @@ impl KernelStore {
         if requested > tip {
             return Err(KernelError::FutureSnapshot);
         }
-        let mut statement = tx.prepare(sql).map_err(map_sqlite)?;
-        let objects = statement
-            .query_map([requested], object_row_from)
-            .map_err(map_sqlite)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(map_sqlite)?;
-        drop(statement);
+        let result = read(&tx)?;
         tx.commit().map_err(map_sqlite)?;
-        Ok(KnownAsOf {
-            known_as_of: requested,
-            tip,
-            objects,
-        })
+        Ok((tip, result))
     }
 
     pub fn stage_candidate(

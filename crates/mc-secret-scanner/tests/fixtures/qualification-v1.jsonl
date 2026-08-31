@@ -1,0 +1,1 @@
+{"case_id":"synthetic-conservative-keyed-1","cell_id":"size_0_256__density_1_8","input":"password=hunter2","expected_rule_ids":["magic-keyed-assignment"],"expected_divergence":"match","consent":"synthetic"}
