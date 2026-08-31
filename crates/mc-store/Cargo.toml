@@ -30,11 +30,20 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # and needs to populate it). Gated so the writers never ship in production builds.
 test-support = []
 
+# The benchmark reuses `tests/support/git_fixtures.rs` via `#[path]`. The
+# fixture module depends only on `gix`, so the target needs no
+# required-features.
+[[bench]]
+name = "anchor_resolution"
+path = "benches/anchor_resolution.rs"
+harness = false
+
 [dev-dependencies]
 # Self dev-dependency so integration tests see the `test-support` fixtures.
 mc-store = { path = ".", features = ["test-support"] }
 # Fixture repositories are written with gix object APIs; no git CLI, even in
 # tests.
 gix = { workspace = true }
+criterion = "=0.8.2"
 proptest = "1"
 tempfile = "3"

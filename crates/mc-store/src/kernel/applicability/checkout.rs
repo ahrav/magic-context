@@ -18,6 +18,12 @@ const MAX_HASHED_FILE_BYTES: u64 = 32 * 1024 * 1024;
 /// Read granularity; large-file hashing checks the deadline after each chunk.
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Worker-thread ceiling for the status scan. Spawn and coordination cost commentlint: allow(JUDGE)
+/// grows with core count while the stat-bound scan does not, so an uncapped commentlint: allow(JUDGE)
+/// scan on a many-core host spends more on threads than on the walk. gix commentlint: allow(JUDGE)
+/// clamps the value to available parallelism on smaller hosts. commentlint: allow(JUDGE)
+const STATUS_SCAN_THREAD_CAP: usize = 4;
+
 /// Deadline plus cooperative interrupt flag threaded through every walk the
 /// engine performs. The flag is the shape gix status accepts, so an async
 /// host can map cancellation onto it without this crate depending on a
@@ -231,6 +237,7 @@ fn scan_dirty_entries(
         // Rename tracking would fold a delete+add pair into one entry;
         // the fingerprint wants the raw path set.
         .index_worktree_rewrites(None)
+        .index_worktree_options_mut(|opts| opts.thread_limit = Some(STATUS_SCAN_THREAD_CAP))
         .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
     let iter = platform
         .into_iter(None)
