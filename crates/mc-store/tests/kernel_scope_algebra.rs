@@ -377,6 +377,91 @@ fn coerce_version_pads_and_demotes_suffixes() {
     assert_eq!(coerce_version(""), None);
 }
 
+#[test]
+fn glued_vendor_suffix_keeps_every_later_component() {
+    let seven = coerce_version("5.4ubuntu2.91").expect("glued suffix coerces");
+    let nine = coerce_version("5.4ubuntu2.93").expect("glued suffix coerces");
+    assert_eq!((seven.major, seven.minor, seven.patch), (5, 4, 0));
+    assert_eq!(seven.build.as_str(), "ubuntu2.91");
+    assert_ne!(
+        seven, nine,
+        "distinct vendor revisions must not coerce onto one version"
+    );
+    let req = semver::VersionReq::parse(">=5.0.0, <6.0.0").expect("valid requirement");
+    assert!(req.matches(&seven) && req.matches(&nine));
+}
+
+#[test]
+fn prerelease_requirement_matches_the_prerelease_value() {
+    let pinned = scope(&[version_range("platform", "=1.0.0-beta.2")]);
+    let exact_pre = ScopeMatchContext::new().with_value(Dimension::Platform, "1.0.0-beta.2");
+    assert_eq!(
+        scope_matches(&pinned, &exact_pre, &UnknownGraph),
+        MatchOutcome::Matches,
+        "a requirement naming a prerelease compares against the written prerelease"
+    );
+    let other_pre = ScopeMatchContext::new().with_value(Dimension::Platform, "1.0.0-beta.3");
+    assert_eq!(
+        scope_matches(&pinned, &other_pre, &UnknownGraph),
+        MatchOutcome::DoesNotMatch
+    );
+    // A plain release range still ignores the qualifier, so kernel-style
+    // strings keep matching.
+    let plain = scope(&[version_range("platform", ">=5.0.0, <6.0.0")]);
+    let kernel = ScopeMatchContext::new().with_value(Dimension::Platform, "5.15.0-91-generic");
+    assert_eq!(
+        scope_matches(&plain, &kernel, &UnknownGraph),
+        MatchOutcome::Matches
+    );
+}
+
+#[test]
+fn reserved_payload_column_makes_a_term_malformed() {
+    let cases = [
+        (exact("branch", "main"), Dimension::Branch),
+        (set("environment", &["prod"]), Dimension::Environment),
+        (range("entity", Some("a"), Some("b")), Dimension::Entity),
+        (version_range("platform", ">=1.0.0"), Dimension::Platform),
+    ];
+    for (mut spec, dimension) in cases {
+        spec.payload = Some("{\"unsupported\":true}".to_string());
+        assert_eq!(
+            CanonicalScope::from_term_specs(&[spec]).unwrap_err(),
+            ScopeFormError::ConflictingColumns(dimension),
+            "no operator owns the payload column"
+        );
+    }
+}
+
+#[test]
+fn redacted_bounds_and_requirements_decode_uncertain() {
+    // Lexicographic order over replacement tokens is an artifact of which
+    // secret each one replaced, so ordering must not reject the scope.
+    let reversed = scope(&[range(
+        "branch",
+        Some("<GITHUB_TOKEN_REDACTED>"),
+        Some("<AWS_ACCESS_KEY_ID_REDACTED>"),
+    )]);
+    assert_eq!(
+        reversed.term(Dimension::Branch),
+        Some(&TermValue::RedactedPlaceholder)
+    );
+    let identical = scope(&[range(
+        "branch",
+        Some("<REDACTED:password>"),
+        Some("<REDACTED:password>"),
+    )]);
+    assert_eq!(
+        identical.term(Dimension::Branch),
+        Some(&TermValue::RedactedPlaceholder)
+    );
+    let requirement = scope(&[version_range("platform", ">=<REDACTED:bearer>")]);
+    assert_eq!(
+        requirement.term(Dimension::Platform),
+        Some(&TermValue::RedactedPlaceholder)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // U2: property laws.
 // ---------------------------------------------------------------------------

@@ -145,7 +145,13 @@ fn bench_decode_plus_match(c: &mut Criterion) {
 
 fn bench_coerce_version(c: &mut Criterion) {
     let mut group = c.benchmark_group("coerce_version");
-    for raw in ["1.2.3", "14", "3ubuntu1", "1.2.3-beta.1+build5", "10.04_LTS"] {
+    for raw in [
+        "1.2.3",
+        "14",
+        "3ubuntu1",
+        "1.2.3-beta.1+build5",
+        "10.04_LTS",
+    ] {
         group.bench_function(raw, |b| b.iter(|| coerce_version(black_box(raw))));
     }
     group.finish();

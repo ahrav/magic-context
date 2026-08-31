@@ -153,6 +153,7 @@ pub enum GitCondition {
 pub enum AnchorDecodeError {
     UnknownKind(String),
     MissingValue(AnchorKind),
+    ConflictingColumns(AnchorKind),
     InvalidOid(AnchorKind),
     InvalidVersionRange,
     InvalidInterval,
@@ -165,6 +166,11 @@ impl std::fmt::Display for AnchorDecodeError {
             Self::MissingValue(kind) => {
                 write!(f, "anchor kind {} has no value", kind.as_str())
             }
+            Self::ConflictingColumns(kind) => write!(
+                f,
+                "anchor kind {} has values in columns it does not own",
+                kind.as_str()
+            ),
             Self::InvalidOid(kind) => {
                 write!(f, "anchor kind {} has an invalid git OID", kind.as_str())
             }
@@ -207,10 +213,43 @@ pub fn encode_anchor_captures(captures: &[AnchorCapture]) -> Vec<u8> {
     .expect("capture payload is serializable")
 }
 
+/// The `anchors` table lacks a constraint tying populated columns to
+/// `anchor_kind`. A row written by a botched migration can therefore name one
+/// kind while carrying another kind's value, and decoding it would evaluate
+/// only the named kind and ignore the rest.
+fn unowned_columns(kind: AnchorKind, row: &AnchorRowSpec) -> bool {
+    let present = [
+        row.exact_value.is_some(),
+        row.reachable_from_oid.is_some(),
+        row.reachable_between_start_oid.is_some() || row.reachable_between_end_oid.is_some(),
+        row.deployment_revision.is_some(),
+        row.config_revision.is_some(),
+        row.platform_version_range.is_some(),
+        row.wall_clock_start.is_some() || row.wall_clock_end.is_some(),
+        row.payload.is_some(),
+    ];
+    let owned = match kind {
+        AnchorKind::Exact => [true, false, false, false, false, false, false, false],
+        AnchorKind::ReachableFrom => [false, true, false, false, false, false, false, true],
+        AnchorKind::ReachableBetween => [false, false, true, false, false, false, false, true],
+        AnchorKind::DeploymentRevision => [false, false, false, true, false, false, false, false],
+        AnchorKind::ConfigRevision => [false, false, false, false, true, false, false, false],
+        AnchorKind::PlatformVersion => [false, false, false, false, false, true, false, false],
+        AnchorKind::WallClockInterval => [false, false, false, false, false, false, true, false],
+    };
+    present
+        .iter()
+        .zip(owned.iter())
+        .any(|(present, owned)| *present && !*owned)
+}
+
 impl AnchorCondition {
     pub fn decode(row: &AnchorRowSpec) -> Result<Self, AnchorDecodeError> {
         let kind = AnchorKind::from_stored(&row.anchor_kind)
             .ok_or_else(|| AnchorDecodeError::UnknownKind(row.anchor_kind.clone()))?;
+        if unowned_columns(kind, row) {
+            return Err(AnchorDecodeError::ConflictingColumns(kind));
+        }
         let require = |value: &Option<String>| -> Result<String, AnchorDecodeError> {
             value
                 .as_deref()
@@ -322,6 +361,11 @@ pub fn evaluate_non_git(condition: &AnchorCondition, ctx: &QueryContext) -> Anch
             let Some(raw) = ctx.platform_version.as_deref() else {
                 return AnchorEvaluation::Uncertain;
             };
+            // Build metadata does not affect version requirements; reject
+            // redacted values before matching.
+            if contains_redaction_placeholder(raw) {
+                return AnchorEvaluation::Uncertain;
+            }
             match version_req_matches(req, raw) {
                 Some(result) => holds(result),
                 None => AnchorEvaluation::Uncertain,

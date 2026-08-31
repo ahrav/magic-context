@@ -299,3 +299,86 @@ fn corrupt_capture_payload_only_disables_fallback_rungs() {
         other => panic!("expected reachable_from, got {other:?}"),
     }
 }
+
+#[test]
+fn rows_populating_another_kinds_column_fail_decode() {
+    // A migration that leaves a stale column behind must not decode as the
+    // narrower condition its `anchor_kind` names.
+    assert_eq!(
+        AnchorCondition::decode(&AnchorRowSpec {
+            exact_value: Some("pinned-token".to_string()),
+            reachable_from_oid: Some(oid(1)),
+            ..row("exact")
+        })
+        .unwrap_err(),
+        AnchorDecodeError::ConflictingColumns(AnchorKind::Exact)
+    );
+    assert_eq!(
+        AnchorCondition::decode(&AnchorRowSpec {
+            exact_value: Some("pinned-token".to_string()),
+            deployment_revision: Some("r1".to_string()),
+            ..row("exact")
+        })
+        .unwrap_err(),
+        AnchorDecodeError::ConflictingColumns(AnchorKind::Exact)
+    );
+    assert_eq!(
+        AnchorCondition::decode(&AnchorRowSpec {
+            platform_version_range: Some(">=1.0.0".to_string()),
+            wall_clock_start: Some(1),
+            ..row("platform_version")
+        })
+        .unwrap_err(),
+        AnchorDecodeError::ConflictingColumns(AnchorKind::PlatformVersion)
+    );
+    // Only the git kinds own the capture payload.
+    assert_eq!(
+        AnchorCondition::decode(&AnchorRowSpec {
+            config_revision: Some("c1".to_string()),
+            payload: Some(b"{}".to_vec()),
+            ..row("config_revision")
+        })
+        .unwrap_err(),
+        AnchorDecodeError::ConflictingColumns(AnchorKind::ConfigRevision)
+    );
+    let with_captures = decode(&AnchorRowSpec {
+        reachable_from_oid: Some(oid(1)),
+        payload: Some(encode_anchor_captures(&[])),
+        ..row("reachable_from")
+    });
+    assert!(matches!(
+        with_captures,
+        AnchorCondition::Git(GitCondition::ReachableFrom { .. })
+    ));
+}
+
+#[test]
+fn redacted_platform_version_is_uncertain() {
+    let condition = decode(&AnchorRowSpec {
+        platform_version_range: Some("=1.2.3".to_string()),
+        ..row("platform_version")
+    });
+    for raw in ["1.2.3-<REDACTED:password>", "1.2.3+<GITHUB_TOKEN_REDACTED>"] {
+        assert_eq!(
+            evaluate_non_git(
+                &condition,
+                &QueryContext {
+                    platform_version: Some(raw.to_string()),
+                    ..QueryContext::default()
+                }
+            ),
+            AnchorEvaluation::Uncertain,
+            "a replacement token must not leave the numeric core deciding {raw}"
+        );
+    }
+    assert_eq!(
+        evaluate_non_git(
+            &condition,
+            &QueryContext {
+                platform_version: Some("1.2.3".to_string()),
+                ..QueryContext::default()
+            }
+        ),
+        AnchorEvaluation::Holds
+    );
+}
