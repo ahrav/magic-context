@@ -72,6 +72,11 @@ fn empty_keyed_values_and_secret_substrings_are_not_findings() {
         "monkey=hunter-two",
         "turkey=hunter-two",
         "keyboard=hunter-two",
+        r#"{"password":"\n"}"#,
+        r#"{"password":"\t"}"#,
+        r#"{"password":"\r\n"}"#,
+        r#"{"password":" \n "}"#,
+        "'api_token': '\\n'",
     ] {
         assert!(scanner.scan(input).unwrap().findings.is_empty(), "{input}");
     }
@@ -79,6 +84,8 @@ fn empty_keyed_values_and_secret_substrings_are_not_findings() {
         "auth_token=hunter-two",
         "api-key=hunter-two",
         r#"{"clientSecret":"hunter-two"}"#,
+        r#"{"password":"\nhunter-two"}"#,
+        r#"{"password":"\\"}"#,
     ] {
         assert!(!scanner.scan(input).unwrap().findings.is_empty(), "{input}");
     }

@@ -529,6 +529,27 @@ const SCALAR_KEYWORDS: &[&str] = &[
     "~",
 ];
 
+// Quoted overlay rules keep `\\.` sequences as content, so a value spelled `\n` arrives as two bytes that `trim` leaves in place.
+fn is_blank_with_escapes(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        let escaped = bytes[index] == b'\\'
+            && bytes
+                .get(index + 1)
+                .is_some_and(|byte| matches!(byte, b'n' | b't' | b'r' | b'f' | b'v' | b'0' | b' '));
+        if !escaped {
+            return false;
+        }
+        index += 2;
+    }
+    true
+}
+
 fn is_scalar(value: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(value) else {
         return false;
@@ -540,7 +561,7 @@ fn is_scalar(value: &[u8]) -> bool {
     {
         return true;
     }
-    if text.is_empty() {
+    if is_blank_with_escapes(text) {
         return true;
     }
     let bytes = text.as_bytes();
@@ -897,10 +918,23 @@ mod tests {
             "",
             "   ",
             "\t\n",
+            "\\n",
+            "\\t",
+            "\\r\\n",
+            " \\n ",
         ] {
             assert!(is_scalar(scalar.as_bytes()), "{scalar:?}");
         }
-        for secret in ["12x", "hunter2", "true-blue", "nilpotent", "nonement"] {
+        for secret in [
+            "12x",
+            "hunter2",
+            "true-blue",
+            "nilpotent",
+            "nonement",
+            "\\\\",
+            "\\nhunter2",
+            "\\x",
+        ] {
             assert!(!is_scalar(secret.as_bytes()), "{secret:?}");
         }
     }
