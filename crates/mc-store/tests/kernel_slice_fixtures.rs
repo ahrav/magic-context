@@ -219,31 +219,29 @@ fn build_fixture(root: &std::path::Path) -> Fixture {
         .commit_seq;
     let accepted = store
         .commit(intent("fixture/accept-redis"), |envelope| {
-            envelope.correct_observation(
-                "redis-branch-observation-object",
-                observation(
-                    "redis-main-observation",
-                    "redis-main-observation-object",
-                    MAIN_SCOPE,
-                    "redis-observation-lineage",
-                    2,
-                    "implemented",
-                    "redis-branch-decision-object",
-                ),
-            )?;
+            envelope.retire_observation("lru-observation-object")?;
+            envelope.retire_observation("redis-branch-observation-object")?;
+            envelope.retire_decision("redis-branch-decision-object")?;
+            envelope.insert_observation(observation(
+                "redis-main-observation",
+                "redis-main-observation-object",
+                MAIN_SCOPE,
+                "redis-main-observation-lineage",
+                1,
+                "implemented",
+                "lru-decision-object",
+            ))?;
             envelope.correct_decision(
-                "redis-branch-decision-object",
+                "lru-decision-object",
                 decision(
                     "redis-main-decision",
                     "redis-main-decision-object",
                     MAIN_SCOPE,
-                    "redis-decision-lineage",
+                    "lru-decision-lineage",
                     2,
                     "Use Redis on main",
                 ),
             )?;
-            envelope.retire_decision("lru-decision-object")?;
-            envelope.retire_observation("lru-observation-object")?;
             Ok(String::new())
         })
         .unwrap()
@@ -471,10 +469,10 @@ fn branch_alignment_then_main_acceptance_preserves_redis_lineage() {
         .store
         .object_history_as_of(fixture.accepted)
         .unwrap();
-    let branch_decision = history
+    let lru_decision = history
         .objects
         .iter()
-        .find(|row| row.object_id == "redis-branch-decision-object")
+        .find(|row| row.object_id == "lru-decision-object")
         .unwrap();
     let main_decision = history
         .objects
@@ -482,17 +480,24 @@ fn branch_alignment_then_main_acceptance_preserves_redis_lineage() {
         .find(|row| row.object_id == "redis-main-decision-object")
         .unwrap();
     assert_eq!(
-        branch_decision.superseded_by.as_deref(),
+        lru_decision.superseded_by.as_deref(),
         Some("redis-main-decision-object")
     );
-    assert_eq!(branch_decision.source_id, main_decision.source_id);
+    assert_eq!(lru_decision.source_id, main_decision.source_id);
     assert_eq!(
-        (
-            branch_decision.source_revision,
-            main_decision.source_revision
-        ),
+        (lru_decision.source_revision, main_decision.source_revision),
         (1, 2)
     );
+    let branch_decision = history
+        .objects
+        .iter()
+        .find(|row| row.object_id == "redis-branch-decision-object")
+        .unwrap();
+    assert_eq!(
+        branch_decision.invalidated_commit_seq,
+        Some(fixture.accepted)
+    );
+    assert_eq!(branch_decision.superseded_by, None);
     assert_eq!(
         fixture
             .store
