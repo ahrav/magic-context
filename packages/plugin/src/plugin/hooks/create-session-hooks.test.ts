@@ -30,12 +30,7 @@ describe("buildMagicContextHookConfig", () => {
         expect(config.toast_duration_ms).toBeUndefined();
     });
 
-    // The mapper was a hand-maintained field list once, and every hook-config
-    // field added after it was written (smart_drops, language, embedding, and
-    // transform_mode) silently read as undefined inside the hook — features
-    // the user opted into stayed off with no warning. The mapper now spreads
-    // the full plugin config; this test pins that contract so a regression to
-    // field-listing fails loudly for exactly the fields that were lost.
+    // buildMagicContextHookConfig must preserve hook-consumed plugin-config fields.
     it("passes through every hook-consumed field, not a hand-maintained subset", () => {
         const config = buildMagicContextHookConfig({
             enabled: true,

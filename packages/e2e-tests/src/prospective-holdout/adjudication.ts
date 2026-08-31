@@ -182,9 +182,8 @@ export function closeAdjudication(input: {
     if (input.close.approvals.some((approval) => approval.approver === input.approver)) {
         fail("adjudication-close.approval: independence-required");
     }
-    // The cohort manifest fixes the case set these judgments cover, so a close stamped
-    // before it claims verdicts over cases intake could still admit. The same instant is
-    // legal: the cohort is fixed at that point.
+    // Reject closes before `input.close.body.closedAt` because intake could still add cases.
+    // Allow equality because the cohort is fixed at `input.close.body.closedAt`.
     if (Date.parse(input.closedAt) < Date.parse(input.close.body.closedAt)) {
         fail("adjudication-close.closedAt: before-cohort-close");
     }
@@ -244,12 +243,7 @@ export function parseAdjudicationClose(raw: unknown): AdjudicationClose {
 export function publishAdjudicationClose(close: AdjudicationClose, destination: string): void {
     const bytes = `${JSON.stringify(close, null, 2)}\n`;
     /**
-     * A publisher interrupted after `linkSync` installed the complete close reaches here
-     * again on its identical retry. Rejecting on existence alone leaves automation unable
-     * to recover through that retry, or to tell a finished prior attempt from conflicting
-     * bytes, so the installed bytes are compared with the ones this call would write: the
-     * retry that finds its own close returns, and anything else fails. This is the
-     * accept-existing contract the freeze artifact publisher already uses.
+     * acceptExisting returns true for identical existing bytes and rejects differing bytes to preserve retry idempotence.
      */
     const acceptExisting = (): boolean => {
         if (!existsSync(destination)) return false;
@@ -283,11 +277,7 @@ export function unblindAfterClose(input: {
     commitmentSecret: Uint8Array;
     unblindApprover: string;
     /**
-     * Secret the approving reviewer holds, and the map custodian does not.
      *
-     * Separate from `authenticationKey` on purpose: that key authenticates the judgments
-     * the custodian's own close already covers, so reusing it here would let the party
-     * being checked produce the check.
      */
     unblindApprovalKey: Uint8Array;
     approvalFingerprint: string;
@@ -318,13 +308,6 @@ export function unblindAfterClose(input: {
     ) {
         fail("unblind: judgment-set-mismatch");
     }
-    // Every input below is supplied to this call or already public in the committed
-    // artifacts, so a plain digest over them is reproducible by whoever calls it. The map
-    // custodian holds `commitmentSecret`, so they could pick any unused actor name,
-    // compute that digest themselves, and reveal the concealed release mapping alone --
-    // which is exactly the second actor this gate exists to require. Keying the digest
-    // with a secret only the approving reviewer holds is what makes the fingerprint
-    // evidence of their approval rather than evidence that someone can hash.
     if (input.unblindApprovalKey.byteLength < 32) fail("unblind.approval-key: too-short");
     const expectedApproval = createHmac("sha256", input.unblindApprovalKey)
         .update(canonicalJson({

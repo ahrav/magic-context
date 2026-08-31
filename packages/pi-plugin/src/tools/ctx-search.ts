@@ -1,17 +1,7 @@
 /**
- * Pi-side wrapper for the `ctx_search` tool.
  *
- * The core search logic in `unifiedSearch()` is harness-agnostic — it operates
- * over the shared SQLite store. The pi-plugin only needs to:
  *
- *   1. Translate the LLM-provided arguments into the search options shape.
- *   2. Resolve session ID and project identity from the Pi extension context.
- *   3. Format results for the LLM the same way the OpenCode plugin does.
  *
- * `ctx_expand` is now registered alongside (see `./ctx-expand.ts`) — Pi
- * sessions are JSONL files, but the shared `readSessionChunk` reads
- * via the `RawMessageProvider` registry, so Pi just registers its own
- * provider for the duration of an expand call.
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -82,7 +72,7 @@ export interface CtxSearchToolDeps {
 	memoryEnabled?: boolean;
 	embeddingEnabled?: boolean;
 	gitCommitsEnabled?: boolean;
-	/** Resolve a directory's project identity, allowing home only when user-level configuration enables it. */
+	/** The resolver allows home only when user-level configuration enables it. */
 	resolveProjectIdentity?: (directory: string) => string | undefined;
 }
 
@@ -159,14 +149,8 @@ export function createCtxSearchTool(
 			const gitCommitsEnabled =
 				snapshot?.gitCommitEnabled ?? deps.gitCommitsEnabled ?? false;
 
-			// Only search message history up to the last compartment boundary —
-			// anything after that (the live tail, including the current turn) is
-			// still in context and already visible to the agent. When NO compartment
-			// exists yet, the historian hasn't scrolled anything out of context, so
-			// the boundary is 0: every indexed message (ordinals are 1-based) is in
-			// the live tail and must be excluded. A negative sentinel here would mean
-			// "search everything" and leak the current prompt back to the agent — the
-			// exact opposite of the intent (issue #131).
+			// The search excludes messages after the last compartment boundary because they remain in the live context.
+			// No compartment sets the boundary to 0, excluding every 1-based indexed message.
 			const lastCompartmentEnd = getLastCompartmentEndMessage(
 				deps.db,
 				sessionId,
@@ -174,7 +158,6 @@ export function createCtxSearchTool(
 			const messageOrdinalCutoff =
 				lastCompartmentEnd >= 0 ? lastCompartmentEnd : 0;
 
-			// Hard-filter claims already rendered in the injected baseline.
 			const visibleRevisionLocators = getVisibleRevisionLocators(
 				deps.db,
 				sessionId,
@@ -187,17 +170,11 @@ export function createCtxSearchTool(
 				return packed.text;
 			};
 
-			// Exact-locator short-circuit (parity with OpenCode ctx_search):
-			// when the whole query is one or more claim/revision locators,
-			// bypass the lexical+semantic lanes and resolve them through the
-			// current-state provider. If nothing resolves we fall through to
-			// the normal lanes so ordinary text still searches the corpus.
+			// Exact-locator short-circuit:
+			// The current-state provider resolves locator-only queries before lexical or semantic search.
+			// Normal search runs when no locator resolves, preserving text-query corpus search.
 			//
-			// Source restriction binds here too: this path runs before
-			// `params.sources` reaches `unifiedSearch`, so without the check a
-			// locator-shaped query would return claim content under a
-			// restriction that names only non-memory sources, or under an
-			// explicit empty list.
+			// Locator-only resolution requires `params.sources` to permit `memory`.
 			const memorySourceAllowed =
 				params.sources === undefined || params.sources.includes("memory");
 			const locatorShape = parseLocatorShapedQuery(query);
@@ -206,10 +183,8 @@ export function createCtxSearchTool(
 					db: deps.db,
 					projectPath: projectIdentity,
 					locators: locatorShape,
-					// The requested limit applies here exactly as it does to
-					// every other search path. Raising the cap to the locator
-					// count let `limit: 1` with two ids return both, and a long
-					// enough locator list slip past the shared hard ceiling.
+					// Using the locator count can make `limit: 1` return two IDs.
+					// Using the locator count can exceed the shared hard ceiling.
 					limit: normalizeSearchResultLimit(params.limit),
 					visibleRevisionLocators,
 				});
@@ -248,9 +223,6 @@ export function createCtxSearchTool(
 					maxMessageOrdinal: messageOrdinalCutoff,
 					gitCommitsEnabled,
 					sources: params.sources,
-					// Explicit agent search → literal-probe multi-query recall
-					// (parity with OpenCode's ctx_search). Pi auto-search leaves
-					// this off to protect its latency budget.
 					explicitSearch: true,
 				},
 			);

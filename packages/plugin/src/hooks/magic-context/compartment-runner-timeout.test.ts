@@ -22,7 +22,6 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            // Ignore EBUSY on Windows
         }
     }
     tempDirs.length = 0;
@@ -61,9 +60,7 @@ describe("historian timeout wiring", () => {
             });
 
             expect(promptSyncSpy).toHaveBeenCalledTimes(1);
-            // toMatchObject (partial) instead of toEqual (exact) because the prompt-sync
-            // helper now also receives fallbackModels + callContext for v0.18 fallback
-            // chain support; this test only asserts the historian timeout reaches it.
+            // The assertion permits unrelated options while requiring `timeoutMs`.
             expect(promptSyncSpy.mock.calls[0]?.[2]).toMatchObject({ timeoutMs: 456_789 });
         } finally {
             promptSyncSpy.mockRestore();
@@ -104,7 +101,7 @@ describe("historian timeout wiring", () => {
             });
 
             expect(promptSyncSpy).toHaveBeenCalledTimes(1);
-            // toMatchObject (partial) — see note in incremental test above.
+            // The assertion permits unrelated options while requiring `timeoutMs`.
             expect(promptSyncSpy.mock.calls[0]?.[2]).toMatchObject({ timeoutMs: 456_789 });
         } finally {
             promptSyncSpy.mockRestore();

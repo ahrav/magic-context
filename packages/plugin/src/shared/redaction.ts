@@ -9,7 +9,7 @@ export function escapeRegex(value: string): string {
 // separators) must BE one of these words, not merely contain them as a
 // substring. Bare substring matching wrongly redacts benign fields like
 // `pin_key_files`, `token_budget`, and `injection_budget_tokens`.
-const SECRET_WORDS = [
+export const SECRET_WORDS = [
     "key",
     "token",
     "secret",
@@ -26,31 +26,28 @@ const SECRET_SEGMENT_PATTERN = new RegExp(
 const TRAILING_DESCRIPTORS = new Set(["id", "ids", "value", "values", "header", "headers"]);
 
 function redactionTypeForKey(key: string): string {
-    const normalized = key
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9_.-]+/g, "_");
-    const suffix = normalized.split(".").filter(Boolean).at(-1) ?? normalized;
-    return suffix || "secret";
+    return (
+        key
+            // `apiKey` needs camel-case splitting; lowercasing first produces
+            // `apikey`, which no vocabulary word matches.
+            .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+            .toLowerCase()
+            .split(/[^a-z0-9]+/)
+            .filter(
+                (segment) => SECRET_SEGMENT_PATTERN.test(segment) || SECRET_QUALIFIERS.has(segment),
+            )
+            .join("_") || "secret"
+    );
 }
 
-// A bare number / boolean / null is never a secret — an API key, bearer token,
-// password, or credential is always a high-entropy string. So when a key-based
-// pattern (the `name=value` / `"name":"value"` forms below) matches purely on
-// the KEY containing a word like "token", but the VALUE is numeric/boolean, it's
-// a count or flag, not a secret. These must stay readable in logs:
-// `tokens.input=45000`, `hasUsageTokens=true`, `max_tokens=4096` are diagnostics,
-// not credentials. (High-entropy secret VALUES are still caught by the
-// value-shaped patterns above — bearer, JWT, AKIA, gh*_, etc. — independent of
-// the key name, so relaxing the key-based match for scalars loses no coverage.)
+// Do not redact numeric, boolean, null, or undefined values solely because their key contains a secret word.
 function isNonSecretScalarValue(value: string): boolean {
     const v = value.trim();
     if (v === "true" || v === "false" || v === "null" || v === "undefined") return true;
-    // Integer or decimal, optional sign/exponent — token counts, ports, sizes.
     return /^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(v);
 }
 
-const SECRET_QUALIFIERS = new Set([
+export const SECRET_QUALIFIERS = new Set([
     "api",
     "access",
     "private",
@@ -108,12 +105,9 @@ export function isSecretKey(key: string): boolean {
     return false;
 }
 
-/** Host-independent path rewriting: only the generic user-home patterns,
- *  never the running host's homedir or username. Case-insensitive with both
- *  separator styles: Windows and macOS filesystems are case-insensitive and
- *  tools emit `c:/users/...` as readily as `C:\Users\...`. Callers that must
- *  produce identical results on every machine (release validation) use this;
- *  diagnostics that redact the local identity use `sanitizePathString`. */
+/** `sanitizePathStringPortable` rewrites generic home-directory patterns without reading the host's home directory or username.
+ * Use `sanitizePathStringPortable` when output must be identical across hosts.
+ * Use `sanitizePathString` when diagnostics must redact the local identity. */
 export function sanitizePathStringPortable(value: string): string {
     return value
         .replace(/\/Users\/[^/]+\//gi, "/Users/<USER>/")
@@ -160,7 +154,7 @@ const SECRET_TEXT_PATTERNS: Array<{
         replacement: "<HUGGINGFACE_TOKEN_REDACTED>",
     },
     {
-        pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+        pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/g,
         replacement: "<AWS_ACCESS_KEY_ID_REDACTED>",
     },
     {
@@ -168,7 +162,7 @@ const SECRET_TEXT_PATTERNS: Array<{
         replacement: "<SLACK_TOKEN_REDACTED>",
     },
     {
-        pattern: /\bAIza[A-Za-z0-9_-]{35}\b/g,
+        pattern: /\bAIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9])/g,
         replacement: "<GOOGLE_API_KEY_REDACTED>",
     },
     {
@@ -190,8 +184,6 @@ const SECRET_TEXT_PATTERNS: Array<{
             valueQuote: string,
             value: string,
         ) =>
-            // A numeric/boolean value matched only because the KEY contains a
-            // secret word (e.g. "max_tokens": "4096") is a count, not a secret.
             isNonSecretScalarValue(value)
                 ? full
                 : `${quote}${key}${quote}${separator}${valueQuote}<REDACTED:${redactionTypeForKey(key)}>${valueQuote}`,
@@ -200,9 +192,6 @@ const SECRET_TEXT_PATTERNS: Array<{
         pattern:
             /\b([A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*([^\s'"`]+)/gi,
         replacement: (full: string, key: string, value: string) =>
-            // tokens.input=45000 / hasUsageTokens=true are diagnostics, not
-            // secrets — keep them readable. Real secret values are still caught
-            // by the value-shaped patterns above.
             isNonSecretScalarValue(value) ? full : `${key}=<REDACTED:${redactionTypeForKey(key)}>`,
     },
 ];
@@ -226,30 +215,20 @@ export function sanitizeDiagnosticText(value: string): string {
     return redactSecretText(sanitizePathString(value));
 }
 
-// Extra shareability-only signals — patterns that mark text as unsafe to share
-// with teammates but that the diagnostic sanitizer (tuned for secret/path
-// REDACTION, not share-gating) does not rewrite. Kept here, NOT in
-// sanitizeDiagnosticText, so diagnostic redaction output is unchanged.
+// `sanitizeDiagnosticText` excludes shareability-only patterns.
 const SHAREABILITY_SENSITIVE_PATTERNS: RegExp[] = [
-    // Windows user home, forward-slash form. Redundant with the portable
-    // path sanitizer's separator-agnostic rewrite; kept as defense in depth.
     /\bC:\/Users\/[^/\s]+/i,
-    // A `~`-rooted home path (personal/local).
     /(?:^|\s)~\/[^\s]+/,
-    // Inline `key: value` / `key=value` secrets the keyed redactor misses in free
-    // text (it keys on config OBJECT keys, not prose).
+    // `sanitizeDiagnosticText` redacts inline `key: value` and `key=value` secrets because keyed redaction only processes config object keys.
     /\b(?:api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret|access[_-]?key)\b\s*[:=]\s*\S+/i,
-    // Local / private endpoints — environment-specific, not a shared truth.
-    // Per-arm boundaries: \b cannot sit next to the non-word "[", so the
-    // bracketed and bare IPv6 loopback forms need their own arms. The bare
-    // arm requires a non-word/non-colon/non-dot lead so suffixes of longer
-    // addresses (2001:db8::1) never match.
+    // Redact local and private endpoints because they identify the environment.
+    // The bracketed arm handles `[::1]` because `\b` does not match before `[` at the start of input or after a non-word character.
+    // The bare IPv6 loopback arm requires a non-word, non-colon, non-dot prefix to avoid matching suffixes of addresses such as `2001:db8::1`.
     /(?:\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0)\b|\[::1\]|(?:^|[^\w:.])::1\b)(?::\d+)?/i,
     /\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
     /\b192\.168\.\d{1,3}\.\d{1,3}\b/,
     /\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/,
-    // IPv4 link-local (APIPA) and IPv6 unique-local (fc00::/7) / link-local
-    // (fe80::/10) — environment-identifying just like the RFC1918 ranges.
+    // The redactor removes IPv4 link-local (APIPA), IPv6 unique-local (`fc00::/7`), and IPv6 link-local (`fe80::/10`) addresses because they identify the environment.
     /\b169\.254\.\d{1,3}\.\d{1,3}\b/,
     /(?:^|[\s"'`=([])\[?(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):[0-9a-f:]*[0-9a-f\]]/i,
 ];
@@ -263,10 +242,8 @@ export function hasShareabilitySensitiveText(text: string): boolean {
     }
 }
 
-/** Host-independent variant of `hasShareabilitySensitiveText`: same secret
- *  and shareability patterns, but never the running host's homedir or
- *  username, so the verdict for a given string is identical on every
- *  machine. Release-artifact validation depends on that determinism. */
+/** `hasPortableSensitiveText` excludes host-specific path data, so identical input produces identical verdicts on every host.
+ * */
 export function hasPortableSensitiveText(text: string): boolean {
     try {
         if (redactSecretText(sanitizePathStringPortable(text)) !== text) return true;

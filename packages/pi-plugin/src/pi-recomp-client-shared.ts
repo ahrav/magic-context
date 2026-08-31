@@ -1,13 +1,9 @@
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 
 /**
- * Shared OpenCode-client emulation backed by a Pi `SubagentRunner`.
+ * `createPiHistorianClient` adapts a Pi `SubagentRunner` to the OpenCode client interface required by `executeContextRecompWithResult`.
  *
- * `executeContextRecompWithResult` is harness-agnostic but expects an
- * OpenCode-shaped `client.session.{create,prompt,messages,delete}`. This wraps
- * the Pi subagent runner into that shape so recomp (and session-upgrade) can
- * reuse the exact shared runner. Extracted from ctx-recomp.ts so both
- * /ctx-recomp and /ctx-session-upgrade share one implementation.
+ * `executeContextRecompWithResult` requires `client.session.{create,prompt,messages,delete}`.
  */
 export function createPiHistorianClient(args: {
 	runner: SubagentRunner;
@@ -31,15 +27,6 @@ export function createPiHistorianClient(args: {
 			return {};
 		}
 		const promptText = extractPromptText(body.parts);
-		// Honor the per-attempt model override. The shared recomp/historian chain
-		// (promptSyncWithModelSuggestionRetry) drives fallbacks by rewriting
-		// body.model = { providerID, modelID } on each attempt and passing
-		// fallbackModels: undefined for override attempts. If we ignored body.model
-		// and always ran args.model, every "fallback" attempt would silently re-run
-		// the SAME primary — so an empty/invalid-but-200 primary could never
-		// escalate to the configured fallbacks or the session model. When an
-		// override is present, let the override own the model and disable the
-		// runner-level chain for this call (the shared layer owns iteration).
 		const modelOverride = readBodyModel(body);
 		const result = await args.runner.run({
 			agent: "magic-context-historian",
@@ -101,10 +88,6 @@ function readBody(input: unknown): {
 }
 
 /**
- * Read a per-attempt model override from the prompt body as the
- * `"provider/modelID"` string the Pi SubagentRunner expects. The shared chain
- * passes `body.model = { providerID, modelID }`. Returns undefined when no
- * usable override is present (fall back to the client's primary model).
  */
 function readBodyModel(body: { model?: unknown }): string | undefined {
 	const model = body.model;

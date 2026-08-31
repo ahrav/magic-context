@@ -1,13 +1,8 @@
 /**
- * Tests for `processSystemPromptForCache` — Pi's parity port of OpenCode's
- * Step 2 + Step 3 in `system-prompt-hash.ts`. Locks in:
  *
- *   - Sticky-date freezing on cache-stable turns (date drift replaced with
- *     first-observed date so prefix cache survives midnight boundaries).
- *   - Date adoption on cache-busting turns (sticky updates to live date).
- *   - Hash detection vs `session_meta.system_prompt_hash`.
- *   - First-pass hash initialization (no spurious hashChanged report).
- *   - Persistence of `system_prompt_hash` and `system_prompt_tokens` to
+ * Stable turns replace date drift with the first-observed date to preserve the prefix cache across midnight.
+ * Cache-busting turns update the sticky date to the live date.
+ * The first pass initializes the hash without reporting `hashChanged`.
  *     session_meta.
  */
 
@@ -55,7 +50,6 @@ describe("processSystemPromptForCache", () => {
 			const sessionId = "ses-freeze";
 			getOrCreateSessionMeta(db, sessionId);
 
-			// Turn 1: live date is 2026-05-01.
 			const turn1 = processSystemPromptForCache({
 				db,
 				sessionId,
@@ -64,16 +58,13 @@ describe("processSystemPromptForCache", () => {
 			});
 			expect(turn1.systemPrompt).toContain("2026-05-01");
 
-			// Turn 2: live date flipped to 2026-05-02 BUT cache is not
-			// busting for any other reason. We should freeze to the
-			// first-observed date so the prefix cache survives.
+			// On a non-cache-busting turn, the function must retain the first-observed date.
 			const turn2 = processSystemPromptForCache({
 				db,
 				sessionId,
 				systemPrompt: "You are a helpful assistant.\nToday's date: 2026-05-02",
 				isCacheBusting: false,
 			});
-			// Frozen back to first date, hash unchanged.
 			expect(turn2.systemPrompt).toContain("2026-05-01");
 			expect(turn2.systemPrompt).not.toContain("2026-05-02");
 			expect(turn2.hashChanged).toBe(false);
@@ -90,7 +81,6 @@ describe("processSystemPromptForCache", () => {
 			const sessionId = "ses-adopt";
 			getOrCreateSessionMeta(db, sessionId);
 
-			// Turn 1: prime sticky to 2026-05-01.
 			processSystemPromptForCache({
 				db,
 				sessionId,
@@ -98,9 +88,7 @@ describe("processSystemPromptForCache", () => {
 				isCacheBusting: false,
 			});
 
-			// Turn 2: live is 2026-05-02 AND we're cache-busting (e.g.
-			// dreamer just published new docs). We should adopt the
-			// live date so future stable turns freeze on it.
+			// A cache-busting turn adopts the live date.
 			const turn2 = processSystemPromptForCache({
 				db,
 				sessionId,
@@ -108,12 +96,9 @@ describe("processSystemPromptForCache", () => {
 				isCacheBusting: true,
 			});
 			expect(turn2.systemPrompt).toContain("2026-05-02");
-			// Hash is over the new live date.
 			expect(turn2.hashChanged).toBe(true);
 
-			// Turn 3: live is still 2026-05-02, not cache-busting. We
-			// should keep using the new sticky (no re-freeze to
-			// 2026-05-01).
+			// A later non-cache-busting turn retains the date adopted by the cache-busting turn.
 			const turn3 = processSystemPromptForCache({
 				db,
 				sessionId,
@@ -143,7 +128,6 @@ describe("processSystemPromptForCache", () => {
 			});
 			expect(turn1.hashChanged).toBe(false); // first pass
 
-			// Turn 2: prompt content changed (e.g. dreamer published new docs).
 			const turn2 = processSystemPromptForCache({
 				db,
 				sessionId,
@@ -154,7 +138,6 @@ describe("processSystemPromptForCache", () => {
 			expect(turn2.hashChanged).toBe(true);
 			expect(turn2.currentHash).not.toBe(turn1.currentHash);
 
-			// session_meta should now reflect the new hash.
 			const meta = getOrCreateSessionMeta(db, sessionId);
 			expect(meta.systemPromptHash).toBe(turn2.currentHash);
 		} finally {
@@ -164,8 +147,7 @@ describe("processSystemPromptForCache", () => {
 	});
 
 	it("does NOT report hashChanged when only the date drifted (sticky restores it)", () => {
-		// This is the critical cache-safety case: a midnight date flip on
-		// an otherwise identical prompt should NOT bust prefix cache.
+		// A midnight date flip on an otherwise identical non-cache-busting prompt must not bust the prefix cache.
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-midnight";
@@ -178,9 +160,7 @@ describe("processSystemPromptForCache", () => {
 				isCacheBusting: false,
 			});
 
-			// Date flipped to 2026-05-02 — sticky-date freeze should
-			// rewrite the prompt back to 2026-05-01 BEFORE hashing, so
-			// hash stays identical.
+			// Non-cache-busting turns replace the live date with the first-observed date.
 			const turn2 = processSystemPromptForCache({
 				db,
 				sessionId,
@@ -211,8 +191,6 @@ describe("processSystemPromptForCache", () => {
 
 			clearPiSystemPromptSession(sessionId);
 
-			// After clearing, the next pass acts like a first pass —
-			// no freezing of a previous date, sticky takes the new
 			// value.
 			const turn = processSystemPromptForCache({
 				db,
@@ -228,14 +206,12 @@ describe("processSystemPromptForCache", () => {
 	});
 
 	it("treats previousHash='' / '0' as first-pass (no spurious hashChanged)", () => {
-		// Newly-created sessions have system_prompt_hash='' or '0'
-		// before the first pass writes a real value. Hash detection
-		// must not report hashChanged on that first comparison.
+		// The first pass stores a computed hash without reporting `hashChanged`.
+		// The first pass does not report `hashChanged`.
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-zero-hash";
 			getOrCreateSessionMeta(db, sessionId);
-			// Force previousHash='0' to simulate legacy session_meta state.
 			updateSessionMeta(db, sessionId, { systemPromptHash: "0" });
 
 			const result = processSystemPromptForCache({

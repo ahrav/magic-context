@@ -1,5 +1,13 @@
 {
   "schema": "magic-context.redaction-vocabulary/v1",
+  "label_words": [
+    "key", "token", "secret", "password", "auth", "authorization", "bearer", "credential"
+  ],
+  "label_qualifiers": [
+    "api", "access", "private", "client", "auth", "authorization", "secret", "bearer",
+    "session", "refresh", "service", "x", "openai", "anthropic", "google", "github",
+    "huggingface", "aws", "azure"
+  ],
   "cases": [
     {
       "name": "anthropic api key",
@@ -170,16 +178,64 @@
       "detections": [{ "secret_type": "api_key", "offset": 12, "length": 6 }]
     },
     {
-      "name": "key trimming keeps javascript-only whitespace out of the secret type",
+      "name": "junk after a key never reaches the secret type",
       "input": "\"api_key\u0085\":\"v\"",
-      "expected_redacted": "\"api_key\u0085\":\"<REDACTED:api_key_>\"",
-      "detections": [{ "secret_type": "api_key_", "offset": 13, "length": 1 }]
+      "expected_redacted": "\"api_key\u0085\":\"<REDACTED:api_key>\"",
+      "detections": [{ "secret_type": "api_key", "offset": 13, "length": 1 }]
     },
     {
       "name": "key trimming removes javascript whitespace before naming the secret type",
       "input": "\"api_key\ufeff\":\"v\"",
       "expected_redacted": "\"api_key\ufeff\":\"<REDACTED:api_key>\"",
       "detections": [{ "secret_type": "api_key", "offset": 14, "length": 1 }]
+    },
+    {
+      "name": "aws provider bytes inside assignment key",
+      "input": "AKIAJJJJJJJJJJJJJJJJ_key=private-value",
+      "expected_redacted": "<AWS_ACCESS_KEY_ID_REDACTED>_key=<REDACTED:key>",
+      "detections": [
+        { "secret_type": "aws_access_key_id", "offset": 0, "length": 20 },
+        { "secret_type": "key", "offset": 25, "length": 13 }
+      ]
+    },
+    {
+      "name": "google provider bytes inside quoted key",
+      "input": "\"AIzaKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK_key\":\"private-value\"",
+      "expected_redacted": "\"<GOOGLE_API_KEY_REDACTED>_key\":\"<REDACTED:google_api_key_key>\"",
+      "detections": [
+        { "secret_type": "google_api_key", "offset": 1, "length": 39 },
+        { "secret_type": "google_api_key_key", "offset": 47, "length": 13 }
+      ]
+    },
+    {
+      "name": "camel case key keeps a specific label",
+      "input": "\"openaiApiKey\":\"private-value\"",
+      "expected_redacted": "\"openaiApiKey\":\"<REDACTED:openai_api_key>\"",
+      "detections": [{ "secret_type": "openai_api_key", "offset": 16, "length": 13 }]
+    },
+    {
+      "name": "aws key id ends at twenty characters",
+      "input": "region ASIAPACIFICNORTHEAST1 selected",
+      "expected_redacted": "region ASIAPACIFICNORTHEAST1 selected",
+      "detections": []
+    },
+    {
+      "name": "an overlong google-shaped identifier is not a key",
+      "input": "AIzaKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK",
+      "expected_redacted": "AIzaKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK",
+      "detections": []
+    },
+    {
+      "name": "a lowercase suffix does not truncate an aws-shaped identifier",
+      "input": "AKIAIOSFODNN7EXAMPLExyz",
+      "expected_redacted": "AKIAIOSFODNN7EXAMPLExyz",
+      "detections": []
+    },
+    {
+      "name": "known gap: a provider token that absorbs the key word leaves the value",
+      "input": "hf_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAkey=private-value",
+      "expected_redacted": "<HUGGINGFACE_TOKEN_REDACTED>=private-value",
+      "detections": [{ "secret_type": "huggingface_token", "offset": 0, "length": 36 }]
     }
   ],
   "exemptions": [

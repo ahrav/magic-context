@@ -118,36 +118,36 @@ import { runVerify } from "./verify";
 
 export interface DreamTaskExecutorDeps {
     client: PluginContext["client"];
-    /** Filesystem directory of the project this drain owns (NOT the identity). */
+    /** The drain uses `sessionDirectory` as its filesystem directory, not as its project identity. */
     sessionDirectory: string;
-    /** Opens the OpenCode DB read-only (for the key-files candidate scan). The
-     *  dream-timer owns the path resolution; null when unavailable. */
+    /**
+     * `openOpenCodeDb` opens the OpenCode DB read-only for key-files candidate scans. The dream-timer resolves its path and returns null when unavailable. */
     openOpenCodeDb: () => Database | null;
     retrospectiveRawProvider?:
         | RetrospectiveRawProvider
         | ((db: Database, projectIdentity: string) => RetrospectiveRawProvider | null);
-    /** Host-side privacy gate for route="observation" learnings. */
+    /** The host uses `userMemoryCollectionEnabled` as the privacy gate for `route="observation"` learnings. */
     userMemoryCollectionEnabled?: boolean;
-    /** Ensure the project embedding provider is registered before primer clustering embeds candidates. */
+    /** The executor registers the project embedding provider before primer clustering embeds candidates. */
     ensureProjectRegistered?: (directory: string, db: Database) => Promise<void> | void;
     /**
-     * Pi only: builds a RawMessageProvider for an arbitrary historical session id
-     * so refresh-primers can render the orientation seed from Pi JSONL. OpenCode
-     * leaves this undefined (the seed read falls to the read-only opencode.db
-     * path). Returning null for a session → refresh falls back to closed-book.
+     * `primerRawProviderFactory` lets Pi read orientation seeds from historical session JSONL.
+     * `primerRawProviderFactory` lets `refresh-primers` render orientation seeds from Pi JSONL.
+     * OpenCode leaves `primerRawProviderFactory` undefined so seed reads use read-only `opencode.db`.
+     * A null `primerRawProviderFactory` result makes refresh use closed-book mode.
      */
     primerRawProviderFactory?: (
         sessionId: string,
     ) => Promise<RawMessageProvider | null> | RawMessageProvider | null;
     language?: string;
-    /** Resolved project transform mode; an explicit TS mode always stays on TS. */
+    /** An explicit `transformMode: "ts"` prevents Rust transformation. */
     transformMode?: "ts" | "rust";
-    /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
+    /** The classifier uses `dreamerModel` only after MODULE authority is confirmed. */
     dreamerModel?: string;
     mural?: { enabled: boolean; model?: string };
     memoryInjectionBudgetTokens?: number;
     retinaHandoff?: boolean;
-    /** Process-local progress callback for user-facing status displays; it never reads from or writes to the prompt/result cache. */
+    /** `onProgress` reports process-local status and never accesses the prompt/result cache. */
     onProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
     curateLifecycle?: {
         beforePrompt?: () => Promise<void> | void;
@@ -163,9 +163,9 @@ export interface DreamTaskExecutorDeps {
     };
 }
 
-/** A failed task either hot-retries (transient: provider/network/rate-limit/
- *  timeout/abort/lease/busy) or advances to the next cron slot (permanent:
- *  model-not-found, validation, parse). Classify off the error shape. */
+/** Failed tasks hot-retry transient provider, network, rate-limit, timeout, abort, lease, and busy errors.
+ * Permanent model-not-found, validation, and parse failures advance to the next cron slot.
+ * */
 function classifyFailure(error: unknown): { transient: boolean; brief: string } {
     const described = describeError(error);
     const brief = described.brief;
@@ -374,20 +374,10 @@ export function applyCurateManifest(args: {
 }
 
 /**
- * Build the TaskExecutor the v2 scheduler drives. The scheduler owns the keyed
- * domain lease + holderId and hands them in; this executor runs one task's actual
- * work (LLM loop / specialized runner), renews the lease during the run, aborts
- * if the lease is lost, and writes one per-task dream_runs telemetry row.
+ * The scheduler supplies the keyed lease and holderId; the executor renews the lease, aborts on lease loss, and writes one `dream_runs` row.
  */
 export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecutor {
-    // Memoize the PROMISE, not a flag+value. Domain groups run concurrently
-    // (task-scheduler runs them under Promise.all), so several tasks call this at
-    // once. A flag-then-await memo set the "resolved" flag BEFORE the session.list
-    // await completed, so a concurrent caller in that window read the still-unset
-    // value (undefined) and created its child session with no parentID — which is
-    // why evaluate-smart-notes children consistently came back parent_id NULL
-    // (top-level in the picker) while the memory-domain group won the race. A
-    // single shared promise makes every caller await the same populated result.
+    // A shared `session.list` promise makes concurrent callers await the same populated parent session.
     let parentSessionIdPromise: Promise<string | undefined> | undefined;
 
     const resolveParentSessionId = (): Promise<string | undefined> => {
@@ -471,11 +461,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 memoryChanges?: ReturnType<typeof computeMemoryDelta>;
                 smartNotesSurfaced?: number;
                 smartNotesPending?: number;
-                /** Broad verification closes its cycle before telemetry is recorded,
-                 *  so pass the cycle-local backlog explicitly when needed. */
+                /** The caller passes the cycle-local backlog because broad verification closes its cycle before telemetry is recorded.
+                 * */
                 backlogAfter?: { pending: number; total: number };
-                /** Successful progress/detail; empty strings are omitted so absent
-                 *  and empty have the same persisted meaning. */
+                /** `progress` and `detail` are persisted only for successful runs.
+                 * Empty strings are omitted so absent and empty have the same persisted meaning. */
                 progress?: string | null;
             },
         ): void => {
@@ -550,30 +540,21 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         }
 
         /**
-         * Claim effects the correction harvest has already COMMITTED, held
-         * outside the try below so the failure path can still report them.
+         * The executor stores committed correction-harvest effects outside `try` so failure reporting retains them.
          *
-         * The harvest commits in its own lease-guarded transaction before model
-         * inference runs. If inference then throws, those anti-memories and their
-         * event receipts are durable, but the failed run row would record no
-         * memory change — and the receipt filter stops any later run from
-         * rediscovering the same events, so the claims would be permanently
-         * absent from `dream_runs.memory_changes_json`.
+         * The harvest commits in its own lease-guarded transaction before model inference.
          */
         let committedHarvestEffects: readonly ClaimOperationResultEffect[] = [];
 
         try {
             if (config.task === "compress-cues") {
                 if (deps.mural?.enabled !== true) {
-                    // Config-gated no-op, but say so: a silent "completed" here
-                    // reads as a successful run in /ctx-dream summaries and would
-                    // otherwise mask a wiring gap.
+                    // The executor logs this config-gated no-op because `/ctx-dream` would otherwise report a successful run and mask a wiring gap.
                     log("[dreamer] compress-cues: skipped (mural is not enabled)");
                     recordRun("completed", null);
                     return { status: "completed" };
                 }
-                // Model ladder mirrors classify: task override → mural
-                // model (the cue COMPRESSOR model) → dreamer model → session model.
+                // The executor selects the model in this order: task override, mural model, dreamer model, then session model.
                 const result = await runCompressCues({
                     db,
                     client: deps.client,
@@ -616,9 +597,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     fallbackModels: config.fallbackModels,
                     language: config.language ?? deps.language,
                 });
-                // Project promotions are claim-native, so the legacy `memories`
-                // diff sees nothing and the run row would record no claim IDs
-                // while the line below reports project_promoted > 0.
                 recordRun("completed", null, {
                     memoryChanges: claimEffectMemoryChanges(result.effects),
                 });
@@ -685,10 +663,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                         ? { pending: result.remaining, total: backlogAtStart.total }
                         : undefined;
                 if (!result.complete) {
-                    // A broad cycle is intentionally resumable: ordinary progress
-                    // is a successful scheduled run, even though this deadline did
-                    // not drain the complete cycle. Only a zero-progress broad run
-                    // is a failure that should raise the dashboard's red status.
+                    // A broad run succeeds when it makes progress before its deadline.
                     if (broadProgress && processed > 0) {
                         recordRun("completed", null, {
                             progress: broadProgress,
@@ -713,8 +688,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             }
 
             if (config.task === "classify-memories") {
-                // Cache-neutral metadata write (classified_at/importance/scope/
-                // shareable) — no memory_changes telemetry (status counts unchanged).
+                // The metadata write updates `classified_at`, `importance`, `scope`, and `shareable` without changing memory-status counts.
                 let moduleArgs:
                     | Pick<
                           import("./classify").ClassifyArgs,
@@ -853,11 +827,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     parent,
                     invocationStartedAt: startedAt,
                 });
-                // Route-`memory` learnings write only the claim tables, so
-                // computeMemoryDelta's legacy diff reports nothing and the run
-                // row would record NULL despite claims being created. Prefer the
-                // committed claim effects and fall back to the legacy diff for
-                // projects still writing that table.
                 recordRun("completed", null, {
                     memoryChanges:
                         claimEffectMemoryChanges([
@@ -865,8 +834,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                             ...retro.effects,
                         ]) ?? computeMemoryDelta(memoryBefore),
                 });
-                // Advance the content watermark on completion (incl. clean "n"
-                // runs) so the next run only scans newer messages.
                 return {
                     status: "completed",
                     schedulePatch:
@@ -876,7 +843,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 };
             }
 
-            // Agentic tasks: verify / curate / maintain-docs.
             return await runAgenticTask(config, ctx, {
                 deps,
                 deadline,
@@ -886,9 +852,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             });
         } catch (error) {
             const { transient, brief } = classifyFailure(error);
-            // Report work the harvest already committed. Without this the claims
-            // exist but no run row ever names them, because the event receipts
-            // keep a retry from rediscovering the same events.
+            // `recordRun` reports committed harvest effects because receipt deduplication prevents retries from rediscovering their events.
             const harvested = claimEffectMemoryChanges([...committedHarvestEffects]);
             recordRun("failed", brief, harvested ? { memoryChanges: harvested } : undefined);
             log(`[dreamer] task ${config.task} failed (transient=${transient}): ${brief}`);
@@ -920,20 +884,14 @@ function renderGateUserLines(messages: RetrospectiveRawMessage[]): string[] {
         .map((message) => `${message.ordinal}: ${message.text}`);
 }
 
-/** Number of user lines re-read before the watermark each run (the overlap), so
- *  friction straddling a run boundary isn't missed. Bounded; idempotence guards
- *  against the re-read re-extracting an already-processed window. */
+/** Retrospective extraction re-reads 12 user lines before the watermark to overlap the prior window.
+ * */
 const RETROSPECTIVE_OVERLAP_USER_LINES = 12;
 
-/** Parse the gate's verdict. Expected shape: a single line `n` (no friction) or
- *  `y: 3, 7` (flagged ordinals). Robust to a model that wraps it in prose:
- *  - scan LINE BY LINE for the first verdict-leading line (`y`/`yes`/`n`/`no`);
- *  - ordinals are taken ONLY from that verdict line (so a stray year/number in
- *    surrounding prose can't fabricate a deepen);
- *  - if no verdict-leading line exists, look for an embedded `y: <nums>` pattern;
- *  - anything unparseable → NO hit (fail safe — the caller still advances the
- *    watermark on a clean run, so a garbled verdict can't wedge progress).
- *  A `y` with zero ordinals is NOT a hit (there are no lines to deepen on). */
+/** The parser accepts `n`/`no` for no friction and `y:`/`yes:` with positive ordinals for flagged lines.
+ * The parser extracts ordinals only after a `y:` or `yes:` marker.
+ * The parser returns no hit when it finds no recognized verdict with positive ordinals.
+ * */
 export function parseFrictionGateVerdict(verdict: string): { hit: boolean; ordinals: number[] } {
     const ordinalsFrom = (line: string): number[] => {
         const afterColon = line.includes(":") ? line.slice(line.indexOf(":") + 1) : line;
@@ -946,17 +904,13 @@ export function parseFrictionGateVerdict(verdict: string): { hit: boolean; ordin
         const line = raw.trim().toLowerCase();
         if (!line) continue;
         if (/^n(o)?\b/.test(line)) return { hit: false, ordinals: [] };
-        // A POSITIVE verdict requires the `y:`/`yes:` colon form. A `y`-leading
-        // line WITHOUT a colon is prose ("yes, the user was upset about 3…") —
-        // keep scanning so its stray digits aren't harvested as ordinals and a
-        // later well-formed `y: 3` isn't swallowed.
+        // A positive verdict requires `y:` or `yes:` followed by a colon.
         if (/^y(es)?\s*:/.test(line)) {
             const ordinals = ordinalsFrom(line);
             return { hit: ordinals.length > 0, ordinals };
         }
     }
 
-    // No clean verdict line — accept an embedded `y: <nums>` form, else fail safe.
     const embedded = verdict.toLowerCase().match(/\by(?:es)?\s*:\s*([\d,\s]+)/);
     if (embedded) {
         const ordinals = (embedded[1].match(/\d+/g) ?? [])
@@ -967,9 +921,8 @@ export function parseFrictionGateVerdict(verdict: string): { hit: boolean; ordin
     return { hit: false, ordinals: [] };
 }
 
-/** Stable source-window key for idempotence: a hash over the flagged user lines'
- *  (sessionId:ts) anchors — NOT prompt ordinals (batch-local). Sorted so order
- *  is irrelevant; the same friction window yields the same key across runs. */
+/** The source-window key hashes sorted `(sessionId:ts)` anchors for flagged user lines instead of batch-local prompt ordinals.
+ * Sorting makes anchor order irrelevant; identical friction windows produce the same key across runs. */
 function computeRetrospectiveWindowKey(flagged: RetrospectiveRawMessage[]): string {
     const anchors = flagged
         .map((message) => `${message.sessionId}:${message.ts}`)
@@ -978,10 +931,8 @@ function computeRetrospectiveWindowKey(flagged: RetrospectiveRawMessage[]): stri
     return createHash("sha256").update(anchors).digest("hex").slice(0, 32);
 }
 
-/** Render the deepen zoom window: the gate-flagged user lines plus ±radius
- *  surrounding context (other user lines + tool metadata), with the flagged
- *  lines marked. Privacy: only user TEXT carries content; tool rows are
- *  metadata-only (the provider already strips assistant prose + tool output). */
+/**
+ * */
 function renderFrictionWindow(
     messages: RetrospectiveRawMessage[],
     flaggedOrdinals: number[],
@@ -1027,16 +978,14 @@ function retrospectiveEventsForSessions(
                 });
             }
         } catch {
-            // Older/partial test DBs may not have event rows; corroboration is optional.
+            // Event corroboration is optional; ignore event-loading failures.
         }
     }
     return events.sort((a, b) => a.createdAt - b.createdAt).slice(-20);
 }
 
 /**
- * Retrospective outcome: the content watermark plus the claim effects the pass
- * committed. Route-`memory` learnings are claim-native, so the legacy
- * `memories` diff cannot see them and run telemetry has to use these.
+ * Route-`memory` learnings are claim-native, so telemetry must use `effects` because the legacy `memories` diff omits them.
  */
 interface RetrospectiveTaskOutcome {
     retrospectiveWatermarkMs: number | null;
@@ -1061,8 +1010,8 @@ async function runRetrospectiveTask(
         return { retrospectiveWatermarkMs: null, effects: [] };
     }
 
-    // Content watermark (max message ts actually scanned) — NOT lastRunAt, which
-    // is schedule-completion time and would skip a message that arrived mid-run.
+    // The content watermark is the maximum timestamp of scanned messages, not `lastRunAt`.
+    // The content watermark must not use `lastRunAt`: it records schedule completion and can skip messages that arrive mid-run.
     const watermarkMs =
         getTaskScheduleState(db, projectIdentity, config.task)?.retrospectiveWatermarkMs ?? 0;
 
@@ -1079,8 +1028,8 @@ async function runRetrospectiveTask(
         return { retrospectiveWatermarkMs: scan.maxScannedTs, effects: [] };
     }
 
-    // Only POST-watermark user lines are genuinely new; the rest are the overlap
-    // re-read. If nothing is new, the window was already handled last run.
+    // Only post-watermark user lines are new; earlier lines are overlap.
+    // The overlap is re-read. If no post-watermark line exists, the previous run already handled the window.
     const postWatermarkOrdinals = new Set(
         userMessages
             .filter((message) => message.ts > watermarkMs)
@@ -1122,11 +1071,8 @@ async function runRetrospectiveTask(
         if (!childSessionId) throw new Error("Retrospective could not create its child session.");
         const sessionId = childSessionId;
 
-        // One child, two turns sharing the same session — OpenCode applies the
-        // per-prompt `body.system`, so turn 1 runs the cheap gate system and turn
-        // 2 (only on a hit) runs the deepen system. fetchOutput returns the whole
-        // child branch, so recording the LAST run's output covers both turns'
-        // token usage without double counting.
+        // OpenCode applies each prompt's `body.system`, so the first turn uses the gate system and a hit enables the deepen system.
+        // Fetching the child branch's final output counts both turns' token usage exactly once.
         const runChildTurn = async (system: string, userText: string) => {
             const remainingMs = Math.max(0, deadline - Date.now());
             return shared.promptSyncWithValidatedOutputRetry(
@@ -1181,7 +1127,6 @@ async function runRetrospectiveTask(
             return { retrospectiveWatermarkMs: watermark, effects };
         };
 
-        // ── Turn 1: cheap LLM gate over U: lines only ──────────────────────
         const userLines = renderGateUserLines(messages);
         const gateRun = await runChildTurn(
             FRICTION_GATE_SYSTEM_PROMPT,
@@ -1195,23 +1140,22 @@ async function runRetrospectiveTask(
         }
 
         const flagged = userMessages.filter((message) => gate.ordinals.includes(message.ordinal));
-        // Require at least one genuinely-new (post-watermark) flagged line —
-        // friction wholly inside the overlap was handled last run.
+        // The second turn requires a flagged post-watermark line because the previous run handled friction wholly within the overlap.
         if (!flagged.some((message) => postWatermarkOrdinals.has(message.ordinal))) {
             log("[dreamer] retrospective: gate hit only on overlap lines");
             return finish(gateRun, scan.maxScannedTs);
         }
 
-        // Source-window idempotence: a stable key over the flagged anchors
-        // (sessionId:ts) — NOT prompt ordinals, which are batch-local. If we have
-        // already deepened this exact window, skip the (expensive) second turn.
+        // A stable key over flagged anchors deduplicates source windows.
+        // The deduplication key uses `(sessionId:ts)` anchors rather than batch-local prompt ordinals; an existing key skips the second turn.
+        // An already-deepened exact window skips the second turn.
         const windowKey = computeRetrospectiveWindowKey(flagged);
         if (isRetrospectiveWindowProcessed(db, projectIdentity, windowKey)) {
             log("[dreamer] retrospective: window already processed");
             return finish(gateRun, scan.maxScannedTs);
         }
 
-        // ── Turn 2: deepen — host renders the zoom window, LLM extracts the rule.
+        // The host renders the zoom window; the LLM extracts the rule.
         const frictionWindow = renderFrictionWindow(
             messages,
             flagged.map((message) => message.ordinal),
@@ -1272,18 +1216,16 @@ async function runRetrospectiveTask(
         return finish(deepenRun, scan.maxScannedTs, applied.effects);
     } finally {
         heartbeat.stop();
-        // PRIVACY: a retrospective child's prompt embeds raw cross-session user
-        // text from the friction window. Always delete the child — even on
-        // failure, and even when keep_subagents is set. The debug-retention flag
-        // must never persist another session's raw user text on disk.
+        // The cleanup path deletes the child session even on failure and when `keep_subagents` is set.
+        // The child-session directory must never persist another session's raw user text on disk.
         if (childSessionId) {
             await deps.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
         }
     }
 }
 
-/** The generic agentic-task path (prompt + child session + per-task model),
- *  with lease renewal → abort-on-loss and maintain-docs protected-region enforce. */
+/** The curate pool loads after child-session creation so hidden or rewritten memories cannot enter the child prompt.
+ * */
 async function runAgenticTask(
     config: DreamTaskRuntimeConfig,
     ctx: TaskExecutorContext,
@@ -1325,11 +1267,6 @@ async function runAgenticTask(
             ? getActiveUserMemories(db).map((um) => ({ id: um.id, content: um.content }))
             : undefined;
 
-    // verify / verify-broad / classify-memories now run via their own non-agentic
-    // manifest runners and never reach runAgenticTask. The agentic path handles
-    // curate / maintain-docs only. The curate pool is loaded AFTER the awaited
-    // child-session creation below — a pool frozen before that await could
-    // carry a memory hidden or rewritten in the gap into the child prompt.
 
     const abortController = new AbortController();
     let leaseLost = false;
@@ -1392,18 +1329,11 @@ async function runAgenticTask(
         });
 
         if (task === "curate") await deps.curateLifecycle?.beforePrompt?.();
-        // Recompute AFTER the awaited lifecycle hook: a slow beforePrompt
-        // spends deadline budget, and a stale remaining window would let the
-        // prompt run past the deadline the lease heartbeat is sized against.
+        // The code recomputes the remaining deadline after `beforePrompt` because the hook consumes deadline budget.
+        // A stale remaining window can let the prompt exceed `deadline`.
         const remainingMs = Math.max(0, deadline - Date.now());
         const promptTimeoutMs = Math.min(remainingMs, config.timeoutMinutes * 60 * 1000);
         if (promptTimeoutMs <= 0) {
-            // Mark this transient explicitly. Each executor invocation
-            // recomputes `startedAt`, so a hot retry gets a full deadline and
-            // this exhaustion is recoverable — but classifyFailure keys off the
-            // error shape, and "deadline expired" matches none of its timeout
-            // patterns, so an unflagged throw would advance to the next cron
-            // slot instead of using the bounded hot-retry path.
             throw Object.assign(
                 new Error(`Dreamer ${task} deadline expired before the prompt was submitted.`),
                 { transient: true },
@@ -1474,10 +1404,6 @@ async function runAgenticTask(
                     `Curate manifest became stale: ${applied.operation.result.staleReason}`,
                 );
             }
-            // Curate's revisions/archives/merges/splits are claim-native, so they
-            // never touch the legacy `memories` table that computeMemoryDelta
-            // diffs. Carry the applied effects to recordRun instead, or the run
-            // records no change at all.
             curateMemoryChanges = claimEffectMemoryChanges(applied.operation.result.effects);
         }
 
@@ -1516,14 +1442,11 @@ async function runAgenticTask(
                     reason: describeError(error).brief,
                 });
             } catch {
-                // Lost leases do not publish rejection receipts.
             }
         }
         throw error;
     } finally {
         heartbeat.stop();
-        // These children contain full memory-pool snapshots or generated project
-        // docs context, so debug-retention must not keep them on disk after a run.
         if (childSessionId) {
             await deps.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
         }

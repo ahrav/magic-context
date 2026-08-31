@@ -17,11 +17,8 @@ export interface CuratePromptMemory {
     hasNoFileSentinel: boolean;
 }
 
-// ── System Prompt ──────────────────────────────────────────────────────────
 
-// Generic agent-registration base. Every dreamer task overrides `system:` with a
-// focused per-task prompt below, so this is only the fallback identity OpenCode/Pi
-// register the hidden agent with — kept minimal so a task never inherits another
+// The fallback prompt must not contain task-specific instructions.
 // task's instructions.
 export const DREAMER_SYSTEM_PROMPT = `You are a background maintenance agent for the magic-context system, running during a scheduled dream window. Your task and its full instructions arrive in the message below. Never read or quote secrets from .env, credentials, or key files, and never commit — the user handles git.`;
 
@@ -55,8 +52,6 @@ Output one XML manifest and nothing else:
 
 ${PROJECT_MEMORY_TAXONOMY}`;
 
-// maintain-docs: edits ARCHITECTURE.md / STRUCTURE.md only. It needs codebase
-// read + doc-write tools and the protected-region rule, and NONE of the memory
 // machinery.
 export const MAINTAIN_DOCS_SYSTEM_PROMPT = `You are a documentation maintainer for the magic-context system. You run during a scheduled dream window to keep a project's root \`ARCHITECTURE.md\` and \`STRUCTURE.md\` synchronized with the actual code.
 
@@ -70,17 +65,10 @@ export const MAINTAIN_DOCS_SYSTEM_PROMPT = `You are a documentation maintainer f
 - **Be prescriptive** ("Use X pattern", not "X pattern is used"). **Current state only** — no temporal language, no history.
 - **Verify before writing** — read the actual files, never guess. All file paths in the docs must point to files that exist.`;
 
-// review-user-memories: a pure JSON reviewer of behavioral observations about the
-// human user (the GLOBAL user profile, NOT project memories). It calls no tools
-// and the host applies the verdict, so it needs no memory ops or taxonomy.
 export const REVIEW_USER_MEMORIES_SYSTEM_PROMPT = `You are a memory reviewer for the magic-context system. You run during a scheduled dream window to decide which recurring observations are real, persistent patterns worth keeping. Observations about the human user belong in their global user profile; observations that describe how THIS project works belong in the project's memory.
 
 You do NOT call any tools — you read the candidate observations the host gives you and return a JSON verdict. Promote a project-scoped pattern only through the \`promote_project\` action the task defines, and only when several candidates corroborate it; the host rejects a project promotion that rests on a single observation. Distill durable patterns; never transcribe a single moment. Output only the JSON the task asks for, with no surrounding prose.`;
 
-// refresh-primers: a read-only code investigator that answers ONE standing
-// question about the current codebase. It runs on the locked
-// dreamer-primer-investigator agent (read-only tools only), so the prompt frames
-// investigation + grounding and never mentions write/memory tools.
 export const PRIMER_INVESTIGATOR_SYSTEM_PROMPT = `You are a read-only code investigator for the magic-context system. You run during a scheduled dream window to answer a single standing question about THIS codebase by reading its current source.
 
 ## Tools (read-only)
@@ -90,7 +78,6 @@ export const PRIMER_INVESTIGATOR_SYSTEM_PROMPT = `You are a read-only code inves
 - **Ground every claim in code you actually opened this run.** Open the files the question points at and verify against them. A paraphrase that reads no files is not an answer.
 - **Answer directly and concretely** — name paths, symbols, and mechanisms, in present tense.`;
 
-// ── Curate ─────────────────────────────────────────────────────────────────
 
 function renderMemoryList(memories: CuratePromptMemory[]): string {
     return memories
@@ -115,7 +102,6 @@ export function buildCuratePrompt(args: {
     memories: CuratePromptMemory[];
     userProfile?: string;
 }): string {
-    // adapted from validated shadow-trial prompt; further tuning happens in the harness
     return `## Task: Curate Project Memory Pool (hygiene)
 
 **Project:** ${args.projectPath}
@@ -267,7 +253,6 @@ export function validateCurateManifest(
     return actions;
 }
 
-// ── Retrospective ───────────────────────────────────────────────────────────
 
 export interface RetrospectivePromptEvent {
     sessionId: string;
@@ -286,8 +271,8 @@ Rules:
 3. Root cause + correction: the learning must tell a future agent what to do differently.
 4. Privacy by host-apply: do not call memory-writing tools. Emit only the XML schema requested by the prompt.`;
 
-/** Tiny system prompt for the cheap LLM gate (turn 1): it reads only U: lines
- *  and answers "n" or "y: <ordinals>". Kept minimal so the gate is cheap. */
+/**
+ * */
 export const FRICTION_GATE_SYSTEM_PROMPT =
     "You are a conservative friction detector for a coding agent. You read recent user message lines and decide whether the user was correcting, re-explaining to, or frustrated with the assistant. Output exactly one line and nothing else.";
 
@@ -349,7 +334,6 @@ Return only XML in this exact shape:
 </learnings>`;
 }
 
-// ── Maintain Docs ──────────────────────────────────────────────────────────
 
 export function buildMaintainDocsPrompt(
     projectPath: string,
@@ -406,7 +390,6 @@ ${!existingDocs.structure ? STRUCTURE_TEMPLATE : ""}
 - Docs are at project root: \`${projectPath}/ARCHITECTURE.md\` and \`${projectPath}/STRUCTURE.md\``;
 }
 
-// ── Templates ──────────────────────────────────────────────────────────────
 
 const ARCHITECTURE_TEMPLATE = `
 ### ARCHITECTURE.md Template (use when creating from scratch)
@@ -508,7 +491,6 @@ const STRUCTURE_TEMPLATE = `
 **Tests:** co-located with source as \\\`*.test.ts\\\`
 \`\`\``;
 
-// ── Dispatcher ─────────────────────────────────────────────────────────────
 
 export function buildDreamTaskPrompt(
     task: DreamingTask,

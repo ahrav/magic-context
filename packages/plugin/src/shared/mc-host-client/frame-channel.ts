@@ -190,8 +190,7 @@ function writeUtf8(cursor: FrameProducerCursor, text: string, byteLength: number
             continue;
         }
 
-        // When encodeInto cannot consume the next scalar, fixed scratch lets
-        // cursor.write split that scalar across transport spans.
+        // When `encodeInto` cannot consume a scalar, `SPLIT_CODE_POINT` lets `cursor.write` span transport segments.
         const sourceCodePoint = text.codePointAt(offset);
         if (sourceCodePoint === undefined) throw new RangeError("invalid UTF-16 input");
         const codePoint =
@@ -422,9 +421,6 @@ export interface FrameChannelHandlers {
     onClosed: (reason: FrameChannelCloseReason, error: unknown) => void;
     onDiagnostic?: (type: FrameChannelDiagnosticType, meta: FrameMeta) => void;
     /**
-     * Fires after any ReceiveLease minted by this channel is released,
-     * including force-releases during close. Owners draining a connection
-     * use it to re-evaluate retirement once callers hand storage back.
      */
     onLeaseReleased?: () => void;
 }
@@ -462,11 +458,7 @@ export interface FrameChannel {
 }
 
 /**
- * A {@link FrameChannel} with a bounded setup phase ahead of frame delivery.
  *
- * `start()` reports nothing. Peer identity is proven by a handshake, and only
- * the channel that ran one can name it — through its own accessor — so a
- * setup channel cannot report an identity it never authenticated.
  */
 export interface SetupFrameChannel extends FrameChannel {
     start(deadline: Deadline): Promise<void>;

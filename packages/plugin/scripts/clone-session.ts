@@ -267,8 +267,6 @@ function assertSnapshotUnchanged(
 }
 
 function randomToken(): string {
-    // OpenCode's ids use an alphanumeric suffix; base64url's '-' and '_' are
-    // not accepted by every OpenCode release.
     return randomBytes(24)
         .toString("base64")
         .replace(/[^A-Za-z0-9]/g, "")
@@ -928,7 +926,6 @@ function copyOpenCodeRows(
         if (rows.length > 0) counts.push({ table: "event", rows: rows.length });
     }
 
-    // Validate the copied session while the write lock is still held.
     const copiedSession = db
         .prepare("SELECT id, title, directory, version, project_id, metadata FROM session WHERE id = ?")
         .get(destinationSessionId) as SqlRow | undefined;
@@ -1497,14 +1494,12 @@ export function cloneSession(options: CloneSessionOptions): CloneResult {
             try {
                 deleteContextDestination(writeContext, destinationSessionId);
             } catch {
-                // Preserve the original error; cleanup is best-effort for a new id.
             }
         }
         if (destinationSessionId && writeOpenCode) {
             try {
                 deleteOpenCodeDestination(writeOpenCode, destinationSessionId);
             } catch {
-                // Preserve the original error; cleanup is best-effort for a new id.
             }
         }
         throw error;

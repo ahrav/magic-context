@@ -96,18 +96,10 @@ export function parseDeletionEvidence(raw: unknown, label: string): DeletionEvid
 }
 
 /**
- * Requires deletion evidence for exactly the declared stores, each completed within its
- * deadline and no earlier than `submittedAt`.
+ * Require exactly one deletion record per declared store with `completedAt` no earlier than `submittedAt`.
  *
- * A store cannot have been cleared of this report's data before the report reached the
- * store, so a completion earlier than `submittedAt` attests some earlier retention run
- * and leaves this report's own copies unaccounted for. Completion at `submittedAt` is the
- * legal boundary: nothing is retained past the instant intake records.
+ * The validator rejects records completed before `submittedAt` because they may describe a prior retention run.
  *
- * Shared with the privacy-rejection path, which never builds a `SanitizedIntake`. Without
- * a submission instant of its own, that path can only be checked against the deadline and
- * the cohort close, and completions predating the report itself satisfy both and still
- * reach the manifest's retention fingerprint.
  */
 export function assertDeletionEvidenceCoversSubmission(
     deletionEvidence: readonly DeletionEvidence[],
@@ -178,8 +170,6 @@ export function parseSanitizedIntake(raw: unknown): SanitizedIntake {
     for (const key of Object.keys(custody)) {
         if (custody[key] !== false) fail(`intake.custody.${key}: access-forbidden`);
     }
-    // The evidence covers the copies this report itself created, so the instant the
-    // report exists bounds every completion below.
     const submittedAt = instant(value.submittedAt, "intake.submittedAt");
     const deletionEvidence = parseDeletionEvidence(value.deletionEvidence, "intake.deletionEvidence");
     assertDeletionEvidenceCoversSubmission(deletionEvidence, submittedAt, "intake.deletionEvidence");
@@ -236,14 +226,7 @@ export function reviewSanitizedIntake(
         commitmentKey: Uint8Array;
         expectedRubricFingerprint: string;
         /**
-         * The epoch's trusted `frozen` lifecycle event.
          *
-         * Publication time is read from this event rather than accepted as a standalone
-         * option. A caller-supplied instant earlier than the actual freeze admits any
-         * report submitted in the gap, because such a report is still inside the declared
-         * intake window and the close manifest drops `submittedAt`, so repository
-         * validation cannot detect the pre-freeze admission afterwards. The ledger event
-         * is the only publication evidence the epoch commits to.
          */
         frozenEvent: LifecycleEvent;
         intakeOpensAt: string;
@@ -263,13 +246,6 @@ export function reviewSanitizedIntake(
     if (Date.parse(intake.submittedAt) <= Date.parse(freezePublishedAt)) {
         fail("intake.submittedAt: not-prospective");
     }
-    // Publication and the declared opening are separate instants, and a freeze may be
-    // published before its window opens, so being after publication does not place a
-    // report inside the window. Both bounds hold together: a case is admitted only when
-    // it is prospective relative to the freeze and inside the window the freeze
-    // committed to. The opening instant itself is inside the window, so equality passes.
-    // The close artifact drops `submittedAt`, so an out-of-window case admitted here is
-    // no longer detectable from the repository.
     if (Date.parse(intake.submittedAt) < Date.parse(input.intakeOpensAt)) {
         fail("intake.submittedAt: before-frozen-opening");
     }
@@ -298,14 +274,7 @@ export function reviewSanitizedIntake(
 }
 
 /**
- * Records a report rejected by the privacy gate, which never produces a
- * `SanitizedIntake` to carry its own submission instant.
  *
- * `submittedAt` is required for exactly that reason: the cohort close checks deletion
- * evidence against each store's deadline and against the close, and both bounds are upper
- * ones, so evidence for a retention run that finished before this report existed would
- * satisfy them and still enter the manifest's retention fingerprint. Carrying the instant
- * here puts this path under the same rule the sanitized path already enforces.
  */
 export function staticPrivacyRejection(
     intakeId: string,

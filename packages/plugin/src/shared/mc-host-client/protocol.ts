@@ -1,27 +1,23 @@
 /**
- * Independent v2 envelope codec for the mc-host direct profile.
  *
- * Normative authority: `docs/mc-host-wire-protocol.md` Section 6 (21-byte
- * little-endian header, frame types, flags bit layout, pure-header rules,
- * exact 64 MiB body cap) and Sections 6.2/8.3 (direction and correlation
- * namespaces). Leaf module: no imports from connection or facade code and no
- * npm subc-client code.
+ * `docs/mc-host-wire-protocol.md` is normative for this codec.
+ * Section 6 defines the 21-byte little-endian header, frame types, flags layout, pure-header rules, and 64 MiB body cap.
+ * Sections 6.2 and 8.3 define direction and correlation namespaces.
  */
 
 import { AdmissionClass, type Priority } from "./types";
 
 export const PROTOCOL_VERSION = 2;
 export const HEADER_LEN = 21;
-/** Bytes 0..5 (`len` then `ver`) never change layout across versions. */
+/** Bytes 0..4 (`len` then `ver`) never change layout across versions. */
 export const FROZEN_PREFIX_LEN = 5;
-/** Interoperability body maximum: exactly 64 MiB (wire doc Section 6.3). */
+/** The protocol caps frame bodies at 64 MiB. */
 export const MAX_FRAME_BODY_LEN = 67_108_864;
-/** Largest correlation: one final request, then the generation must retire. */
+/** A generation must retire after issuing a request with `MAX_CORRELATION`. */
 export const MAX_CORRELATION = 0xffff_ffff_ffff_ffffn;
 
 /**
- * `type` byte at offset 5. Runtime const object plus union type (never a
- * TypeScript enum) so bundled Node/Bun loading needs no enum transform.
+ * The `type` byte occupies offset 5.
  */
 export const FrameType = {
     Request: 0,
@@ -74,7 +70,7 @@ const FLAG_ADMISSION_MASK = 0b0011_0000;
 const FLAG_ADMISSION_SHIFT = 4;
 const FLAG_RESERVED_MASK = 0b1100_0000;
 
-/** Build a flags byte from typed components. Admission defaults to Normal. */
+/* */
 export function buildFlags(
     binary: boolean,
     priority: Priority,
@@ -121,7 +117,7 @@ export type DecodeErrorCode =
     | "frame_body_too_large"
     | "role_or_identity_violation";
 
-/** Typed envelope decode/encode failure mirroring the wire taxonomy. */
+/* */
 export class DecodeError extends Error {
     constructor(
         message: string,
@@ -139,7 +135,7 @@ export interface EnvelopeHeader {
     flags: number;
     channel: number;
     epoch: number;
-    /** u64 correlation; bigint so `2^64 - 1` is representable exactly. */
+    /** `corr` uses `bigint` so `2^64 - 1` is representable exactly. */
     corr: bigint;
 }
 
@@ -154,9 +150,8 @@ function requireUint(value: number, max: number, field: string): void {
 }
 
 /**
- * Validate one complete header against the structural rules of wire doc
- * Sections 6.1-6.3. Shared by encode and decode so both sides reject the
- * same shapes; throws `DecodeError` on the first violation.
+ * Encoding and decoding share structural validation and reject the same header shapes.
+ * The decoder throws `DecodeError` for the first invalid header field.
  */
 export function validateHeader(header: EnvelopeHeader): void {
     if (header.ver !== PROTOCOL_VERSION) {
@@ -231,8 +226,7 @@ export function validateHeader(header: EnvelopeHeader): void {
 }
 
 /**
- * Serialize a header to its fixed 21-byte little-endian form after full
- * range and structural validation.
+ * Encoding validates all ranges and structural rules before serialization.
  */
 export function encodeHeader(header: EnvelopeHeader): Uint8Array {
     requireUint(header.len, 0xffff_ffff, "header len");
@@ -258,10 +252,10 @@ export function encodeHeader(header: EnvelopeHeader): Uint8Array {
 }
 
 /**
- * Decode and fully validate a header from the front of `bytes`. Follows the
- * frozen-prefix order: read `len`+`ver`, reject an unsupported version, read
- * the remaining header bytes, then validate the complete header before the
- * caller allocates or reads any body byte.
+ * The decoder validates the complete header before returning it.
+ * The decoder reads `len` and `ver` before rejecting unsupported versions.
+ * The decoder reads the remaining header bytes only after accepting the version.
+ * The decoder validates the complete header before reading body bytes.
  */
 export function decodeHeader(bytes: Uint8Array): EnvelopeHeader {
     if (bytes.length < FROZEN_PREFIX_LEN) {
@@ -312,25 +306,22 @@ const CONSUMER_TO_HOST_TYPES: ReadonlySet<FrameType> = new Set<FrameType>([
 ]);
 
 /**
- * Frame types a consumer may legally receive from the host (wire doc Section
- * 6.2). `Hello`/`HelloAck` stay numerically decodable but are role-invalid
- * on a consumer connection; a host-originated `Request` is role-invalid too.
+ * On consumer connections, `Hello` and `HelloAck` are numerically decodable but role-invalid.
+ * A host-originated `Request` is role-invalid on consumer connections.
  * Receiving any role-invalid type must close the generation.
  */
 export function isLegalHostToConsumerType(ty: FrameType): boolean {
     return HOST_TO_CONSUMER_TYPES.has(ty);
 }
 
-/** Frame types a consumer may legally originate (wire doc Section 6.2). */
+/* */
 export function isLegalConsumerToHostType(ty: FrameType): boolean {
     return CONSUMER_TO_HOST_TYPES.has(ty);
 }
 
 /**
- * The sender's correlation namespace a received frame settles (wire doc
- * Section 8.3): each direction allocates correlations independently, so a
- * numerically equal host `Ping` correlation never collides with a pending
- * consumer request. Returns `undefined` for frame types that settle nothing.
+ * A received frame settles the sender's correlation namespace.
+ * Each direction allocates correlations independently.
  */
 export function settledCorrelationNamespace(ty: FrameType): "consumer" | "host" | undefined {
     switch (ty) {

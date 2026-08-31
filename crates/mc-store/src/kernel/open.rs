@@ -41,8 +41,24 @@ pub enum KernelError {
     Foreign,
     Inconclusive,
     Io,
+    Busy,
     IdentityMismatch,
     FenceLost,
+    Conflict,
+    InvalidInput,
+    FutureSnapshot,
+    NotFound,
+    InvalidCheckpoint,
+    NoRequiredConsumers,
+    ConsumerPending,
+    Fault,
+}
+
+impl KernelError {
+    /// Returns true only when retrying the unchanged request is valid.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Busy | Self::Held)
+    }
 }
 
 impl fmt::Display for KernelError {
@@ -53,8 +69,17 @@ impl fmt::Display for KernelError {
             Self::Foreign => "kernel store path contains a foreign database family",
             Self::Inconclusive => "kernel store identity could not be established safely",
             Self::Io => "kernel store I/O failed",
+            Self::Busy => "kernel store lock was not acquired before the busy timeout",
             Self::IdentityMismatch => "kernel store identity does not match this build",
             Self::FenceLost => "kernel store writer fence was lost",
+            Self::Conflict => "kernel operation conflicts with an existing receipt",
+            Self::InvalidInput => "kernel operation input is invalid",
+            Self::FutureSnapshot => "kernel snapshot is newer than the committed tip",
+            Self::NotFound => "kernel object was not found",
+            Self::InvalidCheckpoint => "outbox checkpoint is invalid",
+            Self::NoRequiredConsumers => "outbox pruning requires at least one consumer",
+            Self::ConsumerPending => "outbox consumer has not reached the commit-log tip",
+            Self::Fault => "kernel operation was interrupted",
         })
     }
 }
@@ -140,6 +165,9 @@ impl KernelStore {
 
         activate_wal(&writer)?;
         stamp_writer_fence(&mut writer, lease_epoch)?;
+        // A store written by the parent build retains a digest of pre-redaction
+        // candidate input, so it is rewritten before the store is handed out.
+        super::envelope::strip_legacy_candidate_verifiers(&mut writer)?;
         // Two hardening passes are required because the family grows between
         // them. WAL activation creates `-wal` and `-shm` under the process umask,
         // so the first pass restricts them as early as possible; a read-only open
@@ -149,17 +177,48 @@ impl KernelStore {
         let readers = open_read_pool(&db_path)?;
         harden_family(&db_path)?;
 
-        Ok(Self {
+        let store = Self {
             writer: Mutex::new(writer),
             readers,
             next_reader: AtomicUsize::new(0),
             lease_epoch,
             _lease: lease,
-        })
+        };
+        // Reclaiming an expired lease keeps every row; deleting aged runs is left to an
+        // explicit call, so opening a store is not a destructive act.
+        store.abandon_expired_staging_runs(crate::current_time_ms())?;
+        Ok(store)
     }
 
     pub fn lease_epoch(&self) -> u64 {
         self.lease_epoch
+    }
+
+    /// A panic in a caller's closure drops the guard mid-unwind and poisons the
+    /// mutex, so recovering the guard keeps one caught panic from disabling every
+    /// later write. Dropping a rusqlite `Transaction` rolls it back, so the
+    /// recovered connection has no in-flight statement.
+    pub(super) fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
+        Ok(self.writer.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    pub(super) fn lock_reader(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
+        let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        Ok(self.readers[index]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn invalidate_writer_fence_for_test(&self) -> Result<(), KernelError> {
+        let writer = self.lock_writer()?;
+        writer
+            .execute(
+                "UPDATE writer_fence SET writer_epoch=writer_epoch+1 WHERE id=0",
+                [],
+            )
+            .map_err(|_| KernelError::Io)?;
+        Ok(())
     }
 
     #[allow(
@@ -495,6 +554,12 @@ fn open_read_pool(path: &Path) -> Result<Vec<Mutex<Connection>>, KernelError> {
             conn.pragma_update(None, "query_only", "ON")
                 .map_err(|_| KernelError::Io)?;
             apply_preclassification_profile(&conn).map_err(|_| KernelError::Io)?;
+            let query_only: i64 = conn
+                .query_row("PRAGMA query_only", [], |row| row.get(0))
+                .map_err(|_| KernelError::Io)?;
+            if query_only != 1 {
+                return Err(KernelError::Io);
+            }
             Ok(Mutex::new(conn))
         })
         .collect()
@@ -778,8 +843,10 @@ mod tests {
         let error = store
             .with_writer(|tx| -> rusqlite::Result<()> {
                 tx.execute(
-                    "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
-                     VALUES('t1',1,1,'actor','cause')",
+                    "INSERT INTO commit_log(
+                         transaction_id,writer_epoch,producer,operation_key,request_digest,
+                         recorded_at,actor,cause
+                     ) VALUES('t1',1,'fixture','t1','',1,'actor','cause')",
                     [],
                 )?;
                 Err(rusqlite::Error::InvalidQuery)
@@ -812,8 +879,10 @@ mod tests {
                     1
                 );
                 tx.execute(
-                    "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
-                     VALUES('t1',1,1,'actor','cause')",
+                    "INSERT INTO commit_log(
+                         transaction_id,writer_epoch,producer,operation_key,request_digest,
+                         recorded_at,actor,cause
+                     ) VALUES('t1',1,'fixture','t1','',1,'actor','cause')",
                     [],
                 )?;
                 Ok(())
@@ -834,8 +903,9 @@ mod tests {
                     tx.execute(
                         &format!(
                             "{verb} INTO commit_log(
-                                 commit_seq,transaction_id,writer_epoch,recorded_at,actor,cause
-                             ) VALUES(?1,'hijack',1,1,'attacker','rewrite')"
+                                 commit_seq,transaction_id,writer_epoch,producer,operation_key,
+                                 request_digest,recorded_at,actor,cause
+                             ) VALUES(?1,'hijack',1,'fixture','hijack','',1,'attacker','rewrite')"
                         ),
                         [commit_seq],
                     )?;

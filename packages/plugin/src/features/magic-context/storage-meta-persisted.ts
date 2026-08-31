@@ -94,21 +94,11 @@ export type AutoSearchHintDecision =
           decision: "hint";
           text: string;
           /**
-           * Memories whose fragments the hint text carries, each bound to the
-           * normalized content hash that produced it. Replay gates re-check
-           * both against live state so a memory hidden after the hint was
-           * computed — or rewritten in place, even if the replacement later
-           * becomes eligible — stops being served; a decision without the
-           * field (written before the field existed, or reseeded through a
-           * lane that drops it) cannot prove its fragments are clean and
-           * fails closed under an effective claim policy.
+           * `memoryFragments` binds each referenced memory ID to the normalized content hash used to produce the hint.
            */
           memoryFragments?: Array<{ id: number; hash: string }>;
           /**
-           * The native module block id (`messageId#blockIndex`) this decision
-           * was last seeded under. Recorded on the first successful raw-block
-           * resolution so a later revocation can reach the module's stored
-           * hint row even when the raw message can no longer be loaded.
+           * `nativeBlockId` records the `messageId#blockIndex` block under which the decision was seeded.
            */
           nativeBlockId?: string;
       }
@@ -116,7 +106,7 @@ export type AutoSearchHintDecision =
           messageId: string;
           decision: "no-hint";
           reason: AutoSearchHintNoHintReason;
-          /** See the hint variant: last-seeded native module block id. */
+          /** `nativeBlockId` records the last-seeded native module block as `messageId#blockIndex`. */
           nativeBlockId?: string;
       };
 
@@ -135,10 +125,8 @@ export interface PersistedTodoSyntheticAnchor {
     callId: string;
     messageId: string;
     /**
-     * Snapshot JSON of the todos as they existed at the moment we injected.
-     * Source of truth for defer-pass replay so the prefix bytes stay
-     * identical across T0-cache-bust → T1-defer even when a real
-     * `todowrite` mutates `last_todo_state` between T0 and T1.
+     * `stateJson` snapshots the todos at injection time.
+     * `stateJson` preserves identical prefix bytes from T0 cache bust through T1 defer if `todowrite` changes `last_todo_state`.
      */
     stateJson: string;
 }
@@ -164,13 +152,9 @@ export interface ProtectedTailMeta {
     recoveryNoEligibleHeadCount: number;
     forceEmergencyBypassWindowStart: number;
     forceEmergencyBypassUsed: number;
-    // ms-timestamp latch: 0 = inactive, else the time the session entered the
-    // emergency drain catch-up (>=95%). While active the historian drains a chunk
-    // every pass, bypassing the per-window drain budget, until usage falls below
-    // the safe zone (executeThreshold - 10) or the latch self-expires.
+    // `emergencyDrainActive` is `0` when inactive; otherwise it stores the timestamp when the session entered emergency drain catch-up at usage >=95%.
     emergencyDrainActive: number;
-    // ms of the last genuine historian FAILURE; suppresses the latch bypass for a
-    // short backoff so a broken historian can't retry-thrash under the latch.
+    // `historianDrainFailureAt` stores the last historian failure timestamp and suppresses latch bypass during backoff to prevent retry thrashing.
     historianDrainFailureAt: number;
 }
 
@@ -217,8 +201,7 @@ const AUTO_SEARCH_NO_HINT_REASONS = new Set<string>([
     "error",
     "stacked",
     "too-short",
-    // v86 migration tombstone: a pre-policy hint decision converted to
-    // no-hint so its block id can still revoke an already-seeded native hint.
+    // A pre-policy hint decision converted to `no-hint` retains its block ID to revoke an already-seeded native hint.
     "policy-reset",
 ]);
 
@@ -518,9 +501,7 @@ export function getWrapupInProgressState(
     try {
         db.exec("BEGIN IMMEDIATE");
     } catch {
-        // Callers sometimes check this from inside their own write transaction.
-        // Treat an expired marker as absent there and let a later standalone check
-        // reclaim the stale blob.
+        // The transaction path treats an expired marker as absent; a later standalone check reclaims its stale blob.
         return null;
     }
     let finished = false;
@@ -538,7 +519,6 @@ export function getWrapupInProgressState(
             try {
                 db.exec("ROLLBACK");
             } catch {
-                // Transaction may have already been closed by SQLite.
             }
         }
     }
@@ -584,7 +564,6 @@ export function acquireWrapupInProgress(
             try {
                 db.exec("ROLLBACK");
             } catch {
-                // Transaction may have already been closed by SQLite.
             }
         }
     }
@@ -625,7 +604,6 @@ export function updateWrapupInProgress(
             try {
                 db.exec("ROLLBACK");
             } catch {
-                // Transaction may have already been closed by SQLite.
             }
         }
     }
@@ -648,29 +626,19 @@ export function releaseWrapupInProgress(db: Database, sessionId: string, holderI
             try {
                 db.exec("ROLLBACK");
             } catch {
-                // Transaction may have already been closed by SQLite.
             }
         }
     }
 }
 
 /**
- * Per-session compaction mode record. Stored in the `compaction_mode_record`
- * column added by migration v72. Value domain:
- *   - NULL  → no record (treated as "on" by the transition logic, so a
- *             pre-existing row is unambiguously no-record; a session with no
- *             record that boots into compaction-off mode runs the off cleanup)
- *   - "on" / "off" → settled mode for this session
- *   - "on_notice_pending" / "off_notice_pending" → the matching mode is
- *     already active, but its out-of-band transition notice must be retried
- *     after a restart until delivery succeeds
- *   - "off_cleanup_pending" → off mode is active while marker cleanup awaits
- *     a later verification pass; this keeps cleanup retry durable after its
- *     notice has already been delivered
+ * `NULL` means no record; transition logic treats it as `on`, and sessions that boot in compaction-off mode run off cleanup.
+ * `on` and `off` represent the session's settled mode.
+ * `on_notice_pending` and `off_notice_pending` mean the matching mode is active, but its transition notice retries after restart until delivery succeeds.
+ * `off_cleanup_pending` means off mode remains active while marker cleanup awaits a later verification pass, preserving cleanup retries after notice delivery.
  *
- * Helpers use a simple UPDATE under the session row (no compare-and-swap)
- * because there is a single writer per session on the transform path.
- * clearSession() needs no change (the column is row-scoped).
+ * Helpers update the session row without compare-and-swap because the transform path has one writer per session.
+ * The record is row-scoped, so clearSession() removes it with the row.
  */
 export type CompactionModeRecord =
     | "on"
@@ -700,7 +668,7 @@ function normalizeCompactionModeRecord(value: unknown): CompactionModeRecord | n
     return null;
 }
 
-/** Resolves transient delivery/cleanup records to the mode their gates must use. */
+/** The resolver maps transient delivery and cleanup records to the settled mode that controls their gates. */
 export function resolveCompactionModeRecord(
     record: CompactionModeRecord | null,
 ): ResolvedCompactionModeRecord | null {
@@ -717,7 +685,7 @@ export function resolveCompactionModeRecord(
     }
 }
 
-/** Reads the persisted compaction mode record for a session. NULL → no record. */
+/* */
 export function getCompactionModeRecord(
     db: Database,
     sessionId: string,
@@ -731,10 +699,6 @@ export function getCompactionModeRecord(
 }
 
 /**
- * Writes the compaction mode record for a session. Ensures the session_meta row
- * exists first. Pass `null` to clear the record (no record). Only supported
- * settled or transient `CompactionModeRecord` values (or null) are accepted;
- * any other value throws (defensive — callers should pass a typed record).
  */
 export function setCompactionModeRecord(
     db: Database,
@@ -766,29 +730,23 @@ export function protectedTailWindowBudget(
 }
 
 /**
- * The latch exits when usage falls this far BELOW the execute threshold, leaving
- * headroom for a normal execute cycle to resume after the drops (exiting exactly
- * at the threshold would immediately re-enter the force-fire band).
+ * The latch exits at `executeThreshold - 10`, leaving headroom for a normal execute cycle after usage drops.
  */
 export const EMERGENCY_DRAIN_EXIT_MARGIN = 10;
 /**
- * Fallback exit threshold when the execute threshold is unknown/0 (schema default
- * execute threshold is 65 → 65 − 10 = 55).
+ * When the execute threshold is unknown or `0`, the exit threshold is `55` because the schema-default execute threshold is `65` and the hysteresis margin is `10`.
  */
 export const EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE = 55;
 /**
- * After a genuine historian FAILURE, suppress the latch bypass for this long so a
- * broken historian backs off instead of retry-thrashing every pass under the latch.
+ * A genuine historian failure suppresses the latch bypass for the configured backoff duration to prevent retry thrashing.
  */
 export const EMERGENCY_DRAIN_FAILURE_BACKOFF_MS = 60_000;
 /**
- * Self-expiry backstop: clear the latch once it has been active this long, in case
- * a high irreducible floor (system + tools + m[0]/m[1] + protected tail) keeps usage
- * above the exit threshold forever and a usage-driven exit never fires.
+ * The system expires the latch after its maximum active duration if an irreducible floor prevents usage from falling below the exit threshold.
  */
 export const EMERGENCY_DRAIN_MAX_LATCH_MS = 30 * 60 * 1000;
 
-/** Resolve the usage % below which the emergency drain latch clears. */
+/* */
 export function emergencyDrainExitThreshold(executeThresholdPercentage: number): number {
     if (!Number.isFinite(executeThresholdPercentage) || executeThresholdPercentage <= 0) {
         return EMERGENCY_DRAIN_FALLBACK_EXIT_PERCENTAGE;
@@ -823,9 +781,7 @@ export function reserveProtectedTailDrainTokens(args: {
         ensureSessionMetaRow(args.db, args.sessionId);
         let meta = loadProtectedTailMeta(args.db, args.sessionId);
         if (now - meta.protectedTailDrainWindowStartedAt > DRAIN_WINDOW_MS) {
-            // Reset the per-window budget. The emergency latch is usage-driven and
-            // deliberately NOT cleared here — it must persist across window
-            // boundaries until usage returns to the safe zone.
+            // The emergency latch persists across window boundaries until usage falls below the safe-zone threshold or the latch expires.
             args.db
                 .prepare(
                     `UPDATE session_meta
@@ -836,10 +792,7 @@ export function reserveProtectedTailDrainTokens(args: {
             meta = loadProtectedTailMeta(args.db, args.sessionId);
         }
 
-        // Drain catch-up latch lifecycle (usage-driven). Enter when the session
-        // reaches the derived force band; exit once usage falls back below
-        // the safe zone, or after a self-expiry backstop. Persisted unconditionally
-        // so the next pass sees the resolved state even when we skip below.
+        // The transaction persists latch changes before early returns so later passes observe the resolved state.
         const exitThreshold = emergencyDrainExitThreshold(args.executeThresholdPercentage);
         let latchActiveSince = meta.emergencyDrainActive;
         const { forceMaterializationPercentage } = escalationBands(args.executeThresholdPercentage);
@@ -860,9 +813,8 @@ export function reserveProtectedTailDrainTokens(args: {
         const remaining = Math.max(0, budget - meta.protectedTailDrainTokens);
         let reserved = Math.min(requested, args.perRunCap, remaining);
         let bypass = false;
-        // While the latch is active, drain a chunk EVERY pass past the window budget
-        // — UNLESS a recent historian failure is still in its backoff window (so a
-        // broken historian can't retry-thrash under the latch).
+        // When the window budget is exhausted, an active latch bypasses it unless historian failure backoff is active.
+        // Historian failure backoff disables the latch budget bypass to prevent repeated retries.
         const inFailureBackoff =
             meta.historianDrainFailureAt > 0 &&
             now - meta.historianDrainFailureAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS;
@@ -889,8 +841,8 @@ export function reserveProtectedTailDrainTokens(args: {
     return result;
 }
 
-/** Clear the emergency drain catch-up latch (called when the historian no-ops on
- *  an exhausted tail — nothing left to drain, so the latch has done its job). */
+/**
+ * */
 export function clearEmergencyDrainLatch(db: Database, sessionId: string): void {
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
@@ -900,8 +852,8 @@ export function clearEmergencyDrainLatch(db: Database, sessionId: string): void 
     })();
 }
 
-/** Record a genuine historian drain FAILURE (model error / no output). Suppresses
- *  the latch bypass for EMERGENCY_DRAIN_FAILURE_BACKOFF_MS. */
+/**
+ * Historian drain failure disables the latch bypass for `EMERGENCY_DRAIN_FAILURE_BACKOFF_MS`. */
 export function recordHistorianDrainFailure(db: Database, sessionId: string, now?: number): void {
     const ts = now ?? Date.now();
     db.transaction(() => {
@@ -912,7 +864,7 @@ export function recordHistorianDrainFailure(db: Database, sessionId: string, now
     })();
 }
 
-/** Clear the historian drain-failure backoff (called on a successful publish). */
+/* */
 export function clearHistorianDrainFailure(db: Database, sessionId: string): void {
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
@@ -957,27 +909,18 @@ export function setPersistedReasoningWatermark(
 }
 
 /**
- * Reset the persisted reasoning watermark for a session. Used during model
- * switches to make sure stale reasoning state from the previous model does
- * not leak into pressure or replay decisions for the new one.
+ * Model switches clear the reasoning watermark so prior-model state cannot affect pressure or replay decisions.
  */
 export function clearPersistedReasoningWatermark(db: Database, sessionId: string): void {
     setPersistedReasoningWatermark(db, sessionId, 0);
 }
 
-// ---- Tiered emergency-drop watermark (Phase 2) ----
-// `last_emergency_input_sample` is the `currentTotalInputTokens` reading at the
-// moment the tiered emergency drop last acted. It is the SOLE idempotence latch
-// for the emergency drop (there is intentionally no tag-number watermark — a
-// scalar "dropped-through" cursor wrongly excludes still-active lower-numbered
-// tags after a non-contiguous tier-ordered drop; dropped tags already leave the
-// `status='active'` set, so they can't be re-selected). The drop reduces the
-// wire, but the provider hasn't re-measured it yet — the persisted usage stays
-// at the pre-drop value until the next assistant response lands. Without this
-// latch a second force-band pass on the SAME stale reading recomputes the floor from
-// the now-smaller active tail and over-drops the rest of the tail (and busts the
-// cache again). We only re-evaluate once a FRESH provider sample arrives (the
-// reading changes). Reset to 0 on model change (which moves the ceiling).
+// `last_emergency_input_sample` prevents repeated drops for the same provider usage sample.
+// A tag-number cursor would exclude active lower-numbered tags after a non-contiguous tier-ordered drop.
+// The provider reports pre-drop usage until the next assistant response provides a new sample.
+// The watermark prevents a second force-band pass with the same usage sample from over-dropping the active tail.
+// Emergency-drop evaluation skips a usage sample already recorded for the active model.
+// A model change resets `last_emergency_input_sample` because the usage ceiling changes.
 interface PersistedEmergencyInputSampleRow {
     last_emergency_input_sample: number;
 }
@@ -998,9 +941,8 @@ export function getEmergencyInputSample(db: Database, sessionId: string): number
 }
 
 /**
- * Latch the usage sample on every emergency acting pass, including when the
- * selector finds no eligible target. This stops repeated cache busts on the same
- * stale sample; the 95% block remains the backstop for genuine "nothing left to drop".
+ * Every emergency acting pass records its usage sample.
+ * When the selector finds no eligible target, recording the sample prevents repeated cache busts on that stale sample.
  */
 export function setEmergencyDropSample(db: Database, sessionId: string, inputSample: number): void {
     db.transaction(() => {
@@ -1020,11 +962,9 @@ export function clearEmergencyDropSample(db: Database, sessionId: string): void 
     })();
 }
 
-// ---- Channel 1 (in-turn tool-output ctx_reduce nudge) cadence + band state ----
-// `last_nudge_undropped` records the `undropped` estimate when Channel 1 last
-// fired; `last_nudge_level` records the highest band already surfaced in the
-// current cycle. Both reset after ctx_reduce so the next accumulation can start
-// a fresh gentle→firm→urgent sequence without repeating the same band.
+// `last_nudge_undropped` stores the `undropped` estimate from the most recent Channel 1 firing.
+// `last_nudge_level` stores the highest band surfaced in the current cycle.
+// `ctx_reduce` resets `last_nudge_undropped` and `last_nudge_level` so the next accumulation starts a gentle→firm→urgent sequence without repeating a band.
 export type PersistedChannel1NudgeLevel = "" | "gentle" | "firm" | "urgent";
 
 interface PersistedLastNudgeUndroppedRow {
@@ -1103,13 +1043,11 @@ export function resetLastNudgeCycle(db: Database, sessionId: string): void {
 }
 
 /**
- * Clear the persisted Channel-1 cadence/band state when a fresh baseline sees
- * that the reclaimable tail already shrank below the old watermark.
+ * The cadence cycle resets when the reclaimable tail falls below its prior watermark.
  *
- * Why this exists: historian publication, emergency eviction, or pending-op
- * replay can shrink the tail WITHOUT a `ctx_reduce` tool call. The old nudge then
- * referred to a pile that no longer exists, so a regrowth must start a new
- * gentle→firm→urgent cycle instead of inheriting a stale persisted band.
+ * Historian publication, emergency eviction, or pending-op replay can shrink the tail without a `ctx_reduce` tool call.
+ * The persisted nudge state can refer to a reclaimable tail that has already shrunk.
+ * The reset restarts the gentle→firm→urgent cycle instead of retaining the stale band.
  */
 export function resetLastNudgeCycleIfTailShrank(
     db: Database,
@@ -1129,20 +1067,15 @@ export function resetLastNudgeCycleIfTailShrank(
     return changed;
 }
 
-// ---- Channel 2 (synthetic-user-message ceiling) cycle lease/outbox ----
-// State machine stored as a single string in `channel2_nudge_state`:
-//   ''         — no intent (initial)
-//   'pending'  — transform recorded the ceiling condition; deliver on next event
-//   'claimed'  — a delivery attempt is in flight (CAS-claimed before send);
-//                `channel2_nudge_claimed_at` stores the lease timestamp so boot
-//                recovery only rewinds stale claims, never a live sibling send.
-//                OpenCode also writes `channel2_nudge_claim_token` so a slow
-//                sender cannot confirm a lease after another process heals and
+// `''` means no intent and initializes the state machine.
+// `'pending'` means the transform recorded the ceiling condition; the next event delivers it.
+// `'claimed'` marks a delivery attempt CAS-claimed before send.
+// `channel2_nudge_claimed_at` stores the lease timestamp so boot recovery rewinds only stale claims.
+// OpenCode writes `channel2_nudge_claim_token` so a slow sender cannot confirm a lease after another process re-delivers it.
 //                re-delivers it.
-//   'delivered'— confirmed sent; the current tail-reset cycle is consumed
-// On send failure the caller reverts 'claimed' -> 'pending' so a transient error
-// does not consume the cycle. After send succeeds, a
-// confirm failure must NOT re-arm; callers leave the lease non-pending.
+// `'delivered'` marks a confirmed send and consumes the current tail-reset cycle.
+// On send failure, the caller reverts `'claimed'` to `'pending'` so transient errors do not consume the cycle.
+// Callers must not re-arm after confirm failure; leave the lease non-pending.
 export type Channel2NudgeState = "" | "pending" | "claimed" | "delivered";
 
 interface PersistedChannel2StateRow {
@@ -1229,9 +1162,7 @@ export function setChannel2NudgeState(
 }
 
 /**
- * Atomically move the Channel-2 lease from one state to another. Returns true
- * only if the row was in `from` and is now `to` — a cross-process CAS so two
- * concurrent processes can't both claim+deliver the single ceiling nudge.
+ * Atomically change the Channel-2 lease from `from` to `to`; return true only when the row was `from`, preventing concurrent processes from both delivering the ceiling nudge.
  */
 export function casChannel2NudgeState(
     db: Database,
@@ -1367,9 +1298,7 @@ export function getAutoSearchHintDecisions(
 }
 
 /**
- * Record the native module block id a decision was seeded under. Idempotent;
- * a lost write only delays revocation-independence until the next successful
- * raw resolution, so CAS exhaustion is tolerated silently.
+ * The resolver records the native module block ID under which it seeded the decision and tolerates CAS exhaustion because the next successful raw resolution restores revocation independence.
  */
 export function recordAutoSearchHintNativeBlockId(
     db: Database,
@@ -1429,11 +1358,9 @@ function casUpdateJsonArrayColumn<T>(
         const row = db
             .prepare(`SELECT ${column} FROM session_meta WHERE session_id = ?`)
             .get(sessionId) as Record<string, string | null> | undefined;
-        // Preserve the RAW stored value (may be SQL NULL on a legacy row written
-        // before the NOT-NULL default / v17 heal). The CAS predicate below uses
-        // `IS ?` so it matches NULL too — a `= ?` predicate with the coalesced
-        // "[]" would never match a genuinely-NULL row (`NULL = '[]'` is NULL in
-        // SQLite), making the CAS fail forever. Mirrors applyStrippedPlaceholderDelta.
+        // The update preserves NULL so the CAS predicate can match it.
+        // The CAS predicate uses `IS ?` with the uncoalesced expected value so it can match a stored NULL.
+        // A `= ?` predicate using coalesced `"[]"` cannot match a stored NULL because `NULL = '[]'` is NULL in SQLite.
         const rawCurrent = (row?.[column] ?? null) as string | null;
         const currentBlob = rawCurrent ?? "[]";
         const current = parseJsonArray(currentBlob, validator);
@@ -1688,9 +1615,6 @@ export function getPersistedTodoSyntheticAnchor(
     return {
         callId: result.todo_synthetic_call_id,
         messageId: result.todo_synthetic_anchor_message_id,
-        // stateJson may be empty for rows persisted by the pre-Finding-#1
-        // version of this code path. Defer-pass replay falls back to skip
-        // when stateJson is empty, which is the same behavior as before.
         stateJson: result.todo_synthetic_state_json,
     };
 }
@@ -1717,9 +1641,7 @@ export function clearPersistedTodoSyntheticAnchor(db: Database, sessionId: strin
 }
 
 /**
- * Return the timestamp of the most recent ctx_note(read) call for this session,
- * or 0 when the session has never called it. Used by note-nudger to suppress
- * reminders when the agent has already seen notes in recent context.
+ * The note-nudger uses `note_read_at` to suppress recent reminders.
  */
 export function getNoteLastReadAt(db: Database, sessionId: string): number {
     try {
@@ -1730,17 +1652,14 @@ export function getNoteLastReadAt(db: Database, sessionId: string): number {
         const value = (result as { note_last_read_at?: unknown }).note_last_read_at;
         return typeof value === "number" && Number.isFinite(value) ? value : 0;
     } catch {
-        // Column may not exist yet on a DB that hasn't gone through
-        // ensureColumn (e.g. minimal test schemas). The watermark is a
-        // suppression hint, not required for correctness — return 0 so
-        // the nudge flow proceeds as if ctx_note(read) has never been called.
+        // Return `0` when no persisted watermark exists; the watermark only suppresses nudges.
+        // Treat an absent watermark as no completed `ctx_note(read)`.
         return 0;
     }
 }
 
 /**
- * Record that ctx_note(read) was just called for this session. The watermark is
- * compared against note updated_at / created_at on each nudge decision.
+ * Nudge decisions compare this watermark with each note's `updated_at` or `created_at`.
  */
 export function setNoteLastReadAt(db: Database, sessionId: string, at = Date.now()): void {
     db.transaction(() => {
@@ -1780,10 +1699,8 @@ export function getHistorianFailureState(
     };
 }
 
-/** Records a failure and returns the new consecutive-failure count (callers may
- *  ignore the return). The count drives whether a failure notice is framed as
- *  transient (low count — Magic Context will just retry) or escalated to an
- *  actionable "your historian model needs attention" notice (persistent). */
+/**
+ * */
 export function incrementHistorianFailure(db: Database, sessionId: string, error: string): number {
     let nextCount = 1;
     db.transaction(() => {
@@ -1793,7 +1710,7 @@ export function incrementHistorianFailure(db: Database, sessionId: string, error
         db.prepare(
             "UPDATE session_meta SET historian_failure_count = ?, historian_last_error = ?, historian_last_failure_at = ? WHERE session_id = ?",
         ).run(nextCount, error, Date.now(), sessionId);
-        // Normalize error to single line for log greppability
+        // The log stores errors as one line for grep.
         const reason = error.replace(/\s+/g, " ").trim().slice(0, 300);
         sessionLog(sessionId, `historian failure recorded: count=${nextCount} reason="${reason}"`);
     })();
@@ -1809,24 +1726,19 @@ export function clearHistorianFailureState(db: Database, sessionId: string): voi
     })();
 }
 
-// ── Overflow detection state ──
 //
-// Recovery can be armed by either a provider rejection or a proactive model
-// shrink check. Persisting the origin keeps restarts from conflating the two:
-// only the provider's own overflow rejection is trustworthy enough for the
-// transform to abort before another request. Numeric gating is deferred to the
-// module-side provider-accurate estimator.
+// Only a provider-overflow rejection permits the transform to abort before another request.
 
 export type EmergencyRecoveryOrigin = "provider_overflow" | "proactive_model_shrink";
 
 export interface PersistedOverflowState {
-    /** Provider-reported context limit from the overflow error; 0 means none detected. */
+    /** The detected limit is provider-reported; `0` means none detected. */
     detectedContextLimit: number;
-    /** Model key that produced the detected limit, when known. */
+    /** The model key identifies the model that produced the detected limit, when known. */
     detectedContextLimitModelKey: string | null;
-    /** Whether the detected number is prompt-only, combined, or ambiguous. */
+    /** The flag states whether the detected number is prompt-only, combined, or ambiguous. */
     detectedContextLimitProvenance: ContextLimitProvenance;
-    /** True while emergency recovery is still required. */
+    /* */
     needsEmergencyRecovery: boolean;
     /** Why recovery was armed; null for unarmed or untyped legacy state. */
     emergencyRecoveryOrigin: EmergencyRecoveryOrigin | null;
@@ -1883,8 +1795,7 @@ export function getOverflowState(
     const needs =
         typeof result.needs_emergency_recovery === "number" && result.needs_emergency_recovery > 0;
     const persistedOrigin = normalizeEmergencyRecoveryOrigin(result.emergency_recovery_origin);
-    // Legacy provider-overflow rows predate the origin column. A positive detected
-    // limit is provider proof; an untyped flag without one is not abort-eligible.
+    // An armed row without a persisted origin uses `provider_overflow` only when its detected limit is positive; otherwise it has no recovery origin.
     const recoveryOrigin = needs
         ? (persistedOrigin ?? (limit > 0 ? "provider_overflow" : null))
         : null;
@@ -1898,9 +1809,7 @@ export function getOverflowState(
 }
 
 /**
- * Arm emergency recovery with its source. Provider overflow is the default;
- * proactive model-shrink callers must pass that origin explicitly. A parsed
- * provider limit is persisted transactionally with the arm. Repeating a provider
+ * The transaction persists a parsed provider limit with the recovery arm.
  * overflow while recovery is already durable records a process-local reconfirmation.
  */
 export function recordOverflowDetected(
@@ -1911,7 +1820,7 @@ export function recordOverflowDetected(
     origin: EmergencyRecoveryOrigin = "provider_overflow",
     provenance: ContextLimitProvenance = "unknown",
 ): void {
-    // Arm before the durable write so an unreadable or failed write remains fail-closed.
+    // The function arms recovery before the durable write so an unreadable or failed write remains fail-closed.
     emergencyRecoveryArmedSessions.add(sessionId);
     emergencyRecoveryArmedAtBySession.set(sessionId, Date.now());
     db.transaction(() => {
@@ -1945,9 +1854,8 @@ export function recordOverflowDetected(
 }
 
 /**
- * Record the real provider-reported context limit WITHOUT arming emergency
- * recovery. Used for subagent overflow: the limit is useful data for accurate
- * pressure math (consumed by `resolveContextLimit()` via `getOverflowState()`),
+ * The function records the provider-reported limit without arming recovery.
+ * Subagent overflows retain the detected limit for pressure calculations.
  * but subagents can't run historian so the recovery flag would be orphan state.
  */
 export function recordDetectedContextLimit(
@@ -1971,7 +1879,7 @@ export function recordDetectedContextLimit(
     })();
 }
 
-/** Clear the recovery flag. Keeps the detected limit (valuable even after recovery). */
+/** The function clears the recovery flag but retains the detected limit for pressure calculations. */
 export function clearEmergencyRecovery(db: Database, sessionId: string): void {
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
@@ -1985,15 +1893,12 @@ export function clearEmergencyRecovery(db: Database, sessionId: string): void {
             ).run(sessionId);
         }
     })();
-    // Clear only after the durable clear succeeds.
     emergencyRecoveryArmedSessions.delete(sessionId);
     emergencyRecoveryArmedAtBySession.delete(sessionId);
     providerOverflowReconfirmedSessions.delete(sessionId);
 }
 
 /**
- * Clear the detected limit. Called when the session switches to a different
- * model — the old limit is no longer relevant.
  */
 export function clearDetectedContextLimit(db: Database, sessionId: string): void {
     db.transaction(() => {
@@ -2004,16 +1909,15 @@ export function clearDetectedContextLimit(db: Database, sessionId: string): void
     })();
 }
 
-// ── Compaction marker state ──
 
 export interface PersistedCompactionMarkerState {
     boundaryMessageId: string;
     summaryMessageId: string;
     compactionPartId: string;
     summaryPartId: string;
-    /** The raw ordinal at which the boundary was set */
+    /* */
     boundaryOrdinal: number;
-    /** OpenCode message id of the compartment target used to resolve this marker. */
+    /* */
     targetEndMessageId: string | null;
 }
 
@@ -2056,7 +1960,6 @@ export function getPersistedCompactionMarkerState(
             };
         }
     } catch {
-        // Intentional: corrupt JSON → treat as empty
     }
     return null;
 }
@@ -2073,7 +1976,6 @@ export function setPersistedCompactionMarkerState(
     ).run(json, state?.targetEndMessageId ?? null, sessionId);
 }
 
-// ── Stripped placeholder message IDs ──
 
 export function getStrippedPlaceholderIds(db: Database, sessionId: string): Set<string> {
     const row = db
@@ -2086,7 +1988,6 @@ export function getStrippedPlaceholderIds(db: Database, sessionId: string): Set<
         if (Array.isArray(parsed))
             return new Set(parsed.filter((v: unknown) => typeof v === "string"));
     } catch {
-        // Intentional: corrupt JSON → treat as empty
     }
     return new Set();
 }
@@ -2101,18 +2002,13 @@ export function setStrippedPlaceholderIds(db: Database, sessionId: string, ids: 
 }
 
 /**
- * Compare-and-swap a delta (add/remove) onto the persisted stripped-placeholder
- * set, retrying on a concurrent write so sibling OpenCode/Pi processes sharing
- * the session DB merge instead of clobbering each other's discovered IDs.
+ * The function CAS-merges add/remove deltas to preserve concurrently discovered IDs.
  *
- * The mutation is expressed as a delta (not a whole-set overwrite) precisely so
- * the CAS retry is meaningful: each attempt re-reads the current set, re-applies
- * `(current ∪ add) \ remove`, and CAS-writes against the exact bytes it read.
- * A whole-set overwrite would re-apply a stale-read-derived set and silently
- * undo a sibling's concurrent change.
+ * CAS retries reapply the delta to the latest persisted set.
+ * A whole-set overwrite can silently undo a sibling's concurrent change by reapplying a stale-read-derived set.
  *
- * Returns true when the set ended in the intended state (incl. no-op), false
- * only when retries were exhausted.
+ * The function returns true after applying the delta or when the set already reflects it, including no-op deltas.
+ * The function returns false only after all CAS retries are exhausted.
  */
 export function applyStrippedPlaceholderDelta(
     db: Database,
@@ -2128,9 +2024,7 @@ export function applyStrippedPlaceholderDelta(
         const row = db
             .prepare("SELECT stripped_placeholder_ids FROM session_meta WHERE session_id = ?")
             .get(sessionId) as { stripped_placeholder_ids?: string | null } | undefined;
-        // Keep the RAW stored value (NULL vs "") for the CAS predicate — SQLite's
-        // `IS` matches NULL and value equality alike, so we can compare against
-        // exactly what we read regardless of whether the column is NULL or "".
+        // The CAS predicate retains NULL and "" because SQLite `IS` matches NULL and equal non-NULL values.
         const rawStored = row ? (row.stripped_placeholder_ids ?? null) : null;
         const current = new Set<string>(parseStrippedBlob(rawStored));
         for (const id of add) current.add(id);
@@ -2155,7 +2049,7 @@ function parseStrippedBlob(raw: string | null | undefined): string[] {
         if (Array.isArray(parsed))
             return parsed.filter((v: unknown): v is string => typeof v === "string");
     } catch {
-        // corrupt JSON → empty
+        // Invalid JSON is treated as an empty set.
     }
     return [];
 }
@@ -2173,13 +2067,13 @@ export function removeStrippedPlaceholderId(
     return true;
 }
 
-// ── Merged-assistant reasoning stripped IDs (frozen replay watermark) ──
+// The persisted set is a frozen replay watermark for merged-assistant reasoning.
 
 /**
- * Assistant message ids whose merged-run reasoning neutralization has already
- * been first-applied on a cache-busting pass. The set is replayed on every pass
- * and never shrinks while the session exists, so tail growth or a fresh object
- * rebuild cannot introduce a new prefix mutation on a defer pass.
+ * The set records assistant message IDs whose merged-run reasoning neutralization first ran on a cache-busting pass.
+ * Every pass replays the set.
+ * The set never shrinks while the session exists.
+ * The immutable set prevents tail growth and object rebuilds from introducing prefix mutations on defer passes.
  */
 export function getMergedReasoningStrippedIds(db: Database, sessionId: string): Set<string> {
     const row = db
@@ -2189,9 +2083,7 @@ export function getMergedReasoningStrippedIds(db: Database, sessionId: string): 
 }
 
 /**
- * Atomically merge assistant message ids into the persisted applied set. Persistence
- * must succeed before callers first mutate newly detected messages; otherwise a
- * later defer pass could not reproduce those bytes from a fresh rebuild.
+ * Callers must persist newly detected IDs before mutating messages so defer passes can reproduce the bytes after a fresh rebuild.
  */
 
 function isStrippedId(value: unknown): value is string {
@@ -2239,7 +2131,7 @@ export function addMergedReasoningStrippedIds(
     return casMergeStrippedIds(db, sessionId, "merged_reasoning_stripped_ids", ids);
 }
 
-// ── Trailing assistant blank decisions (frozen replay map) ──
+// The persisted map is a frozen replay map for trailing assistant blank decisions.
 
 export type PersistedTrailingBlankDecision = "keep" | `keep:${number}` | "strip";
 
@@ -2272,8 +2164,6 @@ function parseTrailingBlankDecisions(
 }
 
 /**
- * Read each assistant's replay choice. A historical choice is immutable; the live
- * newest assistant may replace its choice until a later assistant freezes it.
  */
 export function getTrailingBlankDecisions(
     db: Database,
@@ -2285,7 +2175,7 @@ export function getTrailingBlankDecisions(
     return parseTrailingBlankDecisions(row?.trailing_blank_decisions);
 }
 
-/** Persist new decisions, optionally refreshing the still-live newest assistant. */
+/* */
 export function addTrailingBlankDecisions(
     db: Database,
     sessionId: string,
@@ -2326,17 +2216,16 @@ export function addTrailingBlankDecisions(
     return false;
 }
 
-// ── Stale ctx_reduce stripped message IDs (frozen replay watermark) ──
+// The persisted set is a frozen replay watermark for stale ctx_reduce-stripped message IDs.
 
 /**
- * Message ids whose ctx_reduce parts have been sentinel-stripped because they
- * aged past the protected window. This set is the FROZEN replay watermark for
- * `dropStaleReduceCalls`: it advances ONLY on cache-busting passes (where the
- * wire is allowed to change) and is replayed verbatim on every pass. Replaying
- * a frozen id set — instead of recomputing a live `messages.length - protected`
- * boundary every pass — is what keeps defer passes byte-identical: tail growth
- * can never push an older ctx_reduce call past a moving boundary and strip it
- * mid-prefix on a defer pass (which busts the Anthropic prompt cache).
+ * The set records IDs whose ctx_reduce parts were sentinel-stripped after aging past the protected window.
+ * Only cache-busting passes advance the set because only they may change the wire.
+ * Every pass replays the set verbatim.
+ * Replaying frozen IDs avoids recomputing the live `messages.length - protected` boundary.
+ * The frozen boundary keeps defer passes byte-identical despite tail growth.
+ * A defer pass does not strip IDs that newly age past the live boundary.
+ * Stripping a mid-prefix ctx_reduce call on a defer pass would bust Anthropic's prompt cache.
  */
 export function getStaleReduceStrippedIds(db: Database, sessionId: string): Set<string> {
     const row = db
@@ -2346,10 +2235,9 @@ export function getStaleReduceStrippedIds(db: Database, sessionId: string): Set<
 }
 
 /**
- * CAS-merge new aged ctx_reduce message ids into the frozen set, retrying on a
- * concurrent write so sibling processes sharing the session DB merge instead of
- * clobbering. Returns true when the set ended in the intended state (incl.
- * no-op), false only when retries were exhausted.
+ * The function CAS-merges `ctx_reduce` IDs to prevent sibling processes from clobbering concurrent updates.
+ * The function returns true when the set reaches the intended state, including a no-op.
+ * The function returns false only after CAS_RETRY_LIMIT failed updates.
  */
 export function addStaleReduceStrippedIds(
     db: Database,
@@ -2360,12 +2248,12 @@ export function addStaleReduceStrippedIds(
 }
 
 /**
- * Message ids whose processed-image file parts have been sentinel-stripped.
- * Frozen replay watermark for `stripProcessedImages`, identical in purpose to
- * `stale_reduce_stripped_ids`: it advances ONLY on cache-busting passes and is
- * replayed verbatim every pass, so an aged image message can never have its
- * images first-removed on a defer pass (which busts the Anthropic prompt cache,
- * because the empty sentinel is filtered off the Anthropic wire).
+ * The set contains message IDs whose processed-image file parts have been sentinel-stripped.
+ * The set is a frozen replay watermark for stripProcessedImages.
+ * The watermark advances only on cache-busting passes.
+ * Every pass replays the watermark verbatim.
+ * A defer pass never first-removes images from an aged image message.
+ * The empty sentinel is filtered from the Anthropic wire and therefore busts the Anthropic prompt cache.
  */
 export function getProcessedImageStrippedIds(db: Database, sessionId: string): Set<string> {
     const row = db
@@ -2375,10 +2263,9 @@ export function getProcessedImageStrippedIds(db: Database, sessionId: string): S
 }
 
 /**
- * CAS-merge new processed-image message ids into the frozen set, retrying on a
- * concurrent write so sibling processes sharing the session DB merge instead of
- * clobbering. Returns true when the set ended in the intended state (incl.
- * no-op), false only when retries were exhausted.
+ * CAS retries prevent sibling processes sharing the session database from clobbering each other's IDs.
+ * The function returns true when the set reaches the intended state, including a no-op.
+ * The function returns false only after CAS_RETRY_LIMIT failed updates.
  */
 export function addProcessedImageStrippedIds(
     db: Database,
@@ -2388,29 +2275,26 @@ export function addProcessedImageStrippedIds(
     return casMergeStrippedIds(db, sessionId, "processed_image_stripped_ids", ids);
 }
 
-// ── Pending compaction marker state (plan v6 deferred drain) ──
 
 /**
- * Payload stored in `session_meta.pending_compaction_marker_state` between
- * a background historian/compressor publish and its consuming pass in the
- * transform. The transform's drain step CAS-compares this blob against its
- * own copy so concurrent publishers don't double-clear.
+ * The payload persists in session_meta.pending_compaction_marker_state between publication and consumption.
+ * A background historian or compressor publishes the payload before the transform consumes it.
+ * CAS comparison preserves a payload published after the consumer read `expected`.
  *
- * `endMessageId` lets the consuming pass validate the marker target is still
- * present (raw OpenCode message + compartment row), then write
- * `PersistedCompactionMarkerState` and clear pending atomically.
+ * endMessageId lets the consuming pass validate that the marker target still exists.
+ * The consuming pass requires both the raw OpenCode message and compartment row before writing persisted state.
+ * The consuming pass writes PersistedCompactionMarkerState and clears pending state atomically.
  *
- * Stored as a JSON string via `stableStringify` for byte-identical CAS.
- * Absence is signalled as SQL NULL, NEVER as `""` — the migration v13 column
- * is intentionally declared without a DEFAULT clause and is excluded from
+ * The persistence layer serializes the pending marker with `stableStringify` so CAS compares byte-identical blobs.
+ * SQL NULL, not "", represents absence.
  * `healNullTextColumns`.
  */
 export interface PendingCompactionMarker {
-    /** Raw ordinal at which the marker should land. */
+    /* */
     ordinal: number;
-    /** OpenCode message ID at the end of the compartment target. */
+    /** endMessageId identifies the final OpenCode message in the compartment target. */
     endMessageId: string;
-    /** Unix ms of publication. Diagnostic only; used by doctor stale-pending checks. */
+    /** The publication timestamp is diagnostic only and supports doctor stale-pending checks. */
     publishedAt: number;
 }
 
@@ -2420,7 +2304,7 @@ export interface DeferredExecutePayload {
     recordedAt: number;
 }
 
-/** Type guard for a parsed PendingCompactionMarker payload. */
+/* */
 function isPendingCompactionMarker(value: unknown): value is PendingCompactionMarker {
     return (
         typeof value === "object" &&
@@ -2439,8 +2323,7 @@ export function getPendingCompactionMarkerState(
         .prepare("SELECT pending_compaction_marker_state FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { pending_compaction_marker_state?: string | null } | null;
     const raw = row?.pending_compaction_marker_state;
-    // Defensive: NULL is the canonical absence, but legacy / cross-version
-    // writes might still put `""` here. Both treated as absent.
+    // The parser treats SQL NULL and "" as absent.
     if (raw === null || raw === undefined || raw === "") return null;
     try {
         const parsed = JSON.parse(raw);
@@ -2448,18 +2331,15 @@ export function getPendingCompactionMarkerState(
             return parsed;
         }
     } catch {
-        // Intentional: corrupt JSON → treat as absent. Next publish will
-        // overwrite cleanly; next consuming pass will read the new value.
+        // The parser treats corrupt JSON as absent; a subsequent publish overwrites it.
     }
     return null;
 }
 
 /**
- * Write or clear the pending-marker blob.
  *
- * Setting `state === null` writes SQL NULL (NOT `""`) so the absence sentinel
- * stays consistent across upgrades. Stringification uses `stableStringify`
- * so callers can later CAS-compare with the same serializer.
+ * Writing state === null stores SQL NULL rather than "".
+ * The serializer uses `stableStringify` so callers can CAS-compare the same serialized value.
  */
 export function setPendingCompactionMarkerState(
     db: Database,
@@ -2474,15 +2354,9 @@ export function setPendingCompactionMarkerState(
 }
 
 /**
- * Compare-and-swap clear: only writes NULL when the currently-stored blob
- * matches `expected` byte-for-byte. Returns true if the CAS succeeded (we
- * cleared the row), false if the row had drifted (another publish overwrote
- * it; that publish's own consuming pass owns the heal).
+ * The clear operation clears the row only if its stored blob byte-matches `expected`; it returns true when the update changes a row.
+ * The newer marker remains pending for its consuming pass.
  *
- * Used by the transform postprocess drain to clear pending without racing
- * a newer background publish: if Publish A's drain reads blob_X then Publish
- * B overwrites with blob_Y before A's CAS runs, A's CAS fails and B's
- * pending stays intact for B's own next consuming pass.
  */
 export function clearPendingCompactionMarkerStateIf(
     db: Database,
@@ -2499,12 +2373,9 @@ export function clearPendingCompactionMarkerStateIf(
     return result.changes > 0;
 }
 
-// ── Pending Pi compaction marker state (Pi deferred native compaction drain) ──
 
 /**
- * Payload stored in `session_meta.pending_pi_compaction_marker_state` between
- * a Pi historian/recomp publication and the next materializing Pi context pass.
- * Stored with `stableStringify` so CAS clear can compare byte-for-byte.
+ * The persistence layer uses `stableStringify` so the CAS clear compares bytes exactly.
  */
 export interface PendingPiCompactionMarker {
     firstKeptEntryId: string;
@@ -2536,8 +2407,6 @@ export function getPendingPiCompactionMarkerState(
         .prepare("SELECT pending_pi_compaction_marker_state FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { pending_pi_compaction_marker_state?: string | null } | null;
     const raw = row?.pending_pi_compaction_marker_state;
-    // Defensive: NULL is the canonical absence, but legacy / cross-version
-    // writes might still put `""` here. Both treated as absent.
     if (raw === null || raw === undefined || raw === "") return null;
     try {
         const parsed = JSON.parse(raw);
@@ -2545,7 +2414,6 @@ export function getPendingPiCompactionMarkerState(
             return parsed;
         }
     } catch {
-        // Fall through to clear malformed durable state below.
     }
     db.prepare(
         "UPDATE session_meta SET pending_pi_compaction_marker_state = NULL WHERE session_id = ? AND pending_pi_compaction_marker_state = ?",
@@ -2599,8 +2467,6 @@ export function peekDeferredExecutePending(
         .prepare("SELECT deferred_execute_state FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { deferred_execute_state?: string | null } | null;
     const raw = row?.deferred_execute_state;
-    // Defensive: NULL is the canonical absence, but legacy / cross-version
-    // writes might still put `""` here. Both treated as absent.
     if (raw === null || raw === undefined || raw === "") return null;
     try {
         return JSON.parse(raw) as DeferredExecutePayload;
@@ -2641,14 +2507,7 @@ export function clearDeferredExecutePendingIfMatches(
 }
 
 /**
- * List all sessions with a deferred marker still pending. Used at hook init
- * to re-seed `deferredHistoryRefreshSessions` and
- * `deferredMaterializationSessions` after a plugin restart — without this,
- * a publish that ran before a crash would lose its deferred-history signal
- * and the next transform pass would not consume the marker.
  *
- * Defensive `!= ''` filter: even though setter writes NULL, an earlier
- * codepath or external write could have left an empty string. Treat both as
  * absent.
  */
 export function getSessionsWithPendingMarker(db: Database): string[] {

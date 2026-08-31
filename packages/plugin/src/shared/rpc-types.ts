@@ -30,14 +30,12 @@ export interface SidebarSnapshot {
     inputTokens: number;
     contextLimit: number;
     /**
-     * Raw wire-input pressure against the resolved model window. This is separate
-     * from Magic Context's execute threshold so native-compaction UI never shows
-     * a threshold-relative fill percentage.
+     * native_context_usage_percentage measures raw wire-input pressure against the resolved model window, independent of Magic Context's execute threshold.
      */
     native_context_usage_percentage?: number;
     /**
-     * Magic Context compaction mode is resolved at startup and sent in the
-     * status-detail wire payload; snake_case matches that payload's field naming.
+     * compaction_enabled is resolved at startup and sent in the status-detail wire payload.
+     * The status-detail payload uses snake_case field names.
      */
     compaction_enabled?: boolean;
     systemPromptTokens: number;
@@ -62,76 +60,58 @@ export interface SidebarSnapshot {
     factTokens: number;
     memoryTokens: number;
     /**
-     * Token estimate of the injected <project-docs> block (root ARCHITECTURE.md
-     * + STRUCTURE.md) that lives in m[0] in v2. Part of the message stream, not
-     * conversation. Display layer shows this as "Docs".
+     * docsTokens estimates the injected <project-docs> block from root ARCHITECTURE.md and STRUCTURE.md in m[0].
      */
     docsTokens: number;
     /**
-     * Token estimate of the injected <user-profile> block (promoted user
-     * memories) that lives in m[0] in v2. Part of the message stream, not
-     * conversation. Display layer shows this as "Profile".
+     * profileTokens estimates injected promoted user memories in the <user-profile> block in m[0].
      */
     profileTokens: number;
     /**
-     * Token estimate of real user/assistant discussion (text + reasoning +
-     * image parts) inside messages, excluding injected <session-history>,
-     * <project-docs>, and <user-profile> blocks. Display layer shows this as
+     * conversationTokens estimates user and assistant text, reasoning, and image content excluding injected session-history, project-docs, and user-profile blocks.
      * "Conversation".
      */
     conversationTokens: number;
     /**
-     * Token estimate of tool call I/O inside messages (tool_use, tool_result,
-     * tool, tool-invocation parts). Actionable — users can reduce via
-     * ctx_reduce. Display layer shows this as "Tool Calls".
+     * toolCallTokens estimates tool call I/O in tool_use, tool_result, tool, and tool-invocation parts.
      */
     toolCallTokens: number;
     /**
-     * Measured token cost of tool schemas (description + JSON-schema
-     * parameters) OpenCode sends in the request `tools` parameter. Populated
-     * by the `tool.definition` plugin hook, keyed by
-     * `{providerID, modelID, agentName}`. Zero until the first turn after
-     * plugin startup measures the current agent's tool set. Display layer
-     * shows this as "Tool Definitions".
+     * toolDefinitionTokens measures request `tools` schema tokens keyed by `{providerID, modelID, agentName}` and remains zero until the first measured turn.
      */
     toolDefinitionTokens: number;
     /** Persisted reclaimable (U) and eligible (T) token counts used by both nudge mechanisms. */
     tailHygiene?: TailHygieneStatus;
     /**
-     * Effective execute-threshold percentage for this session's active model,
-     * after per-model resolution and the tokens→percentage conversion (when
-     * `execute_threshold_tokens` applies). Surfaces in the sidebar / status
-     * dialog header alongside `usagePercentage` so users can see how close
-     * the session is to triggering compaction. Defaults to `65` when no live
-     * model is known yet — matches the runtime fallback used by the
-     * scheduler and transform paths.
+     * `executeThreshold` is the effective execute-threshold percentage for the active model.
+     * `execute_threshold_tokens` is converted to a percentage after per-model resolution.
+     * `executeThreshold` appears beside `usagePercentage` in the sidebar and status dialog.
+     * `executeThreshold` lets users compare usage with the compaction threshold.
+     * `executeThreshold` defaults to `65` when no live model is known.
+     * The scheduler and transform paths default `executeThreshold` to `65` when no live model is known.
      */
     executeThreshold: number;
     /**
-     * True when `executeThreshold` was clamped down from a higher configured value
-     * (tokens config above 90% × contextLimit, or a percentage above the 90% cap).
-     * The sidebar/status dialog append a small marker so the user knows their
-     * configured value was reduced rather than applied verbatim (issue #241).
-     * Absent when no clamp occurred.
+     * The clamp flag is true when `executeThreshold` is reduced to the 90% cap.
+     * The clamp applies above 90% of `contextLimit`, whether configured in tokens or as a percentage.
+     * The sidebar and status dialog mark values clamped below the configured threshold.
+     * The marker is absent when no clamp occurred.
      */
     executeThresholdClamped?: boolean;
-    /** Rust module cache boundary state, when the session uses Rust authority mode. */
+    /** The session exposes Rust module cache boundary state only in Rust authority mode. */
     boundaryPresent?: boolean;
     coverageOrdinal?: number | null;
     newWorkTokens?: number | null;
     totalInputTokens?: number | null;
     /**
-     * Live recomp / session-upgrade progress for this session, or null when no
-     * recomp is running (and no recent terminal state is being shown). Drives the
-     * sidebar "Recomp"/"Upgrade" progress bar and the /ctx-status dialog. Mirrors
-     * the runtime `RecompProgress` shape from compartment-runner-types.ts.
+     * The session reports live recomp or session-upgrade progress; otherwise it reports null.
      */
-    /** Read-only per-task candidate counts; populated by the server RPC. */
+    /* */
     dreamerBacklog?: DreamTaskBacklogMap;
-    /** Process-local task progress; absent when no Dreamer task is running. */
+    /** Dreamer task progress; absent or null when no Dreamer task is running. */
     dreamerProgress?: DreamTaskProgress | null;
     recompProgress?: {
-        /** "recomp" → "Recomp" labels; "upgrade" → "Upgrade" labels. */
+        /* */
         kind?: "recomp" | "upgrade" | "embed" | "wrapup";
         phase: "recomp" | "migration" | "done" | "failed" | "skipped";
         processedMessages: number;
@@ -167,29 +147,27 @@ export interface StatusDetail extends SidebarSnapshot {
         };
     };
     /**
-     * Parsed cache TTL in ms. -1 = never expires (cacheTtl "never"; Infinity
-     * cannot ride JSON-RPC and 0 would be indistinguishable from unset). The
-     * values discriminate without the cacheNeverExpires flag: -1 never /
-     * N live. Falsy-value contract: see storage_versions for the precedent.
+     * cacheTtlMs uses -1 for cacheTtl "never".
+     * JSON-RPC cannot represent Infinity, and 0 means unset.
+     * -1 represents never expiration without relying on `cacheNeverExpires`.
      */
     cacheTtlMs: number;
-    /** Remaining ms in the idle-TTL window. -1 = never expires; 0 = expired
-     *  (only meaningful when lastResponseTime > 0); N = live countdown. */
+    /** cacheRemainingMs is the remaining idle-TTL duration: -1 means never expires and 0 means expired.
+     * A value of 0 means expired only when lastResponseTime > 0; positive values count down. */
     cacheRemainingMs: number;
     cacheExpired: boolean;
-    /** True when cacheTtl is "never" — the idle-TTL heuristic is disabled on
-     *  this lane. Redundant with cacheTtlMs === -1; kept as the readable form. */
+    /** cacheNeverExpires is true when cacheTtl is "never" and disables the idle-TTL heuristic.
+     * cacheNeverExpires duplicates `cacheTtlMs === -1` for readability. */
     cacheNeverExpires?: boolean;
     executeThreshold: number;
     /**
-     * Which config source produced `executeThreshold`. "tokens" means
-     * execute_threshold_tokens matched for this session's model and was
-     * converted to a percentage. "percentage" means percentage config was used.
+     * executeThresholdMode identifies the config source that produced executeThreshold.
+     * Tokens mode applies when execute_threshold_tokens matches the session model.
+     * Tokens mode converts execute_threshold_tokens to a percentage; percentage mode uses percentage config.
      */
     executeThresholdMode: "percentage" | "tokens";
     /**
-     * When `executeThresholdMode === "tokens"`, the absolute clamped token value
-     * (≤ 80% × contextLimit) that will trigger execute. Undefined in percentage mode.
+     * `executeThresholdTokens` is the token threshold (≤ 80% × `contextLimit`) that triggers execution; it is undefined in percentage mode.
      */
     executeThresholdTokens?: number;
     protectedTagCount: number;
@@ -197,34 +175,32 @@ export interface StatusDetail extends SidebarSnapshot {
     historyBlockTokens: number;
     compressionBudget: number | null;
     compressionUsage: string | null;
-    /** Effective configured toast duration in ms after config resolution. */
+    /** toastDurationMs is the effective configured toast duration in ms after config resolution. */
     toastDurationMs: number;
-    /** One-line status data for the experimental memory mural. */
+    /* */
     mural?: { present: boolean; ageMs: number | null };
-    /** Runtime logger write failures observed by this plugin process. */
+    /** loggerDiagnostics records runtime logger write failures observed by this plugin process. */
     loggerDiagnostics: LoggerDiagnostics;
     /**
-     * Stable storage-version probe: "which schema is the DB at, which fence does
-     * this binary carry". Field names are deliberately snake_case, mirroring the
-     * `storage_versions` block of the mc-module status envelope, so fleet probes
-     * parse one shape across both surfaces. The module cannot read context.db
-     * (the plugin owns it), so this surface supplies the live DB value; the module
-     * surface supplies the module-store value instead.
+     * Field names use snake_case, mirroring the `storage_versions` block of the mc-module status envelope.
+     * `storage_versions` mirrors the mc-module status envelope so fleet probes use one shape across both surfaces.
+     * The plugin status surface supplies the live context.db value because the mc-module cannot read context.db.
+     * The mc-module status surface supplies the module-store value instead of the live context.db value.
      */
     storage_versions: {
         /**
-         * Persisted schema version of context.db (MAX of schema_migrations).
-         * null = the version probe FAILED (read threw — broken/unreachable store);
-         * 0 = probe succeeded on a fresh DB without a migrations table. Distinct so
-         * readers never conflate broken-with-empty (fleet status-surface contract).
+         * context_db_schema_version is the persisted context.db schema version: MAX(schema_migrations).
+         * null means the version probe failed because the read threw.
+         * A successful probe on a fresh DB without a migrations table returns 0.
+         * Distinct null and 0 values prevent fleet readers from conflating a failed probe with an empty database.
          */
         context_db_schema_version: number | null;
-        /** Highest context.db schema version this plugin build supports. */
+        /** plugin_supported_version is the highest context.db schema version this plugin build supports. */
         plugin_supported_version: number;
     };
 }
 
-/** Embedding coverage for `/ctx-embed` status (mirrors getEmbeddingCoverageStatus). */
+/** EmbedDetail mirrors getEmbeddingCoverageStatus for `/ctx-embed` status. */
 export interface EmbedDetail {
     enabled: boolean;
     model: string;

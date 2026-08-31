@@ -1,14 +1,6 @@
 /**
- * Regression coverage for `detectRecentCommit`.
  *
- * Pin the parity-critical behaviors against OpenCode's commit-detection
- * walk in `tag-messages.ts`:
  *
- *   1. Detects 7-12 char hex paired with a commit verb in same text part
- *   2. Walks at most COMMIT_LOOKBACK (5) recent assistant messages
- *   3. Skips user / toolResult messages
- *   4. Doesn't match commit hashes inside tool args / non-text parts
- *   5. Returns false when no verb-paired hash exists in recent assistants
  */
 
 import { describe, expect, it } from "bun:test";
@@ -81,9 +73,6 @@ describe("detectRecentCommit", () => {
 	});
 
 	it("scans up to COMMIT_LOOKBACK (5) most-recent assistant messages", () => {
-		// Insert 6 assistant messages — only the last 5 are scanned.
-		// The OLDEST (index 0) carries the verb+hash pair; it should be
-		// outside the lookback window and not detected.
 		const messages = [
 			assistant("Way back: committed deadbeef"),
 			assistant("filler 1"),
@@ -96,8 +85,6 @@ describe("detectRecentCommit", () => {
 	});
 
 	it("matches a hash + verb in any of the last 5 assistant messages", () => {
-		// Same setup as above, but the verb+hash pair is within the
-		// last 5 — detected.
 		const messages = [
 			assistant("filler 0"),
 			assistant("filler 1"),
@@ -114,8 +101,6 @@ describe("detectRecentCommit", () => {
 	});
 
 	it("doesn't match commit hashes embedded in toolCall args (no text part)", () => {
-		// An assistant message whose only content is a toolCall part —
-		// no text — must not match even if the args reference a hash.
 		const message = {
 			role: "assistant",
 			content: [
@@ -131,8 +116,6 @@ describe("detectRecentCommit", () => {
 	});
 
 	it("requires hash AND verb in the SAME text part", () => {
-		// Hash in one part, verb in another — should NOT match. This
-		// matches OpenCode's behavior (per-part scan, not message-wide).
 		const message = {
 			role: "assistant",
 			content: [

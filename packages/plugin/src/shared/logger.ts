@@ -75,7 +75,7 @@ export function log(message: string, data?: unknown): void {
             scheduleFlush();
         }
     } catch {
-        // Intentional: logging must never throw
+        // Logging must never throw.
     }
 }
 
@@ -91,7 +91,7 @@ export function getLoggerDiagnostics(): LoggerDiagnostics {
     };
 }
 
-/** Flush buffered log entries immediately. Primarily useful to diagnostic readers and tests. */
+/* */
 export function flushLogger(): void {
     flush();
 }

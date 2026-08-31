@@ -16,11 +16,11 @@ import type { Database } from "@magic-context/core/shared/sqlite";
 import { openExistingContextDatabaseForMutation } from "../lib/database-access";
 
 export interface AuthorityProjectToVerify {
-    /** Human-readable role in a cross-project operation, such as "source" or "target". */
+    /** Identifies the project's human-readable role, such as "source" or "target". */
     role: string;
-    /** Durable Magic Context project identity stored by the authority marker. */
+    /** Identifies the durable Magic Context project identity stored by the authority marker. */
     projectPath: string;
-    /** Filesystem root used to bind the module request to this project. */
+    /** Identifies the filesystem root that binds the module request to the project. */
     projectRoot: string | null;
 }
 
@@ -35,10 +35,7 @@ export function authorityDrainCommand(project: AuthorityProjectToVerify): string
 }
 
 /**
- * Prove that every requested project is writable by TypeScript before a command
- * mutates shared context.db rows. A durable authority marker is the fence: no
- * marker means TypeScript owns the project, while a marker requires the module
- * to confirm TypeScript ownership for every authority domain.
+ * Requires TypeScript authority for each requested project with an authority marker.
  */
 export async function assertProjectsUseTsAuthority(args: {
     db: Database;
@@ -133,7 +130,6 @@ export async function reportAuthorityMarkers(args: {
     try {
         currentIdentity = resolveProjectIdentity(process.cwd());
     } catch {
-        // A doctor run must still report the durable fences when cwd identity fails.
     }
     const transport = new McHostModuleTransport();
     for (const marker of markers) {

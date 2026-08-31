@@ -55,10 +55,10 @@ pub fn per_connection_limits() -> ShmHostLimits {
     }
 }
 
-/// Ceiling on sparse ring virtual arena bytes this process admits at once. commentlint: allow(JUDGE)
+/// Ceiling on sparse ring virtual arena bytes this process admits at once.
 pub const MAX_RING_RESIDENT_BYTES: u64 = 1 << 30;
 
-/// Admission limits for `connections` concurrent sparse rings, bounded by aggregate virtual arena bytes. One connection stays admissible. commentlint: allow(JUDGE)
+/// Admission limits for `connections` concurrent sparse rings, bounded by aggregate virtual arena bytes. One connection stays admissible.
 pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
     let one = per_connection_limits();
     let affordable = MAX_RING_RESIDENT_BYTES
@@ -208,7 +208,7 @@ impl RingTransport {
 
     /// Test hook: install a publication observer for connections prepared
     /// after this call. The hook runs on the endpoint thread after the ring
-    /// commit. commentlint: allow(JUDGE)
+    /// commit.
     #[doc(hidden)]
     pub fn set_publish_hook(&self, hook: PublishHook) {
         *self.publish_hook.lock().expect("publish hook lock") = Some(hook);

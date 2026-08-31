@@ -1,25 +1,19 @@
 /**
- * Direct claim-memory operation kernel (direct-claims-cutover plan: U2;
- * KTD3-KTD5, KTD7, KTD13; R1-R8, R19-R20).
  *
  * One two-phase protocol owns every project-memory mutation:
- *   - phase one validates the claim-local mutation token and stages the
- *     domain rows inside a savepoint, returning touched projects and effect
- *     descriptors; a stale token rolls the savepoint back so zero partial
+ * Phase one validates the claim-local mutation token and stages domain rows in a savepoint.
+ * Phase one returns touched projects and effect descriptors.
+ * A stale token rolls the savepoint back so no partial rows survive.
  *     rows survive.
- *   - phase two allocates one generation per touched project, finalizes the
- *     policy ladder and projection under those generations, writes the
- *     receipt-grouped outbox effects, verifies effect counts and the
- *     generation vector, and stores the durable receipt (effect summary plus
- *     canonical result bytes) before commit.
+ * Phase two allocates one generation per touched project and finalizes each touched project's policy ladder and projection.
+ * Phase two writes receipt-grouped outbox effects and verifies effect counts and the generation vector.
+ * Phase two stores the durable receipt, including its effect summary and canonical result bytes, before commit.
  *
- * Replaying the same producer/key/digest returns the stored result bytes
- * verbatim with zero new effects; the same key with a different digest fails
- * before the staging callback runs. Stale and no-op outcomes persist as
- * zero-effect receipts; every receipt lives until whole-incarnation reset.
+ * Replaying the same producer, key, and digest returns the stored result bytes verbatim with zero new effects.
+ * The same key with a different digest fails before the staging callback runs.
+ * Stale and no-op outcomes persist as zero-effect receipts; every receipt lives until whole-incarnation reset.
  *
- * Producer adapters supply evidence provenance, claim-local tokens, and
- * stable operation keys; the kernel owns all SQL and effect ordering (KTD7).
+ * Producer adapters supply evidence provenance, claim-local tokens, and stable operation keys; the kernel owns all SQL and effect ordering.
  */
 
 import { type Database, isInTransaction } from "../../../shared/sqlite.ts";
@@ -80,11 +74,11 @@ import {
 } from "./storage-claims.ts";
 import type { MemoryScope } from "./types.ts";
 
-/** Frozen semantic key vocabulary for direct project-memory claims. */
+/** PROJECT_MEMORY_CLAIM_PREDICATE and PROJECT_MEMORY_CLAIM_SCOPE define the frozen semantic key vocabulary for direct project-memory claims. */
 export const PROJECT_MEMORY_CLAIM_PREDICATE = "states";
 export const PROJECT_MEMORY_CLAIM_SCOPE = "project-memory";
 
-/** Actor stamped on automatic maturity ladder steps by the kernel. */
+/** The kernel stamps automatic maturity ladder steps with this actor. */
 export const CLAIM_KERNEL_POLICY_ACTOR = "mc-claim-kernel-v1";
 
 export class ClaimOperationKeyReuseError extends Error {
@@ -96,8 +90,8 @@ export class ClaimOperationKeyReuseError extends Error {
     }
 }
 
-/** Caller-input defects (unknown claim, duplicate collision, bad shape).
- * Thrown before any receipt exists, so the transaction rolls back whole. */
+/** ClaimOperationInputError reports unknown claims, duplicate collisions, and malformed input.
+ * ClaimOperationInputError is thrown before any receipt exists, so the transaction rolls back entirely. */
 export class ClaimOperationInputError extends Error {
     constructor(message: string) {
         super(message);
@@ -106,7 +100,6 @@ export class ClaimOperationInputError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Claim-local mutation token (KTD3, R5)
 // ---------------------------------------------------------------------------
 
 export interface ProjectMemoryClaimRef {
@@ -119,7 +112,7 @@ export interface ProjectMemoryClaimRef {
     content: string;
 }
 
-/** Resolve a project-memory claim by public ID, fail-closed on corruption. */
+/** The resolver fails closed when claim-graph corruption occurs while resolving a project-memory claim by public ID. */
 export function getProjectMemoryClaimByPublicId(
     db: Database,
     publicClaimId: string,
@@ -228,7 +221,7 @@ function policyHeadsDigestForRevision(db: Database, revisionId: number): string 
     return computePolicyHeadsDigest(counts);
 }
 
-/** Mint the claim-local mutation token for the claim's current state. */
+/** The token issuer mints the claim-local mutation token from the claim's current state. */
 export function computeProjectMemoryMutationToken(
     db: Database,
     publicClaimId: string,
@@ -254,7 +247,7 @@ export type ClaimTokenValidation =
     | { ok: true; claim: ProjectMemoryClaimRef }
     | { ok: false; stalePart: ClaimTokenStalePart; reason: string };
 
-/** Recompute the token under the write transaction and name the stale part. */
+/** The write transaction recomputes the token and identifies the stale component. */
 export function validateProjectMemoryMutationToken(
     db: Database,
     token: ClaimMutationToken,
@@ -291,7 +284,6 @@ export function validateProjectMemoryMutationToken(
 }
 
 // ---------------------------------------------------------------------------
-// Generic two-phase runner (KTD5)
 // ---------------------------------------------------------------------------
 
 export interface ClaimOperationEnvelope {
@@ -313,9 +305,9 @@ export type ClaimOperationStageOutcome =
           kind: "effects";
           payload: CanonicalJsonValue | null;
           effects: readonly ClaimEffectDescriptor[];
-          /** Revisions whose policy ladder/projection phase two finalizes. */
+          /** Phase two finalizes each revision's policy ladder and projection. */
           policyRevisionIds?: readonly number[];
-          /** Public claim IDs whose mutation tokens are added to the result payload. */
+          /** The result payload includes mutation tokens for the affected public claim IDs. */
           mutationTokenPublicClaimIds?: readonly string[];
       }
     | {
@@ -333,7 +325,7 @@ export type ClaimOperationStageOutcome =
 export interface ClaimOperationRunResult {
     outcome: "applied" | "stale" | "noop";
     replayed: boolean;
-    /** Exact stored result bytes; byte-identical across replays (R6). */
+    /* */
     resultJson: string;
     result: ClaimOperationResult;
 }
@@ -392,8 +384,8 @@ function payloadWithMutationTokens(
     };
 }
 
-/** Ladder + projection finalization for one revision under an allocated
- * generation (phase two of KTD5). */
+/** Phase two finalizes the ladder and projection for one revision under its allocated generation.
+ * */
 function finalizeRevisionPolicyInCurrentTransaction(
     db: Database,
     revisionId: number,
@@ -483,8 +475,7 @@ function insertReceipt(
 }
 
 /**
- * Transaction-local two-phase runner. The staging callback runs inside a
- * savepoint; a stale outcome rolls it back so no partial rows survive (R5).
+ * The staging callback runs inside a savepoint, so stale tokens leave no partial rows.
  */
 export function runClaimOperationInCurrentTransaction(
     db: Database,
@@ -550,7 +541,6 @@ export function runClaimOperationInCurrentTransaction(
         );
     }
 
-    // Phase two: one generation per touched project (R4).
     const generationByProject = new Map<number, { generation: number; existed: boolean }>();
     for (const effect of staged.effects) {
         if (generationByProject.has(effect.projectId)) continue;
@@ -563,8 +553,7 @@ export function runClaimOperationInCurrentTransaction(
         });
     }
     for (const [projectId, allocation] of generationByProject) {
-        // Append-only collision guards inspect every INSERT, including ON
-        // CONFLICT resolution, so allocation uses UPDATE-then-INSERT.
+        // Append-only collision guards inspect every INSERT, including ON CONFLICT resolution, so allocation uses UPDATE-then-INSERT.
         if (allocation.existed) {
             db.prepare(
                 "UPDATE claim_project_generations SET generation = ?, updated_at = ? WHERE project_id = ?",
@@ -659,8 +648,7 @@ export function runClaimOperationInCurrentTransaction(
         );
     }
 
-    // Postconditions: declared effect count and the committed generation
-    // vector must agree with the stored rows (KTD5 phase-two verification).
+    // The stored effect count and generation vector must match the committed rows.
     const storedCount = (
         db
             .prepare("SELECT COUNT(*) AS count FROM claim_operation_effects WHERE receipt_id = ?")
@@ -687,7 +675,7 @@ export function runClaimOperationInCurrentTransaction(
     return { outcome: "applied", replayed: false, resultJson, result };
 }
 
-/** Standalone runner: one immediate transaction around the two phases. */
+/** The runner executes both phases in one immediate transaction. */
 export function runClaimOperation(
     db: Database,
     envelope: ClaimOperationEnvelope,
@@ -700,19 +688,19 @@ export function runClaimOperation(
 }
 
 // ---------------------------------------------------------------------------
-// Evidence provenance (KTD7): producers describe, the kernel writes.
+// Producers provide evidence provenance; the kernel persists it.
 // ---------------------------------------------------------------------------
 
 export interface ClaimEvidenceProvenance {
     sourceLocator: string;
-    /** Raw span text; only its SHA-256 is stored. */
+    /** The code stores only the raw span text's SHA-256. */
     sourceContent: string;
     sourceSessionId?: string | null;
     extractor: string;
     extractorVersion: string;
     extractorRunId: string;
     independenceKey: string;
-    /** Omitted means the schema's conservative `model_inference` default. */
+    /** The schema defaults an omitted value to `model_inference`. */
     sourceTrustClass?: SourceTrustClass;
 }
 
@@ -747,9 +735,9 @@ function writeEvidenceChain(
 }
 
 /**
- * Canonical provenance shape for claim-operation request digests. Shared with
- * the typed anti-memory writer so both digest the same field set; a field
- * added to `ClaimEvidenceProvenance` must land here exactly once.
+ * Claim-operation request digests use the canonical `ClaimEvidenceProvenance` field set.
+ * The typed anti-memory writer uses the same field set so both writers compute identical digests.
+ * The canonical digest field set contains each `ClaimEvidenceProvenance` field exactly once.
  */
 export function provenanceRequestShape(provenance: ClaimEvidenceProvenance): CanonicalJsonValue {
     return {
@@ -765,11 +753,8 @@ export function provenanceRequestShape(provenance: ClaimEvidenceProvenance): Can
 }
 
 /**
- * Project a mutation token onto the exact fields that identify the request.
- * Digesting a caller's token object directly would fold in any extra property
- * it happens to carry, so two spellings of the same token — one built here,
- * one round-tripped through JSON by a retrying caller — would digest
- * differently and turn an honest replay into `ClaimOperationKeyReuseError`.
+ * Request-digest computation uses only canonical token fields; extra caller properties otherwise make equivalent retries produce different digests and raise `ClaimOperationKeyReuseError`.
+ * A JSON-round-tripped token can contain a different property set from a locally constructed equivalent token.
  */
 export function tokenRequestShape(token: ClaimMutationToken): CanonicalJsonValue {
     return {
@@ -784,7 +769,6 @@ export function tokenRequestShape(token: ClaimMutationToken): CanonicalJsonValue
 }
 
 // ---------------------------------------------------------------------------
-// Project-memory domain rows shared by the typed operations
 // ---------------------------------------------------------------------------
 
 export interface ProjectMemoryAttributes {
@@ -796,10 +780,9 @@ export interface ProjectMemoryAttributes {
 }
 
 /**
- * Importance applied when a create request omits it. Exported so typed writers
- * that build their own request digests can digest the same resolved value this
- * module persists, keeping an omitted importance and an explicit `50` one
- * request rather than two.
+ * Create requests that omit importance use 50.
+ * Typed writers use the exported default when computing request digests.
+ * An omitted importance and an explicit 50 must produce the same request digest.
  */
 export const DEFAULT_MEMORY_IMPORTANCE = 50;
 
@@ -888,13 +871,11 @@ function appendLifecycleEvent(
 }
 
 /**
- * `exemptClaimIds` names every claim this operation itself is about to move off
- * the (project, category, hash) coordinate, so its own participants can never
- * read as the pre-existing owner. A revise or restore exempts one claim; a
- * merge exempts the target AND its sources, because the sources are still
- * `active` at check time and only retire later in the same transaction —
- * without the exemption, merged content that keeps a source's wording (the
- * common outcome) collides with that source and rejects a legitimate merge.
+ * `exemptClaimIds` excludes claims that the operation moves off the `(project, category, hash)` coordinate.
+ * Exempted claims cannot be treated as pre-existing owners of the coordinate.
+ * A revise or restore exempts one claim; a merge exempts its target and sources.
+ * Merge sources remain `active` during the ownership check and retire later in the same transaction.
+ * Without the exemption, merged content that keeps a source's wording collides with that source and rejects a legitimate merge.
  */
 function assertNoLiveDuplicate(
     db: Database,
@@ -906,8 +887,7 @@ function assertNoLiveDuplicate(
     },
 ): void {
     const exempt = [...new Set(args.exemptClaimIds)];
-    // An empty exemption list must not emit `NOT IN ()`, which SQLite rejects
-    // as a syntax error rather than matching every row.
+    // An empty exemption list omits the predicate so no rows are excluded.
     const exemptClause =
         exempt.length === 0 ? "" : ` AND claim_id NOT IN (${exempt.map(() => "?").join(", ")})`;
     const duplicate = db
@@ -959,7 +939,7 @@ function upsertCurrentHead(
     );
 }
 
-/** Rebuild the current-head dedup projection from authoritative rows (KTD4). */
+/** The rebuild derives the current-head deduplication projection from authoritative rows. */
 export function rebuildClaimMemoryCurrentHeads(db: Database, nowMs: number = Date.now()): void {
     db.transaction(() => {
         db.prepare("DELETE FROM claim_memory_current_heads").run();
@@ -1006,16 +986,6 @@ function attachEvidenceStage(
         payload: { claim: claimPayloadLocator(claim), kind: "evidence_attached" },
         effects: [
             {
-                // The observation identifies the attachment. One receipt can
-                // hold several attachments to the SAME claim and revision — an
-                // autonomous manifest whose entries normalize onto one live
-                // (project, category, hash) slot creates the claim once and
-                // attaches the rest, and an unchanged revise attaches too. A
-                // key of claim plus revision alone repeats across them, and
-                // `claim_operation_effects` enforces UNIQUE (receipt_id,
-                // effect_key) with an append-only trigger, so the second
-                // attachment would abort the whole manifest — including the
-                // unrelated entries in it — and every deterministic retry the
                 // same way.
                 effectKey: `evidence:${claim.publicClaimId}:r${claim.revision}:o${observationId}`,
                 projectId: claim.projectId,
@@ -1030,13 +1000,12 @@ function attachEvidenceStage(
 }
 
 // ---------------------------------------------------------------------------
-// Typed operations (R1, R7): create / revise
 // ---------------------------------------------------------------------------
 
 export interface CreateProjectMemoryClaimInput {
     projectId: number;
     content: string;
-    /** Optional normalized-hash preimage when display content is not dedup identity. */
+    /* */
     dedupText?: string;
     category: string;
     importance?: number;
@@ -1049,9 +1018,7 @@ export interface CreateProjectMemoryClaimInput {
     requestScope?: string;
     nowMs?: number;
     /**
-     * Set only by the typed anti-memory writer (`storage-anti-memory.ts`).
-     * The stage refuses `REJECTED_APPROACH` rows without it so no generic
-     * caller can mint an anti-memory revision that lacks its payload row.
+     * The stage rejects `REJECTED_APPROACH` rows without a payload row so generic callers cannot create an anti-memory revision without its payload.
      */
     antiMemoryWriter?: boolean;
 }
@@ -1117,7 +1084,7 @@ function createPolicySubjectForRevision(
     });
 }
 
-/** Transaction-local domain stage for composition inside one outer claim operation. */
+/* */
 export function stageCreateProjectMemoryClaimInCurrentTransaction(
     db: Database,
     input: CreateProjectMemoryClaimInput,
@@ -1227,9 +1194,7 @@ export function stageCreateProjectMemoryClaimInCurrentTransaction(
 }
 
 /**
- * Create a project-memory claim, or — when a live claim already owns the
- * (project, category, normalized hash) slot — attach the independent
- * provenance as evidence to its current revision (R7).
+ * The operation creates a project-memory claim or attaches independent provenance to the current revision of the live claim that owns the `(project, category, normalized hash)` slot.
  */
 export function createProjectMemoryClaim(
     db: Database,
@@ -1263,7 +1228,7 @@ export function createProjectMemoryClaim(
 export interface ReviseProjectMemoryClaimInput {
     token: ClaimMutationToken;
     content?: string;
-    /** Optional normalized-hash preimage when display content is not dedup identity. */
+    /** `dedupText` preserves the normalized-hash preimage when display content is not the deduplication identity. */
     dedupText?: string;
     category?: string;
     importance?: number;
@@ -1277,16 +1242,13 @@ export interface ReviseProjectMemoryClaimInput {
     requestScope?: string;
     nowMs?: number;
     /**
-     * Set only by the typed anti-memory writer (`storage-anti-memory.ts`).
-     * The stage refuses `REJECTED_APPROACH` revisions without it: a generic
-     * revise would advance the current revision with no
-     * `claim_anti_memory_revision_payloads` row, permanently breaking the
-     * typed reader for that claim (the payload table is append-only).
+     * `antiMemoryWriter === true` is required to revise an anti-memory claim or change a claim to or from `ANTI_MEMORY_CATEGORY`.
+     * The stage rejects `REJECTED_APPROACH` revisions without a `claim_anti_memory_revision_payloads` row so generic revision calls cannot advance the claim without payload data.
      */
     antiMemoryWriter?: boolean;
 }
 
-/** Transaction-local domain stage for composition inside one outer claim operation. */
+/** The stage runs inside the caller's outer claim-operation transaction. */
 export function stageReviseProjectMemoryClaimInCurrentTransaction(
     db: Database,
     input: ReviseProjectMemoryClaimInput,
@@ -1333,13 +1295,10 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
     }
     const contentUnchanged = sha256Utf8Hex(nextContent) === claim.contentDigest;
     const normalizedHash = computeNormalizedHash(input.dedupText ?? nextContent);
-    // `dedupText` decouples deduplication identity from display content, so a
-    // revision can leave the content bytes and every attribute untouched and
-    // still move the claim to a different (project, category, hash) slot. That
-    // has to count as a change: the early return skips the revision append, so
-    // `normalized_hash` would keep the superseded preimage in both the
-    // attributes row and the current head, and the duplicate check for the new
-    // identity would never run.
+    // `dedupText` decouples deduplication identity from display content, allowing a revision to move to a different `(project, category, hash)` slot without changing its content or other attributes.
+    // A changed `dedupText` must trigger a revision because the early return skips the revision append.
+    // `normalized_hash` must update in both the attributes row and the current head.
+    // The early return would skip the duplicate check for the changed `(project, category, hash)` identity.
     const unchanged =
         contentUnchanged &&
         normalizedHash === current.normalizedHash &&
@@ -1358,21 +1317,8 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
         exemptClaimIds: [claim.claimId],
     });
     const observationId = writeEvidenceChain(db, claim.projectId, input.provenance, nextContent);
-    // A metadata-only revision re-states the current revision's exact bytes, so
-    // every observation supporting those bytes still supports them. Dropping
-    // them would rebuild this revision's trust from the reviser's provenance
-    // alone — `hasExplicitUserEvidence` and `countIndependentEvidenceGroups`
-    // both read `supports` rows per revision — so an importance/scope/sharing
-    // change would reclassify a user-asserted memory down to the reviser's own
-    // maturity and drop it out of the automatic surfaces. A content-changing
-    // revision carries nothing: those observations attest to bytes this
-    // revision replaced. Relations are named rather than copied wholesale so a
-    // future non-supporting relation (a refutation, say) is never re-asserted
-    // as support here, the same discipline the merge path applies to lineage.
-    // Carrying a stamp forward cannot by itself manufacture trust:
-    // `hasExplicitUserEvidence` independently requires a non-first revision to
-    // still hold the claim's first-revision bytes, so model-authored content
-    // never inherits explicit-user standing through this path.
+    // Metadata-only revisions retain `supports` observations because their content bytes are unchanged.
+    // A content-changing revision carries no prior `supports` observations because they attest to replaced bytes.
     const carriedObservationIds = contentUnchanged
         ? (
               db
@@ -1447,9 +1393,6 @@ export function stageReviseProjectMemoryClaimInCurrentTransaction(
 }
 
 /**
- * Append a revision carrying changed content and/or revision-bound
- * attributes. Identical content and attributes with independent provenance
- * attach evidence to the current revision instead (R7).
  */
 export function reviseProjectMemoryClaim(
     db: Database,
@@ -1484,7 +1427,6 @@ export function reviseProjectMemoryClaim(
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle (KTD4) and same-project merge (R8)
 // ---------------------------------------------------------------------------
 
 export interface SetProjectMemoryLifecycleInput {
@@ -1496,7 +1438,7 @@ export interface SetProjectMemoryLifecycleInput {
     nowMs?: number;
 }
 
-/** Transaction-local domain stage for composition inside one outer claim operation. */
+/* */
 export function stageSetProjectMemoryClaimLifecycleInCurrentTransaction(
     db: Database,
     input: SetProjectMemoryLifecycleInput,
@@ -1574,8 +1516,8 @@ export function stageSetProjectMemoryClaimLifecycleInCurrentTransaction(
     };
 }
 
-/** Append one lifecycle event; the revision identity is untouched. Setting
- * the state the head already holds stores a zero-effect no-op receipt. */
+/**
+ * */
 export function setProjectMemoryClaimLifecycle(
     db: Database,
     producer: ProducerIdentity,
@@ -1604,20 +1546,19 @@ export function setProjectMemoryClaimLifecycle(
 export interface MergeProjectMemoryClaimsInput {
     targetToken: ClaimMutationToken;
     sourceTokens: readonly ClaimMutationToken[];
-    /** Undefined keeps the target's current content. */
+    /* */
     mergedContent?: string;
     actor: string;
     requestScope?: string;
     nowMs?: number;
 }
 
-/** Transaction-local domain stage for composition inside one outer claim operation. */
+/* */
 export function stageMergeProjectMemoryClaimsInCurrentTransaction(
     db: Database,
     input: MergeProjectMemoryClaimsInput,
     nowMs: number,
 ): ClaimOperationStageOutcome {
-    // Every claim-local token validates before the first effect.
     const targetValidation = validateProjectMemoryMutationToken(db, input.targetToken);
     if (!targetValidation.ok) {
         return {
@@ -1659,15 +1600,6 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         );
     }
     const normalizedHash = computeNormalizedHash(mergedContent);
-    // A merge keeps the target's category and terminally retires every source,
-    // so merging across categories destroys the source category's live fact.
-    // Categories partition distinct facts: two similar claims filed under
-    // different categories are not duplicates, one is miscategorized. Rejecting
-    // here — before any staging — is what the pre-cutover `merge_memories`
-    // guaranteed ("cross-category merges are rejected before any store mutation
-    // so a miscategorization cannot silently destroy a distinct fact"), and what
-    // the curator prompt still promises the model. The check belongs to the
-    // operation rather than one caller so every entry point inherits it.
     const sourceCategories = new Set<string>();
     for (const source of sources) {
         const attributes = readRevisionAttributes(db, source.currentRevisionId);
@@ -1698,13 +1630,6 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         exemptClaimIds: [target.claimId, ...sources.map((source) => source.claimId)],
     });
 
-    // Both evidence relations carry lineage, so both flow into the merged
-    // revision: `supports` covers create/revise/split-produced sources, and
-    // `merged_from` covers a source that is itself merge-produced and so holds
-    // no `supports` row of its own. Naming the relations rather than reading
-    // every row keeps a future non-lineage relation (a refutation, say) from
-    // being silently re-asserted here as merge support; a source carrying only
-    // such a relation instead trips the zero-evidence guard below.
     const sourceObservations = sources.flatMap((source) =>
         (
             db
@@ -1721,16 +1646,6 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
             "merge sources carry no supporting evidence; direct-SQL corruption",
         );
     }
-    // A merge that keeps the target's bytes — the default when `mergedContent`
-    // is omitted — leaves the target's own observations still attesting to
-    // exactly this content. Building the revision from source observations alone
-    // dropped that provenance from the live chain: current-state evidence
-    // summaries lost it, and merging this claim again propagated only its source
-    // lineage, so the original attestation was gone for good. Carried as
-    // `supports` because these observations attest the content, while source
-    // observations arrive as `merged_from` lineage. A merge that REPLACES the
-    // bytes carries nothing, for the same reason the source rule gives: those
-    // observations attest to content this revision replaced.
     const evidence = new Map<number, "supports" | "merged_from">();
     if (mergedContent === target.content) {
         for (const row of db
@@ -1824,12 +1739,7 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
         });
         policyRevisionIds.push(source.currentRevisionId);
     }
-    // The target head lands only after every source head is `retired`. The
-    // dedup index over (project, category, normalized_hash) is partial on
-    // `lifecycle_state = 'active'`, so merged content that keeps a source's
-    // wording still collides with that source's live head until it vacates the
-    // coordinate. Retiring first makes the ordering carry the same guarantee
-    // the exemption in `assertNoLiveDuplicate` states.
+    // The merge retires source heads before creating the target head to prevent active deduplication from colliding with retained source content.
     upsertCurrentHead(db, {
         claimId: target.claimId,
         projectId: target.projectId,
@@ -1861,12 +1771,7 @@ export function stageMergeProjectMemoryClaimsInCurrentTransaction(
 }
 
 /**
- * Same-project merge (R8): appends one target revision whose evidence links
- * every observation the sources carry as `merged_from` — including the ones a
- * merge-produced source itself carries as `merged_from`, so lineage survives
- * repeated merges — records supersedes conflicts, and retires the sources.
- * Trust and approval never transfer — the new target revision opens its own
- * conservative policy subject.
+ * A same-project merge links source `supports` and `merged_from` observations as `merged_from`.
  */
 export function mergeProjectMemoryClaims(
     db: Database,
@@ -1897,12 +1802,11 @@ export function mergeProjectMemoryClaims(
 }
 
 // ---------------------------------------------------------------------------
-// Applicability mapping and verification (KTD7 step 6, U9 consumers)
 // ---------------------------------------------------------------------------
 
 export interface ApplyProjectMemoryMappingInput {
     token: ClaimMutationToken;
-    /** Exact revision the mapping was computed against. */
+    /** The applicability mapping targets the revision used to compute it. */
     revisionLocator: string;
     paths: ApplicabilityPathsInput;
     knownFrom?: number;
@@ -1910,16 +1814,9 @@ export interface ApplyProjectMemoryMappingInput {
 }
 
 /**
- * Refuse a generic revision-scoped operation against an anti-memory claim.
  *
- * Anti-memory revisions carry a typed payload row and revision-bound state
- * that only the typed writer in `storage-anti-memory.ts` knows how to keep
- * whole. Verification and applicability both attach to one exact revision, so
- * letting a generic caller attach them here produces state the typed writer
- * silently drops the next time it appends a revision — a verified,
- * path-scoped warning quietly loses its authority and scope on its next TTL
- * extension. Refuse instead, so the gap is a failed call rather than a
- * downgrade nobody sees.
+ * Generic anti-memory writes drop typed revision state on the next append.
+ * The generic API rejects anti-memory writes because generic appends discard typed revision state.
  */
 function refuseGenericAntiMemoryRevisionAccess(
     db: Database,
@@ -1933,7 +1830,7 @@ function refuseGenericAntiMemoryRevisionAccess(
     }
 }
 
-/** Transaction-local domain stage for composition inside one outer claim operation. */
+/** `stageApplyProjectMemoryMappingInCurrentTransaction` composes within one outer claim operation. */
 export function stageApplyProjectMemoryMappingInCurrentTransaction(
     db: Database,
     input: ApplyProjectMemoryMappingInput,
@@ -1982,8 +1879,8 @@ export function stageApplyProjectMemoryMappingInCurrentTransaction(
     };
 }
 
-/** Append path knowledge onto the exact current revision's baseline
- * applicability stream. A mapping equal to the stream head is a no-op. */
+/** The mapping appends path knowledge to the exact current revision's baseline applicability stream.
+ * A mapping equal to the baseline applicability stream head is a no-op. */
 export function applyProjectMemoryMapping(
     db: Database,
     producer: ProducerIdentity,
@@ -2022,7 +1919,7 @@ export interface RecordProjectMemoryVerificationInput {
     nowMs?: number;
 }
 
-/** Transaction-local domain stage for composition inside one outer claim operation. */
+/* */
 function stageVerificationEventInCurrentTransaction(
     db: Database,
     input: RecordProjectMemoryVerificationInput,
@@ -2041,9 +1938,6 @@ function stageVerificationEventInCurrentTransaction(
             reason: `revision: verification targets ${input.revisionLocator} but current is ${expectedLocator}`,
         };
     }
-    // Each entry point admits exactly one category class, so neither is a side
-    // door into the other: the generic recorder refuses anti-memory, and the
-    // typed recorder accepts nothing else.
     if (antiMemory === "refuse") {
         refuseGenericAntiMemoryRevisionAccess(db, claim.currentRevisionId, "verification");
     } else if (
@@ -2086,15 +1980,8 @@ export function stageRecordProjectMemoryVerificationInCurrentTransaction(
 }
 
 /**
- * Record a verification outcome against an anti-memory claim.
  *
- * The generic recorder refuses this category because a generic revision path
- * drops the TTL, outcome, and scope invariants the typed writer maintains. A
- * verification event carries none of that state — it appends an outcome against
- * the current revision and touches neither content nor category — so the
- * verification lane needs an entry point that is allowed to record one. This is
- * the API that refusal message names; re-exported from `storage-anti-memory.ts`
- * so the typed surface is where a caller looks for it.
+ * Verification appends an outcome to the current revision without changing its content or category.
  */
 export function stageAntiMemoryVerificationInCurrentTransaction(
     db: Database,
@@ -2104,8 +1991,8 @@ export function stageAntiMemoryVerificationInCurrentTransaction(
     return stageVerificationEventInCurrentTransaction(db, input, nowMs, "require");
 }
 
-/** Append one verification event against the exact current revision and
- * finalize its policy under the same operation (KTD7 step 6). */
+/**
+ * */
 export function recordProjectMemoryVerification(
     db: Database,
     producer: ProducerIdentity,
@@ -2131,7 +2018,6 @@ export function recordProjectMemoryVerification(
 }
 
 // ---------------------------------------------------------------------------
-// Nonsemantic telemetry (R3): mutable counters, no receipts.
 // ---------------------------------------------------------------------------
 
 export function recordClaimUsage(
@@ -2146,7 +2032,6 @@ export function recordClaimUsage(
     const nowMs = args.nowMs ?? Date.now();
     const column = args.kind === "seen" ? "seen_count" : "retrieval_count";
     const stamp = args.kind === "seen" ? "last_seen_at" : "last_retrieved_at";
-    // Column names come from the fixed ternaries above, never caller input.
     // pi-lens-ignore: sql-injection
     const update = db.prepare(
         `UPDATE claim_usage_stats
@@ -2161,13 +2046,7 @@ export function recordClaimUsage(
 }
 
 /**
- * Count each DELIVERED anti-memory warning exactly once as `retrieved`.
  *
- * The shared search resolver deliberately counts only `memory`-source usage,
- * so warning retrieval telemetry is a delivery-surface obligation. Every
- * surface that renders packed results (explicit tools, auto-search runners)
- * must call this one entry point instead of restating the filter, or a new
- * consumer silently loses warning counters.
  */
 export function recordDeliveredAntiMemoryUsage(
     db: Database,
@@ -2188,7 +2067,6 @@ export function recordDeliveredAntiMemoryUsage(
 }
 
 // ---------------------------------------------------------------------------
-// Consumer checkpoints and outbox pruning (KTD13, R20)
 // ---------------------------------------------------------------------------
 
 export function readOutboxConsumerCheckpoint(
@@ -2206,9 +2084,6 @@ export function readOutboxConsumerCheckpoint(
 }
 
 /**
- * Advance one consumer/project cursor. Regression is rejected, the cursor may
- * not run past the current outbox tail, and the acknowledged id must not split a
- * receipt group within the project: a page cannot expose half an operation
  * (KTD13).
  */
 export function advanceOutboxConsumerCheckpointInCurrentTransaction(
@@ -2224,16 +2099,7 @@ export function advanceOutboxConsumerCheckpointInCurrentTransaction(
             `outbox checkpoint for ${args.consumer}/${args.projectId} cannot regress (${existing} -> ${args.ackedEffectId})`,
         );
     }
-    // A cursor past the tail claims to have observed effects that do not exist.
-    // Nothing else catches it: the receipt-split query below finds no `pending`
-    // row beyond such an id, so it passes. Left unchecked, once every required
-    // consumer holds a future cursor the prune boundary becomes that future id,
-    // and effects allocated below it afterwards are deleted having never been
-    // published to anyone.
     //
-    // The tail falls back to the existing cursor rather than zero so a
-    // re-acknowledgement stays idempotent after pruning empties the table — the
-    // acknowledged effects are gone precisely because they were consumed.
     const tailRow = db.prepare("SELECT MAX(id) AS tail FROM claim_operation_effects").get() as {
         tail: number | null;
     };
@@ -2272,19 +2138,7 @@ export interface ClaimOutboxPruneResult {
 }
 
 /**
- * Consumption-driven outbox retention (KTD13): the prune boundary is the
- * minimum acknowledged effect id across every REQUIRED consumer paired with
- * every project the outbox still holds effects for (an absent checkpoint pins
- * the boundary at zero), and only complete receipt groups at or below the
- * boundary leave. Receipts themselves never leave (R20). Runs inside the
- * caller's write transaction so the enabled=1 capability row can never commit.
  *
- * The pairing is what makes the boundary sound. Checkpoints are keyed
- * (consumer, project_id) while the delete below is global over effect ids, so a
- * consumer-only aggregate reports a boundary derived from the projects it HAS
- * acknowledged and silently ignores the ones it never checkpointed. A consumer
- * caught up on one project past another project's effect ids would then prune
- * effects it never processed.
  */
 export function pruneClaimOperationEffectsInCurrentTransaction(
     db: Database,

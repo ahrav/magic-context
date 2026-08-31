@@ -1,7 +1,3 @@
-//! Proves the off-path SQLite runtime probe and the shared direct-format
-//! vocabulary against the cross-runtime fixture owned by the TypeScript host.
-//! Run with: cargo test -p mc-store sqlite_runtime_source
-
 use mc_store::sqlite_runtime::{
     compute_marker_digest, compute_schema_manifest_digest, evaluate_sqlite_runtime_gate,
     format_dotted_version, parse_dotted_version, probe_sqlite_engine_identity_off_path,
@@ -47,7 +43,6 @@ fn manifest_components(fixture: &Value) -> Vec<(String, Vec<String>, Vec<String>
 fn sqlite_runtime_source() {
     let fixture = fixture();
 
-    // Vocabulary parity with the TypeScript host.
     assert_eq!(
         u64::from(MC_APPLICATION_ID),
         fixture["applicationId"].as_u64().unwrap()
@@ -73,7 +68,6 @@ fn sqlite_runtime_source() {
         format_dotted_version(MIN_SUPPORTED_SQLITE_VERSION)
     );
 
-    // Manifest shape and digest parity through the canonical line encoding.
     assert_eq!(
         SCHEMA_MANIFEST_PROTOCOL,
         fixture["componentManifest"]["protocol"].as_str().unwrap()
@@ -84,7 +78,7 @@ fn sqlite_runtime_source() {
         fixture["goldens"]["manifestDigest"].as_str().unwrap()
     );
 
-    // Marker digest parity, binding the database incarnation.
+    // The marker digest binds the database incarnation.
     let marker = &fixture["goldens"]["marker"];
     assert_eq!(
         compute_marker_digest(
@@ -103,8 +97,6 @@ fn sqlite_runtime_source() {
     );
     assert_ne!(other_incarnation, marker["markerDigest"].as_str().unwrap());
 
-    // Synthetic gate outcomes: approved source passes, unsafe bundled source
-    // and unknown source identities fail.
     let safe = SqliteEngineIdentity {
         sqlite_version: "3.51.3".to_string(),
         sqlite_source_id: "2026-01-01 00:00:00 0123456789abcdef0123456789abcdef01234567"
@@ -201,8 +193,6 @@ fn sqlite_runtime_source_connection_contract() {
 
 #[test]
 fn sqlite_runtime_source_id_gate_fails_closed_on_non_ascii_stamps() {
-    // A multi-byte sequence straddling the stamp/hash boundary must be refused,
-    // never split: `split_at` on a byte inside a UTF-8 sequence panics.
     let straddling = format!("2026-01-01 00:00:00\u{e9}{}", "0".repeat(45));
     assert!(!straddling.is_char_boundary(20));
     assert_eq!(
@@ -215,7 +205,6 @@ fn sqlite_runtime_source_id_gate_fails_closed_on_non_ascii_stamps() {
         )]
     );
 
-    // Multi-byte content anywhere else in a long-enough identity is refused too.
     let padded = format!("\u{4e16}\u{754c}\u{4e16}\u{754c}{}", "0".repeat(60));
     assert_eq!(
         evaluate_sqlite_runtime_gate(&SqliteEngineIdentity {

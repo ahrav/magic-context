@@ -544,8 +544,7 @@ describe("claim policy storage kernel", () => {
                     .id,
             );
 
-            // Matching bytes are insufficient when the producer cannot attest
-            // that a user authored the revision.
+            // Matching bytes are insufficient when the producer cannot attest that a user authored the revision.
             const copied = addObservation(fx, {
                 trust: "explicit_user",
                 extractor: "historian",
@@ -558,7 +557,6 @@ describe("claim policy storage kernel", () => {
                 .run(edited, copied);
             expect(hasExplicitUserEvidence(fx.db, edited)).toBeFalse();
 
-            // The dashboard's own observation for those bytes qualifies.
             const dashboard = addObservation(fx, {
                 trust: "explicit_user",
                 extractor: EXPLICIT_USER_REVISION_PRODUCER,
@@ -596,7 +594,6 @@ describe("claim policy storage kernel", () => {
                 (fx.db.prepare("SELECT MAX(id) AS id FROM claim_revisions").get() as { id: number })
                     .id,
             );
-            // Correct producer, but the observation describes different bytes.
             fx.db
                 .prepare(
                     "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 2)",
@@ -632,7 +629,6 @@ describe("claim policy storage kernel", () => {
                 .get(revisionId) as Record<string, unknown>;
             expect(row.effective_maturity).toBe("VERIFIED");
             expect(row.auto_eligible).toBe(1);
-            // Rebuild from authoritative rows reproduces identical fields.
             refreshEffectivePolicyInCurrentTransaction(fx.db, revisionId, { nowMs: 5 });
             expect(
                 fx.db

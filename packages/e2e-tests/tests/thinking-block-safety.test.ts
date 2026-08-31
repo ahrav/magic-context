@@ -14,23 +14,14 @@ import {
 } from "../src/incident-pool/scenarios/source-linked-regressions";
 
 /**
- * E2E regression suite for the Anthropic 400 error family:
  *
  *   "messages.N.content.M: thinking or redacted_thinking blocks in the
  *    latest assistant message cannot be modified. These blocks must remain
  *    as they were in the original response."
  *
- * The scenario mechanics, per-bug background (nudge anchor, dropped user
- * shell, image-part survival), and the auto-search adjudication scoping live
- * in the shared incident-pool driver module
- * (`src/incident-pool/scenarios/source-linked-regressions.ts`); this file is
- * the thin green wrapper binding those drivers to the ordinary mode-manifest
  * suite.
  */
 
-// Shared harness for lightweight tests. Each driver resets mock state before
-// running so they're independent. One subprocess per file is dramatically
-// faster than per-test and still gives full isolation between files.
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 
 let h: TestHarness;

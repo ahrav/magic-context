@@ -1,32 +1,25 @@
 /**
- * U9 production-input and provider-credential qualifier (KTD7, KTD21, KTD23, R51).
  *
- * Generates, deterministically (stable key order, no timestamps, no environment
- * input), three byte-exact outputs:
+ * The script generates five byte-exact outputs with stable key order and no timestamp or environment input.
  *
  *   - release/mc-host-production-inputs.lock.json      (immutable input lock)
  *   - release/mc-host-provider-credentials.json        (closed harness/provider matrix)
  *   - tmp/mc-host-release-qualification.json (local qualification evidence)
  *
  * Inputs:
- *   - The U8 pre-build release contract (scripts/generate-mc-host-release-manifest.ts).
- *     Every U9 artifact cites its canonical SHA-256 digest; a stale or edited
- *     committed contract fails closed.
- *   - release/mc-host-production-input-sources.json, the operator-populated source
- *     manifest describing the exact production artifact bytes (CPU ONNX Runtime,
- *     gte-modernbert-base-f16, tokenizer/config files, semantic corpus) plus the
- *     recorded offline semantic-oracle evidence. Real production bytes are not in
- *     this repository: entries release engineering has not qualified yet are
- *     explicitly `qualified: false`, which propagates to non-production evidence
- *     that `requireQualificationEvidence` (the U2/U6 build gate) rejects. No
- *     placeholder hash, committed tiny fixture, developer cache, or mutable URL
- *     can ever qualify.
+ * The release contract from `scripts/generate-mc-host-release-manifest.ts` is an input.
+ * Each output cites the release contract's canonical SHA-256 digest.
+ * The operator-populated source manifest records the qualified production artifact bytes and semantic-oracle evidence.
+ * The repository contains no real production bytes.
+ * Unqualified entries set `qualified: false`.
+ * `requireQualificationEvidence` rejects non-production evidence.
+ * No placeholder hash, committed tiny fixture, developer cache, or mutable URL can qualify.
  *
  * Usage:
- *   bun scripts/qualify-mc-host-production-inputs.ts                # write outputs
- *   bun scripts/qualify-mc-host-production-inputs.ts --check        # fail on any drift
- *   bun scripts/qualify-mc-host-production-inputs.ts --check --verify-bytes
- *       # additionally re-hash the local artifact bytes (qualifying host only)
+ * The command writes all generated outputs.
+ * The command fails when any generated output drifts.
+ * The command checks drift and verifies local artifact bytes.
+ * With `--verify-bytes`, the script re-hashes local artifact bytes only on the qualifying host.
  */
 
 import { createHash } from "node:crypto";
@@ -92,24 +85,22 @@ function fail(message: string): never {
     throw new Error(`mc-host input qualification: ${message}`);
 }
 
-/** Shared with the U8 generator so one exact-key contract governs both, while
- *  failures stay attributed to the file the operator actually edited. */
+/** This script and the release-contract generator share one exact-key contract.
+ * */
 const assertExactKeys = exactKeysAsserter("mc-host input qualification");
 
 /**
- * A required free-text attestation: present, a string, and carrying something a
- * human wrote. Blank-checking only the length accepts `"   "`, which reads as an
- * approver or a provenance record in the committed lock while asserting nothing.
+ * Whitespace-only attestations assert nothing.
  */
 function isFilledText(value: unknown): value is string {
     return typeof value === "string" && value.trim().length > 0;
 }
 
 // ---------------------------------------------------------------------------
-// U9 pins (cross-checked against the U8 contract; drift fails closed).
+// The following pins are cross-checked against the release contract; drift fails closed.
 // ---------------------------------------------------------------------------
 
-/** Exact production model/native-runtime identity already pinned in-repo
+/** The source manifest pins the production model and native-runtime identities.
  *  (docs/synapse-model-bundle.md, crates/mc-host/Cargo.toml). */
 export const RUNTIME_IDENTITY = {
     model: {
@@ -120,13 +111,10 @@ export const RUNTIME_IDENTITY = {
     rust_crates: {
         fastembed: "6.0.0",
         ort: "2.0.0-rc.13",
-        // Resolved ORT feature closure (docs/synapse-model-bundle.md §3). Most of
-        // it is enabled transitively, so `crossCheckRepoPins` does not assert
-        // this exact list against `crates/mc-host/Cargo.toml` — proving the
-        // effective graph needs Cargo resolution. What it does enforce there is
-        // the security-relevant negative: `default-features = false` on both
-        // crates, and no declared feature naming a download, TLS/fetch, Hugging
-        // Face, image-model, or accelerator capability.
+        // The following ORT feature closure matches `docs/synapse-model-bundle.md` §3.
+        // Cargo resolution enables `ort_features` transitively.
+        // `crossCheckRepoPins` cannot compare `ort_features` with `crates/mc-host/Cargo.toml` because Cargo resolution determines the effective feature graph.
+        // `crossCheckRepoPins` requires `default-features = false` for both crates and rejects declared download, TLS/fetch, Hugging Face, image-model, and accelerator features.
         ort_features: [
             "api-17",
             "api-18",
@@ -145,9 +133,8 @@ export const RUNTIME_IDENTITY = {
     },
 } as const;
 
-/** Platform floors, harness runtimes, layout IDs, budgets, size limits, and
- *  durability scope. Floors/layouts are duplicated deliberately and asserted
- *  equal to the U8 contract, so either side drifting fails closed (R47, KTD23). */
+/**
+ * Duplicated floors and layouts must equal the U8 contract; mismatches fail closed. */
 export const QUALIFICATION_PINS = {
     platform_floors: {
         "linux-x64-gnu": {
@@ -163,8 +150,7 @@ export const QUALIFICATION_PINS = {
         "npm_hoisted",
         "npm_nested",
     ],
-    // Plan "Startup and storage budgets" table. p95 values are release-
-    // qualification thresholds; hard values are runtime deadlines.
+    // The qualification thresholds are runtime deadlines.
     cold_start_budgets_ms: {
         retained_transport: { p95: 2000, hard: 5000 },
         bootstrap_copy: { p95: 1000, hard: 3000 },
@@ -177,7 +163,6 @@ export const QUALIFICATION_PINS = {
             hard: 90000,
         },
     },
-    // Internal channel budgets with headroom (U6 enforces actuals against these).
     package_size_limits_bytes: {
         "@cortexkit/mc-host-linux-x64-gnu": {
             compressed_max: 471859200,
@@ -187,7 +172,7 @@ export const QUALIFICATION_PINS = {
     durability_scope: "process_crash_only",
 } as const;
 
-/** Assert the duplicated U9 pins agree with the U8 contract (fail on mismatch). */
+/* */
 export function assertPinsMatchContract(contract: ReleaseContract): void {
     for (const platform of contract.platforms.supported) {
         const pinned =
@@ -265,7 +250,6 @@ export function assertPinsMatchContract(contract: ReleaseContract): void {
 }
 
 // ---------------------------------------------------------------------------
-// Provider-credential matrix, typed argument variants, and closure schema.
 // ---------------------------------------------------------------------------
 
 export const VALUE_CAP_BYTES = 16384;
@@ -276,10 +260,9 @@ const VARIABLE_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
 export const HARNESS_CLOSURE_SCHEMA =
     "magic-context.mc-host-harness-closure/v1";
 
-// The closure manifest's closed sets, published into the credentials doc's
-// `closure_manifest_schema` and enforced verbatim by
-// `validateClosureManifest`. Field lists are alphabetical because the
-// published document is canonically sorted.
+// The credentials document publishes the closure manifest's closed sets.
+// `validateClosureManifest` enforces the published closed sets verbatim.
+// Field lists are alphabetical because the published document is canonically sorted.
 export const HARNESS_CLOSURE_MANIFEST_FIELDS = [
     "argument_variant",
     "entrypoint",
@@ -327,14 +310,11 @@ const CREDENTIALS_DOC = {
     caps: {
         value_cap_bytes: VALUE_CAP_BYTES,
         row_cap_bytes: ROW_CAP_BYTES,
-        // Individual value size is checked before aggregate row size (KTD21).
         individual_before_row: true,
         row_size_definition:
             "sum of UTF-8 byte lengths of every variable name and its value in the selected row",
     },
-    // Connection-key-derived fingerprint identity. Pinned here so U2 and the
-    // TypeScript client derive the identical protocol-internal fingerprint; the
-    // fingerprint itself is never emitted, persisted, or rendered.
+    // `fingerprint` is never emitted.
     fingerprint: {
         domain: "subc-broca-credential-v1",
         canonicalization: "harness-provider-name-length-value/1",
@@ -473,9 +453,9 @@ const CREDENTIALS_DOC = {
                     credential_variables: ["OPENAI_API_KEY"],
                 },
             },
-            // Pi alias-to-canonical fallback (harness-provider-map.ts). The alias's
-            // own subscription mechanism is unsupported; a run naming the alias with
-            // direct API keys selects only the canonical row.
+            // The Pi alias falls back to its canonical provider row.
+            // A run naming the Pi alias with its own subscription mechanism is unsupported.
+            // A run naming the Pi alias with direct API keys selects only the canonical row.
             aliases: {
                 "google-antigravity": {
                     canonical: "google",
@@ -492,7 +472,7 @@ const CREDENTIALS_DOC = {
             },
         },
     },
-    // Closed unsupported-mechanism union -> auth_mechanism_unsupported.
+    // Unsupported mechanisms map to `auth_mechanism_unsupported`.
     unsupported_auth_mechanisms: [
         "ambient_credential_chain",
         "bedrock",
@@ -503,7 +483,6 @@ const CREDENTIALS_DOC = {
         "vertex_adc",
     ],
     unsupported_auth_reason: "auth_mechanism_unsupported",
-    // Unknown/custom canonical providers and unknown aliases.
     unknown_provider_reason: "provider_unsupported",
     // No qualified row may name or depend on ambient host state.
     forbidden_variable_names: [
@@ -532,8 +511,7 @@ const CREDENTIALS_DOC = {
     ],
     forbidden_variable_prefixes: ["GIT_", "GPG_", "SSH_", "XDG_", "npm_"],
     forbidden_variable_suffixes: ["_PROXY", "_proxy"],
-    // Every rejected descriptor/closure/argument/provider/auth/credential
-    // condition binds to exactly one U8 harness_unavailable_reason.
+    // Every rejected descriptor, closure, argument, provider, authentication, or credential condition maps to exactly one U8 `harness_unavailable_reason`.
     rejection_bindings: {
         descriptor_missing: "descriptor_absent",
         descriptor_identity_invalid: "descriptor_invalid",
@@ -553,11 +531,8 @@ const CREDENTIALS_DOC = {
         credential_row_over_cap: "credential_row_too_large",
         credential_fingerprint_mismatch: "credential_snapshot_mismatch",
     },
-    // Closed harness runtime-closure manifest schema (KTD21). U2 materializes a
-    // daemon-owned content-addressed closure matching this shape; runtime code
-    // never discovers new dependencies. Every closed set below is the same
-    // constant `validateClosureManifest` enforces, so the published schema
-    // and the enforced schema cannot drift apart.
+    // The closure schema is closed; U2 materializes a daemon-owned content-addressed closure that conforms to it.
+    // Runtime code never discovers dependencies; `validateClosureManifest` enforces the published closure sets.
     closure_manifest_schema: {
         id: HARNESS_CLOSURE_SCHEMA,
         closed: true,
@@ -649,7 +624,7 @@ function variableNameForbidden(doc: CredentialsMatrix, name: string): boolean {
     );
 }
 
-/** Static validation of the credential matrix + U8 cross-checks. */
+/* */
 export function validateCredentialsDoc(
     doc: CredentialsMatrix,
     contract: ReleaseContract,
@@ -736,10 +711,8 @@ export function validateCredentialsDoc(
         )) {
             const fieldEntries = Object.entries(variant.fields);
             const placeholderPositions = new Map<string, number>();
-            // Count occurrences, not distinct names: a Map keyed by name would
-            // collapse a template that repeats one placeholder, and
-            // `renderArgumentVariant` substitutes only `field.position`, so
-            // every other copy of that token would survive into argv unrendered.
+            // Count placeholder occurrences rather than names because repeated placeholders require multiple substitutions.
+            // Repeated placeholder tokens outside `field.position` remain unrendered in `argv`.
             let placeholderCount = 0;
             variant.template.forEach((token, index) => {
                 if (token.startsWith("{") && token.endsWith("}")) {
@@ -767,7 +740,6 @@ export function validateCredentialsDoc(
 }
 
 // ---------------------------------------------------------------------------
-// Broca run evaluation (matrix consumer; used by tests and later by U2).
 // ---------------------------------------------------------------------------
 
 export type HarnessUnavailableReason =
@@ -785,10 +757,10 @@ export type HarnessUnavailableReason =
 export interface BrocaRunRequest {
     harness: string;
     provider: string;
-    /** Requested auth mechanism; defaults to direct_api_key. */
+    /* */
     mechanism?: string;
-    /** Bounded captured credential source (names -> values). Values never
-     *  leave this evaluation; only names/order are release data. */
+    /** `evaluateBrocaRun` does not expose credential values.
+     * Credential values never leave `evaluateBrocaRun`; only credential names and order are release data. */
     credentials: Record<string, string>;
 }
 
@@ -806,9 +778,7 @@ function utf8Bytes(text: string): number {
 }
 
 /**
- * Evaluate one Broca run against the closed matrix, in the U8 precedence order:
- * provider row lookup (with Pi alias-to-canonical fallback), auth mechanism,
- * credential presence, individual value cap, then aggregate row cap.
+ * The evaluator checks the provider row, auth mechanism, credential presence, individual value cap, and row cap in U8 precedence order.
  */
 export function evaluateBrocaRun(
     doc: CredentialsMatrix,
@@ -831,10 +801,8 @@ export function evaluateBrocaRun(
         return { ok: false, reason: "auth_mechanism_unsupported" };
     }
     let rowBytes = 0;
-    // Presence first, then individual caps for every value, then row size —
-    // individual-size precedence over aggregate row size (KTD21). The first
-    // pass collects the validated pairs so the cap pass cannot silently skip a
-    // variable and under-count the row.
+    // The evaluator checks presence, individual caps, and row size in that order so individual-size errors take precedence.
+    // The individual-cap pass collects validated pairs so the row-cap pass counts every variable.
     const present: Array<[string, string]> = [];
     for (const name of row.credential_variables) {
         const value = request.credentials[name];
@@ -861,9 +829,7 @@ export function evaluateBrocaRun(
 }
 
 /**
- * Canonical `(harness, provider, name, length, value)` row encoding backing the
- * connection-keyed fingerprint. Returns the pre-MAC message only; no fingerprint
- * is computed here and neither the message nor any value is ever emitted into a
+ * The fingerprint encodes the canonicalization tag, harness, provider, and each row variable's name, value length, and value in order.
  * release artifact.
  */
 export function canonicalCredentialRowEncoding(
@@ -883,7 +849,6 @@ export function canonicalCredentialRowEncoding(
 }
 
 // ---------------------------------------------------------------------------
-// Typed argument-variant rendering.
 // ---------------------------------------------------------------------------
 
 export type ArgumentVariantResult =
@@ -891,8 +856,7 @@ export type ArgumentVariantResult =
     | { ok: false; reason: "argument_variant_invalid"; detail: string };
 
 /**
- * Render one exact fixed isolation argv from a typed variant. No raw appendable
- * argv exists; each typed field maps to one fixed host-owned template position.
+ * Typed rendering produces a fixed isolation `argv` without raw appended arguments.
  */
 export function renderArgumentVariant(
     doc: CredentialsMatrix,
@@ -950,7 +914,6 @@ export function renderArgumentVariant(
 }
 
 // ---------------------------------------------------------------------------
-// Source-manifest schema and byte verification.
 // ---------------------------------------------------------------------------
 
 export const INPUT_KEYS = [
@@ -964,8 +927,8 @@ export const INPUT_KEYS = [
     "tokenizer_config",
 ] as const;
 
-/** Inputs whose bytes are JSON. The model and the ORT shared library are not, and
- *  their internal validity is the runtime bundle validator's to judge. */
+/** Only JSON inputs undergo byte parsing.
+ * The runtime bundle validator, not this parser, validates the model and ORT shared library. */
 const JSON_SHAPED_INPUTS: ReadonlySet<string> = new Set([
     "config",
     "corpus",
@@ -980,10 +943,8 @@ const PRODUCTION_LICENSE_APPROVERS = [
 ] as const;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 /**
- * Ref names that identify a moving target rather than one immutable revision.
- * Matched per URL path segment, so a ref is rejected wherever it appears —
- * including as the final segment (`.../repo/main`), which a substring match on
- * `/main/` misses because nothing follows the ref to supply the closing slash.
+ * `MUTABLE_SOURCE_REFS` contains refs that identify moving targets rather than immutable revisions.
+ * The matcher rejects a ref in every URL path segment, including the final `.../repo/main` segment.
  */
 const MUTABLE_SOURCE_REFS = new Set([
     "main",
@@ -993,14 +954,11 @@ const MUTABLE_SOURCE_REFS = new Set([
     "nightly",
 ]);
 /**
- * Query-parameter names that carry an access credential. `buildLock` copies
- * `source` verbatim into a committed artifact, so a credential-bearing URL would
- * be published in Git history permanently; and a signed URL is time-limited,
- * which is the opposite of the immutable identity a qualified source asserts.
+ * `buildLock` commits `source` verbatim.
+ * The validator rejects signed URLs because their expiry conflicts with an immutable source identity.
  *
- * Matched against the name with separators removed, so `X-Amz-Signature`,
- * `access_token`, and `apiKey` all land. Short, ambiguous names are matched
- * exactly instead so an innocuous `design` or `keyspace` is not rejected.
+ * The matcher removes separators before comparing parameter names.
+ * The matcher compares short ambiguous names exactly to avoid rejecting `design` and `keyspace`.
  */
 const CREDENTIAL_QUERY_SUBSTRINGS = [
     "token",
@@ -1015,13 +973,11 @@ const CREDENTIAL_QUERY_SUBSTRINGS = [
 ];
 const CREDENTIAL_QUERY_EXACT = new Set(["sig", "auth", "key", "pwd", "sas"]);
 /**
- * Host names reserved by RFC 2606 and RFC 6761, plus loopback. None of them can
- * resolve to a server holding a production artifact, so a production lock naming
- * one records provenance nobody can act on — including the `example.invalid` hosts
- * the committed test fixtures use, which is exactly the value that must not reach a
- * production manifest by being left in place.
+ * The validator rejects reserved and loopback hostnames from production sources.
+ * A production lock must name a source that can provide the recorded artifact.
+ * Production manifests must not retain `example.invalid` fixture hosts.
  *
- * Matched on the host and its parent suffixes, so `models.example.invalid` lands.
+ * The matcher checks each hostname suffix, so it rejects `models.example.invalid`.
  */
 const RESERVED_SOURCE_HOST_SUFFIXES = [
     "invalid",
@@ -1036,19 +992,15 @@ const RESERVED_SOURCE_HOST_SUFFIXES = [
     "::1",
 ];
 
-/** The IPv4 loopback block, which is reserved in full rather than at `.1` alone. */
+/** The validator rejects the entire IPv4 loopback block, not only addresses ending in `.1`. */
 const LOOPBACK_IPV4 = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
 
 /**
- * The reserved-host comparison form of a URL hostname: lowercased, IPv6 brackets
- * stripped, and an IPv4-mapped IPv6 literal reduced to the IPv4 address it carries.
  *
  * `URL.hostname` brackets an IPv6 literal, so a bare `::1` entry would never match
- * without stripping. It also canonicalizes `[::ffff:127.0.0.1]` to
- * `[::ffff:7f00:1]` — loopback written in a form that equals neither `127.0.0.1`
- * nor `::1` — so the mapped prefix is reduced to dotted quad before comparison.
- * Decimal and octal spellings need no help here: the parser already normalizes
- * `2130706433` and `0177.0.0.1` to `127.0.0.1`.
+ * `URL.hostname` canonicalizes `[::ffff:127.0.0.1]` to `[::ffff:7f00:1]`.
+ * The validator converts IPv4-mapped IPv6 literals to dotted quad because the canonical form matches neither `127.0.0.1` nor `::1`.
+ * `URL` normalizes decimal and octal IPv4 spellings to `127.0.0.1`.
  */
 function reservedHostForm(hostname: string): string {
     const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
@@ -1058,12 +1010,11 @@ function reservedHostForm(hostname: string): string {
         const low = Number.parseInt(hex[2] ?? "", 16);
         return `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`;
     }
-    // The dotted-quad spelling of the same mapping, which `URL` preserves as written.
     const dotted = /^::ffff:((?:\d{1,3}\.){3}\d{1,3})$/.exec(host);
     return dotted?.[1] ?? host;
 }
 
-/** The decoded path segments of a source URL, refusing a malformed escape. */
+/** `sourcePathSegments` returns the raw segment when `decodeURIComponent` rejects a malformed escape. */
 function sourcePathSegments(url: URL): string[] {
     return url.pathname.split("/").map((raw) => {
         try {
@@ -1082,8 +1033,8 @@ function isCredentialQueryName(name: string): boolean {
     );
 }
 
-/** `startsWith("https://")` does not imply parseability, so report a malformed
- *  URL through `fail` rather than letting a raw `TypeError` escape. */
+/**
+ * The validator reports an invalid HTTPS URL through `fail` rather than allowing `URL` to throw `TypeError`. */
 function parseSourceUrl(key: string, source: string) {
     try {
         return new URL(source);
@@ -1093,11 +1044,9 @@ function parseSourceUrl(key: string, source: string) {
 }
 
 /**
- * Path *segments* that identify a committed fixture tree or a developer cache.
- * Compared per segment, never as a substring: a real artifact store whose name
- * merely contains one of these words — `/mnt/release/hf-tests/fixtures-store/`,
- * `/opt/prod-node_modules_mirror/` — names nothing that is actually a fixture or
- * a cache, and must not be permanently unqualifiable because of its spelling.
+ * The matcher compares complete path segments rather than substrings.
+ * A segment such as `fixtures-store` or `prod-node_modules_mirror` is not itself a fixture or cache path.
+ * The validator does not reject artifact stores solely because a segment contains a fixture or cache term.
  */
 const FIXTURE_OR_CACHE_PATH_SEGMENTS = [
     "synapse-tiny",
@@ -1106,19 +1055,13 @@ const FIXTURE_OR_CACHE_PATH_SEGMENTS = [
     ".bun",
     "target",
 ];
-/** Consecutive segment runs denied wherever they appear (`.../tests/fixtures/...`). */
+/** The validator rejects the `tests/fixtures` segment run at any depth. */
 const FIXTURE_OR_CACHE_SEGMENT_RUNS = [["tests", "fixtures"]];
 /**
- * Denied only when qualifying for production. `scripts/__fixtures__` holds the
- * committed qualification fixtures — tiny text stand-ins named after the real
- * artifacts (`model.onnx`, `ort-runtime.so`) carrying `example.invalid`
- * provenance. Those files are the intended input in `test-fixture` mode, so the
- * segment cannot join the all-mode list, but a production manifest that points
- * at them must never reach `productionQualified: true`.
  */
 const PRODUCTION_ONLY_DENIED_SEGMENTS = ["__fixtures__"];
 
-/** The denied segment or run a candidate path contains, or `null`. */
+/* */
 function deniedPathSegment(
     candidate: string,
     mode: SourceManifest["mode"],
@@ -1142,16 +1085,12 @@ function deniedPathSegment(
 }
 
 /**
- * Resolve a `verify_local_path` to the exact absolute path whose bytes will be
- * hashed, enforcing the U9 path rules that apply to a *production artifact*
- * path: `no_parent_segments` and `no_symlink_escape`. The closure manifest's
- * `relative` rule governs its own `node` paths and deliberately does not apply
- * here — production qualification requires an absolute path instead, because the
- * real artifacts live outside the repository on the qualifying host.
+ * Production artifact paths must not contain parent segments or escape through symlinks.
+ * The closure manifest's `relative` rule applies only to its `node` paths.
+ * `verify_local_path` must be absolute in `production` mode.
  *
- * The fixture/developer-cache deny-list is applied to the fully symlink-resolved
- * path, not just the spelling in the manifest: a symlink at an allowed path that
- * points into a developer cache must not be able to qualify.
+ * `resolveVerifyPath` applies the fixture and developer-cache deny-list after resolving symlinks.
+ * A verify path resolving into a developer cache cannot qualify.
  */
 function resolveVerifyPath(
     rootDir: string,
@@ -1162,8 +1101,7 @@ function resolveVerifyPath(
     if (verifyPath.startsWith("~")) {
         fail(`inputs.${key}: home-relative verify path is rejected`);
     }
-    // `no_parent_segments` applies to the path as written: normalizing first
-    // would silently collapse an interior `..` and accept it.
+    // `no_parent_segments` checks the written path because normalization would collapse an interior `..` and accept it.
     if (
         verifyPath
             .split(/[\\/]+/)
@@ -1179,16 +1117,9 @@ function resolveVerifyPath(
     const lexical = isAbsolute(verifyPath)
         ? normalize(verifyPath)
         : resolve(rootDir, verifyPath);
-    // Resolve symlinks when the bytes exist so the deny-list sees the real
-    // location; when absent, keep the lexical path so the caller reports the
-    // missing-bytes failure against the path the manifest actually names.
+    // `resolveVerifyPath` resolves existing paths so the deny-list checks their real locations.
+    // Missing paths retain their lexical form.
     //
-    // `realpathSync.native` deliberately, matching `safeRealpath` in the plugin's
-    // enforcement-artifact canonicalizer: the OS `realpath(3)` is the authority on
-    // symlink resolution, and two security checks in one repository should not
-    // disagree about what a path resolves to. Not imported from there — release
-    // tooling depending on a plugin feature's internals would point the coupling
-    // the wrong way — so the shared decision is the primitive, not the call.
     let resolved = lexical;
     if (existsSync(lexical)) {
         try {
@@ -1368,32 +1299,24 @@ export interface OracleEvidence {
         target: string;
         kernel: string;
         glibc: string;
-        /** Whether the recorded kernel and glibc are the certified floor exactly
-         *  rather than merely at or above it. */
+        /**
+         * */
         exact_floor: boolean;
-        /** The certified Linux lane executes the sealed ORT object through
-         *  `/proc/self/fd`; an oracle on a host that cannot must not qualify it. */
+        /**
+         * */
         procfs_self_fd_exec: boolean;
     };
     expected_vectors: number;
     tolerance: number;
     network_access: string;
-    /** The recorded outcome. Only `"pass"` qualifies. */
+    /* */
     result: string;
-    /** Vectors actually compared; must equal `expected_vectors`. */
+    /* */
     vectors_compared: number;
-    /** Worst per-vector deviation observed; must be within `tolerance`. */
+    /* */
     observed_max_error: number;
     /**
-     * The artifact digests the oracle ran against, one per qualified input.
      *
-     * This is the oracle declaring its own inputs, cross-checked against the
-     * qualified set — not a recomputation of the Synapse fingerprint, which is a
-     * composite over model, tokenizer, config, corpus, table epoch, and embedding
-     * parameters and would have to be derived the way the Rust side derives it.
-     * What it does establish is that a transcript cannot outlive the bytes it
-     * describes: requalifying an artifact changes its digest, and a retained
-     * oracle then names bytes that are no longer in the lock.
      */
     bound_inputs: Record<string, string>;
     smoke_report: {
@@ -1483,10 +1406,7 @@ function expectedHarnessPackage(harness: HarnessClosureName): string {
 }
 
 /**
- * Validate one closed, content-addressable harness closure graph.
  *
- * The graph is sorted to make its identity reproducible. Extension order is
- * intentionally semantic and is therefore preserved rather than sorted.
  */
 export function validateClosureManifest(
     manifest: unknown,
@@ -1734,14 +1654,14 @@ export function validateClosureManifest(
     }
 }
 
-/** Canonical bytes used as the content-addressed closure identity. */
+/* */
 export function canonicalClosureManifest(
     manifest: HarnessClosureManifest,
 ): string {
     return canonicalJson(manifest);
 }
 
-/** Deterministic SHA-256 over the canonical closure manifest bytes. */
+/* */
 export function closureManifestDigest(
     manifest: HarnessClosureManifest,
 ): string {
@@ -1758,22 +1678,15 @@ function rustRawString(value: string): string {
     fail("closure manifest cannot be represented as a bounded Rust raw string");
 }
 
-/** Recursively collect every 64-hex value from the committed tiny fixture
- *  manifest so no tiny-fixture artifact byte identity can ever qualify.
+/**
  *
- *  In production mode the committed qualification-fixture digests join the set.
- *  The path deny-list alone is spelling-based, so copying those same tiny text
- *  stand-ins to a directory without `__fixtures__` in its name would otherwise
- *  let them qualify; blocking the byte identity follows the relocation. */
+ * */
 function tinyFixtureHashBlacklist(
     rootDir: string,
     mode: SourceManifest["mode"],
 ): Set<string> {
     const blacklist = new Set<string>();
     const path = join(rootDir, TINY_FIXTURE_MANIFEST_PATH);
-    // Required input, not best-effort: a missing manifest would silently empty
-    // the blacklist and let committed tiny-fixture bytes qualify as production
-    // inputs, so treat absence exactly like the unreadable case below.
     if (!existsSync(path)) {
         fail(`missing tiny-fixture manifest at ${TINY_FIXTURE_MANIFEST_PATH}`);
     }
@@ -1799,8 +1712,6 @@ function tinyFixtureHashBlacklist(
     }
     if (mode === "production") {
         const fixturePath = join(rootDir, QUALIFICATION_FIXTURE_MANIFEST_PATH);
-        // Absent in a consumer checkout that ships no fixtures; only its digests
-        // are being denied, and the path deny-list still covers the in-tree copy.
         if (existsSync(fixturePath)) {
             try {
                 collect(JSON.parse(readFileSync(fixturePath, "utf8")));
@@ -1815,12 +1726,7 @@ function tinyFixtureHashBlacklist(
 }
 
 /**
- * Every immutability, credential, and reachability rule that only means anything
- * for a retrievable `https` source.
  *
- * Split out of {@link validateQualifiedArtifact} because a content-addressed
- * `urn:sha256:` input has no host, path, query, or fragment to judge: running
- * these rules over one would reject a source its own digest already proves.
  */
 function validateArtifactSourceUrl(
     key: string,
@@ -1833,13 +1739,7 @@ function validateArtifactSourceUrl(
             `inputs.${key}: source must be an https URL naming one artifact or a urn:sha256 identity`,
         );
     }
-    // Compare per path segment so a mutable ref is caught in any position.
-    // The host is excluded deliberately: only the path names the revision.
     const sourceUrl = parseSourceUrl(key, source);
-    // Judged on the parsed path rather than the spelling. A dot segment moves the
-    // trailing slash out of the string — `…/<digest>/model.onnx/..` parses to
-    // `/…/<digest>/` — and the digest survives as a segment, so the
-    // content-address check below still passed a URL naming a directory.
     if (sourceUrl.pathname.endsWith("/")) {
         fail(`inputs.${key}: source must be an https URL naming one artifact`);
     }
@@ -1848,16 +1748,12 @@ function validateArtifactSourceUrl(
             `inputs.${key}: source must not embed URL credentials (userinfo is copied into the committed lock)`,
         );
     }
-    // A reserved name can never identify a retrievable artifact, so a production
-    // lock naming one records provenance that cannot be acted on. Allowed in
-    // `test-fixture` mode, which is what the committed fixtures use.
     if (mode === "production") {
         const host = reservedHostForm(sourceUrl.hostname);
         const reserved =
             RESERVED_SOURCE_HOST_SUFFIXES.find(
                 (suffix) => host === suffix || host.endsWith(`.${suffix}`),
             ) ??
-            // The whole 127.0.0.0/8 block is loopback, not only `127.0.0.1`.
             (LOOPBACK_IPV4.test(host) ? "127.0.0.0/8" : undefined);
         if (reserved !== undefined) {
             fail(
@@ -1872,31 +1768,20 @@ function validateArtifactSourceUrl(
             );
         }
     }
-    // Names are not enough: a credential hides just as well inside a *value*, as a
-    // nested URL with its own userinfo, and one level down from that too. Rather
-    // than chase nesting depth, production rejects the whole component — a source
-    // whose path must already name its content digest has nothing left for a query
-    // string to identify, so there is no legitimate production form to lose.
-    // `test-fixture` mode keeps the name and value checks, which is where the
-    // mutable-ref-in-query rules still apply.
+    // Production rejects query strings because nested URLs can conceal credentials; `test-fixture` retains query name and value checks.
     if (mode === "production" && sourceUrl.search !== "") {
         fail(
             `inputs.${key}: production source must not carry a query string (it cannot be proven credential-free and the path already names the content)`,
         );
     }
-    // A fragment is never sent to the server, so it cannot select artifact bytes:
-    // on an immutable artifact URL it is noise at best, and at worst it is where
-    // an OAuth-style flow puts an access token — which `buildLock` would copy
-    // into the committed lock. Rejecting the whole component closes that class
-    // rather than chasing individual credential and ref spellings inside it.
+    // The validator rejects fragments because they cannot select artifact bytes and can carry credentials.
     if (sourceUrl.hash !== "") {
         fail(
             `inputs.${key}: source must not carry a URL fragment (it cannot select bytes and can carry credentials)`,
         );
     }
     const rejectMutableRef = (value: string): void => {
-        // Case-folded: a ref differing only in case is still a moving target,
-        // and no immutable artifact URL needs a token spelled like one.
+        // The validator compares mutable-ref names case-insensitively because a case-only variant remains mutable.
         if (MUTABLE_SOURCE_REFS.has(value.toLowerCase())) {
             fail(
                 `inputs.${key}: mutable source identity (${value} ref) is rejected`,
@@ -1904,10 +1789,7 @@ function validateArtifactSourceUrl(
         }
     };
     for (const rawSegment of sourceUrl.pathname.split("/")) {
-        // `URL.pathname` preserves percent-encoding, so `ma%69n` would survive a
-        // literal comparison while the server still resolves it as `main`.
-        // Decode before comparing, and treat a malformed escape as a rejection
-        // rather than passing the undecodable spelling through.
+        // `URL.pathname` preserves percent-encoding, so the validator decodes path segments before comparing them with mutable-ref names.
         let segment: string;
         try {
             segment = decodeURIComponent(rawSegment);
@@ -1916,18 +1798,10 @@ function validateArtifactSourceUrl(
                 `inputs.${key}: source path segment ${JSON.stringify(rawSegment)} has a malformed percent-escape`,
             );
         }
-        // Decoding can reveal separators the split above could not see:
-        // `resolve%2Fmain%2Fmodel.onnx` is one raw segment that a server which
-        // decodes escaped separators resolves through the moving `main` ref. Split
-        // again after decoding so each revealed component is compared on its own.
+        // The validator decodes and re-splits path segments because `%2F` can expose mutable-ref components hidden in a raw segment.
         for (const token of segment.split(/[\\/]+/)) rejectMutableRef(token);
     }
-    // Immutability by denylist can never be complete: an unlisted branch name like
-    // `develop` reads as immutable simply because nobody thought of it. Production
-    // therefore requires the path to name the content positively — a segment that is
-    // the artifact's own digest, or any content-addressed revision of git-SHA-1
-    // length or longer. The ref denylist stays as defense in depth for both modes,
-    // since a mutable ref alongside a digest is still a manifest worth rejecting.
+    // Production requires a path segment equal to `sha256` or matching `/^[0-9a-f]{40,}$/i` because a denylist cannot identify every mutable ref.
     if (mode === "production") {
         const addressed = sourcePathSegments(sourceUrl).some(
             (segment) =>
@@ -1941,13 +1815,12 @@ function validateArtifactSourceUrl(
         }
     }
     // An endpoint can also name its revision in the query string
-    // (`/download?ref=main`), and such a URL keeps resolving a moving target
-    // however immutable its path looks. Split composite values so a ref buried in
-    // `?path=repo/main/model.onnx` is caught.
+    // A query-string revision such as `/download?ref=main` remains a moving target even when its path is immutable.
+    // The validator splits composite query values so it can find embedded mutable refs.
+    // The validator rejects `main` when it appears in a composite value such as `?path=repo/main/model.onnx`.
     //
-    // `URLSearchParams` already decoded these values, so they are compared as
-    // they are: decoding a second time would turn a literal `%` in a legitimate
-    // value into a malformed-escape rejection.
+    // The validator compares `URLSearchParams` values without decoding them again.
+    // A second decode would reject a literal `%` in a legitimate query value as a malformed escape.
     for (const [, value] of sourceUrl.searchParams) {
         for (const token of value.split(/[\\/,;:@]+/)) rejectMutableRef(token);
     }
@@ -1976,12 +1849,7 @@ function validateQualifiedArtifact(
     if (typeof artifact.source !== "string") {
         fail(`inputs.${key}: source must be an immutable artifact identity`);
     }
-    // A locally built input — the sealed ORT object, the bundle manifest, the
-    // semantic corpus — is not retrievable from anywhere, so it names itself by
-    // content instead of by URL. The digest *is* the identity there, so the only
-    // thing left to prove is that it agrees with the artifact's own hash; every
-    // rule in `validateArtifactSourceUrl` reads URL structure a `urn:` identity
-    // does not have.
+    // A `urn:sha256:` source has no URL path or query, so its embedded digest must equal `artifact.sha256`.
     const contentAddress = artifact.source.match(/^urn:sha256:([0-9a-f]{64})$/);
     if (contentAddress === null) {
         validateArtifactSourceUrl(key, artifact.source, artifact.sha256, mode);
@@ -2082,9 +1950,7 @@ export function checkOracleEvidence(
             `oracle: execution provider must be ${contract.model_lane.execution_provider}`,
         );
     }
-    // Nested exactness matters here: an unknown or mis-cased key (`Kernel`)
-    // would otherwise read as absent and be reported as a capability failure
-    // rather than as the typo it is.
+    // The schema rejects unknown and mis-cased keys so `Kernel` is reported as a typo rather than as a missing capability.
     assertExactKeys(
         oracle.host,
         ["target", "kernel", "glibc", "exact_floor", "procfs_self_fd_exec"],
@@ -2093,13 +1959,7 @@ export function checkOracleEvidence(
     if (oracle.host?.target !== "linux-x64-gnu") {
         fail("oracle: the offline oracle must run on the linux-x64-gnu lane");
     }
-    // Run the recorded host through the U8 platform gate itself rather than
-    // re-deriving its floors here. Sharing a predicate made the two agree; running
-    // the same function makes them identical by construction, which is what the
-    // last divergence between them argued for. It also brings the capability
-    // requirements along: the certified Linux lane demands `procfs_self_fd_exec`,
-    // so an oracle that loaded the sealed ORT object by some other path cannot
-    // qualify evidence for a host that never exercised the production path.
+    // `evaluatePlatform` applies the U8 floor and capability requirements, including `procfs_self_fd_exec` for certified Linux, to the recorded host.
     const platform = evaluatePlatform(contract, {
         os: "linux",
         arch: "x64",
@@ -2116,19 +1976,14 @@ export function checkOracleEvidence(
     if (typeof oracle.host.exact_floor !== "boolean") {
         fail("oracle: host exact_floor must be boolean");
     }
-    // `evaluatePlatform` above proves the host is at or above the floor. Claiming
-    // it *is* the floor is a stronger, separate statement, and only a comparison
-    // against the contract's pins can check it.
+    // `evaluatePlatform` establishes that the host meets or exceeds the floor, not that it equals the floor.
+    // Only comparison with the contract pins establishes that the host equals the floor.
     const linuxFloor = contract.platforms.supported.find(
         (p) => p.target === "linux-x64-gnu",
     );
     if (linuxFloor === undefined || !("kernel_min" in linuxFloor)) {
         fail("oracle: U8 contract lacks the linux floor");
     }
-    // Compared at the floor's own precision, not by string equality: a distro
-    // spells the floor kernel `4.18.0-513.el8.x86_64`, and that host *is* at the
-    // floor. `compareDotted` is the same reader the platform gate uses, so the
-    // two cannot disagree about what a version means.
     const atFloor = (probe: unknown, floor: string): boolean =>
         typeof probe === "string" && compareDotted(probe, floor) === 0;
     if (
@@ -2210,9 +2065,7 @@ export function checkOracleEvidence(
         ["semantic_corpus", "corpus"],
     ] as const) {
         const artifact = inputs[inputKey];
-        // An unqualified input is skipped for the same reason `bound_inputs` skips
-        // it: it already forces `production_qualified: false`, and aborting here
-        // would make the incremental state release engineering works in
+        // The validator skips unqualified artifacts because they force `production_qualified: false`.
         // unrepresentable.
         if (!artifact.qualified) continue;
         if (report.inputs[reportKey] !== artifact.sha256) {
@@ -2239,11 +2092,6 @@ export function checkOracleEvidence(
     ) {
         fail("oracle: smoke report does not prove the complete offline lifecycle");
     }
-    // Everything above describes how the oracle was *run*. None of it says the
-    // comparison passed, and a run that failed or never happened produces exactly
-    // the same parameters — so without a recorded outcome, presence was being read
-    // as success. Canonical regeneration cannot close that, because the outcome is
-    // absent from the source it regenerates from.
     if (oracle.result !== "pass") {
         fail(
             `oracle: recorded result must be "pass" (got ${JSON.stringify(oracle.result)})`,
@@ -2254,9 +2102,6 @@ export function checkOracleEvidence(
             `oracle: compared ${JSON.stringify(oracle.vectors_compared)} vectors, expected ${oracle.expected_vectors}`,
         );
     }
-    // A pass means every vector came in within tolerance, so the worst deviation
-    // observed is the claim that has to hold. `<=` matches the tolerance's own
-    // inclusive reading, and a negative or non-finite value is not a deviation.
     if (
         typeof oracle.observed_max_error !== "number" ||
         !Number.isFinite(oracle.observed_max_error) ||
@@ -2267,10 +2112,7 @@ export function checkOracleEvidence(
             `oracle: observed_max_error must be a finite value in [0, ${oracle.tolerance}]`,
         );
     }
-    // A recorded pass says the comparison succeeded; it does not say over which
-    // bytes. Without that binding, evidence from another embedding space — or an
-    // oracle retained across a requalification that changed the artifacts — still
-    // reads as a pass for the current bundle.
+    // The report binds each recorded pass to the artifact digest it covers.
     assertExactKeys(oracle.bound_inputs, [...INPUT_KEYS], "oracle.bound_inputs");
     for (const key of INPUT_KEYS) {
         const bound = oracle.bound_inputs[key];
@@ -2281,12 +2123,7 @@ export function checkOracleEvidence(
         }
         const artifact = inputs[key];
         if (!artifact.qualified) {
-            // An unqualified input already lands in `unqualified[]` and forces
-            // `production_qualified: false`, so no release can consume this state.
-            // Failing here instead would make it unrepresentable, and release
-            // engineering has to be able to record inputs and the oracle
-            // incrementally — the tool's contract is that gaps propagate to the
-            // verdict rather than aborting the run.
+            // Missing inputs produce an incomplete verdict instead of aborting the run.
             continue;
         }
         if (artifact.sha256 !== bound) {
@@ -2707,9 +2544,7 @@ function verifyArtifactBytes(
             `inputs.${key}: verify bytes missing at ${artifact.verify_local_path}`,
         );
     }
-    // Production artifacts are hundreds of MB (ONNX model, ORT shared library):
-    // compare the cheap size first, then hash in fixed-size chunks so peak
-    // memory stays constant instead of scaling with the artifact.
+    // The streaming hash uses O(1) memory with respect to artifact size.
     const size = statSync(path).size;
     if (size !== artifact.size_bytes) {
         fail(
@@ -2734,17 +2569,8 @@ function verifyArtifactBytes(
             `inputs.${key}: byte digest does not match the locked sha256 (input bytes changed)`,
         );
     }
-    // Byte identity is not loadability. Matching the locked digest proves these are
-    // the intended bytes; it says nothing about whether the runtime can parse them,
-    // so a plain-text stand-in with a correct digest qualifies and then fails at
-    // bundle load. Checking the JSON inputs parse is the cheap part of that gap and
-    // catches exactly that case.
+    // A matching digest does not prove that the runtime can parse the artifact.
     //
-    // Shape only, deliberately. The schema each file must satisfy lives in the Rust
-    // bundle validator (`crates/mc-host/src/synapse/bundle.rs`), and a second
-    // implementation here would be free to disagree with it — the useful version of
-    // full semantic validation is running that validator over these bytes on the
-    // qualifying host, not restating its rules in TypeScript.
     if (JSON_SHAPED_INPUTS.has(key)) {
         try {
             JSON.parse(readFileSync(path, "utf8"));
@@ -2757,18 +2583,12 @@ function verifyArtifactBytes(
 }
 
 /**
- * Capabilities the pinned ORT/fastembed closure must not carry. Matched as
- * substrings of each declared feature name so a renamed or versioned spelling
- * (`download-binaries`, `fetch-models`, `cuda-12`) still lands, since the point
- * is to deny a class of behavior rather than an exact feature list.
  *
- * Exported because the same denylist has to be applied to the *resolved* feature
- * graph, which this scan cannot see. Cargo unifies the features selected for a
- * package anywhere in the graph, including from a manifest that is not in this
- * repository at all, so no reading of `crates/mc-host/Cargo.toml` can bound the
- * effective closure — only `cargo metadata` can, and it needs a resolvable
- * workspace and a toolchain the portable drift check must not require. The
- * release-script test suite runs where both exist and asserts it there.
+ * The resolver must apply this denylist to the resolved feature graph.
+ * Manifest-text scanning cannot inspect the resolved feature graph.
+ * Cargo unifies features selected for a package anywhere in the dependency graph, including by external manifests.
+ * Reading `crates/mc-host/Cargo.toml` cannot bound features selected by external manifests.
+ * The resolver must use `cargo metadata` to inspect the resolved feature closure; manifest text cannot bound features selected elsewhere in the graph.
  */
 export const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
     "download",
@@ -2798,18 +2618,10 @@ export const FORBIDDEN_RUNTIME_FEATURE_SUBSTRINGS = [
 ];
 
 /**
- * Walk `line`'s characters that lie outside TOML strings, carrying multi-line
- * string state across lines.
  *
- * One walk serves both the comment stripper and the nesting counter, because they
- * have to agree on what a string is. When they did not, the stripper removed a
- * closing `"""` that sat behind a `#` and the counter then read the rest of the file
- * as string body — the two answers were derived from separate scans, so nothing
- * forced them to match.
+ * The comment stripper and nesting counter share this scan so they use identical string boundaries.
  *
- * `visit` is called with each unquoted character and its offset; returning `false`
- * stops the walk, which is how the stripper reports the comment it found. The state
- * is the caller's because a multi-line string's close may be lines away.
+ * `state` belongs to the caller because a multiline string can close on a later line.
  */
 function scanUnquoted(
     line: string,
@@ -2838,8 +2650,6 @@ function scanUnquoted(
         }
         const char = line[index] as string;
         if (char === '"' || char === "'") {
-            // Single-line string: consume to its close, honouring escapes in a basic
-            // string. An unterminated one ends at the line.
             let scan = index + 1;
             let escaped = false;
             for (; scan < line.length; scan++) {
@@ -2861,20 +2671,15 @@ function scanUnquoted(
 }
 
 /**
- * Strip TOML comments from one line, leaving `#` inside a quoted value alone.
+ * `stripTomlComments` leaves `#` inside quoted TOML values unchanged.
  *
- * Comments are the one place a `Cargo.toml` can contain text that reads exactly
- * like a declaration but means nothing: a commented `version = "=2.0.0-rc.13"`
- * inside a multiline features array would otherwise satisfy a textual check while
- * Cargo resolves whatever the real key says. Removing them before any comparison
- * closes that for every check at once, rather than per pattern.
+ * Commented declarations must not satisfy textual checks.
+ * Cargo ignores commented declarations.
  *
- * Multi-line-string aware, and the state is the caller's for that reason. A closing
- * delimiter may sit behind a `#` — `value = """` then `# """` is a valid value whose
- * second line begins with one — and stripping that line in isolation deleted the
- * close, leaving every scan's string state open for the rest of the file. With the
- * eligibility rule that a line inside a string is not structure, that silently
- * skipped every table after it.
+ * A multiline string may contain a line beginning `# """`; stripping that line in isolation removes its closing delimiter.
+ * Removing a multiline closing delimiter leaves subsequent scans inside the string.
+ * Lines inside multiline strings must not be parsed as TOML structure.
+ * An unclosed multiline string prevents later table headers from being parsed.
  */
 function stripTomlComments(
     line: string,
@@ -2890,11 +2695,8 @@ function stripTomlComments(
 }
 
 /**
- * Split `cargo` into comment-stripped lines.
  *
- * One state object threaded across the whole file, since a multi-line string spans
- * lines. `Array.map(stripTomlComments)` cannot express this: `map` passes the index
- * as the second argument, which would silently become the state.
+ * A multiline string can close on a later line.
  */
 function tomlLines(cargo: string): string[] {
     const state = { multiline: null as string | null };
@@ -2902,13 +2704,9 @@ function tomlLines(cargo: string): string[] {
 }
 
 /**
- * The key text of an assignment, up to the first `=` outside quotes, or `null` when
- * the line holds no assignment.
  *
- * A quoted key may contain `=` — `target.'cfg(target_os = "linux")'.dependencies.ort`
- * is one key — so splitting on the first `=` anywhere truncates it to
- * `target.'cfg(target_os `, which is neither the real key nor recognizable as
- * mentioning a dependency table. Structure is only structure outside strings here
+ * Split on `=` only outside quotes because quoted TOML keys may contain `=`.
+ * Splitting `target.'cfg(target_os = "linux")'.dependencies.ort` at its first `=` produces `target.'cfg(target_os ` instead of the full key.
  * too.
  */
 function assignmentKeyText(line: string): string | null {
@@ -2933,14 +2731,11 @@ function assignmentKeyText(line: string): string | null {
 }
 
 /**
- * Normalize a TOML table header to its dotted form, collapsing the whitespace TOML
- * permits around dots.
  *
- * `[target . 'cfg(...)' . dependencies]` is the same table as
- * `[target.'cfg(...)'.dependencies]`, so a suffix test on the raw text classifies it
- * as something other than a dependency table and every declaration inside goes
- * unexamined. Whitespace is collapsed only outside quotes, since a quoted key may
- * legitimately contain dots and spaces of its own.
+ * Normalize whitespace outside quotes before testing whether a table name ends in `.dependencies`.
+ * `[target . 'cfg(...)' . dependencies]` and `[target.'cfg(...)'.dependencies]` identify the same table.
+ * Whitespace is collapsed only outside quotes because quoted keys may contain spaces.
+ * Quoted keys may contain dots and spaces.
  */
 function normalizeTableHeader(header: string): string {
     let out = "";
@@ -2965,7 +2760,6 @@ function normalizeTableHeader(header: string): string {
         }
         out += char;
     }
-    // Collapse only in the unquoted spans, which is what splitting on quotes gives.
     return out
         .split(/(\'[^']*\'|"(?:[^"\\]|\\.)*")/)
         .map((part, index) =>
@@ -2980,47 +2774,32 @@ function escapeRegex(literal: string): string {
 }
 
 /**
- * Match `key = <value>` in a joined inline entry, anchored to a key boundary.
+ * Require a key boundary so `features` does not match `default-features`.
  *
- * Every key in a dependency entry is a suffix of some other name a manifest may
- * legally carry: `features` sits inside `default-features`, and `default-features`,
- * `version`, and `package` all sit inside a `fake…` decoy Cargo tolerates as an
- * unused key. An unanchored match reads the decoy and reports on it, so key lookups
- * go through one anchored constructor rather than each site remembering the
- * boundary — three of them did, one did not, and that is the bug this removes.
+ * An unanchored key match can read a decoy key instead of the intended key.
  */
 function tomlKeyPattern(key: string, value: string): RegExp {
     const bare = escapeRegex(key);
-    // A key inside an inline table is a TOML key like any other, so it may be
-    // quoted: Cargo reads `"features" = ["cuda"]` exactly as it reads the bare
-    // spelling. Matching only the bare one meant both the presence test and the
-    // extraction missed the array, so its accelerator was never examined — and a
-    // quoted `"package"` concealed a rename the same way.
+    // Inline-table keys may be quoted.
+    // `"features"` and `features` name the same TOML key.
+    // tomlKeyPattern matches quoted keys so callers examine their values.
     const spelling = `(?:${bare}|"${bare}"|'${bare}')`;
     return new RegExp(`(?:^|[\\s,{])${spelling}\\s*=\\s*${value}`);
 }
 
 /**
- * A quoted key carrying a backslash escape, which is the one spelling
- * `tomlKeyPattern` cannot represent.
+ * tomlKeyPattern cannot match quoted TOML keys containing backslash escapes.
  *
- * `"featu\u0072es"` is `features` to Cargo, and a pattern over literal spellings
- * cannot decode it, so an entry holding one is refused rather than examined with the
- * key treated as absent. The refusal direction is what matters: a hidden `features`
- * array or `package` rename is exactly the declaration that must not pass.
+ * Cargo treats `"featu\u0072es"` as `features`.
  */
 const ESCAPED_TOML_KEY = /(?:^|[\s,{])"[^"]*\\[^"]*"\s*=/;
 
 /**
  * The net brace and bracket nesting a line opens or closes, ignoring quoted text.
  *
- * Counting every character treats a bracket inside a string as structure, so a
- * valid `poison = "["` leaves the depth permanently positive and every line after
- * it — including a later target-specific dependency — is read as nested content and
- * skipped. Structure is only structure outside strings.
+ * structuralDelta ignores brackets in quoted strings; otherwise `poison = "["` keeps depth positive and skips subsequent lines.
  *
- * Basic and literal strings on one line, which is what Cargo dependency and feature
- * values are; a multi-line `"""` string would need the parser this scan is not.
+ * TODO: Handle multiline TOML strings when scanning structural delimiters.
  */
 function structuralDelta(
     line: string,
@@ -3036,37 +2815,25 @@ function structuralDelta(
 }
 
 /**
- * True when a normalized dotted key path contains a component matching `names`.
  *
- * A dotted assignment is a table declaration: `patch.crates-io.ort = { path = ... }`,
- * `features.default = ["ort/cuda"]`, and
- * `target.'cfg(...)'.dependencies.ort_cuda = { package = "ort" }` all create the table
- * their prefix names, before any header and with whatever whitespace TOML allows
- * around the dots. A scan that only reacts to headers reads none of them.
+ * Dotted assignments create tables without headers.
+ * A header-only scan misses dotted assignments.
  *
- * Used to refuse those forms rather than model them: each scan here reasons about a
- * specific table, and an assignment that reaches into one without a header is a
- * declaration the scan cannot attribute. The table form is always available to
- * whoever needs to express it.
+ * The manifest scans reject dotted assignments because they cannot attribute those assignments to a table.
  */
 function dottedKeyTouches(keyText: string, names: readonly RegExp[]): boolean {
     const normalized = normalizeTableHeader(keyText);
     if (!normalized.includes(".")) return false;
     return splitDottedKey(normalized).some((part) => {
         const name = resolveTomlName(part);
-        // A component this scan cannot read cannot be ruled out as one of `names`:
-        // `"patch"."crates-io"."ort" = { path = "fake-ort" }` declares the override
-        // table under a quoted spelling Cargo resolves, and testing the raw
-        // component against a bare-name pattern matched nothing. Callers use this to
-        // refuse an assignment they cannot attribute, so unreadable answers yes.
+        // Return true for unreadable components so callers reject unassignable assignments.
+        // Cargo resolves quoted table-path components before matching.
         if (name === null) return true;
         return names.some((candidate) => candidate.test(name));
     });
 }
 
 /**
- * The components of a normalized dotted key path, each resolved to the name Cargo
- * will see, or `null` when any component uses a spelling this scan refuses.
  */
 function resolveDottedPath(normalized: string): string[] | null {
     const resolved: string[] = [];
@@ -3079,13 +2846,12 @@ function resolveDottedPath(normalized: string): string[] | null {
 }
 
 /**
- * Split a normalized dotted key path into its components, on the dots outside
+ * Split normalized dotted paths only at dots outside quotes.
  * quotes only.
  *
- * A quoted component may contain dots of its own: `[replace."ort:2.0.0-rc.13"]` is
- * a two-component path whose second component is one package-ID spec, and a plain
- * `split(".")` shreds it into five whose last is `13"`. Bare Cargo table names carry
- * no dots, which is why only the version-bearing `[replace]` key needs this.
+ * `[replace."ort:2.0.0-rc.13"]` has two path components.
+ * The quoted component is one package-ID spec.
+ * A plain `split(".")` incorrectly splits quoted dots.
  */
 function splitDottedKey(normalized: string): string[] {
     const parts: string[] = [];
@@ -3121,21 +2887,16 @@ function splitDottedKey(normalized: string): string[] {
 }
 
 /**
- * Resolve a TOML key or string value as written to the name Cargo will see, or
- * `null` when this scan cannot say. Used for dependency keys, a renamed
- * dependency's `package` value, and forwarded feature values in `[features]` —
- * all three are the same three spellings with the same reason to refuse a fourth.
+ * Resolve supported TOML spellings to the name Cargo sees; otherwise return `null`.
+ * Dependency keys and `package` values use the same supported TOML spellings.
  *
- * `null` is a refusal, not an absence. A quoted key is a basic string and may
- * carry escapes — `"o\u0072t"` is `ort` to Cargo — so a scan that treats any
- * spelling it does not understand as "some other key" would skip the declaration
- * entirely, which is how a target-specific entry with an accelerator feature could
- * go unexamined while the base entry validated cleanly. Callers must treat `null`
- * as an unreadable dependency table.
+ * Return `null` for unsupported spellings so callers reject them rather than treating them as other names.
+ * Cargo resolves `"o\u0072t"` to `ort`.
+ * Treat unsupported spellings as unreadable so scans do not skip their declarations.
+ * Reject unreadable target-specific entries before validating the base entry.
  */
 function resolveTomlName(raw: string): string | null {
     const key = raw.trim();
-    // Bare keys: letters, digits, underscore, dash.
     if (/^[A-Za-z0-9_-]+$/.test(key)) return key;
     // Literal strings take no escapes, so the contents are the name verbatim.
     const literal = /^'([^']*)'$/.exec(key);
@@ -3143,19 +2904,15 @@ function resolveTomlName(raw: string): string | null {
     // Basic strings without a backslash need no decoding.
     const basic = /^"([^"\\]*)"$/.exec(key);
     if (basic !== null) return basic[1] ?? null;
-    // Anything else — an escaped basic string, a dotted key, a spelling not
-    // covered above — is refused rather than guessed at.
+    // resolveTomlName returns `null` for escaped basic strings, dotted keys, and unsupported spellings.
     return null;
 }
 
 /**
- * Every TOML string token in `entry`, quotes included, or `null` when one is
+ * The function returns each quoted substring in `entry`, including its quotes, or `null` if a quote is unterminated.
  * unterminated.
  *
- * Returned with quotes so `resolveTomlName` can apply the same refuse-the-fourth-
- * spelling rule it applies to keys: a basic string carrying escapes is refused
- * rather than decoded, which is what keeps `["ort/c\u0075da"]` from reading as an
- * unrecognized value and slipping past the forwarding filter.
+ * `tomlStringTokens` preserves quotes so `resolveTomlName` applies its spelling rules.
  */
 function tomlStringTokens(entry: string): string[] | null {
     const tokens: string[] = [];
@@ -3182,65 +2939,53 @@ function tomlStringTokens(entry: string): string[] | null {
 }
 
 /**
- * A resolved table-path component naming a dependency table Cargo unifies features
- * from: the base table, or its dev, build, and target-specific variants.
+ * `DEPENDENCY_TABLE` matches dependency-table component names.
+ * Cargo unifies features from base, dev, build, and target-specific dependency tables.
  *
- * Matched against one resolved component rather than the raw path, since a header
- * component is a TOML key and `["dependencies"]` names the same table as
+ * The scanner matches resolved path components so quoted headers use Cargo's names.
+ * A header component is a TOML key, so `["dependencies"]` and `[dependencies]` name the same table.
  * `[dependencies]`.
  */
 const DEPENDENCY_TABLE = /^(?:dev-|build-)?dependencies$/;
 
 /**
- * One dependency declaration, resolved to the crate Cargo will actually fetch.
+ * `DependencyDeclaration` identifies the crate Cargo fetches.
  */
 interface DependencyDeclaration {
-    /** The table it appeared in, e.g. `dependencies` or `target.'cfg(...)'.dependencies`. */
+    /** `section` records the dependency table containing the declaration. */
     section: string;
-    /** The key as declared, which is what Cargo feature forwarding names. */
+    /** `key` is the declared key Cargo uses for feature forwarding. */
     key: string;
-    /** `package = "..."` when the dependency is renamed, otherwise the key. */
+    /** `crate` is the `package` value for renamed dependencies; otherwise it is `key`. */
     crate: string;
-    /** The complete inline entry, comments stripped, joined onto one line. */
+    /** `entry` contains the declaration with comments removed and lines joined. */
     entry: string;
 }
 
 /**
- * Enumerate every dependency declaration in `Cargo.toml`, resolved to the crate
- * each one actually names.
+ * The function returns dependency declarations in `Cargo.toml` resolved to their crate identities.
  *
- * The resolved identity is the point. A dependency key is not a crate name: Cargo
- * lets `ort_cuda = { package = "ort", features = ["cuda"] }` declare the same crate
- * under another key and unifies its features with the ordinary `ort` entry, so a
- * scan comparing keys would leave that declaration unexamined while the safe entry
+ * Cargo can rename `ort` as `ort_cuda`, so resolving `package` is required to unify declarations for the same crate.
+ * A key-based scan would not inspect `ort_cuda` as `ort`.
  * validated cleanly.
  *
- * Returns `null` when any dependency table holds a key or a `package` value this
- * scan cannot read. That refusal is deliberate: a declaration whose identity is
- * unreadable is exactly the one that must not pass unexamined, so the whole file is
- * rejected rather than a subset validated. `null` also covers an unbalanced entry.
+ * The function returns `null` when a dependency key or `package` value cannot be resolved.
+ * An unreadable declaration identity must reject the whole file rather than let a subset pass.
+ * `null` also covers unbalanced entries.
  *
- * Section tracking covers every table Cargo unifies features from — base, dev,
- * build, and target-specific — and deliberately reads declarations outside them
- * too, so a decoy under `[package.metadata.qualification]` is attributed to its own
- * section rather than mistaken for a dependency.
+ * Section tracking covers base, dev, build, and target-specific dependency tables.
+ * The scan also reads declarations outside dependency tables.
+ * Scanning non-dependency tables prevents `[package.metadata.qualification]` from being mistaken for a dependency section.
  *
- * This is a scan, not a TOML parser. Every shape it cannot account for fails, so
- * being wrong costs a false rejection with an actionable message rather than a
- * false qualification. Brace and bracket counting suffices because Cargo
- * dependency values are versions, paths, and URLs, none of which contain them.
+ * Unsupported input causes rejection rather than qualification.
+ * The scan tracks braces and brackets only outside quoted strings.
  */
 function dependencyDeclarations(
     cargo: string,
 ): DependencyDeclaration[] | null {
     const lines = tomlLines(cargo);
     const declarations: DependencyDeclaration[] = [];
-    // `[dependencies.ort]` and `[target.'cfg(...)'.dependencies.ort]` declare a
-    // crate through a subtable rather than an inline value, so the crate name is in
-    // the header and its keys are ordinary assignments beneath it. Accumulate those
-    // into the same entry shape an inline table produces — `version = "..."`,
-    // `default-features = false`, `features = [...]`, `package = "..."` — so every
-    // check downstream applies to both spellings unchanged.
+    // `[dependencies.ort]` and `[target.'cfg(...)'.dependencies.ort]` declare dependencies through subtables rather than inline values.
     let open: { section: string; key: string; body: string[] } | null = null;
     const closeSubtable = (): boolean => {
         if (open === null) return true;
@@ -3258,22 +3003,14 @@ function dependencyDeclarations(
     const stringState = { multiline: null as string | null };
     for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
-        // A line that starts inside an open multi-line string is not structure: a
-        // `poison = """\n[package.metadata.decoy]\n"""` value would otherwise read as
-        // a real header and close the dependency subtable early, dropping every key
-        // Cargo still counts below it — `features` included — from the scanned entry.
+        // The scanner ignores lines that begin inside multiline strings because their contents are not TOML structure.
+        // Multiline strings can contain text that resembles a table header.
         const atTopLevel = depth === 0 && stringState.multiline === null;
         depth += structuralDelta(line, stringState);
-        // A `[...]` line is only a section header at top level; inside a multiline
-        // array it is array syntax.
+        // Bracketed lines inside multiline arrays are array syntax.
         const header = atTopLevel ? /^\[([^\]]+)\]$/.exec(trimmed) : null;
         if (header !== null) {
             if (!closeSubtable()) return null;
-            // Resolved before it is classified: a header component is a TOML key, so
-            // `["dependencies"]` and `[target.'cfg(...)'."dependencies"]` name the
-            // ordinary dependency tables Cargo unifies features from. Testing the raw
-            // suffix attributed them elsewhere and every declaration inside — a
-            // renamed `ort` among them — went unexamined.
             const parts = resolveDottedPath(normalizeTableHeader(header[1] ?? ""));
             if (parts === null) return null;
             section = parts.join(".");
@@ -3291,9 +3028,7 @@ function dependencyDeclarations(
             }
             continue;
         }
-        // Accumulate the whole subtable, nested array lines included: skipping them
-        // for being below top level would truncate `features = [` into an entry the
-        // feature check then reports as unreadable, rejecting a valid manifest.
+        // The scanner continues collecting an open subtable so a multiline `features` array is not truncated.
         if (open !== null) {
             if (trimmed !== "") open.body.push(trimmed);
             continue;
@@ -3303,12 +3038,6 @@ function dependencyDeclarations(
         if (keyText === null) continue;
         const key = resolveTomlName(keyText);
         if (key === null) {
-            // A dotted assignment creates its own table:
-            // `target.'cfg(...)'.dependencies.ort_cuda = { package = "ort" }` is a
-            // dependency declaration wherever it appears, including before the first
-            // header where `section` is still empty. The key is unreadable to this
-            // scan either way, so a key that mentions `dependencies` refuses the file
-            // rather than being skipped as unrelated.
             if (
                 inDependencyTable ||
                 dottedKeyTouches(keyText, [/^[^.]*dependencies$/])
@@ -3332,10 +3061,10 @@ function dependencyDeclarations(
     return declarations;
 }
 
-/** The crate a declaration resolves to: `package = "..."` when renamed, else the
- *  key. `null` when a `package` value is present but unreadable, or when the entry
- *  spells any key in a way this scan cannot resolve — a concealed `package` is
- *  indistinguishable from an absent one, so an unreadable key spelling refuses. */
+/** `resolveRenamedCrate` returns `package` when present; otherwise it returns the declaration key.
+ * `resolveRenamedCrate` returns `null` when `package` is present but unreadable.
+ * `resolveRenamedCrate` returns `null` when an entry key cannot be resolved.
+ * */
 function resolveRenamedCrate(key: string, entry: string): string | null {
     if (ESCAPED_TOML_KEY.test(entry)) return null;
     if (!tomlKeyPattern("package", "").test(entry)) return key;
@@ -3344,28 +3073,19 @@ function resolveRenamedCrate(key: string, entry: string): string | null {
 }
 
 /**
- * A package-ID spec, as `[replace]` keys are written: an optional source, then the
- * package name and version.
+ * A package-ID spec starts with a package name and may include an `@` or `:` suffix.
  *
- * The version must not reach a path, fragment, or query separator, which is what
- * keeps a source URL from matching with `https` as its name.
  */
 const PACKAGE_ID_SPEC = /^([A-Za-z0-9_-]+)(?:[@:][^/#?]*)?$/;
 
 /**
- * The crate a `[replace]` key names, or `null` when this scan cannot say.
+ * `replacedCrateName` returns the crate named by a `[replace]` key, or `null` when the key does not explicitly name a package.
  *
- * A `[replace]` key is a package-ID spec rather than a bare crate name, and Cargo
- * accepts several spellings of one: `ort:2.0.0-rc.13`, the modern
- * `ort@2.0.0-rc.13`, and a source URL carrying the package in its fragment
- * (`https://github.com/pykeio/ort#ort:2.0.0-rc.13`). Cutting the spec at its first
- * `:` reads only the first — the `@` form keeps its version attached and the URL
- * form reduces to `https`, so both were compared against the qualified crates under
- * a name no crate has and passed as overrides of something unrelated.
+ * Cargo also accepts a source URL whose fragment identifies the package.
+ * Splitting at the first `:` misparses `@` package IDs and source URLs.
  *
- * A spec that never writes its package down — a bare source URL, or one whose
- * fragment holds only a version, where Cargo derives the name from the source
- * itself — returns `null` so the caller refuses the manifest instead of guessing.
+ * A bare source URL does not name its package explicitly.
+ * Cargo derives the package name from the source when the fragment contains only a version.
  */
 function replacedCrateName(spec: string): string | null {
     const trimmed = spec.trim();
@@ -3375,14 +3095,13 @@ function replacedCrateName(spec: string): string | null {
     if (hash === -1) return null;
     const fragment = PACKAGE_ID_SPEC.exec(trimmed.slice(hash + 1).trim());
     const named = fragment?.[1];
-    // A fragment may hold a version instead of a package (`…/ort#2.0.0-rc.13`),
-    // which leaves the name implicit in the source this scan does not resolve.
+    // A fragment containing only a version does not explicitly name a package.
     if (named === undefined || !/^[A-Za-z_]/.test(named)) return null;
     return named;
 }
 
-/** Join the inline entry starting at `index` onto one line, or `null` when its
- *  braces and brackets never balance. */
+/**
+ * */
 function joinInlineEntry(lines: string[], index: number): string | null {
     const collected: string[] = [];
     let depth = 0;
@@ -3397,16 +3116,12 @@ function joinInlineEntry(lines: string[], index: number): string | null {
 }
 
 /**
- * Extract `crate`'s complete inline dependency entry from the `[dependencies]`
- * table of `Cargo.toml`.
  *
- * Returns `null` unless the crate is declared exactly once in the whole file — by
- * resolved identity, so a rename counts — and that declaration is in
- * `[dependencies]`. Requiring uniqueness is what stops a second declaration under
- * a target-specific table, or under another key via `package`, contributing
- * features this check never sees. `null` also covers the absent, unreadable, and
- * `[dependencies.<crate>]` section forms; callers must fail closed on it rather
- * than read it as "declares nothing".
+ * `inlineDependencyEntry` matches renamed dependencies by resolved package identity.
+ * Rejecting duplicate declarations prevents unchecked declarations from contributing features.
+ * Duplicate declarations can occur in target-specific tables or under renamed keys via `package`.
+ * `inlineDependencyEntry` returns `null` for absent, unreadable, and `[dependencies.<crate>]` declarations.
+ * Callers must reject `null` rather than treat it as an absent declaration.
  */
 function inlineDependencyEntry(cargo: string, crate: string): string | null {
     const declarations = dependencyDeclarations(cargo);
@@ -3418,19 +3133,13 @@ function inlineDependencyEntry(cargo: string, crate: string): string | null {
 }
 
 /**
- * Assert one `Cargo.toml` dependency entry pins `version` exactly, opts out of
- * default features, and declares no forbidden capability.
  *
- * The declared array is not the effective feature closure — most of
- * `RUNTIME_IDENTITY.rust_crates.ort_features` arrives transitively — so this
- * enforces the closure's negative half, which is the part a silent edit would
- * exploit: adding a download, TLS, or accelerator feature while leaving the
- * version pin untouched.
+ * The declared feature array is not the effective feature closure.
+ * The assertion rejects forbidden declared features without reconstructing the effective feature closure.
+ * A forbidden download, TLS, or accelerator feature can be added without changing the version pin.
  *
- * Every unreadable shape fails rather than passing vacuously. A declared
- * `features` key whose array cannot be read is the dangerous case: reading it as
- * an empty list is exactly how a reformatted multiline array would smuggle a
- * forbidden capability past the version pin.
+ * Unreadable dependency shapes fail validation.
+ * An unreadable `features` array fails validation instead of being treated as empty.
  */
 function assertPinnedCrateFeatures(
     cargo: string,
@@ -3443,8 +3152,7 @@ function assertPinnedCrateFeatures(
             `${crate} must be declared exactly once, as an inline dependency table under [dependencies], in ${MC_HOST_CARGO_TOML_PATH}; the qualified feature closure cannot be checked otherwise`,
         );
     }
-    // Anchored: `fakeversion = "=<pin>"` contains the literal a substring test looks
-    // for, so a decoy key could satisfy the pin while the real one differs.
+    // The `version` pattern matches only the `version` key; `fakeversion` does not match.
     if (!tomlKeyPattern("version", `"=${escapeRegex(version)}"`).test(entry)) {
         fail(
             `pinned ${crate} identity does not match ${MC_HOST_CARGO_TOML_PATH}`,
@@ -3455,11 +3163,10 @@ function assertPinnedCrateFeatures(
             `${crate} in ${MC_HOST_CARGO_TOML_PATH} must set default-features = false`,
         );
     }
-    // One anchored pattern for both the presence test and the extraction. A
-    // boundary is required because `features` is a suffix of other keys —
-    // `default-features` legitimately, `fakefeatures` as a decoy whose array an
-    // unanchored extraction would read instead of the real one. Using two patterns
-    // is what let presence be anchored while extraction was not.
+    // Anchoring prevents `fakefeatures` from satisfying the checks or supplying the extracted array.
+    // The `features` pattern bounds the key because `features` is a suffix of other keys.
+    // `default-features` is valid, but `fakefeatures` could provide a decoy array.
+    // An unanchored extraction could read a decoy array instead of `features`.
     const FEATURES_KEY = tomlKeyPattern("features", "");
     const declared = tomlKeyPattern("features", "\\[([^\\]]*)\\]").exec(entry);
     if (FEATURES_KEY.test(entry) && declared === null) {
@@ -3467,9 +3174,9 @@ function assertPinnedCrateFeatures(
             `${crate} in ${MC_HOST_CARGO_TOML_PATH} declares a features list this qualifier cannot read`,
         );
     }
-    // Same string rule as the `[features]` forwarding scan: stripping quotes is not
-    // reading a TOML string, and `"c\u0075da"` decodes to a forbidden feature that
-    // an undecoded substring test cannot see.
+    // The feature parser decodes TOML strings so escaped names are checked.
+    // `"c\u0075da"` decodes to a forbidden feature.
+    // An undecoded substring test cannot detect escaped forbidden features.
     const tokens = tomlStringTokens(declared?.[1] ?? "");
     if (tokens === null) {
         fail(
@@ -3497,11 +3204,10 @@ function assertPinnedCrateFeatures(
 }
 
 /**
- * Strip trailing commas from `bun.lock`'s JSONC so it can be parsed as JSON.
+ * `stripJsoncTrailingCommas` removes trailing commas so JSON can parse `bun.lock`.
  *
- * String-aware, because a lockfile carries package names, version ranges, and
- * integrity hashes: a blind regex would corrupt any value that legitimately ends
- * in a comma before a closing brace.
+ * The parser recognizes strings because lockfile values can end in `,}`.
+ * A blind regex could corrupt a string value ending in `,}`.
  */
 function stripJsoncTrailingCommas(text: string): string {
     let out = "";
@@ -3522,7 +3228,6 @@ function stripJsoncTrailingCommas(text: string): string {
             continue;
         }
         if (char === ",") {
-            // Look past whitespace for a closer; drop the comma only then.
             let j = i + 1;
             while (j < text.length && /\s/.test(text[j] as string)) j++;
             const next = text[j];
@@ -3534,25 +3239,16 @@ function stripJsoncTrailingCommas(text: string): string {
 }
 
 /**
- * Resolve the version `workspace` actually gets for `pkg`, from `bun.lock`'s
  * `packages` table.
  *
- * A nested resolution is keyed by the *consumer's package name*, not its
- * directory (`@cortexkit/pi-magic-context/<pkg>`, never `packages/pi-plugin/<pkg>`
- * — no key in the table is a filesystem path), so the workspace's name is read
- * from `workspaces[workspace].name` and the nested entry is preferred over the
- * hoisted one when both exist.
+ * Nested resolutions are keyed by the consumer's package name, not its filesystem path.
+ * The resolver reads `workspaces[workspace].name` because resolution keys are package names, not filesystem paths.
+ * The resolver prefers the workspace's nested resolution to a hoisted resolution when both exist.
  *
- * This replaces a substring search for `"<pkg>@<version>"`, which proved only that
- * the version appeared somewhere in the file — a transitive copy at an unrelated
- * version would satisfy it while the workspace resolved to something else.
+ * A substring match could accept an unrelated transitive copy while the workspace resolves to another version.
  *
- * Returns `null` when the lockfile cannot be read, the workspace is not declared,
- * the workspace does not itself depend on the package, or the package is not
- * resolved, so callers fail closed instead of accepting an unverified version.
- * The declaration check is what makes the hoisted fallback safe: without it, a
- * workspace that stopped depending on the package at all would still qualify
- * whatever version some unrelated workspace or transitive dependency left hoisted.
+ * The resolver returns `null` when `lockText` cannot be parsed, the workspace is undeclared, `pkg` is undeclared, or `pkg` is unresolved.
+ * The declaration check prevents a workspace with no package dependency from qualifying a version hoisted by an unrelated workspace or transitive dependency.
  */
 function resolveLockedVersion(
     lockText: string,
@@ -3600,22 +3296,18 @@ function resolveLockedVersion(
 }
 
 /**
- * Reject a `[features]` entry that forwards a forbidden capability to a qualified
+ * The validator rejects `[features]` entries that forward forbidden capabilities to qualified dependencies.
  * crate.
  *
- * Cargo's feature table enables a dependency's feature with `dep/feature`, so a
- * closure claim checked only against dependency entries is defeated from the other
- * side: `[features] default = ["ort/cuda"]` enables CUDA for every build that does
- * not pass `--no-default-features`, which `build:rust` does not.
+ * Cargo enables dependency features with `dep/feature`.
+ * `[features] default = ["ort/cuda"]` enables CUDA unless the build passes `--no-default-features`.
  *
- * Every entry in the table is scanned, not only the ones reachable from `default`.
- * A forwarding declared under an unreachable feature name still contradicts the
- * closure the lock publishes, and feature reachability is exactly the resolution
- * this scan declines to approximate.
+ * The scan examines every entry, not only entries reachable from `default`.
+ * An unreachable forwarding still contradicts the published closure.
+ * The scan rejects unreachable forwardings rather than approximate feature reachability.
  *
- * Forwarding names the dependency *key*, so a renamed dependency forwards under its
- * rename. The key set therefore comes from the resolved declarations rather than
- * from the crate names.
+ * Cargo forwards dependency features through the dependency key, including a rename.
+ * The scan uses resolved declaration keys rather than crate names.
  */
 function assertNoForbiddenFeatureForwarding(
     cargo: string,
@@ -3634,19 +3326,17 @@ function assertNoForbiddenFeatureForwarding(
     const stringState = { multiline: null as string | null };
     for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
-        // A line that starts inside an open multi-line string is not structure: its
-        // content would otherwise read as a real header and reattribute every line
-        // after it, which is enough to move a declaration out of the table this scan
+        // The parser ignores lines that begin inside multiline strings because they cannot be TOML structure.
+        // The `inMultiline` guard prevents multiline-string content from being parsed as a table header.
         // is examining.
         const atTopLevel = depth === 0 && stringState.multiline === null;
         depth += structuralDelta(line, stringState);
         if (!atTopLevel) continue;
         const header = /^\[([^\]]+)\]$/.exec(trimmed);
         if (header !== null) {
-            // Resolved before it is compared, for the reason the dependency scan
-            // resolves its own headers: a header component is a TOML key, so
-            // `["features"]` names the same table as `[features]`, and comparing the
-            // raw text left the whole forwarding table unexamined.
+            // A table-header component is a TOML key.
+            // `["features"]` names the same table as `[features]`.
+            // Comparing unresolved header text skips quoted `[features]` headers.
             const parts = resolveDottedPath(normalizeTableHeader(header[1] ?? ""));
             if (parts === null) {
                 fail(
@@ -3659,8 +3349,7 @@ function assertNoForbiddenFeatureForwarding(
         const keyText = assignmentKeyText(trimmed);
         if (keyText === null) continue;
         if (section !== "features") {
-            // `features.default = ["ort/cuda"]` declares the same table without a
-            // header, so a header-only scan never sees the forwarding.
+            // Dotted `features.default` assignments bypass a header-only scan.
             if (dottedKeyTouches(keyText, [/^features$/])) {
                 fail(
                     `${MC_HOST_CARGO_TOML_PATH} declares a dotted features assignment this qualifier cannot attribute; use the [features] table`,
@@ -3706,19 +3395,14 @@ function assertNoForbiddenFeatureForwarding(
 }
 
 /**
- * Reject a workspace `[patch]` or `[replace]` override that could redirect a
+ * The validator rejects workspace `[patch]` and `[replace]` overrides for qualified crates.
  * qualified crate.
  *
- * Cargo resolves overrides from the workspace root, so a leaf manifest can name the
- * exact pin while the build compiles a replacement source entirely. No reading of
- * `crates/mc-host/Cargo.toml` can see that.
+ * Cargo resolves overrides from the workspace root.
+ * A workspace override can replace a leaf manifest's pinned source.
  *
- * This refuses rather than resolves: an override naming a qualified crate — or a
- * `[patch]` table this scan cannot attribute — fails the qualification instead of
- * being followed. Following it means resolving the workspace graph through
- * `cargo metadata`, which needs a toolchain the portable drift check must not
- * require; that is the escalation if overrides ever become legitimate here, not a
- * further textual rule.
+ * The validator rejects overrides that name qualified crates and `[patch]` tables whose targets cannot be attributed.
+ * The portable drift check cannot require a toolchain.
  */
 function assertNoQualifiedCrateOverride(
     rootDir: string,
@@ -3730,10 +3414,7 @@ function assertNoQualifiedCrateOverride(
             `${WORKSPACE_CARGO_TOML_PATH} is required to rule out an override of the qualified crates`,
         );
     }
-    // Annotated rather than inferred: a call only narrows away the `null` the
-    // checks below refuse when the callee is a const of an explicit `never`-returning
-    // type, so without the annotation the compiler stops enforcing exactly the
-    // refusals this scan depends on.
+    // // Explicit `never` return preserves TypeScript's null narrowing at `unreadable` calls.
     const unreadable: () => never = () =>
         fail(
             `${WORKSPACE_CARGO_TOML_PATH} declares an override this qualifier cannot read, so the qualified crate identities cannot be ruled out`,
@@ -3746,19 +3427,16 @@ function assertNoQualifiedCrateOverride(
         }
     };
     const lines = tomlLines(readFileSync(path, "utf8"));
-    // Which override table the scan is inside, resolved rather than matched against
-    // the header text: a table name is a TOML key, so `["replace"]` and
-    // `[replace]` are the same table and Cargo applies both. Comparing the text left
-    // every quoted or escaped spelling unattributed and therefore unexamined.
+    // // TOML treats quoted and unquoted table keys as the same name.
+    // // Raw comparison misses quoted and escaped table keys.
     let override: "patch" | "replace" | null = null;
     let depth = 0;
     const stringState = { multiline: null as string | null };
-    // `[patch.<registry>.<crate>]` and `[replace.<package-id>]` name their crate in
-    // the header, and a `package` rename would be an assignment inside the body, so
-    // the verdict cannot be reached until the body ends. Deciding it from assignment
-    // lines instead read `path` as the crate name and only reached the header's crate
-    // on a non-assignment line — so a subtable that ran to EOF without a trailing
-    // blank line was never checked.
+    // // Longer patch and replace paths name the crate in the table header.
+    // // A `package` assignment in the body can rename the header key.
+    // The parser resolves a subtable only after its body reveals a `package` rename.
+    // The parser does not infer the crate from assignment keys such as `path`.
+    // The parser closes an open subtable at EOF and at subsequent headers.
     let openCrate: string | null = null;
     let openBody: string[] = [];
     const closeSubtable = (): void => {
@@ -3773,9 +3451,7 @@ function assertNoQualifiedCrateOverride(
     };
     for (const [index, line] of lines.entries()) {
         const trimmed = line.trim();
-        // A line that starts inside an open multi-line string is not structure: its
-        // content would otherwise read as a real header and reattribute every line
-        // after it, which is enough to move a declaration out of the table this scan
+        // The parser ignores lines inside multiline strings so their contents cannot be parsed as table headers.
         // is examining.
         const atTopLevel = depth === 0 && stringState.multiline === null;
         depth += structuralDelta(line, stringState);
@@ -3783,25 +3459,20 @@ function assertNoQualifiedCrateOverride(
         const header = /^\[([^\]]+)\]$/.exec(trimmed);
         if (header !== null) {
             closeSubtable();
-            // Resolved before it is compared: a header component is a TOML key, so
-            // `["\u0072eplace"."ort:2.0.0-rc.13"]` and `["patch"."crates-io"."ort"]`
-            // spell the override tables in ways Cargo resolves and a raw comparison
-            // does not, leaving the whole table unattributed and unexamined. An
-            // unreadable component cannot be ruled out as one of them.
+            // // TOML resolves escaped and quoted header components before Cargo interprets them.
             const parts = resolveDottedPath(normalizeTableHeader(header[1] ?? ""));
             if (parts === null) unreadable();
             const root = parts[0] ?? "";
             override = root === "patch" || root === "replace" ? root : null;
             if (override === null) continue;
-            // `[patch.<registry>]` and `[replace]` hold one assignment per overridden
-            // crate; a longer path names the crate in its own subtable.
+            // // Patch registry tables and replace tables store overridden crates as assignments.
+            // // Longer override paths name a crate in a subtable.
             const subtable =
                 (override === "patch" && parts.length >= 3) ||
                 (override === "replace" && parts.length >= 2);
             if (!subtable) continue;
             const last = parts[parts.length - 1] ?? "";
-            // A `[replace]` subtable is keyed by a package-ID spec, a `[patch]` one by
-            // the crate name.
+            // // Replace subtable keys are package-ID specs; patch subtable keys are crate names.
             const named = override === "replace" ? replacedCrateName(last) : last;
             if (named === null) unreadable();
             openCrate = named;
@@ -3812,8 +3483,7 @@ function assertNoQualifiedCrateOverride(
             continue;
         }
         if (override === null) {
-            // `patch.crates-io.ort = { path = "fake-ort" }` is an override declared
-            // without a header, including before `[workspace]`.
+            // The parser scans assignments outside headers because dotted keys can declare overrides before `[workspace]`.
             const dotted = assignmentKeyText(trimmed);
             if (
                 dotted !== null &&
@@ -3834,9 +3504,8 @@ function assertNoQualifiedCrateOverride(
         if (crate === null) unreadable();
         const entry = joinInlineEntry(lines, index);
         if (entry === null) unreadable();
-        // A patch entry renames the same way a dependency does:
-        // `ort_fork = { package = "ort", path = "..." }` overrides `ort`, so the key
-        // is not the crate.
+        // The resolver uses `package` because a patch entry's key can differ from the overridden crate.
+        // // A patch entry's `package` field identifies the overridden crate, not its key.
         const resolved = resolveRenamedCrate(crate, entry);
         if (resolved === null) unreadable();
         reject(resolved);
@@ -3844,7 +3513,7 @@ function assertNoQualifiedCrateOverride(
     closeSubtable();
 }
 
-/** Repo-pinned identity cross-checks (bun.lock harness versions, Cargo crate pins). */
+/* */
 function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
     const bunLockPath = join(rootDir, BUN_LOCK_PATH);
     const piVersion = manifest.harnesses.pi.version;
@@ -3884,8 +3553,7 @@ function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
         for (const [crate, version] of qualified) {
             assertPinnedCrateFeatures(cargo, crate, version);
         }
-        // The dependency entries are only one side of the closure: `[features]` can
-        // forward a capability to the same crates, so both sides are checked.
+        // The `[features]` table can forward capabilities to qualified crates, so qualification checks both dependency declarations and feature forwarding.
         const declarations = dependencyDeclarations(cargo);
         if (declarations === null) {
             fail(
@@ -3897,8 +3565,7 @@ function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
             declarations,
             qualified.map(([crate]) => crate),
         );
-        // The leaf manifest is not the whole answer: an override in the workspace
-        // root redirects the crate Cargo actually builds.
+        // A workspace-root override can redirect the crate Cargo builds, so qualification checks the root manifest.
         assertNoQualifiedCrateOverride(
             rootDir,
             qualified.map(([crate]) => crate),
@@ -3907,7 +3574,6 @@ function crossCheckRepoPins(rootDir: string, manifest: SourceManifest): void {
 }
 
 // ---------------------------------------------------------------------------
-// Lock, credentials, and evidence construction.
 // ---------------------------------------------------------------------------
 
 function buildLock(
@@ -3924,7 +3590,7 @@ function buildLock(
     for (const key of INPUT_KEYS) {
         const artifact = manifest.inputs[key];
         if (artifact.qualified) {
-            // Names, order, and source identities only — never credential or byte values.
+            // The evidence artifact contains names, order, and source identities, never credential or byte values.
             inputs[key] = {
                 qualified: true,
                 source: artifact.source,
@@ -3999,9 +3665,8 @@ function buildLock(
         }
     }
     unqualified.sort();
-    // Single source of truth for the release verdict: the lock records it and
-    // the evidence artifact reuses this exact value, so the artifact a build
-    // gate reads can never disagree with the lock it cites.
+    // The evidence artifact reuses the lock's release verdict, preventing disagreement between the artifact and the lock it cites.
+    // The evidence artifact reuses the lock's release verdict, preventing disagreement between the artifact and the lock it cites.
     const productionQualified =
         manifest.mode === "production" && unqualified.length === 0;
     const lock = {
@@ -4027,7 +3692,6 @@ function buildLock(
 }
 
 // ---------------------------------------------------------------------------
-// Generation and drift check.
 // ---------------------------------------------------------------------------
 
 export interface QualifyResult {
@@ -4048,8 +3712,8 @@ export function generate(
     assertPinsMatchContract(contract);
     validateCredentialsDoc(CREDENTIALS_DOC, contract);
 
-    // Stale-U8 detection: the committed contract JSON must be byte-identical to
-    // a clean regeneration of the in-source contract literal.
+    // The committed contract JSON must be byte-identical to a clean regeneration of the in-source contract literal.
+    // The committed contract JSON must be byte-identical to a clean regeneration of the in-source contract literal.
     const canonicalContract = canonicalJson(contract);
     const u8Digest = sha256Hex(canonicalContract);
     const contractPath = join(rootDir, RELEASE_CONTRACT_PATH);
@@ -4076,18 +3740,11 @@ export function generate(
             }`,
         );
     }
-    // One gate, not two. `verifyExternalBytes` was never a field of `generate`'s
-    // option type, so no caller could ever set it: the release prerequisite passed
-    // `verifyBytes: true` with `check: true` and this resolved to `false`, silently
-    // skipping `verifyClosureSourceBytes` while the command reported that every
-    // production byte had been verified. Missing or modified OpenCode/Pi source
-    // roots then passed `release:qualify:require` and failed only when the daemon
-    // tried to materialize them.
     //
-    // Byte verification needs the real artifacts on disk at the manifest's
-    // (absolute, in production) verify paths, which only the qualifying host
-    // has. Drift checking must stay portable so CI can guard the committed
-    // lock, so verify bytes in write mode and only on explicit request in
+    // Write-mode qualification verifies artifact bytes on the qualifying host; portable drift checks verify bytes only when explicitly requested.
+    // Write-mode qualification verifies artifact bytes on the qualifying host; portable drift checks verify bytes only when explicitly requested.
+    // Write-mode qualification verifies artifact bytes on the qualifying host; portable drift checks verify bytes only when explicitly requested.
+    // Write-mode qualification verifies artifact bytes on the qualifying host; portable drift checks verify bytes only when explicitly requested.
     // --check mode.
     const verifyBytes = options.verifyBytes ?? !options.check;
     validateSourceManifest(manifestRaw, contract, rootDir, verifyBytes);
@@ -4159,14 +3816,7 @@ export function generate(
                                               ["executable", harness.closure?.executable],
                                               ["interpreter", harness.closure?.interpreter],
                                               ["entrypoint", harness.closure?.entrypoint],
-                                              // Extensions are launch roots too:
-                                              // `validateClosureManifest` requires a node
-                                              // for every one and reaches the closure
-                                              // through it. A closure that puts its
-                                              // provider extensions in a source root of
-                                              // their own is valid there, so leaving them
-                                              // out here made `generate` reject a manifest
-                                              // the qualifier had just accepted.
+                                              // Closure construction includes provider extensions as roots because `validateClosureManifest` requires a node for each extension and accepts extensions rooted in their source roots.
                                               ...(harness.closure?.extensions ?? []).map(
                                                   (path) => ["extension", path] as const,
                                               ),
@@ -4244,12 +3894,8 @@ export function generate(
         const path = join(rootDir, relative);
         const expected = outputs[key];
         if (options.check) {
-            // The qualification evidence is an environment-derived byproduct
-            // under gitignored `tmp/`, not a committed artifact, so neither its
-            // absence nor its bytes are drift in this committed-artifact check.
-            // Staleness is caught where it matters: `requireQualificationEvidence`
-            // fails closed on absent, malformed, or contract-mismatched evidence
-            // when a production build tries to consume it.
+            // Files under gitignored `tmp/` are not committed artifacts; their absence or bytes do not constitute drift in this committed-artifact check.
+            // `requireQualificationEvidence` rejects absent, malformed, and contract-mismatched evidence before production consumption.
             if (key === "evidence") {
                 continue;
             }
@@ -4276,37 +3922,22 @@ export function generate(
 }
 
 // ---------------------------------------------------------------------------
-// Build-entrypoint consumption gate (U2/U6).
 // ---------------------------------------------------------------------------
 
 /**
- * Load and verify the qualification evidence a production build is allowed to
- * consume. Fails closed on absent, malformed, stale (artifact or U8 digest
- * mismatch), test-only, or non-production evidence. The production verdict is
- * re-derived from the digest-verified lock bytes rather than trusted from the
- * evidence file's own `production_qualified` field, and every committed U8 and U9
- * output must equal a canonical regeneration from the committed sources, so a
- * hand-edited lock, credential matrix, or generated contract cannot pass however
- * consistently its digests are updated.
+ * Production consumption fails closed on absent, malformed, stale, test-only, or non-production evidence.
+ * Stale evidence has an artifact or U8 digest mismatch.
+ * Each committed U8 and U9 output must equal its canonical regeneration from committed sources.
+ * Updating digests consistently cannot make a hand-edited lock, credential matrix, or generated contract pass.
  *
- * Trust boundary: this gate proves the committed *description* of the release is
- * canonical and production-qualified. It does not hash the production artifacts
- * that description names unless `verifyBytes` is requested — the lock records
- * each artifact's `sha256` but deliberately not its `verify_local_path`, which is
- * host-specific, and the real bytes exist only on the qualifying host. A build
- * running on that host should pass `verifyBytes: true` to re-hash them here; a
- * build elsewhere must verify the bytes it actually embeds against the returned
- * lock digest itself.
+ * This gate verifies the canonical, production-qualified committed release description; it verifies named artifact bytes only when `verifyBytes` is requested.
+ * The lock records each artifact's `sha256` but not its `verify_local_path`; paths are host-specific.
+ * A build on the qualifying host must pass `verifyBytes: true` to re-hash the artifacts.
+ * A build elsewhere must verify the artifact bytes it embeds against the returned digests.
  *
- * Returns the verified evidence and artifact digests for embedding into build
  * inputs.
  */
 /**
- * Shared identity gate for one U9 qualification-evidence document: shape,
- * schema, U8 release-contract digest, and release identity. Both the build's
- * release-context loader and the production consumption gate call this, so
- * what counts as "this release's evidence" cannot drift between the two
- * validators. Returns the mismatch reason, or null when the document is this
  * release's evidence.
  */
 export function qualificationEvidenceIdentityMismatch(
@@ -4384,9 +4015,7 @@ export function requireQualificationEvidence(
         }
         digests[key] = actual;
     }
-    // The evidence's own `production_qualified`/`test_only` bits are
-    // self-describing and therefore not authority: re-derive the verdict from
-    // the lock bytes just digest-verified above. Evidence that claims
+    // The gate re-derives qualification from digest-verified lock bytes.
     // qualification over a lock that records unqualified inputs fails closed.
     const lock = ((): Record<string, unknown> => {
         try {
@@ -4416,10 +4045,9 @@ export function requireQualificationEvidence(
     if (lock.production_qualified !== true) {
         reject("inputs are not production-qualified (lock verdict is not true)");
     }
-    // `unqualified` and `production_qualified` are summary fields, so an edit
-    // that clears both still leaves the per-row truth behind. Re-derive the
-    // verdict from every row the lock actually carries: any input, the oracle,
-    // or any harness still marked unqualified contradicts the summary.
+    // The validator derives qualification from per-row values rather than `unqualified` or `production_qualified`.
+    // `INPUT_KEYS`, `oracle`, and the `opencode` and `pi` harness rows must be qualified.
+    // The validator rejects a non-string `version` for `opencode` or `pi` when it contradicts that row's summary version.
     const rows = lock.inputs as
         | Record<string, { qualified?: unknown }>
         | undefined;
@@ -4438,23 +4066,12 @@ export function requireQualificationEvidence(
         | Record<string, { version?: unknown }>
         | undefined;
     for (const name of ["opencode", "pi"] as const) {
-        // A qualified harness records its version as a bare string; an
-        // unqualified one records a `{ qualified: false, reason }` object.
         if (typeof harnesses?.[name]?.version !== "string") {
             reject(`lock row harnesses.${name} is not qualified`);
         }
     }
-    // Everything above reads markers: it proves the lock *says* every row
-    // qualified, not that the rows still carry real artifact hashes, sizes,
-    // licenses, oracle results, or harness identities — `{ "qualified": true }`
-    // satisfies each one. Nothing above reads the generated U8 consumer
-    // artifacts either, and it is the generated Rust contract the runtime
-    // actually compiles, not the digest of the in-source literal.
+    // The qualification-marker checks do not verify artifact evidence.
     //
-    // Both gaps close the same way: regenerate every U8 and U9 output from the
-    // committed sources and require the committed bytes to match. Stripped lock
-    // rows, a replaced credential matrix, and an edited generated contract all
-    // fail that comparison, whatever digest the evidence cites.
     const u8 = generateReleaseOutputs(rootDir, { check: true });
     if (u8.drift.length > 0) {
         reject(`generated U8 outputs are not canonical: ${u8.drift.join("; ")}`);
@@ -4486,20 +4103,9 @@ export function requireQualificationEvidence(
 }
 
 /**
- * Assert the interpreter running a qualifying pass is the pinned Bun.
  *
- * `harness_runtimes` is otherwise copied into the lock as an assertion nothing
- * corroborates. Binding it to the real interpreter is only meaningful where the
- * qualification actually happens — the host holding the artifacts, which is the host
- * asked to verify bytes.
  *
- * Enforced at the CLI boundary, not inside `generate`. `generate` is driven by tests
- * over synthetic roots and by CI's portable drift check, and a host-environment
- * assertion buried in it would make both depend on the runner's Bun — which is
- * exactly the failure this function's placement exists to avoid.
  *
- * Bun only: the lock pins Node and npm as ranges (`24.x`, `11.x`), so there is no
- * exact value to compare, and identifying them would mean spawning each interpreter.
  */
 export function assertPinnedQualifyingRuntime(running: string | undefined): void {
     const pinned = QUALIFICATION_PINS.harness_runtimes.bun;
@@ -4530,14 +4136,6 @@ function main(): void {
         process.exit(2);
     }
     const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
-    // Byte verification is the qualifying host's operation, so it is the one place
-    // the pinned harness runtime is bound to a real interpreter. The condition has to
-    // predict `generate`'s own resolution rather than restate part of it: write mode
-    // verifies bytes without being asked, while the consumption gate always regenerates
-    // in check mode and so verifies only when explicitly told to. Getting this subset
-    // wrong in either direction is a live failure — too narrow and the documented
-    // `release:qualify` hashes artifacts unbound, too wide and the gate refuses to run
-    // on a host that was never going to read a byte.
     const willVerifyBytes = requireQualified ? verifyBytes : verifyBytes || !check;
     if (willVerifyBytes) {
         try {
@@ -4547,17 +4145,7 @@ function main(): void {
             process.exit(1);
         }
     }
-    // `--check` reports drift and prints the verdict; it exits 0 over unqualified
-    // inputs on purpose, because the committed manifest is deliberately unqualified
-    // until release engineering records the real bytes, and CI has to stay green in
-    // that state. `--require-qualified` is the release prerequisite: it runs the
-    // same consumption gate a production build runs, so the gate is reachable
-    // outside the tests and a release cannot proceed on an unqualified verdict.
     //
-    // The prerequisite pairs with `--verify-bytes` (see `release:qualify:require`),
-    // because it runs where the artifacts are: without it the gate proves the
-    // committed description is canonical while the bytes about to be packaged could
-    // have been replaced, truncated, or removed since qualification.
     if (requireQualified) {
         try {
             const accepted = requireQualificationEvidence(rootDir, {

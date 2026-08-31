@@ -374,7 +374,7 @@ fn close_channel(env: &Env, channel: &mut Channel) -> Result<()> {
 
 fn quarantine_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     channel.closed = true;
-    // The quarantine retains the mapping, not the peer. Holding `setup` keeps the host's connection permit and both rings for the process lifetime. commentlint: allow(JUDGE)
+    // The quarantine retains the mapping, not the peer. Holding `setup` keeps the host's connection permit and both rings for the process lifetime.
     if let Some(mut setup) = channel.setup.take() {
         setup::goodbye(&mut setup);
     }
@@ -425,7 +425,7 @@ fn cleanup_env(raw_env: usize) {
                     && channel.stranded.is_empty())
             });
             for (_, quarantined) in registry.channels.drain() {
-                // Process exit owns uncertain alias reclamation. commentlint: allow(JUDGE)
+                // Process exit owns uncertain alias reclamation.
                 std::mem::forget(quarantined);
             }
         }
@@ -1279,7 +1279,7 @@ pub fn release(env: &Env, channel_id: u32, token: u32) -> Result<()> {
     })
 }
 
-/// A full ring is ordinary backpressure, so it carries a distinct message the caller can classify as retryable instead of terminal. commentlint: allow(JUDGE)
+/// A full ring is ordinary backpressure, so it carries a distinct message the caller can classify as retryable instead of terminal.
 fn reservation_error(failure: ProducerError) -> Error {
     match failure {
         ProducerError::Exhausted | ProducerError::Deadline => error("shared-memory ring is full"),

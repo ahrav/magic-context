@@ -67,9 +67,8 @@ function waitForReady(child: ChildProcess, deadlineMs: number): Promise<string> 
         }, deadlineMs);
         child.stdout?.on("data", (chunk: Buffer) => {
             stdout += chunk.toString("utf8");
-            // Require the line terminator: a chunk boundary can split the
-            // READY line, and a bare `$` anchor would accept the truncated
-            // prefix as the whole connection-file path.
+            // The regex requires the line terminator because stdout chunks can split a `READY` line.
+            // A truncated match would treat a path prefix as the connection-file path.
             const match = /^READY ([^\r\n]+)\r?\n/m.exec(stdout);
             if (match?.[1]) {
                 const path = match[1];

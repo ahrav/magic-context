@@ -74,7 +74,7 @@ export interface InjectionCanaryHit {
 
 export interface MetamorphicReport {
     schema: typeof METAMORPHIC_REPORT_SCHEMA;
-    /** Resolved pre-run, because a partial report can hold no scored entry to carry it; null for the deterministic runner. commentlint: allow(JUDGE) */
+    /** Resolved pre-run, because a partial report can hold no scored entry to carry it; null for the deterministic runner. */
     system: SystemVersionTuple | null;
     entries: MetamorphicReportEntry[];
     coverage: ScenarioCoverage[];
@@ -90,7 +90,7 @@ export type TierInvalidReason =
           failedInvariants: MetamorphicInvariantVerdict["invariant"][];
       }
     | {
-          /** Two ERROR controls satisfy every equality invariant trivially, so agreement proves nothing here. commentlint: allow(JUDGE) */
+          /** Two ERROR controls satisfy every equality invariant trivially, so agreement proves nothing here. */
           kind: "control-error";
           controlAErrorReason: string | null;
           controlBErrorReason: string | null;

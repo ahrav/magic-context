@@ -29,9 +29,9 @@ function minOf(values: readonly number[]): number {
     return values.reduce((minimum, value) => Math.min(minimum, value), Number.POSITIVE_INFINITY);
 }
 
-/** Per-claim content ceiling for inclusion in a verification batch. A batch
- *  interpolates up to VERIFY_BATCH_SIZE contents into one prompt, so this bounds
- *  the request a single record can demand. */
+/**
+ * A batch interpolates at most VERIFY_BATCH_SIZE claim contents into one prompt.
+ * The 8192-byte limit bounds each record's prompt contribution. */
 const MAX_VERIFY_CLAIM_CONTENT_BYTES = 8192;
 
 function ensureBroadCycleStart(args: {
@@ -99,24 +99,12 @@ export async function partitionVerifyScope(args: {
 }): Promise<VerifyGateResult> {
     const runStartedAt = args.now ?? Date.now();
     const active = readDreamerProjectClaims(args.db, args.projectIdentity, "verification");
-    // Anti-memories carry no mapped files, so they qualify by category — but a
-    // `stale` latest outcome is the demotion verdict verification itself
-    // recorded (the record stays lifecycle-active until its TTL expires so
-    // explicit search can still show it labeled). Without this exclusion a
-    // demoted anti-memory reads as never-verified (`verifiedAt() === 0`) and
-    // re-enters every subsequent batch, re-asking the model a question it
-    // already answered until the TTL lapses.
+    // Anti-memories qualify by category because they have no mapped files.
+    // `stale` is the demotion outcome recorded by verification.
+    // Excluding stale anti-memories prevents demoted records from being reverified.
     //
-    // Oversized content is also excluded. `buildVerifyPrompt` interpolates each
-    // claim's content whole and a batch holds up to VERIFY_BATCH_SIZE records,
-    // and anti-memory payload fields carry no write-side length ceiling — so one
-    // outsized warning can push the request past the verifier's limit and fail
-    // the entire batch, repeatedly, because an unverified record stays eligible
-    // for the next pass. Truncating instead would be worse than skipping: the
-    // prompt asks for the complete field-labeled content back on UPDATE, so a
-    // shortened copy would round-trip into the stored record. A skipped record
-    // stays visible to explicit search, labeled, and stays out of automatic
-    // surfaces for want of VERIFIED maturity.
+    // Oversized content is excluded because `buildVerifyPrompt` interpolates each claim's complete content.
+    // The failure repeats because unverified records remain eligible for the next pass.
     const candidates = active.filter((claim) =>
         claim.category === ANTI_MEMORY_CATEGORY
             ? claim.verification.latestOutcome !== "stale" &&

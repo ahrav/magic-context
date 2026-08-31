@@ -38,10 +38,8 @@ describe("release root materialization", () => {
             expect(lstatSync(join(destination, manifest.entrypoints.rustHost)).mode & 0o111).toBe(0o111);
             expect(lstatSync(join(destination, manifest.entrypoints.databaseTemplate)).mode & 0o222).toBe(0);
             expect(existsSync(join(parent, ".v2.publish-lock"))).toBe(false);
-            // A worker killed after the rename installed this root retries with the same
-            // inputs, so the retry must complete rather than report a conflict it cannot
-            // distinguish from one. It leaves no staging directory behind and releases the
-            // lock, which is what proves the accept-existing path runs inside the wrapper.
+            // A retry with matching inputs must accept an already installed root.
+            // An accepted retry creates no additional staging directory and releases the publication lock.
             const stagingBefore = readdirSync(parent).filter((entry) => entry.startsWith(".v2.staging-")).sort();
             const retried = materializeReleaseRoot({
                 promotedRoot: promoted,
@@ -52,14 +50,12 @@ describe("release root materialization", () => {
             });
             expect(retried.root).toBe(destination);
             expect(retried.observedRootFingerprint).toBe(materialized.observedRootFingerprint);
-            // The accepted retry leaves its own staging directory behind no more than a
-            // completed publication does.
             expect(readdirSync(parent).filter((entry) => entry.startsWith(".v2.staging-")).sort())
                 .toEqual(stagingBefore);
             expect(existsSync(join(parent, ".v2.publish-lock"))).toBe(false);
-            // Bytes that are not this root are the case existence alone could not tell
-            // apart, and the lock wraps that rejection too, so its diagnostic surviving
-            // the wrapper unchanged proves the wrapper still releases on that path.
+            // A destination containing a different root must be rejected.
+            // The publication lock also covers rejection of a conflicting destination.
+            // Rejecting a conflicting destination releases the publication lock.
             const conflicting = mkdtempSync(join(tmpdir(), "holdout-conflicting-"));
             const conflictingDestination = join(parent, "v3");
             let rejected: unknown;

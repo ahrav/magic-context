@@ -31,9 +31,6 @@ function peer(daemonVer = releaseContract.versions.daemon, daemonId = 7): Authen
 }
 
 /**
- * Host-health metrics carry wire epoch names, which differ from the contract
- * names; building the fixture from the wire spelling is what makes the probe's
- * mapping observable instead of silently yielding an empty epoch set.
  */
 function wireEpochs(overrides: Record<string, unknown> = {}) {
     return {
@@ -214,9 +211,6 @@ describe("managed authenticated compatibility probe", () => {
 
         await readCompatibilitySnapshot(bounded, Date.now() + 40);
 
-        // Without a per-request bound the client would start a fresh full-length
-        // request budget here, letting the probe overrun the aggregate deadline
-        // its caller promised.
         expect(timeouts).toHaveLength(1);
         expect(timeouts[0]).toBeGreaterThan(0);
         expect(timeouts[0]).toBeLessThanOrEqual(40);

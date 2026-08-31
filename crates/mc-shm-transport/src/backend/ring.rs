@@ -639,7 +639,7 @@ impl RingGrant {
         Ok(grant)
     }
 
-    /// Decodes one exact-length grant slice. commentlint: allow(JUDGE)
+    /// Decodes one exact-length grant slice.
     pub fn decode_slice(bytes: &[u8]) -> Result<Self, RingError> {
         let bytes: [u8; GRANT_BYTES] = bytes.try_into().map_err(|_| RingError::InvalidGrant)?;
         Self::decode(bytes)
@@ -686,24 +686,24 @@ impl fmt::Debug for RingGrant {
     }
 }
 
-/// Ring attachment handle. commentlint: allow(JUDGE)
+/// Ring attachment handle.
 pub struct RingAttachment {
     descriptors: [OwnedFd; 3],
     grant: RingGrant,
 }
 
 impl RingAttachment {
-    /// Attaches ring. commentlint: allow(JUDGE)
+    /// Attaches ring.
     pub fn attach(self) -> Result<Ring, RingError> {
         Ring::attach(self.descriptors, self.grant)
     }
 
-    /// Grant. commentlint: allow(JUDGE)
+    /// Grant.
     pub const fn grant(&self) -> RingGrant {
         self.grant
     }
 
-    /// Splits descriptors from grant. commentlint: allow(JUDGE)
+    /// Splits descriptors from grant.
     pub fn into_parts(self) -> ([OwnedFd; 3], RingGrant) {
         (self.descriptors, self.grant)
     }
@@ -727,7 +727,7 @@ pub struct Ring {
 }
 
 impl Ring {
-    /// Creates sealed sparse ring. commentlint: allow(JUDGE)
+    /// Creates sealed sparse ring.
     pub fn create(profile: &TargetProfile, lane: u32) -> Result<Self, RingError> {
         let runtime = RuntimeDir::create_in(&std::env::temp_dir())?;
         let mut ring = Self::create_in(profile, lane, &runtime)?;
@@ -737,7 +737,7 @@ impl Ring {
 
     /// Creates ring using already validated candidate runtime directory.
     ///
-    /// Profile identity is enforced upstream by `TargetProfile::new`; only span geometry is re-checked here because it constrains this ring's wrap behavior. commentlint: allow(JUDGE)
+    /// Profile identity is enforced upstream by `TargetProfile::new`; only span geometry is re-checked here because it constrains this ring's wrap behavior.
     pub fn create_in(
         profile: &TargetProfile,
         lane: u32,
@@ -807,7 +807,7 @@ impl Ring {
         self.mapping.fd.as_raw_fd()
     }
 
-    /// Returns mapping, data, and capacity descriptors. commentlint: allow(JUDGE)
+    /// Returns mapping, data, and capacity descriptors.
     pub fn raw_descriptors(&self) -> [RawFd; 3] {
         [
             self.mapping.fd.as_raw_fd(),
@@ -816,12 +816,12 @@ impl Ring {
         ]
     }
 
-    /// Duplicates the data-readiness descriptor for an owning event-loop registration. commentlint: allow(JUDGE)
+    /// Duplicates the data-readiness descriptor for an owning event-loop registration.
     pub fn duplicate_data_ready(&self) -> Result<OwnedFd, RingError> {
         self.data_ready.duplicate()
     }
 
-    /// Binds one data wait to the observed generation. commentlint: allow(JUDGE)
+    /// Binds one data wait to the observed generation.
     ///
     /// Returns `true` only when the caller should block on the data-readiness descriptor.
     /// A `false` result means data or a generation change is already visible.
@@ -853,7 +853,7 @@ impl Ring {
         Ok(true)
     }
 
-    /// Ends an external data wait and drains its coalesced token. commentlint: allow(JUDGE)
+    /// Ends an external data wait and drains its coalesced token.
     pub fn complete_data_wait(&self) -> Result<(), RingError> {
         let wake = self.data_wake_ptr()?;
         // SAFETY: wake page remains mapped and atomics were initialized before activation.
@@ -861,7 +861,7 @@ impl Ring {
         self.data_ready.drain()
     }
 
-    /// Duplicates attachment handle. commentlint: allow(JUDGE)
+    /// Duplicates attachment handle.
     pub fn attachment(&self) -> Result<RingAttachment, RingError> {
         // SAFETY: F_DUPFD_CLOEXEC duplicates owned valid descriptor.
         let raw = unsafe { libc::fcntl(self.raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
@@ -976,7 +976,7 @@ impl Ring {
         })
     }
 
-    /// Waits on capacity readiness until deadline. commentlint: allow(JUDGE)
+    /// Waits on capacity readiness until deadline.
     pub fn reserve_until(
         &self,
         bound: usize,
@@ -1134,7 +1134,7 @@ impl Ring {
         Ok(Some(lease))
     }
 
-    /// Waits until a frame can be leased or deadline expires. commentlint: allow(JUDGE)
+    /// Waits until a frame can be leased or deadline expires.
     pub fn wait_for_data(&self, deadline: Instant) -> Result<bool, RingError> {
         loop {
             if self.data_available()? {
@@ -1332,7 +1332,7 @@ impl Ring {
         Ok((descriptors, bytes))
     }
 
-    /// Readiness probe that only reads shared state. commentlint: allow(JUDGE)
+    /// Readiness probe that only reads shared state.
     pub fn probe(&self) -> Result<(), RingError> {
         if self.is_quarantined() {
             return Err(RingError::Quarantined);
@@ -1340,7 +1340,7 @@ impl Ring {
         self.conservation().map(|_| ())
     }
 
-    /// Counts resident arena pages. commentlint: allow(JUDGE)
+    /// Counts resident arena pages.
     pub fn resident_arena_pages(&self) -> Result<usize, RingError> {
         let page_size = system_page_size();
         let arena_len = self.arena_bytes();
@@ -1704,12 +1704,12 @@ impl ProducerReservation<'_> {
         self.capacity() - self.cursor
     }
 
-    /// Number of reserved spans. commentlint: allow(JUDGE)
+    /// Number of reserved spans.
     pub const fn segment_count(&self) -> usize {
         self.plan.span_count() as usize
     }
 
-    /// Returns one reserved span. commentlint: allow(JUDGE)
+    /// Returns one reserved span.
     pub fn segment(&self, index: usize) -> Result<Option<LeaseSpan<'_>>, ProducerError> {
         let Some(span) = self.plan.span(index) else {
             return Ok(None);
@@ -1720,7 +1720,7 @@ impl ProducerReservation<'_> {
             .map_err(ProducerError::Ring)
     }
 
-    /// Advances cursor after writes into reserved spans. commentlint: allow(JUDGE)
+    /// Advances cursor after writes into reserved spans.
     pub fn advance(&mut self, bytes: usize) -> Result<(), ProducerError> {
         if self.finished {
             return Err(ProducerError::Aborted);
@@ -1739,7 +1739,7 @@ impl ProducerReservation<'_> {
         Ok(())
     }
 
-    /// Sets the wire header that commit validates against exact body length. commentlint: allow(JUDGE)
+    /// Sets the wire header that commit validates against exact body length.
     pub fn set_wire_header(
         &mut self,
         wire_header: [u8; WIRE_V2_HEADER_BYTES],
@@ -2204,7 +2204,7 @@ fn create_macos_shm(len: usize) -> Result<OwnedFd, RingError> {
     // shm_open to minimize that inheritance window.
     // SAFETY: fd is owned and F_SETFD changes only its descriptor flags.
     let cloexec = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
-    // An un-unlinked name persists in the kernel until reboot, so the unlink runs before either result is reported. commentlint: allow(JUDGE)
+    // An un-unlinked name persists in the kernel until reboot, so the unlink runs before either result is reported.
     // SAFETY: name.as_ptr() remains valid for the call; shm_unlink removes the name immediately.
     let unlinked = unsafe { libc::shm_unlink(name.as_ptr()) };
     if cloexec < 0 || unlinked != 0 {

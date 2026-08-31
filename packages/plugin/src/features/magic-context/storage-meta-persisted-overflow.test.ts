@@ -47,7 +47,6 @@ describe("recordDetectedContextLimit", () => {
     });
 
     it("creates the session_meta row when missing (like recordOverflowDetected)", () => {
-        // Do NOT call ensureSessionMetaRow first.
         recordDetectedContextLimit(db, "ses_fresh", 64_000);
 
         const state = getOverflowState(db, "ses_fresh");

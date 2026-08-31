@@ -88,34 +88,22 @@ afterEach(() => {
         try {
             rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
 });
 
 describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
     /**
-     * Regression guard for the CI-only infinite-loop bug discovered on 2026-05-19:
+     * Repeated `noReply` notifications must not prevent OpenCode's loop from terminating.
      *
-     * When pressure stays >=95% across multiple transform passes (e.g. force-cleanup
-     * usage that keeps reporting 85k tokens), the same compartment run stays active
-     * for the duration of historian execution. Without the `notificationSent`
-     * guard, each transform pass would call `sendIgnoredMessage(...)`, which uses
-     * `client.session.prompt({ noReply: true })`. OpenCode persists each such
-     * call as a USER message with finish=null in the session DB.
      *
-     * On the next loop iteration, `latest(msgs)` returns the new notification-user
-     * as `lastUser` (highest ID), and `lastUser.id > lastAssistant.id` makes
-     * OpenCode's break condition `lastUser.id < lastAssistant.id` false →
-     * runLoop keeps calling the LLM → mock returns 85k usage again → transform
-     * fires again → notification fires again → INFINITE LOOP.
      *
-     * The guard ensures sendIgnoredMessage runs at most once per ActiveCompartmentRun.
+     * Each ActiveCompartmentRun calls sendIgnoredMessage at most once.
      */
     it("sends the 95% comparting notification at most once per active compartment run", async () => {
         const sessionId = "ses-notification-guard";
 
-        // Create an OpenCode DB with enough messages so hasEligibleHistoryForCompartment
-        // returns true (need raw history beyond any existing compartment end).
+        // Raw history must extend beyond the existing compartment end for `hasEligibleHistoryForCompartment` to return `true`.
         createOpenCodeDb(
             sessionId,
             Array.from({ length: 12 }, (_, i) => ({
@@ -127,8 +115,6 @@ describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
 
         const db = openDatabase();
 
-        // Stub a client that exposes session.prompt. sendIgnoredMessage calls
-        // session.prompt with noReply:true — we count those to verify the guard.
         const promptMock = mock(async () => ({ data: {} }));
         const client = {
             session: {
@@ -136,9 +122,8 @@ describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
             },
         } as unknown as PluginContext["client"];
 
-        // Register a never-resolving active compartment run so the phase sees
-        // an in-flight run on every pass. Using registerActiveCompartmentRun
-        // directly avoids depending on runCompartmentAgent's network paths.
+        // The registered active run never resolves, so every pass observes an in-flight run.
+        // The registered active run avoids runCompartmentAgent network paths.
         const neverResolves = new Promise<void>(() => {});
         registerActiveCompartmentRun(sessionId, neverResolves);
 
@@ -164,26 +149,20 @@ describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
             messages: [],
             pendingCompartmentInjection: null,
             deferredHistoryRefreshSessions: new Set<string>(),
-            // historianTimeoutMs short so the await returns "timed_out" quickly
-            // (the registered activeRun never resolves on its own).
+            // A short `historianTimeoutMs` makes the await return `"timed_out"` before the registered active run resolves.
             historianTimeoutMs: 50,
         };
 
-        // Pass 1: pressure is high, activeRun exists with notificationSent=false.
-        // The notification should fire exactly once and flip notificationSent=true.
         await runCompartmentPhase(baseArgs);
         expect(countIgnoredNotifications(promptMock, "Context at 97%")).toBe(1);
         expect(activeRun?.notificationSent).toBe(true);
 
-        // Pass 2: same activeRun, still notificationSent=true → no additional call.
         await runCompartmentPhase(baseArgs);
         expect(countIgnoredNotifications(promptMock, "Context at 97%")).toBe(1);
 
-        // Pass 3: still 1 — never re-fires while the same run is active.
         await runCompartmentPhase(baseArgs);
         expect(countIgnoredNotifications(promptMock, "Context at 97%")).toBe(1);
 
-        // Verify message text
         const calls = promptMock.mock.calls as unknown as Array<
             [{ body?: { parts?: Array<{ text?: string }> } }]
         >;

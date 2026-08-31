@@ -6,7 +6,7 @@ export interface EscalationBands {
     emergencyPercentage: number;
 }
 
-/** Keep force cleanup above normal execution while preserving the absolute 95% wall. */
+/** forceMaterializationPercentage must exceed the execution threshold; emergencyPercentage must be 95%. */
 export function escalationBands(effectiveThresholdPercentage: number): EscalationBands {
     const threshold = Number.isFinite(effectiveThresholdPercentage)
         ? Math.min(effectiveThresholdPercentage, MAX_EXECUTE_THRESHOLD)

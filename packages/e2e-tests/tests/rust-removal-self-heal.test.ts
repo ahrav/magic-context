@@ -1,20 +1,10 @@
 /// <reference types="bun-types" />
 
 /**
- * Incident regression #1: mid-session message removal wedged the ordinal
  * resolver permanently.
  *
- * The bug: when a message is removed mid-session (session.revert, which opencode
- * emits as `message.removed`), the Rust adapter's ordinal resolver saw the raw
- * array shrink under its stored anchor and entered a permanent mismatch loop —
- * every later pass failed to resolve ordinals and the transform stopped serving
- * (parking the session). The fix is a self-heal re-prime that rebuilds the
- * ordinal map from the durable rows after a removal.
  *
- * The assertion targets the outcome: after a real removal the transform keeps
- * serving and the session never permanently parks.
  *
- * Drives the FULL production path: opencode → plugin → direct mc-host → McHandler.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -45,9 +35,8 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: removal self-heal", 
             expect(passesBefore.some((p) => p.servedFrom === "transform")).toBe(true);
             expect(passesBefore.every((p) => p.decision !== "error")).toBe(true);
 
-            // Pick a MID-session user message to remove (not newest, not first).
-            // Reverting to it drops it and everything after — the exact shape
-            // session.revert produces and opencode persists as message.removed.
+            // Choose a nonterminal user message so `session.revert` deletes later messages.
+            // session.revert removes the selected message and every later message.
             const messages = await h.listMessages(sessionId);
             const userIds = messages
                 .map((m) => m.info)
@@ -59,13 +48,10 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: removal self-heal", 
             const midUserId = userIds[Math.floor(userIds.length / 2)]!;
 
             await h.revertMessage(sessionId, midUserId);
-            // Let the async clear-and-reindex settle (the re-prime source).
             await Bun.sleep(2_000);
 
             const passCountBeforeNext = h.readRustPasses().length;
 
-            // The passes after the removal MUST recover — this is the exact point
-            // the old resolver wedged. Drive fresh turns with realistic spacing.
             for (let i = 6; i <= 10; i += 1) {
                 h.mock.setDefault({
                     text: `post-removal assistant ${i}`,
@@ -82,10 +68,6 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: removal self-heal", 
             const allAfter = await h.waitForRustPasses(passCountBeforeNext + 3);
             const passesAfter = allAfter.slice(passCountBeforeNext);
 
-            // Outcome invariants (no permanent wedge):
-            //  - the session is not permanently parked (the last pass serves), and
-            //  - the module resumed real transforms after the removal, proving the
-            //    ordinal resolver re-primed rather than looping forever.
             const lastPass = passesAfter.at(-1)!;
             expect(lastPass.decision).not.toBe("parked");
             expect(passesAfter.some((p) => p.servedFrom === "transform")).toBe(true);

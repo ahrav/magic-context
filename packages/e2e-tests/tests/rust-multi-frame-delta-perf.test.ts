@@ -107,9 +107,6 @@ describe.skipIf(!rustPrereqs.ok)("rust transport: large tail delta", () => {
         expect(smallDelta.prefixGuardMs).toBeLessThan(10);
         expect(smallDelta.stateSyncMs).toBeLessThan(15);
         expect(smallDelta.wireBuildMs).toBeLessThan(10);
-        // The hermetic daemon uses McHandler over external TCP, which can add scheduling overhead.
-        // Apply timing limits only in strict production-like environments; enforce message,
-        // page-count, and payload-size limits in every environment.
         if (process.env.MC_RUST_E2E_STRICT_PERF === "1") {
             expect(smallDelta.transportMs).toBeLessThan(30);
             expect(smallDelta.adapterElapsedMs).toBeLessThan(100);
@@ -118,9 +115,6 @@ describe.skipIf(!rustPrereqs.ok)("rust transport: large tail delta", () => {
         expect(smallDeltas.every((pass) => pass.transportPages === 1)).toBe(true);
         expect(smallDeltas.every((pass) => pass.transportBytes < 512 * 1024)).toBe(true);
 
-        // SOFT+ may reuse the caller-owned tail in one small module request or retransmit the
-        // same bytes across bounded pages. The module assertions cover both paths; the provider
-        // wire-size increase separately proves that the large tail was not lost.
         expect(largeTailDelta.applied).toBe(true);
         expect(largeTailDelta.transportPages).toBeGreaterThanOrEqual(1);
         expect(largeTailDelta.transportPages).toBeLessThanOrEqual(6);

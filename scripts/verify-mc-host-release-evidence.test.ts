@@ -66,7 +66,7 @@ function fullStubs() {
     };
 }
 
-/** Rewrites one proof file in place and re-pins its digest in the evidence. */
+/* */
 function rewriteProof(
     root: string,
     evidence: Record<string, unknown>,
@@ -146,11 +146,7 @@ const LOCK_PATH = "release/mc-host-production-inputs.lock.json";
 const INDEX_PATH = "release/mc-host-payload-index.json";
 
 /**
- * Stand-in for the production-input qualification consumer.
  *
- * Returns the digests the real consumer returns, derived the same way, so the
- * trust-index validation downstream of it is exercised against real citations
- * rather than being skipped along with the qualification check.
  */
 function stubQualification(): { u8Digest: string; lockSha256: string } {
     return {
@@ -160,18 +156,8 @@ function stubQualification(): { u8Digest: string; lockSha256: string } {
 }
 
 /**
- * Bytes to stage for a cited artifact.
  *
- * The lock and payload index are taken from the committed artifacts rather than
- * hand-built, because the GA gate now runs the real trust-index validator over
- * the index: package identities, platform floors, size budgets against the lock,
- * and real payload-manifest and bootstrap-launcher digests. A synthetic index
- * cannot satisfy that, and a fixture that diverges from the shipped shape is how
- * a gate ends up passing tests while failing on real artifacts.
  *
- * The committed index is fail-closed, so the only edits are the ones a qualified
- * release would make: flip the verdict and each entry to qualified, drop the
- * unqualified reason, and supply real digests.
  */
 function citedArtifactBytes(field: string): string {
     const contract = buildContract();
@@ -207,9 +193,6 @@ function citedArtifactBytes(field: string): string {
         })}\n`;
     }
     if (field === "stop_provenance_sha256") {
-        // Genesis is the only acceptable ancestry for the first payload-bearing
-        // release, and `validateStopRecord` requires exactly the contract's
-        // genesis fields bound to the current release identity.
         const genesis: Record<string, unknown> = {};
         for (const key of contract.stop_provenance_schema.genesis
             .required_fields) {
@@ -224,10 +207,8 @@ function citedArtifactBytes(field: string): string {
 }
 
 /**
- * Stages the registry gate the GA gate reads reservation versions from.
+ * The staged registry gate supplies reservation versions to the GA gate.
  *
- * Payload reservations must be inert prereleases and must never collide with a
- * release version, which is what makes them safe to exclude from ancestry.
  */
 function installRegistryGate(root: string): void {
     const contract = buildContract();
@@ -400,14 +381,12 @@ function installReleaseArtifacts(
         evidence[field] = sha256Hex(bytes);
     }
     installRegistryGate(root);
-    // Qualified verification requires the signer workflow the proofs cite to
-    // exist in the checkout under validation.
     const workflowPath = join(root, QUALIFICATION_WORKFLOW_PATH);
     mkdirSync(dirname(workflowPath), { recursive: true });
     writeFileSync(workflowPath, "name: qualification stub\n");
 }
 
-/** The verifier plus every sibling module it imports. */
+/** The staged verifier needs imported sibling modules to resolve relative imports. */
 const VERIFIER_MODULES = [
     "verify-mc-host-release-evidence",
     "build-mc-host-payload",
@@ -416,10 +395,8 @@ const VERIFIER_MODULES = [
 ] as const;
 
 /**
- * Path to a verifier copy whose root carries no release artifacts at all.
+ * The verifier copy's root contains no release artifacts.
  *
- * The verifier resolves its root from its own module path, so isolating it from
- * this checkout's `tmp/` means running a copy rather than passing a directory.
  * `node_modules` is linked in because one sibling module imports `typescript`.
  */
 function isolatedVerifier(): string {
@@ -551,8 +528,6 @@ describe("installed release evidence", () => {
             headSha: "a".repeat(40),
             workflow: ".github/workflows/mc-host-release-qualification.yml",
         };
-        // The api path is rebuilt under source.repository, so a run id borrowed
-        // from a foreign repository or host must not survive parsing as ours.
         expect(
             workflowRunApiPath({
                 ...source,
@@ -565,7 +540,7 @@ describe("installed release evidence", () => {
                 runUrl: "https://evil.example.com/ahrav/magic-context/actions/runs/123456",
             }),
         ).toBeNull();
-        // The attempt is signed into the certificate, never carried by the run url.
+        // The certificate binds the attempt; `run_url` does not.
         expect(
             workflowRunApiPath({
                 ...source,
@@ -590,9 +565,9 @@ describe("installed release evidence", () => {
         const evidence = qualifiedEvidence();
         installReleaseArtifacts(root, evidence);
         installProofArtifacts(root, evidence);
-        // `--check-schema` validates shape, not GA qualification. Binding proofs
-        // to the checked-out commit is a property of the GA gate, so schema-only
-        // runs at any other commit must not fail closed on it.
+        // `--check-schema` validates shape, not GA qualification.
+        // The GA gate binds proofs to the checked-out commit.
+        // Schema-only runs at other commits do not require proof binding to the checked-out commit.
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, false, {
                 requireQualification: () => stubQualification(),
@@ -720,9 +695,6 @@ describe("installed release evidence", () => {
         ).toThrow(/must cite a test report under tmp\/mc-host-test-reports\//);
     });
 
-    // Schema, target, and verdict share a single reject condition, so one case
-    // per clause keeps a regression in any one of them from riding on its
-    // neighbours still being enforced.
     for (const mutation of ["failed", "wrong-schema", "wrong-target"] as const) {
         test(`a test report must attest a passing run for its target (${mutation})`, () => {
             const root = mkdtempSync(join(tmpdir(), "mc-host-installed-evidence-"));
@@ -738,8 +710,6 @@ describe("installed release evidence", () => {
             ) as Record<string, unknown>;
             const reportPath = (report.observations as Record<string, unknown>)
                 .test_report_path as string;
-            // The citation path and digest stay consistent, so only the report's
-            // own content can carry the rejection.
             const forged = `${canonicalJson({
                 schema:
                     mutation === "wrong-schema"
@@ -804,10 +774,8 @@ describe("installed release evidence", () => {
     });
 
     test("a re-run qualifies on the successful attempt whatever the attestation order", () => {
-        // One digest can be attested in several attempts: a re-run leaves the
-        // proof bytes unchanged because their run_url omits the attempt. `gh
-        // attestation verify` documents no ordering for its array, so neither
-        // order may decide qualification.
+        // Attestation-array order must not determine qualification.
+        // Attestation-array order must not determine qualification.
         const attemptEntry = (sha256: string, attempt: string) =>
             matchingAttestation({
                 artifactSha256: sha256,
@@ -836,8 +804,7 @@ describe("installed release evidence", () => {
                     expectedHeadSha: "a".repeat(40),
                 }),
             ).not.toThrow();
-            // Candidates are tried in attempt order, so the failed attempt 1 is
-            // rejected and attempt 2 carries the release.
+            // Attempt 1 is rejected; attempt 2 qualifies the release.
             expect(runChecks).toEqual(["1", "2"]);
         }
     });
@@ -855,8 +822,6 @@ describe("installed release evidence", () => {
             run_attempt: 2,
             ...overrides,
         });
-        // Observed responses return the bare path; GitHub's documented example
-        // for a run attempt appends the ref. Both denote the same workflow.
         expect(
             workflowRunAttemptMatchesSource(observed(source.workflow), source, "2"),
         ).toBe(true);
@@ -870,7 +835,7 @@ describe("installed release evidence", () => {
         expect(
             workflowRunAttemptMatchesSource(observed(`${source.workflow}@main`), source, "2"),
         ).toBe(true);
-        // The ref is dropped, never the rest of the claim.
+        // Verification drops the malformed ref, not the claim.
         expect(
             workflowRunAttemptMatchesSource(
                 observed(".github/workflows/untrusted.yml@main"),
@@ -1040,9 +1005,7 @@ describe("installed release evidence", () => {
     ])("%s proof is required for GA", (_name, mutate) => {
         const evidence = qualifiedEvidence();
         mutate(evidence);
-        // The schema gate rejects a failed proof before any artifact is read, so
-        // this asserts against the schema entry point rather than staging
-        // artifacts and stubs that would never be consulted.
+        // The schema gate rejects failed proofs before reading artifacts.
         expect(() => validateInstalledReleaseEvidence(evidence)).toThrow(
             /qualified evidence contains a failed proof or blocker|payloads_before_parents/,
         );
@@ -1053,8 +1016,6 @@ describe("installed release evidence", () => {
         const evidence = qualifiedEvidence();
         installReleaseArtifacts(root, evidence);
         installProofArtifacts(root, evidence);
-        // Every artifact and stub still verifies; only the workflow the evidence
-        // claims to have run under is absent from this checkout.
         rmSync(join(root, QUALIFICATION_WORKFLOW_PATH));
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, fullStubs()),
@@ -1140,17 +1101,8 @@ describe("installed release evidence", () => {
             payload_index_sha256: "release/mc-host-payload-index.json",
             stop_provenance_sha256: "release/mc-host-n-minus-one-stop.json",
         } as const;
-        // Each case rewrites one cited artifact into its committed fail-closed
-        // shape. The evidence still claims `qualified: true` with passing,
-        // attested proofs, so only parsing the artifact's own claim can catch it.
-        // Each case rewrites one cited artifact and re-derives its digest, so the
-        // evidence stays byte-consistent with what it cites.
         const cases: [string, string, (parsed: Record<string, unknown>) => void, RegExp][] = [
             [
-                // The qualification run's own contents are validated by its full
-                // consumer, which this test stubs; only the citation this gate owns
-                // is checked here — that the evidence and the run name the *same*
-                // contract, not merely that each is current on its own.
                 "qualification from another release contract",
                 files.qualification_sha256,
                 (parsed) => {
@@ -1221,8 +1173,8 @@ describe("installed release evidence", () => {
                     ),
                 label,
             ).toThrow(pattern);
-            // Schema-only verification still accepts it: the artifacts are only
-            // required to be qualified when the evidence is gating GA.
+            // Schema-only verification does not require proof artifacts; GA qualification does.
+            // Schema-only verification does not require proof artifacts; GA qualification does.
             expect(() =>
                 validateInstalledReleaseEvidenceAgainstArtifacts(
                     root,
@@ -1242,8 +1194,8 @@ describe("installed release evidence", () => {
             ...contract.packages.parents,
             ...contract.packages.payloads,
         ].map((name) => packages.find((entry) => entry.name === name));
-        // The published order regressed to parents-first, but the boolean and
-        // the publication proof that echoes it still say otherwise.
+        // The package-order flag and publication proof must match the published order.
+        // The package-order flag and publication proof must match the published order.
         expect((evidence.publication as { payloads_before_parents: boolean })
             .payloads_before_parents).toBe(true);
         expect(() => validateInstalledReleaseEvidence(evidence)).toThrow(
@@ -1256,9 +1208,8 @@ describe("installed release evidence", () => {
         const evidence = qualifiedEvidence();
         installReleaseArtifacts(root, evidence);
         installProofArtifacts(root, evidence);
-        // Swapping only the recorded digest proves the comparison has two
-        // independent sides; reading the expected value back out of the proof
-        // made this substitution invisible.
+        // The target proof must match the digest recorded in `evidence.targets`.
+        // The target proof must match the digest recorded in `evidence.targets`.
         (evidence.targets as { test_report_sha256: string }[])[0].test_report_sha256 =
             sha256Hex("a different test report");
         expect(() =>
@@ -1275,9 +1226,9 @@ describe("installed release evidence", () => {
             payload_index_sha256: "release/mc-host-payload-index.json",
             stop_provenance_sha256: "release/mc-host-n-minus-one-stop.json",
         } as const;
-        // No proof kind covers stop provenance, so a digest match was the only
-        // thing between qualified evidence and a stop record granting no usable
-        // authority. Each replacement is byte-consistent with its digest.
+        // A digest match alone must not grant usable stop authority.
+        // A digest match alone must not grant usable stop authority.
+        // Each forged replacement matches its recorded digest.
         const cases: [string, unknown, RegExp][] = [
             ["unknown tag", { tag: "whatever" }, /unknown stop-provenance tag/],
             [
@@ -1295,10 +1246,10 @@ describe("installed release evidence", () => {
                 /forbidden field predecessor_release_version/,
             ],
             [
-                // Schema-valid in every respect, including a `predecessor_manifest`
-                // that really does hash to its cited digest — so only the ancestry
-                // rules reject it. This is what schema-level validation alone
-                // accepted: an unauthorized grant of legacy stop authority.
+                // Schema validation accepts a digest-valid `predecessor_manifest` even when ancestry rules reject it.
+                // Schema validation accepts a digest-valid `predecessor_manifest` even when ancestry rules reject it.
+                // Schema validation accepts a digest-valid `predecessor_manifest` even when ancestry rules reject it.
+                // Schema validation accepts a digest-valid `predecessor_manifest` even when ancestry rules reject it.
                 "a fully well-formed predecessor grant",
                 (() => {
                     const contract = buildContract();
@@ -1361,19 +1312,15 @@ describe("installed release evidence", () => {
         installReleaseArtifacts(root, evidence);
         installProofArtifacts(root, evidence);
         rmSync(join(root, QUALIFICATION_WORKFLOW_PATH));
-        // No `verifyAttestation` stub, so the real `gh` path is selected and the
-        // pinned signer identity has to be satisfiable. Until the lane exists it
-        // is not, and the failure must say so rather than reporting six proofs
-        // as unattested. Qualification is stubbed to isolate the attestation
-        // preconditions; the assertion below covers the unstubbed default.
+        // Without `verifyAttestation`, verification uses the real `gh` path.
+        // Tests stub qualification to isolate attestation verification.
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 requireQualification: () => stubQualification(),
                 expectedHeadSha: "a".repeat(40),
             }),
         ).toThrow(/qualification workflow .* does not exist/);
-        // With the workflow present, exact source-digest verification proceeds
-        // to the attestation lookup rather than requiring a mutable source ref.
+        // With the workflow present, verification looks up attestations by exact source digest.
         const workflow = ".github/workflows/mc-host-release-qualification.yml";
         mkdirSync(dirname(join(root, workflow)), { recursive: true });
         writeFileSync(join(root, workflow), "name: placeholder\n");
@@ -1383,15 +1330,12 @@ describe("installed release evidence", () => {
                 expectedHeadSha: "a".repeat(40),
             }),
         ).toThrow(/lacks a valid attestation/);
-        // Unstubbed, the real production-input qualification consumer runs and its
-        // rejection surfaces — proof that GA delegates to the full validator
-        // rather than to the summary fields this file used to check.
+        // Without a qualification stub, GA invokes the production-input validator.
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 expectedHeadSha: "a".repeat(40),
             }),
         ).toThrow(/qualification evidence rejected/);
-        // Both stubs bypass it: the preconditions are about the `gh` path.
         expect(() =>
             validateInstalledReleaseEvidenceAgainstArtifacts(root, evidence, true, {
                 ...fullStubs(),
@@ -1404,10 +1348,9 @@ describe("installed release evidence", () => {
         const evidence = qualifiedEvidence();
         installReleaseArtifacts(root, evidence);
         installProofArtifacts(root, evidence);
-        // Rewrite one flow proof so it reports the same three passing booleans
-        // against a different artifact — the source-checkout / stale-install case.
-        // The proof stays byte-consistent with its recorded digest, so only the
-        // integrity binding can reject it.
+        // A product-flow proof must bind the published artifact's integrity digest.
+        // The proof's package_integrity differs from the published artifact's integrity digest.
+        // The integrity binding must reject a proof whose bytes match its recorded digest but whose artifact digest differs.
         const proofs = evidence.proof_artifacts as {
             kind: string;
             path: string;
@@ -1428,10 +1371,10 @@ describe("installed release evidence", () => {
     });
 
     test("qualified evidence cannot leave a report digest unrecorded", () => {
-        // `null` is the fail-closed template's value. Left in qualified evidence
-        // the proof simply echoes it back and agrees, so the lane is authorized
-        // without naming any report — the binding would look present and enforce
-        // nothing. A placeholder digest is the same hole with extra steps.
+        // `null` marks an unrecorded report digest.
+        // Matching `null` values do not bind a proof to a report.
+        // The binding must reject a proof that names no report.
+        // A placeholder digest binds no report, so qualified evidence must reject it.
         for (const [label, mutate, pattern] of [
             [
                 "null synapse report",
@@ -1464,8 +1407,7 @@ describe("installed release evidence", () => {
                 label,
             ).toThrow(pattern);
         }
-        // Unqualified evidence may still carry `null`: that is the template's own
-        // shape, and `--write-template` must keep producing it.
+        // Unqualified template evidence may retain `null`.
         const template = qualifiedEvidence();
         template.qualified = false;
         template.blockers = ["target smoke has not run"];

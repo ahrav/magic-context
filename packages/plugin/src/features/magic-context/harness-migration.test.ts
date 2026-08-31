@@ -1,14 +1,9 @@
-/// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createDirectTestDatabase } from "./test-database";
 
 /**
- * Phase 2a regression: every session-scoped table must carry a `harness`
- * column so OpenCode and Pi can share `~/.local/share/cortexkit/magic-context/`
- * without conflating their session state. This test verifies that every
- * session-scoped table in the direct format has the expected column default.
  */
 
 const SESSION_SCOPED_TABLES = [
@@ -40,7 +35,7 @@ describe("harness column", () => {
             }>;
             const harness = cols.find((c) => c.name === "harness");
             expect(harness, `${table} should have harness column`).toBeDefined();
-            // Stored DEFAULT in sqlite_master includes literal quotes.
+            // PRAGMA table_info returns quoted string defaults.
             expect(harness?.dflt_value).toBe("'opencode'");
             expect(harness?.notnull).toBe(1);
         }

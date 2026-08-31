@@ -1,16 +1,11 @@
 /**
- * Canonical Dreamer v2 task registry (pure — no DB imports, so the config schema
- * can import the task names without pulling runtime code).
+ * This module has no DB imports, so the config schema can import these task names.
  *
- * v2 promotes the former post-phases (review-user-memories, key-files,
- * evaluate-smart-notes) to first-class scheduled tasks alongside the agentic
- * maintenance tasks, and assigns each a LEASE DOMAIN so disjoint-state tasks run
- * concurrently while memory-mutating tasks serialize. See lease.ts + the A+B spec.
+ * Disjoint-state tasks use separate lease domains; memory-mutating tasks share a lease and serialize.
  */
 
 export const CANONICAL_DREAM_TASKS = [
-    // map-memories runs BEFORE verify (it records the file mappings verify gates
-    // on) and shares the memory lease, so it leads the canonical order.
+    // `map-memories` precedes `verify` because it records the file mappings that `verify` gates on.
     "map-memories",
     "verify",
     "verify-broad",
@@ -27,18 +22,18 @@ export const CANONICAL_DREAM_TASKS = [
 
 export type DreamTaskName = (typeof CANONICAL_DREAM_TASKS)[number];
 
-/** Cheap, read-only work counts for one Dreamer task. */
+/* */
 export interface DreamTaskBacklog {
-    /** Items selected by the task's current backlog predicate. */
+    /** `pending` counts items that the task's current backlog predicate selects. */
     pending: number;
-    /** Total items in the task's candidate pool. */
+    /** `total` counts every item in the task's candidate pool. */
     total: number;
 }
 
-/** Backlog counts keyed by canonical task name. */
+/* */
 export type DreamTaskBacklogMap = Partial<Record<DreamTaskName, DreamTaskBacklog>>;
 
-/** Stable human-readable rendering shared by /ctx-dream and status surfaces. */
+/* */
 export function formatDreamTaskBacklogs(
     backlogs: DreamTaskBacklogMap,
     tasks: readonly DreamTaskName[] = CANONICAL_DREAM_TASKS,
@@ -52,7 +47,7 @@ export function formatDreamTaskBacklogs(
         .join("\n");
 }
 
-/** Process-local progress for the task currently applying a run chunk. */
+/* */
 export interface DreamTaskProgress {
     task: DreamTaskName;
     processed: number;
@@ -60,7 +55,7 @@ export interface DreamTaskProgress {
     startedAt: number;
 }
 
-/** Persisted per-task run counts used by dream-run history and summaries. */
+/* */
 export interface DreamTaskRunBacklog {
     pendingAtStart: number;
     totalAtStart: number;
@@ -69,25 +64,22 @@ export interface DreamTaskRunBacklog {
     processed: number;
 }
 
-/** Use the decrease in the persisted backlog between the start and end snapshots as the per-run progress count, clamped to zero when the backlog does not decrease. */
+/* */
 export function processedDreamTaskItems(startPending: number, endPending: number): number {
     return Math.max(0, startPending - endPending);
 }
 
 /**
- * The agentic tasks — those run as a generic dreamer agent session driven by
- * `buildDreamTaskPrompt`. The other canonical tasks (map-memories, verify,
- * verify-broad, classify-memories, review-user-memories, evaluate-smart-notes,
- * primers, retrospective) have their own specialized runners and do NOT go
- * through the prompt builder.
+ * `curate` and `maintain-docs` run generic dreamer agent sessions through `buildDreamTaskPrompt`.
+ * Specialized runners handle every other canonical task.
  */
 export const AGENTIC_DREAM_TASKS = ["curate", "maintain-docs"] as const;
 
 /**
- * Tasks that read-modify-write the project `memories` table (+ epoch +
- * supersede-delta rows). They SHARE one per-project "memory" lease so they
- * serialize with each other — concurrent runs race semantically (stale-view
- * merges/splits). Canonical run order when several are due in one drain.
+ * `MEMORY_DOMAIN_TASKS` contains tasks that read-modify-write `memories`, epoch, or supersede-delta rows.
+ * `MEMORY_DOMAIN_TASKS` share one per-project `memory` lease.
+ * Concurrent memory-domain runs can race on stale views.
+ * `MEMORY_DOMAIN_TASKS` defines the run order when several tasks are due in one drain.
  */
 export const MEMORY_DOMAIN_TASKS: readonly DreamTaskName[] = [
     "map-memories",
@@ -104,9 +96,9 @@ export const MEMORY_DOMAIN_TASKS: readonly DreamTaskName[] = [
 const MEMORY_DOMAIN_SET = new Set<DreamTaskName>(MEMORY_DOMAIN_TASKS);
 
 /**
- * Lease KIND per task. `memory` + the three independent kinds are per-project;
- * `user-memories` is GLOBAL (mutates the cross-project user-profile pool, so two
- * different projects' dreamers must not review concurrently).
+ * `memory`, `maintain-docs`, and `evaluate-smart-notes` leases are per-project; `user-memories` is global.
+ * `user-memories` uses a global lease because it mutates the cross-project user-profile pool.
+ * `review-user-memories` runs from different projects must not run concurrently.
  */
 export type LeaseKind = "memory" | "maintain-docs" | "evaluate-smart-notes" | "user-memories";
 
@@ -123,15 +115,11 @@ export function leaseKindFor(task: DreamTaskName): LeaseKind {
         case "evaluate-smart-notes":
             return "evaluate-smart-notes";
         default:
-            // Memory-domain tasks already returned above; this is unreachable.
             return "memory";
     }
 }
 
 /**
- * Resolve the concrete lease key for a task in a project. The global
- * `user-memories` lease is NOT project-scoped (one reviewer across all projects);
- * every other domain is keyed by project so different projects never block.
  */
 export function leaseKeyFor(task: DreamTaskName, projectIdentity: string): string {
     const kind = leaseKindFor(task);
@@ -143,8 +131,6 @@ export function isCanonicalDreamTask(value: string): value is DreamTaskName {
 }
 
 /**
- * Stable canonical ordering used when multiple due tasks share a lease domain
- * (preserves the suite order for the memory domain).
  */
 export function compareTaskOrder(a: DreamTaskName, b: DreamTaskName): number {
     return CANONICAL_DREAM_TASKS.indexOf(a) - CANONICAL_DREAM_TASKS.indexOf(b);

@@ -251,7 +251,7 @@ fn valid_interrupted_reset_marker_resumes_without_opening_old_family() {
     let dir = tempfile::tempdir().unwrap();
     // Quarantine resume compares paths lexically. A symlinked root
     // (`/var` -> `/private/var`) fails that comparison when spellings are mixed.
-    // commentlint: allow(JUDGE)
+    //
     let root = dir.path().canonicalize().unwrap();
     let conn = seed_kernel(&root);
     conn.execute_batch("CREATE TABLE unexpected(value INTEGER) STRICT;")
@@ -345,8 +345,10 @@ fn kernel_with_uncheckpointed_wal_opens_and_preserves_rows() {
     let conn = Connection::open(core_path(dir.path())).unwrap();
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.execute(
-        "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
-         VALUES('t1',1,1,'actor','cause')",
+        "INSERT INTO commit_log(
+             transaction_id,writer_epoch,producer,operation_key,request_digest,
+             recorded_at,actor,cause
+         ) VALUES('t1',1,'fixture','t1','',1,'actor','cause')",
         [],
     )
     .unwrap();

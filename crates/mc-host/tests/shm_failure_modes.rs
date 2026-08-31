@@ -181,7 +181,7 @@ async fn connect_after_reclamation(path: &Path) -> Client {
 }
 
 /// Waits for `host` to dispatch before killing, so the `active` case cannot
-/// degrade into an idle disconnect. commentlint: allow(JUDGE)
+/// degrade into an idle disconnect.
 async fn crash_victim(host: &TestHost, role: &str) {
     let dispatched_before = host.handler.dispatch_count();
     let victim = Victim::spawn(&host.publication_path(), role);
@@ -226,7 +226,7 @@ async fn repeated_crashes_do_not_ratchet_single_connection_capacity() {
     let _serial = serial_failure_test().await;
     let host = TestHost::start_with(|config| config.limits.max_connections = 1).await;
     // The test records the baseline after one crash cycle so first-cycle setup
-    // does not affect a measured cycle. commentlint: allow(JUDGE)
+    // does not affect a measured cycle.
     crash_victim(&host, "active").await;
     connect_after_reclamation(&host.publication_path())
         .await
@@ -240,7 +240,7 @@ async fn repeated_crashes_do_not_ratchet_single_connection_capacity() {
         let probe = connect_after_reclamation(&host.publication_path()).await;
         probe.close().await.unwrap();
         // Readmission alone would still pass while descriptors, mappings, or
-        // threads ratchet on every kill. commentlint: allow(JUDGE)
+        // threads ratchet on every kill.
         support::process_resources::await_envelope(
             std::process::id(),
             baseline,
@@ -305,7 +305,7 @@ async fn daemon_restart_discards_old_rings_and_accepts_fresh_client() {
     let body = support::mode_body(serde_json::json!({"mode": "echo"}));
     let publication;
     // Keep the stale client connected: connection cleanup would reclaim its
-    // ring before restart. commentlint: allow(JUDGE)
+    // ring before restart.
     let (stale, stale_route) = {
         let host = support::echo_host::InProcessHost::start(data_root.path());
         publication = host.publication.clone();
@@ -331,7 +331,7 @@ async fn daemon_restart_discards_old_rings_and_accepts_fresh_client() {
 
     let fresh = connect_after_reclamation(&publication).await;
     // A successor that republished the predecessor's identity would hand this
-    // client the discarded generation. commentlint: allow(JUDGE)
+    // client the discarded generation.
     assert_ne!(
         stale_daemon,
         fresh.daemon_id(),

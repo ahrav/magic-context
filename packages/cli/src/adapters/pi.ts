@@ -130,10 +130,6 @@ export class PiAdapter implements HarnessAdapter {
     }
 
     getPluginCacheInfo(): PluginCacheInfo {
-        // Pi doesn't have a separate user-level plugin cache the way OpenCode
-        // does — it shells out to npm at install time. Reporting as "no cache"
-        // means doctor --clear will skip Pi cleanup, which is the correct
-        // behavior since there's nothing for us to safely clear.
         return { path: null, exists: false, sizeBytes: 0 };
     }
 
@@ -142,22 +138,18 @@ export class PiAdapter implements HarnessAdapter {
     }
 
     getInstalledPluginVersion(): string | null {
-        // Try to ask Pi for the package version.
         const piBin = detectPiBinary();
         if (!piBin) return null;
         try {
             const output = runPiCommand(piBin.path, ["list"], 5000);
             if (output === null) return null;
-            // Pi's `list` output line shape varies; look for our package name
-            // followed by a version number. Conservative — return null on
-            // parse failure rather than risk wrong output.
+            // `getInstalledPluginVersion` returns `null` on parse failure to avoid reporting an incorrect version.
             const re = new RegExp(
                 `${PLUGIN_NAME.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}.*?(\\d+\\.\\d+\\.\\d+(?:[-+][\\w.-]+)?)`,
             );
             const match = re.exec(output);
             if (match) return match[1] ?? null;
         } catch {
-            // Pi binary might not support `list`, or call timed out.
         }
         return null;
     }
@@ -174,8 +166,6 @@ function readPiSettings(): PiSettingsLike | null {
 }
 
 function readPiSettingsForUpdate(): PiSettingsLike {
-    // Missing settings may be created, but malformed settings must propagate to
-    // mutation callers so they can abort without replacing user data.
     return readJsoncConfigForUpdate(getPiUserExtensionsPath()) as PiSettingsLike;
 }
 

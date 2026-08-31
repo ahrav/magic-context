@@ -1,28 +1,23 @@
 /**
- * Source-inventory scanning and committed verifier-evidence normalization (U3).
  *
- * Three responsibilities, all fail-closed:
  *
- * 1. Normalize the two committed mutation-artifact shapes (`mutations[].name`
- *    and `mutation_records[].id`) into one evidence view without rewriting the
- *    raw artifacts, link every record to the verifier it challenged, and
- *    derive the accepted 20-artifact/27-record snapshot from a live file scan.
- * 2. Scan the named incident sources (audit A/G headings and embedded claims,
- *    parity H2 claims, the thinking-block adjudication, the Pi declared-red
- *    synthesis suite, and the bead-recorded provenance mismatches) into stable
- *    source-item/source-claim identities with content digests, and compare
- *    them one-to-one with the committed inventory.
- * 3. Enforce the ownership matrix: every executable claim is owned by an
- *    executable catalog variant whose driver/verifier binding names a scenario
- *    module — `live` bindings must resolve to real exports, `declared`
- *    bindings must name a module that does not exist yet (landing the module
- *    forces the flip to `live`), and a bare Bun test can never satisfy a
+ * The scanner normalizes `mutations[].name` and `mutation_records[].id` into one evidence view.
+ * The scanner preserves the raw mutation artifacts.
+ * Each mutation record identifies the verifier it challenged.
+ * The live scan must produce exactly 20 artifacts and 27 records.
+ * The scanner extracts stable source-item and source-claim identities from the named incident sources.
+ * Each extracted source item and claim includes a content digest.
+ * Each extracted source identity must match exactly one committed inventory entry.
+ * Each executable claim must be owned by an executable catalog variant.
+ * Each driver/verifier binding must name a scenario module.
+ * A `live` binding must resolve to a real scenario-module export.
+ * A `declared` binding must name a scenario module that does not exist.
+ * A bare Bun test cannot satisfy a driver/verifier binding.
  *    binding.
  *
- * A verifier change gates on mutation replay (R14): `changedVerifiers` names
- * the verifiers whose bytes drifted, `mutationRecordsBoundTo` yields the
- * records to replay serially, and `assertMutationReplayResults` fails unless
- * every bound crafted mutation still produced the expected red result.
+ * A verifier change gates on mutation replay:
+ * `mutationRecordsBoundTo` returns the records bound to verifiers whose bytes changed.
+ * The replay runner processes records from `mutationRecordsBoundTo` serially, and `assertMutationReplayResults` fails unless every replayed mutation produces the expected red result.
  */
 
 import { createHash } from "node:crypto";
@@ -56,9 +51,9 @@ export const PI_TODO_SOURCE_PATH =
     "packages/e2e-tests/incidents/pi-todo-provenance.md";
 export const BEAD_SOURCE_PATH = "bead:magic-context-x4l.9";
 
-/** Task-level provenance-mismatch wording recorded from `magic-context-x4l.9`;
- *  neither claim has a demonstrated incident in the named sources, so both are
- *  `unsupported` adjudication-only inventory (AE3). */
+/** Provenance-mismatch wording:
+ * `WRONG_DREAMER_ARCHIVAL_WORDING` and `HISTORIAN_INCONSISTENT_STATE_WORDING` lack demonstrated incidents in the named sources.
+ * Both constants are `unsupported` adjudication-only inventory. */
 export const WRONG_DREAMER_ARCHIVAL_WORDING =
     "wrong Dreamer archival: bead wording and verify-prompt.ts risk language allege the Dreamer archives the wrong memory, with no demonstrated incident in the named sources";
 export const HISTORIAN_INCONSISTENT_STATE_WORDING =
@@ -76,24 +71,23 @@ export function slugify(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Mutation evidence normalization (R11, KTD5).
 // ---------------------------------------------------------------------------
 
 export interface MutationEvidenceRecord {
-    /** Normalized unique evidence id (`ev-<slug>`). */
+    /** `evidenceId` uses the normalized `ev-<slug>` format. */
     evidenceId: string;
-    /** Matching inventory claim id (`claim-mutation-<slug>`). */
+    /** `claimId` uses the matching `claim-mutation-<slug>` format. */
     claimId: string;
-    /** Artifact path relative to the e2e package root. */
+    /** `artifactPath` is relative to the e2e package root. */
     artifactPath: string;
-    /** The raw `mutations[].name` or `mutation_records[].id` value. */
+    /** `rawName` preserves the raw `mutations[].name` or `mutation_records[].id` value. */
     rawName: string;
     shape: "mutations" | "mutation_records";
-    /** Repo-relative path of the verifier this mutation challenged. */
+    /** `verifierPath` is the repo-relative path of the challenged verifier. */
     verifierPath: string;
-    /** Committed replay command for the R14 contributor gate. */
+    /** `replayCommand` is the committed command that replays this mutation. */
     replayCommand: string;
-    /** Digest of the raw record object, for drift detection. */
+    /** `recordDigest` detects drift in the raw record object. */
     recordDigest: string;
 }
 
@@ -106,7 +100,7 @@ export interface MutationEvidenceArtifact {
 export interface EvidenceView {
     artifacts: MutationEvidenceArtifact[];
     records: MutationEvidenceRecord[];
-    /** Repo-relative verifier path -> sha256 of its current bytes. */
+    /** `verifierDigests` maps each repo-relative verifier path to the SHA-256 digest of its current bytes. */
     verifierDigests: Record<string, string>;
 }
 
@@ -130,21 +124,18 @@ function requireString(value: unknown, label: string): string {
 }
 
 const E2E_TEST_PATH_RE = /(?:^|[\s'"])((?:tests|scripts)\/[\w./-]+\.ts)/;
-/** `--test <target>` names an integration target, which cargo resolves to
+/** `cargo test -p <crate> --test <target>` resolves to `<crate>/tests/<target>.rs`.
  *  `<crate>/tests/<target>.rs`. */
 const CARGO_INTEGRATION_RE = /cargo test -p ([\w-]+) --test ([\w-]+)/;
-/** `--lib <module>::…::<test>` names a test inside an inline `#[cfg(test)]`
- *  module, so the verifier is the module's own source file. */
+/** `cargo test -p <crate> --lib <module>::…::<test>` resolves to the source file for `<module>`.
+ * */
 const CARGO_UNIT_RE = /cargo test -p ([\w-]+) --lib ([\w:]+)/;
-/** A `src/`-rooted TS test path, recorded relative to its own package root. */
+/* */
 const PACKAGE_SRC_TEST_PATH_RE = /(?:^|[\s'"])(src\/[\w./-]+\.test\.ts)/;
 
-/** Resolve the verifier a `mutations[]`-shaped record challenged from the
- *  artifact's committed run command. Rust verifiers resolve through cargo's
- *  target layout; every resolved path is then required to exist by
- *  `buildEvidenceView`, so an unhandled layout (a `mod.rs` directory module,
- *  say) fails loudly on the missing verifier rather than resolving to a
- *  plausible-looking wrong file. */
+/**
+ * Rust verifier paths follow Cargo's target layout.
+ * */
 function verifierFromCommand(
     repoRoot: string,
     command: string,
@@ -159,8 +150,7 @@ function verifierFromCommand(
     }
     const unit = command.match(CARGO_UNIT_RE);
     if (unit) {
-        // Drop the test function, then the conventional `tests` module that
-        // wraps it, leaving the module path the source file is named after.
+        // verifierFromCommand removes the test function and trailing `tests` module because the remaining module path names the source file.
         const segments = unit[2].split("::");
         segments.pop();
         if (segments.at(-1) === "tests") segments.pop();
@@ -170,10 +160,8 @@ function verifierFromCommand(
     }
     const match = command.match(E2E_TEST_PATH_RE);
     if (match) return `packages/e2e-tests/${match[1]}`;
-    // A `src/`-relative path was recorded from the owning package's directory,
-    // which the command itself does not name. Resolve it against every package
-    // and require exactly one hit, so an ambiguous path fails closed instead of
-    // silently attributing the mutation to whichever package sorts first.
+    // The resolver checks every package because a `src/`-relative command path does not name its owning package.
+    // Ambiguous package-relative paths fail instead of selecting the first package.
     const packageRelative = command.match(PACKAGE_SRC_TEST_PATH_RE);
     if (packageRelative) {
         const hits = readdirSync(resolve(repoRoot, "packages"))
@@ -191,9 +179,8 @@ function verifierFromCommand(
     );
 }
 
-/** Resolve the verifier a `mutation_records[]`-shaped record challenged: the
- *  candidate test file (from the reverted-rerun command) that contains the
- *  record's `must_fail` test id. */
+/**
+ * */
 function verifierFromMustFail(
     repoRoot: string,
     rerunCommand: string,
@@ -246,12 +233,6 @@ export function loadMutationEvidence(
         let declaredRecords = 0;
         if (Array.isArray(raw.mutations)) {
             declaredRecords = raw.mutations.length;
-            // A deferred record states that no mutation was applied and names
-            // the reason, so it binds no verifier and carries no replay. It is
-            // not evidence and must not become an evidence record. Tolerating it
-            // is gated on the matrix still being unresolved, checked per record
-            // below. An artifact whose every record is deferred therefore has no
-            // run command to require.
             const proven = raw.mutations.filter(
                 (rawRecord) =>
                     !isRecord(rawRecord) || rawRecord.status !== "deferred",
@@ -322,9 +303,6 @@ export function loadMutationEvidence(
             );
         }
 
-        // Counted on what the artifact DECLARED, not on what survived: an
-        // all-deferred artifact contributes no evidence yet is still a
-        // well-formed record of why, while an artifact declaring nothing at all
         // is malformed.
         if (declaredRecords === 0)
             throw new Error(
@@ -362,9 +340,8 @@ export function loadMutationEvidence(
     return { artifacts, records, verifierDigests };
 }
 
-/** Assert the accepted mutation snapshot (R11): 20 JSON artifacts, 27 records.
- *  The seven `shm-hardening-*` drills raised both counts; the all-deferred
- *  drill contributes an artifact but no record. */
+/**
+ * */
 export function assertEvidenceSnapshot(view: EvidenceView): void {
     if (view.artifacts.length !== EXPECTED_MUTATION_ARTIFACTS) {
         throw new Error(
@@ -379,7 +356,6 @@ export function assertEvidenceSnapshot(view: EvidenceView): void {
 }
 
 // ---------------------------------------------------------------------------
-// Source scanning (R1): stable item/claim identities plus content digests.
 // ---------------------------------------------------------------------------
 
 export interface ScannedClaim {
@@ -397,8 +373,8 @@ export interface ScannedItem {
 const AUDIT_HEADING_RE = /^#{2,3} (A\d+b?|G\d+)[.:] /;
 const ANY_HEADING_RE = /^#{2,3} /;
 
-/** One claim per A/G heading, embedded `> **...**` note, and deferred-fix
- *  bullet, in document order, digesting each claim's own text block. */
+/**
+ * */
 export function scanAuditClaims(text: string): ScannedClaim[] {
     const lines = text.split("\n");
     const claims: Array<{ line: number; claim: ScannedClaim }> = [];
@@ -474,7 +450,7 @@ export function scanAuditClaims(text: string): ScannedClaim[] {
     return claims.map((entry) => entry.claim);
 }
 
-/** One claim per H2 verdict entry in `parity-findings-s2.md`. */
+/* */
 export function scanParityClaims(text: string): ScannedClaim[] {
     const lines = text.split("\n");
     const claims: ScannedClaim[] = [];
@@ -492,7 +468,7 @@ export function scanParityClaims(text: string): ScannedClaim[] {
     return claims;
 }
 
-/** Enumerate every named source into stable items/claims with digests. */
+/* */
 export function scanSources(
     repoRoot: string = REPO_ROOT,
     e2eRoot: string = E2E_ROOT,
@@ -513,8 +489,6 @@ export function scanSources(
             digest: sha256(auditText),
             claims: scanAuditClaims(auditText),
         },
-        // R1: AUDITOR.md is an audit guide, not a findings ledger — exactly one
-        // guide-level row and no finding claims.
         {
             id: "src-auditor-guide",
             sourcePath: AUDITOR_SOURCE_PATH,
@@ -583,7 +557,7 @@ export function scanSources(
     return items;
 }
 
-/** Compare the committed inventory with a live source scan, one-to-one. */
+/* */
 export function verifySourceCompleteness(
     inventory: SourceInventory,
     scanned: ScannedItem[],
@@ -641,8 +615,6 @@ export function verifySourceCompleteness(
 }
 
 // ---------------------------------------------------------------------------
-// Ownership matrix (U3 approach 4): every executable disposition has a
-// registry-callable owner; bindings are scenario modules, never bare tests.
 // ---------------------------------------------------------------------------
 
 const EXECUTABLE_DISPOSITIONS = new Set([
@@ -669,12 +641,7 @@ function parseBinding(
 }
 
 /**
- * Parse a scenario module once per path.
  *
- * Five modules back all 26 catalog variants and every variant checks two
- * bindings, so an unmemoized read-plus-parse repeats the same work up to ten
- * times per validation. The cache is keyed by resolved path and lives for the
- * process, which is correct here because validation reads a fixed committed tree.
  */
 const parsedModules = new Map<string, ts.SourceFile>();
 
@@ -804,7 +771,6 @@ export function verifyOwnershipMatrix(
                 claim.disposition === "unsupported" &&
                 owners.length > 0
             ) {
-                // AE3: unsupported provenance-mismatch claims stay adjudication-only.
                 throw new Error(
                     `unsupported claim ${claim.id} must not have an executable target`,
                 );
@@ -839,7 +805,7 @@ export function verifyOwnershipMatrix(
     }
 }
 
-/** Cross-check that inventory mutation claims and live evidence records agree. */
+/* */
 export function crossCheckEvidenceInventory(
     inventory: SourceInventory,
     view: EvidenceView,
@@ -872,10 +838,9 @@ export function crossCheckEvidenceInventory(
 }
 
 // ---------------------------------------------------------------------------
-// Verifier-change mutation replay gate (R14).
 // ---------------------------------------------------------------------------
 
-/** Verifier paths whose bytes drifted from the accepted digests. */
+/* */
 export function changedVerifiers(
     acceptedDigests: Record<string, string>,
     currentDigests: Record<string, string>,
@@ -901,19 +866,8 @@ export function mutationRecordsBoundTo(
 }
 
 /**
- * Repo-relative paths of the executable verifier modules the catalog binds.
  *
- * `loadMutationEvidence` derives its verifier paths from the run commands
- * recorded in mutation artifacts, which name Rust degradation/roundtrip tests
- * and standalone Bun test files. Those are the modules a crafted mutation was
- * replayed against, NOT the modules that score the pool: the drivers and
- * verifiers a variant actually executes are named by `verifier_binding`. The
- * two sets are disjoint in this tree, so a gate built only from mutation
- * evidence cannot see a change to a scoring verifier. Deriving the compared set
- * from the validated bindings is what makes the gate cover them.
  *
- * Paths are the `path` half of a `path#symbol` binding, relative to
- * `packages/e2e-tests`, and must stay confined under it.
  */
 export function boundVerifierFiles(catalog: IncidentCatalog): string[] {
     const paths = new Set<string>();
@@ -941,10 +895,6 @@ export function boundVerifierFiles(catalog: IncidentCatalog): string[] {
 }
 
 /**
- * Byte digests of the catalog's bound verifier modules, keyed by repo-relative
- * path. A binding that names a module which does not exist is a validation
- * failure here rather than a silently absent digest, which would compare equal
- * against any other tree that also lacks it.
  */
 export function boundVerifierDigests(
     catalog: IncidentCatalog,
@@ -966,10 +916,6 @@ export function boundVerifierDigests(
 }
 
 /**
- * Contributor gate: after replaying a changed verifier's bound mutations
- * serially, every bound record must have produced the expected red result.
- * `true` means the crafted invalid state was rejected (the mutated run failed
- * as committed); anything else fails the gate.
  */
 export function assertMutationReplayResults(
     view: EvidenceView,
@@ -1043,7 +989,6 @@ export function verifyProspectiveSourceEvidence(
 }
 
 // ---------------------------------------------------------------------------
-// One-stop validation for the committed repository state.
 // ---------------------------------------------------------------------------
 
 export function validateEvidenceAndSources(

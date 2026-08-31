@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";

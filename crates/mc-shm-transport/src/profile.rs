@@ -645,13 +645,13 @@ impl fmt::Display for AdmissionError {
 
 impl std::error::Error for AdmissionError {}
 
-/// Hardware profile id the host stamps into every production grant. commentlint: allow(JUDGE)
+/// Hardware profile id the host stamps into every production grant.
 pub const MC_HOST_RING_PROFILE: &str = "mc-host-test-ring-v1";
 
-/// Descriptor slots and lease bound of `MC_HOST_RING_PROFILE`. commentlint: allow(JUDGE)
+/// Descriptor slots and lease bound of `MC_HOST_RING_PROFILE`.
 pub const MC_HOST_RING_DEPTH: usize = 8;
 
-/// Geometry named by `MC_HOST_RING_PROFILE`, so a peer or harness that echoes that id exercises the depth and topology the host actually creates. commentlint: allow(JUDGE)
+/// Geometry named by `MC_HOST_RING_PROFILE`, so a peer or harness that echoes that id exercises the depth and topology the host actually creates.
 pub fn mc_host_ring_profile() -> Result<TargetProfile, ProfileError> {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(
@@ -668,7 +668,7 @@ pub fn mc_host_ring_profile() -> Result<TargetProfile, ProfileError> {
     })
 }
 
-/// Builds a generic ring profile for tests and local tools. commentlint: allow(JUDGE)
+/// Builds a generic ring profile for tests and local tools.
 pub fn ring_profile(hardware: HardwareProfileId) -> Result<TargetProfile, ProfileError> {
     TargetProfile::new(ProfileConfig {
         descriptor: TransportDescriptor::new(hardware),

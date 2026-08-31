@@ -1,18 +1,15 @@
 /**
- * Ongoing enforcement-artifact revalidation (direct claim kernel).
  *
- * ENFORCED maturity is earned by a passing evaluation of exact artifact
- * bytes; editing or deleting the recorded `canonical_path` after the fact
- * would otherwise leave the rung standing forever, because validity reads
- * only the stored `pass` result and explicit revocation events. A missing or
- * digest-drifted artifact gets a revocation event plus a policy refresh, so
- * `supportedMaturity` falls back to the revision's next supported rung. A
- * missing PROJECT ROOT is treated as "cannot judge" (checkout absent or
- * moved) and revokes nothing.
+ * ENFORCED maturity requires a passing evaluation of the artifact's exact bytes.
+ * Editing or deleting the recorded `canonical_path` requires revocation.
+ * Validity reads only stored `pass` results and explicit revocation events.
+ * A missing or digest-drifted artifact triggers revocation and a policy refresh.
+ * After revocation, `supportedMaturity` falls back to the revision's next supported rung.
+ * A missing project root revokes no artifacts.
  *
- * Revocations commit through the claim operation kernel, so each one leaves
- * a durable receipt, a lifecycle effect for the module mirror, and a policy
- * generation bump that invalidates every derived cache.
+ * The claim operation kernel commits revocations.
+ * Each revocation leaves a durable receipt and updates the module mirror lifecycle.
+ * Each revocation increments the policy generation and invalidates derived caches.
  */
 
 import { randomUUID } from "node:crypto";
@@ -29,25 +26,24 @@ import {
 } from "./storage-claim-policy";
 import { isWithin, safeRealpath, sha256FileStreaming, sha256FileSync } from "./verification-paths";
 
-/** Per-project throttle for the artifact-revalidation probe: rehashing every
- *  enforced artifact on every transform pass would put file I/O on the hot
- *  path for a condition (a deleted or edited artifact) that is rare. */
+/** The per-project throttle prevents rehashing enforced artifacts on every transform pass.
+ * Rehashing every enforced artifact on every transform pass puts file I/O on the hot path.
+ * */
 const artifactRevalidationLastRunMs = new Map<string, number>();
 const ARTIFACT_REVALIDATION_INTERVAL_MS = 5 * 60 * 1000;
-// A long-lived host cycling through many checkouts accumulates one entry per
-// identity+root pair; the map is not Database-scoped (roots outlive handles),
-// so cap it by evicting oldest-inserted entries instead.
+// A long-lived host can accumulate one throttle entry per identity-and-root pair.
+// The throttle map is process-scoped rather than Database-scoped.
+// The map evicts the least-recently-probed key when its size exceeds the entry cap.
 const ARTIFACT_REVALIDATION_THROTTLE_MAX_ENTRIES = 512;
 
-/** Test seam: clears the per-project throttle. */
+/* */
 export function __resetArtifactRevalidationThrottleForTests(): void {
     artifactRevalidationLastRunMs.clear();
 }
 
 /**
- * Re-verify that every currently valid enforcement artifact still exists on
- * disk with the recorded bytes. Throttled per identity+root; the filesystem
- * walk runs off the caller's synchronous path.
+ * The function re-verifies each currently valid enforcement artifact against its recorded bytes.
+ * The filesystem walk runs asynchronously rather than on the caller's synchronous path.
  */
 export function revalidateEnforcementArtifacts(
     db: Database,
@@ -56,20 +52,17 @@ export function revalidateEnforcementArtifacts(
     nowMs = Date.now(),
 ): void {
     if (!hasClaimPolicySchema(db)) return;
-    // Canonicalize the checkout root first: enforcement records the real
-    // root, and probing under a symlinked alias spelling would neither match
-    // the recorded rows nor share the alias's throttle window.
+    // Enforcement records canonical checkout roots.
+    // Symlink aliases resolve to the canonical root before row matching.
+    // Symlink aliases share the canonical root's throttle window.
     const canonicalRoot = safeRealpath(projectRoot);
     if (canonicalRoot === null) return;
-    // The throttle key carries the CHECKOUT root, not just the identity:
-    // worktrees and clones share one identity, artifacts are scoped by
-    // enforced_from_root, and an identity-only key would let whichever
-    // checkout runs first after each interval starve the others' probes.
+    // Worktrees and clones can share an identity while using separate artifact scopes.
+    // An identity-only throttle key would let the first checkout suppress other checkouts' probes.
     const throttleKey = `${projectIdentity}\u0000${canonicalRoot}`;
     const last = artifactRevalidationLastRunMs.get(throttleKey) ?? 0;
     if (nowMs - last < ARTIFACT_REVALIDATION_INTERVAL_MS) return;
-    // Refresh insertion order so the cap below evicts the least-recently
-    // PROBED key, then bound the map.
+    // Deleting and reinserting the throttle key makes insertion order track probe recency.
     artifactRevalidationLastRunMs.delete(throttleKey);
     artifactRevalidationLastRunMs.set(throttleKey, nowMs);
     while (artifactRevalidationLastRunMs.size > ARTIFACT_REVALIDATION_THROTTLE_MAX_ENTRIES) {
@@ -77,11 +70,10 @@ export function revalidateEnforcementArtifacts(
         if (oldest === undefined) break;
         artifactRevalidationLastRunMs.delete(oldest);
     }
-    // The filesystem walk runs OFF the caller's synchronous path AND uses
-    // asynchronous reads: the probe is invoked from the transform hot path,
-    // and a large artifact must not block the event loop even when the
-    // deferred callback runs — each read and hash yields. The throttle
-    // above already coalesces concurrent passes.
+    // The transform hot path schedules the probe asynchronously.
+    // Large artifacts must not block the event loop when the deferred callback runs.
+    // Each read and hash yields so large artifacts do not block the event loop.
+    // The throttle suppresses new probes for ARTIFACT_REVALIDATION_INTERVAL_MS after each scheduled run.
     void revalidateEnforcementArtifactsNow(db, projectIdentity, projectRoot, nowMs).catch(
         (error) => {
             log(
@@ -102,11 +94,10 @@ async function revalidateEnforcementArtifactsNow(
         .prepare("SELECT id FROM projects WHERE canonical_identity = ?")
         .get(projectIdentity) as { id: number } | null | undefined;
     if (!projectRow) return;
-    // Resolve the owning root once: per-artifact containment compares live
-    // resolved paths, a legitimately symlinked root must not itself read as
-    // an escape, and the row selection below matches the canonical spelling
-    // (what enforcement records) alongside the lexical one (legacy rows).
-    // An unresolvable root leaves nothing to validate.
+    // The resolved project root keeps containment checks on resolved paths.
+    // Resolved containment permits a symlinked project root.
+    // The query matches resolved and lexical root spellings.
+    // Legacy rows use the lexical root spelling.
     let rootReal: string;
     try {
         rootReal = await realpath(projectRoot);
@@ -115,10 +106,9 @@ async function revalidateEnforcementArtifactsNow(
     }
     const artifacts = db
         .prepare(
-            // Scoped to artifacts THIS checkout enforced: clones and
-            // worktrees share the project identity, and another checkout
-            // legitimately lacks or differs at the same relative path — a
-            // NULL owning root (legacy row) is unjudgeable and skipped.
+            // The query excludes artifacts enforced from other checkouts.
+            // Clones and worktrees share project identity.
+            // Another checkout can differ at the same relative path.
             `SELECT artifact.id AS id, artifact.revision_id AS revisionId,
                     artifact.canonical_path AS canonicalPath,
                     artifact.bytes_digest AS bytesDigest,
@@ -147,9 +137,7 @@ async function revalidateEnforcementArtifactsNow(
         publicClaimId: string;
     }>;
     for (const artifact of artifacts) {
-        // canonical_path is recorded project-relative and traversal-checked
-        // at record time; re-guard here so a corrupted row cannot make the
-        // probe hash a file outside the owning root.
+        // The validator ignores canonical paths that lexically escape the owning root.
         const relative = normalize(artifact.canonicalPath);
         if (isAbsolute(relative) || relative === ".." || relative.startsWith(`..${sep}`)) {
             continue;
@@ -157,25 +145,19 @@ async function revalidateEnforcementArtifactsNow(
         const absolute = join(projectRoot, relative);
         let drifted: string | null = null;
         try {
-            // The lexical guard above cannot see symlinks: the artifact or a
-            // parent directory replaced by a link out of the owning root
-            // would pass the join and hash an external file that happens to
-            // hold the recorded bytes. Require the LIVE resolved path to
-            // stay under the resolved root before trusting any digest.
+            // Lexical checks do not detect symlinks.
+            // A symlinked artifact or parent can escape the owning root.
+            // Such a path could hash an external file with the recorded bytes.
             const live = await realpath(absolute);
             if (!isWithin(rootReal, live)) {
                 drifted = "artifact escapes the owning root";
             } else if (!statSync(live).isFile()) {
-                // A FIFO or other non-regular replacement would make the
-                // streamed read below block forever waiting for a writer —
-                // the pass would never reach the revoking transaction, and
-                // each throttle window would strand another hung stream.
+                // FIFO reads can block indefinitely, so the validator rejects non-regular files.
+                // A blocked read prevents the revoking transaction from running.
                 drifted = "artifact replaced by a non-file";
             } else {
-                // Streamed hash: reading AND hashing yield per chunk, so a
-                // large artifact never pins the event loop. ENOENT means the
-                // file is gone (a drift); any other read error is
-                // indistinguishable from transient I/O.
+                // ENOENT denotes an absent artifact, so the validator treats it as drift.
+                // The validator treats read errors other than ENOENT, EISDIR, ENOTDIR, and ELOOP as transient because their causes are unknown.
                 const digest = await sha256FileStreaming(live);
                 if (digest !== artifact.bytesDigest) drifted = "artifact bytes drifted";
             }
@@ -184,10 +166,8 @@ async function revalidateEnforcementArtifactsNow(
             if (code === "ENOENT") {
                 drifted = "artifact file missing";
             } else if (code === "EISDIR" || code === "ENOTDIR" || code === "ELOOP") {
-                // A path replaced by a directory, a parent replaced by a
-                // file, or a symlink loop is a PERMANENT type change, not
-                // transient I/O: the recorded regular file no longer exists,
-                // and skipping would keep the claim ENFORCED forever on a
+                // A path replaced by a directory, a parent replaced by a file, or a symlink loop means the recorded regular file is absent, not unreadable due to transient I/O.
+                // Revoking prevents a path-type change from leaving the claim ENFORCED.
                 // recurring error.
                 drifted = "artifact replaced by a non-file";
             } else {
@@ -197,11 +177,8 @@ async function revalidateEnforcementArtifactsNow(
         if (drifted === null) continue;
         const driftReason = drifted;
         try {
-            // One kernel operation per revocation: the nonce makes each
-            // probe's key unique (a restored artifact must be re-judged by a
-            // LATER probe, so replaying an old stored outcome would be
-            // wrong), while the in-transaction bytes and validity rechecks
-            // below keep the revocation itself idempotent.
+            // Each probe uses a unique operationKey so a restored artifact is re-judged.
+            // Replaying a prior outcome could skip revalidation after an artifact is restored.
             const operation = runClaimOperation(
                 db,
                 {
@@ -216,11 +193,7 @@ async function revalidateEnforcementArtifactsNow(
                     }),
                 },
                 (): ClaimOperationStageOutcome => {
-                    // Re-read the FILE inside the transaction too: an artifact
-                    // edited or removed and then restored to its recorded bytes
-                    // between the check above and this write must not be
-                    // permanently revoked while valid — the same
-                    // bytes-at-commit discipline the enforcement command applies
+                    // The transaction re-reads the file to avoid revoking an artifact restored to its recorded bytes.
                     // before recording.
                     try {
                         const live = realpathSync(absolute);
@@ -232,12 +205,8 @@ async function revalidateEnforcementArtifactsNow(
                             return { kind: "noop", payload: { restored: true } };
                         }
                     } catch (error) {
-                        // ENOENT/EISDIR/ENOTDIR at commit time confirm the drift
-                        // being committed (missing file or a path replaced by a
-                        // non-file) — fall through to revoke, or the permanent
-                        // type change would keep the claim ENFORCED on every
-                        // recurring probe. Anything else is indistinguishable
-                        // from transient I/O; keep the artifact and retry later.
+                        // ENOENT, EISDIR, ENOTDIR, and ELOOP permit revocation.
+                        // The validator revokes path-type changes so recurring probes cannot leave the claim ENFORCED.
                         const code = (error as { code?: string } | null)?.code;
                         if (
                             code !== "ENOENT" &&
@@ -248,10 +217,7 @@ async function revalidateEnforcementArtifactsNow(
                             return { kind: "noop", payload: { transientIo: true } };
                         }
                     }
-                    // Re-check inside the transaction: a concurrent revocation
-                    // must not be doubled. Every drifted artifact is revoked —
-                    // not only the latest — because an older still-valid pass
-                    // row becomes the support again the moment a newer one is
+                    // The validator revokes every drifted artifact because an older valid pass can support the claim after a newer pass is revoked.
                     // revoked.
                     const stillValid = db
                         .prepare(

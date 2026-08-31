@@ -1,14 +1,8 @@
 #!/usr/bin/env bun
 /**
- * Measure the agent-facing mutable-prose surface and its provider-visible schema
- * overhead. `--assert` is the deterministic CI entry point; it checks the
- * committed budget fixture and, when a light manifest is supplied, enforces the
- * recorded ceiling without inventing counts for missing light prose or adjuncts.
  *
  * Usage:
  *   bun packages/plugin/scripts/measure-agent-surface.ts
- *   bun packages/plugin/scripts/measure-agent-surface.ts --assert
- *   bun packages/plugin/scripts/measure-agent-surface.ts --assert --light-surface path.json
  */
 import { resolve } from "node:path";
 import {

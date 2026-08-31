@@ -1,28 +1,19 @@
 /**
- * Typed transactional writers and fail-closed readers for the authoritative
- * claims-and-evidence domain (migration v82): projects, episodes, source
- * spans, observations, claims, immutable claim revisions, evidence links,
- * revision-scoped conflicts, and verification events.
+ * This module provides transactional writers and fail-closed readers for the authoritative claims-and-evidence domain.
  *
- * Write protocol: every multi-row writer runs inside an immediate
- * transaction or a caller-held one, claims
- * the caller's expected current-revision pointer before inserting anything,
- * and finishes with a compare-and-swap whose change count must be exactly one.
- * A stale writer therefore rolls back its revision and evidence rows and gets
- * a recoverable `stale` outcome instead of leaving partial authoritative rows.
+ * Every multi-row writer runs in either an immediate transaction or a caller-held transaction.
+ * Each multi-row writer claims the caller's expected current-revision pointer before inserting rows.
+ * Each multi-row writer finishes with a compare-and-swap whose change count is exactly one.
+ * A stale writer rolls back its revision and evidence rows.
+ * A stale writer returns recoverable `stale` rather than leaving partial authoritative rows.
  *
- * Dependency-light on purpose: only type-only and `node:` imports, so the Node
- * SQLite smoke script can load this module under Node's type-stripping loader
- * (which cannot resolve extensionless runtime imports). That is also why the
- * small project-registry lookup is not imported from
+ * Node's type-stripping loader cannot resolve extensionless runtime imports, so runtime specifiers use `.ts`.
+ * This module keeps the project-registry lookup local to avoid a runtime dependency on `storage-project-identities.ts`.
  * `storage-project-identities.ts`.
  *
- * Transaction ownership is split in two layers: `...InCurrentTransaction`
- * primitives assume the caller already holds a write transaction and never
- * issue BEGIN/COMMIT themselves, while the standalone public writers wrap
- * them in `db.transaction(fn).immediate()` — BEGIN IMMEDIATE at the top
- * level, a stacked savepoint when the caller already holds a transaction —
- * so a nested call composes instead of failing on a nested BEGIN.
+ * Each `...InCurrentTransaction` primitive requires the caller to hold a write transaction.
+ * `...InCurrentTransaction` primitives never issue BEGIN or COMMIT.
+ * At the top level, `.immediate()` issues BEGIN IMMEDIATE; inside a transaction, it creates a stacked savepoint.
  */
 
 import { createHash } from "node:crypto";
@@ -50,7 +41,7 @@ export class ClaimGraphCorruptionError extends Error {
     }
 }
 
-/** Exact bytes-of-record hash: UTF-8 SHA-256, never the normalized memory MD5. */
+/* */
 export function sha256Utf8Hex(text: string): string {
     return createHash("sha256").update(text, "utf8").digest("hex");
 }
@@ -79,8 +70,7 @@ export function resolveProjectId(db: Database, identity: string): number | null 
     return typeof row?.project_id === "number" ? row.project_id : null;
 }
 
-// The prefix predicate mirrors `isCanonicalProjectIdentity` in
-// storage-project-identities.ts; keep the two in sync. commentlint: allow(JUDGE)
+// `assertCanonicalProjectIdentity` must match `isCanonicalProjectIdentity` in `storage-project-identities.ts`.
 function assertCanonicalProjectIdentity(canonicalIdentity: string): void {
     if (
         !(canonicalIdentity.startsWith("git:") || canonicalIdentity.startsWith("dir:")) ||
@@ -91,7 +81,7 @@ function assertCanonicalProjectIdentity(canonicalIdentity: string): void {
 }
 
 /**
- * Transaction-local `ensureProject`: requires the caller to hold a write
+ * `ensureProjectInCurrentTransaction` requires the caller to hold a write transaction.
  * transaction.
  */
 export function ensureProjectInCurrentTransaction(db: Database, canonicalIdentity: string): number {
@@ -111,8 +101,7 @@ export function ensureProjectInCurrentTransaction(db: Database, canonicalIdentit
 }
 
 /**
- * Idempotent across racing connections: a unique-key loser re-reads the
- * inserted project row.
+ * After losing a unique-key race, `ensureProject` re-reads the inserted project row.
  */
 export function ensureProject(db: Database, canonicalIdentity: string): number {
     assertCanonicalProjectIdentity(canonicalIdentity);
@@ -130,12 +119,12 @@ export function ensureProject(db: Database, canonicalIdentity: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// Evidence chain: episodes → source spans → observations
+// Evidence flows from episodes to source spans to observations.
 // ---------------------------------------------------------------------------
 
 export interface EpisodeInput {
     projectId: number;
-    /** Provenance only; never joined to session lifecycle cleanup. */
+    /** Evidence-chain rows exist only for provenance and are excluded from session lifecycle cleanup joins. */
     sourceSessionId?: string | null;
 }
 
@@ -152,7 +141,7 @@ export function createEpisode(db: Database, input: EpisodeInput): number {
 export interface SourceSpanInput {
     episodeId: number;
     sourceLocator: string;
-    /** Raw span text; only its SHA-256 is stored. */
+    /** The database stores only each raw span text's SHA-256. */
     content: string;
     startOffset: number;
     endOffset: number;
@@ -186,7 +175,7 @@ export interface ObservationInput {
     extractorVersion: string;
     extractorRunId: string;
     independenceKey: string;
-    /** Omitted means the schema's conservative `model_inference` default. */
+    /** An omitted source trust class uses the schema's conservative `model_inference` default. */
     sourceTrustClass?: SourceTrustClass;
 }
 
@@ -226,7 +215,6 @@ export function createObservation(db: Database, input: ObservationInput): number
 }
 
 // ---------------------------------------------------------------------------
-// Claims and immutable revisions
 // ---------------------------------------------------------------------------
 
 export interface ClaimEvidenceInput {
@@ -341,8 +329,8 @@ function insertRevisionWithEvidence(
 }
 
 /**
- * Applicability is written in the same transaction as the revision:
- * caller-supplied lineage when present, otherwise the `unknown` baseline
+ * Applicability rolls back with the revision transaction.
+ * The transaction writes caller-supplied lineage when present; otherwise it writes the `unknown` baseline.
  * stream.
  */
 function writeNewRevisionApplicability(
@@ -384,11 +372,11 @@ export interface CreateClaimInput {
     content: string;
     evidence: readonly ClaimEvidenceInput[];
     sourceSessionId?: string | null;
-    /** Lineage-specific applicability; omitted means the `unknown` baseline. */
+    /* */
     applicability?: RevisionApplicabilityInput;
 }
 
-/** Transaction-local `createClaim`: requires a caller-held write transaction. */
+/** `createClaimInCurrentTransaction` requires the caller to hold a write transaction. */
 export function createClaimInCurrentTransaction(
     db: Database,
     input: CreateClaimInput,
@@ -456,38 +444,35 @@ export function createClaimInCurrentTransaction(
     return { status: "applied", claimId, revisionId, revision: 1 };
 }
 
-/** Create a claim, its revision 1, and its evidence links atomically. */
+/** `createClaimInCurrentTransaction` atomically creates the claim, revision 1, and evidence links. */
 export function createClaim(db: Database, input: CreateClaimInput): ClaimWriteOutcome {
     return db.transaction(() => createClaimInCurrentTransaction(db, input)).immediate();
 }
 
 export interface AppendClaimRevisionInput {
     claimId: number;
-    /** The current revision id the caller last read; the CAS expectation. */
+    /** `expectedCurrentRevisionId` must be the revision ID the caller last read. */
     expectedCurrentRevisionId: number;
     content: string;
     evidence: readonly ClaimEvidenceInput[];
     sourceSessionId?: string | null;
-    /** Lineage-specific applicability; omitted means the `unknown` baseline. */
+    /* */
     applicability?: RevisionApplicabilityInput;
 }
 
 /**
- * Transaction-local `appendClaimRevision`: requires a caller-held write
- * transaction. The caller's expected pointer is validated before inserting a
- * revision, then advanced with a final CAS. The surrounding immediate
- * transaction provides the cross-process serialization; the pointer read is
- * the staleness check, not a row lock.
+ * appendClaimRevisionInCurrentTransaction requires a caller-held write transaction and validates expectedCurrentRevisionId before insertion.
+ * The final CAS advances the pointer after inserting the revision.
+ * The immediate transaction serializes writers across processes.
+ * The pointer read checks staleness; it does not lock the row.
  */
 export function appendClaimRevisionInCurrentTransaction(
     db: Database,
     input: AppendClaimRevisionInput,
 ): ClaimWriteOutcome {
     const now = Date.now();
-    // The immediate write lock serializes writers, so one read of the pointer
-    // is the staleness check; the closing CAS re-asserts the same predicate.
-    // The claim_id equality mirrors the composite pointer FK when foreign
-    // keys are off.
+    // The immediate transaction serializes writers; the final CAS reasserts expectedCurrentRevisionId.
+    // The claim_id predicate enforces the composite pointer foreign key when foreign keys are disabled.
     const current = db
         .prepare(
             `SELECT claims.project_id AS projectId, pointed.revision AS revision
@@ -516,10 +501,9 @@ export function appendClaimRevisionInCurrentTransaction(
     const validated = normalizeEvidence(db, current.projectId, input.evidence);
     if (!validated.ok) return { status: "invalid", reason: validated.reason };
 
-    // A pointer repointed backward by direct SQL still passes the CAS
-    // (the caller read the corrupted pointer), but the next revision
-    // number would collide with existing history. Surface that as
-    // corruption instead of a raw append-only trigger error.
+    // A backward-repointed pointer makes current.revision + 1 collide with existing history.
+    // A caller that reads a backward-repointed pointer can satisfy the CAS.
+    // The explicit check throws ClaimGraphCorruptionError before the append-only trigger rejects the insert.
     const maxRevision = db
         .prepare("SELECT MAX(revision) AS max FROM claim_revisions WHERE claim_id = ?")
         .get(input.claimId) as { max: number | null };
@@ -568,7 +552,6 @@ export function appendClaimRevision(
 }
 
 // ---------------------------------------------------------------------------
-// Conflicts and verification events
 // ---------------------------------------------------------------------------
 
 export interface ClaimConflictInput {
@@ -578,11 +561,10 @@ export interface ClaimConflictInput {
 }
 
 /**
- * Transaction-local `addClaimConflict`: requires a caller-held write
- * transaction. Contradiction is symmetric, so its endpoints are canonically
- * ordered and a reverse duplicate returns the existing row. Supersession
- * keeps the caller's direction. Distinct-claim, same-project, and
- * reverse-supersession rules are enforced by the database guards.
+ * addClaimConflict requires a caller-held write transaction.
+ * Contradiction endpoints are canonically ordered because contradiction is symmetric.
+ * A reverse duplicate contradiction returns the existing row.
+ * Supersession preserves the caller's direction; database guards require distinct claims in the same project and prohibit reverse supersession.
  */
 export function addClaimConflictInCurrentTransaction(
     db: Database,
@@ -619,7 +601,7 @@ export interface VerificationEventInput {
     verifier: string;
 }
 
-/** Append one verification event; `unverified` is the absence of events. */
+/** An unverified claim has no verification events. */
 export function addVerificationEvent(db: Database, input: VerificationEventInput): number {
     return toRowId(
         db
@@ -670,14 +652,12 @@ export interface ClaimEvidenceRecord {
 }
 
 /**
- * Supported writers never commit these shapes; only direct SQL can. Readers
- * treat all of them as corruption rather than serving unauditable claims.
  */
 export interface ClaimGraphCorruptionReport {
     nullPointerClaimIds: number[];
     evidencelessRevisionIds: number[];
-    /** Claims whose pointer targets a revision below the claim's max: a
-     * direct-SQL rollback of published history the clear-guard cannot see. */
+    /** A pointer below the maximum revision indicates a direct-SQL rollback that the clear guard cannot detect.
+     * */
     stalePointerClaimIds: number[];
 }
 
@@ -757,8 +737,7 @@ function assertRevisionsHaveEvidence(
 }
 
 export function listClaimRevisions(db: Database, claimId: number): ClaimRevisionRecord[] {
-    // Resolving through getClaimById fails closed on a null current-revision
-    // pointer even when every revision row is properly evidenced.
+    // getClaimById rejects claims with a null current_revision_id.
     const claim = getClaimById(db, claimId);
     if (!claim) return [];
     const revisions = db
@@ -774,9 +753,7 @@ export function listClaimRevisions(db: Database, claimId: number): ClaimRevision
 }
 
 /**
- * A pointer at anything but the newest revision is a direct-SQL rollback of
- * published history (the clear guard and composite FK both permit it), so
- * readers refuse to serve the claim rather than presenting stale history as
+ * A pointer below the maximum revision indicates a direct-SQL rollback.
  * current.
  */
 function assertCurrentPointerIsMaxRevision(
@@ -828,8 +805,8 @@ export function getRevisionEvidence(db: Database, revisionId: number): ClaimEvid
         )
         .all(revisionId) as ClaimEvidenceRecord[];
     if (rows.length === 0) {
-        // An existing revision with zero evidence is the corruption shape this
-        // module fails closed on; only a nonexistent revision reads as empty.
+        // The module treats an existing revision with zero evidence as corruption; only a nonexistent revision reads as empty.
+        // The module treats an existing revision with zero evidence as corruption; only a nonexistent revision reads as empty.
         const revisionExists = db
             .prepare("SELECT 1 FROM claim_revisions WHERE id = ? LIMIT 1")
             .get(revisionId);

@@ -51,7 +51,7 @@ export interface ShmFrameChannelOptions {
 // Explicit reservations have no published frame and may make one bounded capacity probe.
 const MAX_RESERVATION_BLOCK_MS = 5;
 
-/** A full ring is backpressure, so callers may retry rather than fail the route. commentlint: allow(JUDGE) */
+/** A full ring is backpressure, so callers may retry rather than fail the route. */
 function ringFullError(cause: unknown): McHostCallError {
     return new McHostCallError(
         "not_sent",
@@ -388,7 +388,7 @@ export class ShmFrameChannel implements SetupFrameChannel {
                         }
                     })
                 ) {
-                    // Readiness includes setup-socket closure. Check only after an empty drain so graceful Goodbye reaches dispatcher first. commentlint: allow(JUDGE)
+                    // Readiness includes setup-socket closure. Check only after an empty drain so graceful Goodbye reaches dispatcher first.
                     if (this.attached().peerClosed()) {
                         this.options.handlers.onClosed("eof", undefined);
                         try {

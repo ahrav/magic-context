@@ -108,9 +108,7 @@ function findUniqueCollision(
             return candidate;
         }
     }
-    // A source row can be returned by a unique index lookup only when it is the
-    // target identity itself. Treat that case as no collision so a repeated
-    // operation remains an idempotent no-op.
+    // A source row matching `fromIdentity` is not a collision.
     if (row[table.identityColumn] !== fromIdentity) return row;
     return null;
 }
@@ -150,10 +148,6 @@ function reconcileTaskScheduleCollision(db: Database, source: SqliteRow, target:
         (typeof target.last_run_at !== "number" || source.last_run_at > target.last_run_at);
     const latest = sourceIsNewer ? source : target;
 
-    // Take schedule outcome fields from the newest completed run. Merge progress
-    // independently: retrospective checks keep the furthest completed position, while
-    // an active broad verification pass keeps its earliest start. This preserves
-    // completed checks as newer than the pass watermark when identities are merged.
     db.prepare(
         `UPDATE task_schedule_state
             SET last_run_at = ?, next_due_at = ?, schedule = ?, last_status = ?,
@@ -294,8 +288,6 @@ export function mergeProjectIdentities(
     const mergedAt = options.now ?? Date.now();
     const run = db
         .transaction(() => {
-            // v22's identity-level map remains useful for legacy consumers; the row-level
-            // log below is the authoritative audit trail for this command.
             if (tableExists(db, "v22_identity_rekey_map")) {
                 db.prepare(
                     `INSERT INTO v22_identity_rekey_map (old_project_path, new_project_path, rekeyed_at)

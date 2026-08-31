@@ -176,7 +176,6 @@ describe("checkLocalEmbeddingRuntime (multi-root)", () => {
         const broken = makeRoot();
         const good = makeRoot();
         try {
-            // broken: exists but no package
             installPackage(good, true);
             const status = checkLocalEmbeddingRuntime([broken, good], "win32", "x64");
             expect(status.state).toBe("ok");
@@ -197,10 +196,6 @@ describe("checkLocalEmbeddingRuntime (multi-root)", () => {
     });
 });
 
-// Build a plugin tree where `require.resolve("onnxruntime-node")` actually
-// succeeds from the plugin dir — mirrors the real on-disk dev-path / hoisted
-// layout (a nested node_modules the package manager populated), which a
-// hardcoded path check would get wrong across layouts.
 function installResolvablePlugin(
     withPackage: boolean,
     withBinary: boolean,

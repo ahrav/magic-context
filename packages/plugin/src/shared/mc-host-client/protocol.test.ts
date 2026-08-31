@@ -61,7 +61,7 @@ function expectDecodeError(bytes: Uint8Array, code: DecodeErrorCode): void {
     expect((caught as DecodeError).code).toBe(code);
 }
 
-/** A valid 21-byte routed StreamData header for mutation-based rejection tests. */
+/** Returns a valid StreamData header. */
 function validHeaderBytes(): Uint8Array {
     return hexToBytes(
         bytesToHex(

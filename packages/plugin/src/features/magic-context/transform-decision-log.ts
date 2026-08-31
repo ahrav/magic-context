@@ -103,10 +103,8 @@ const scheduledWriteTokensBySession = new Map<string, Set<symbol>>();
 
 let writerOverrideForTests: TransformDecisionWriter | null = null;
 
-// Tests override the retention cap so the prune can be exercised with a handful
-// of rows instead of writing TRANSFORM_DECISIONS_RETENTION+ rows (each opening a
-// fresh DB connection), which timed out under CI load. The prune SQL is
-// cap-agnostic (LIMIT ?), so a small cap verifies identical behavior.
+// Tests override the retention cap to exercise pruning with few rows.
+// The prune query uses `LIMIT ?`, so a small cap exercises identical behavior.
 let retentionOverrideForTests: number | null = null;
 
 export function normalizeMaterializeReason(
@@ -125,17 +123,16 @@ export function normalizeMaterializeReason(
         return null;
     }
 
-    // OpenCode's pressure refold flips rematerialized=true without changing
-    // mustMaterialize().reason. Pi records the same path as "drift" above, but
-    // keep this fallback for cross-harness parity and future callers.
+    // OpenCode pressure refolds set rematerialized=true without changing mustMaterialize().reason.
+    // Pi records pressure refolds as "drift".
     return rematerialized ? "pressure_refold" : null;
 }
 
 /**
- * Stage one Rust pass for the assistant message that will receive its provider usage row.
- * The transform runs before that assistant exists, so binding to the newest input message
- * attributes a multi-step pass to the previous step. The ordinary OpenCode event path binds
- * this pending record to the next completed assistant id.
+ * The Rust pass stages one decision for the assistant message that receives its provider usage row.
+ * The transform runs before its assistant entry exists.
+ * Binding to the newest input message attributes a multi-step pass to the previous step.
+ * The OpenCode event path binds the pending decision to the next completed assistant ID.
  */
 export function writeRustTransformDecision(args: {
     sessionId: string;
@@ -331,15 +328,11 @@ function findNewestPiAssistantEntryIdAfter(
 ): string | null {
     if (!Array.isArray(entries)) return null;
 
-    // Bind only to an assistant entry positioned AFTER the snapshot. A pure
-    // value-skip backward scan misattributes when NO new assistant has arrived
-    // yet (the branch still ends at the snapshot): it would skip the snapshot by
-    // value and fall back to an OLDER assistant, recording THIS pass's cache
-    // decision against the wrong message. Resolve the snapshot's INDEX first, then
-    // return the first assistant after it. If the snapshot id is absent (compacted
-    // away / reordered), refuse to bind (return null) — the pending row stays for
-    // a later pass (at most one per session; overwritten by the next bust), never
-    // attaching to an older entry.
+    // A value-skip backward scan can misattribute a pass when no assistant follows the snapshot.
+    // When no new assistant arrives, skipping the snapshot by value can select an older assistant.
+    // Selecting an older assistant records the pass's cache decision against the wrong message.
+    // If compaction or reordering removes the snapshot ID, the resolver returns null without binding the pending row.
+    // At most one pending row exists per session; the next bust overwrites it.
     let startIndex = 0;
     if (snapshotNewestAssistantEntryId !== null) {
         let snapshotIndex = -1;
@@ -370,18 +363,15 @@ function writeTransformDecisionBestEffort(dbPath: string, row: TransformDecision
         const writer = writerOverrideForTests ?? writeTransformDecisionRow;
         writer(dbPath, row);
     } catch {
-        // Best-effort telemetry only. Never throw into OpenCode/Pi event or
-        // context hooks; a locked/missing DB just drops this attribution row.
+        // Telemetry failures must not throw from OpenCode/Pi event or context hooks.
+        // A locked or missing database drops the attribution row.
     }
 }
 
-// One long-lived non-blocking telemetry handle per database path. Opening a
-// connection per write costs a file open, schema read, and close on every
-// cache-affecting pass; the handle is separate from the main plugin connection
-// so busy_timeout=0 keeps telemetry writes non-blocking (a locked DB throws
-// SQLITE_BUSY immediately and the row is dropped by the best-effort caller).
-// If the DB file is ever replaced on disk, writes land on the old inode until
-// restart — acceptable for drop-on-contention telemetry.
+// Opening a connection per write incurs a file open, schema read, and close.
+// A separate telemetry handle lets `busy_timeout=0` make telemetry writes non-blocking.
+// With `busy_timeout=0`, a locked database throws `SQLITE_BUSY` immediately and drops the attribution row.
+// Replacing the DB file leaves writes on the old inode until restart.
 const telemetryDbByPath = new Map<string, Database>();
 
 function telemetryDatabase(dbPath: string): Database {
@@ -391,7 +381,7 @@ function telemetryDatabase(dbPath: string): Database {
         try {
             db.exec("PRAGMA busy_timeout=0");
         } catch (err) {
-            // The handle is not in the map yet, so nothing else closes it.
+            // No map entry references the handle before insertion, so only its creator can close it.
             closeQuietly(db);
             throw err;
         }

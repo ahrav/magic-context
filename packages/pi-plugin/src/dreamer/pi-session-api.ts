@@ -3,16 +3,7 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
 /**
- * Shared resolver for pi-coding-agent's session APIs, used by every Pi dreamer
- * provider that reads historical JSONL sessions (retrospective, refresh-primers).
  *
- * ONE resolver on purpose: the session-listing API drifted once already
- * (`SessionManager.listSessions` never existed publicly; listing is
- * `SessionManager.listAll`, and `loadEntriesFromFile` is not exported — entries
- * come from `readFileSync` + `parseSessionEntries`). When each provider carried
- * its own copy of this lookup, one copy got fixed and the other kept probing the
- * nonexistent API, so its feature silently degraded. Any future Pi API drift
- * should break exactly one resolver and one test.
  */
 export interface PiSessionApi {
 	listSessions: (sessionDir?: string) => unknown[] | Promise<unknown[]>;
@@ -102,8 +93,6 @@ export async function loadDefaultPiSessionApi(
 			"Pi session APIs unavailable: expected SessionManager.listAll on pi-coding-agent",
 		);
 	}
-	// loadEntriesFromFile is NOT part of pi-coding-agent's public API — fall back
-	// to readFileSync + parseSessionEntries (both exported).
 	const loadEntriesFromFile: PiSessionApi["loadEntriesFromFile"] =
 		mod.loadEntriesFromFile ??
 		((filePath: string) => {

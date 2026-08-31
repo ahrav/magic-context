@@ -1,27 +1,18 @@
 /**
- * Pi-side `<session-history>` injection — mirrors OpenCode's
- * `prepareCompartmentInjection` + `renderCompartmentInjection`
  * (packages/plugin/src/hooks/magic-context/inject-compartments.ts).
  *
  * Pi differences:
- *   - Pi messages have `content: string | (TextContent | ImageContent)[]`,
- *     not OpenCode's `parts: unknown[]`. We project Pi messages into a
- *     minimal MessageLike-shaped view so the shared
- *     `prepareCompartmentInjection` can do its DB read + cache lookup +
- *     boundary trim. The actual render writes back to Pi shape.
- *   - Pi messages don't have a stable per-message id at the AgentMessage
- *     layer. We synthesize one using the same `pi-msg-${index}-${ts}-${role}`
- *     scheme `transcript-pi.ts` uses, so the boundary-trim cutoff comparison
- *     stays consistent across passes.
+ * Pi messages use `content` instead of OpenCode's `parts`.
+ * The MessageLike view lets `prepareCompartmentInjection` read storage, use its cache, and trim the boundary.
+ * Pi `AgentMessage` values lack stable per-message IDs.
+ * Boundary trimming uses `pi-msg-${index}-${ts}-${role}` IDs to match `transcript-pi.ts`.
+ * The boundary-trim cutoff comparison uses the same synthesized ID across passes.
  *
  * Cache safety:
- *   - `prepareCompartmentInjection` honors its own injection cache. On
- *     defer passes (`isCacheBusting=false`) the cached prepared block is
- *     replayed, the boundary trim is re-applied, and we just re-write the
- *     cached block into Pi message[0]. Provider prompt cache stays stable.
- *   - On cache-busting passes (historian/compressor publish, /ctx-flush)
- *     the cache is rebuilt and the new block is written. Caller is
- *     responsible for setting `isCacheBusting` correctly via the shared
+ * `isCacheBusting=false` reuses the prepared block and reapplies boundary trimming.
+ * Deferred passes write the cached block to `piMessages[0]` to preserve the provider prompt cache.
+ * Cache-busting passes rebuild the prepared block.
+ * The caller derives `isCacheBusting` from `historyRefreshSessions`.
  *     historyRefreshSessions signal.
  */
 
@@ -89,9 +80,7 @@ import { sessionLog as logSession } from "@magic-context/core/shared/logger";
 import { resolvePiStableId, SYNTH_USER_ID_PREFIX } from "./read-session-pi";
 
 /**
- * Pi message shapes — kept structurally compatible with
- * `@earendil-works/pi-coding-agent`'s `AgentMessage` union. Same minimal
- * subset transcript-pi.ts uses.
+ * Pi message shapes structurally match the `AgentMessage` subset used by `transcript-pi.ts`.
  */
 type PiTextContent = { type: "text"; text: string; textSignature?: string };
 type PiImageContent = { type: "image"; data: string; mimeType: string };
@@ -112,7 +101,7 @@ type PiToolResultMessage = {
 };
 type PiAgentMessage = PiUserMessage | PiAssistantMessage | PiToolResultMessage;
 
-/** Resolve a live Pi message to the stable ID stored with its compartment boundary. */
+/* */
 function resolveStableId(
 	msg: PiAgentMessage,
 	index: number,
@@ -122,29 +111,17 @@ function resolveStableId(
 }
 
 /**
- * Mutate `piMessages` in place: remove every message whose synthesized
- * id appears at or before the cutoff. Preserves the rest of the array.
  *
- * Mirrors the `messages.splice(0, cutoffIndex+1)` behavior the shared
- * `prepareCompartmentInjection` does on its (OpenCode) MessageLike[].
  *
- * # Synthetic-user (folded toolResult) cutoffs
+ * Synthetic-user cutoffs use the first folded `toolResult` entry ID.
  *
- * A compartment's `endMessageId` comes from `convertEntriesToRawMessages`,
- * which folds a run of `toolResult` entries into a synthetic-user RawMessage
- * with id `${SYNTH_USER_ID_PREFIX}<firstFoldedToolResultEntryId>`. The LIVE Pi
- * message array does NOT contain that synthetic id — folding is a historian-
- * chunking artifact only; the underlying toolResult messages are present as
- * real entries. So a raw `resolveStableId(msg) === cutoffMessageId` comparison
- * can never match a synth-user cutoff, `cutoffIndex` stays -1, and the
- * summarized prefix is never trimmed → duplicate content + overflow in
- * tool-heavy sessions. When the cutoff is synthetic, strip the prefix and match
- * against the underlying real toolResult entry id instead (the suffix is, by
- * construction, the real entry id of the first folded toolResult, which IS a
- * visible message). Trimming through that toolResult covers the whole folded
- * run because the bidirectional orphan sweep below removes the rest of the run.
+ * `convertEntriesToRawMessages` records folded `toolResult` runs as synthetic-user IDs, while live Pi messages retain individual `toolResult` IDs.
+ * Synthetic-user cutoffs resolve to the first folded `toolResult` ID before live Pi message comparison.
+ * When the cutoff is synthetic, the function strips its prefix and matches the first folded `toolResult` entry ID.
+ * The suffix is the first folded `toolResult` entry ID, which remains visible in `piMessages`.
+ * Trimming through the first folded `toolResult` removes the folded run because the orphan sweep removes its remaining entries.
+ * The bidirectional orphan sweep removes the remaining entries in the folded run.
  *
- * Returns the count of messages removed — used for log parity.
  */
 function trimPiMessagesToBoundary(
 	piMessages: PiAgentMessage[],
@@ -153,8 +130,6 @@ function trimPiMessagesToBoundary(
 	trimMutableEntryIds = false,
 ): number {
 	if (cutoffMessageId.length === 0) return 0;
-	// Resolve a synthetic-user (folded toolResult) cutoff to the real entry id
-	// of the underlying toolResult, which is what the live message carries.
 	const effectiveCutoffId = cutoffMessageId.startsWith(SYNTH_USER_ID_PREFIX)
 		? cutoffMessageId.slice(SYNTH_USER_ID_PREFIX.length)
 		: cutoffMessageId;
@@ -169,14 +144,13 @@ function trimPiMessagesToBoundary(
 	}
 	if (cutoffIndex < 0) return 0;
 
-	// Start with the same prefix trim as the shared OpenCode projection, then
-	// repeatedly sweep both directions across Pi's split tool-call shape. The
-	// sweep is intentionally scoped by the owning assistant message index, not by
-	// bare callId: Pi/OpenCode may reuse callIds across turns, and a global callId
-	// match can delete a valid kept-tail pair from a later turn. Pair ownership is
-	// inferred from the nearest assistant carrying that callId (backward first,
-	// then forward for legacy/test shapes where a result precedes its call). This
-	// preserves the non-contiguous same-turn cleanup while avoiding cross-turn
+	// The function applies the OpenCode prefix trim before sweeping Pi's split tool-call pairs in both directions.
+	// Pi represents tool calls and results as separate messages, so the function sweeps pairs in both directions.
+	// The sweep scopes pairs by their owning assistant-message index, not by `callId` alone.
+	// Pi and OpenCode can reuse `callId` values across turns, so a global `callId` match can remove a kept-tail pair from a later turn.
+	// Assistant-index ownership preserves same-turn cleanup without removing pairs from later turns.
+	// Pair scoping uses the assistant-message index because `callId` values can repeat across turns.
+	// Assistant-index ownership preserves non-contiguous same-turn cleanup without cross-turn removal.
 	// over-removal.
 	const remove = new Set<number>();
 	for (let i = 0; i <= cutoffIndex; i++) remove.add(i);
@@ -301,14 +275,10 @@ export const __test = {
 
 const PI_M1_PLACEHOLDER =
 	"<session-history-since>(no new content since last materialization)</session-history-since>";
-// Pi uses a STATIC upgrade-state marker, intentionally diverging from OpenCode's
-// dynamic getUpgradeState(db, sessionId). OpenCode flips this per-session when a
-// `/ctx-session-upgrade` recomp transitions legacy→v2, forcing an m[0] refold.
-// Pi has no equivalent per-session upgrade-state transition wired into the m[0]
-// markers yet, so a static const is internally consistent (stored marker and
-// current marker always match → never falsely triggers, never misses a real Pi
-// transition because there is none). Revisit if Pi gains a session-upgrade flow
-// that must invalidate m[0].
+// Pi's static marker does not change per session.
+// Pi has no per-session upgrade-state transition for m[0] markers.
+// A static marker keeps the stored and current markers equal.
+// TODO: Invalidate m[0] when Pi adds a session-upgrade flow.
 const PI_M0_UPGRADE_STATE = "pi-m0m1-v2";
 const EMPTY_MAX_COMPARTMENT_SEQ = -1;
 
@@ -327,12 +297,10 @@ interface FrozenM0Inputs {
 }
 
 /**
- * Real-tokenizer size of ONLY the <session-history> slice of a rendered m[0]
- * (parity with OpenCode's historySliceTokens). The over-budget tightening loop
- * must measure the history block against the history budget, not the whole m[0]
- * — m[0] also carries <project-docs>/<user-profile>/<project-memory>, each with
- * its own budget. Charging those against the history budget over-tightens decay
- * and starves session-history. Returns 0 when there's no history slice.
+ * The value measures only the `<session-history>` slice of rendered `m[0]` with the real tokenizer.
+ * The history budget applies only to the `<session-history>` block, not all of `m[0]`.
+ * `m[0]` also carries `<project-docs>`, `<user-profile>`, and `<project-memory>`, each with its own budget.
+ * `<project-docs>`, `<user-profile>`, and `<project-memory>` have separate budgets; charging them to the history budget over-tightens decay.
  */
 function historySliceTokensPi(m0Text: string): number {
 	const slice = extractM0Block(m0Text, "session-history");
@@ -340,11 +308,7 @@ function historySliceTokensPi(m0Text: string): number {
 }
 
 /**
- * Fail-open wrapper around getActiveUserMemories (parity with OpenCode's
- * safeGetActiveUserMemories). On a DB that predates the user_memories table
- * (unmigrated / partially-initialized), the raw call throws "no such table:
- * user_memories"; OpenCode degrades to an empty profile, so Pi must too —
- * otherwise m[0] materialization crashes the whole transform on such DBs.
+ * An absent `user_memories` table must not abort m[0] materialization.
  */
 function safeGetActiveUserMemoriesPi(db: ContextDatabase): UserMemory[] {
 	try {
@@ -359,33 +323,32 @@ export interface PiM0M1State {
 	sessionId: string;
 	projectIdentity: string;
 	projectDirectory: string;
-	/** When false, project memories are NOT read or rendered into m[0]/m[1]
-	 *  (config `memory.enabled=false`). Mirrors OpenCode, which passes
-	 *  `projectPath: undefined` in that case so every memory read short-circuits.
-	 *  Docs are controlled independently by injectDocs. Unset/true keeps memory on. */
+	/** When `memory.enabled` is false, project memories are not read or rendered into `m[0]` or `m[1]`.
+	 * When `memoryEnabled=false`, `memoryProjectPath` returns `undefined`, so memory reads return their empty values.
+	 * `injectDocs` unset or true does not disable project-memory injection. */
 	memoryEnabled?: boolean;
-	/** Defaults true. When false, m[0] omits the <project-docs> block and docs hash. */
+	/** `injectDocs` defaults to true; when false, `m[0]` omits the `<project-docs>` block and docs hash. */
 	injectDocs?: boolean;
-	/** Memory-block trim budget (~4K). Bounds the <project-memory> block. */
+	/** The memory trim budget limits the `<project-memory>` block to approximately 4K tokens. */
 	injectionBudgetTokens?: number;
-	/** v2 decay-render history budget (~60K). Drives compartment tier demotion.
-	 *  Distinct from injectionBudgetTokens — using the memory budget here would
-	 *  over-demote every compartment. */
+	/** The v2 decay-render history budget is approximately 60K tokens and drives compartment tier demotion.
+	 * Using injectionBudgetTokens here would over-demote every compartment.
+	 * */
 	historyBudgetTokens?: number;
-	/** User-profile block budget (~4K). The m[1] new-user-profile delta is
-	 *  trimmed to 25% of this (matches OpenCode renderM1). Defaults when unset. */
+	/** renderM1 trims the m[1] new-user-profile delta to 25% of this budget.
+	 * */
 	userProfileBudgetTokens?: number;
-	/** Provider-side cache-eviction signals for HARD-bust detection. */
+	/** `hardSignals` provides provider-side cache-eviction signals for HARD-bust detection. */
 	hardSignals?: PiM0HardSignals;
-	/** Mural feature switch (`mural.enabled`). When
-	 *  true and the fold's model accepts images, HARD materialization resolves
-	 *  + renders the deterministic mural on demand and folds its image into the
-	 *  cached baseline. Defer passes replay the baked-in bytes without re-render. */
+	/**
+	 * When `muralEnabled` is true and the fold's model accepts images, HARD materialization resolves the mural on demand.
+	 * HARD materialization renders the deterministic mural and stores its image in the cached baseline.
+	 * Defer passes replay the mural bytes stored in the cached baseline. */
 	muralEnabled?: boolean;
-	/** Explicit mural wire options for tests. When set, skips on-demand resolve
-	 * during HARD materialization (mirrors OpenCode `M0M1RenderOptions.mural`). */
+	/** `mural` supplies explicit wire options and skips on-demand mural resolution.
+	 * */
 	mural?: MuralWireOptions;
-	/** Keeps memory/docs injection while suppressing compartment history rendering and trimming. */
+	/** `compactionOff` keeps memory and docs injection while suppressing compartment history rendering and trimming. */
 	compactionOff?: boolean;
 }
 
@@ -408,10 +371,7 @@ function readProjectDocsForPiM0(state: PiM0M1State): PiProjectDocsRender {
 }
 
 /**
- * The project path used for MEMORY reads only. Returns undefined when
- * `memory.enabled=false`, so every memory read short-circuits to its empty
- * value (mirrors OpenCode passing `projectPath: undefined`). Project docs use
- * the independent injectDocs flag.
+ * `memory.enabled=false` makes memory reads return their empty values; `injectDocs` controls project docs independently.
  */
 function memoryProjectPath(state: PiM0M1State): string | undefined {
 	return state.memoryEnabled === false ? undefined : state.projectIdentity;
@@ -477,23 +437,16 @@ export interface PiM0SnapshotMarkers {
 	upgradeState: string;
 	compartmentRenderEpoch: string | null;
 	lastBaselineEndMessageId: string | null;
-	// HARD-bust markers (parity with OpenCode M0SnapshotMarkers): provider-side
-	// cache-eviction signals. systemHash/modelKey come from runtime; Pi has no
-	// Captured from PiM0HardSignals at the injection call site.
+	// HARD-bust markers record provider-side cache-eviction signals.
 	systemHash: string;
 	modelKey: string;
-	// Pi sessions can switch projects in-process (`/cd`). NULL on legacy cached
-	// rows means unknown/lazy-adopted and must not force a HARD fold by itself.
+	// Pi sessions can switch projects in-process (`/cd`). Legacy cached rows with NULL projectIdentity are unknown/lazy-adopted and must not force a HARD fold.
 	projectIdentity: string | null;
 	muralEnabled: boolean;
 	renderBudgetIdentity: string;
 }
 
 /**
- * Runtime cache-eviction signals threaded into Pi's materialization decision
- * (parity with OpenCode M0HardSignals). systemHash + cacheExpired derive from
- * session_meta; modelKey comes from the volatile liveModelBySession map in
- * context-handler. toolSetHash is always "" on Pi (no tool.definition hook).
  */
 export interface PiM0HardSignals {
 	systemHash: string;
@@ -522,7 +475,7 @@ export interface PiMaterializeMismatch {
 export interface PiMaterializeDecision {
 	value: boolean;
 	reason: string | null;
-	/** The exact compared values for the signal that fired. */
+	/** HARD-bust markers record the values compared when a HARD-bust signal fires. */
 	mismatch?: PiMaterializeMismatch;
 }
 
@@ -547,7 +500,7 @@ const injectionTokenCountsBySession = new Map<
 	PiInjectionTokenCountCache
 >();
 
-/** Process-local mirror of the mural payload persisted with the cached m0 row. */
+/** The cache stores mural payloads only within one process. */
 interface CachedPiMural {
 	dataUrl: string | null;
 	contentHash: string | null;
@@ -593,7 +546,7 @@ function muralForWire(sessionId: string): MuralWireOptions | undefined {
 	};
 }
 
-/** Convert a PNG data URL into Pi's native image content block (raw base64). */
+/* */
 function piImageFromDataUrl(dataUrl: string): PiImageContent | null {
 	const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s.exec(dataUrl);
 	if (!match) return null;
@@ -601,9 +554,6 @@ function piImageFromDataUrl(dataUrl: string): PiImageContent | null {
 }
 
 /**
- * Resolve mural wire options for a HARD fold. Explicit test `state.mural` wins;
- * otherwise gate on `muralEnabled` + vision capability via resolveMuralWire.
- * Returns undefined when the feature is off so renderM0Pi skips the block.
  */
 function resolveMuralForM0Pi(
 	state: PiM0M1State,
@@ -654,34 +604,29 @@ export interface PiM0M1InjectionResult extends PiInjectionResult {
 	m0Bytes: number;
 	m1Bytes: number;
 	/**
-	 * True when this pass lost the materialization retry race and used temporary
-	 * fallback content instead of a freshly persisted session-history cache. Keep
-	 * deferred marker signals armed in that case because the rendered boundary may
-	 * not match the latest saved compartment snapshot.
+	 * Deferred marker signals remain armed because fallback content may not match the latest saved compartment snapshot.
 	 */
 	contentionExhausted: boolean;
-	/** The compartment boundary actually represented by the m[0]/m[1] pair sent. */
+	/** The sent m[0]/m[1] pair represents the recorded compartment boundary. */
 	renderedBoundary: PiRenderedCompartmentBoundary;
 	/**
-	 * Watermark of the compartment coverage rendered into the m[1] delta THIS
-	 * pass (max end ordinal / end message id of the compartments included in
-	 * the m[1] render), derived from the SAME compartment snapshot the render
-	 * used. NULL unless m[1] was freshly recomputed this pass without a
-	 * contention fallback: the soft-refresh sibling-fallback serves a sibling's
-	 * stale cached m[1] (recomputed=false while contentionExhausted stays
-	 * false) and the pure-replay branch serves bytes rendered by an earlier
-	 * pass — neither may certify coverage for compartments those bytes never
-	 * contained, so the deferred-marker drain keeps its signal armed and
-	 * retries on the next fresh render. Per-pass in-memory ONLY (never
-	 * persisted): the drain reads it solely on busting passes that freshly
-	 * recomputed m[1]; replay passes never evaluate the m[1] coverage arm.
+	 * m1RenderedCoverage records coverage from m[1] freshly recomputed from this pass's snapshot.
+	 * The watermark is the maximum end ordinal or end message ID among compartments in m[1].
+	 * m1RenderedCoverage uses the snapshot that rendered m[1].
+	 * m1RenderedCoverage is null unless this pass freshly recomputed m[1] without contention fallback.
+	 * Sibling fallback leaves recomputed false and contentionExhausted false.
+	 * Pure replay serves bytes rendered by an earlier pass.
+	 * Replayed or sibling-fallback bytes cannot certify coverage of unrendered compartments.
+	 * The deferred-marker drain keeps its signal armed until a fresh render.
+	 * m1RenderedCoverage is memory-only and is never persisted.
+	 * The drain reads this watermark only on busting passes with freshly recomputed m[1].
 	 */
 	m1RenderedCoverage: PiRenderedCompartmentBoundary | null;
 	/**
-	 * Number of synthetic, id-less messages prepended at the FRONT of the array
-	 * by this injection (the m[0] + m[1] pair). These never resolve to a real
-	 * SessionEntry id, so downstream anchor-GC must exclude them from its
-	 * "all messages resolved" denominator or pruning never runs.
+	 * The synthetic-message injection prepends two synthetic m[0]/m[1] messages with no SessionEntry IDs.
+	 * The synthetic m[0]/m[1] messages never resolve to SessionEntry IDs.
+	 * Anchor GC must exclude the synthetic m[0]/m[1] messages because they have no SessionEntry IDs.
+	 * Anchor GC excludes synthetic messages from the resolved-message denominator; otherwise it never prunes.
 	 */
 	syntheticLeadingCount: number;
 }
@@ -693,10 +638,9 @@ function decodeCachedM0(value: Buffer | Uint8Array | null): string | null {
 	);
 }
 
-// v2: session_facts is retired as a render source (facts = promoted memories).
-// The m[0] snapshot still carries a sessionFactsVersion field for shape
-// stability, but it is pinned to 0 so it never drives re-materialization —
-// fact changes no longer affect rendered bytes.
+// `session_facts` does not supply render input.
+// `sessionFactsVersion` never triggers re-materialization.
+// Fact changes do not affect rendered bytes.
 function getSessionFactsVersion(
 	_db: ContextDatabase,
 	_sessionId: string,
@@ -708,11 +652,8 @@ function normalizeCachedMaxCompartmentSeq(
 	stored: number,
 	compartments: readonly PiCompartment[],
 ): number {
-	// Backward compatibility for legacy empty snapshots persisted with 0: only
-	// reinterpret 0 as empty against the exact compartment snapshot used for the
-	// cache-validity decision. If a seq-0 compartment exists, 0 is a real
-	// watermark and must remain publishable; only a truly empty session upgrades
-	// the legacy sentinel to EMPTY_MAX_COMPARTMENT_SEQ.
+	// `stored === 0` denotes the legacy empty-session sentinel only when `compartments` is empty.
+	// `0` remains a real sequence number when a seq-0 compartment exists.
 	if (stored === 0 && compartments.length === 0) {
 		return EMPTY_MAX_COMPARTMENT_SEQ;
 	}
@@ -854,15 +795,11 @@ function getCachedMarkers(
 		compartments,
 	);
 	const cachedBoundary = getCachedBoundary(db, state.sessionId);
-	// Invalidate a null cached boundary ONLY when the live snapshot actually has
-	// a usable boundary — i.e. the cache is genuinely stale (a boundary appeared
-	// since it was written). An empty `end_message_id` on the latest compartment
-	// is a LEGITIMATE state (schema default ''; OpenCode degrades to "inject
-	// without visible-prefix trimming"), so a materialize can correctly persist a
-	// null boundary. Rejecting that every pass caused a re-materialize loop for
-	// legacy / partially-upgraded sessions. When the live snapshot also has no
-	// usable boundary, reuse the cache and let findCompartmentBoundaryForSnapshot
-	// degrade to no-trim.
+	// Cache validation invalidates a null cached boundary only when the live snapshot has a usable boundary.
+	// An empty `end_message_id` is valid and disables visible-prefix trimming.
+	// A boundaryless baseline may persist a null boundary.
+	// The cache remains valid when the live snapshot has no usable boundary.
+	// The cache is reused when the live snapshot has no usable boundary.
 	const liveBoundary = lastBaselineEndMessageId(compartments);
 	if (
 		maxCompartmentSeq >= 0 &&
@@ -883,8 +820,6 @@ function getCachedMarkers(
 		materializedAt: meta.cachedM0MaterializedAt,
 		upgradeState: cachedUpgradeIdentity.upgradeState ?? "",
 		compartmentRenderEpoch: cachedUpgradeIdentity.compartmentRenderEpoch,
-		// The boundary that was persisted WITH these cached m[0] bytes (may be
-		// null for a legitimately-boundaryless baseline — see the guard above).
 		lastBaselineEndMessageId: cachedBoundary,
 		systemHash: meta.cachedM0SystemHash ?? "",
 		modelKey: meta.cachedM0ModelKey ?? "",
@@ -943,11 +878,8 @@ function readCurrentMarkersFromCompartments(
 			projectDocsHash ?? readProjectDocsForPiM0(state).canonicalHash,
 		sessionFactsVersion: getSessionFactsVersion(db, state.sessionId),
 		materializedAt: Date.now(),
-		// Dynamic upgrade state (parity with OpenCode getUpgradeState): suffix
-		// "legacy" when any legacy=1 compartment remains, else "ready". This makes
-		// `/ctx-session-upgrade` (legacy→v2 conversion) flip the marker so m[0]
-		// re-materializes with the upgraded tiered content. A static const would
-		// leave Pi serving stale legacy-rendered m[0] after an upgrade.
+		// Changes to `upgradeState` invalidate legacy-rendered m[0].
+		// A static upgrade state would retain legacy-rendered m[0] after conversion.
 		upgradeState: `${PI_M0_UPGRADE_STATE}:${
 			compartments.some((c) => c.legacy === 1) ? "legacy" : "ready"
 		}`,
@@ -969,28 +901,21 @@ export function mustMaterializePi(
 	currentCompartmentsOverride?: readonly PiCompartment[],
 ): PiMaterializeDecision {
 	const meta = getOrCreateSessionMeta(db, state.sessionId);
-	// Accept a caller-provided snapshot so the materialize decision and the
-	// subsequent cached-marker reload in injectM0M1Pi normalize against the SAME
-	// compartment set. Re-reading here (when the caller already read) opened a
-	// TOCTOU where a count change between the decision and the reload could flip
-	// markers to null and escape to the unguarded re-materialize path.
+	// The caller snapshot keeps materialization and cached-marker reload on the same compartment set.
+	// A reread can observe a changed compartment count and produce null markers.
 	const currentCompartments =
 		currentCompartmentsOverride ?? getRenderableCompartmentsPi(db, state);
 	const current = readCurrentMarkersFromCompartments(
 		db,
 		state,
 		currentCompartments,
-		// Project-doc edits are deliberately soft: they ride the next natural HARD
-		// fold. Reuse the persisted hash for the cache decision so defer passes do
-		// not synchronously read and fingerprint docs they cannot materialize.
+		// The cache decision reuses the persisted hash so deferred passes do not read or fingerprint docs they cannot materialize.
 		meta.cachedM0ProjectDocsHash ?? undefined,
 	);
 	if (!meta.cachedM0Bytes) return { value: true, reason: "first_render" };
 	if (!meta.cachedM1Bytes) return { value: true, reason: "cached_m1_missing" };
-	// Keep invalid cached baselines on the guarded materialize path. The
-	// cache_invalid branch below does not have its own contention fallback, so
-	// detecting missing required markers / empty decoded bytes here prevents a
-	// lease-contention false negative from dropping m[0]/m[1] entirely.
+	// The guarded materialize path retains invalid cached baselines because `cache_invalid` has no contention fallback.
+	// Detecting missing required markers and empty decoded bytes prevents lease-contention false negatives from dropping m[0]/m[1].
 	if (!decodeCachedM0(meta.cachedM0Bytes)) {
 		return { value: true, reason: "cache_invalid" };
 	}
@@ -998,8 +923,7 @@ export function mustMaterializePi(
 	if (cached === null) {
 		return { value: true, reason: "cache_invalid" };
 	}
-	// A renderer-format change must fold cached m[0] exactly once. The fold
-	// persists this component with the rendered bytes, consuming the trigger.
+	// A renderer-format change folds cached m[0] exactly once because the fold persists `compartmentRenderEpoch` with the rendered bytes.
 	if (cached.compartmentRenderEpoch !== current.compartmentRenderEpoch) {
 		return piMaterializeMismatch(
 			"compartment_render_epoch",
@@ -1024,11 +948,8 @@ export function mustMaterializePi(
 			current.renderBudgetIdentity,
 		);
 	}
-	// ── HARD: provider-side cache eviction (the cache was already dead) ──
-	// Parity with OpenCode mustMaterialize. An empty current signal means
-	// "unknown this pass" and is never treated as a change. Pi never produces a
-	// toolSetHash (no tool.definition hook), so that branch is effectively inert
-	// on Pi — kept for structural parity. See PARITY.md.
+	// Pi treats `toolSetHash` as unknown for the pass and never as a change.
+	// Pi has no `tool.definition` hook, so it never produces `toolSetHash` and the `toolSetHash` comparison branch is inert.
 	const hard = state.hardSignals ?? EMPTY_PI_HARD_SIGNALS;
 	const canonicalHardModelKey = piModelRefToCanonical(hard.modelKey);
 	const canonicalCachedModelKey = piModelRefToCanonical(
@@ -1056,9 +977,9 @@ export function mustMaterializePi(
 			hard.systemHash,
 		);
 	}
-	// Pi can switch projects within the same session (`/cd`). Legacy cached rows
-	// have a NULL marker: treat that as unknown/MATCH for lazy adoption so the
-	// first post-upgrade no-switch pass does not HARD-fold existing sessions.
+	// Pi can switch projects within the same session (`/cd`).
+	// Legacy cached rows with a `NULL` marker are treated as unknown/MATCH for lazy adoption.
+	// Treating a `NULL` project marker as MATCH avoids HARD-folding an existing session until its project changes.
 	if (
 		meta.cachedM0ProjectIdentity !== null &&
 		meta.cachedM0ProjectIdentity !== state.projectIdentity
@@ -1070,11 +991,10 @@ export function mustMaterializePi(
 			state.projectIdentity,
 		);
 	}
-	// Idle > TTL: self-consuming guard via cachedM0MaterializedAt (parity with
-	// OpenCode). cacheExpired stays true every pass until lastResponseTime
-	// updates, so fold only when the last response is newer than the last
-	// materialization; the fold sets materializedAt = now, so the rest of the
-	// turn skips. Next idle-after-response re-arms.
+	// Idle periods exceeding TTL use `cachedM0MaterializedAt` to prevent repeated invalidation.
+	// OpenCode's `cacheExpired` remains true until `lastResponseTime` changes.
+	// The fold sets `cachedM0MaterializedAt` to `now`, blocking repeated invalidation until `lastResponseTime` advances.
+	// The next idle period after a response rearms the `cachedM0MaterializedAt` guard.
 	if (
 		hard.cacheExpired &&
 		hard.lastResponseTime > 0 &&
@@ -1088,7 +1008,7 @@ export function mustMaterializePi(
 		);
 	}
 
-	// ── HARD: genuine m[0] CONTENT change ──
+	// An m[0] content change requires a HARD fold.
 	if (cached.upgradeState !== current.upgradeState) {
 		return piMaterializeMismatch(
 			"renderer_upgrade",
@@ -1114,10 +1034,9 @@ export function mustMaterializePi(
 			canonicalSnapshotVector(current.claimSnapshotVector as SnapshotVector),
 		);
 	}
-	// Use !== (not >), matching OpenCode mustMaterialize: a max-id that DECREASES
-	// (revert / message.removed shrinking the compartment or mutation set) must
-	// still invalidate m[0]. A '>' comparison would miss a decrease and serve a
-	// stale cached baseline.
+	// The comparison uses `!==` because a max ID decrease invalidates m[0].
+	// A max ID decrease from a revert or `message.removed` must still invalidate m[0].
+	// A `>` comparison would miss a max ID decrease and serve a stale cached baseline.
 	if (current.maxMutationId !== (meta.cachedM0MaxMutationId ?? 0)) {
 		return piMaterializeMismatch(
 			"pending_mutations",
@@ -1126,17 +1045,12 @@ export function mustMaterializePi(
 			current.maxMutationId,
 		);
 	}
-	// new_compartment is NOT a trigger (parity with OpenCode — Bug 1 fix): new
-	// compartments are an m[1] delta (renderM1Pi readNewCompartments WHERE
-	// sequence > cachedM0Seq, normalized via normalizeCachedMaxCompartmentSeq in
-	// the render path), folded into m[0] only on a HARD bust.
-	// project_user_profile_version is also NOT a trigger: additive user-profile
-	// rides the m[1] <new-user-profile> delta.
-	// projectDocsHash is also NOT a trigger: docs-only edits ride along until a
-	// natural HARD fold, which reads fresh docs and persists the hash matching the
-	// bytes it rendered.
-	// session_facts is retired as a render source (facts = promoted memories),
-	// so its version is pinned to 0 and never triggers either.
+	// A new compartment is an m[1] delta, not a HARD trigger.
+	// Compartments fold into m[0] only on HARD busts.
+	// project_user_profile_version never triggers a fold; additive user profiles are an m[1] delta.
+	// projectDocsHash does not trigger a fold; a HARD fold reads fresh docs and persists the rendered hash.
+	// session_facts is not a render source because facts are promoted memories.
+	// session_facts is pinned to version 0 and never triggers a fold.
 	return { value: false, reason: null };
 }
 
@@ -1161,8 +1075,8 @@ export function renderM0Pi(
 	compartmentsOverride?: PiCompartment[],
 	userProfileOverride?: UserMemory[],
 	workspaceOverride?: WorkspaceRenderContext,
-	/** Optional mural wire options (HARD fold only). When vision-capable, emits
-	 *  the `<memory-mural>` marker block; the PNG rides as a separate image part. */
+	/** Pi emits mural output only for HARD folds when enabled and vision-capable.
+	 * The string contains the `<memory-mural>` marker block; the PNG is a separate image part. */
 	mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string },
 	claimLaneOverride?: ClaimLaneSnapshot | null,
 ): string {
@@ -1186,38 +1100,22 @@ export function renderM0Pi(
 	const memoryBlock = renderClaimMemoryBlock(claims, "project-memory", {
 		sourceNameByClaimId: claimLane?.sourceNameByClaimId,
 	});
-	// v2: decay-render compartments via the shared module (same validated curve
-	// as OpenCode). Facts are NOT rendered (v2 faithful: facts = promoted
-	// memories, surfaced via memoryBlock / <project-memory>).
-	// The decay-pressure multiplier maps to a proportionally tighter effective
-	// budget (lower budget → higher curve pressure → more demotion), keeping the
-	// shared decay-curve as the single source of pressure math — same approach as
-	// OpenCode renderM0. The materialize loop escalates it when m[0] is over budget.
+	// Facts render through <project-memory>, not through decayed compartments.
+	// `decayPressureMultiplier` values above `1` reduce `historyBudgetTokens` and increase decay pressure.
 	const baseHistoryBudget =
 		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
 	const decayed = renderDecayedCompartments({
 		compartments:
 			compartmentsOverride ?? getRenderableCompartmentsPi(db, state),
-		// v2: use the HISTORY budget (~60K), not the memory injection budget (~4K).
-		// Falling back to the memory budget would over-demote every compartment.
+		// The renderer uses `historyBudgetTokens` rather than the memory injection budget to avoid over-demoting compartments.
 		historyBudgetTokens:
 			baseHistoryBudget / Math.max(1, decayPressureMultiplier),
 	});
-	// Sibling-block layout MUST match OpenCode renderM0 exactly (otherwise the
-	// two harnesses put different bytes on the wire for the same state):
-	//   <project-docs>   — sibling
-	//   <user-profile>   — sibling
-	//   <session-history>…decayed COMPARTMENTS ONLY…</session-history>
-	//   <project-memory> — sibling
-	// The <session-history> wrapper contains ONLY the decayed compartments — it
-	// does NOT envelope project-docs / user-profile / project-memory. Sections
-	// joined by "\n\n".
+	// Pi preserves the sibling-block order used by OpenCode `renderM0`.
+	// <session-history> contains only decayed compartments.
 	const sections: string[] = [];
 	if (projectDocs.length > 0) sections.push(projectDocs);
-	// Baseline user-profile MUST be trimmed to budget, matching OpenCode renderM0.
-	// Rendering all active user memories untrimmed would put different (larger)
-	// bytes on the wire than OpenCode for the same state, and let m[0] grow
-	// without bound as the global user-profile accumulates.
+	// The renderer trims the baseline user profile to the budget to match OpenCode `renderM0`.
 	const trimmedProfile = trimUserMemoriesToBudget(
 		userProfileOverride ?? safeGetActiveUserMemoriesPi(db),
 		state.userProfileBudgetTokens ?? DEFAULT_USER_PROFILE_BUDGET_TOKENS,
@@ -1236,7 +1134,7 @@ export function renderM0Pi(
 		);
 	}
 	if (memoryBlock) sections.push(memoryBlock);
-	// Sibling layout parity with OpenCode renderM0: mural marker after memories.
+	// The renderer places the mural marker after memory blocks to match OpenCode `renderM0`.
 	if (mural?.enabled && mural.supportsVision && mural.dataUrl) {
 		sections.push(
 			"<memory-mural>\nThe project memory mural image follows.\n</memory-mural>",
@@ -1245,11 +1143,8 @@ export function renderM0Pi(
 	return sections.join("\n\n").trim();
 }
 
-/** Raised when the m[0] snapshot changed between the read-markers phase and the
- *  persist phase (a concurrent writer — sibling Pi/OpenCode process sharing the
- *  same SQLite DB, or the historian — mutated state mid-materialization). Caught
- *  by the retry wrapper so we never cache m[0] bytes that no longer match the
- *  markers they were rendered from. */
+/** The renderer throws when m[0] changes between marker reads and persistence.
+ * */
 function isTransientSqliteLockError(error: unknown): boolean {
 	if (!error || typeof error !== "object") return false;
 	const { code, message } = error as { code?: unknown; message?: unknown };
@@ -1427,8 +1322,7 @@ export function materializeM0Pi(
 	snapshotMarkers: PiM0SnapshotMarkers;
 	renderedRevisionLocators: string[];
 } {
-	// Phase 1 (no lock): read markers + render. Rendering can be slow, so we do
-	// it OUTSIDE the write lock to keep the BEGIN IMMEDIATE critical section tiny.
+	// The fold reads markers and renders outside the write lock because rendering can be slow.
 	const docs = readProjectDocsForPiM0(state);
 	const foldMaterializedAt = Date.now();
 	const frozen = readFrozenM0InputsPi(state, db, docs, foldMaterializedAt);
@@ -1440,9 +1334,9 @@ export function materializeM0Pi(
 	const renderedRevisionLocators = snapshotClaims.map(
 		(item) => item.revisionLocator,
 	);
-	// On-demand mural: runs INSIDE the HARD fold only (not on defers). Explicit
-	// test-supplied `state.mural` wins; otherwise resolve from muralEnabled +
-	// this fold's model key. Baked-in cachedMuralBySession replays on defer.
+	// On-demand murals run only during HARD folds, not deferrals.
+	// When no on-demand mural is supplied, mural resolution uses `muralEnabled` and the HARD fold's model key.
+	// cachedMuralBySession replays on deferral.
 	const memoryBudget =
 		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
 	const mural = resolveMuralForM0Pi(
@@ -1455,10 +1349,7 @@ export function materializeM0Pi(
 		mural?.enabled && mural.supportsVision ? (mural.dataUrl ?? null) : null;
 	const frozenMuralHash =
 		mural?.enabled && mural.supportsVision ? (mural.contentHash ?? null) : null;
-	// Over-budget tightening loop (matches OpenCode materializeM0): if the
-	// rendered m[0] exceeds the history budget, escalate the decay pressure and
-	// re-render up to 3x so tight budgets demote more aggressively. Without this,
-	// Pi would select different (looser) tiers than OpenCode under budget pressure.
+	// The renderer rerenders only when m[0] exceeds 105% of the history budget.
 	let decayPressureMultiplier = 1;
 	let m0 = renderM0Pi(
 		state,
@@ -1498,10 +1389,8 @@ export function materializeM0Pi(
 	const m0Bytes = Buffer.from(m0, "utf8");
 	const phase3ProjectDocsHash = readProjectDocsForPiM0(state).canonicalHash;
 
-	// Phase 2 + 3 (locked): re-read markers under BEGIN IMMEDIATE; if anything
-	// changed since Phase 1, the rendered bytes are stale — roll back and let the
-	// caller retry. m[1] is rendered and persisted INSIDE the same transaction as
-	// m[0] so cached_m0_bytes/cached_m1_bytes/markers/memory_block_ids stay paired.
+	// The transaction rereads markers under `BEGIN IMMEDIATE`; changed markers invalidate the rendered output.
+	// The m[0] transaction renders and persists m[1] so `cached_m0_bytes`, `cached_m1_bytes`, markers, and `memory_block_ids` remain paired.
 	try {
 		db.exec("BEGIN IMMEDIATE");
 	} catch (error) {
@@ -1596,11 +1485,9 @@ export function materializeM0Pi(
 			state.sessionId,
 		);
 
-		// Persist the frozen trim boundary INSIDE the materialize transaction,
-		// BEFORE COMMIT. If written after COMMIT, a crash in the window leaves a
-		// fresh m[0]/maxCompartmentSeq paired with a stale (or null) boundary, so
-		// the next pass trims against the wrong point (under/over-trim). Atomic
-		// with the m[0] bytes + markers + m[1] bytes is the only correct placement.
+		// Writing the trim boundary after COMMIT allows a crash to leave fresh m[0] and maxCompartmentSeq paired with a stale or null boundary.
+		// A stale or null trim boundary causes the next pass to under-trim or over-trim.
+		// The transaction persists the boundary with m[0], its markers, and m[1].
 		setCachedBoundary(
 			db,
 			state.sessionId,
@@ -1623,13 +1510,12 @@ export function materializeM0Pi(
 		try {
 			db.exec("ROLLBACK");
 		} catch {
-			// already rolled back
 		}
 		throw error;
 	}
 }
 
-/** Retry materializeM0Pi on contention (parity with OpenCode materializeWithRetry). */
+/* */
 export function materializeM0PiWithRetry(
 	state: PiM0M1State,
 	db: ContextDatabase,
@@ -1878,16 +1764,11 @@ function cachedPiRowMatchesSnapshot(args: {
 			args.markers.projectUserProfileVersion &&
 		rowMarkers.maxCompartmentSeq === args.markers.maxCompartmentSeq &&
 		rowMarkers.maxMutationId === args.markers.maxMutationId &&
-		// Project-docs hash is inert for CAS decisions: byte-different m[0] rows
-		// fail the buffer compare above, while hash-only drift with identical bytes
-		// must still refresh m[1] against the current cached prefix.
 		rowMarkers.materializedAt === args.markers.materializedAt &&
 		rowMarkers.sessionFactsVersion === args.markers.sessionFactsVersion &&
 		(rowMarkers.upgradeState ?? null) === (args.markers.upgradeState ?? null) &&
 		rowMarkers.compartmentRenderEpoch === args.markers.compartmentRenderEpoch &&
-		// HARD-bust markers (parity with OpenCode cachedRowMatchesState): a sibling
-		// that re-materialized under a new system/tool/model identity must invalidate
-		// this process's cached row so the soft-refresh CAS adopts the sibling's m[0].
+		// A new system, tool, or model identity invalidates this process's cached row so the soft-refresh CAS adopts a sibling's m[0].
 		(rowMarkers.systemHash ?? "") === (args.markers.systemHash ?? "") &&
 		piModelRefToCanonical(rowMarkers.modelKey ?? "") ===
 			piModelRefToCanonical(args.markers.modelKey ?? "") &&
@@ -2016,22 +1897,12 @@ function softRefreshCachedM1Pi(args: {
 			args.db,
 			markers,
 			markers.renderedRevisionLocators ?? [],
-			// Render new compartments from the SAME snapshot the boundary advances
-			// from below, so a concurrent sibling publish can't put a compartment
-			// in m[1] while its raw messages stay in the tail.
+			// New compartments use the snapshot that advances the trim boundary, preventing a concurrent publish from placing a compartment in m[1] while its raw messages remain in the tail.
 			args.compartmentsForNormalization,
 		);
 		const m1Bytes = Buffer.from(rendered.text, "utf8");
-		// Advance the persisted trim boundary to the latest compartment now rendered
-		// in m[1]. renderM1 covers compartments seq > cachedM0Seq up to the current
-		// latest, so the visible-message trim must move with it — otherwise the newly
-		// summarized compartment's raw messages stay in the tail (duplication) on
-		// this and every subsequent replay pass. Persisted in the SAME transaction as
-		// cached_m1_bytes so replay passes (which read the boundary from this row)
-		// trim consistently. Mirrors OpenCode caching prepared.compartmentEndMessageId
-		// on each cache-busting pass. Boundary is NOT part of the m[0] CAS identity
-		// (cachedPiRowMatchesSnapshot excludes it), so advancing it cannot spuriously
-		// invalidate a sibling's cached m[0].
+		// The transaction advances the trim boundary with m[1] so summarized raw messages do not remain in the tail.
+		// The cache persists the boundary with cached_m1_bytes so replay reads a consistent trim point.
 		const latestCompartment = args.compartmentsForNormalization.at(-1);
 		const advancedBoundary =
 			latestCompartment?.endMessageId &&
@@ -2055,7 +1926,6 @@ function softRefreshCachedM1Pi(args: {
 		try {
 			args.db.exec("ROLLBACK");
 		} catch {
-			// already rolled back
 		}
 		throw error;
 	}
@@ -2092,9 +1962,8 @@ function prependM0M1Messages(
 	const firstTimestamp = piMessages[0]?.timestamp;
 	const baseTimestamp =
 		typeof firstTimestamp === "number" ? firstTimestamp : Date.now();
-	// Pi's native image part is `{ type: "image", data: base64, mimeType }` —
-	// serializers rebuild `data:…;base64,…` for providers. OpenCode uses a
-	// file-part with a data URL; same PNG bytes, different envelope.
+	// Pi's native image part is `{ type: "image", data: base64, mimeType }`.
+	// Pi treats a file part containing a data URL differently from its native image envelope, even when both contain the same PNG bytes.
 	const muralImage =
 		mural?.enabled && mural.supportsVision && mural.dataUrl
 			? piImageFromDataUrl(mural.dataUrl)
@@ -2124,10 +1993,7 @@ export function injectM0M1Pi(
 	entryIds?: readonly (string | undefined)[],
 	recomputeM1ThisPass = false,
 ): PiM0M1InjectionResult {
-	// One compartment snapshot for the WHOLE decision: the materialize decision
-	// and every cached-marker reload below normalize against this same set, so a
-	// concurrent count change can't flip markers to null mid-decision and escape
-	// the guarded fallback (TOCTOU).
+	// The materialization decision and marker reloads use one snapshot so concurrent count changes cannot bypass the guarded fallback.
 	const currentCompartments = getRenderableCompartmentsPi(db, state);
 	let decision = mustMaterializePi(state, db, currentCompartments);
 	if (decision.value) {
@@ -2149,11 +2015,7 @@ export function injectM0M1Pi(
 	let freshFallbackRenderedRevisionLocators: string[] | null = null;
 
 	if (decision.value) {
-		// On contention exhaustion, reuse the cached m[0]/m[1] pair rather than
-		// throwing (matches OpenCode injectM0M1). A sibling process mutated state
-		// mid-materialization; serving the slightly-stale cached pair this pass is
-		// correct and the next pass retries — dropping injection entirely would lose
-		// the whole history block.
+		// On contention exhaustion, the renderer serves the cached m[0]/m[1] pair so injection retains the history block.
 		try {
 			const result = materializeM0PiWithRetry(state, db);
 			m0 = result.m0;
@@ -2174,12 +2036,7 @@ export function injectM0M1Pi(
 					"pi m[0] materialization contention exhausted; reusing cached m[0]/m[1]",
 				);
 			} catch {
-				// No cached baseline to fall back to — this happens when the cache was
-				// deliberately cleared THIS pass (cache-bust) and then hit contention.
-				// Dropping injection would lose the entire history block, so render a
-				// fresh (non-persisted) m[0]/m[1] pair as a last resort. It is not cached
-				// because we couldn't win the materialize lock; the next pass
-				// re-materializes and persists.
+				// When a cache-bust clears the baseline before contention, the renderer produces an uncached pair instead of omitting the history block.
 				const fresh = renderFreshM0PiNonPersisted(state, db);
 				m0 = fresh.m0;
 				markers = fresh.snapshotMarkers;
@@ -2211,10 +2068,7 @@ export function injectM0M1Pi(
 				m1Recomputed = true;
 			} catch (error) {
 				if (!(error instanceof PiMaterializeContentionError)) throw error;
-				// Cache was already invalid (no usable cached m[0]/markers to reuse) AND
-				// we lost the materialize lock to a sibling process. Dropping injection
-				// would lose the whole history block, so render a fresh non-persisted
-				// m[0]/m[1] as a last resort — the next pass re-materializes and persists.
+				// When lock contention leaves no usable cached pair, the renderer produces a non-persisted pair to retain the history block.
 				const fresh = renderFreshM0PiNonPersisted(state, db);
 				m0 = fresh.m0;
 				markers = fresh.snapshotMarkers;
@@ -2239,14 +2093,12 @@ export function injectM0M1Pi(
 	}
 
 	if (materialized) {
-		// m[1] was rendered and persisted atomically inside materializeM0Pi.
 	} else if (contentionExhausted && freshFallbackRenderedRevisionLocators) {
 		const freshM1 = renderM1PiWithMetadata(state, db, markers, []);
 		m1 = freshM1.text;
 		memoryUpdateCount = freshM1.memoryUpdateCount;
 		m1Recomputed = true;
 	} else if (contentionExhausted) {
-		// m[1] was replayed with the cached m[0] pair above.
 	} else if (recomputeM1ThisPass) {
 		const refreshed = softRefreshCachedM1Pi({
 			state,
@@ -2267,19 +2119,9 @@ export function injectM0M1Pi(
 		markers = replayed.markers;
 	}
 
-	// Pressure backstop refold (parity with OpenCode) — only on Pi's cache-busting
-	// recompute gate (`executedWorkThisPass`) where m[1] was freshly recomputed;
-	// defer passes replay persisted bytes and must never live-read/refold. Three
-	// independent triggers (any one folds):
-	//   1. memoryUpdateCount > 40 — supersede-delta drift (size-independent).
-	//   2. m[1]/m[0] SIZE RATIO — gated by M0_DRIFT_RATIO_FLOOR so a tiny early
-	//      m[0] doesn't make 15% trivially exceeded and refold every pass.
-	//   3. m[1] ABSOLUTE CAP — when m[0] is small the ratio test is suppressed, so
-	//      m[1] could otherwise grow unbounded after the new_compartment trigger
-	//      was removed. Fold once m[1] exceeds a fixed share of the history budget.
-	// Token counts (NOT char lengths) on both sides of the ratio — parity with
-	// OpenCode. The documented intent is "m[1] exceeds ~15% of m[0] tokens";
-	// char length diverges from token count on XML-heavy / non-Latin content.
+	// The ratio requires m[0] to contain at least 500 tokens so small early snapshots do not trigger refolds.
+	// The absolute cap bounds m[1] while the ratio check is disabled below 500 m[0] tokens.
+	// The ratio compares token counts on both sides, not character lengths.
 	const M0_DRIFT_RATIO_FLOOR_TOKENS = 500;
 	const M1_DRIFT_RATIO = 0.15;
 	const M1_ABSOLUTE_CAP_RATIO = 0.2;
@@ -2313,7 +2155,6 @@ export function injectM0M1Pi(
 			materialized = true;
 		} catch (error) {
 			if (!(error instanceof PiMaterializeContentionError)) throw error;
-			// Keep the un-refolded m[0]/m[1]; next pass retries the fold.
 		}
 	}
 
@@ -2322,21 +2163,9 @@ export function injectM0M1Pi(
 		currentCompartments,
 		boundaryId,
 	);
-	// m[1]-side coverage watermark for the deferred-marker drain (liveness
-	// fix): fresh publications render their compartment into the m[1] delta —
-	// m[0] folds new compartments only on a HARD bust — so the m[0] snapshot
-	// boundary above stays behind the pending marker until an unrelated HARD
-	// fold. The drain may apply once the marker is covered by a compartment
-	// THIS pass actually rendered into m[1]. Derived from the SAME compartment
-	// snapshot the m[1] render used (TOCTOU: the drain gate must never
-	// re-derive this from live DB rows), and only when m[1] was freshly
-	// recomputed this pass without a contention fallback — the sibling-
-	// fallback (stale bytes, recomputed=false) and pure-replay branches leave
-	// it null so the drain preserves the deferred signal. Compartments at or
-	// below markers.maxCompartmentSeq are m[0] content already certified by
-	// renderedBoundary; only compartments beyond that watermark are m[1]
-	// content, so the latest snapshot compartment qualifies exactly when the
-	// m[1] delta carried it.
+	// The drain may apply only when m[1] rendered the compartment during the current pass.
+	// The coverage watermark must derive from rendered compartments, not live DB rows.
+	// Keep the coverage watermark null when m[1] is replayed or borrowed; neither branch rendered compartments eligible for draining.
 	let m1RenderedCoverage: PiRenderedCompartmentBoundary | null = null;
 	if (m1Recomputed && !contentionExhausted) {
 		const latestM1Compartment = currentCompartments.at(-1);
@@ -2375,15 +2204,6 @@ export function injectM0M1Pi(
 		).length > 0;
 	if (claimLaneMoved) {
 		m0 = stripProjectMemoryBlock(m0);
-		// The mural is a picture of the same claim lane: it renders public claim
-		// ids, categories, and cue text drawn from the snapshot this fence just
-		// declared stale. Withholding only the text would leave those cues legible
-		// in the image, so drop the cached wire payload and its hash too. Safe to
-		// clear rather than merely skip: the payload is frozen alongside
-		// claimSnapshotVector in one cached m[0] row, so a moved vector means this
-		// image can never be published again. The next pass folds on the same
-		// vector change and re-derives it from the project-level mural render,
-		// which reuses the stored PNG whenever the cue text is unchanged.
 		rememberPiMuralPayload(state.sessionId, null, null);
 		db.prepare(
 			"UPDATE session_meta SET memory_block_count = 0, memory_block_ids = '[]', memory_block_hashes = '[]' WHERE session_id = ?",
@@ -2392,11 +2212,6 @@ export function injectM0M1Pi(
 	const muralWire = m0.includes("<memory-mural>")
 		? muralForWire(state.sessionId)
 		: undefined;
-	// Runs after the staleness fence so one predicate covers both cases: a legacy
-	// row with no paired payload that cannot replay its old image part, and a stale
-	// snapshot whose payload was just dropped above. Since that omission already
-	// changes provider-visible bytes, remove the false text claiming an image
-	// follows and keep the fallback internally consistent.
 	if (!muralWire) m0 = stripMemoryMuralBlock(m0);
 	prependM0M1Messages(piMessages, m0, m1, muralWire);
 	logSession(
@@ -2423,7 +2238,6 @@ export function injectM0M1Pi(
 		contentionExhausted,
 		renderedBoundary,
 		m1RenderedCoverage,
-		// prependM0M1Messages always unshifts exactly the m[0] + m[1] pair.
 		syntheticLeadingCount: 2,
 	};
 }

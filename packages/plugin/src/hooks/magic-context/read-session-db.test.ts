@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -16,15 +15,14 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 afterEach(() => {
-    // Close any cached OpenCode read-only DB handle so the new XDG_DATA_HOME
-    // points to a fresh DB on the next test case.
+    // Close the cached OpenCode read-only DB handle so the next test case opens a DB under the new XDG_DATA_HOME.
     closeReadOnlySessionDb();
     process.env.XDG_DATA_HOME = originalXdgDataHome;
     for (const dir of tempDirs) {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     }
     tempDirs.length = 0;
@@ -217,7 +215,7 @@ describe("isMidTurnFromOpenCodeDb", () => {
         const db = createMidTurnDb();
         insertAssistant(db, "session-1", "assistant-1", { finish: "tool-calls" }, 100);
         insertUser(db, "session-1", "user-1", { content: "new turn" }, 200);
-        // No parts inserted — partless messages must count as real.
+        // Partless messages count as real.
 
         expect(isMidTurnFromOpenCodeDb(db, "session-1")).toBe(false);
     });
@@ -462,7 +460,7 @@ describe("findLastAssistantModelFromOpenCodeDb", () => {
                 timeCreated: 2000,
             },
         ]);
-        // Returns the fully-populated earlier assistant rather than the newer partial row.
+        // `findLastAssistantModelFromOpenCodeDb` returns the fully populated earlier assistant rather than the newer partial row.
         expect(findLastAssistantModelFromOpenCodeDb("ses_A")).toEqual({
             providerID: "anthropic",
             modelID: "claude-opus-4-7",
@@ -501,7 +499,7 @@ describe("findLastAssistantModelFromOpenCodeDb", () => {
 
     it("returns null gracefully when the DB is missing entirely", () => {
         useTempDataHome("read-session-db-missing-db-");
-        // Do NOT create the DB. The helper should log and return null instead of throwing.
+        // `findLastAssistantModelFromOpenCodeDb` logs an absent session DB error and returns `null` without creating a DB.
         expect(findLastAssistantModelFromOpenCodeDb("ses_A")).toBeNull();
     });
 
@@ -543,9 +541,9 @@ describe("findLastAssistantModelFromOpenCodeDb", () => {
             providerID: "anthropic",
             modelID: "claude-opus-4-7",
         });
-        // Important: must not have an `agent` property at all (RPC handler
-        // checks `if (recovered.agent)` so undefined is fine, but presence
-        // of an empty string would break the agentBySession lookup).
+        // `agent` must be absent; an empty string triggers the `agentBySession` lookup.
+        // `recovered.agent` must be absent; an empty string triggers the `agentBySession` lookup.
+        // `recovered.agent` must be absent; an empty string triggers the `agentBySession` lookup.
         expect((result as { agent?: string }).agent).toBeUndefined();
     });
 });

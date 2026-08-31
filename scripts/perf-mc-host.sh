@@ -122,7 +122,7 @@ budget_collect() {
   return "$rc"
 }
 
-# Odd blocks run arms forward, even blocks reversed (matches
+# Even blocks reverse arm order to counter time-dependent drift.
 # evidence::counterbalanced_schedule).
 budget_block() {
   local block="$1"
@@ -142,8 +142,7 @@ budget_block() {
   done
   # Cross-NUMA paired arms: auto-selection either finds a pair or
   # finalizes a structured skip without failing the block. Their order
-  # reverses on even blocks exactly like the same-L3 arms, so
-  # time-dependent drift cancels for the cross-NUMA paired comparison
+  # Their order reverses on even blocks exactly like the same-L3 arms.
   # too.
   local cross=(atomic-floor ring-serial)
   if (((block - 1) % 2 == 1)); then

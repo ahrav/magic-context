@@ -7,10 +7,6 @@ import { join } from "node:path";
 import { detectConflicts, resolveCompactionForBoot } from "./conflict-detector";
 
 /**
- * Regression tests for plugin-conflict detection. The previous substring-
- * based matcher misclassified `oh-my-opencode-slim` and `opencode-dcp-fork`
- * as the canonical plugins, causing magic-context to disable itself with
- * a false-positive conflict warning. See issue #43.
  */
 describe("detectConflicts", () => {
     let projectDir: string;
@@ -27,9 +23,9 @@ describe("detectConflicts", () => {
         homeDir = join(root, "home");
         mkdirSync(homeDir, { recursive: true });
 
-        // Save and override every env var that affects config-path resolution.
-        // OPENCODE_CONFIG_DIR takes precedence over XDG_CONFIG_HOME, so we set
-        // it directly and clear XDG to fully isolate from any inherited or
+        // The test isolates config-path resolution from inherited environment variables.
+        // `OPENCODE_CONFIG_DIR` overrides `XDG_CONFIG_HOME`.
+        // Clearing `XDG_CONFIG_HOME` prevents inherited config paths from affecting the test.
         // test-leaked state.
         originalEnv = {
             OPENCODE_CONFIG_DIR: process.env.OPENCODE_CONFIG_DIR,
@@ -40,8 +36,7 @@ describe("detectConflicts", () => {
         process.env.OPENCODE_CONFIG_DIR = userConfigDir;
         process.env.HOME = homeDir;
         delete process.env.XDG_CONFIG_HOME;
-        // Disable auto-compaction default during tests so we isolate plugin
-        // detection from compaction detection.
+        // Setting `OPENCODE_DISABLE_AUTOCOMPACT=1` isolates plugin detection from compaction detection.
         process.env.OPENCODE_DISABLE_AUTOCOMPACT = "1";
     });
 
@@ -50,11 +45,10 @@ describe("detectConflicts", () => {
             if (v === undefined) delete process.env[k];
             else process.env[k] = v;
         }
-        // Test directories live under tmpdir(); cleanup is best-effort.
         try {
             rmSync(projectDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
         try {
             rmSync(userConfigDir, {
@@ -64,7 +58,7 @@ describe("detectConflicts", () => {
                 retryDelay: 100,
             });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     });
 
@@ -72,7 +66,6 @@ describe("detectConflicts", () => {
         writeFileSync(join(projectDir, "opencode.json"), JSON.stringify({ plugin: plugins }));
     }
 
-    // --- DCP detection ---
 
     describe("DCP detection", () => {
         it("matches the canonical @tarquinen/opencode-dcp package", () => {
@@ -106,13 +99,12 @@ describe("detectConflicts", () => {
         });
     });
 
-    // --- OMO detection (the issue #43 case) ---
 
     describe("OMO detection", () => {
         it("matches the canonical oh-my-opencode package", () => {
             writeProjectConfig(["oh-my-opencode"]);
             const result = detectConflicts(projectDir);
-            // No OMO config = hooks default ACTIVE = all three flagged
+            // Without OMO config, the detector flags all three default-active hooks.
             expect(result.conflicts.omoPreemptiveCompaction).toBe(true);
             expect(result.conflicts.omoContextWindowMonitor).toBe(true);
             expect(result.conflicts.omoAnthropicRecovery).toBe(true);
@@ -164,8 +156,7 @@ describe("detectConflicts", () => {
         });
 
         it("still detects canonical OMO when slim is also installed", () => {
-            // A user running both slim and the real OMO should still get
-            // the conflict warning for the real one.
+            // The detector flags canonical OMO when the config also contains slim OMO.
             writeProjectConfig(["oh-my-opencode-slim", "oh-my-opencode@latest"]);
             const result = detectConflicts(projectDir);
             expect(result.conflicts.omoPreemptiveCompaction).toBe(true);
@@ -237,7 +228,7 @@ describe("detectConflicts", () => {
                 join(omoDir, "omo.jsonc"),
                 JSON.stringify({
                     "[opencode]": {
-                        // No disabled_hooks — hooks default ACTIVE
+                        // Without `disabled_hooks`, OMO activates hooks by default.
                     },
                 }),
             );
@@ -249,14 +240,14 @@ describe("detectConflicts", () => {
 
         it("reads disabled_hooks from both old and new config paths", () => {
             writeProjectConfig(["oh-my-opencode"]);
-            // Old path: only disables preemptive-compaction
+            // The legacy config path disables only preemptive-compaction.
             writeFileSync(
                 join(projectDir, "oh-my-opencode.json"),
                 JSON.stringify({
                     disabled_hooks: ["preemptive-compaction"],
                 }),
             );
-            // New path: disables the other two
+            // The unified config path disables the hooks not disabled by the legacy config.
             const omoDir = join(homeDir, ".omo");
             mkdirSync(omoDir, { recursive: true });
             writeFileSync(
@@ -271,7 +262,7 @@ describe("detectConflicts", () => {
                 }),
             );
             const result = detectConflicts(projectDir);
-            // All three are disabled across both configs
+            // Together, the legacy and unified configs disable all three OMO hooks.
             expect(result.hasConflict).toBe(false);
         });
 
@@ -292,7 +283,6 @@ describe("detectConflicts", () => {
         });
     });
 
-    // --- Combined / control cases ---
 
     it("returns no conflicts for an empty plugin list", () => {
         writeProjectConfig([]);
@@ -306,10 +296,8 @@ describe("detectConflicts", () => {
         expect(result.hasConflict).toBe(false);
     });
 
-    // --- Tuple plugin entries (issue #49) ---
     // OpenCode supports ["pkg@version", { ...options }] tuple form.
-    // The old code spread the raw array into the plugin list, causing
-    // matchesPackageName to receive an array instead of a string → crash.
+    // `matchesPackageName` accepts package strings, so the detector normalizes tuple entries first.
 
     describe("tuple plugin entries (issue #49)", () => {
         it("does not crash when a plugin is defined as a [name, options] tuple", () => {
@@ -349,20 +337,11 @@ describe("detectConflicts", () => {
         });
     });
 
-    // --- Compaction-off mode matrix (issue #266 S2) ---
-    // The detector must NOT flag OpenCode compaction.auto=true / prune=true as
-    // a plugin-disabling conflict when MC compaction is OFF (compaction-off
-    // mode), or compaction-off users get a DISABLED plugin — the exact inverse
-    // of intent. With MC compaction ON, today's conflict behavior is unchanged.
+    // When MC compaction is off, the detector must not treat native compaction.auto or compaction.prune as a plugin-disabling conflict.
+    // When MC compaction is on, the detector treats `compaction.auto` and `compaction.prune` as conflicts.
     //
-    // The 2x2 matrix: MC mode (on/off) x native compaction.auto (true/false).
-    // Each case asserts BOTH the conflict verdict AND the plugin-enabled
-    // outcome (the boot path disables the plugin when hasConflict).
     describe("compaction-off mode matrix (issue #266)", () => {
-        // The suite beforeEach sets OPENCODE_DISABLE_AUTOCOMPACT=1 to isolate
-        // plugin detection from compaction detection. These matrix tests
-        // exercise compaction detection directly, so they clear that env var
-        // and write an explicit compaction block to control the native state.
+        // Tests that exercise compaction detection clear `OPENCODE_DISABLE_AUTOCOMPACT`, which the suite setup sets to `1`.
         function writeCompactionConfig(auto: boolean, prune = false): void {
             const prev = process.env.OPENCODE_DISABLE_AUTOCOMPACT;
             delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
@@ -403,7 +382,6 @@ describe("detectConflicts", () => {
             expect(result.conflicts.compactionAuto).toBe(false);
             expect(result.conflicts.compactionPrune).toBe(false);
             expect(result.hasConflict).toBe(false);
-            // Native compaction state is still reported honestly.
             expect(result.nativeCompaction.auto).toBe(true);
         });
 
@@ -412,15 +390,11 @@ describe("detectConflicts", () => {
             const result = detectWithMode(false);
             expect(result.conflicts.compactionAuto).toBe(false);
             expect(result.hasConflict).toBe(false);
-            // No-manager: neither MC nor native compaction owns the window.
+            // When MC compaction and native compaction are disabled, neither manages compaction.
             expect(result.nativeCompaction.auto).toBe(false);
             expect(result.nativeCompaction.prune).toBe(false);
         });
 
-        // Mutation direction: force mode-on in the detector with auto=true →
-        // conflict fires. This proves the off-gate isn't just always-pass —
-        // the same native config that was NOT a conflict in the off case
-        // becomes a conflict when the mode is forced on.
         it("mutation direction: same auto=true config DOES conflict when mode forced on", () => {
             writeCompactionConfig(true);
             const offResult = detectWithMode(false);
@@ -430,7 +404,7 @@ describe("detectConflicts", () => {
             expect(onResult.conflicts.compactionAuto).toBe(true);
         });
 
-        // prune=true follows the same gate as auto=true.
+        // `compaction.prune=true` is a conflict only when MC compaction is enabled.
         it("MC OFF + prune=true → NO conflict (prune is not a conflict in compaction-off mode)", () => {
             writeCompactionConfig(false, true);
             const result = detectWithMode(false);
@@ -439,7 +413,7 @@ describe("detectConflicts", () => {
             expect(result.nativeCompaction.prune).toBe(true);
         });
 
-        // DCP and OMO conflicts keep their existing policy in BOTH modes.
+        // DCP and OMO conflicts disable the plugin whether compactionEnabled is true or false.
         it("MC OFF + DCP plugin → DCP conflict still fires (compaction-off does not broaden compatibility)", () => {
             writeProjectConfig(["@tarquinen/opencode-dcp"]);
             const result = detectWithMode(false);
@@ -454,8 +428,8 @@ describe("detectConflicts", () => {
             expect(result.hasConflict).toBe(true);
         });
 
-        // Default (no options) preserves today's mode-on behavior — a call
-        // site that cannot supply the resolved mode fails toward mode-on.
+        // `detectConflicts` defaults `compactionEnabled` to `true` when options omit it.
+        // `detectConflicts` uses file-based compaction detection when `resolvedCompaction` is absent.
         it("default (no options) treats compaction.auto=true as a conflict (fail toward mode-on)", () => {
             writeCompactionConfig(true);
             const prev = process.env.OPENCODE_DISABLE_AUTOCOMPACT;
@@ -470,15 +444,8 @@ describe("detectConflicts", () => {
         });
     });
 
-    // --- Resolved-config arm (issue #309) ---
-    // The plugin boot now consumes the host's RESOLVED config
-    // (ctx.client.config.get()) instead of re-deriving compaction from files.
-    // These tests exercise the resolved arm directly via the
-    // `resolvedCompaction` option and the `resolveCompactionForBoot` helper.
+    // The plugin boot consumes the host's resolved config instead of re-deriving compaction from files.
     describe("resolved-config arm (issue #309)", () => {
-        // The suite beforeEach sets OPENCODE_DISABLE_AUTOCOMPACT=1 to isolate
-        // plugin detection from compaction detection. These tests exercise the
-        // resolved arm, so they clear it and restore it per-case.
         function withoutAutoCompactEnv<T>(fn: () => T): T {
             const prev = process.env.OPENCODE_DISABLE_AUTOCOMPACT;
             delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
@@ -490,9 +457,8 @@ describe("detectConflicts", () => {
         }
 
         it("resolved auto=false + file layer that would default true → NO conflict (#309)", () => {
-            // No compaction block in any file + no env override → the file-based
-            // arm would default to auto=true and wrongly disable the plugin.
-            // The resolved arm says auto=false, which must win.
+            // Without a compaction block or environment override, file-based detection defaults `auto` to `true`.
+            // `resolvedCompaction.auto=false` overrides the file-based default.
             withoutAutoCompactEnv(() => {
                 const result = detectConflicts(projectDir, {
                     compactionEnabled: true,
@@ -529,19 +495,17 @@ describe("detectConflicts", () => {
         });
 
         it("resolved arm is skipped when resolvedCompaction is absent (file-based fallback unchanged)", () => {
-            // No resolvedCompaction → the file-based check runs. With no
-            // compaction block and no env override, it defaults to auto=true.
             withoutAutoCompactEnv(() => {
                 const result = detectConflicts(projectDir, { compactionEnabled: true });
                 expect(result.conflicts.compactionAuto).toBe(true);
                 expect(result.hasConflict).toBe(true);
-                // File-based arm does NOT carry the resolved-config label.
+                // `resolvedCompaction` is not reported for file-based detection.
                 expect(result.reasons.join("; ")).not.toContain("(resolved config)");
             });
         });
 
         it("OPENCODE_DISABLE_AUTOCOMPACT short-circuits the resolved arm", () => {
-            // Resolved says auto=true, but the env override must win.
+            // OPENCODE_DISABLE_AUTOCOMPACT overrides resolvedCompaction.auto and resolvedCompaction.prune.
             process.env.OPENCODE_DISABLE_AUTOCOMPACT = "1";
             try {
                 const result = detectConflicts(projectDir, {
@@ -566,13 +530,12 @@ describe("detectConflicts", () => {
                 });
                 expect(result.conflicts.compactionAuto).toBe(false);
                 expect(result.hasConflict).toBe(false);
-                // Native compaction state is still reported honestly.
+                // Native compaction state remains reported when compactionEnabled is false.
                 expect(result.nativeCompaction.auto).toBe(true);
             });
         });
     });
 
-    // --- resolveCompactionForBoot (the resolved-config fetch helper) ---
     describe("resolveCompactionForBoot", () => {
         it("returns the resolved compaction block from the client", async () => {
             const client = {
@@ -587,12 +550,7 @@ describe("detectConflicts", () => {
         });
 
         it("returns null when the compaction block is absent (file-based fallback, not host defaults)", async () => {
-            // An absent block means the response shape did not carry the resolved
-            // state (server version drift, a fetch racing boot) — NOT that the
-            // host resolved its defaults. Reading absence as auto=true disabled
-            // the plugin for real users whose auto=false lived in the file layer
-            // (issue #309, second arm: the 2026-08-14 desktop incident where
-            // every session overflowed with nothing managing the window).
+            // An absent compaction block is not evidence that the host resolved default values.
             const client = {
                 config: {
                     get: async () => ({ data: {} }),

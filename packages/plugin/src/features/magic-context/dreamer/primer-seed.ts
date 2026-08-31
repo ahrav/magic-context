@@ -1,24 +1,10 @@
 /**
- * Seed assembly for the open-book refresh-primers investigation.
  *
- * The seed is ORIENTATION, not the answer source: it tells the investigator
- * WHERE the question arose and WHAT the main agent read — then the investigator
- * re-reads CURRENT source to ground the answer. Two structural guarantees make
- * "current source is truth, not the old chunk's conclusions" enforceable instead
- * of merely prompted:
+ * The seed provides orientation, not answer content.
  *
- *  1. The orientation seed renders ONLY `U:` (what was asked) and `TC:` (which
- *     files/symbols were read) lines — the assistant's old `A:` conclusions are
- *     NEVER rendered, so the model cannot paraphrase them. (The standard chunk
- *     formatter interleaves A: narrative with TC: in one block, so this needs a
- *     dedicated renderer, not a line filter.)
- *  2. TC: shows tool INPUTS only (no outputs) — already the formatter default.
+ * TC: lines include tool-call inputs, not outputs.
  *
- * Raw availability: reading old origin raw works on OpenCode (compaction markers
- * filter summary rows, they don't delete message/part rows). When the raw range
- * is empty (deleted session, or Pi-only with no provider registered), we fall
- * back to a closed-book seed (origin compartment P1) rather than silently
- * proceeding with an empty orientation.
+ * The builder uses the origin compartment's P1 when the raw range is empty.
  */
 import {
     cleanUserText,
@@ -35,20 +21,19 @@ import type { RawMessage } from "../../../hooks/magic-context/read-session-raw";
 import type { Database } from "../../../shared/sqlite";
 import { getPrimerCandidatesByIds, type Primer } from "../storage-primers";
 
-/** Token cap for the rendered orientation seed — a huge origin compartment must
- *  not blow the prompt; the investigator digs via tools, it does not need the
- *  whole chunk inline. */
+/**
+ * */
 export const PRIMER_SEED_CAP_TOKENS = 4000;
 
 export interface PrimerSeed {
-    /** "raw" = U:/TC: orientation from the origin compartment; "closed-book" =
-     *  origin compartment P1 (raw unavailable). */
+    /** `"raw"` uses U:/TC: orientation from the origin compartment.
+     * `"closed-book"` uses the origin compartment's P1 when raw data is unavailable. */
     kind: "raw" | "closed-book";
-    /** The orientation block (already token-capped). */
+    /* */
     orientation: string;
-    /** P1 of the immediately-preceding and -following compartments, for context. */
+    /** `prePost` stores P1, or content when P1 is null, from adjacent sequence numbers. */
     prePost: string;
-    /** Session + ordinal range the orientation came from (for logging). */
+    /* */
     sessionId: string | null;
 }
 
@@ -62,9 +47,8 @@ interface CompartmentP1Row {
 }
 
 /**
- * Render ONLY user text (`U:`) and tool-call summaries (`TC:`) for the raw
- * messages in [startOrdinal, endOrdinal]. Assistant narrative is structurally
- * excluded — there is no code path that emits an `A:` line here.
+ * The renderer appends a truncation notice when adding a noninitial line would exceed capTokens.
+ * The renderer structurally excludes assistant narrative.
  */
 function renderUserAndToolOrientation(
     messages: RawMessage[],
@@ -85,8 +69,7 @@ function renderUserAndToolOrientation(
                 .join(" / ");
             if (text) out.push(`U: ${text}`);
         }
-        // Tool-call inputs (no outputs) — what the agent looked at. Applies to
-        // both assistant tool-use messages and tool-result user messages.
+        // TC: lines include tool-call inputs from assistant tool-use and tool-result user messages, not outputs.
         for (const tc of extractToolCallSummaries(msg.parts)) out.push(tc);
         for (const line of out) {
             const lineTokens = estimateTokens(line);
@@ -145,14 +128,14 @@ function closedBookOriginP1(
 }
 
 /**
- * Build the orientation seed for a primer from its most-recent occurrence's
- * origin compartment. MUST be called inside a `withRawSessionMessageCache` scope
- * (and, on Pi, with a RawMessageProvider registered for the session) so the raw
- * read is cached across the run.
+ * The builder uses the primer's most-recent occurrence's origin compartment for its orientation seed.
+ * Callers must invoke this function within a `withRawSessionMessageCache` scope.
+ * Callers on Pi must register a RawMessageProvider for the session so the scope can cache raw-message reads.
+ * A `withRawSessionMessageCache` scope caches raw-message reads for all calls within its callback.
  */
 export function buildPrimerSeed(db: Database, primer: Primer): PrimerSeed {
     const candidates = getPrimerCandidatesByIds(db, primer.sourceCandidateIds);
-    // Most-recent occurrence drives the seed (freshest code context).
+    // Most-recent occurrence drives the seed.
     const mostRecent = candidates
         .slice()
         .sort((a, b) => b.sourceMessageTime - a.sourceMessageTime || b.id - a.id)[0];
@@ -176,8 +159,7 @@ export function buildPrimerSeed(db: Database, primer: Primer): PrimerSeed {
     }
     const inRange = raw.some((m) => m.ordinal >= start && m.ordinal <= end);
     if (!inRange) {
-        // Deleted session, or Pi with no provider registered: do NOT proceed with
-        // an empty orientation — fall back to the origin compartment's P1.
+        // For deleted sessions or Pi sessions without a registered provider, the builder falls back to the origin compartment's P1 instead of returning an empty orientation.
         const closed = closedBookOriginP1(db, sessionId, start);
         return {
             kind: "closed-book",

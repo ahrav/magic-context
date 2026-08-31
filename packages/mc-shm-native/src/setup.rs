@@ -132,7 +132,7 @@ pub fn begin_connect(
     })
 }
 
-/// A ring alone cannot express peer death: a host that exits without a Goodbye frame leaves its rings looking merely idle, so the setup socket is the only liveness signal. `MSG_PEEK` keeps the probe side-effect free and repeatable. commentlint: allow(JUDGE)
+/// A ring alone cannot express peer death: a host that exits without a Goodbye frame leaves its rings looking merely idle, so the setup socket is the only liveness signal. `MSG_PEEK` keeps the probe side-effect free and repeatable.
 pub fn peer_closed(stream: &UnixStream) -> bool {
     let mut probe = [0u8; 1];
     match rustix::net::recv(

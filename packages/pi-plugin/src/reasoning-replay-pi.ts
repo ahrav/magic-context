@@ -1,37 +1,10 @@
 /**
- * Pi-side reasoning clearing & inline-thinking strip — mirrors
- * OpenCode's `clearOldReasoning`, `replayClearedReasoning`, and
  * `replayStrippedInlineThinking`.
  *
- * Why this matters for Pi:
- *   - Pi assistants carry `(PiTextContent | PiThinkingContent | PiToolCall)[]`
- *     in their `content` arrays.
- *   - Older assistant turns' thinking content stays visible to the
- *     model on every pass, wasting tokens AND mutating cached prefix
- *     content if it ever changes shape (e.g. thinking blocks getting
- *     stripped lazily by the provider). Both are exactly what
- *     OpenCode's reasoning-clearing replay was added to fix.
  *
  * Behavior:
- *   - On execute passes (cache-busting): walk Pi assistant messages
- *     whose tag number is older than `clear_reasoning_age` from the
- *     newest tag, EMPTY each `PiThinkingContent.thinking` (and drop its
- *     stale signature), persist watermark = max-tag-cleared in
- *     `session_meta.cleared_reasoning_through_tag`. Pi serializers drop
- *     empty thinking before the wire, so nothing (and no stale signature)
- *     reaches any provider.
- *   - On EVERY pass (including defer): replay the cleared state from
- *     the watermark so the message array stays byte-stable — same
- *     contract as OpenCode's `replayClearedReasoning`.
- *   - Inline `<thinking>...</thinking>` markup in text content is also
- *     stripped on every pass via the same watermark.
+ * Inline thinking markup is removed for messages through the cleared-reasoning watermark.
  *
- * Providers with `capabilities.interleaved.field` (e.g. Moonshot/Kimi
- * `reasoning_content`) used to need a special bypass to keep typed
- * reasoning intact. OpenCode PR #24146 (preserve empty reasoning_content
- * for DeepSeek V4 thinking mode) made the provider transform always
- * emit the interleaved field — empty when no reasoning parts remain —
- * so the bypass is no longer needed.
  */
 
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -63,17 +36,8 @@ const INLINE_THINKING_PATTERNS = [
 	/<think>[\s\S]*?<\/think>\s*/gi,
 ] as const;
 
-// Pi clears old reasoning to an EMPTY thinking block (not "[cleared]"). Every Pi
-// serializer drops empty thinking before the wire — anthropic.ts (empty thinking
-// skipped), openai-completions.ts (filtered out of nonEmptyThinkingBlocks, with
-// reasoning_content="" auto-filled for providers that require it), and
-// amazon-bedrock.ts (empty thinking skipped). So an emptied block reaches NO
-// provider, which structurally eliminates the stale-signature hazard that
-// "[cleared]" + the original signature created on canonical Claude/Bedrock (a
-// content/signature mismatch). The signature is dropped too since the block is
-// discarded everywhere. This is intentionally DIFFERENT from OpenCode, whose
-// non-Anthropic adapters forward empty parts, so OpenCode must keep "[cleared]"
-// for canonical-anthropic-only and gate the write off elsewhere (see PARITY.md).
+// Pi's Amazon Bedrock serializer omits empty thinking blocks.
+// Omitting empty thinking blocks prevents stale content/signature pairs from reaching providers.
 const CLEARED = "";
 
 function stripInlineThinkingMarkup(text: string): string {
@@ -85,15 +49,9 @@ function stripInlineThinkingMarkup(text: string): string {
 }
 
 /**
- * Build a `messageIdToTagNumber` map from the tagger's `targets` map
- * (returned by `tagTranscript`). For each message that has any tagged
- * part, record the MAX tag number across its parts — same contract
- * OpenCode's `messageTagNumbers` uses (see tag-messages.ts:209).
  *
- * Only text and tool tags are present in `targets`; thinking parts
- * are not tagged. That's fine: we only need the message's primary
- * tag to gate reasoning replay, and the primary tag always comes
- * from a text or tool part.
+ * Thinking parts are absent from `targets`.
+ * Reasoning replay uses each message's maximum tag.
  */
 export function buildMessageIdToMaxTag(
 	targets: Map<number, TagTarget>,
@@ -109,12 +67,7 @@ export function buildMessageIdToMaxTag(
 }
 
 /**
- * Clear typed reasoning on assistant messages whose tag number is
- * older than `(maxTag - clearReasoningAge)`. Returns the highest tag
- * number that was actually cleared, so the caller can persist the
- * watermark via `setReasoningWatermark`.
  *
- * Mirrors OpenCode's `clearOldReasoning` (strip-content.ts).
  */
 export function clearOldReasoningPi(args: {
 	messages: unknown[];
@@ -153,18 +106,11 @@ export function clearOldReasoningPi(args: {
 				(part as { type?: unknown }).type === "thinking"
 			) {
 				const tp = part as PiThinkingContent;
-				// Leave REDACTED thinking blocks untouched. Unlike normal thinking,
-				// redacted blocks bypass the empty-drop in Pi's serializers
-				// (transform-messages.ts and anthropic.ts serialize `redacted`
-				// before the empty-thinking check), so emptying one + dropping its
-				// signature would leave a malformed redacted block (no data, no sig)
-				// on the wire. A redacted block carries no plaintext to save anyway;
-				// keeping it verbatim is both safe and byte-stable across passes.
+				// The loop preserves redacted thinking blocks because serializers retain them even when empty.
+				// Redacted blocks contain no plaintext, so clearing them saves no tokens.
+				// Keeping redacted blocks verbatim preserves byte stability across passes.
 				if (tp.redacted) continue;
-				// Empty the thinking AND drop its now-stale signature (a signature
-				// over the original text would mismatch the emptied content). The
-				// empty block is dropped by every Pi serializer, so neither reaches
-				// the wire; dropping the sig keeps clear/replay producing identical
+				// Clearing eligible thinking blocks also removes signatures for the original thinking text.
 				// working-array state.
 				if (tp.thinking !== CLEARED || tp.thinkingSignature !== undefined) {
 					tp.thinking = CLEARED;
@@ -181,10 +127,6 @@ export function clearOldReasoningPi(args: {
 }
 
 /**
- * Strip inline `<thinking>...</thinking>` and `<think>...</think>` markup
- * from assistant text content on execute passes. Returns the highest
- * message tag actually stripped so callers can persist it through
- * `setReasoningWatermark` and replay the same stripping on defer passes.
  */
 export function stripInlineThinkingPi(args: {
 	messages: unknown[];
@@ -241,9 +183,6 @@ export function stripInlineThinkingPi(args: {
 }
 
 /**
- * Replay typed-reasoning clearing on EVERY pass (execute or defer).
- * Mirrors OpenCode's `replayClearedReasoning` — required for cache
- * stability so the Pi assistant content array stays byte-identical
  * across passes.
  */
 export function replayClearedReasoningPi(args: {
@@ -279,13 +218,7 @@ export function replayClearedReasoningPi(args: {
 				(part as { type?: unknown }).type === "thinking"
 			) {
 				const tp = part as PiThinkingContent;
-				// Mirror clearOldReasoningPi exactly: redacted blocks are left
-				// untouched (they bypass the serializers' empty-drop, so emptying
-				// one would put a malformed redacted block on the wire).
 				if (tp.redacted) continue;
-				// Replay the exact clear shape from clearOldReasoningPi: empty
-				// thinking + dropped signature, so defer passes are byte-identical
-				// to the cache-busting pass that set the watermark.
 				if (tp.thinking !== CLEARED || tp.thinkingSignature !== undefined) {
 					tp.thinking = CLEARED;
 					tp.thinkingSignature = undefined;
@@ -298,12 +231,7 @@ export function replayClearedReasoningPi(args: {
 }
 
 /**
- * Replay inline `<thinking>...</thinking>` stripping on EVERY pass.
- * Mirrors OpenCode's `replayStrippedInlineThinking`. Some providers
- * (e.g. older Anthropic responses, Kimi non-interleaved) emit inline
- * thinking markup inside text content; once we strip it on an
- * execute pass via the same watermark, we must keep stripping on
- * every later pass to keep the prefix stable.
+ * This function replays inline `<thinking>...</thinking>` stripping on every pass.
  */
 export function replayStrippedInlineThinkingPi(args: {
 	db: ContextDatabase;
@@ -351,16 +279,10 @@ export function replayStrippedInlineThinkingPi(args: {
 }
 
 /**
- * @internal TEST-ONLY legacy index-id helper. NOT for production use.
+ * Index-based fallback IDs are for tests only.
  *
- * Production code resolves stable ids exclusively through
- * `resolvePiStableId` (read-session-pi.ts), which prefers the real
- * SessionEntry id and only falls back to this `pi-msg-<index>-...` format.
- * This standalone export produces ONLY the index-based fallback, which DRIFTS
- * when the visible array shifts — using it in production would reintroduce the
- * orphaned-state / cache-bust bug the unification fixed. It is retained solely
- * so the reasoning-replay unit tests can exercise the index-id shape directly.
- * Do not import it into production modules; reach for `resolvePiStableId`.
+ * Production callers must use `resolvePiStableId`.
+ * Index-based IDs can orphan persisted state when the visible array shifts.
  */
 export function piMessageStableId(
 	msg: unknown,

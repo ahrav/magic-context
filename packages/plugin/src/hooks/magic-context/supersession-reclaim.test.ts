@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -42,7 +41,7 @@ function freshDb(): ReturnType<typeof openDatabase> & object {
 
 const SES = "ses-1";
 
-/** A droppable tool target; optional input for ctx_note action / edit filePath reads. */
+/* */
 function target(input?: Record<string, unknown>): TagTarget {
     return {
         setContent: () => true,
@@ -54,7 +53,7 @@ function target(input?: Record<string, unknown>): TagTarget {
     };
 }
 
-/** A target whose drop would reclaim nothing (absent/incomplete on this pass). */
+/* */
 function noDropTarget(): TagTarget {
     return { setContent: () => false, canDrop: () => false };
 }
@@ -75,7 +74,6 @@ describe("buildSupersessionReclaimOps", () => {
             [3, target()],
         ]);
         const ops = buildSupersessionReclaimOps({ db, sessionId: SES, targets });
-        // newest (3) kept; 1 and 2 dropped.
         expect(ids(ops)).toEqual([1, 2]);
     });
 
@@ -151,7 +149,6 @@ describe("buildSupersessionReclaimOps", () => {
             targets,
             pendingOps: [{ id: 1, sessionId: SES, tagId: 2, operation: "drop", queuedAt: 0 }],
         });
-        // 2 already pending, 3 not droppable → only 1.
         expect(ids(ops)).toEqual([1]);
     });
 });
@@ -159,7 +156,6 @@ describe("buildSupersessionReclaimOps", () => {
 describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
     it("keeps the newest edit per file, marks older edits to the same file", () => {
         const db = freshDb();
-        // Two edits to file A, one edit to file B.
         insertTag(db, SES, "c1", "tool", 900, 1, 0, "edit");
         insertTag(db, SES, "c2", "tool", 900, 2, 0, "edit");
         insertTag(db, SES, "c3", "tool", 900, 3, 0, "write");
@@ -173,7 +169,6 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
             sessionId: SES,
             targets,
         });
-        // newest A (2) and only-B (3) kept; older A (1) compressed.
         expect(ids(ops)).toEqual([1]);
         expect([...editMarkerTagIds]).toEqual([1]);
     });
@@ -204,8 +199,6 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
 
     it("excludes non-reclaimable older edits but still marks reclaimable ones", () => {
         const db = freshDb();
-        // All three edit A.ts. Newest-first: 3 (kept), 2 (older, reclaimable),
-        // 1 (older, but can't reclaim → excluded).
         insertTag(db, SES, "c1", "tool", 900, 1, 0, "edit");
         insertTag(db, SES, "c2", "tool", 900, 2, 0, "edit");
         insertTag(db, SES, "c3", "tool", 900, 3, 0, "edit");
@@ -237,14 +230,9 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
             targets,
             pendingOps: [{ id: 1, sessionId: SES, tagId: 1, operation: "drop", queuedAt: 0 }],
         });
-        // older A (1) is already pending → not re-emitted.
         expect(ops).toHaveLength(0);
     });
 
-    // Real-target integration: a COMPLETED OpenCode edit is
-    // `{ type:"tool", state:{ input, output } }`, classified as a "result"
-    // occurrence. The selector must still resolve its filePath (via the
-    // readInput result-occurrence fallback) and compress the older one.
     it("resolves filePath from completed {type:tool} parts and marks the older edit", () => {
         const db = freshDb();
         const tagger = createTagger();
@@ -275,7 +263,6 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
             sessionId: SES,
             targets,
         });
-        // newest (call-b) kept; older (call-a) compressed.
         expect([...editMarkerTagIds]).toEqual([olderId!]);
     });
 });

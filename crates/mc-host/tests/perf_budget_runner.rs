@@ -1,8 +1,3 @@
-//! Runner-level contract tests: script syntax, script/Rust schedule and
-//! rate-default parity, deterministic counterbalanced dry-run schedules,
-//! preserved open-loop arrival schedules, missed-slot accounting under a
-//! full in-flight queue, and throughput-arm rate separation.
-
 #![allow(clippy::duplicate_mod)]
 
 #[path = "support/perf_measurement.rs"]
@@ -17,8 +12,7 @@ mod ring;
 #[path = "support/echo_host.rs"]
 mod echo_host;
 
-// The bench entry point, included for its schedule-expansion seam
-// (`plan_block_entries`, `DEFAULT_RATES`); its collection machinery is
+// `ipc_budget`'s collection machinery is unused.
 // unused here.
 #[path = "../benches/ipc_budget.rs"]
 #[allow(dead_code)]
@@ -39,7 +33,6 @@ fn script_text() -> String {
     std::fs::read_to_string(repo_root().join("scripts/perf-mc-host.sh")).unwrap()
 }
 
-/// The budget arm names in forward orientation, from the shared constants.
 fn budget_arms() -> Vec<String> {
     [
         evidence::ARM_ATOMIC,
@@ -52,7 +45,6 @@ fn budget_arms() -> Vec<String> {
     .collect()
 }
 
-/// The cross-NUMA paired tail in forward orientation.
 fn cross_arms() -> Vec<String> {
     [evidence::ARM_ATOMIC, evidence::ARM_RING_SERIAL]
         .iter()
@@ -60,8 +52,6 @@ fn cross_arms() -> Vec<String> {
         .collect()
 }
 
-/// Extracts every `name=(...)` array assignment in the script as its
-/// whitespace-separated tokens, in file order.
 fn script_array_values(script: &str, name: &str) -> Vec<Vec<String>> {
     let prefix = format!("{name}=(");
     script
@@ -176,7 +166,7 @@ fn dry_run_schedule_is_stable_across_invocations() {
     let second = counterbalanced_schedule(10, &arms);
     assert_eq!(first, second);
     assert_eq!(first.len(), 10);
-    // Counterbalancing: each arm leads half the blocks' orientations.
+    // The two orientations reverse every pairwise arm order.
     assert_eq!(first[0].first(), first[2].first());
     assert_eq!(first[1].first(), first[3].first());
     assert_ne!(first[0].first(), first[1].first());
@@ -208,8 +198,7 @@ fn open_loop_preserves_schedule_and_records_missed_slots() {
     let result = ring::run_open_loop(&host.publication, &cfg).unwrap();
     assert!(!result.truncated, "healthy host must complete the window");
 
-    // The arrival schedule is frozen by (rate, window): the measured slot
-    // count equals measure/interval regardless of completions.
+    // For each `(rate, window)`, the measured slot count equals `measure / interval` regardless of completions.
     let expected_slots = 800 * 50; // 800 ms at 50 slots/ms
     assert!(
         (result.scheduled_slots as i64 - expected_slots).unsigned_abs() <= 1,
@@ -229,12 +218,10 @@ fn open_loop_preserves_schedule_and_records_missed_slots() {
     );
     assert!(result.outcomes.success > 0);
 
-    // Issue-time discrimination: with a saturated one-deep window the
-    // generator runs behind schedule, so recorded lag is large and
+    // With a saturated one-deep window, the generator runs behind schedule, so recorded lag is large.
     // mean(sched-to-completion) = mean(issue-to-completion) + mean(lag)
-    // (identical timestamps per request). An implementation that timed
-    // issue from the scheduled slot would record lag but identical
-    // sched/issue distributions and fail this.
+    // Each request uses the same timestamps in both mean calculations.
+    // Issue timestamps must record actual issuance, not the scheduled slot.
     let sched_mean = result.sched_to_completion.mean();
     let issue_mean = result.issue_to_completion.mean();
     let lag_mean = result.scheduler_lag.mean();
@@ -262,12 +249,11 @@ fn open_loop_separates_lag_from_server_latency() {
     assert!(!result.truncated, "healthy host must complete the window");
     assert!(result.outcomes.success > 0);
     assert!(result.outcomes.conserved(result.scheduled_slots));
-    // Three distinct distributions with consistent sample counts.
     assert_eq!(result.sched_to_completion.len(), result.outcomes.success);
     assert_eq!(result.issue_to_completion.len(), result.outcomes.success);
     assert_eq!(result.scheduler_lag.len(), result.outcomes.success);
-    // sched-to-completion >= issue-to-completion for every request, so it
-    // holds for medians too.
+    // For every request, `sched-to-completion >= issue-to-completion`.
+    // The same inequality holds for medians.
     assert!(
         result.sched_to_completion.value_at_quantile(0.5)
             >= result.issue_to_completion.value_at_quantile(0.5)
@@ -292,10 +278,9 @@ fn throughput_arm_reports_rates_separately() {
     assert!(result.successful_per_sec > 0.0);
     assert!(result.goodput_bytes_per_sec > result.successful_per_sec);
     assert!(result.measured >= Duration::from_millis(700));
-    // A healthy window closes either on the boundary terminal (depth-1
-    // requests left in flight) or on the window deadline between frames
-    // (depth in flight); the post-window drain must resolve each exactly
-    // once (an undrained response returns Err instead).
+    // A healthy window closes on the boundary terminal with `depth - 1` requests in flight or on the deadline between frames with `depth` in flight.
+    // The post-window drain must resolve every in-flight request exactly once.
+    // An undrained response returns `Err`.
     let depth = cfg.depth as u64;
     assert!(
         result.drained == depth || result.drained == depth - 1,
@@ -317,9 +302,7 @@ fn serial_arm_stays_one_in_flight() {
     let result = ring::run_serial(&host.publication, &cfg).unwrap();
     assert_eq!(result.outcomes.success, 200);
     assert!(result.outcomes.conserved(result.scheduled));
-    // Serial: one request in flight, so measured wall time is at least
-    // the sum of recorded RTTs; a depth-2 pipeline would halve the wall
-    // time and fail.
+    // With one request in flight, elapsed wall time must be at least the sum of recorded RTTs.
     let sum_rtt_ns: u64 = result
         .histogram
         .iter_recorded()
@@ -339,7 +322,6 @@ fn host_death_mid_run_conserves_outcomes() {
     let host = echo_host::InProcessHost::start(data_dir.path());
     let publication = host.publication.clone();
 
-    // Kill the host mid-measurement from another thread.
     let killer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(600));
         drop(host);
@@ -355,11 +337,9 @@ fn host_death_mid_run_conserves_outcomes() {
     let result = ring::run_open_loop(&publication, &cfg).unwrap();
     killer.join().unwrap();
 
-    // Host death may resolve every in-flight request cleanly first (the
-    // host error-flushes before closing), so specific failure outcomes
-    // are not guaranteed. The guaranteed signals are the truncation
-    // marker — the window cannot complete against a dead host — and
-    // conservation over the slots reached before the break.
+    // Exact completion counts are not guaranteed after a dead-host break.
+    // A truncation marker shows that a window cannot complete against a dead host.
+    // Verify conservation only over slots reached before the break.
     let o = &result.outcomes;
     assert!(
         result.truncated,

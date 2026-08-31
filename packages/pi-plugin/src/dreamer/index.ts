@@ -24,7 +24,7 @@ export interface PiDreamerOptions {
 	db: ContextDatabase;
 	projectDir: string;
 	projectIdentity: string;
-	/** Resolved runnable DreamerConfig from loadPiConfig(). When disable=true, the caller does not register. */
+	/** `loadPiConfig()` resolves `config` to a runnable `DreamerConfig`. */
 	config: DreamerConfig;
 	/**
 	 * Dreamer needs the real embedding config so it can
@@ -49,11 +49,9 @@ export interface PiDreamerOptions {
 		max_commits: number;
 	};
 	/**
-	 * G5: fired after dreamer publishes content that may affect
-	 * <project-docs>, <user-profile>, or <key-files>. Implementation
-	 * lives in context-handler (Slice 3); when undefined, refresh is a
-	 * no-op (no harm — caches just stay stale until next /ctx-flush or
-	 * system-prompt hash change). Slice 3 passes
+	 * Dreamer invokes `onAdjunctsRefreshNeeded` after publishing content that may affect `<project-docs>`, `<user-profile>`, or `<key-files>`.
+	 * When `onAdjunctsRefreshNeeded` is undefined, no refresh occurs.
+	 * Caches remain stale until the next refresh when `onAdjunctsRefreshNeeded` is undefined.
 	 * `signalPiSystemPromptRefreshForProject` here.
 	 */
 	onAdjunctsRefreshNeeded?: (projectIdentity: string) => void;
@@ -82,16 +80,15 @@ type SessionDeleteArgs = SessionMessagesArgs;
 
 interface ProjectRegistration {
 	cleanup: () => void;
-	/** Run dream tasks for this project IMMEDIATELY (Dreamer v2 manual path).
-	 *  `task` forces one task ignoring its gate; omitted runs all enabled. The
+	/** `runManual` runs dream tasks for this project immediately.
+	 * `task` forces one task ignoring its gate; omitting it runs all enabled tasks.
 	 *  registered dreamer timer also runs due tasks on its own schedule. */
 	runManual: (task?: DreamTaskName) => Promise<ManualRunResult>;
-	/** The directory this registration was built for. `resolveProjectIdentity`
-	 *  is intentionally identical across worktrees/clones of one repo, so a
-	 *  `/cd` into a different checkout of the SAME repo keeps the same identity
-	 *  but a different directory. We track it so re-registration can detect the
-	 *  switch and rebuild against the new checkout + its config instead of
-	 *  silently reusing the first one. */
+	/**
+	 * `resolveProjectIdentity` returns the same identity for worktrees and clones of one repository.
+	 * `projectDir` records the checkout directory so re-registration can detect a switch.
+	 * Re-registration rebuilds the timer and client against the new checkout and its configuration.
+	 * */
 	projectDir: string;
 }
 
@@ -113,8 +110,8 @@ let piSubagentRunnerFactory: PiSubagentRunnerFactory = () =>
 let startDreamScheduleTimerFn: typeof defaultStartDreamScheduleTimer =
 	defaultStartDreamScheduleTimer;
 
-/** Initialize the Pi-side dreamer integration: register this project with
- *  the singleton timer, ensure PiSubagentRunner is the active runner. */
+/**
+ * `registerPiDreamerProject` registers the project with the singleton timer and activates `PiSubagentRunner`. */
 export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 	if (opts.config.disable === true) {
 		return;
@@ -122,24 +119,20 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 
 	const existing = registeredProjects.get(opts.projectIdentity);
 	if (existing) {
-		// Same identity, same directory → genuinely already registered, no-op.
 		if (existing.projectDir === opts.projectDir) {
 			return;
 		}
-		// Same identity, DIFFERENT directory: a worktree/clone switch in the same
-		// process. The existing registration's timer + client closure are pinned
-		// to the OLD checkout and its boot-time dreamerConfig. Tear it down and
-		// rebuild against the new directory + freshly-resolved config below, so
-		// the dreamer runs in the right checkout (and honors a `dreamer.disable`
-		// that may differ between checkouts — handled by the disable early-return
-		// above, which fires before this).
+		// A changed `projectDir` for the same `projectIdentity` indicates a worktree or clone switch.
+		// The existing timer and client closure remain pinned to the original directory.
+		// Re-registration tears down the existing timer and client closure before rebuilding them.
+		// Re-registration rebuilds the timer and client for the new directory with freshly resolved configuration.
+		// Re-registration uses the new checkout's configuration, including its `dreamer.disable` setting.
+		// A disabled re-registration leaves any existing registration unchanged.
 		existing.cleanup();
 		registeredProjects.delete(opts.projectIdentity);
 	}
 
-	// Build the dreamer client ONCE so both the timer and the immediate
-	// /ctx-dream path share the same `inFlightDreams` accounting + the
-	// same module-private `sessionsById` table.
+	// Module-level `inFlightDreams` and `sessionsById` are shared by the timer and `/ctx-dream` path.
 	const client = createPiDreamerClient(opts);
 
 	let cleanup: (() => void) | undefined;
@@ -154,30 +147,25 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		retinaHandoff: opts.retinaHandoff,
 		ensureRegistered: ensureProjectRegisteredFromPiDirectory,
 		// SCHEDULED Pi retrospective must read Pi JSONL sessions, not opencode.db.
-		// Supply the Pi provider factory (db arg ignored — Pi reads JSONL by cwd),
-		// converging the scheduled path onto the same provider the manual
-		// /ctx-dream path already uses.
+		// The Pi provider factory ignores `db` because Pi reads JSONL from the current working directory.
+		// The scheduled timer uses the manual path's Pi JSONL provider.
 		retrospectiveRawProvider: () =>
 			new PiRetrospectiveRawProvider({ projectCwd: opts.projectDir }),
-		// SCHEDULED refresh-primers likewise needs the Pi JSONL factory so its
-		// open-book seed renders raw U:/TC: lines; without it the scheduled task
-		// silently ran closed-book (the manual /ctx-dream path already wires this).
+		// The scheduled primer requires the Pi JSONL factory to render raw U:/TC: lines.
+		// Without `primerRawProviderFactory`, the scheduled task receives no primer context.
 		primerRawProviderFactory: createPiPrimerRawProviderFactory(),
 	}).then((timerCleanup) => {
 		if (cancelled) {
-			// Registration was cancelled before timer setup completed —
-			// immediately invoke cleanup to prevent leaked timer registration.
+			// Cancellation can stop registration before timer setup completes.
 			timerCleanup?.();
 			return;
 		}
 		cleanup = timerCleanup;
 	});
 
-	// Manual /ctx-dream (Dreamer v2): run dream tasks NOW via the per-task
-	// scheduler, using the same DreamTimerClient facade the timer uses (cast at
-	// the boundary — it implements the session.{create,prompt,messages,delete}
-	// surface the executor consumes; TS can't see structural compatibility
-	// through the wrapper). Project-scoped: only this project's tasks run.
+	// Manual runs use the per-task scheduler.
+	// `DreamTimerClient` implements the executor's required `session` methods, but TypeScript cannot infer that through the wrapper.
+	// Manual runs execute only tasks for `opts.projectIdentity`.
 	const runManual = async (task?: DreamTaskName): Promise<ManualRunResult> =>
 		runManualDream({
 			db: opts.db,
@@ -210,17 +198,8 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 }
 
 /**
- * Run one dream cycle IMMEDIATELY for the given project, mirroring
- * OpenCode's `/ctx-dream` behavior. Returns the run result, or `null`
- * if there's nothing to dequeue (queue empty or another worker holds
- * the lease — see `processDreamQueue` semantics). Throws if the project
- * isn't registered (call `registerPiDreamerProject` first).
+ * The queue-claim operation returns `null` when the queue is empty or another worker holds the lease.
  *
- * The user-visible reason this exists: without it, the user types
- * `/ctx-dream` and gets "queued, the timer will run it eventually" —
- * which makes the command feel broken even though the queue entry is
- * really there. Mirroring OpenCode's behavior lets us actually drain
- * it on the same turn.
  */
 export async function runPiDreamForProject(
 	projectIdentity: string,
@@ -235,7 +214,7 @@ export async function runPiDreamForProject(
 	return registration.runManual(task);
 }
 
-/** Cleanup hook — call from session_shutdown to deregister this project. */
+/* */
 export function unregisterPiDreamerProject(opts: {
 	projectIdentity: string;
 }): void {
@@ -248,9 +227,8 @@ export function unregisterPiDreamerProject(opts: {
 	registeredProjects.delete(opts.projectIdentity);
 }
 
-/** Wait for any currently-running dreamer task to finish gracefully. Used
- *  in agent_end / session_shutdown so Pi doesn't kill an in-flight dream
- *  in `--print` mode. Same pattern as `awaitInFlightHistorians()`. */
+/**
+ * */
 export async function awaitInFlightDreamers(): Promise<void> {
 	if (inFlightDreams.size === 0) {
 		return;
@@ -284,13 +262,11 @@ function createPiDreamerClient(opts: PiDreamerOptions): DreamTimerClient {
 
 			const userMessage = extractUserMessage(args);
 			const systemPrompt = extractSystemPrompt(args);
-			// Per-task model override (Dreamer v2): the SHARED executor
-			// (promptSyncWithValidatedOutputRetry) owns fallback iteration — it
-			// rewrites body.model to each candidate (per-task model, then the
-			// per-task fallback chain) and calls this facade once per attempt. So
-			// we use body.model as the current attempt's model and pass
-			// fallbackModels: undefined; passing the dreamer-level chain here would
-			// double-iterate and override a task's own (possibly empty) chain.
+			// `promptSyncWithValidatedOutputRetry` owns fallback iteration.
+			// `promptSyncWithValidatedOutputRetry` tries the per-task model and then its fallback chain.
+			// Pi's facade uses `body.model` as the current attempt's model.
+			// This facade passes `fallbackModels: undefined` to avoid a second fallback iteration.
+			// Passing the dreamer-level chain would iterate fallbacks twice and override each task's configured chain.
 			const perTaskModel = extractBodyModel(args) ?? model;
 			const requestedAgent = extractBodyAgent(args) ?? "magic-context-dreamer";
 			const runPromise = runner.run({
@@ -299,9 +275,8 @@ function createPiDreamerClient(opts: PiDreamerOptions): DreamTimerClient {
 				userMessage,
 				model: perTaskModel,
 				fallbackModels: undefined,
-				// The executor enforces the per-task timeout via its abort signal;
-				// give the subprocess a generous ceiling so the signal is the
-				// authority (not a second, conflicting wall-clock here).
+				// The executor's abort signal enforces the per-task timeout.
+				// The subprocess timeout exceeds per-task timeouts so the executor's abort signal controls cancellation.
 				timeoutMs: 30 * 60 * 1000,
 				cwd: dreamSession.directory,
 				signal: args.signal ?? undefined,
@@ -322,19 +297,11 @@ function createPiDreamerClient(opts: PiDreamerOptions): DreamTimerClient {
 				dreamSession.messages = [
 					makeMessage("user", [{ type: "text", text: userMessage }]),
 					makeMessage("assistant", [
-						// Synthetic tool parts first so investigationToolCallCount
-						// (refresh-primers grounding gate) sees the agent's tool use,
-						// then the final answer text.
+						// Place synthetic tool parts before final text so `investigationToolCallCount` counts the agent's tool use.
 						...syntheticToolParts(result.toolCallCount ?? 0),
 						{ type: "text", text: result.assistantText },
 					]),
 				];
-				// G5: fire conservatively after every successful dreamer task. Many
-				// dreamer tasks (verify, curate, docs) don't touch the system-
-				// prompt adjuncts, but improve / maintain-docs / user-memory-review
-				// can update <project-docs>, <user-profile>, or <key-files>. The cost
-				// of one extra disk read per session next turn is tiny compared to
-				// stale adjuncts surviving until restart.
 				opts.onAdjunctsRefreshNeeded?.(opts.projectIdentity);
 			} finally {
 				inFlightDreams.delete(runPromise);
@@ -408,8 +375,8 @@ function extractSystemPrompt(args: { body?: unknown }): string {
 	return typeof system === "string" ? system : "";
 }
 
-/** Read the per-task `body.model` ({ providerID, modelID }) the executor sets,
- *  back into a "provider/model" spec the PiSubagentRunner expects. */
+/**
+ * */
 function extractBodyModel(args: { body?: unknown }): string | undefined {
 	const body = args.body;
 	if (typeof body !== "object" || body === null) return undefined;
@@ -435,11 +402,10 @@ type SyntheticPart =
 	| { type: "tool"; tool: string; state: { input: { description: string } } };
 
 /**
- * Build `toolCallCount` synthetic tool parts so the shared
- * `investigationToolCallCount` / `extractToolCallSummaries` (which require
- * `{ type: "tool", tool, state }`) sees the agent's investigation on Pi. Pi's
- * facade only carries the final assistant text, so without these the
- * refresh-primers grounding gate (count > 0) would reject every Pi answer.
+ * `investigationToolCallCount` and `extractToolCallSummaries` require `{ type: "tool", tool, state }` parts.
+ * Pi's facade carries only final assistant text.
+ * Pi's facade omits tool parts, so synthetic parts preserve the evidence required by the grounding gate.
+ * Without synthetic tool parts, the refresh-primers grounding gate rejects Pi answers because `investigationToolCallCount` returns 0.
  */
 function syntheticToolParts(count: number): SyntheticPart[] {
 	const safe = Math.max(0, Math.floor(count));

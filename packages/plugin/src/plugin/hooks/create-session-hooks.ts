@@ -10,21 +10,9 @@ import type { RustModeModuleClient } from "../../hooks/magic-context/rust-mode-t
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import type { PluginContext } from "../types";
 /**
- * Map the full plugin config down to the per-session hook config. Pure and
- * exported so it can be unit-tested directly — without a module-level
- * `mock.module` of the hooks barrel, which in Bun leaks process-globally across
- * test files (mock.restore() does not undo it) and corrupts sibling suites that
- * import the real hook shape.
  */
 export function buildMagicContextHookConfig(pluginConfig: MagicContextPluginConfig) {
-    // Pass the WHOLE plugin config through and only override the fields that
-    // need defaulting. This was a hand-maintained field-by-field mapping, which
-    // silently dropped every hook-config field added after the mapping was
-    // written: `smart_drops`, `language`, `embedding`, and `transform_mode`
-    // all read as undefined inside the hook even when set by
-    // the user, turning opted-in features off with no warning. The hook only
-    // consumes the fields its config type declares, so the extra top-level keys
-    // carried by the spread are inert.
+    // The spread preserves future hook-config fields without mapper changes.
     return {
         ...pluginConfig,
         protected_tags: pluginConfig.protected_tags ?? DEFAULT_PROTECTED_TAGS,

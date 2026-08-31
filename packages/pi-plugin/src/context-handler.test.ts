@@ -416,8 +416,7 @@ describe("Pi fallback tag adoption", () => {
 			expect(textOf(fallbackMessages[0])).toBe("§1§ hello");
 			expect(tagger.getTag(sessionId, `${fallbackId}:p0`, "message")).toBe(1);
 
-			// Next pass starts with a data_version-only cache hit after the tagger's
-			// own write, then Pi migrates the fallback row to the real entry id.
+			// After the tagger writes, the next pass gets a data_version-only cache hit, then Pi migrates the fallback row to the real entry ID.
 			tagger.initFromDb(sessionId, db);
 			const realId = "entry-real-user";
 			const realMessages = [userMessage("hello", 10)];
@@ -476,8 +475,7 @@ describe("Pi fallback tag adoption", () => {
 			const tagger = createTagger();
 			tagger.initFromDb(sessionId, db);
 
-			// This commit lands after the caller's negative preflight and fingerprint
-			// construction, matching a sibling Pi process on the same session.
+			// The sibling commit lands after the caller's negative preflight and fingerprint construction, so adoption must re-probe the database.
 			insertTag(
 				siblingDb,
 				sessionId,
@@ -977,8 +975,7 @@ describe("Pi fallback tag adoption", () => {
 				},
 			);
 
-			// The real-id survivor and its pending op keep the tag identity already
-			// emitted by the racing pass.
+			// The real-ID survivor and its pending operation preserve the tag identity emitted by the racing pass.
 			expect(readTagRow(db, sessionId, 90)).toBeUndefined();
 			expect(readTagRow(db, sessionId, 91)?.status).toBe("active");
 			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([91]);
@@ -993,7 +990,7 @@ describe("Pi fallback tag adoption", () => {
 			const sessionId = "ses-pi-tool-owner-no-ts";
 			const tagger = createTagger();
 			const callId = "call-no-ts";
-			// No-timestamp synthetic owner form: pi-msg-${index}-${role} (no ts segment).
+			// Synthetic owners without timestamps use `pi-msg-${index}-${role}`.
 			const piOwner = "pi-msg-0-assistant";
 			insertTag(db, sessionId, callId, "tool", 10, 95, 0, "Read", 0, piOwner);
 			tagger.bindToolTag(sessionId, callId, piOwner, 95);
@@ -1009,7 +1006,7 @@ describe("Pi fallback tag adoption", () => {
 				},
 			);
 
-			// Unmatchable by (ts,callID) → left as-is, never wrong-rekeyed.
+			// The resolver leaves owners that do not match `(ts, callID)` unchanged to avoid incorrect rekeys.
 			expect(readTagRow(db, sessionId, 95)?.toolOwnerMessageId).toBe(piOwner);
 			expect(
 				tagger.getToolTag(sessionId, callId, "entry-no-ts"),
@@ -1037,8 +1034,6 @@ describe("Pi fallback tag adoption", () => {
 				0,
 				"entry-real",
 			);
-			// Split a gate hole from a wrong test premise: the tool-owner gate MUST
-			// be false here (no pi-msg-* owners), so the branch-walk never runs.
 			expect(hasPiFallbackToolOwnerTags(db, sessionId)).toBe(false);
 
 			let resolverCalls = 0;
@@ -1056,8 +1051,6 @@ describe("Pi fallback tag adoption", () => {
 				},
 			);
 
-			// The cheap hasPiFallbackToolOwnerTags gate short-circuits before any
-			// branch walk, so the resolver is never consulted.
 			expect(resolverCalls).toBe(0);
 		} finally {
 			closeQuietly(db);
@@ -1090,8 +1083,7 @@ describe("registerPiContextHandler", () => {
 				model: { provider: "openai", id: "gpt-5.6-sol" },
 			};
 
-			// Record the initial model before populating session metadata; only a
-			// genuine model change may clear this metadata.
+			// Session metadata retains the initial model; only a genuine model change clears it.
 			recordPiLiveModel(sessionId, "openai/gpt-5.6-sol");
 			await handler(
 				{ messages: [userMessage("warm", 1)] as never[] },
@@ -1138,8 +1130,7 @@ describe("registerPiContextHandler", () => {
 	});
 
 	it("evicts the least-recently-tracked session's per-session caches past the cap", () => {
-		// Register a victim session with observable per-session state, then track
-		// >100 newer sessions so the victim is evicted via clearContextHandlerSession.
+		// More than 100 newer sessions evict the victim through `clearContextHandlerSession`.
 		const victim = "ses-evict-victim";
 		setPiChannel1Baseline(victim, {
 			baselineU: 0,
@@ -1163,20 +1154,18 @@ describe("registerPiContextHandler", () => {
 			trackSessionForProject("proj-evict", `ses-evict-${i}`);
 		}
 
-		// Victim's per-session Channel 1 baseline was cleared by eviction
-		// (clearContextHandlerSession → clearPiChannel1State).
+		// Eviction clears the victim's per-session Channel 1 baseline.
 		expect(getPiChannel1Baseline(victim)).toBeUndefined();
 
-		// Cleanup the survivors.
 		clearContextHandlerSession(victim);
 		for (let i = 0; i < 100; i++) clearContextHandlerSession(`ses-evict-${i}`);
 	});
 
 	it("schedules first-touch message index reconciliation", async () => {
-		// Another test file in the same process may have activated the Pi entry,
-		// which arms the module-global boot-quiet gate and defers background
-		// lanes by two minutes. Reconciliation timing is what this test asserts,
-		// so neutralize the gate explicitly.
+		// Resetting the module-global boot-quiet gate removes its two-minute deferral of background lanes.
+		// Resetting the module-global boot-quiet gate removes its two-minute deferral of background lanes.
+		// Resetting the module-global boot-quiet gate removes its two-minute deferral of background lanes.
+		// Resetting the module-global boot-quiet gate removes its two-minute deferral of background lanes.
 		setBootQuietPeriodForTests(null);
 		const db = createTestDb();
 		try {
@@ -1191,9 +1180,8 @@ describe("registerPiContextHandler", () => {
 			const messages = [userMessage("hello", 1)] as never[];
 
 			await handler({ messages }, fakeContext("ses-context") as never);
-			// The reconciliation runs asynchronously behind event-loop yields, so a
-			// fixed number of microtask hops is not enough under full-suite load.
-			// Poll with a wall-clock deadline instead of assuming a hop count.
+			// Reconciliation yields to the event loop, so a fixed number of microtask hops is insufficient under full-suite load.
+			// A wall-clock deadline avoids assuming a hop count.
 			const deadline = Date.now() + 5_000;
 			while (!isSessionReconciled("ses-context") && Date.now() < deadline) {
 				await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1206,10 +1194,8 @@ describe("registerPiContextHandler", () => {
 	});
 
 	it("resolves per-project options via resolveForProject using the pass cwd", async () => {
-		// Council #4 (project-config bleed on /cd): a Pi process can switch
-		// projects mid-session; the context handler must resolve options from the
-		// CURRENT pass cwd, not the launch-cwd base options. We assert the
-		// resolver is consulted with ctx.cwd and that its returned options win.
+		// A Pi process can switch projects mid-session; resolve options for the active project.
+		// A Pi process can switch projects mid-session; resolve options for the active project.
 		const db = createTestDb();
 		try {
 			const fake = createFakePi();
@@ -1233,7 +1219,6 @@ describe("registerPiContextHandler", () => {
 				fakeContext("ses-switch", switchedDir) as never,
 			);
 
-			// The resolver was consulted with the pass's cwd.
 			expect(seenDirs).toContain(switchedDir);
 		} finally {
 			closeQuietly(db);
@@ -1659,9 +1644,7 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				// Disable protection so the immediate drop on tag #2 actually
-				// materializes; otherwise the schema default (20) defers the
-				// drop because tag #2 is in the protected window.
+				// Protection below 2 drops tag #2 immediately; the default protection window of 20 defers it.
 				protectedTags: 0,
 			});
 			const handler = fake.handlers.get("context") as (
@@ -1669,11 +1652,7 @@ describe("registerPiContextHandler", () => {
 				ctx: never,
 			) => Promise<{ messages: never[] }>;
 
-			// Force scheduler to "execute" by pushing usage above the
-			// default 65% threshold. Pi pending-ops materialization is
-			// gated on schedulerDecision === "execute" || forceMaterialization
-			// (mirrors OpenCode); without an over-threshold context, the
-			// scheduler returns "defer" and drops correctly stay queued.
+			// Usage above 65% makes the scheduler materialize pending drops.
 			const overThresholdCtx = {
 				...fakeContext("ses-context"),
 				getContextUsage: () => ({
@@ -2015,11 +1994,7 @@ describe("registerPiContextHandler", () => {
 		const db = createTestDb();
 		try {
 			const { persistPiPressureFromMessageEnd } = await import("./index");
-			// Pi resolves the window from its own runtime (piContextWindow), not
-			// models.dev. Use a wrong-but-still-SANE window (30k): sub-20k values
-			// are rejected by the sanity floor, so the "reported window is wrong"
-			// scenario must use a value inside [20k, 3M] that is still smaller than
-			// the tokens the model successfully accepted.
+			// A 30k `piContextWindow` stays within Pi's accepted [20k, 3M] range because Pi ignores models.dev.
 			updateSessionMeta(db, "ses-pi-pressure-alert", {
 				observedSafeInputTokens: 80_000,
 			});
@@ -3040,7 +3015,6 @@ describe("registerPiContextHandler", () => {
 				protectedTags: 3,
 				clearReasoningAge: 11,
 				commitClusterTrigger: { enabled: false, min_clusters: 9 },
-				// ceiling = contextLimit(100k) × execThreshold(40%) = 40000
 				emergencyCeilingTokens: 40_000,
 			});
 			expect(large.triggerBudget).toBe(32_500);
@@ -3414,9 +3388,7 @@ describe("registerPiContextHandler", () => {
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-firstpass-preserve";
-			// Simulate pre-restart state: persisted pressure (so the reset block
-			// fires), a persisted historian failure (restart recovery needs it),
-			// and a reasoning watermark (clearing it would resurface reasoning).
+			// The reasoning watermark prevents reasoning from resurfacing after restart despite persisted pressure and historian failure.
 			incrementHistorianFailure(db, sessionId, "previous failure");
 			updateSessionMeta(db, sessionId, {
 				lastContextPercentage: 62,
@@ -3435,7 +3407,6 @@ describe("registerPiContextHandler", () => {
 			await handler({ messages: [msg] as never[] }, {
 				...fakeContext(sessionId),
 				sessionManager: { getSessionId: () => sessionId },
-				// Same model as before (no model change) → first-pass path only.
 				getContextUsage: () => ({
 					tokens: 120_000,
 					percent: 62,
@@ -3444,10 +3415,10 @@ describe("registerPiContextHandler", () => {
 			} as never);
 
 			const meta = getOrCreateSessionMeta(db, sessionId);
-			// Usage fields cleared (stale pressure must not drive thresholds).
+			// The reset clears usage fields so stale pressure cannot drive thresholds.
 			expect(meta.lastContextPercentage).toBe(0);
 			expect(meta.lastInputTokens).toBe(0);
-			// PRESERVED — restart recovery + reasoning replay depend on these.
+			// Restart recovery preserves historian failure and the reasoning watermark; the watermark prevents reasoning replay.
 			expect(meta.clearedReasoningThroughTag).toBe(7);
 			expect(
 				getHistorianFailureState(db, sessionId).failureCount,
@@ -4145,10 +4116,7 @@ describe("registerPiContextHandler", () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-marker-m1-coverage";
 			const appendCompaction = mock(() => "compact-1");
-			// The exact shape a normal publication produces: m[0] still carries
-			// the empty pre-publication baseline (renderedBoundary <none> — no
-			// HARD fold has moved the compartment into m[0]), while the new
-			// compartment rendered into THIS pass's m[1] delta covers the marker.
+			// Without a HARD fold, normal publication leaves m[0] empty while this pass's m[1] delta covers the marker.
 			const restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
 				(_state, _db, _messages) => ({
 					injected: true,
@@ -4200,10 +4168,7 @@ describe("registerPiContextHandler", () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-marker-sibling-fallback";
 			const appendCompaction = mock(() => "compact-1");
-			// softRefreshCachedM1Pi's sibling-fallback serves a sibling's stale
-			// cached m[1] with recomputed=false while contentionExhausted stays
-			// FALSE — the contention veto alone does not catch it, so the
-			// injection reports null m[1] coverage and the drain must skip.
+			// When sibling fallback returns stale m[1] with recomputed=false, the drain must skip because contentionExhausted remains false.
 			const restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
 				(_state, _db, _messages) => ({
 					injected: true,
@@ -4243,8 +4208,7 @@ describe("registerPiContextHandler", () => {
 
 				expect(appendCompaction).not.toHaveBeenCalled();
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
-				// The deferred-history signal survives so the next FRESH render
-				// (non-fallback) retries the drain instead of losing the marker.
+				// A non-fallback pass retries the drain instead of losing the marker.
 				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(true);
 			} finally {
 				restoreInjection();
@@ -4257,10 +4221,8 @@ describe("registerPiContextHandler", () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-marker-defer-no-drain";
 			const appendCompaction = mock(() => "compact-1");
-			// Regression pin for the deferredHistoryDrainEligible gate: a pure
-			// SOFT+ defer/replay pass (no history-refresh consumption, no
-			// materialization this pass) must never drain — even when the
-			// pending marker exists and the injection reports full coverage.
+			// A SOFT+ defer/replay pass without history-refresh consumption or materialization must not drain, even with a pending marker and full injection coverage.
+			// A SOFT+ defer/replay pass without history-refresh consumption or materialization must not drain, even with a pending marker and full injection coverage.
 			const restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
 				(_state, _db, _messages) => ({
 					injected: true,
@@ -4288,8 +4250,7 @@ describe("registerPiContextHandler", () => {
 					summary: "summary",
 					publishedAt: 1,
 				});
-				// Deliberately NO deferred-history / materialization signals and
-				// no pressure: this is a replay pass, not a busting pass.
+				// A replay pass without deferred-history, materialization, or pressure signals must not drain.
 
 				await runDrainPass({ db, sessionId, appendCompaction });
 
@@ -4358,10 +4319,6 @@ describe("collectMessageEntryIdsByRef", () => {
 	});
 
 	it("resolves entry ids by reference identity, not by position", () => {
-		// Same scenario as production: Pi's `agent.state.messages` and
-		// `sessionManager.getBranch()` are in sync. Each event message has
-		// a corresponding `type: "message"` branch entry whose `.message`
-		// field is the SAME object reference.
 		const m1 = userMessage("first", 1);
 		const m2 = userMessage("second", 2);
 		const m3 = userMessage("third", 3);
@@ -4382,18 +4339,10 @@ describe("collectMessageEntryIdsByRef", () => {
 	});
 
 	it("survives off-by-one length divergence (regression for log-observed bug)", () => {
-		// Production bug: Pi's `state.messages.length = N` while
-		// `getBranch()` emit-eligible count = N ± 1. The position-based
-		// walk in `collectMessageEntryIds` returned a slice with wrong
-		// alignment. Reference-based resolution returns the correct
-		// id for matched refs and undefined for unmatched, regardless
-		// of length divergence.
+		// When message and branch lengths diverge, resolve IDs by reference: matched messages receive IDs and unmatched messages receive `undefined`.
 		const m1 = userMessage("turn-1", 1);
 		const m2 = userMessage("turn-2", 2);
 		const m3 = userMessage("turn-3", 3);
-		// `event.messages` has 3 entries but `getBranch()` only has 2
-		// emit-eligible entries — Pi runtime hasn't appended turn-3
-		// yet at the moment the context event fires (race window).
 		const result = collectMessageEntryIdsByRef(
 			{
 				sessionManager: {
@@ -4410,12 +4359,7 @@ describe("collectMessageEntryIdsByRef", () => {
 	});
 
 	it("survives catastrophic length divergence (issue #81 scenario)", () => {
-		// Production bug: another Pi extension (e.g. condensed-milk-pi)
-		// mutates `event.messages` in its own context handler, so the
-		// messages we see have ZERO ref-identity overlap with the
-		// branch entries. Position-based walk would map every index
-		// to the wrong id; reference-based walk returns undefined for
-		// every slot, leaving the caller's synthesized fallback to
+		// When no branch entry matches an event message, `collectMessageEntryIdsByRef` returns `undefined` for every slot.
 		// handle them.
 		const mutated = [
 			userMessage("mutated-1", 1),
@@ -4438,7 +4382,6 @@ describe("collectMessageEntryIdsByRef", () => {
 			mutated,
 			"ses-ref",
 		);
-		// All slots unmapped because no ref identity overlaps.
 		expect(result).toEqual([undefined, undefined, undefined]);
 	});
 
@@ -4489,9 +4432,6 @@ describe("collectMessageEntryIdsByRef", () => {
 	});
 
 	it("skips non-message entry types and entries with missing fields", () => {
-		// `compaction` and `branch_summary` entries are NOT used for
-		// ref-mapping (Pi's `buildSessionContext` wraps them in fresh
-		// objects per call, so reference matching would fail anyway).
 		const m1 = userMessage("user-msg", 1);
 		const result = collectMessageEntryIdsByRef(
 			{
@@ -4608,16 +4548,12 @@ describe("maybeFireHistorian raw provider cleanup", () => {
 });
 
 describe("emergency-scaled boundary retry derives its band from the execute threshold", () => {
-	// The retry gate must track escalationBands(T), not literal 80. At T=90 the
-	// force band is 92: usage in [80, 92) must NOT trigger the emergency-scaled
-	// relaxation (a revert to `usage.percentage >= 80` makes this test fail).
 	it("does not relax the boundary below the derived force band at T=90", () => {
 		const {
 			escalationBands,
 		} = require("@magic-context/core/shared/escalation-bands");
 		const band = escalationBands(90).forceMaterializationPercentage;
 		expect(band).toBe(92);
-		// The literal the fix removed sits below the derived band — pin the gap.
 		expect(band).toBeGreaterThan(80);
 	});
 	it("keeps the default-config band at 85 (zero drift for T<=80)", () => {

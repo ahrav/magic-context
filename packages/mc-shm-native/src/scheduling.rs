@@ -67,7 +67,7 @@ fn wait_until_handled(
     Ok(!closing.load(Ordering::Acquire))
 }
 
-/// Native worker limit. commentlint: allow(JUDGE)
+/// Native worker limit.
 pub(crate) const WORKER_LIMIT: u32 = 0;
 
 type ReadinessCallback = ThreadsafeFunction<(), (), (), Status, false, true, 2>;

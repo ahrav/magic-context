@@ -5,13 +5,8 @@ import { delimiter, join } from "node:path";
 import { findOnPath } from "./find-on-path";
 
 /**
- * Build an isolated PATH out of tmpdir-allocated bin directories so tests
- * don't depend on the host's real PATH (which would make the suite
- * order-dependent and brittle across CI envs).
+ * Tests use a staged PATH to avoid host-dependent results.
  *
- * Each scenario stages its own set of dirs, installs marker files with the
- * expected permission bits, then sets process.env.PATH for the duration of
- * the test and restores it after.
  */
 describe("findOnPath", () => {
     let originalPath: string | undefined;
@@ -99,7 +94,6 @@ describe("findOnPath", () => {
         const dir = join(tempRoot, "bin");
         const binName = isWindows ? "opencode.exe" : "opencode";
         const expected = makeExecutable(dir, binName);
-        // PATH like ":dir:" — empty segments at start, middle, end
         process.env.PATH = `${delimiter}${dir}${delimiter}${delimiter}`;
 
         const found = findOnPath("opencode");
@@ -137,10 +131,8 @@ describe("findOnPath", () => {
     });
 
     it.if(!isWindows)("recognizes wrapper scripts (regression for issue #75)", () => {
-        // Reporter's case: PATH starts with a directory holding a custom
-        // wrapper script that does env setup before invoking the real
-        // opencode binary. The wrapper IS a regular executable file —
-        // detection should succeed without caring about content.
+        // Executable wrapper scripts are valid PATH matches.
+        // Executable wrapper scripts are valid PATH matches.
         const wrapperDir = join(tempRoot, "home-bin");
         mkdirSync(wrapperDir, { recursive: true });
         const wrapperPath = join(wrapperDir, "opencode");
@@ -156,8 +148,7 @@ describe("findOnPath", () => {
     });
 
     it.if(!isWindows)("does not match directories named like the binary", () => {
-        // Edge: someone has a directory called `opencode/` in a PATH entry.
-        // statSync().isFile() must reject it.
+        // Directories named `opencode` are not executable candidates.
         const dir = join(tempRoot, "bin");
         mkdirSync(join(dir, "opencode"), { recursive: true });
         process.env.PATH = dir;
@@ -165,7 +156,6 @@ describe("findOnPath", () => {
     });
 
     it.if(isWindows)("tries .exe, .cmd, .bat, .com extensions on Windows", () => {
-        // Install only a .cmd to verify extension fallback works.
         const dir = join(tempRoot, "bin");
         const cmdPath = makeExecutable(dir, "opencode.cmd");
         process.env.PATH = dir;

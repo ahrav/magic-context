@@ -71,8 +71,8 @@ describe("pi cross harness", () => {
         const fromOpenCode = "OpenCode wrote this memory for Pi flagship search";
         emitMemoryWriteOnce(oc.mock, fromOpenCode);
         await oc.sendPrompt(ocSession, "remember this workflow rule for Pi");
-        // v86 trust policy: agent writes start CANDIDATE and are hidden from
-        // automatic injection; promote through the real verification API.
+        // Agent-created memories start as CANDIDATE and are excluded from automatic injection.
+        // Automatic-injection tests must call `promoteMemoryToVerified` first.
         promoteMemoryToVerified(pi.contextDbPath(), fromOpenCode);
         await pi.newSession();
 
@@ -82,11 +82,8 @@ describe("pi cross harness", () => {
             usage: { input_tokens: 140, output_tokens: 10, cache_creation_input_tokens: 140 },
         });
         await pi.sendPrompt("read flagship memory from pi", { timeoutMs: 60_000 });
-        // Pi now injects shared project memories into <session-history>
-        // (parity with OpenCode), so the cross-harness check is on the
-        // outbound provider request body, not on `ctx_search` output —
-        // visible memories are intentionally filtered from search results
-        // to avoid duplicate context. Mirrors the OpenCode-side assertion
+        // Assert against the outbound provider request body because Pi injects shared project memories into `<session-history>`.
+        // Do not assert on `ctx_search` output; it filters visible memories from search results.
         // below.
         expect(JSON.stringify(pi.mock.lastRequest()!.body)).toContain(fromOpenCode);
 

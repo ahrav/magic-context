@@ -1,19 +1,13 @@
 #!/usr/bin/env bun
 
 /**
- * Show all user/assistant messages since the last compartment,
- * marking dropped ones with [D].
  *
  * Usage:
- *   bun scripts/tail-view.ts <session_id>
- *   bun scripts/tail-view.ts <session_id> --all    # include tool calls
- *   bun scripts/tail-view.ts <session_id> --from N  # from ordinal N
  */
 
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
 
-// --- DB paths ---
 
 function getDataDir(): string {
 	return join(process.env.HOME ?? "~", ".local", "share");
@@ -30,7 +24,6 @@ function openPluginDb(): Database {
 	);
 }
 
-// --- Types ---
 
 interface RawMessageRow {
 	id: string;
@@ -57,7 +50,6 @@ interface TailMessage {
 	toolParts: { callId: string; tagNumber: number | null; dropped: boolean; toolName?: string }[];
 }
 
-// --- Read OpenCode messages ---
 
 function readSessionMessages(
 	ocDb: Database,
@@ -87,7 +79,6 @@ function readSessionMessages(
 		try {
 			list.push(JSON.parse(part.data) as ParsedPart);
 		} catch {
-			// skip unparseable parts
 		}
 		partsByMessageId.set(part.message_id, list);
 	}
@@ -108,7 +99,6 @@ function readSessionMessages(
 	});
 }
 
-// --- Read tag status ---
 
 interface TagInfo {
 	tagNumber: number;
@@ -129,7 +119,6 @@ function readTags(pluginDb: Database, sessionId: string): TagInfo[] {
 	}));
 }
 
-// --- Get last compartment end ---
 
 function getLastCompartmentEnd(pluginDb: Database, sessionId: string): number {
 	const row = pluginDb
@@ -138,7 +127,6 @@ function getLastCompartmentEnd(pluginDb: Database, sessionId: string): number {
 	return row?.max_end ?? 0;
 }
 
-// --- Extract text from parts ---
 
 function extractPartText(part: ParsedPart): string | null {
 	if (part.type === "text" && typeof part.text === "string") {
@@ -151,7 +139,6 @@ function isToolPart(part: ParsedPart): boolean {
 	return part.type === "tool-invocation" || part.type === "tool-result";
 }
 
-// --- Build tail view ---
 
 function buildTailMessages(
 	ocDb: Database,
@@ -162,9 +149,6 @@ function buildTailMessages(
 	const messages = readSessionMessages(ocDb, sessionId);
 	const tags = readTags(pluginDb, sessionId);
 
-	// Build tag lookup: messageId (from tag) -> TagInfo
-	// Message tags: "msg_xxx:pN" -> tag
-	// Tool tags: "toolu_xxx" -> tag
 	const tagByKey = new Map<string, TagInfo>();
 	for (const tag of tags) {
 		tagByKey.set(tag.messageId, tag);
@@ -226,7 +210,6 @@ function buildTailMessages(
 	return result;
 }
 
-// --- Format output ---
 
 function roleLabel(role: string): string {
 	switch (role) {
@@ -261,7 +244,6 @@ function formatTailView(messages: TailMessage[], includeTools: boolean): string 
 
 		totalMessages++;
 
-		// Check if ALL parts of this message are dropped
 		const allTextDropped = msg.textParts.every((p) => p.dropped);
 		const allToolDropped = msg.toolParts.every((p) => p.dropped);
 		const allDropped = allTextDropped && allToolDropped && (hasText || hasTools);
@@ -272,7 +254,6 @@ function formatTailView(messages: TailMessage[], includeTools: boolean): string 
 			activeMessages++;
 		}
 
-		// Show text parts
 		for (const tp of msg.textParts) {
 			const dropMark = tp.dropped ? "[D]" : "   ";
 			const tagStr = tp.tagNumber !== null ? `§${tp.tagNumber}§` : "§?§";
@@ -280,7 +261,6 @@ function formatTailView(messages: TailMessage[], includeTools: boolean): string 
 			lines.push(`${dropMark} ${tagStr.padEnd(9)} ${roleLabel(msg.role)} #${String(msg.ordinal).padEnd(5)} ${preview}`);
 		}
 
-		// Show tool parts (if requested)
 		if (includeTools) {
 			for (const tp of msg.toolParts) {
 				const dropMark = tp.dropped ? "[D]" : "   ";
@@ -301,7 +281,6 @@ function formatTailView(messages: TailMessage[], includeTools: boolean): string 
 	return [...header, ...lines].join("\n");
 }
 
-// --- Main ---
 
 function parseArgs(argv: string[]): { sessionId: string; includeTools: boolean; fromOrdinal: number | null } {
 	let sessionId = "";

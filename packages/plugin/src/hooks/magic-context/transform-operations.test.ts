@@ -36,7 +36,6 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            // Ignore EBUSY on Windows
         }
     }
     tempDirs.length = 0;
@@ -315,9 +314,6 @@ describe("tagMessages", () => {
                 ];
 
                 const { targets } = tagMessages("ses-1", messages, tagger, db);
-                // Result-only window: invocation absent → owner falls
-                // back to the result message's own id (m-tool) per
-                // deriveToolOwnerMessageId's last-resort branch.
                 const toolTagId = tagger.getToolTag("ses-1", "call-new", "m-tool")!;
                 targets.get(toolTagId)!.setContent("[dropped]");
 
@@ -459,7 +455,6 @@ describe("clearOldReasoning", () => {
                     [messages[3], [thinkingPart2]],
                 ]);
 
-                // maxTag=10, clearReasoningAge=5 => ageCutoff=5; tag 2 is old (cleared), tag 8 is recent (kept)
                 const messageTagNumbers = new Map<TestMessage, number>([
                     [messages[1], 2],
                     [messages[3], 8],
@@ -524,7 +519,6 @@ describe("clearOldReasoning", () => {
                 [messages[1], [thinkingPart]],
             ]);
 
-            // maxTag=10, age=5 => ageCutoff=5, tag 1 is <=5
             const messageTagNumbers = new Map<TestMessage, number>([[messages[1], 1]]);
 
             const cleared = clearOldReasoning(messages, reasoningByMessage, messageTagNumbers, 5);
@@ -564,7 +558,6 @@ describe("clearOldReasoning", () => {
                 [messages[1], [reasoningPart]],
             ]);
 
-            // maxTag=10, age=5 => ageCutoff=5; tag 2 is old (cleared); tag 10 is recent (no reasoning map entry)
             const messageTagNumbers = new Map<TestMessage, number>([
                 [messages[1], 2],
                 [messages[3], 10],
@@ -596,7 +589,6 @@ describe("clearOldReasoning", () => {
                 [messages[1], [thinkingPart]],
             ]);
 
-            // maxTag=8, age=5 => ageCutoff=3; tag 7 is >3 (recent — kept)
             const messageTagNumbers = new Map<TestMessage, number>([[messages[1], 7]]);
 
             const cleared = clearOldReasoning(messages, reasoningByMessage, messageTagNumbers, 5);

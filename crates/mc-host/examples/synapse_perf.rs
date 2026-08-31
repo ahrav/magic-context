@@ -1,8 +1,8 @@
-//! Hermetic Synapse query/batch load generator.
+//! This binary generates hermetic Synapse query and batch load.
 //!
-//! Open-loop work keeps absolute scheduled-send timestamps. Closed-loop work
-//! holds fixed concurrency. Every wire call and caller-level operation is
-//! retained as NDJSON before the validated summary.
+//! Open-loop work preserves absolute scheduled-send timestamps.
+//! Closed-loop work holds fixed concurrency.
+//! The harness retains every wire call and caller-level operation as NDJSON before the validated summary.
 
 #[path = "../tests/support/perf_measurement.rs"]
 mod perf_measurement;
@@ -43,19 +43,16 @@ const MAX_CENSORED_PER_MILLE: u128 = 10;
 const MAX_TOTAL_ATTEMPTS: u32 = 4;
 const QUERY_DEADLINE: Duration = Duration::from_secs(3);
 const BATCH_DEADLINE: Duration = Duration::from_secs(120);
-/// Validity ceiling on any single logical request's pending-poll count.
-/// The densest legal schedule polls at the busy-poll floor
-/// (`perf_measurement::POLL_MIN_DELAY_MS`) for the entire batch deadline,
-/// plus slack for the jittered fast-first poll and cursored page reads. A
-/// max above this means the poll policy regressed (for example a delay
-/// collapsed to zero) and the repetition's amplification numbers cannot be
-/// trusted, so the run is invalidated.
+/// A logical request with more than `MAX_POLLS_PER_LOGICAL` pending polls invalidates the run.
+/// The densest legal schedule polls at `perf_measurement::POLL_MIN_DELAY_MS` for `BATCH_DEADLINE`.
+/// The bound includes slack for the jittered fast-first poll and cursored page reads.
+/// The harness invalidates a repetition when its amplification numbers cannot be trusted.
 const MAX_POLLS_PER_LOGICAL: u64 =
     BATCH_DEADLINE.as_millis() as u64 / perf_measurement::POLL_MIN_DELAY_MS + 64;
 const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const MODEL: &str = "synapse-perf-tiny";
 const QUERY_TEXT: &str = "model-free benchmark query";
-/// Shared queued-request byte budget for every cell (see `run`).
+/// All cells share this queued-request byte budget.
 const HARNESS_QUEUED_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -218,22 +215,17 @@ fn parse_opts_from(args: impl IntoIterator<Item = String>) -> Result<Opts, Strin
     })
 }
 
-/// Identity of the build this binary was compiled from, supplied by the
-/// collection script as `MC_HOST_PERF_BUILD_ID`.
+/// `MC_HOST_PERF_BUILD_ID` identifies the build that produced this binary.
 ///
-/// Read at compile time, not run time, because the thing it identifies is the
-/// artifact: the `--variant` axis selects client retry and poll policy plus
-/// admission configuration, and cannot select a different host implementation.
-/// A pre-change host is therefore a different binary, and this is the only field
-/// in the evidence that distinguishes one from another.
+/// The `--variant` axis selects client retry and poll policy plus admission configuration.
+/// The `--variant` axis cannot select a different host implementation.
+/// A pre-change host requires a different binary.
 const HOST_BUILD_ID: Option<&str> = option_env!("MC_HOST_PERF_BUILD_ID");
 
-/// Variants whose meaning depends on which host build ran them.
+/// `baseline` and `hygiene-only` require identifiable pre-change host builds.
 ///
-/// `baseline` and `hygiene-only` are defined by the contract as pre-change host
-/// code, which this binary cannot select at run time. Emitting such a cell from
-/// an unidentified build produces evidence that looks like a host comparison but
-/// is not one, so the run is refused rather than left for a reader to catch.
+/// An unidentified build cannot provide host-comparison evidence.
+/// The harness refuses cells from unidentified builds rather than emit misleading host-comparison evidence.
 fn requires_build_id(variant: SynapseVariant) -> bool {
     matches!(
         variant,
@@ -247,8 +239,7 @@ fn parse<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, String> {
 
 struct DelayEngine {
     delay: Duration,
-    /// Shared with the wire clock so a service sample's start instant is
-    /// directly comparable to the hold window's boundaries.
+    /// The hold window shares the wire clock so service-sample start instants are comparable to its boundaries.
     origin: Instant,
     service: Arc<StdMutex<Vec<ServiceSample>>>,
 }
@@ -270,7 +261,7 @@ impl EmbeddingEngine for DelayEngine {
             .push(ServiceSample {
                 started_ns,
                 service_ns: elapsed,
-                // Classified once the hold window's boundaries are known.
+                // The harness classifies service samples after the hold-window boundaries are known.
                 window: WindowClass::Measured,
             });
         Ok(vectors)
@@ -283,8 +274,7 @@ fn lane() -> LaneInfo {
         fingerprint: FINGERPRINT.to_owned(),
         table_epoch: 1,
         dims: 8,
-        // The inline delay engine computes on CPU, matching a bundle-backed
-        // CPU lane's advertised execution provider.
+        // A caller timeout does not make its correlation unknown.
         execution_provider: "cpu",
         max_tokens: 512,
         max_text_bytes: 1024,
@@ -445,36 +435,23 @@ struct WireReply {
 struct RoutedWire {
     writer: Mutex<WriteHalf<UnixStream>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<(raw_client::RawFrame, u64)>>>,
-    /// Correlations whose caller gave up (attempt timeout) but whose
-    /// terminal may still arrive. Without this, a late terminal looks
-    /// like an unknown correlation, poisons `reader_error`, and kills
-    /// every other in-flight call in the repetition.
     ///
-    /// Never evicted, only consumed when its late terminal arrives. A cap with
-    /// FIFO eviction cannot be sized safely: the harness accepts rates where a
-    /// single saturated cell times out more calls than any fixed bound, and
-    /// evicting a still-live entry converts an expected late reply into a fatal
-    /// unknown correlation that poisons the wire for every unrelated request.
-    /// Residency is therefore bounded by the calls that genuinely never receive
-    /// a terminal, at one `u64` each.
+    /// Timed-out correlations are never evicted; their late terminals consume them.
+    /// FIFO eviction can evict a live correlation after unbounded timeouts, turning its late reply into a fatal unknown correlation.
+    /// An unknown correlation poisons the wire for every unrelated request.
+    /// Only calls without a terminal leave a correlation stored.
     ///
-    /// Ordering protocol, which both sides must follow so a live
-    /// correlation is never absent from both maps at once: the giving-up
-    /// caller inserts here *before* removing its `pending` entry, and the
-    /// reader checks `pending` *before* checking here.
+    /// The giving-up caller inserts the correlation into `tombstones` before removing it from `pending`; the reader checks `pending` before `tombstones`, so a live correlation remains in at least one map.
     tombstones: Mutex<std::collections::BTreeSet<u64>>,
     next_corr: AtomicU64,
     channel: u16,
     epoch: u32,
     origin: Instant,
     reader_error: Mutex<Option<String>>,
-    /// Frames whose write completed after the caller's deadline.
     ///
-    /// `write_all` is not cancel-safe, so a frame that starts just inside the
-    /// deadline is always finished rather than abandoned mid-stream. That work
-    /// still reaches the host after the deadline the harness recorded as
-    /// expired, which perturbs later load, so it is counted and invalidates the
-    /// repetition rather than being silently tolerated.
+    /// A `write_all` that starts before `deadline` must finish because cancelling it can leave a partial frame on the shared connection.
+    /// A write that completes after `deadline` can perturb later load.
+    /// The harness counts an over-deadline write and invalidates the repetition because the write perturbs later load.
     overdeadline_writes: AtomicU64,
 }
 
@@ -483,14 +460,12 @@ enum WireCallError {
         sent_ns: u64,
         terminal_ns: u64,
     },
-    /// The deadline lapsed before any byte reached the socket, so there is no
-    /// send instant and no attempt to record.
+    /// No byte reaches the socket before the deadline, so the call has no send instant or attempt to record.
     ///
-    /// Distinct from [`WireCallError::Timeout`] because reporting a call that
-    /// never reached the wire as a timed-out attempt would anchor a logical
-    /// request's latency at a send that did not happen and add a phantom row to
-    /// the attempt ledger. Carries nothing: with no send there is no interval to
-    /// report, and the caller stamps its own terminal instant.
+    /// `ExpiredBeforeSend` differs from `WireCallError::Timeout`: no byte reached the socket, so it records no send instant or attempt.
+    /// A call that never reaches the wire has no send instant from which to measure latency.
+    /// Recording a timed-out attempt for a call that never reached the wire would add a phantom attempt-ledger row.
+    /// `ExpiredBeforeSend` carries no timestamps because no send interval exists.
     ExpiredBeforeSend,
     Transport(String),
 }
@@ -535,8 +510,7 @@ impl RoutedWire {
         u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    /// The zero of the wire clock, so a consumer outside the wire can place its
-    /// own observations on the same axis as recorded sends and terminals.
+    /// `origin` defines the wire clock zero, allowing external observations to share the send and terminal timeline.
     fn origin(&self) -> Instant {
         self.origin
     }
@@ -545,45 +519,28 @@ impl RoutedWire {
         self.overdeadline_writes.load(Ordering::Relaxed)
     }
 
-    /// Position of `at` on the same wire clock [`Self::elapsed_ns`] reports,
-    /// so a scheduled instant and a recorded send are directly comparable.
+    /// `at` uses the `Self::elapsed_ns` clock, so scheduled instants and recorded sends are directly comparable.
     fn ns_at(&self, at: Instant) -> u64 {
         u64::try_from(at.saturating_duration_since(self.origin).as_nanos()).unwrap_or(u64::MAX)
     }
 
-    /// Takes the caller's absolute deadline, not a duration.
     ///
     /// Waiting for the shared writer is time the caller's deadline is spending.
-    /// Computing a budget outside this function and arming the timer only after
-    /// the write hands every contended call an effective budget larger than its
-    /// deadline, and a stalled writer an unbounded one — so attempts could
-    /// succeed after their logical deadline, which is exactly the evidence a
-    /// tail study cannot afford to get wrong.
+    /// The caller starts the deadline timer before waiting for `writer`, so writer contention cannot extend the effective deadline.
     ///
-    /// The write itself is deliberately *not* interruptible. `write_all` is not
-    /// cancel-safe: dropping it mid-frame leaves a partial request on the shared
-    /// connection and desynchronizes framing for every other in-flight logical
-    /// request, which no later call can recover from. Instead the wait for the
-    /// writer is bounded and the deadline is re-tested while the lock is held,
-    /// so an expired call never starts a write; once a frame is started it is
+    /// `write_all` is not cancel-safe: dropping it mid-frame leaves a partial request on the shared connection.
     /// finished.
     async fn call(&self, body: Vec<u8>, deadline: Instant) -> Result<WireReply, WireCallError> {
         if let Some(error) = self.reader_error.lock().await.clone() {
             return Err(WireCallError::Transport(error));
         }
-        // The host retires the generation on any non-increasing Request
-        // correlation (connection.rs read-loop watermark), so allocation and
-        // socket write must be atomic: allocating outside the writer lock
-        // lets two tasks write in inverted correlation order under load.
         let (corr, rx, sent_ns) = {
             let Ok(writer) = tokio::time::timeout_at(deadline.into(), self.writer.lock()).await
             else {
                 return Err(WireCallError::ExpiredBeforeSend);
             };
             let mut writer = writer;
-            // The timer above can lose its own race: the lock may be granted at
-            // or after the deadline without the timeout arm being polled first.
-            // Re-testing here is what guarantees no frame is written past the
+            // Avoid starting a frame after the deadline expires.
             // deadline.
             if Instant::now() >= deadline {
                 return Err(WireCallError::ExpiredBeforeSend);
@@ -608,12 +565,9 @@ impl RoutedWire {
                     "send correlation {corr}: {error}"
                 )));
             }
-            // Socket backpressure can hold this write past the deadline it
-            // started inside. Abandoning it is not an option — a partial frame
-            // desynchronizes the shared connection for every other in-flight
-            // request — so the crossing is recorded instead. The host executes
-            // work the harness has already accounted as expired, which perturbs
-            // later load, so a repetition that does this is not admissible.
+            // Socket backpressure can keep `write_all` running past `deadline`.
+            // The caller must not cancel `writer.write_all(&frame)`: a partial frame desynchronizes the shared connection.
+            // `overdeadline_writes` records writes that complete after `deadline`.
             if Instant::now() >= deadline {
                 self.overdeadline_writes.fetch_add(1, Ordering::Relaxed);
             }
@@ -633,27 +587,12 @@ impl RoutedWire {
                     .unwrap_or_else(|| "connection closed while awaiting reply".to_owned()),
             )),
             Err(_) => {
-                // Install the tombstone *before* dropping the pending entry.
-                // The reader looks up `pending` first and only then consults
-                // the tombstones, so this order keeps `corr` present in
-                // `pending ∪ tombstones` at every instant. Removing from
-                // `pending` first opens a window in which a reader running
-                // concurrently finds neither, reports an unknown correlation,
-                // and poisons the shared connection for every other in-flight
-                // logical request over an expected late terminal.
+                // Installing the tombstone before removing `pending` keeps `corr` in `pending ∪ tombstones` throughout the transition.
                 self.tombstones.lock().await.insert(corr);
-                // A terminal that already consumed the sender leaves this
-                // tombstone unclaimed. That residue is bounded by the calls
-                // that never receive a terminal at all, which is why nothing is
-                // evicted: an eviction cannot tell a stale entry from a live
-                // one, and getting it wrong poisons the whole wire.
+                // Unclaimed tombstones are bounded by calls that never receive a terminal.
+                // Tombstones are never evicted because any tombstone can still receive a late terminal.
                 self.pending.lock().await.remove(&corr);
-                // The reader can fail between this call's health check and its
-                // `pending` insert, leaving a sender nothing will ever settle.
-                // That expires as an ordinary attempt timeout, so without this
-                // re-check a disconnected wire is indistinguishable from
-                // workload censoring — and if it is the last call of the
-                // repetition, nothing else ever observes the stored error.
+                // The timeout path re-checks `reader_error` because the reader can fail after the earlier check.
                 if let Some(error) = self.reader_error.lock().await.clone() {
                     return Err(WireCallError::Transport(error));
                 }
@@ -704,9 +643,7 @@ async fn read_terminals(
         }
         let sender = wire.pending.lock().await.remove(&frame.corr);
         let Some(sender) = sender else {
-            // A terminal for a correlation whose caller already timed out
-            // is expected wire traffic, not corruption: consume the
-            // tombstone and discard the frame silently.
+            // A terminal matching a tombstone is an expected late terminal.
             if wire.tombstones.lock().await.remove(&frame.corr) {
                 continue;
             }
@@ -726,23 +663,13 @@ struct RunContext {
     opts: Opts,
 }
 
-/// Outcome of a recorded wire call that the caller has to tell apart.
 ///
 /// The timeout arm carries the send timestamp the attempt ledger recorded
-/// rather than a sentinel string. A logical request's latency starts at its
-/// first wire send, so a first attempt that times out must still supply that
-/// instant: substituting the timeout instant reports a terminal timeout as
-/// near-zero logical latency, and letting a later retry set the anchor instead
-/// omits both the first attempt and the retry delay.
+/// Logical-request latency starts at the first wire send.
+/// A timed-out first attempt retains its send timestamp.
 enum CallError {
-    Timeout {
-        sent_ns: u64,
-    },
-    /// The deadline was already spent, so nothing reached the wire and no
-    /// attempt was recorded. The caller terminates the logical request as timed
-    /// out without anchoring a send that never happened.
+    Timeout { sent_ns: u64 },
     Expired,
-    /// Transport loss or an unparsable response. The caller cannot act on it.
     Fatal(String),
 }
 
@@ -754,12 +681,9 @@ impl RunContext {
         body: Vec<u8>,
         deadline: Instant,
     ) -> Result<(WireReply, serde_json::Value), CallError> {
-        // The absolute deadline goes all the way down: `RoutedWire::call` bounds
-        // writer acquisition and reply receipt against it, so no part of the
-        // call runs on a budget the caller's deadline has already spent.
+        // `RoutedWire::call` applies the caller's deadline to writer acquisition and reply receipt.
         let result = self.wire.call(body, deadline).await;
-        // Allocated only for a call that reached the wire, so a refused call
-        // leaves no gap-filling id behind and, more importantly, no row.
+        // The call allocates an attempt ID only after the request reaches the wire.
         let next_attempt_id = || self.next_attempt.fetch_add(1, Ordering::Relaxed);
         match result {
             Ok(reply) => {
@@ -767,11 +691,7 @@ impl RunContext {
                 let json: serde_json::Value = serde_json::from_slice(&reply.frame.body)
                     .map_err(|error| CallError::Fatal(format!("response JSON: {error}")))?;
                 let code = json["code"].as_str().map(str::to_owned);
-                // Error envelopes carry the hint at the top level; a served
-                // batch descriptor and a pending poll reply carry it under
-                // `result`. Recording only the former leaves the ledger
-                // unable to audit whether the poll schedule honored the cap
-                // the host actually served.
+                // The response handler records `retry_after_ms` from error envelopes and result payloads.
                 let retry_after_ms = json["retry_after_ms"]
                     .as_u64()
                     .or_else(|| json["result"]["retry_after_ms"].as_u64());
@@ -785,10 +705,6 @@ impl RunContext {
                 } else if is_error && code.as_deref() == Some("timeout") {
                     AttemptDisposition::Timeout
                 } else if is_error {
-                    // Any other error terminal is outside the client policy's
-                    // vocabulary. The caller turns it into a harness error and
-                    // invalidates the repetition, so the retained attempt row
-                    // must not claim a successful wire call.
                     AttemptDisposition::Failure
                 } else {
                     AttemptDisposition::Success
@@ -803,8 +719,6 @@ impl RunContext {
                     actual_send_ns: reply.sent_ns,
                     terminal_ns: reply.received_ns,
                     latency_ns: reply.received_ns.saturating_sub(reply.sent_ns),
-                    // Stamped from the owning logical request once the hold
-                    // window's boundaries are known.
                     window: WindowClass::Measured,
                 });
                 Ok((reply, json))
@@ -877,16 +791,11 @@ fn terminal_record(
         terminal_code: code,
         attempts,
         polls,
-        // Stamped once the hold window's boundaries are known.
+        // The owning logical request assigns `window` after the hold-window boundaries are known.
         window: WindowClass::Measured,
     }
 }
 
-/// True when a harness error is a lost shared wire rather than a harness
-/// defect: reader-loop frame failures (early EOF), send failures on the
-/// write half, and callers that observed the reader's stored error. The
-/// harness's single connection cannot reconnect mid-run, so these remain
-/// fatal, but the summary counts them separately from real harness bugs.
 fn is_connection_loss(error: &str) -> bool {
     error.contains("frame header: ")
         || error.contains("frame body: ")
@@ -908,10 +817,6 @@ async fn execute_query(
         attempts += 1;
         let mut params = constraints();
         params["text"] = QUERY_TEXT.into();
-        // Mirrors the plugin's pre-attempt guard: a remaining budget under
-        // one millisecond truncates to the out-of-contract `deadline_ms: 0`
-        // (`parse_query` rejects zero), so it is an exhausted deadline, not
-        // a sendable attempt.
         let remaining_ms = u64::try_from(
             deadline
                 .saturating_duration_since(Instant::now())
@@ -943,8 +848,6 @@ async fn execute_query(
         {
             Ok(value) => value,
             Err(CallError::Timeout { sent_ns }) => {
-                // The attempt reached the wire, so it anchors this request's
-                // latency whether or not a retry follows.
                 first_send.get_or_insert(sent_ns);
                 let may_retry = ctx
                     .opts
@@ -972,8 +875,7 @@ async fn execute_query(
                     0,
                 ));
             }
-            // Nothing reached the wire, so no send to anchor and no attempt to
-            // count: the same terminal the pre-attempt guard above produces.
+            // Expired-before-send calls create no attempt record because no request reached the wire.
             Err(CallError::Expired) => {
                 let now = ctx.wire.elapsed_ns();
                 return Ok(terminal_record(
@@ -1094,8 +996,7 @@ async fn execute_batch(
         .collect::<Vec<_>>()
         .into();
     let body = request("embed.batch", params)?;
-    // Served pages are checked against the request's own item identities, so
-    // the lookup is built once per logical request rather than per page.
+    // The logical request builds the item-identity lookup once because every served page is checked against it.
     let expected_items: std::collections::BTreeMap<&str, &str> = items
         .iter()
         .map(|item| (item.id.as_str(), item.content_sha256.as_str()))
@@ -1104,27 +1005,16 @@ async fn execute_batch(
     let mut first_send = None;
     let mut batch_attempts = 0u64;
     let mut polls = 0u64;
-    // One-resubmission budget for `module_restarted`, mirroring the plugin
-    // policy (embedding-synapse.ts): a host restart evicts every in-flight
-    // job, the first `module_restarted` on a logical request resubmits the
-    // batch once, and a second is terminal for that logical request.
+    // The first `module_restarted` response resubmits a logical request once.
+    // A second `module_restarted` response is terminal for the logical request.
     let mut restart_used = false;
-    // The outer loop reruns submit-then-poll when a host restart evicts the
-    // job: the resubmitted batch keeps the same logical request, deadline,
-    // and accumulating attempt/poll counters. Submit retries are gated on a
-    // per-submission counter that resets on each resubmission, mirroring the
-    // plugin's fresh callWithRetry budget per submission; `batch_attempts`
-    // stays cumulative because it feeds the attempt ledger.
+    // Each resubmission receives a fresh `callWithRetry` budget.
     'logical: loop {
         let mut submit_attempts = 0u32;
         let (job_id, served_poll_cap) = loop {
-            // Mirrors the query loop's pre-attempt guard above and the plugin's
-            // per-attempt remaining-budget check. Testing the deadline before a
-            // retry sleep is not sufficient: the timer can wake after it under
-            // saturation, and `record_call` would then hand `RoutedWire::call` a
-            // zero budget, which writes its frame before timing out the
-            // receiver. The harness would put a post-deadline submission on the
-            // wire and record the attempt it created.
+            // The retry loop checks the deadline before each attempt because a retry sleep can wake after the deadline.
+            // `RoutedWire::call` returns `ExpiredBeforeSend` without starting a frame when `deadline` has expired.
+            // An expired submission returns `ExpiredBeforeSend` without writing a frame.
             if Instant::now() >= deadline {
                 let now = ctx.wire.elapsed_ns();
                 return Ok(terminal_record(
@@ -1146,8 +1036,6 @@ async fn execute_batch(
             {
                 Ok(value) => value,
                 Err(CallError::Timeout { sent_ns }) => {
-                    // The submission reached the wire, so it anchors this
-                    // request's latency even when a resubmission follows.
                     first_send.get_or_insert(sent_ns);
                     if submit_attempts < MAX_TOTAL_ATTEMPTS {
                         let delay = Duration::from_secs_f64(rng.retry_delay_ms(100) / 1_000.0);
@@ -1195,8 +1083,7 @@ async fn execute_batch(
             let code = json["code"].as_str().unwrap_or("unparsable");
             if code == "module_restarted" {
                 if !std::mem::replace(&mut restart_used, true) {
-                    // A resubmission is a new submission: restart the outer
-                    // loop so the per-submission retry budget resets.
+                    // The outer loop restarts so each resubmission receives a fresh retry budget.
                     continue 'logical;
                 }
                 return Ok(terminal_record(
@@ -1213,9 +1100,7 @@ async fn execute_batch(
             if code != "queue_full" {
                 return Err(format!("unexpected embed.batch error: {json}"));
             }
-            // Mirrors the plugin's split budgets: `queue_full` is a
-            // deadline-bounded wait with the shared safety cap, while other
-            // transients keep the four-attempt budget.
+            // `queue_full` waits until the deadline, subject to the shared safety cap; other transients allow four attempts.
             if submit_attempts >= perf_measurement::QUEUE_FULL_MAX_ATTEMPTS {
                 return Ok(terminal_record(
                     logical_id,
@@ -1247,9 +1132,7 @@ async fn execute_batch(
 
         let mut cursor = serde_json::Value::Null;
         let mut collected = Vec::with_capacity(items.len());
-        // The first `embed.result` goes out immediately in every arm,
-        // mirroring the plugin; fast arms seed the pending ladder with the
-        // jittered fast-first delay, consumed by the first pending reply.
+        // Fast arms seed the pending ladder with the jittered fast-first delay, which the first pending reply consumes.
         let mut poll_ladder_ms = ctx
             .opts
             .variant
@@ -1258,9 +1141,7 @@ async fn execute_batch(
         loop {
             let mut poll_attempt = 0u32;
             let (reply, json) = loop {
-                // Same pre-send guard as the submission loop: a late-waking
-                // poll or pending-ladder timer must not turn into a
-                // zero-budget `embed.result` that still reaches the wire.
+                // A late-waking poll or pending-ladder timer must not invoke `embed.result` with zero budget because the call still reaches the wire.
                 if Instant::now() >= deadline {
                     let now = ctx.wire.elapsed_ns();
                     return Ok(terminal_record(
@@ -1293,9 +1174,9 @@ async fn execute_batch(
                         let code = json["code"].as_str();
                         let retryable = reply.frame.ty == raw_client::TY_ERROR
                             && matches!(code, Some("queue_full" | "timeout"));
-                        // Mirrors the plugin's split budgets: `queue_full`
-                        // waits for a slot under the shared deadline-bounded
-                        // cap; other transients keep four attempts.
+                        // `queue_full` retries until the deadline under the shared cap; other transients allow four attempts.
+                        // `queue_full` retries until the deadline under the shared cap; other transients allow four attempts.
+                        // `queue_full` retries until the deadline under the shared cap; other transients allow four attempts.
                         let attempt_cap = if code == Some("queue_full") {
                             perf_measurement::QUEUE_FULL_MAX_ATTEMPTS
                         } else {
@@ -1312,9 +1193,7 @@ async fn execute_batch(
                         tokio::time::sleep(delay).await;
                     }
                     Err(CallError::Timeout { .. }) => {
-                        // `first_send` is already anchored by the submission
-                        // that produced this job, so the poll's own send adds
-                        // nothing to the logical latency window.
+                        // `first_send` remains anchored to the first sent submission across resubmissions.
                         if poll_attempt < MAX_TOTAL_ATTEMPTS {
                             let delay = Duration::from_secs_f64(rng.retry_delay_ms(100) / 1_000.0);
                             if Instant::now() + delay < deadline {
@@ -1419,13 +1298,10 @@ async fn execute_batch(
                 if !cursor.is_string() {
                     return Err(format!("non-final page omitted cursor: {json}"));
                 }
-                // Paged fetches carry no pending delay, so this is the only
-                // place the page loop can observe an exhausted deadline. The
-                // pending path below clamps its sleep and stops here for the
-                // same reason: `record_call` would otherwise enter with a zero
-                // budget and `RoutedWire::call` writes before its receiver
-                // expires, emitting and recording a post-deadline poll that
-                // inflates amplification and host load in slow cells.
+                // Paged fetches carry no pending delay, so the page loop can observe an exhausted deadline only here.
+                // The pending path clamps its sleep to the remaining budget before calling `record_call`.
+                // `record_call` must not start with zero budget.
+                // `RoutedWire::call` writes before its receiver expires when `record_call` has zero budget.
                 if Instant::now() >= deadline {
                     let now = ctx.wire.elapsed_ns();
                     return Ok(terminal_record(
@@ -1446,14 +1322,8 @@ async fn execute_batch(
                 .opts
                 .variant
                 .pending_poll_delay_ms(&mut poll_ladder_ms, served_delay);
-            // Mirrors the plugin's `pendingPollDelay`, which clamps every
-            // pending wait to the remaining budget. An unclamped sleep
-            // crosses the logical deadline, and the next iteration still
-            // enters `record_call`: `RoutedWire::call` writes the request
-            // before its zero-budget receiver expires, so the harness both
-            // sends and records a post-deadline poll. That inflates poll
-            // amplification and host load in precisely the slow cells this
-            // benchmark is measuring.
+            // The pending path clamps each wait to the remaining budget to prevent post-deadline polls.
+            // A retry sleep that crosses the deadline must not start `record_call`, because `RoutedWire::call` writes the request before its receiver expires.
             let remaining = deadline.saturating_duration_since(Instant::now());
             tokio::time::sleep(Duration::from_secs_f64(delay_ms / 1_000.0).min(remaining)).await;
             if Instant::now() >= deadline {
@@ -1495,15 +1365,10 @@ fn validate_vectors(json: &serde_json::Value, expected: usize) -> Result<(), Str
     Ok(())
 }
 
-/// Validates one `embed.result` page's lane identity and vector payload.
 ///
-/// The query arm gates every reply through [`validate_vectors`]. Without the
-/// same gate on the batch arm, a host or engine regression that returns the
-/// expected item ids alongside corrupted vectors, a mismatched content hash,
-/// or the wrong lane identity still reaches `LogicalDisposition::Completed`
-/// and contributes to the completed rate and the latency summaries. `done` is
-/// not checked here because it is a paging state, not a payload property: the
-/// caller distinguishes a final page from a continuation.
+/// The batch arm must validate vectors before recording completion.
+/// Corrupted vectors, a mismatched content hash, or a wrong lane identity must not produce `LogicalDisposition::Completed`.
+/// `done` marks paging state; the caller distinguishes final pages from continuations.
 fn validate_batch_page(
     json: &serde_json::Value,
     expected: &std::collections::BTreeMap<&str, &str>,
@@ -1529,8 +1394,7 @@ fn validate_batch_page(
             .as_str()
             .ok_or_else(|| format!("vector {id} omitted content_sha256: {json}"))?;
         match expected.get(id) {
-            // An unrequested id is caught here rather than by the exactly-once
-            // comparison, which only sees the collected order.
+            // The `None` arm rejects unrequested IDs because the exactly-once comparison only sees collected order.
             None => return Err(format!("batch page returned unrequested id {id}: {json}")),
             Some(want) if *want != served_sha => {
                 return Err(format!(
@@ -1539,8 +1403,6 @@ fn validate_batch_page(
             }
             Some(_) => {}
         }
-        // The engine serves one golden vector for every text, so a payload
-        // that drifts from it is a regression rather than input variation.
         let vector = item["vector"]
             .as_array()
             .ok_or_else(|| format!("vector {id} omitted its payload: {json}"))?;
@@ -1549,8 +1411,7 @@ fn validate_batch_page(
                 "vector {id} payload is not the golden vector: {json}"
             ));
         }
-        // A JSON non-finite arrives as a non-number, so a component that is
-        // neither integral nor floating point never reaches the ledger.
+        // Values that are neither integral nor floating-point never reach the ledger.
         if vector.iter().any(|value| value.as_f64().is_none()) {
             return Err(format!(
                 "vector {id} carries a non-finite component: {json}"
@@ -1612,48 +1473,33 @@ async fn warm(ctx: &RunContext) -> Result<(), String> {
     Ok(())
 }
 
-/// One repetition's load-generation result.
 ///
-/// Grouped rather than returned as a widening tuple because every field is
-/// derived from the same generator run and the window is what makes the other
 /// two interpretable.
 struct LoadOutcome {
     records: Vec<LogicalRecord>,
     send_lag_max_ns: u64,
     missed_slots: u64,
     window: perf_measurement::HoldWindow,
-    /// `None` when a boundary observation failed; the reason is recorded in the
-    /// run's fatal errors, which already invalidate the repetition.
+    /// Fatal errors invalidate the repetition.
     task_window: Option<TaskWindow>,
 }
 
-/// Task counter evidence for one repetition's measured window.
 ///
-/// The deltas and the span they cover travel together: a delta whose interval
-/// is unknown cannot support the resource-shift claim, so they are one value
-/// rather than two independently-optional fields that could disagree.
+/// TaskWindow keeps deltas and their observed span together because unknown spans cannot support resource-shift claims.
 struct TaskWindow {
     deltas: Vec<process_resources::TaskDelta>,
-    /// The instants the two observations actually landed on. A saturated
-    /// harness can overshoot a boundary, so the covered span is reported rather
-    /// than assumed to equal the frozen boundaries exactly.
+    /// The boundary timestamps report when the observations actually landed.
+    /// Overload can delay a boundary observation past its requested instant.
+    /// The reported span uses the observed instants, not the requested boundaries.
     observed_start_ns: u64,
     observed_end_ns: u64,
 }
 
-/// Observes the process task counters at the measured window's own boundaries.
 ///
-/// Snapshots taken around the whole generate-and-drain interval would charge
-/// the discarded warmup prefix and any post-window drain to the comparison,
-/// and an overloaded cell drains for longer than its control — so the extra
-/// accounting time is itself correlated with the treatment. Sampling at
-/// `warmup_end` and `end` keeps the CPU and context-switch deltas on the same
-/// span as every other estimate.
+/// Sampling outside the measured window would charge warmup and post-window drain to the comparison.
+/// Sampling at `warmup_end` and `end` aligns CPU and context-switch deltas with the measured window.
 ///
-/// Returns the deltas and the instants the observations landed on. A failed
-/// observation yields the error text instead: the counters are evidence for
-/// the resource-shift claim, so a missing sample must invalidate that claim
-/// rather than silently degrade to a wider span.
+/// A missing counter sample invalidates the resource-shift claim.
 async fn observe_task_window(
     origin: Instant,
     warmup_end: Instant,
@@ -1678,15 +1524,12 @@ async fn observe_task_window(
     })
 }
 
-/// Open-loop validity gate measured at the wire rather than at the pacer.
+/// The validity gate measures first-send lag at the socket, not pacer wake-up lag.
 ///
-/// The pacer's wake-up delay is only part of a slot's lateness: once the pacer
-/// spawns the request, the task can still wait on the runtime's queue or the
-/// shared writer before its first byte reaches the socket. Sampling the lag
-/// before the spawn therefore lets a saturated, no-longer-open-loop repetition
-/// pass with zero missed slots and silently corrupt the tail comparison. A slot
-/// is missed when its recorded first send lands a full slot gap or more after
-/// its intended start.
+/// Pacer wake-up lag excludes delay after request spawn.
+/// After spawn, a request can wait on the runtime queue or shared writer.
+/// First-send lag includes runtime-queue and shared-writer delay.
+/// Measuring lag before spawn can falsely pass a saturated repetition, report zero missed slots, and corrupt the tail comparison.
 fn open_loop_send_lag(records: &[LogicalRecord], rate: u64) -> (u64, u64) {
     let mut send_lag_max_ns = 0;
     let mut missed_slots = 0;
@@ -1706,10 +1549,8 @@ fn open_loop_send_lag(records: &[LogicalRecord], rate: u64) -> (u64, u64) {
     (send_lag_max_ns, missed_slots)
 }
 
-/// The two boundary instants of `window` on the caller's clock.
+/// `start` maps `window`'s nanosecond offsets to the caller's clock.
 ///
-/// Derived from the window rather than recomputed from `seconds` so the
-/// observation boundaries cannot drift from the boundaries every estimate is
 /// partitioned by.
 fn window_boundaries(window: &perf_measurement::HoldWindow, start: Instant) -> (Instant, Instant) {
     (
@@ -1718,12 +1559,9 @@ fn window_boundaries(window: &perf_measurement::HoldWindow, start: Instant) -> (
     )
 }
 
-/// Collects the boundary observation, recording any failure as a fatal error.
 ///
-/// A lost or failed observation leaves the deltas absent instead of widening
-/// their span: the resource-shift comparison is only meaningful over the
-/// measured window, so no sample is better than a sample covering a different
-/// interval in each arm.
+/// The resource-shift comparison is meaningful only over the measured window.
+/// A missing sample is preferable to samples covering different intervals.
 async fn join_task_window(
     ctx: &RunContext,
     observed: tokio::task::JoinHandle<Result<TaskWindow, String>>,
@@ -1751,24 +1589,12 @@ async fn run_load(ctx: RunContext) -> LoadOutcome {
             for slot in 0..offered {
                 let offset_ns = perf_measurement::open_loop_offset_ns(slot, rate);
                 let scheduled = start + Duration::from_nanos(offset_ns);
-                // A slot's own spacing is the gap to the next slot; exact for
-                // every rate rather than a global constant.
                 let slot_gap_ns = perf_measurement::open_loop_offset_ns(slot + 1, rate) - offset_ns;
-                // The spin window is bounded by half the slot gap so the
-                // pacer can never busy-spin continuously at high rates: an
-                // unbounded spin per sub-slack slot would saturate a worker
-                // core in the same process as the host under test and
-                // inflate the tails this harness measures.
                 let slack = PACING_SLACK.min(Duration::from_nanos(slot_gap_ns / 2));
                 tokio::time::sleep_until((scheduled - slack).into()).await;
                 while Instant::now() < scheduled {
                     std::hint::spin_loop();
                 }
-                // The intended schedule, not a reconstruction from the pacer's
-                // observed lag. The frozen offered rate is defined by intended
-                // starts, and comparing the recorded first send against this
-                // value is what makes the validity gate sensitive to time the
-                // request spent queued after the pacer released it.
                 let scheduled_ns = start_ns.saturating_add(offset_ns);
                 let task_ctx = ctx.clone();
                 tasks.spawn(async move { execute(&task_ctx, slot + 1, Some(scheduled_ns)).await });
@@ -1852,13 +1678,7 @@ struct Summary {
     engine_delay_ms: u64,
     max_waiting_queries: usize,
     query_retry_after_ms: u64,
-    /// Subtracted from every permit-wait sample, so two runs with otherwise
-    /// identical emitted configuration derive different wait distributions
-    /// when it differs. Emitted with the other treatment inputs to keep that
-    /// subtraction reproducible from the summary alone.
     transport_floor_ns: u64,
-    /// See [`HOST_BUILD_ID`]. `null` for an unidentified build, which the
-    /// contract admits only for variants that vary client policy alone.
     host_build_id: Option<&'static str>,
     ledger: perf_measurement::SynapseLedgerSummary,
     attempt_latency: Option<LatencySummary>,
@@ -1868,43 +1688,23 @@ struct Summary {
     service_time: Option<LatencySummary>,
     service_time_mean_ns: Option<f64>,
     service_time_cv: Option<f64>,
-    /// Engine calls the service estimates above are built from, and those the
-    /// window classification held out. Emitted so a reader can tell a cell with
-    /// few in-window engine calls from one whose samples were discarded.
     service_measured_samples: u64,
     service_excluded_samples: u64,
     send_lag_max_ns: u64,
     missed_slots: u64,
-    /// Frozen hold window on the wire clock. Emitted so both discards and the
-    /// in-flight censoring below are re-derivable from raw evidence.
     hold_window_start_ns: u64,
     warmup_end_ns: u64,
     hold_window_end_ns: u64,
-    /// Rows held out of every estimate above as the window's warmup prefix.
-    /// They stay in raw evidence with `window: "warmup"`.
     warmup_offered: u64,
     warmup_attempts: u64,
-    /// Rows held out because they opened at or after the window end: a
-    /// closed-loop worker that passed the boundary test but did not reach the
-    /// wire until the window had closed. They stay in raw evidence with
     /// `window: "after_window"`.
     after_window_offered: u64,
     after_window_attempts: u64,
     censored_per_mille: f64,
-    /// Task counter deltas over the measured window, absent when a boundary
-    /// observation failed. The instants the two observations landed on are
-    /// emitted alongside so the covered span is auditable rather than assumed
-    /// to equal `[warmup_end_ns, hold_window_end_ns]` exactly.
     task_deltas: Option<Vec<process_resources::TaskDelta>>,
     task_window_start_ns: Option<u64>,
     task_window_end_ns: Option<u64>,
-    /// Transport-loss failures on the single shared wire. A subset of
-    /// `fatal_errors` (still part of the fatal gate), counted separately
-    /// so analysis can distinguish connection loss from harness defects.
     connection_loss_errors: u64,
-    /// Frames whose write finished after the caller's deadline. See
-    /// [`RoutedWire::overdeadline_writes`]: any nonzero value means the host ran
-    /// work the harness had already accounted as expired, so the repetition is
     /// inadmissible.
     overdeadline_writes: u64,
     fatal_errors: Vec<String>,
@@ -1977,13 +1777,6 @@ async fn run(
     String,
 > {
     let data_root = tempfile::tempdir().map_err(|error| format!("temporary data root: {error}"))?;
-    // One origin for the engine and the wire: service samples and logical rows
-    // are only comparable to the hold window if they share a clock. Taken
-    // before the host starts so the engine, which is built first, can hold it;
-    // every timestamp is window-relative, so the extra startup offset is common
-    // to all of them and cancels. Shadowing this with a second `Instant::now()`
-    // for the wire would put service samples and window boundaries on different
-    // zeros, shifting every service classification by the startup interval.
     let origin = Instant::now();
     let service = Arc::new(StdMutex::new(Vec::new()));
     let engine = Arc::new(DelayEngine {
@@ -1994,11 +1787,6 @@ async fn run(
     let mut limits = SynapseLimits {
         max_waiting_queries: opts.max_waiting_queries,
         query_retry_after_ms: opts.query_retry_after_ms,
-        // Uniform across every variant arm so admission-treatment cells stay
-        // comparable: startup validation charges (waiters + queued jobs +
-        // queued bytes) against one resident budget, and the default 64 MiB
-        // queued-byte budget leaves no room for any waiting query. The
-        // benchmark's batch payloads are far below this bound.
         max_queued_request_bytes: HARNESS_QUEUED_REQUEST_BYTES,
         ..Default::default()
     };
@@ -2042,12 +1830,8 @@ async fn run(
         task_window,
     } = load;
     let mut attempts = ctx.attempts.lock().await.clone();
-    // Apply the frozen window before anything is estimated: classify every row
-    // against the boundaries and censor requests the window closed on.
     window.stamp(&mut records, &mut attempts);
     let logical = records;
-    // Raw evidence keeps every row; only the measured set feeds the ledger, the
-    // rates, and the percentiles.
     let (logical_estimates, logical_excluded) =
         perf_measurement::partition_measured(&logical, |record| record.window);
     let (attempt_estimates, attempt_excluded) =
@@ -2061,14 +1845,6 @@ async fn run(
             .map(|attempt| attempt.latency_ns)
             .collect(),
     );
-    // Percentiles describe requests that reached a terminal outcome inside the
-    // window. A censored row's `latency_ns` runs to whenever it actually
-    // settled — seconds or minutes past the boundary for an overloaded cell —
-    // so admitting it would let the tail be dominated by durations the ledger
-    // simultaneously declares right-censored, and the contamination would grow
-    // with the treatment. The censoring rate reports what this excludes, so the
-    // pair stays interpretable: percentiles over answered requests, plus the
-    // fraction that went unanswered.
     let logical_latency = LatencySummary::from_unsorted(
         logical_estimates
             .iter()
@@ -2076,12 +1852,6 @@ async fn run(
             .map(|request| request.latency_ns)
             .collect(),
     );
-    // Permit wait is only meaningful for attempts the engine actually
-    // served: a rejected or timed-out query attempt did no engine work,
-    // so subtracting the engine delay from it produces a hugely negative
-    // residual that is scheduler noise, not permit queueing. The type
-    // stays signed and unclamped so genuine timer-resolution negatives
-    // on successful attempts remain visible.
     let permit_wait = SignedSummary::from_unsorted(
         attempt_estimates
             .iter()
@@ -2103,12 +1873,6 @@ async fn run(
             .map(|request| request.polls)
             .collect(),
     );
-    // Service samples carry their own start instant, so the same window
-    // classification that partitions logical rows partitions them. Without it
-    // the engine calls made under the discarded warmup prefix — and those
-    // drained after the boundary — would enter mean S, CV, and the service
-    // percentiles that the capacity estimate is built on, while the logical and
-    // attempt ledgers excluded that very cohort.
     let mut service_samples = service.lock().expect("service samples").clone();
     for sample in &mut service_samples {
         sample.window = window.classify(sample.started_ns);
@@ -2211,11 +1975,6 @@ fn censored_count(ledger: &perf_measurement::SynapseLedgerSummary) -> u64 {
     ledger.timed_out.saturating_add(ledger.in_flight)
 }
 
-/// The two dispositions the censoring rate counts, and therefore the two the
-/// latency percentiles exclude. A timeout's duration is truncated at the
-/// deadline and an in-flight row's runs past the window, so both are
-/// right-censored observations rather than measured request latencies; keeping
-/// one definition means the reported rate always describes exactly the rows the
 /// percentiles omit.
 fn is_censored(disposition: LogicalDisposition) -> bool {
     matches!(
@@ -2313,13 +2072,6 @@ fn main() {
                 .poll_distribution
                 .as_ref()
                 .is_some_and(|polls| polls.max > MAX_POLLS_PER_LOGICAL);
-            // An empty measured window is internally consistent — the ledger
-            // balances, censoring divides to zero, and no missed-slot gate
-            // applies to closed loop — so nothing above rejects it. A cell with
-            // no measured request carries no estimate at all and must not be
-            // consumable as admissible evidence. A closed-loop repetition
-            // reaches this state whenever every request it opened fell in the
-            // warmup prefix or spanned the whole hold.
             let empty_window = summary.ledger.offered == 0
                 || summary.logical_latency.is_none()
                 || summary.service_time.is_none();
@@ -2400,12 +2152,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn call_writes_strictly_increasing_correlations_under_concurrency() {
-        // The host retires the generation on any non-increasing Request
-        // correlation, so allocation and socket write must be atomic under
-        // the writer lock. This drives many concurrent callers through one
-        // wire and decodes the request headers server-side: hoisting the
-        // fetch_add outside the writer lock lets two tasks write inverted
-        // correlations, which this assertion catches.
         const CALLERS: usize = 256;
         let (stream, mut peer) = UnixStream::pair().expect("create local stream pair");
         let server = tokio::spawn(async move {
@@ -2436,12 +2182,6 @@ mod tests {
         for _ in 0..CALLERS {
             let wire = Arc::clone(&wire);
             callers.spawn(async move {
-                // The server never replies, so every call resolves as an
-                // attempt timeout after its write; only the write order
-                // matters here. One second is microseconds of loopback writes
-                // away from being generous for 256 contending writers, so the
-                // test still exercises write ordering rather than the pre-send
-                // refusal, and it is also how long the reply wait takes to
                 // expire.
                 let deadline = Instant::now() + Duration::from_secs(1);
                 match wire.call(b"{}".to_vec(), deadline).await {
@@ -2471,9 +2211,6 @@ mod tests {
 
     #[test]
     fn terminal_module_restarted_rejection_keeps_ledgers_valid() {
-        // One submit, one poll that answered module_restarted, one
-        // resubmission, then a terminal module_restarted poll: four owned
-        // attempts, disposition Rejected.
         let record = terminal_record(
             7,
             None,
@@ -2516,10 +2253,6 @@ mod tests {
 
         assert!(ledger.valid, "{:?}", ledger.errors);
         assert_eq!(censored_count(&ledger), 0);
-        // module_restarted attempts are admitted work — only queue_full is
-        // an admission rejection — and they are not timeouts, so both
-        // submissions and both restarted polls count as admitted and the
-        // timeout breakdown stays empty.
         assert_eq!(ledger.admitted_by_method["embed.batch"], 2);
         assert_eq!(ledger.admitted_by_method["embed.result"], 2);
         assert!(ledger.rejected_by_method_code.is_empty());
@@ -2575,11 +2308,6 @@ mod tests {
         .expect_err("B is a loss arm")
         .contains("requires --max-waiting-queries 0"));
 
-        // `baseline` and `hygiene-only` claim pre-change host code, which this
-        // binary cannot select at run time. Without a build id the emitted cell
-        // would look like a host comparison while running the changed host, so
-        // the run is refused. Guarded on the constant because a collection build
-        // legitimately sets it.
         if HOST_BUILD_ID.is_none() {
             for variant in ["baseline", "hygiene-only"] {
                 assert!(
