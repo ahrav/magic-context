@@ -1,6 +1,7 @@
 import { CHARS_PER_TOKEN } from "../ballast";
 import { makeContractPrimitives } from "../contract-primitives";
 import { ID_SHAPED_QUERY_MAX_TOKENS } from "../../../plugin/src/features/magic-context/search";
+import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 
 export const ARM_IDS = ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"] as const;
 export type ArmId = (typeof ARM_IDS)[number];
@@ -244,6 +245,10 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     const r1 = p.record(interventions.r1, "scenario.interventions.r1");
     p.exact(r1, ["insertAfterTurnId", "query", "locatorIds"], "scenario.interventions.r1");
     const expectedAnswer = p.string(root.expectedAnswer, "scenario.expectedAnswer");
+    /** Verifiers compare against the model's trimmed file contents, and `p.string` preserves the authored bytes so a fingerprint stays over what was written. A padded answer is therefore unmatchable in every arm; reject it here rather than trimming and changing the covered bytes. commentlint: allow(JUDGE) */
+    if (expectedAnswer !== expectedAnswer.trim()) {
+        p.fail("scenario.expectedAnswer: not-trimmed");
+    }
     const r1Query = p.string(r1.query, "scenario.interventions.r1.query");
     /** `scriptedCtxSearchTurn` interpolates the query into the model-visible prompt, so a query containing the expected answer lets R1 pass its critical check with no retrieval. Case-folded because a model reads `sqlite` and `SQLite` as the same token. commentlint: allow(JUDGE) */
     if (r1Query.toLowerCase().includes(expectedAnswer.toLowerCase())) {
@@ -256,6 +261,19 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     );
     if (!turnIds.has(insertAfterTurnId)) {
         p.fail("scenario.interventions.r1.insertAfterTurnId: unknown-turn");
+    }
+    const insertIndex = turnScript.findIndex(({ id }) => id === insertAfterTurnId);
+    const afterInsertion = turnScript.slice(insertIndex + 1);
+    /** `scriptedCtxSearchTurn` only performs the fixed oracle exchange; a later user turn has to consume the retrieved result and write the answer file, so without one R1 fails even when retrieval succeeded and its cell is not comparable with the other arms. commentlint: allow(JUDGE) */
+    if (!afterInsertion.some(({ role }) => role === "user")) {
+        p.fail("scenario.interventions.r1.insertAfterTurnId: no-following-probe");
+    }
+    /** The evidence turn carries the answer by design and sits before this point; a turn at or after it that repeats the answer hands the gold to every arm directly, so the baseline passes without retrieval however the evidence turn is designated. commentlint: allow(JUDGE) */
+    if (
+        afterInsertion.some(({ content }) =>
+            content.toLowerCase().includes(expectedAnswer.toLowerCase()))
+    ) {
+        p.fail("scenario.turnScript: post-insertion-answer-leak");
     }
     const locatorIds = parseStringArray(
         r1.locatorIds,
@@ -283,8 +301,11 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     if (memories.length === 0) {
         p.fail("scenario.interventions.r2.memories: empty");
     }
-    /** The seeder resolves rows with identical normalized content onto one claim and attaches the rest as extra provenance, so repeated claims collapse to a single `publicClaimId`: R1 would satisfy several handles from one delivered row while R2 exercised fewer gold memories than declared. Exact duplicates only — the seeder's normalization is not reproduced here. commentlint: allow(JUDGE) */
-    p.unique(memories.map(({ claim }) => claim), "scenario.interventions.r2.memories");
+    /** The seeder resolves rows with equal normalized content onto one claim and attaches the rest as extra provenance, so claims differing only by casing or whitespace still collapse to a single `publicClaimId`: R1 would satisfy several handles from one delivered row while R2 exercised fewer gold memories than declared. Keyed through the production normalizer so the two identities cannot drift. commentlint: allow(JUDGE) */
+    p.unique(
+        memories.map(({ claim }) => normalizeMemoryContent(claim)),
+        "scenario.interventions.r2.memories",
+    );
     const r3 = p.record(interventions.r3, "scenario.interventions.r3");
     /** `r2.memories` is the declaration's only gold, so it is also what a runner seeds and resolves `r1.locatorIds` against. Unequal lengths leave a handle with no `publicClaimId` to map to and make R1 and R2 compare different gold sets; pairing is positional. commentlint: allow(JUDGE) */
     if (locatorIds.length !== memories.length) {

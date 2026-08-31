@@ -148,22 +148,62 @@ describe("paired-delta scenario contract", () => {
         ).toThrow(/evidenceTurnId: not-before-r1-insertion/);
     });
 
-    it("rejects duplicate R2 gold claims", () => {
+    it("rejects a padded expected answer the verifier could never match", () => {
+        expect(() =>
+            parseScenarioDeclaration(scenario({ expectedAnswer: "alpha-17 " })),
+        ).toThrow(/expectedAnswer: not-trimmed/);
+    });
+
+    it("rejects an answer leak in any turn at or after the R1 insertion point", () => {
+        const base = scenario();
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                turnScript: [
+                    ...base.turnScript.slice(0, 2),
+                    { id: "turn-probe", role: "user", content: "Write ALPHA-17 to the file." },
+                ],
+            })),
+        ).toThrow(/turnScript: post-insertion-answer-leak/);
+    });
+
+    it("requires a user probe turn after the R1 insertion point", () => {
         const base = scenario();
         expect(() =>
             parseScenarioDeclaration(scenario({
                 interventions: {
                     ...base.interventions,
-                    r1: { ...base.interventions.r1, locatorIds: ["mem-alpha", "mem-beta"] },
-                    r2: {
-                        memories: [
-                            { claim: "The ID is alpha-17.", evidence: "First sighting." },
-                            { claim: "The ID is alpha-17.", evidence: "Second sighting." },
-                        ],
-                    },
+                    r1: { ...base.interventions.r1, insertAfterTurnId: "turn-probe" },
                 },
             })),
-        ).toThrow(/r2\.memories: duplicate/);
+        ).toThrow(/insertAfterTurnId: no-following-probe/);
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                turnScript: [
+                    ...base.turnScript.slice(0, 2),
+                    { id: "turn-probe", role: "assistant", content: "Understood." },
+                ],
+            })),
+        ).toThrow(/insertAfterTurnId: no-following-probe/);
+    });
+
+    it("rejects duplicate R2 gold claims", () => {
+        const base = scenario();
+        for (const second of ["The ID is alpha-17.", "the id is   ALPHA-17.  "]) {
+            expect(() =>
+                parseScenarioDeclaration(scenario({
+                    interventions: {
+                        ...base.interventions,
+                        r1: { ...base.interventions.r1, locatorIds: ["mem-alpha", "mem-beta"] },
+                        r2: {
+                            memories: [
+                                { claim: "The ID is alpha-17.", evidence: "First sighting." },
+                                { claim: second, evidence: "Second sighting." },
+                            ],
+                        },
+                    },
+                })),
+            ).toThrow(/r2\.memories: duplicate/);
+        }
     });
 
     it("requires one declared gold memory per R1 locator handle", () => {
