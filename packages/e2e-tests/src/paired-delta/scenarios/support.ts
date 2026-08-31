@@ -11,8 +11,8 @@ interface ScenarioSpec {
     locatorId: string;
 }
 
-/** Matches the delivered memory-row marker (`[memory] ... id=<publicClaimId>`), not a bare id: the empty-results renderer echoes the query back, and a locator query *is* the resolved ids, so a bare substring test passes on zero retrieval. Absent or empty resolved ids fail rather than falling back to a symbolic match, so a runner that skips the handle-to-publicClaimId mapping cannot score a retrieval it never performed. commentlint: allow(JUDGE) */
-function r1WirePassed(context: VerifierContext): boolean {
+/** A validity gate, not a scored check: `ArmedCellResult` keeps only aggregate counts, so scoring this on R1 alone would give R1 a larger denominator than the arms it is subtracted from and manufacture a retrieval delta. A runner calls this and, on false, records the R1 cell as not completed instead of letting it contribute a score. Matches the delivered memory-row marker (`[memory] ... id=<publicClaimId>`), not a bare id: the empty-results renderer echoes the query back, and a locator query *is* the resolved ids, so a bare substring test passes on zero retrieval. commentlint: allow(JUDGE) */
+export function r1WireDelivered(context: VerifierContext): boolean {
     const resolved = context.resolvedLocatorIds ?? [];
     if (resolved.length === 0) return false;
     const wire = context.scriptedTurnText ?? "";
@@ -34,9 +34,6 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
         return [
             { id: "check-file", passed: actual !== null },
             { id: "check-answer", passed: actual === spec.answer },
-            ...(context.armId === "r1"
-                ? [{ id: "check-r1-wire", passed: r1WirePassed(context) }]
-                : []),
         ];
     };
 
@@ -54,7 +51,6 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
                 id: "check-answer",
                 appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
             },
-            { id: "check-r1-wire", appliesToArms: ["r1"] },
         ],
         criticalCheckIds: ["check-answer"],
         turnScript: [

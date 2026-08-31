@@ -126,26 +126,23 @@ describe("paired-delta scenario contract", () => {
 
     it("requires the evidence turn to precede the R1 insertion point", () => {
         const base = scenario();
-        expect(() =>
-            parseScenarioDeclaration(scenario({
-                interventions: {
-                    ...base.interventions,
-                    r1: { ...base.interventions.r1, insertAfterTurnId: "turn-evidence" },
-                },
-                absencePrecondition: {
-                    ...base.absencePrecondition,
-                    evidenceTurnId: "turn-probe",
-                },
-            })),
-        ).toThrow(/evidenceTurnId: not-before-r1-insertion/);
-        expect(() =>
-            parseScenarioDeclaration(scenario({
-                interventions: {
-                    ...base.interventions,
-                    r1: { ...base.interventions.r1, insertAfterTurnId: "turn-evidence" },
-                },
-            })),
-        ).toThrow(/evidenceTurnId: not-before-r1-insertion/);
+        /** Answer-free turns so the ordering rule is what fires, not the post-insertion leak scan. commentlint: allow(JUDGE) */
+        const turnScript: ScenarioDeclaration["turnScript"] = [
+            { id: "turn-lead", role: "user", content: "Start the task." },
+            { id: "turn-evidence", role: "user", content: "Consult the memo." },
+            { id: "turn-probe", role: "user", content: "Write the remembered ID." },
+        ];
+        for (const insertAfterTurnId of ["turn-lead", "turn-evidence"]) {
+            expect(() =>
+                parseScenarioDeclaration(scenario({
+                    turnScript,
+                    interventions: {
+                        ...base.interventions,
+                        r1: { ...base.interventions.r1, insertAfterTurnId },
+                    },
+                })),
+            ).toThrow(/evidenceTurnId: not-before-r1-insertion/);
+        }
     });
 
     it("rejects a padded expected answer the verifier could never match", () => {
@@ -246,7 +243,7 @@ describe("paired-delta scenario contract", () => {
         ).not.toThrow();
     });
 
-    it("requires every critical check to cover every compared arm", () => {
+    it("requires every scored check to cover every compared arm", () => {
         expect(() =>
             parseScenarioDeclaration(scenario({
                 checks: [
@@ -258,7 +255,18 @@ describe("paired-delta scenario contract", () => {
                 ],
                 criticalCheckIds: ["check-mc-only"],
             })),
-        ).toThrow(/criticalCheckIds: arm-coverage-incomplete/);
+        ).toThrow(/checks: arm-coverage-incomplete\(check-mc-only\)/);
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                checks: [
+                    {
+                        id: "check-shared",
+                        appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
+                    },
+                    { id: "check-r1-only", appliesToArms: ["r1"] },
+                ],
+            })),
+        ).toThrow(/checks: arm-coverage-incomplete\(check-r1-only\)/);
     });
 
     it("rejects an R2 declaration with no gold memory", () => {

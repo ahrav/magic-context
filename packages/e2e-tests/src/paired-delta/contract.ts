@@ -210,6 +210,12 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         p.fail("scenario.checks: ladder-intersection-empty");
     }
 
+    /** `ArmedCellResult` keeps only aggregate passed/total counts, so a check scored on some compared arms and not others gives them different denominators and the paired subtraction compares unlike ratios — an arm can lead purely by having an extra check. Arm-specific conditions belong in a validity gate that decides `runHealth`, not in the scored set. commentlint: allow(JUDGE) */
+    for (const { id, appliesToArms } of checks) {
+        if (!COMPARED_ARM_IDS.every((arm) => appliesToArms.includes(arm))) {
+            p.fail(`scenario.checks: arm-coverage-incomplete(${id})`);
+        }
+    }
     const criticalCheckIds = parseStringArray(
         root.criticalCheckIds,
         CHECK_ID_RE,
@@ -218,13 +224,6 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     const checksById = new Map(checks.map((check) => [check.id, check]));
     if (criticalCheckIds.some((id) => !checksById.has(id))) {
         p.fail("scenario.criticalCheckIds: unknown-check");
-    }
-    /** `validateCheckVector` omits a check from the arms it does not apply to, so a critical check declared for only some compared arms gives those arms different critical denominators and the paired critical delta subtracts unlike outcomes. Requiring full coverage keeps every critical comparison like-for-like. commentlint: allow(JUDGE) */
-    if (
-        criticalCheckIds.some((id) =>
-            !COMPARED_ARM_IDS.every((arm) => checksById.get(id)!.appliesToArms.includes(arm)))
-    ) {
-        p.fail("scenario.criticalCheckIds: arm-coverage-incomplete");
     }
 
     const turnScript = p.array(root.turnScript, "scenario.turnScript").map((rawTurn, index) => {
@@ -263,14 +262,13 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         p.fail("scenario.interventions.r1.insertAfterTurnId: unknown-turn");
     }
     const insertIndex = turnScript.findIndex(({ id }) => id === insertAfterTurnId);
-    const afterInsertion = turnScript.slice(insertIndex + 1);
     /** `scriptedCtxSearchTurn` only performs the fixed oracle exchange; a later user turn has to consume the retrieved result and write the answer file, so without one R1 fails even when retrieval succeeded and its cell is not comparable with the other arms. commentlint: allow(JUDGE) */
-    if (!afterInsertion.some(({ role }) => role === "user")) {
+    if (!turnScript.slice(insertIndex + 1).some(({ role }) => role === "user")) {
         p.fail("scenario.interventions.r1.insertAfterTurnId: no-following-probe");
     }
-    /** The evidence turn carries the answer by design and sits before this point; a turn at or after it that repeats the answer hands the gold to every arm directly, so the baseline passes without retrieval however the evidence turn is designated. commentlint: allow(JUDGE) */
+    /** From the insertion turn inclusive: the ballast precedes that turn, so an answer repeated there is not buried either and stays visible to every arm. The evidence turn carries the answer by design and is required to sit strictly earlier, so it is outside this range. commentlint: allow(JUDGE) */
     if (
-        afterInsertion.some(({ content }) =>
+        turnScript.slice(insertIndex).some(({ content }) =>
             content.toLowerCase().includes(expectedAnswer.toLowerCase()))
     ) {
         p.fail("scenario.turnScript: post-insertion-answer-leak");

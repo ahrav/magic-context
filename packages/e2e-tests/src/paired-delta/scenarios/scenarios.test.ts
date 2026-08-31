@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { validateCheckVector } from "../contract";
 import { CHARS_PER_TOKEN } from "../../ballast";
 import { pairedDeltaScenarios } from "./index";
+import { r1WireDelivered } from "./support";
 
 describe("paired-delta authored scenarios", () => {
     it("contains ten information-absence scenarios across four families", () => {
@@ -38,14 +39,21 @@ describe("paired-delta authored scenarios", () => {
             }
         });
 
-        it(`${scenario.scenarioId} enforces structural pressure and R1 wire checks`, async () => {
-            expect(
-                scenario.absencePrecondition.minimumBallastBytes / CHARS_PER_TOKEN,
-            ).toBeGreaterThan(scenario.modelContextLimit);
+        it(`${scenario.scenarioId} scores identical denominators on every compared arm`, () => {
+            const perArm = ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"].map((arm) =>
+                scenario.checks.filter(({ appliesToArms }) =>
+                    appliesToArms.includes(arm as never)).length);
+            expect(new Set(perArm).size).toBe(1);
+        });
+
+        it(`${scenario.scenarioId} gates R1 wire delivery outside the scored checks`, async () => {
             const root = mkdtempSync(join(tmpdir(), "paired-delta-scenario-"));
             try {
                 mkdirSync(join(root, "result"), { recursive: true });
                 writeFileSync(join(root, "result", "answer.txt"), scenario.expectedAnswer);
+                expect(
+                    scenario.absencePrecondition.minimumBallastBytes / CHARS_PER_TOKEN,
+                ).toBeGreaterThan(scenario.modelContextLimit);
                 /** Stand in for the runner's handle-to-publicClaimId mapping: the search turn is served resolved ids, so the declared `mem-*` handles never reach the wire text. commentlint: allow(JUDGE) */
                 const resolvedLocatorIds = scenario.interventions.r1.locatorIds.map(
                     (_handle, index) => `mcm_${String(index).padStart(32, "0")}`,
@@ -62,23 +70,27 @@ describe("paired-delta authored scenarios", () => {
                 });
                 validateCheckVector(scenario, "r1", checks);
                 expect(checks.every(({ passed }) => passed)).toBe(true);
+                expect(checks.some(({ id }) => id === "check-r1-wire")).toBe(false);
 
-                /** The empty-results renderer echoes the query, and a locator query is the resolved ids, so a bare substring test would score zero retrieval as a pass. commentlint: allow(JUDGE) */
-                const emptyRender = await scenario.verifier({
+                expect(r1WireDelivered({
+                    armId: "r1",
+                    workspacePath: root,
+                    scriptedTurnText: `Found 1 results:\n${deliveredRows}`,
+                    resolvedLocatorIds,
+                })).toBe(true);
+                /** The empty-results renderer echoes the query, and a locator query is the resolved ids, so a bare substring test would treat zero retrieval as delivery. commentlint: allow(JUDGE) */
+                expect(r1WireDelivered({
                     armId: "r1",
                     workspacePath: root,
                     scriptedTurnText: `No results found for "${resolvedLocatorIds.join(" ")}" `
                         + "across notes, memories, primers, git commits, or message history.",
                     resolvedLocatorIds,
-                });
-                expect(emptyRender.find(({ id }) => id === "check-r1-wire")?.passed).toBe(false);
-
-                const unmapped = await scenario.verifier({
+                })).toBe(false);
+                expect(r1WireDelivered({
                     armId: "r1",
                     workspacePath: root,
                     scriptedTurnText: scenario.interventions.r1.locatorIds.join(" "),
-                });
-                expect(unmapped.find(({ id }) => id === "check-r1-wire")?.passed).toBe(false);
+                })).toBe(false);
             } finally {
                 rmSync(root, { recursive: true, force: true });
             }
