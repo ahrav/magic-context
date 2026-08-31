@@ -352,13 +352,15 @@ impl KernelStore {
         fault_after_events: bool,
     ) -> Result<CommitReceipt, KernelError> {
         let mut writer = self.lock_writer()?;
-        commit_with_writer(
+        let receipt = commit_with_writer(
             &mut writer,
             self.lease_epoch(),
             intent,
             operation,
             fault_after_events,
-        )
+        )?;
+        super::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())?;
+        Ok(receipt)
     }
 }
 
@@ -783,42 +785,50 @@ impl KernelStore {
         &self,
         rows: &[AlignmentProjectionSpec],
     ) -> Result<ProjectionReplaceResult, KernelError> {
-        let rows = rows
-            .iter()
-            .map(RedactedProjection::new)
-            .collect::<Result<Vec<_>, _>>()?;
         let mut writer = self.lock_writer()?;
         let tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| KernelError::Io)?;
         check_fence(&tx, self.lease_epoch())?;
+        let result = replace_alignment_projection_tx(&tx, rows)?;
+        tx.commit().map_err(|_| KernelError::Io)?;
+        Ok(result)
+    }
+}
+
+pub(super) fn replace_alignment_projection_tx(
+    tx: &Transaction<'_>,
+    rows: &[AlignmentProjectionSpec],
+) -> Result<ProjectionReplaceResult, KernelError> {
+    let rows = rows
+        .iter()
+        .map(RedactedProjection::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    tx.execute(
+        "DELETE FROM durable_text_redactions WHERE owner_kind='alignment_projection'",
+        [],
+    )
+    .map_err(|_| KernelError::Io)?;
+    tx.execute("DELETE FROM alignment_projection", [])
+        .map_err(|_| KernelError::Io)?;
+    for row in &rows {
         tx.execute(
-            "DELETE FROM durable_text_redactions WHERE owner_kind='alignment_projection'",
-            [],
+            "INSERT INTO alignment_projection(
+                 decision_id,observation_id,alignment_kind,alignment_payload,
+                 built_through_commit_seq
+             ) VALUES (?1,?2,?3,?4,?5)",
+            params![
+                row.decision_id.text,
+                row.observation_id.text,
+                row.alignment_kind.text,
+                row.alignment_payload.as_ref().map(|field| &field.text),
+                row.built_through_commit_seq,
+            ],
         )
         .map_err(|_| KernelError::Io)?;
-        tx.execute("DELETE FROM alignment_projection", [])
-            .map_err(|_| KernelError::Io)?;
-        for row in &rows {
-            tx.execute(
-                "INSERT INTO alignment_projection(
-                     decision_id,observation_id,alignment_kind,alignment_payload,
-                     built_through_commit_seq
-                 ) VALUES (?1,?2,?3,?4,?5)",
-                params![
-                    row.decision_id.text,
-                    row.observation_id.text,
-                    row.alignment_kind.text,
-                    row.alignment_payload.as_ref().map(|field| &field.text),
-                    row.built_through_commit_seq,
-                ],
-            )
-            .map_err(|_| KernelError::Io)?;
-            row.record(&tx)?;
-        }
-        tx.commit().map_err(|_| KernelError::Io)?;
-        Ok(ProjectionReplaceResult { rows: rows.len() })
+        row.record(tx)?;
     }
+    Ok(ProjectionReplaceResult { rows: rows.len() })
 }
 
 struct RedactedIntent {

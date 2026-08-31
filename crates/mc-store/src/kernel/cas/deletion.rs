@@ -199,6 +199,8 @@ impl KernelStore {
             if state.pending_unlink {
                 self.complete_pending_purge_locked(&mut writer, &state.digest)?;
             }
+            crate::kernel::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
+                .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
             return Ok(result_from_state(&state, request.kind, true));
         }
         if request.kind == ArtifactDeletionKind::Delete && state.live_object_ids.is_empty() {
@@ -208,6 +210,8 @@ impl KernelStore {
                     &state.digest,
                 ));
             }
+            crate::kernel::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
+                .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
             return Ok(result_from_state(&state, request.kind, true));
         }
 
@@ -344,6 +348,8 @@ impl KernelStore {
             fault == Some(ArtifactDeletionFault::BeforeCommit),
         )
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+        crate::kernel::slice::rebuild_alignment_with_writer(&mut writer, self.lease_epoch())
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
 
         let committed = serde_json::from_str::<DeletionReceiptPayload>(&receipt.result)
             .unwrap_or_else(|_| DeletionReceiptPayload {

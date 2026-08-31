@@ -41,7 +41,8 @@ pub use outbox::{ConsumerAbandonment, OutboxPruneResult};
 pub use retention::{StagingMaintenanceResult, StagingTerminalState};
 pub use scope::{ScopeSpec, ScopeTermSpec, ScopeWriteOutcome};
 pub use slice::{
-    DecisionEventOutcome, DecisionEventPayload, DecisionEventSpec, DecisionPayload, DecisionSpec,
-    DecisionWriteOutcome, ObservationDependencySpec, ObservationPayload, ObservationSpec,
-    ObservationWriteOutcome, RetirementOutcome,
+    AlignmentRebuild, AlignmentRow, AlignmentSnapshot, DecisionEventOutcome, DecisionEventPayload,
+    DecisionEventSpec, DecisionPayload, DecisionRow, DecisionSpec, DecisionWriteOutcome,
+    ObservationDependencySpec, ObservationPayload, ObservationRow, ObservationSpec,
+    ObservationWriteOutcome, RetirementOutcome, SliceSnapshot,
 };
