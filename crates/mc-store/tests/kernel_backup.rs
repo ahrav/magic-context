@@ -1335,3 +1335,44 @@ fn scratch_cleanup_spares_files_the_store_could_not_have_written() {
     assert!(!generated.exists(), "generated scratch was not reclaimed");
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 1);
 }
+
+#[test]
+fn a_dangling_reference_is_refused_even_when_integrity_check_passes() {
+    let root = private_dir();
+    let destination = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    let backup = store.backup(request(destination.path())).unwrap();
+    insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    // `foreign_keys=OFF` lets a dangling row be written that `integrity_check`
+    // still reports as ok, so only a referential check can reject it.
+    let artifact = Connection::open(&backup.destination_path).unwrap();
+    artifact.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    artifact
+        .execute(
+            "INSERT INTO capture_pin_refs(capture_pin_id,evidence_id,expires_at)
+             VALUES ('no-such-pin','no-such-evidence',NULL)",
+            [],
+        )
+        .unwrap();
+    let integrity: String = artifact
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok", "fixture must pass integrity_check");
+    let violations: i64 = artifact
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(violations > 0, "fixture must have a dangling reference");
+    drop(artifact);
+
+    assert_eq!(
+        store.restore(&backup.destination_path).unwrap_err(),
+        KernelError::InvalidRestore
+    );
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(insert_domain(&store, 3, Sensitivity::Normal), 3);
+}

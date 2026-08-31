@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -984,11 +984,26 @@ fn valid_recovery_path(path: &Path, recovery_dir: &Path) -> bool {
 // authoritative copy and a half-installed replacement is discarded.
 pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
     let marker_path = restore_marker_path(path);
-    let metadata = fs::symlink_metadata(&marker_path).map_err(|_| KernelError::Inconclusive)?;
+    // Validating a pathname and then reopening it leaves a window for a swap, so the
+    // checks and the read share one descriptor. `NONBLOCK` keeps a FIFO from
+    // blocking the open before the type check runs.
+    let marker_file = rfs::open(
+        &marker_path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| KernelError::Inconclusive)?;
+    let metadata = marker_file
+        .metadata()
+        .map_err(|_| KernelError::Inconclusive)?;
     if !metadata.is_file() || metadata.len() > RESTORE_MARKER_MAX_BYTES {
         return Err(KernelError::Inconclusive);
     }
-    let bytes = fs::read(&marker_path).map_err(|_| KernelError::Inconclusive)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::take(marker_file, RESTORE_MARKER_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|_| KernelError::Inconclusive)?;
     let marker: RestoreMarker =
         serde_json::from_slice(&bytes).map_err(|_| KernelError::Inconclusive)?;
     let recovery_directory = path_from_bytes(&marker.recovery_directory);

@@ -457,6 +457,16 @@ pub(super) fn verify_exact_identity(conn: &mut Connection) -> Result<(), KernelE
     if integrity_check != "ok" {
         return Err(KernelError::Inconclusive);
     }
+    // `integrity_check` validates page structure, not references, so a family
+    // written with `foreign_keys=OFF` can pass it while holding dangling rows.
+    let foreign_key_violations: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| KernelError::Inconclusive)?;
+    if foreign_key_violations != 0 {
+        return Err(KernelError::Inconclusive);
+    }
     match classify_open_kernel(conn, expected_identity()?)? {
         OpenIdentity::Exact => Ok(()),
         OpenIdentity::Mismatch { .. } => Err(KernelError::IdentityMismatch),
