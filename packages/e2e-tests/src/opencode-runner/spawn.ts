@@ -294,8 +294,32 @@ function writeConfigs(
     // tui.json: not needed for headless serve, but harmless to emit nothing for now.
 }
 
-const CREDENTIAL_CONFIG_KEY =
-    /^(?:(?:api|access|private|auth)?key|(?:auth)?token|authorization|credentials?|password|secret)$/i;
+const CREDENTIAL_CONFIG_KEY_WORDS: ReadonlySet<string> = new Set([
+    "key",
+    "apikey",
+    "token",
+    "secret",
+    "secrets",
+    "password",
+    "passwd",
+    "passphrase",
+    "credential",
+    "credentials",
+    "auth",
+    "authorization",
+    "bearer",
+    "cookie",
+    "dsn",
+]);
+
+function isCredentialShapedConfigKey(key: string): boolean {
+    const words = key
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter(Boolean);
+    return words.some((word) => CREDENTIAL_CONFIG_KEY_WORDS.has(word));
+}
 
 function assertProviderConfigHasNoCredentials(value: unknown): void {
     const seen = new WeakSet<object>();
@@ -304,7 +328,7 @@ function assertProviderConfigHasNoCredentials(value: unknown): void {
         seen.add(current);
         for (const [key, child] of Object.entries(current)) {
             const childPath = `${path}.${key}`;
-            if (CREDENTIAL_CONFIG_KEY.test(key.replaceAll("_", ""))) {
+            if (!Array.isArray(current) && isCredentialShapedConfigKey(key)) {
                 throw new Error(
                     `provider config contains credential-shaped key: ${childPath}; ` +
                         "pass credentials through extraEnv",
@@ -514,9 +538,11 @@ function isInheritableEnvKey(key: string): boolean {
  * instead would refuse every default spawn, since that fake default is always
  * present and is shaped like a secret.
  *
- * Credentials written directly into `openCodeConfigExtra.provider` are refused
- * by `writeConfigs`; the sanctioned provider config references an environment
- * variable and passes its value through `extraEnv`.
+ * Credential-shaped keys written directly into `openCodeConfigExtra.provider`
+ * are refused by `writeConfigs` via a word-level name denylist; values are
+ * not inspected, so a secret under an innocuously named key still lands in
+ * the generated `opencode.json`. The sanctioned provider config references
+ * an environment variable and passes its value through `extraEnv`.
  *
  * The pairing this enforces was previously a convention: `liveModelSpawnOptions()`
  * returns the credential and `hostname: "127.0.0.1"` together, and a comment

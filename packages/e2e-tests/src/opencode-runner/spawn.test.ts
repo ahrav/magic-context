@@ -112,6 +112,35 @@ describe("opencode child lifecycle", () => {
         }
     });
 
+    it("rejects compound credential key shapes while allowing count-like keys", () => {
+        const root = mkdtempSync(join(tmpdir(), "opencode-provider-shapes-"));
+        const env: IsolatedEnv = {
+            configDir: join(root, "config"),
+            dataDir: join(root, "data"),
+            cacheDir: join(root, "cache"),
+            workdir: join(root, "work"),
+        };
+        const write = (options: Record<string, unknown>) => () =>
+            __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                mockProviderURL: "http://127.0.0.1:4321",
+                openCodeConfigExtra: {
+                    provider: { anthropic: { options } },
+                },
+            });
+        try {
+            for (const dir of Object.values(env)) mkdirSync(dir, { recursive: true });
+            expect(write({ headers: { "x-api-key": "sk-live" } })).toThrow(
+                /credential-shaped key: provider\.anthropic\.options\.headers\.x-api-key/,
+            );
+            expect(write({ accessToken: "sk-live" })).toThrow(/accessToken/);
+            expect(write({ clientSecret: "sk-live" })).toThrow(/clientSecret/);
+            expect(write({ secret_access_key: "sk-live" })).toThrow(/secret_access_key/);
+            expect(write({ maxTokens: 4096, baseURL: "http://127.0.0.1:1" })).not.toThrow();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("resolves the plugin entry when spawning, not when this module was imported", () => {
         // A module-level `existsSync` snapshot is taken before any caller code
         // runs, so a caller that builds the bundle and then spawns in the same

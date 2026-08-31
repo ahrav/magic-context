@@ -1,4 +1,5 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { HEX64_RE } from "../contract-primitives";
 import { publishJsonAtomically } from "../incident-pool/report";
 import { parsePolicyOwnerDocument } from "../prospective-holdout/contract";
 import type { ArmId, ReasonCode } from "./contract";
@@ -51,7 +52,7 @@ export interface PairedDeltaReport {
 }
 
 function requireHex64(value: string, label: string): void {
-    if (!/^[0-9a-f]{64}$/.test(value)) {
+    if (!HEX64_RE.test(value)) {
         throw new Error(`paired-delta-report: ${label}-invalid`);
     }
 }

@@ -1,14 +1,18 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync } from "node:fs";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
+import { publishJsonAtomically } from "../incident-pool/report";
 import {
+    ARM_IDS,
     PRIMARY_ARM_IDS,
+    PairedDeltaContractError,
     REGRET_ARM_IDS,
+    RUN_HEALTHS,
     validateCheckVector,
     type ArmId,
     type ArmedCellResult,
     type CheckResult,
     type ReasonCode,
+    type RunHealth,
     type ScenarioDeclaration,
 } from "./contract";
 
@@ -125,7 +129,7 @@ export interface CoordinateResult {
 }
 
 export interface PairedDeltaRunResult {
-    status: "completed" | "cost-cap-reached" | "deadline-reached";
+    status: "completed" | "cost-cap-reached" | "deadline-reached" | "invalid-stored-records";
     records: RolloutRecord[];
     coordinates: CoordinateResult[];
     spentUsd: number;
@@ -138,6 +142,9 @@ export interface PairedDeltaRunResult {
 }
 
 export class ProviderUnavailableError extends Error {}
+
+/** Thrown when an in-flight rollout outlives the run deadline. */
+export class RolloutDeadlineError extends Error {}
 
 export async function verifyDualMockResolution(input: {
     liveProviderId: string;
@@ -171,32 +178,100 @@ export async function verifyDualMockResolution(input: {
     }
 }
 
+const RUN_HEALTH_SET: ReadonlySet<string> = new Set(RUN_HEALTHS);
+const ARM_ID_SET: ReadonlySet<string> = new Set(ARM_IDS);
+
+/**
+ * Stored records control spend caps and resume behavior. A record with a
+ * non-finite or negative cost would disable the cost cap: adding NaN to the
+ * spent total makes every later cap comparison false.
+ */
+function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
+    if (!Array.isArray(raw)) {
+        throw new Error(`rollout store ${path} must contain an array`);
+    }
+    raw.forEach((candidate, index) => {
+        const fail = (why: string): never => {
+            throw new Error(`rollout store ${path} record ${index}: ${why}`);
+        };
+        if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
+            fail("record-not-object");
+        }
+        const record = candidate as Partial<RolloutRecord>;
+        if (record.schema !== ROLLOUT_RECORD_SCHEMA) fail("schema-mismatch");
+        if (
+            typeof record.poolManifestFingerprint !== "string" ||
+            typeof record.scenarioId !== "string" ||
+            typeof record.armId !== "string" ||
+            !ARM_ID_SET.has(record.armId) ||
+            !Number.isSafeInteger(record.replicateIndex) ||
+            (record.replicateIndex as number) < 0
+        ) {
+            fail("coordinate-invalid");
+        }
+        if (!Number.isFinite(record.costUsd) || (record.costUsd as number) < 0) {
+            fail("cost-invalid");
+        }
+        if (record.costSource !== "observed" && record.costSource !== "estimated") {
+            fail("cost-source-invalid");
+        }
+        const cell = record.cell as Partial<ArmedCellResult> | undefined;
+        if (
+            cell === null ||
+            typeof cell !== "object" ||
+            typeof cell.runHealth !== "string" ||
+            !RUN_HEALTH_SET.has(cell.runHealth)
+        ) {
+            fail("run-health-invalid");
+        }
+    });
+    return raw as RolloutRecord[];
+}
+
 export class FileRolloutStore implements RolloutStore {
+    private records: RolloutRecord[] | null = null;
+    private indexByCoordinate = new Map<string, number>();
+
     constructor(private readonly path: string) {}
 
     list(): RolloutRecord[] {
-        try {
-            const raw = JSON.parse(readFileSync(this.path, "utf8")) as unknown;
-            if (!Array.isArray(raw)) throw new Error("rollout store must contain an array");
-            return raw as RolloutRecord[];
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-            throw error;
-        }
+        return [...this.load()];
     }
 
     put(record: RolloutRecord): void {
-        const records = this.list();
-        const index = records.findIndex((candidate) => sameCoordinate(candidate, record));
-        if (index >= 0 && records[index]?.cell.runHealth === "completed") {
-            throw new Error(`refusing to replace completed rollout ${coordinateKey(record)}`);
+        const records = this.load();
+        const key = coordinateKey(record);
+        const index = this.indexByCoordinate.get(key);
+        if (index !== undefined && records[index]?.cell.runHealth === "completed") {
+            throw new Error(`refusing to replace completed rollout ${key}`);
         }
-        if (index >= 0) records[index] = record;
-        else records.push(record);
-        mkdirSync(dirname(this.path), { recursive: true });
-        const temporary = `${this.path}.tmp-${process.pid}-${crypto.randomUUID()}`;
-        writeFileSync(temporary, `${JSON.stringify(records, null, 2)}\n`, { mode: 0o600 });
-        renameSync(temporary, this.path);
+        if (index !== undefined) {
+            records[index] = record;
+        } else {
+            this.indexByCoordinate.set(key, records.length);
+            records.push(record);
+        }
+        // The records file feeds spend and resume decisions for later runs, so
+        // it stays owner-only even though report artifacts are world-readable.
+        publishJsonAtomically(records, this.path, { mode: 0o600 });
+    }
+
+    private load(): RolloutRecord[] {
+        if (this.records) return this.records;
+        let records: RolloutRecord[] = [];
+        try {
+            records = parseRolloutRecords(
+                JSON.parse(readFileSync(this.path, "utf8")) as unknown,
+                this.path,
+            );
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        this.records = records;
+        this.indexByCoordinate = new Map(
+            records.map((record, index) => [coordinateKey(record), index]),
+        );
+        return records;
     }
 }
 
@@ -236,6 +311,9 @@ export async function runPairedDelta(
     dependencies: RunnerDependencies,
 ): Promise<PairedDeltaRunResult> {
     const stored = options.store.list();
+    const storedByCoordinate = new Map(
+        stored.map((record) => [coordinateKey(record), record]),
+    );
     const records: RolloutRecord[] = [];
     const coordinates: CoordinateResult[] = [];
     const invalidStoredCoordinates: RolloutCoordinate[] = [];
@@ -248,13 +326,28 @@ export async function runPairedDelta(
     let status: PairedDeltaRunResult["status"] = "completed";
     let startedAny = false;
     const selectedScenarioIds = new Set(options.scenarios.map(({ scenarioId }) => scenarioId));
+    const inMatrix = (record: RolloutRecord): boolean =>
+        record.poolManifestFingerprint === options.poolManifestFingerprint &&
+        selectedScenarioIds.has(record.scenarioId) &&
+        record.replicateIndex >= 0 &&
+        record.replicateIndex < options.replicateCount;
+
+    // A non-resume run asserts a fresh matrix; refusing before any rollout
+    // keeps the run from paying for a coordinate it cannot persist.
+    if (!options.resume) {
+        const conflict = stored.find(inMatrix);
+        if (conflict) {
+            throw new Error(
+                `records file already contains rollouts for this matrix ` +
+                    `(${coordinateKey(conflict)}); resume the run or point ` +
+                    "at a fresh records path",
+            );
+        }
+    }
 
     for (const record of stored) {
         if (
-            record.poolManifestFingerprint === options.poolManifestFingerprint &&
-            selectedScenarioIds.has(record.scenarioId) &&
-            record.replicateIndex >= 0 &&
-            record.replicateIndex < options.replicateCount &&
+            inMatrix(record) &&
             record.repoCommit === options.repoCommit &&
             record.pinnedProviderId === options.pinnedProviderId &&
             record.pinnedSnapshotId === options.pinnedSnapshotId &&
@@ -291,7 +384,7 @@ export async function runPairedDelta(
                     armId,
                     replicateIndex,
                 };
-                const existing = stored.find((record) => sameCoordinate(record, coordinate));
+                const existing = storedByCoordinate.get(coordinateKey(coordinate));
                 if (existing) {
                     const bindingMatches =
                         existing.repoCommit === options.repoCommit &&
@@ -307,14 +400,18 @@ export async function runPairedDelta(
                         invalidStoredCoordinates.push(coordinate);
                         return null;
                     }
-                    if (options.resume && existing.cell.runHealth === "completed") {
+                    // Completed records are immutable evidence; re-executing
+                    // one would pay for a rollout whose result the store must
+                    // then discard.
+                    if (existing.cell.runHealth === "completed") {
                         resumedRollouts++;
                         records.push(existing);
                         coordinateResult.cells[armId] = existing;
                         return existing;
                     }
                 }
-                if (dependencies.now() >= options.deadlineEpochMs) {
+                const remainingMs = options.deadlineEpochMs - dependencies.now();
+                if (remainingMs <= 0) {
                     status = "deadline-reached";
                     return null;
                 }
@@ -336,8 +433,11 @@ export async function runPairedDelta(
                         baseScriptFingerprint: fingerprint,
                         intervention,
                     });
-                    await handle.prepare?.();
-                    observation = await handle.run();
+                    const started = handle;
+                    observation = await withRolloutDeadline(async () => {
+                        await started.prepare?.();
+                        return started.run();
+                    }, remainingMs);
                 } catch (error) {
                     failure = error;
                 } finally {
@@ -365,6 +465,7 @@ export async function runPairedDelta(
                     : failedRecord(
                         options,
                         coordinate,
+                        scenario,
                         fingerprint,
                         intervention,
                         wallClockMs,
@@ -380,6 +481,7 @@ export async function runPairedDelta(
                 if (record.costSource === "observed") observedCostRollouts++;
                 else estimatedCostRollouts++;
                 if (record.cell.reasonCode) incrementExclusion(exclusionCounts, armId, record.cell.reasonCode);
+                if (failure instanceof RolloutDeadlineError) status = "deadline-reached";
                 return record;
             };
 
@@ -398,7 +500,7 @@ export async function runPairedDelta(
                 mcOn.cell.criticalPassed < mcOn.cell.criticalTotal
             ) {
                 for (const armId of REGRET_ARM_IDS.slice(1)) {
-                    await runArm(armId);
+                    const rung = await runArm(armId);
                     if (status !== "completed") {
                         coordinateResult.incomplete = true;
                         coordinateResult.regret = computeRegretRungs(
@@ -408,6 +510,7 @@ export async function runPairedDelta(
                         coordinates.push(coordinateResult);
                         break outer;
                     }
+                    if (rung?.cell.runHealth !== "completed") break;
                 }
                 coordinateResult.regret = computeRegretRungs(scenario, coordinateResult.cells);
             }
@@ -416,6 +519,10 @@ export async function runPairedDelta(
             );
             coordinates.push(coordinateResult);
         }
+    }
+
+    if (status === "completed" && invalidStoredCoordinates.length > 0) {
+        status = "invalid-stored-records";
     }
 
     return {
@@ -445,16 +552,32 @@ function completedRecord(
     const identityMatches =
         observation.echoedProviderId === options.pinnedProviderId &&
         observation.echoedModelId === options.pinnedSnapshotId;
-    const reasonCode: ReasonCode | null = !observation.absencePreconditionHeld
+    const declarationMatches =
+        observation.baseScriptFingerprint === expectedFingerprint &&
+        canonicalFingerprint(observation.intervention) ===
+            canonicalFingerprint(expectedIntervention);
+    let reasonCode: ReasonCode | null = !observation.absencePreconditionHeld
         ? "absence-precondition-unmet"
         : !observation.armIdentityMatches || !identityMatches
             ? "arm-identity-mismatch"
-            : null;
-    const runHealth = reasonCode === null ? "completed" : "unavailable";
+            : !declarationMatches
+                ? "invalid-result"
+                : null;
+    let runHealth: RunHealth = reasonCode === null
+        ? "completed"
+        : reasonCode === "invalid-result"
+            ? "malformed"
+            : "unavailable";
     let checks: CheckResult[] = [];
     if (runHealth === "completed") {
-        validateCheckVector(scenario, coordinate.armId, observation.checks);
-        checks = observation.checks;
+        try {
+            validateCheckVector(scenario, coordinate.armId, observation.checks);
+            checks = observation.checks;
+        } catch (error) {
+            if (!(error instanceof PairedDeltaContractError)) throw error;
+            reasonCode = "invalid-result";
+            runHealth = "malformed";
+        }
     }
     const applicableCritical = new Set(
         scenario.checks
@@ -503,6 +626,7 @@ function completedRecord(
 function failedRecord(
     options: RunPairedDeltaOptions,
     coordinate: RolloutCoordinate,
+    scenario: ScenarioDeclaration,
     fingerprint: string,
     intervention: InterventionDescriptor,
     wallClockMs: number,
@@ -511,6 +635,16 @@ function failedRecord(
     reserveUsd: number,
 ): RolloutRecord {
     const providerUnavailable = failure instanceof ProviderUnavailableError;
+    const deadlineExceeded = failure instanceof RolloutDeadlineError;
+    const worstCaseUsd = tokenCostUsd(
+        {
+            input: scenario.modelContextLimit,
+            output: scenario.modelContextLimit,
+            cacheCreation: 0,
+            cacheRead: 0,
+        },
+        options.pricesPerMillionTokens,
+    );
     return {
         schema: ROLLOUT_RECORD_SCHEMA,
         ...coordinate,
@@ -528,12 +662,20 @@ function failedRecord(
             criticalPassed: 0,
             criticalTotal: 0,
             invalidSuccess: false,
-            runHealth: providerUnavailable ? "unavailable" : "crash",
-            reasonCode: providerUnavailable ? "provider-unavailable" : "harness-failure",
+            runHealth: providerUnavailable
+                ? "unavailable"
+                : deadlineExceeded
+                    ? "timeout"
+                    : "crash",
+            reasonCode: providerUnavailable
+                ? "provider-unavailable"
+                : deadlineExceeded
+                    ? "deadline-exceeded"
+                    : "harness-failure",
         },
         checks: [],
         usage: { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
-        costUsd: reserveUsd,
+        costUsd: providerUnavailable ? reserveUsd : Math.max(reserveUsd, worstCaseUsd),
         costSource: "estimated",
         wallClockMs,
         turns: 0,
@@ -602,6 +744,28 @@ function coordinateKey(coordinate: RolloutCoordinate): string {
     ].join(":");
 }
 
-function sameCoordinate(a: RolloutCoordinate, b: RolloutCoordinate): boolean {
-    return coordinateKey(a) === coordinateKey(b);
+async function withRolloutDeadline<T>(
+    work: () => Promise<T>,
+    remainingMs: number,
+): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const pending = work();
+    try {
+        return await Promise.race([
+            pending,
+            new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                    () => reject(new RolloutDeadlineError(
+                        `rollout still in flight after the ${remainingMs}ms deadline budget`,
+                    )),
+                    remainingMs,
+                );
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+        // On timeout the losing promise settles later with no consumer;
+        // swallow its rejection so it cannot surface as unhandled.
+        pending.catch(() => {});
+    }
 }

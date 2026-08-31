@@ -1,8 +1,8 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
-import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import {
     completeFamilyCount,
+    pairedFactsFingerprint,
     type Direction,
     type EstimatorOutcome,
     type FamilyEstimatorAdapter,
@@ -152,11 +152,15 @@ function estimateEndpoint(
                 bootstrapSeed ^ stringSeed(`${endpoint}:${familyId}`),
             );
             const floor = noiseFloors.get(familyId) ?? null;
+            // A single observation resamples to itself, so its interval has
+            // zero width and excludes zero whenever the estimate is nonzero;
+            // n = 1 can never count as resolved evidence.
+            const resolvable = enoughFamilies && values.length >= 2;
             return {
                 familyId,
                 pointEstimate,
                 interval,
-                resolution: enoughFamilies && !includesZero(interval) ? "resolved" : "unresolved",
+                resolution: resolvable && !includesZero(interval) ? "resolved" : "unresolved",
                 noise: {
                     label: floor === null
                         ? "no-noise-floor"
@@ -176,7 +180,10 @@ function estimateEndpoint(
         pointEstimate: mean(familyMeans),
         interval,
         familyCount: families.length,
-        resolution: enoughFamilies && !includesZero(interval) ? "resolved" : "unresolved",
+        resolution:
+            enoughFamilies && familyMeans.length >= 2 && !includesZero(interval)
+                ? "resolved"
+                : "unresolved",
         families,
     };
 }
@@ -285,23 +292,26 @@ export function estimateFamilyDeltas(input: {
     };
 }
 
-function sortedPairs(pairs: readonly PairedCaseFact[]): PairedCaseFact[] {
-    return [...pairs].sort((left, right) =>
-        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`.localeCompare(
-            `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
-        ));
+function endpointDirection({ resolution, interval }: EndpointEstimate): Direction {
+    if (resolution !== "resolved") return "no-change";
+    if (interval.lower > 0) return "improvement";
+    if (interval.upper < 0) return "regression";
+    return "no-change";
 }
 
+/**
+ * The primary contrasts compare MC-on against different baselines, so
+ * conflicting non-neutral endpoint directions are a legitimate outcome and
+ * produce an inconclusive projection rather than an error.
+ */
 function projectedDirection(analysis: FamilyDeltaAnalysis): Direction {
-    const directional = analysis.endpoints.flatMap(({ families }) =>
-        families.filter(({ interval }) => !includesZero(interval)));
-    if (directional.length === 0) return "no-change";
-    const hasPositive = directional.some(({ interval }) => interval.lower > 0);
-    const hasNegative = directional.some(({ interval }) => interval.upper < 0);
-    if (hasPositive && hasNegative) {
-        throw new PairedDeltaEstimatorError("projection: mixed-direction");
-    }
-    return hasPositive ? "improvement" : "regression";
+    const directions = new Set(
+        analysis.endpoints
+            .map(endpointDirection)
+            .filter((direction) => direction !== "no-change"),
+    );
+    if (directions.size !== 1) return "no-change";
+    return [...directions][0]!;
 }
 
 export function createFamilyEstimatorAdapter(input: {
@@ -330,7 +340,7 @@ export function createFamilyEstimatorAdapter(input: {
             ) {
                 throw new PairedDeltaEstimatorError("adapter: policy-fingerprint-mismatch");
             }
-            if (canonicalFingerprint(sortedPairs(pairs)) !== input.expectedPairedFactsFingerprint) {
+            if (pairedFactsFingerprint(pairs) !== input.expectedPairedFactsFingerprint) {
                 throw new PairedDeltaEstimatorError("adapter: paired-facts-fingerprint-mismatch");
             }
             const evidenceSufficient =

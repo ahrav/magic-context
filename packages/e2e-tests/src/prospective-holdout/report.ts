@@ -71,6 +71,23 @@ export function completeFamilyCount(pairs: readonly PairedCaseFact[]): number {
     ).length;
 }
 
+/**
+ * Canonical ordering for paired-case facts: caseId, model, seed, platform.
+ * All fingerprints over a pair set hash this one ordering, so the estimator
+ * adapter's expected fingerprint and the report body bind to the same bytes.
+ */
+export function sortPairedFacts(pairs: readonly PairedCaseFact[]): PairedCaseFact[] {
+    return [...pairs].sort((left, right) =>
+        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`.localeCompare(
+            `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
+        )
+    );
+}
+
+export function pairedFactsFingerprint(pairs: readonly PairedCaseFact[]): string {
+    return canonicalFingerprint(sortPairedFacts(pairs));
+}
+
 function summarizePairs(pairs: readonly PairedCaseFact[]): {
     pairedFactsFingerprint: string;
     completeFamilyCount: number;
@@ -79,11 +96,7 @@ function summarizePairs(pairs: readonly PairedCaseFact[]): {
     pairCount: number;
     completePairCount: number;
 } {
-    const sortedPairs = [...pairs].sort((left, right) =>
-        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`.localeCompare(
-            `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
-        )
-    );
+    const sortedPairs = sortPairedFacts(pairs);
     // A pair is per execution coordinate, so one case contributes several. Case ids are
     // deduplicated because the report parser rejects a repeated id, while the pair counts
     // stay per coordinate.

@@ -698,11 +698,15 @@ export function parseIncidentReport(raw: unknown): IncidentPoolReport {
     };
 }
 
-export function publishJsonAtomically(value: unknown, path: string): void {
+export function publishJsonAtomically(
+    value: unknown,
+    path: string,
+    options?: { mode?: number },
+): void {
     mkdirSync(dirname(path), { recursive: true });
     const temp = `${path}.tmp-${randomBytes(6).toString("hex")}`;
     writeFileSync(temp, `${JSON.stringify(value, null, 4)}\n`, {
-        mode: 0o644,
+        mode: options?.mode ?? 0o644,
     });
     renameSync(temp, path);
 }

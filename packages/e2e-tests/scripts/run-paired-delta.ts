@@ -190,6 +190,7 @@ async function main(): Promise<void> {
         recordsPath: args.recordsPath,
         rolloutCount: result.records.length,
         providerCalls: Object.fromEntries(providerCalls),
+        invalidStoredCoordinates: result.invalidStoredCoordinates,
         completeRegretLadders: result.coordinates.filter(({ regret }) =>
             regret?.retrieval !== undefined &&
             regret.formation !== undefined &&
@@ -199,6 +200,7 @@ async function main(): Promise<void> {
             (regret.formation === undefined || regret.representation === undefined)).length,
         exclusionCounts: result.exclusionCounts,
     }, null, 2));
+    if (result.status !== "completed") process.exitCode = 1;
 }
 
 await main();

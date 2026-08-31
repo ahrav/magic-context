@@ -120,6 +120,20 @@ describe("family-clustered delta estimator", () => {
             noise.label === "no-noise-floor" && noise.floor === null)).toBe(true);
     });
 
+    it("keeps single-observation families unresolved", () => {
+        const result = estimate({
+            minimumAnalyzableFamilyCount: 2,
+            observations: [
+                { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "mc-on-vs-mc-off", delta: 0.5, runHealth: "completed" },
+                { coordinateId: "var-b:0", familyId: "fam-b", endpoint: "mc-on-vs-mc-off", delta: 0.4, runHealth: "completed" },
+            ],
+            noiseFloors: undefined,
+        });
+        const families = result.endpoints[0]!.families;
+        expect(families.every(({ resolution }) => resolution === "unresolved")).toBe(true);
+        expect(families.every(({ interval }) => interval.lower === interval.upper)).toBe(true);
+    });
+
     it("rejects unhealthy input instead of silently excluding it", () => {
         expect(() => estimate({
             observations: [
@@ -187,6 +201,19 @@ describe("bound prospective estimator adapter", () => {
             observations: observations.map((row) => ({ ...row, delta: -Math.abs(row.delta) - 0.2 })),
         })).analyze(pairs, H3);
         expect(negative.direction).toBe("regression");
+
+        const disagreeing = adapter(estimate({
+            minimumAnalyzableFamilyCount: 1,
+            observations: [
+                ...observations.map((row) => ({ ...row, delta: Math.abs(row.delta) + 0.2 })),
+                ...observations.map((row) => ({
+                    ...row,
+                    endpoint: "mc-on-vs-compaction" as const,
+                    delta: -Math.abs(row.delta) - 0.2,
+                })),
+            ],
+        })).analyze(pairs, H3);
+        expect(disagreeing.direction).toBe("no-change");
     });
 
     it("binds pool, policy, and prospective facts with typed failures", () => {
