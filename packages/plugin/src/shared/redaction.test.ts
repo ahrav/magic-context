@@ -192,6 +192,18 @@ describe("credentialValueFormat", () => {
         );
         expect(credentialValueFormat("-----BEGIN RSA PRIVATE KEY-----")).toBe("PEM private key");
 
+        // `SECRET_TEXT_PATTERNS` redacts these formats, so config validation must reject
+        // them under innocuous keys.
+        expect(credentialValueFormat("github_pat_abcdefghijklmnopqrstuv0123456789")).toBe(
+            "GitHub fine-grained token",
+        );
+        expect(credentialValueFormat("hf_abcdefghijklmnopqrstuvwxyz0123456789")).toBe(
+            "Hugging Face token",
+        );
+        for (const prefix of ["xoxa", "xoxb", "xoxp", "xoxr", "xoxs", "xoxu", "xoxv", "xoxc"]) {
+            expect(credentialValueFormat(`${prefix}-0123456789abcdef`)).toBe("Slack token");
+        }
+
         for (const value of [
             "run-42",
             "application/json",

@@ -231,10 +231,14 @@ const CREDENTIAL_VALUE_FORMATS: ReadonlyArray<{ label: string; pattern: RegExp }
     // Ordered before the general `sk-` shape, which would otherwise claim it.
     { label: "Anthropic-style key", pattern: /^sk-ant-[A-Za-z0-9_-]{16,}/ },
     { label: "OpenAI-style key", pattern: /^sk-[A-Za-z0-9_-]{16,}/ },
+    /** Ordered before the `gh*_` shape, whose character class cannot reach the `i` in `github_pat_`. commentlint: allow(JUDGE) */
+    { label: "GitHub fine-grained token", pattern: /^github_pat_[A-Za-z0-9_]{20,}/ },
     { label: "GitHub token", pattern: /^gh[pousr]_[A-Za-z0-9]{20,}/ },
     { label: "AWS access key id", pattern: /^(?:AKIA|ASIA)[0-9A-Z]{12,}/ },
     { label: "Google API key", pattern: /^AIza[0-9A-Za-z_-]{30,}/ },
-    { label: "Slack token", pattern: /^xox[abprs]-[0-9A-Za-z-]{10,}/ },
+    { label: "Hugging Face token", pattern: /^hf_[A-Za-z0-9]{30,}/ },
+    /** The same prefix set `SECRET_TEXT_PATTERNS` redacts: `xoxu`, `xoxv`, and `xoxc` are user, bot-refresh, and browser-session tokens, no less usable than the `xoxb` shape. commentlint: allow(JUDGE) */
+    { label: "Slack token", pattern: /^xox[abprsuvc]-[0-9A-Za-z-]{10,}/ },
     { label: "PEM private key", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
     /** Any userinfo at all: the password may be empty (`redis://:secret@host`) or absent (`https://ghp_token@host`), and a bare token in the username position is the shape a personal access token takes. commentlint: allow(JUDGE) */
     { label: "credential-bearing URI", pattern: /^[a-z][a-z0-9+.-]*:\/\/[^/@\s]+@/i },

@@ -177,6 +177,10 @@ describe("opencode child lifecycle", () => {
                 ["Bearer sk-live-abcdefghijklmnop", "HTTP authorization scheme"],
                 ["sk-ant-abcdefghijklmnopqrstuv", "Anthropic-style key"],
                 ["ghp_abcdefghijklmnopqrstuvwxyz012345", "GitHub token"],
+                ["github_pat_abcdefghijklmnopqrstuv0123456789", "GitHub fine-grained token"],
+                ["hf_abcdefghijklmnopqrstuvwxyz0123456789", "Hugging Face token"],
+                ["xoxu-0123456789abcdef", "Slack token"],
+                ["xoxc-0123456789abcdef", "Slack token"],
                 ["postgres://user:hunter2@db.internal/app", "credential-bearing URI"],
             ] as const) {
                 const attempt = () =>

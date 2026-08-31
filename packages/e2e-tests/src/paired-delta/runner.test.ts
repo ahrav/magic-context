@@ -351,8 +351,45 @@ describe("paired-delta runner", () => {
         expect(disposedArms).toEqual(["mc-on"]);
     });
 
-    it("bounds rollout creation with the run deadline and disposes a late handle", async () => {
-        const disposedArms: string[] = [];
+    it("does not start the rollout when preparation outlives the deadline", async () => {
+        const calls: string[] = [];
+        const result = await runPairedDelta(
+            { ...options(), deadlineEpochMs: Date.now() + 25 },
+            {
+                now: Date.now,
+                async createRollout({ coordinate }): Promise<RolloutHandle> {
+                    return {
+                        async prepare() {
+                            calls.push(`prepare:${coordinate.armId}`);
+                            // Preparation resolves after the deadline; `run()` must not start.
+                            await new Promise((resolve) => setTimeout(resolve, 60));
+                        },
+                        async run(): Promise<RolloutObservation> {
+                            calls.push(`run:${coordinate.armId}`);
+                            throw new Error("run must not start after the deadline");
+                        },
+                        async dispose() {
+                            calls.push(`dispose:${coordinate.armId}`);
+                        },
+                    };
+                },
+            },
+        );
+
+        expect(result.status).toBe("deadline-reached");
+        expect(result.records[0]?.cell).toMatchObject({
+            runHealth: "timeout",
+            reasonCode: "deadline-exceeded",
+        });
+        expect(result.records[0]?.harnessDisposed).toBe(true);
+        expect(calls).toEqual(["prepare:mc-on", "dispose:mc-on"]);
+
+        // The late `prepare()` completion must not call `run()` after `dispose()`.
+        await new Promise((resolve) => setTimeout(resolve, 90));
+        expect(calls).toEqual(["prepare:mc-on", "dispose:mc-on"]);
+    });
+
+    it("bounds rollout creation with the run deadline and disposes a late handle", async () => {        const disposedArms: string[] = [];
         const lateHandle = (disposeFails: boolean) =>
             async (armId: string): Promise<RolloutHandle> => {
                 // Creation outlives the deadline, then resolves while the run is
@@ -1181,8 +1218,25 @@ describe("paired-delta runner", () => {
         }
     });
 
-    it("rejects a stored attempt total that cannot be summed", () => {
-        const root = mkdtempSync(join(tmpdir(), "paired-delta-total-"));
+    it("refuses a records file whose spend total overflows across records", async () => {
+        // Each record's own attempt total is finite. The sum across records is what the
+        // pre-scan accumulates.
+        const half = Number.MAX_VALUE * 0.6;
+        const store = new MemoryStore([
+            { ...storedRecord("mc-on"), costUsd: half, maxAttemptCostUsd: half },
+            { ...storedRecord("mc-off"), costUsd: half, maxAttemptCostUsd: half },
+        ]);
+
+        expect(store.list().every(({ costUsd, priorAttemptsCostUsd }) =>
+            Number.isFinite(priorAttemptsCostUsd + costUsd)
+        )).toBe(true);
+
+        await expect(runPairedDelta(options(store), dependencies())).rejects.toThrow(
+            /spend total overflows the finite range/,
+        );
+    });
+
+    it("rejects a stored attempt total that cannot be summed", () => {        const root = mkdtempSync(join(tmpdir(), "paired-delta-total-"));
         try {
             const path = join(root, "records.json");
             // Both figures are finite; their sum is what the pre-scan adds.

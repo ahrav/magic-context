@@ -605,6 +605,13 @@ export async function runPairedDelta(
         /** The reserve is the expected price of the next single call, so it takes the dearest attempt this coordinate has seen — not the cumulative total, which several cheap failures would inflate into a budget the next rollout cannot fit. commentlint: allow(JUDGE) */
         reserveUsd = Math.max(reserveUsd, record.costUsd, record.maxAttemptCostUsd);
         spentUsd += record.priorAttemptsCostUsd + record.costUsd;
+        /** The parser bounds each record's own attempt total, which leaves the sum across records unbounded: enough near-maximal records make `spentUsd` infinite, and from there every cap comparison is false and the summary serializes the figure as `null`. The ledger is refused at the first accumulation that leaves the finite range rather than admitting rollouts against it. commentlint: allow(JUDGE) */
+        if (!Number.isFinite(spentUsd)) {
+            throw new Error(
+                `records file spend total overflows the finite range at ` +
+                    `${coordinateKey(record)}; point at a fresh records path`,
+            );
+        }
         /** A stored attempt means this matrix has already started, whatever it was billed: a zero-cost first arm would otherwise keep the first-rollout exemption and let the next arm start with the reserve already over budget. commentlint: allow(JUDGE) */
         startedAny = true;
     }
@@ -710,10 +717,15 @@ export async function runPairedDelta(
                     /** Creation consumed part of the budget, so the rollout gets what is left rather than the allowance measured before it. commentlint: allow(JUDGE) */
                     const runMs = options.deadlineEpochMs - dependencies.now();
                     if (runMs <= 0) throw new RolloutDeadlineError("deadline reached before run");
-                    observation = await withRolloutDeadline(async () => {
-                        await started.prepare?.();
-                        return started.run();
-                    }, runMs);
+                    /** Preparation and the rollout are bounded as separate steps because the deadline only rejects the race, never the work: a single step whose `prepare()` overran would lose the race, then resolve and call `run()` from the losing continuation — starting a paid rollout past the deadline, on a handle `finally` has already disposed, with no record of it. Bounding them apart means an overrun leaves nothing to continue into. commentlint: allow(JUDGE) */
+                    const prepare = started.prepare?.bind(started);
+                    if (prepare) await withRolloutDeadline(() => prepare(), runMs);
+                    /** Preparation spent from the same budget, so the rollout is bounded by what remains after it. commentlint: allow(JUDGE) */
+                    const rolloutMs = options.deadlineEpochMs - dependencies.now();
+                    if (rolloutMs <= 0) {
+                        throw new RolloutDeadlineError("deadline reached before run");
+                    }
+                    observation = await withRolloutDeadline(() => started.run(), rolloutMs);
                 } catch (error) {
                     failure = error;
                 } finally {
