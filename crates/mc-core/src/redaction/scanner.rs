@@ -1,7 +1,8 @@
-use mc_secret_scanner::{Finding, RuleSource};
+use mc_secret_scanner::{RuleSource, ScanReport};
 
 use super::{
-    redaction_type_for_key, Detection, Redaction, RedactionError, RedactionErrorKind, DETECTOR_ID,
+    redaction_type_for_key, Detection, DetectionAction, DetectionExactness, DetectionSpanKind,
+    Redaction, RedactionError, RedactionErrorKind, ScanProvenance, DETECTOR_ID,
 };
 
 struct RuleLabel {
@@ -47,6 +48,7 @@ fn is_known_rule(rule_id: &str) -> bool {
 
 #[derive(Debug)]
 struct Replacement {
+    rule_id: String,
     start: usize,
     end: usize,
     /// Lowest `specificity` wins when findings share a span.
@@ -55,9 +57,9 @@ struct Replacement {
     replacement: String,
 }
 
-pub(super) fn redact(input: &str, findings: &[Finding]) -> Result<Redaction, RedactionError> {
-    let mut replacements = Vec::with_capacity(findings.len());
-    for finding in findings {
+pub(super) fn redact(input: &str, report: ScanReport) -> Result<Redaction, RedactionError> {
+    let mut replacements = Vec::with_capacity(report.findings.len());
+    for finding in &report.findings {
         let value = finding.value_span;
         input
             .get(finding.full_span.start()..finding.full_span.end())
@@ -83,7 +85,7 @@ pub(super) fn redact(input: &str, findings: &[Finding]) -> Result<Redaction, Red
     }
     replacements
         .sort_by_key(|replacement| (replacement.start, replacement.end, replacement.specificity));
-    render(input, replacements)
+    render(input, replacements, report)
 }
 
 fn describe(
@@ -96,6 +98,7 @@ fn describe(
     if let Some(key) = key {
         let secret_type = redaction_type_for_key(key);
         return Ok(Replacement {
+            rule_id: rule_id.to_owned(),
             start,
             end,
             specificity: 0,
@@ -105,6 +108,7 @@ fn describe(
     }
     if let Some(label) = provider_label(rule_id) {
         return Ok(Replacement {
+            rule_id: rule_id.to_owned(),
             start,
             end,
             specificity: 0,
@@ -118,6 +122,7 @@ fn describe(
         });
     }
     Ok(Replacement {
+        rule_id: rule_id.to_owned(),
         start,
         end,
         specificity: 1,
@@ -126,7 +131,17 @@ fn describe(
     })
 }
 
-fn render(input: &str, replacements: Vec<Replacement>) -> Result<Redaction, RedactionError> {
+fn render(
+    input: &str,
+    replacements: Vec<Replacement>,
+    report: ScanReport,
+) -> Result<Redaction, RedactionError> {
+    let detector_revision = format!(
+        "{}:{}:{}",
+        report.revision.crate_version,
+        report.revision.semantic_digest_version,
+        report.revision.upstream_commit
+    );
     let mut text = String::with_capacity(input.len());
     let mut detections = Vec::with_capacity(replacements.len());
     let mut cursor = 0;
@@ -139,6 +154,11 @@ fn render(input: &str, replacements: Vec<Replacement>) -> Result<Redaction, Reda
         text.push_str(&replacement.replacement);
         detections.push(Detection {
             detector_id: DETECTOR_ID,
+            detector_revision: detector_revision.clone(),
+            rule_id: replacement.rule_id,
+            exactness: DetectionExactness::Exact,
+            span_kind: DetectionSpanKind::Value,
+            action: DetectionAction::Substitute,
             secret_type: replacement.secret_type,
             offset: start,
             length: replacement
@@ -149,7 +169,15 @@ fn render(input: &str, replacements: Vec<Replacement>) -> Result<Redaction, Reda
         cursor = replacement.end;
     }
     text.push_str(input.get(cursor..).ok_or_else(invalid_span)?);
-    Ok(Redaction { text, detections })
+    Ok(Redaction {
+        text,
+        detections,
+        provenance: ScanProvenance {
+            detector_id: DETECTOR_ID,
+            detector_revision,
+            semantic_digest: Some(report.semantic_digest),
+        },
+    })
 }
 
 const fn invalid_span() -> RedactionError {

@@ -10,6 +10,89 @@ use mc_secret_scanner::{
 
 pub const DETECTOR_ID: &str = "mc-secret-scanner";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedactionLabel {
+    ApiKey,
+    AuthToken,
+    Password,
+    Key,
+    Token,
+    Secret,
+}
+
+impl RedactionLabel {
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::ApiKey => "<REDACTED:api_key>",
+            Self::AuthToken => "<REDACTED:auth_token>",
+            Self::Password => "<REDACTED:password>",
+            Self::Key => "<REDACTED:key>",
+            Self::Token => "<REDACTED:token>",
+            Self::Secret => "<REDACTED:secret>",
+        }
+    }
+}
+
+fn is_secret_key_word(word: &str) -> bool {
+    matches!(
+        word,
+        "key"
+            | "keys"
+            | "token"
+            | "tokens"
+            | "secret"
+            | "secrets"
+            | "password"
+            | "passwords"
+            | "auth"
+            | "authorization"
+            | "bearer"
+            | "credential"
+            | "credentials"
+    )
+}
+
+#[must_use]
+pub fn label_for_secret_key(key: &str) -> Option<RedactionLabel> {
+    let words = key_tokens(key);
+    if !words.iter().any(|word| is_secret_key_word(word)) {
+        return None;
+    }
+    if words.iter().any(|word| word == "api")
+        && words
+            .iter()
+            .any(|word| matches!(word.as_str(), "key" | "keys"))
+    {
+        Some(RedactionLabel::ApiKey)
+    } else if words
+        .iter()
+        .any(|word| matches!(word.as_str(), "auth" | "authorization"))
+        && words
+            .iter()
+            .any(|word| matches!(word.as_str(), "token" | "tokens"))
+    {
+        Some(RedactionLabel::AuthToken)
+    } else if words
+        .iter()
+        .any(|word| matches!(word.as_str(), "password" | "passwords"))
+    {
+        Some(RedactionLabel::Password)
+    } else if words
+        .iter()
+        .any(|word| matches!(word.as_str(), "key" | "keys"))
+    {
+        Some(RedactionLabel::Key)
+    } else if words
+        .iter()
+        .any(|word| matches!(word.as_str(), "token" | "tokens"))
+    {
+        Some(RedactionLabel::Token)
+    } else {
+        Some(RedactionLabel::Secret)
+    }
+}
+
 const LABEL_WORDS: &[&str] = &[
     "key",
     "token",
@@ -45,6 +128,11 @@ const LABEL_QUALIFIERS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
     pub detector_id: &'static str,
+    pub detector_revision: String,
+    pub rule_id: String,
+    pub exactness: DetectionExactness,
+    pub span_kind: DetectionSpanKind,
+    pub action: DetectionAction,
     pub secret_type: String,
     pub offset: usize,
     pub length: usize,
@@ -54,6 +142,29 @@ pub struct Detection {
 pub struct Redaction {
     pub text: String,
     pub detections: Vec<Detection>,
+    pub provenance: ScanProvenance,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetectionExactness {
+    Exact,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetectionSpanKind {
+    Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetectionAction {
+    Substitute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanProvenance {
+    pub detector_id: &'static str,
+    pub detector_revision: String,
+    pub semantic_digest: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +175,7 @@ pub enum RedactionErrorKind {
     WorkLimit,
     InvalidSpan,
     UnknownRule,
+    SecretDetected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +199,7 @@ impl fmt::Display for RedactionError {
             RedactionErrorKind::WorkLimit => "secret scan work limit exceeded",
             RedactionErrorKind::InvalidSpan => "secret scan produced an invalid span",
             RedactionErrorKind::UnknownRule => "secret scan produced an unclassified rule",
+            RedactionErrorKind::SecretDetected => "secret-bearing field was rejected",
         })
     }
 }
@@ -136,28 +249,38 @@ impl Redactor {
                 },
             });
         }
-        scanner::redact(input, &report.findings)
+        scanner::redact(input, report)
     }
 }
 
 static REDACTOR: LazyLock<Result<Redactor, RedactionError>> = LazyLock::new(Redactor::new);
 
-pub fn redact_durable_text(input: &str) -> Redaction {
-    match REDACTOR
+pub fn redact_durable_text(input: &str) -> Result<Redaction, RedactionError> {
+    REDACTOR
         .as_ref()
         .map_err(|error| *error)
         .and_then(|redactor| redactor.redact(input))
-    {
-        Ok(redaction) => redaction,
-        Err(_) => Redaction {
-            text: "<REDACTED:secret>".to_owned(),
-            detections: vec![Detection {
-                detector_id: DETECTOR_ID,
-                secret_type: "secret".to_owned(),
-                offset: 0,
-                length: input.len(),
-            }],
-        },
+}
+
+pub fn redact_transaction_durable_text(input: &str) -> Result<Redaction, RedactionError> {
+    redact_durable_text(input)
+}
+
+pub fn reject_secret_text(input: &str) -> Result<(), RedactionError> {
+    reject_redaction(redact_durable_text(input)?)
+}
+
+pub fn reject_transaction_secret_text(input: &str) -> Result<(), RedactionError> {
+    reject_secret_text(input)
+}
+
+fn reject_redaction(redaction: Redaction) -> Result<(), RedactionError> {
+    if redaction.detections.is_empty() {
+        Ok(())
+    } else {
+        Err(RedactionError {
+            kind: RedactionErrorKind::SecretDetected,
+        })
     }
 }
 
@@ -193,6 +316,27 @@ fn redaction_type_for_key(key: &str) -> String {
     }
 }
 
+fn key_tokens(key: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for part in key.split(|character: char| !character.is_ascii_alphanumeric()) {
+        let bytes = part.as_bytes();
+        let mut start = 0;
+        for index in 1..bytes.len() {
+            if bytes[index].is_ascii_uppercase()
+                && (bytes[index - 1].is_ascii_lowercase()
+                    || bytes.get(index + 1).is_some_and(u8::is_ascii_lowercase))
+            {
+                tokens.push(part[start..index].to_ascii_lowercase());
+                start = index;
+            }
+        }
+        if start < part.len() {
+            tokens.push(part[start..].to_ascii_lowercase());
+        }
+    }
+    tokens
+}
+
 fn is_label_segment(segment: &str) -> bool {
     let stem = segment.strip_suffix('s').unwrap_or(segment);
     LABEL_WORDS.contains(&stem) || LABEL_QUALIFIERS.contains(&segment)
@@ -204,7 +348,7 @@ mod tests {
 
     #[test]
     fn scanner_is_the_only_redaction_path() {
-        let redaction = redact_durable_text("π password=hunter-two");
+        let redaction = redact_durable_text("π password=hunter-two").unwrap();
         assert_eq!(redaction.text, "π password=<REDACTED:password>");
         assert!(redaction
             .detections
@@ -255,11 +399,11 @@ mod tests {
     }
 
     #[test]
-    fn durable_redaction_hides_the_entire_field_on_scanner_failure() {
+    fn durable_redaction_rejects_scanner_failure() {
         let input = "password=sentinel".repeat(mc_secret_scanner::MAX_INPUT_BYTES);
-        let redaction = redact_durable_text(&input);
-        assert_eq!(redaction.text, "<REDACTED:secret>");
-        assert_eq!(redaction.detections[0].length, input.len());
-        assert!(!redaction.text.contains("sentinel"));
+        assert_eq!(
+            redact_durable_text(&input).unwrap_err().kind(),
+            RedactionErrorKind::InputLimit
+        );
     }
 }

@@ -11,7 +11,9 @@ fn redactor() -> &'static Redactor {
 #[test]
 fn established_replacement_spelling_remains_stable() {
     assert_eq!(
-        redact_durable_text("Authorization: Bearer abc123def456ghi789").text,
+        redact_durable_text("Authorization: Bearer abc123def456ghi789")
+            .unwrap()
+            .text,
         "Authorization: Bearer <REDACTED:bearer>"
     );
     for (input, expected) in [
@@ -25,7 +27,11 @@ fn established_replacement_spelling_remains_stable() {
         ),
         ("aws_secret=hunter-two", "aws_secret=<REDACTED:aws_secret>"),
     ] {
-        assert_eq!(redact_durable_text(input).text, expected, "{input}");
+        assert_eq!(
+            redact_durable_text(input).unwrap().text,
+            expected,
+            "{input}"
+        );
     }
 }
 
@@ -33,7 +39,7 @@ fn established_replacement_spelling_remains_stable() {
 fn portable_scanner_is_authoritative() {
     let input =
         "provider AGE-SECRET-KEY-1QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE";
-    let redaction = redact_durable_text(input);
+    let redaction = redact_durable_text(input).unwrap();
     assert_eq!(redaction.text, "provider <REDACTED:secret>");
     assert!(redaction
         .detections
@@ -48,7 +54,7 @@ fn concatenated_secret_keys_remain_redacted() {
         "authtoken=hunter-two",
         r#"{"apikeys":"hunter-two"}"#,
     ] {
-        let redaction = redact_durable_text(input);
+        let redaction = redact_durable_text(input).unwrap();
         assert!(!redaction.detections.is_empty(), "{input}");
         assert!(!redaction.text.contains("hunter-two"), "{input}");
     }
@@ -62,7 +68,7 @@ fn scalar_values_remain_visible() {
         "max_tokens=4096",
         r#"{"max_tokens":"4096"}"#,
     ] {
-        assert_eq!(redact_durable_text(input).text, input);
+        assert_eq!(redact_durable_text(input).unwrap().text, input);
     }
 }
 

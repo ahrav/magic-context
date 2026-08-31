@@ -1,4 +1,7 @@
-use mc_core::redaction::{redact_durable_text, Detection};
+use mc_core::redaction::{
+    redact_durable_text, Detection, DetectionAction, DetectionExactness, DetectionSpanKind,
+    Redaction, ScanProvenance, DETECTOR_ID,
+};
 use rusqlite::{params, Transaction};
 
 use super::{map_sqlite, KernelError};
@@ -10,7 +13,7 @@ pub(super) struct RedactedField {
 }
 
 pub(super) fn redact(value: &str) -> RedactedField {
-    let redaction = redact_durable_text(value);
+    let redaction = redact_durable_text(value).unwrap_or_else(|_| failed_scan(value));
     RedactedField {
         text: redaction.text,
         detections: redaction.detections,
@@ -19,11 +22,33 @@ pub(super) fn redact(value: &str) -> RedactedField {
 
 /// Lookup keys, primary keys, and dedup identities must not contain detected secrets because redaction can alias distinct values.
 pub(super) fn identity(value: &str) -> Result<String, KernelError> {
-    let redaction = redact_durable_text(value);
+    let redaction = redact_durable_text(value).unwrap_or_else(|_| failed_scan(value));
     if redaction.detections.is_empty() {
         Ok(redaction.text)
     } else {
         Err(KernelError::InvalidInput)
+    }
+}
+
+fn failed_scan(value: &str) -> Redaction {
+    Redaction {
+        text: "<REDACTED:secret>".to_owned(),
+        detections: vec![Detection {
+            detector_id: DETECTOR_ID,
+            detector_revision: "scan-failed".to_owned(),
+            rule_id: "scan-failed".to_owned(),
+            exactness: DetectionExactness::Exact,
+            span_kind: DetectionSpanKind::Value,
+            action: DetectionAction::Substitute,
+            secret_type: "secret".to_owned(),
+            offset: 0,
+            length: value.len(),
+        }],
+        provenance: ScanProvenance {
+            detector_id: DETECTOR_ID,
+            detector_revision: "scan-failed".to_owned(),
+            semantic_digest: None,
+        },
     }
 }
 
