@@ -284,6 +284,10 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         p.fail("scenario.interventions.r2.memories: empty");
     }
     const r3 = p.record(interventions.r3, "scenario.interventions.r3");
+    /** `r2.memories` is the declaration's only gold, so it is also what a runner seeds and resolves `r1.locatorIds` against. Unequal lengths leave a handle with no `publicClaimId` to map to and make R1 and R2 compare different gold sets; pairing is positional. commentlint: allow(JUDGE) */
+    if (locatorIds.length !== memories.length) {
+        p.fail("scenario.interventions.r1.locatorIds: memory-cardinality-mismatch");
+    }
     p.exact(r3, ["evidence"], "scenario.interventions.r3");
 
     const absence = p.record(root.absencePrecondition, "scenario.absencePrecondition");

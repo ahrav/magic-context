@@ -11,12 +11,12 @@ interface ScenarioSpec {
     locatorId: string;
 }
 
-/** Absent or empty resolved ids fail rather than falling back to a symbolic match, so a runner that skips the handle-to-publicClaimId mapping cannot score a retrieval it never performed. commentlint: allow(JUDGE) */
+/** Matches the delivered memory-row marker (`[memory] ... id=<publicClaimId>`), not a bare id: the empty-results renderer echoes the query back, and a locator query *is* the resolved ids, so a bare substring test passes on zero retrieval. Absent or empty resolved ids fail rather than falling back to a symbolic match, so a runner that skips the handle-to-publicClaimId mapping cannot score a retrieval it never performed. commentlint: allow(JUDGE) */
 function r1WirePassed(context: VerifierContext): boolean {
     const resolved = context.resolvedLocatorIds ?? [];
     if (resolved.length === 0) return false;
     const wire = context.scriptedTurnText ?? "";
-    return resolved.every((id) => wire.includes(id));
+    return resolved.every((id) => wire.includes(`id=${id}`));
 }
 
 export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { ID_SHAPED_QUERY_MAX_TOKENS } from "../../../plugin/src/features/magic-context/search";
 import {
     PairedDeltaContractError,
     PAIRED_DELTA_MANIFEST_SCHEMA,
@@ -111,7 +112,7 @@ describe("paired-delta scenario contract", () => {
         ).toThrow(/r1\.locatorIds: empty/);
     });
 
-    it("bounds R1 locator sets to the scripted-search limit", () => {
+    it("requires one declared gold memory per R1 locator handle", () => {
         const base = scenario();
         expect(() =>
             parseScenarioDeclaration(scenario({
@@ -119,21 +120,35 @@ describe("paired-delta scenario contract", () => {
                     ...base.interventions,
                     r1: {
                         ...base.interventions.r1,
-                        locatorIds: ["a", "b", "c", "d", "e", "f"].map((s) => `mem-${s}`),
+                        locatorIds: ["mem-alpha", "mem-beta"],
                     },
                 },
             })),
+        ).toThrow(/r1\.locatorIds: memory-cardinality-mismatch/);
+    });
+
+    it("bounds R1 locator sets to the scripted-search limit", () => {
+        const base = scenario();
+        const withLocators = (count: number): Partial<ScenarioDeclaration> => ({
+            interventions: {
+                ...base.interventions,
+                r1: {
+                    ...base.interventions.r1,
+                    locatorIds: Array.from({ length: count }, (_, i) => `mem-handle${i}`),
+                },
+                r2: {
+                    memories: Array.from({ length: count }, (_, i) => ({
+                        claim: `Gold claim ${i}.`,
+                        evidence: `Gold evidence ${i}.`,
+                    })),
+                },
+            },
+        });
+        expect(() =>
+            parseScenarioDeclaration(scenario(withLocators(ID_SHAPED_QUERY_MAX_TOKENS + 1))),
         ).toThrow(/r1\.locatorIds: exceeds-search-limit/);
         expect(() =>
-            parseScenarioDeclaration(scenario({
-                interventions: {
-                    ...base.interventions,
-                    r1: {
-                        ...base.interventions.r1,
-                        locatorIds: ["a", "b", "c", "d", "e"].map((s) => `mem-${s}`),
-                    },
-                },
-            })),
+            parseScenarioDeclaration(scenario(withLocators(ID_SHAPED_QUERY_MAX_TOKENS))),
         ).not.toThrow();
     });
 

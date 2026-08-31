@@ -50,14 +50,28 @@ describe("paired-delta authored scenarios", () => {
                 const resolvedLocatorIds = scenario.interventions.r1.locatorIds.map(
                     (_handle, index) => `mcm_${String(index).padStart(32, "0")}`,
                 );
+                const deliveredRows = resolvedLocatorIds
+                    .map((id, index) =>
+                        `[${index + 1}] [memory] score=0.91 id=${id} category=decision match=exact`)
+                    .join("\n");
                 const checks = await scenario.verifier({
                     armId: "r1",
                     workspacePath: root,
-                    scriptedTurnText: `oracle search complete ${resolvedLocatorIds.join(" ")}`,
+                    scriptedTurnText: `Found ${resolvedLocatorIds.length} results:\n${deliveredRows}`,
                     resolvedLocatorIds,
                 });
                 validateCheckVector(scenario, "r1", checks);
                 expect(checks.every(({ passed }) => passed)).toBe(true);
+
+                /** The empty-results renderer echoes the query, and a locator query is the resolved ids, so a bare substring test would score zero retrieval as a pass. commentlint: allow(JUDGE) */
+                const emptyRender = await scenario.verifier({
+                    armId: "r1",
+                    workspacePath: root,
+                    scriptedTurnText: `No results found for "${resolvedLocatorIds.join(" ")}" `
+                        + "across notes, memories, primers, git commits, or message history.",
+                    resolvedLocatorIds,
+                });
+                expect(emptyRender.find(({ id }) => id === "check-r1-wire")?.passed).toBe(false);
 
                 const unmapped = await scenario.verifier({
                     armId: "r1",
