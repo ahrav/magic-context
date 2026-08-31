@@ -70,7 +70,7 @@ fn wait_until_handled(
 /// Native worker limit. commentlint: allow(JUDGE)
 pub(crate) const WORKER_LIMIT: u32 = 0;
 
-type ReadinessCallback = ThreadsafeFunction<(), (), (), Status, false, true, 1>;
+type ReadinessCallback = ThreadsafeFunction<(), (), (), Status, false, true, 2>;
 
 struct Registration {
     descriptors: Vec<OwnedFd>,
@@ -94,7 +94,7 @@ impl Reactor {
             callback
                 .build_threadsafe_function::<()>()
                 .weak::<true>()
-                .max_queue_size::<1>()
+                .max_queue_size::<2>()
                 .build()?,
         );
         let epoll = Arc::new(
