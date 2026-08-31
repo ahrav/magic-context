@@ -229,7 +229,7 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - name: Store tests against real commons
-        run: cargo test -p mc-store
+        run: cargo test -p mc-store --features test-support
 
       - name: Host lifecycle and closure proofs
         run: |

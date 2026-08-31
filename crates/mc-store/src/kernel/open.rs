@@ -9,8 +9,9 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex, PoisonError, TryLockError};
+use std::time::Instant;
 
 use super::schema::{
     apply_kernel_schema, kernel_schema_digest, kernel_schema_object_inventory,
@@ -24,9 +25,11 @@ use crate::sqlite_runtime::{
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 const READ_POOL_SIZE: usize = 2;
+const WRITER_ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 const RESET_MARKER_PROTOCOL: &str = "mc-kernel-reset-marker-v1";
 const RESET_MARKER_SUFFIX: &str = ".mc-reset";
 const RESET_MARKER_STAGING_SUFFIX: &str = ".staging";
+const RESTORE_MARKER_SUFFIX: &str = ".mc-restore";
 const QUARANTINE_INFIX: &str = ".mc-quarantine-";
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
@@ -52,6 +55,10 @@ pub enum KernelError {
     NoRequiredConsumers,
     ConsumerPending,
     Fault,
+    Deadline,
+    UnsafeDestination,
+    InvalidBackup,
+    InvalidRestore,
 }
 
 impl KernelError {
@@ -80,6 +87,10 @@ impl fmt::Display for KernelError {
             Self::NoRequiredConsumers => "outbox pruning requires at least one consumer",
             Self::ConsumerPending => "outbox consumer has not reached the commit-log tip",
             Self::Fault => "kernel operation was interrupted",
+            Self::Deadline => "kernel operation exceeded its deadline",
+            Self::UnsafeDestination => "backup destination is not a private local directory",
+            Self::InvalidBackup => "backup artifact failed verification",
+            Self::InvalidRestore => "restore source failed verification",
         })
     }
 }
@@ -94,9 +105,13 @@ impl std::error::Error for KernelError {}
 
 pub struct KernelStore {
     writer: Mutex<Connection>,
-    readers: Vec<Mutex<Connection>>,
+    pub(super) readers: Vec<Mutex<Connection>>,
     next_reader: AtomicUsize,
+    // Distinct from mutex poisoning, which `PoisonError::into_inner` recovers: this
+    // records that an unrecoverable restore left the family unusable.
+    poisoned: AtomicBool,
     lease_epoch: u64,
+    pub(super) db_path: PathBuf,
     _lease: Box<dyn LeaseHandle>,
 }
 
@@ -142,6 +157,12 @@ impl KernelStore {
         let lease = lease_store.acquire(&lease_key).map_err(map_lease_error)?;
         let lease_epoch = lease.epoch();
 
+        if entry_exists(&restore_marker_path(&db_path))? {
+            super::backup::resume_restore(&db_path)?;
+        } else {
+            super::backup::reap_orphan_restore_recovery(&db_path)?;
+        }
+
         if entry_exists(&reset_marker_path(&db_path))? {
             resume_quarantine(&db_path)?;
         }
@@ -181,7 +202,9 @@ impl KernelStore {
             writer: Mutex::new(writer),
             readers,
             next_reader: AtomicUsize::new(0),
+            poisoned: AtomicBool::new(false),
             lease_epoch,
+            db_path,
             _lease: lease,
         };
         // Reclaiming an expired lease keeps every row; deleting aged runs is left to an
@@ -199,14 +222,60 @@ impl KernelStore {
     /// later write. Dropping a rusqlite `Transaction` rolls it back, so the
     /// recovered connection has no in-flight statement.
     pub(super) fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
-        Ok(self.writer.lock().unwrap_or_else(PoisonError::into_inner))
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(KernelError::InvalidRestore);
+        }
+        let writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(KernelError::InvalidRestore);
+        }
+        Ok(writer)
+    }
+
+    /// `Mutex::lock` has no timeout, so a deadline-bounded caller polls instead of
+    /// blocking behind an operation that may outlive its own budget.
+    pub(super) fn lock_writer_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
+        loop {
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(KernelError::InvalidRestore);
+            }
+            let guard = match self.writer.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(KernelError::Deadline);
+                    }
+                    std::thread::sleep(WRITER_ACQUIRE_POLL);
+                    continue;
+                }
+            };
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(KernelError::InvalidRestore);
+            }
+            return Ok(guard);
+        }
+    }
+
+    pub(super) fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
     }
 
     pub(super) fn lock_reader(&self) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(KernelError::InvalidRestore);
+        }
         let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        Ok(self.readers[index]
+        let reader = self.readers[index]
             .lock()
-            .unwrap_or_else(PoisonError::into_inner))
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(KernelError::InvalidRestore);
+        }
+        Ok(reader)
     }
 
     #[cfg(feature = "test-support")]
@@ -381,6 +450,29 @@ struct FormatMarker {
     marker_digest: String,
 }
 
+pub(super) fn verify_exact_identity(conn: &mut Connection) -> Result<(), KernelError> {
+    let integrity_check: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|_| KernelError::Inconclusive)?;
+    if integrity_check != "ok" {
+        return Err(KernelError::Inconclusive);
+    }
+    // `integrity_check` validates page structure, not references, so a family
+    // written with `foreign_keys=OFF` can pass it while holding dangling rows.
+    let foreign_key_violations: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| KernelError::Inconclusive)?;
+    if foreign_key_violations != 0 {
+        return Err(KernelError::Inconclusive);
+    }
+    match classify_open_kernel(conn, expected_identity()?)? {
+        OpenIdentity::Exact => Ok(()),
+        OpenIdentity::Mismatch { .. } => Err(KernelError::IdentityMismatch),
+    }
+}
+
 fn classify_open_kernel(
     conn: &mut Connection,
     expected: &ExpectedIdentity,
@@ -484,7 +576,7 @@ fn read_valid_marker(conn: &Connection) -> Result<FormatMarker, KernelError> {
     })
 }
 
-fn open_writer(path: &Path) -> rusqlite::Result<Connection> {
+pub(super) fn open_writer(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -503,7 +595,7 @@ fn bootstrap(path: &Path) -> Result<Connection, KernelError> {
     Ok(conn)
 }
 
-fn apply_preclassification_profile(conn: &Connection) -> rusqlite::Result<()> {
+pub(super) fn apply_preclassification_profile(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
@@ -516,7 +608,7 @@ fn apply_preclassification_profile(conn: &Connection) -> rusqlite::Result<()> {
 /// `PRAGMA journal_mode` returns the mode now in effect rather than failing.
 ///
 /// Readers depend on WAL for snapshot isolation, so the returned mode is checked.
-fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
+pub(super) fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
     let mode: String = conn
         .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
         .map_err(|_| KernelError::Io)?;
@@ -527,7 +619,7 @@ fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
         .map_err(|_| KernelError::Io)
 }
 
-fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<(), KernelError> {
+pub(super) fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<(), KernelError> {
     let epoch = i64::try_from(epoch).map_err(|_| KernelError::IdentityMismatch)?;
     let tx = conn.transaction().map_err(|_| KernelError::Io)?;
     if tx
@@ -541,6 +633,18 @@ fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<(), KernelErr
         return Err(KernelError::IdentityMismatch);
     }
     tx.commit().map_err(|_| KernelError::Io)
+}
+
+pub(super) fn open_reader(path: &Path) -> Result<Connection, KernelError> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(super::map_sqlite)?;
+    conn.pragma_update(None, "query_only", "ON")
+        .map_err(super::map_sqlite)?;
+    apply_preclassification_profile(&conn).map_err(super::map_sqlite)?;
+    Ok(conn)
 }
 
 fn open_read_pool(path: &Path) -> Result<Vec<Mutex<Connection>>, KernelError> {
@@ -565,7 +669,7 @@ fn open_read_pool(path: &Path) -> Result<Vec<Mutex<Connection>>, KernelError> {
         .collect()
 }
 
-fn family_sidecars(path: &Path) -> [PathBuf; 3] {
+pub(super) fn family_sidecars(path: &Path) -> [PathBuf; 3] {
     [
         suffix_path(path, "-wal"),
         suffix_path(path, "-shm"),
@@ -573,7 +677,7 @@ fn family_sidecars(path: &Path) -> [PathBuf; 3] {
     ]
 }
 
-fn harden_family(path: &Path) -> Result<(), KernelError> {
+pub(super) fn harden_family(path: &Path) -> Result<(), KernelError> {
     protect_file(path).map_err(|_| KernelError::Io)?;
     for sidecar in family_sidecars(path) {
         protect_file(&sidecar).map_err(|_| KernelError::Io)?;
@@ -726,12 +830,16 @@ fn valid_quarantine_path(path: &Path, quarantine: &Path) -> bool {
         })
 }
 
+pub(super) fn restore_marker_path(path: &Path) -> PathBuf {
+    suffix_path(path, RESTORE_MARKER_SUFFIX)
+}
+
 fn reset_marker_path(path: &Path) -> PathBuf {
     suffix_path(path, RESET_MARKER_SUFFIX)
 }
 
 /// `Path::display` replaces non-UTF-8 bytes, which would name a different file.
-fn suffix_path(path: &Path, suffix: &str) -> PathBuf {
+pub(super) fn suffix_path(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)
@@ -775,12 +883,12 @@ fn prepare_private_dir(path: &Path) -> Result<(), KernelError> {
     Ok(())
 }
 
-fn sync_parent(path: &Path) -> Result<(), KernelError> {
+pub(super) fn sync_parent(path: &Path) -> Result<(), KernelError> {
     let parent = path.parent().ok_or(KernelError::Io)?;
     sync_directory(parent)
 }
 
-fn sync_directory(path: &Path) -> Result<(), KernelError> {
+pub(super) fn sync_directory(path: &Path) -> Result<(), KernelError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| KernelError::Io)

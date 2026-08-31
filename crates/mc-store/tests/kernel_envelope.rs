@@ -996,3 +996,46 @@ fn a_blank_alignment_kind_cannot_replace_a_valid_projection() {
     .unwrap();
     assert_eq!(surviving, "intended", "the valid projection must survive");
 }
+
+#[test]
+fn envelope_persists_declared_sensitivity_across_canonical_and_outbox_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let mut normal = domain(1);
+    normal.sensitivity = Sensitivity::Normal;
+    let mut sensitive = domain(2);
+    sensitive.sensitivity = Sensitivity::Sensitive;
+    store
+        .commit(intent("mixed-sensitivity", 'a'), |envelope| {
+            envelope.insert_domain(normal)?;
+            envelope.insert_domain(sensitive)?;
+            Ok("stored".to_string())
+        })
+        .unwrap();
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    for table in ["domains", "object_registry", "outbox"] {
+        let values = connection
+            .prepare(&format!(
+                "SELECT object_id,sensitivity_class FROM {table} ORDER BY object_id"
+            ))
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            values,
+            [
+                ("object-1".to_string(), "normal".to_string()),
+                ("object-2".to_string(), "sensitive".to_string())
+            ],
+            "{table}"
+        );
+    }
+}
