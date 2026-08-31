@@ -159,12 +159,14 @@ function writeConfigs(
         ? releaseRootPath(opts.releaseRoot, "opencodePlugin")
         : pluginEntryPath();
     const pluginSpec = `file://${pluginEntry}`;
-    const extra = opts.openCodeConfigExtra ?? {};
-    const contributedProviders = extra.provider;
     /** Every caller-supplied config channel is written to disk beside the others, and all three are `Record<string, unknown>` — an easy mix-up — so each is guarded rather than only the one an unauthenticated serve reads. commentlint: allow(JUDGE) */
-    assertConfigHasNoCredentials(extra, "openCodeConfigExtra");
-    assertConfigHasNoCredentials(opts.magicContextConfig, "magicContextConfig");
-    assertConfigHasNoCredentials(opts.projectMagicContextConfig, "projectMagicContextConfig");
+    const extra = canonicalConfig(opts.openCodeConfigExtra, "openCodeConfigExtra") ?? {};
+    const magicContextConfig = canonicalConfig(opts.magicContextConfig, "magicContextConfig");
+    const projectMagicContextConfig = canonicalConfig(
+        opts.projectMagicContextConfig,
+        "projectMagicContextConfig",
+    );
+    const contributedProviders = extra.provider;
     const extraWithoutProvider = { ...extra };
     delete extraWithoutProvider.provider;
 
@@ -217,7 +219,7 @@ function writeConfigs(
         history_budget_percentage: 0.15,
         dreamer: { disable: true },
         sidekick: { disable: true },
-        ...(opts.magicContextConfig ?? {}),
+        ...(magicContextConfig ?? {}),
     };
     if (opts.userMcHostConnectionFile) {
         Object.assign(magicContext, {
@@ -236,7 +238,7 @@ function writeConfigs(
         JSON.stringify(magicContext, null, 2),
     );
 
-    if (opts.projectMagicContextConfig) {
+    if (projectMagicContextConfig) {
         const projectConfigDir = join(env.workdir, ".cortexkit");
         mkdirSync(projectConfigDir, { recursive: true });
         writeFileSync(
@@ -245,7 +247,7 @@ function writeConfigs(
                 {
                     $schema:
                         "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json",
-                    ...opts.projectMagicContextConfig,
+                    ...projectMagicContextConfig,
                 },
                 null,
                 2,
@@ -253,6 +255,26 @@ function writeConfigs(
         );
     }
 
+}
+
+/**
+ * Serialize before validation so `toJSON()` transformations cannot bypass credential checks.
+ * Cyclic input causes `JSON.stringify` to throw before credential validation.
+ */
+function canonicalConfig(
+    value: Record<string, unknown> | undefined,
+    label: string,
+): Record<string, unknown> | undefined {
+    if (value === undefined) return undefined;
+    /** A spread copies own enumerable fields whatever `toJSON()` reported, so the scan and the write must read one representation; `writeConfigs` assembles every file from this return value. commentlint: allow(JUDGE) */
+    const serialized = JSON.parse(JSON.stringify(value)) as unknown;
+    /** A `toJSON()` returning a non-object leaves no fields to spread, and treating it as a config would write the scalar's own properties instead. commentlint: allow(JUDGE) */
+    if (serialized === null || typeof serialized !== "object" || Array.isArray(serialized)) {
+        throw new Error(`${label} must serialize to a JSON object`);
+    }
+    const canonical = serialized as Record<string, unknown>;
+    assertConfigHasNoCredentials(canonical, label);
+    return canonical;
 }
 
 /**
@@ -265,10 +287,6 @@ function writeConfigs(
  * than by recognition.
  */
 function assertConfigHasNoCredentials(value: unknown, label: string): void {
-    /** The guard walks what will be written, not what was passed: a value with a `toJSON()` hook — `new URL("https://user:pw@host")` — exposes no enumerable fields to `Object.entries` and then serializes into the credential the value scan exists to catch. A cyclic config throws here, which is the same refusal the write would have produced. commentlint: allow(JUDGE) */
-    const serialized: unknown = value === undefined
-        ? undefined
-        : JSON.parse(JSON.stringify(value)) as unknown;
     const seen = new WeakSet<object>();
     const visit = (current: unknown, path: string): void => {
         if (current === null || typeof current !== "object" || seen.has(current)) return;
@@ -293,7 +311,7 @@ function assertConfigHasNoCredentials(value: unknown, label: string): void {
             visit(child, childPath);
         }
     };
-    visit(serialized, label);
+    visit(value, label);
 }
 
 /**

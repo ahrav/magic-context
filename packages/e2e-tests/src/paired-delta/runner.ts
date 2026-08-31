@@ -172,14 +172,11 @@ export async function verifyDualMockResolution(input: {
     }): Promise<{ providerId: string; modelId: string; contextLimit: number }>;
 }): Promise<void> {
     const fixtureRoute = { providerId: "mock-anthropic", modelId: "mock-sonnet" };
-    /** The gate exists to prove two distinct routes resolve independently. A live route equal to the fixture route makes the check pass while every supposedly live rollout can run on the fixture provider. commentlint: allow(JUDGE) */
-    if (
-        input.liveProviderId === fixtureRoute.providerId &&
-        input.liveModelId === fixtureRoute.modelId
-    ) {
+    /** The gate exists to prove two distinct routes resolve independently, and the provider is what decides the endpoint: `writeConfigs` writes the generated fixture provider after the contributed ones, so a live route naming that provider is served by the fixture regardless of the model it names. A different model under it resolves against the same mock and echoes back what was asked, so the route checks pass while every supposedly live rollout runs on fixture traffic. commentlint: allow(JUDGE) */
+    if (input.liveProviderId === fixtureRoute.providerId) {
         throw new Error(
-            "dual-mock live route duplicates the fixture route " +
-                `${fixtureRoute.providerId}/${fixtureRoute.modelId}`,
+            "dual-mock live route duplicates the fixture provider " +
+                `${fixtureRoute.providerId}`,
         );
     }
     const routes = [

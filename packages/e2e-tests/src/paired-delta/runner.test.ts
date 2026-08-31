@@ -769,17 +769,20 @@ describe("paired-delta runner", () => {
         });
     });
 
-    it("refuses a live route that duplicates the fixture route", async () => {
-        await expect(
-            verifyDualMockResolution({
-                liveProviderId: "mock-anthropic",
-                liveModelId: "mock-sonnet",
-                modelContextLimit: 4096,
-                async sendPrompt(route) {
-                    return { ...route, contextLimit: 4096 };
-                },
-            }),
-        ).rejects.toThrow(/duplicates the fixture route/);
+    it("refuses a live route that duplicates the fixture provider", async () => {
+        // The fixture provider selects the mock endpoint, whatever model is named under it.
+        for (const liveModelId of ["mock-sonnet", "some-other-model"]) {
+            await expect(
+                verifyDualMockResolution({
+                    liveProviderId: "mock-anthropic",
+                    liveModelId,
+                    modelContextLimit: 4096,
+                    async sendPrompt(route) {
+                        return { ...route, contextLimit: 4096 };
+                    },
+                }),
+            ).rejects.toThrow(/duplicates the fixture provider/);
+        }
     });
 
     it("persists a rollout whose other observation fields are not JSON-safe", async () => {

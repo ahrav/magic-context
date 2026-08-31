@@ -233,8 +233,48 @@ describe("opencode child lifecycle", () => {
                 })
             ).not.toThrow();
 
-            for (const header of ["Cookie", "Proxy-Authorization", "set-cookie"]) {
-                expect(() =>
+            // `toJSON()` returns `{}`, but object spread copies `embedding`. The credential scan and config write must inspect the same representation.
+            for (
+                const channel of [
+                    "magicContextConfig",
+                    "projectMagicContextConfig",
+                    "openCodeConfigExtra",
+                ] as const
+            ) {
+                const hidden: Record<string, unknown> = {
+                    embedding: { apiKey: "sk-ant-abcdefghijklmnopqrstuv" },
+                };
+                Object.defineProperty(hidden, "toJSON", {
+                    value: () => ({}),
+                    enumerable: false,
+                });
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                    [channel]: hidden,
+                });
+                for (
+                    const file of [
+                        join(env.configDir, "opencode.json"),
+                        join(env.configDir, "opencode", "magic-context.jsonc"),
+                        join(env.workdir, ".cortexkit", "magic-context.jsonc"),
+                    ]
+                ) {
+                    if (!existsSync(file)) continue;
+                    expect(readFileSync(file, "utf8")).not.toContain("sk-ant-");
+                }
+            }
+
+            // A scalar JSON value has no configuration fields to merge; its original properties are ignored.
+            const scalar: Record<string, unknown> = { embedding: { apiKey: "sk-live" } };
+            Object.defineProperty(scalar, "toJSON", { value: () => "opaque", enumerable: false });
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                    magicContextConfig: scalar,
+                })
+            ).toThrow(/magicContextConfig must serialize to a JSON object/);
+
+            for (const header of ["Cookie", "Proxy-Authorization", "set-cookie"]) {                expect(() =>
                     __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
                         mockProviderURL: "http://127.0.0.1:4321",
                         openCodeConfigExtra: {
