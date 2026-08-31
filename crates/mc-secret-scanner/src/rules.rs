@@ -201,8 +201,7 @@ impl RuleSet {
         rules.extend(parse_document(overlay, RuleSource::ConservativeOverlay)?);
         let mut identities = BTreeSet::new();
         for rule in &rules {
-            if rule.declaration.name.is_empty() || !identities.insert(rule.declaration.name.clone())
-            {
+            if !identities.insert(rule.declaration.name.clone()) {
                 return Err(ConstructionError::InvalidRuleIdentity);
             }
         }
@@ -287,15 +286,7 @@ impl RuleSet {
         hash.update((limits.max_input_bytes as u64).to_le_bytes());
         hash.update((limits.max_candidates as u64).to_le_bytes());
         hash.update((limits.max_work_bytes as u64).to_le_bytes());
-        // Tag and count each safelist so moving a pattern between them changes the digest: context patterns suppress on surrounding text and value patterns on the extracted value, so the two are not interchangeable.
-        for (tag, patterns) in [(b'c', CONTEXT_SAFELIST), (b'v', VALUE_SAFELIST)] {
-            hash.update([tag]);
-            hash.update((patterns.len() as u64).to_le_bytes());
-            for pattern in patterns {
-                hash.update((pattern.len() as u64).to_le_bytes());
-                hash.update(pattern.as_bytes());
-            }
-        }
+        hash_safelists(&mut hash, CONTEXT_SAFELIST, VALUE_SAFELIST);
         let mut active: Vec<_> = self.active(profile).collect();
         active.sort_by(|left, right| {
             (left.source, left.declaration.name.as_str())
@@ -305,6 +296,18 @@ impl RuleSet {
             encode_rule(&mut hash, rule)?;
         }
         Ok(hash.finalize().into())
+    }
+}
+
+// Tags distinguish context and value lists in the digest, so moving a pattern between them changes it even though the concatenated bytes do not.
+fn hash_safelists(hash: &mut Sha256, context: &[&str], value: &[&str]) {
+    for (tag, patterns) in [(b'c', context), (b'v', value)] {
+        hash.update([tag]);
+        hash.update((patterns.len() as u64).to_le_bytes());
+        for pattern in patterns {
+            hash.update((pattern.len() as u64).to_le_bytes());
+            hash.update(pattern.as_bytes());
+        }
     }
 }
 
@@ -552,6 +555,19 @@ mod tests {
         );
     }
 
+    /// The identity loop assumes every parsed name is non-empty.
+    #[test]
+    fn an_empty_rule_name_is_rejected_before_the_identity_check() {
+        assert_eq!(
+            parse_document(
+                b"rules:\n- name: ''\n  regex: 'x'\n  anchors: ['x']\n  radius: 16\n",
+                RuleSource::Upstream
+            )
+            .err(),
+            Some(ConstructionError::InvalidRulePolicy)
+        );
+    }
+
     #[test]
     fn construction_wiring_rejects_source_tampering() {
         assert_eq!(
@@ -636,31 +652,57 @@ mod tests {
         }
     }
 
+    fn safelist_digest(context: &[&str], value: &[&str]) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash_safelists(&mut hash, context, value);
+        hash.finalize().into()
+    }
+
     #[test]
     fn moving_a_pattern_between_safelists_changes_the_semantic_digest() {
-        let mut hash = Sha256::new();
-        for (tag, patterns) in [(b'c', &["a", "b"][..]), (b'v', &["c"][..])] {
-            hash.update([tag]);
-            hash.update((patterns.len() as u64).to_le_bytes());
-            for pattern in patterns {
-                hash.update((pattern.len() as u64).to_le_bytes());
-                hash.update(pattern.as_bytes());
-            }
-        }
-        let before: [u8; 32] = hash.finalize().into();
+        assert_ne!(
+            safelist_digest(&["a", "b"], &["c"]),
+            safelist_digest(&["a"], &["b", "c"])
+        );
+        assert_ne!(
+            safelist_digest(CONTEXT_SAFELIST, VALUE_SAFELIST),
+            safelist_digest(&CONTEXT_SAFELIST[..CONTEXT_SAFELIST.len() - 1], &{
+                let mut moved = vec![CONTEXT_SAFELIST[CONTEXT_SAFELIST.len() - 1]];
+                moved.extend_from_slice(VALUE_SAFELIST);
+                moved
+            })
+        );
+    }
 
-        let mut hash = Sha256::new();
-        for (tag, patterns) in [(b'c', &["a"][..]), (b'v', &["b", "c"][..])] {
-            hash.update([tag]);
-            hash.update((patterns.len() as u64).to_le_bytes());
-            for pattern in patterns {
-                hash.update((pattern.len() as u64).to_le_bytes());
-                hash.update(pattern.as_bytes());
-            }
-        }
-        let after: [u8; 32] = hash.finalize().into();
+    /// Both digest inputs have the same pattern count and concatenated bytes but different pattern boundaries.
+    #[test]
+    fn moving_a_safelist_pattern_boundary_changes_the_semantic_digest() {
+        assert_ne!(
+            safelist_digest(&["ab", "c"], VALUE_SAFELIST),
+            safelist_digest(&["a", "bc"], VALUE_SAFELIST)
+        );
+    }
 
-        assert_ne!(before, after);
+    #[test]
+    fn every_safelist_pattern_reaches_the_semantic_digest() {
+        for index in 0..CONTEXT_SAFELIST.len() {
+            let mut shortened = CONTEXT_SAFELIST.to_vec();
+            shortened.remove(index);
+            assert_ne!(
+                safelist_digest(CONTEXT_SAFELIST, VALUE_SAFELIST),
+                safelist_digest(&shortened, VALUE_SAFELIST),
+                "dropping context pattern {index} left the digest unchanged"
+            );
+        }
+        for index in 0..VALUE_SAFELIST.len() {
+            let mut shortened = VALUE_SAFELIST.to_vec();
+            shortened.remove(index);
+            assert_ne!(
+                safelist_digest(CONTEXT_SAFELIST, VALUE_SAFELIST),
+                safelist_digest(CONTEXT_SAFELIST, &shortened),
+                "dropping value pattern {index} left the digest unchanged"
+            );
+        }
     }
 
     // A mixed rule would let a named structural group decide the reported secret span.

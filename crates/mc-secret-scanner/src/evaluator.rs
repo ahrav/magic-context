@@ -107,17 +107,17 @@ fn evaluate_candidate(
     limits: ScanLimits,
 ) -> Result<Option<Finding>, Abort> {
     let full_match = captures.get(0).ok_or(ScanError::InvalidSpan)?;
-    // A nonparticipating declared value or key group skips the candidate, rather than aborting the whole scan or silently skipping the gate keyed on that group.
+    // A nonparticipating declared value, secret, or key group skips the candidate, rather than aborting the whole scan, reporting the whole match, or silently skipping the gate keyed on that group.
     let value_match = if let Some(name) = rule.declaration.value_group.as_deref() {
         match captures.name(name) {
             Some(value) => value,
             None => return Ok(None),
         }
     } else if let Some(group) = rule.declaration.secret_group {
-        captures
-            .get(usize::from(group))
-            .filter(|value| !value.is_empty())
-            .unwrap_or(full_match)
+        match captures.get(usize::from(group)) {
+            Some(value) => value,
+            None => return Ok(None),
+        }
     } else if let Some(alternative) = first_unnamed_capture(rule, captures) {
         alternative
     } else {
@@ -943,6 +943,21 @@ mod tests {
             r#"{"name":"t-value","regex":"(?:alpha=(?P<value>[A-Za-z0-9]{20})|beta)","anchors":["alpha"],"radius":16,"value_group":"value"}"#,
         );
         assert!(matches!(only_candidate(&rule, "beta"), Ok(None)));
+        assert!(matches!(
+            only_candidate(&rule, "alpha=Ab3fGh1jKlMnOpQrStUv"),
+            Ok(Some(_))
+        ));
+    }
+
+    #[test]
+    fn a_declared_secret_group_that_does_not_participate_skips_the_candidate() {
+        let rule = alternation_rule(
+            r#"{"name":"t-secret","regex":"(?:alpha=([A-Za-z0-9]{20})|beta=[A-Za-z0-9]{20})","anchors":["alpha"],"radius":16,"secret_group":1}"#,
+        );
+        assert!(matches!(
+            only_candidate(&rule, "beta=Ab3fGh1jKlMnOpQrStUv"),
+            Ok(None)
+        ));
         assert!(matches!(
             only_candidate(&rule, "alpha=Ab3fGh1jKlMnOpQrStUv"),
             Ok(Some(_))
