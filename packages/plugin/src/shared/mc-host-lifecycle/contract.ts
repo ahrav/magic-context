@@ -241,23 +241,24 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         fail("output is not a single JSON value");
     }
     const record = requireObject(parsed, "result");
-    requireExactKeys(
-        record,
-        [
-            "schema",
-            "command",
-            "ok",
-            "state",
-            "reason",
-            "remediation",
-            "effects",
-            "readiness",
-            "checks",
-            "versions",
-        ],
-        "result",
-    );
+    const resultKeys = [
+        "schema",
+        "command",
+        "ok",
+        "state",
+        "reason",
+        "remediation",
+        "effects",
+        "readiness",
+        "checks",
+        "versions",
+    ];
+    if ("shared_memory" in record) resultKeys.push("shared_memory");
+    requireExactKeys(record, resultKeys, "result");
     if (record.schema !== DAEMON_RESULT_SCHEMA) fail("schema is not magic-context.daemon/v1");
+    if (record.shared_memory !== undefined && record.shared_memory !== null) {
+        fail("shared_memory diagnostics are not supported by this release");
+    }
     const command = record.command;
     // The contract's command union is exactly start/stop/restart/status/doctor.
     // `probe` is an accepted argv spelling of the read-only observation, but the
@@ -380,10 +381,14 @@ export function parseDaemonResult(stdoutText: string): DaemonResultV1 {
         const rawReadiness = requireObject(record.readiness, "readiness");
         readiness = {};
         for (const [component, value] of Object.entries(rawReadiness)) {
-            if (component !== "transport" && component !== "storage" && component !== "synapse") {
+            const normalized = component === "shared_memory" ? "transport" : component;
+            if (normalized !== "transport" && normalized !== "storage" && normalized !== "synapse") {
                 fail("readiness carries an unknown component");
             }
-            readiness[component] = parseReadinessRecord(value, component);
+            if (readiness[normalized] !== undefined) {
+                fail("readiness carries duplicate transport components");
+            }
+            readiness[normalized] = parseReadinessRecord(value, normalized);
         }
     }
     if (!Array.isArray(record.checks) || record.checks.length > CHECK_IDS.size) {

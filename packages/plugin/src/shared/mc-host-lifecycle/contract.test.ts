@@ -29,6 +29,7 @@ function validResult(overrides: Record<string, unknown> = {}): Record<string, un
             storage: { state: "ready", reason: "healthy" },
             synapse: { state: "ready", reason: "healthy" },
         },
+        shared_memory: null,
         checks: [
             { id: "compatibility.daemon", status: "pass", reason: "healthy", remediation: null },
             { id: "lifecycle.publication", status: "pass", reason: "healthy", remediation: null },
@@ -53,6 +54,21 @@ describe("parseDaemonResult", () => {
         expect(parsed.reason).toBe("healthy");
         expect(parsed.checks.length).toBe(2);
         expect(parsed.versions.daemon).toBe("mc-host/0.1.0");
+    });
+
+    test("normalizes the native shared-memory readiness name", () => {
+        const parsed = parseDaemonResult(
+            JSON.stringify(
+                validResult({
+                    readiness: {
+                        shared_memory: { state: "ready", reason: "healthy" },
+                    },
+                }),
+            ),
+        );
+        expect(parsed.readiness).toEqual({
+            transport: { state: "ready", reason: "healthy" },
+        });
     });
 
     test("rejects a probe command in a result and accepts the status it really emits", () => {

@@ -1986,10 +1986,16 @@ fn start_ring_bridge(
                             rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR,
                         ),
                     ];
-                    if rustix::event::poll(&mut fds, None).is_err()
-                        || fds[1].revents().intersects(
-                            rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR,
-                        )
+                    loop {
+                        match rustix::event::poll(&mut fds, None) {
+                            Ok(_) => break,
+                            Err(rustix::io::Errno::INTR) if !cancel.is_cancelled() => continue,
+                            Err(_) => return None,
+                        }
+                    }
+                    if fds[1]
+                        .revents()
+                        .intersects(rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR)
                     {
                         return None;
                     }
@@ -2023,7 +2029,14 @@ fn start_ring_bridge(
                         rustix::event::PollFlags::HUP | rustix::event::PollFlags::ERR,
                     ),
                 ];
-                if rustix::event::poll(&mut fds, None).is_err() {
+                let poll_ready = loop {
+                    match rustix::event::poll(&mut fds, None) {
+                        Ok(_) => break true,
+                        Err(rustix::io::Errno::INTR) if !cancel.is_cancelled() => continue,
+                        Err(_) => break false,
+                    }
+                };
+                if !poll_ready {
                     break;
                 }
                 if fds[0].revents().contains(rustix::event::PollFlags::IN) {
