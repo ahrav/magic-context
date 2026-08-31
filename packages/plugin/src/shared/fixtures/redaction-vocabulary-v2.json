@@ -1,0 +1,20 @@
+{
+  "schema": "magic-context.redaction-vocabulary/v2",
+  "shared_case_count": 1,
+  "cases": [
+    {
+      "name": "shared keyed password",
+      "input": "password=hunter-two",
+      "legacy_expected": "password=<REDACTED:password>",
+      "portable_expected": "password=<REDACTED:password>",
+      "expectation": "shared"
+    },
+    {
+      "name": "portable age secret key",
+      "input": "provider AGE-SECRET-KEY-1QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE",
+      "legacy_expected": "provider AGE-SECRET-KEY-1QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE",
+      "portable_expected": "provider <REDACTED:secret>",
+      "expectation": "portable_only"
+    }
+  ]
+}

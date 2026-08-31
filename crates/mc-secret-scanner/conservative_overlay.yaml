@@ -1,0 +1,77 @@
+rules:
+- name: magic-anthropic-api-key
+  regex: '\bsk-ant-(?:api03-)?[A-Za-z0-9_-]{32,}'
+  anchors: [sk-ant-]
+  radius: 256
+- name: magic-openai-api-key
+  regex: '\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}'
+  anchors: [sk-]
+  radius: 256
+- name: magic-github-pat
+  regex: '\bgithub_pat_[A-Za-z0-9_]{20,}'
+  anchors: [github_pat_]
+  radius: 256
+- name: magic-github-token
+  regex: '\b(?:gh[opsu]|ghr)_[A-Za-z0-9]{30,}'
+  anchors: [ghp_, gho_, ghs_, ghu_, ghr_]
+  radius: 256
+- name: magic-huggingface-token
+  regex: '\bhf_[A-Za-z0-9]{30,}'
+  anchors: [hf_]
+  radius: 256
+- name: magic-aws-access-key-id
+  regex: '\b(?:AKIA|ASIA)[0-9A-Z]{16}'
+  anchors: [AKIA, ASIA]
+  radius: 256
+- name: magic-slack-token
+  regex: '\bxox[abprsuvc]-[A-Za-z0-9-]{10,}'
+  anchors: [xox]
+  radius: 256
+- name: magic-google-api-key
+  regex: '\bAIza[A-Za-z0-9_-]{35}'
+  anchors: [AIza]
+  radius: 256
+- name: magic-bearer-token
+  regex: '(?i)\bAuthorization\s*:\s*Bearer\s+(?P<value>[A-Za-z0-9._~+/=-]{8,})'
+  anchors: [Authorization, authorization]
+  radius: 256
+  value_group: value
+- name: magic-jwt
+  regex: '\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
+  anchors: [eyJ]
+  radius: 256
+- name: magic-keyed-double-quoted
+  regex: '(?i)"(?P<key>[^"'']*(?:key|token|secret|password|auth|bearer|credential)[^"'']*)"\s*:\s*"(?P<value>[^"'']*)"'
+  anchors: [key, token, secret, password, auth, bearer, credential]
+  radius: 256
+  key_group: key
+  value_group: value
+  reject_scalars: true
+- name: magic-keyed-single-quoted
+  regex: '(?i)''(?P<key>[^"'']*(?:key|token|secret|password|auth|bearer|credential)[^"'']*)''\s*:\s*''(?P<value>[^"'']*)'''
+  anchors: [key, token, secret, password, auth, bearer, credential]
+  radius: 256
+  key_group: key
+  value_group: value
+  reject_scalars: true
+- name: magic-keyed-double-single
+  regex: '(?i)"(?P<key>[^"'']*(?:key|token|secret|password|auth|bearer|credential)[^"'']*)"\s*:\s*''(?P<value>[^"'']*)'''
+  anchors: [key, token, secret, password, auth, bearer, credential]
+  radius: 256
+  key_group: key
+  value_group: value
+  reject_scalars: true
+- name: magic-keyed-single-double
+  regex: '(?i)''(?P<key>[^"'']*(?:key|token|secret|password|auth|bearer|credential)[^"'']*)''\s*:\s*"(?P<value>[^"'']*)"'
+  anchors: [key, token, secret, password, auth, bearer, credential]
+  radius: 256
+  key_group: key
+  value_group: value
+  reject_scalars: true
+- name: magic-keyed-assignment
+  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*(?P<value>[^\s''"`]+)'
+  anchors: [key, token, secret, password, auth, bearer, credential]
+  radius: 256
+  key_group: key
+  value_group: value
+  reject_scalars: true

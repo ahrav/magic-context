@@ -15,7 +15,16 @@ cache-core = ["dep:cortexkit-cache-core"]
 
 [dependencies]
 cortexkit-cache-core = { workspace = true, optional = true }
+mc-secret-scanner = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+criterion = "=0.8.2"
+proptest = "1.7"
+
+[[bench]]
+name = "redaction"
+harness = false

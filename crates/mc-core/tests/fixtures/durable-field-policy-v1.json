@@ -1,0 +1,12 @@
+{
+  "schema": "magic-context.durable-field-policy/v1",
+  "content": {
+    "input": "π password=hunter-two",
+    "legacy": "π password=<REDACTED:password>"
+  },
+  "scalar": "tokens.input=45000",
+  "identity": [
+    "password=first-identity",
+    "password=second-identity"
+  ]
+}

@@ -1,9 +1,9 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
-
-import { hasShareabilitySensitiveText, redactSecretText } from "./redaction";
 import vocabulary from "./fixtures/redaction-vocabulary-v1.json";
+import portableVocabulary from "./fixtures/redaction-vocabulary-v2.json";
+import { hasShareabilitySensitiveText, redactSecretText } from "./redaction";
 
 describe("redaction vocabulary fixture", () => {
     test("matches the cross-runtime redacted output", () => {
@@ -23,6 +23,33 @@ describe("redaction vocabulary fixture", () => {
         }
         for (const knownMiss of vocabulary.known_misses) {
             expect(redactSecretText(knownMiss)).toBe(knownMiss);
+        }
+    });
+});
+
+describe("portable redaction vocabulary fixture", () => {
+    test("contains complete cross-runtime cases", () => {
+        expect(portableVocabulary.cases.length).toBeGreaterThan(0);
+        for (const fixture of portableVocabulary.cases) {
+            expect(fixture.name.length).toBeGreaterThan(0);
+            expect(fixture.input.length).toBeGreaterThan(0);
+            expect(fixture.legacy_expected.length).toBeGreaterThan(0);
+            expect(fixture.portable_expected.length).toBeGreaterThan(0);
+            expect(redactSecretText(fixture.input)).toBe(fixture.legacy_expected);
+        }
+    });
+
+    test("matches conservative cases shared by both runtimes", () => {
+        const shared = portableVocabulary.cases.filter(
+            (fixture) => fixture.expectation === "shared",
+        );
+        expect(shared.length).toBe(portableVocabulary.shared_case_count);
+        expect(portableVocabulary.shared_case_count).toBeGreaterThan(0);
+        for (const fixture of shared) {
+            expect(fixture.name.length).toBeGreaterThan(0);
+            expect(fixture.input.length).toBeGreaterThan(0);
+            expect(fixture.legacy_expected).toBe(fixture.portable_expected);
+            expect(redactSecretText(fixture.input)).toBe(fixture.legacy_expected);
         }
     });
 });
