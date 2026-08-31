@@ -716,11 +716,19 @@ fn staged_candidate_never_enters_canonical_state() {
         [ACTOR.to_string()].into()
     );
     assert_eq!(
-        query_strings(
-            root.path(),
-            "SELECT DISTINCT idempotency_key FROM change_event"
-        ),
+        query_strings(root.path(), "SELECT DISTINCT operation_key FROM commit_log"),
         OPERATION_KEYS.map(str::to_string).into()
+    );
+    let change_identities = query_strings(
+        root.path(),
+        "SELECT DISTINCT idempotency_key FROM change_event",
+    );
+    assert_eq!(change_identities.len(), OPERATION_KEYS.len());
+    assert!(
+        change_identities
+            .iter()
+            .all(|key| key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit())),
+        "{change_identities:?}"
     );
     assert_eq!(
         query_count(root.path(), "SELECT COUNT(*) FROM admission_decisions"),
