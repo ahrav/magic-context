@@ -255,6 +255,13 @@ fn slice_payloads_redact_before_storage_and_missing_parents_are_typed() {
         })
         .unwrap_err();
     assert_eq!(missing_dependency.kind(), KernelErrorKind::NotFound);
+    let wrong_dependency_kind = store
+        .commit(intent("non-decision-dependency", 'b'), |envelope| {
+            envelope.insert_observation(observation(1, "domain-object"))?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(wrong_dependency_kind.kind(), KernelErrorKind::NotFound);
 
     let duplicate = store
         .commit(intent("duplicate-source", '6'), |envelope| {
