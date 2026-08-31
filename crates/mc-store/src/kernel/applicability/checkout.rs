@@ -329,8 +329,14 @@ fn scan_dirty_entries(
         }
         budget.check()?;
         let rela_path = entry.path(&index);
+        // A chmod moves the git entry mode while the bytes stay equal, so
+        // the mode tag participates alongside the content hash.
         entries.insert(DirtyEntry {
-            content_hash: worktree_content_hash(repo, rela_path, budget)?,
+            content_hash: format!(
+                "{}:{}",
+                worktree_content_hash(repo, rela_path, budget)?,
+                worktree_mode_tag(repo, rela_path)
+            ),
             path: path_string(rela_path),
             status: "assume_valid",
         });
@@ -605,6 +611,39 @@ fn submodule_head_hash(path: &Path) -> String {
         Ok(head) => format!("gitlink:{}", head.detach()),
         Err(_) => "gitlink-unborn".to_string(),
     }
+}
+
+/// Git mode class of a worktree path: `file`, `exec`, `symlink`, `dir`, or
+/// `absent`. On non-Unix targets the executable bit does not exist, so
+/// `file` covers both blob modes.
+fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
+    let Some(workdir) = repo.workdir() else {
+        return "absent";
+    };
+    let Ok(rela_path) = gix::path::try_from_bstr(rela_path) else {
+        return "absent";
+    };
+    let Some(path) = contained_path(workdir, &rela_path) else {
+        return "absent";
+    };
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return "absent";
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return "symlink";
+    }
+    if file_type.is_dir() {
+        return "dir";
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 != 0 {
+            return "exec";
+        }
+    }
+    "file"
 }
 
 /// Sparse-checkout configuration and patterns determine which paths

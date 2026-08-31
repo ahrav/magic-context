@@ -14,7 +14,7 @@ use super::super::scope::GraphOracle;
 use super::checkout::{CheckoutSnapshot, EvalBudget};
 
 /// Identities are internal fallback keys, not `git patch-id` output.
-pub const PATCH_ID_ALGORITHM: &str = "mc-patch-id-v3";
+pub const PATCH_ID_ALGORITHM: &str = "mc-patch-id-v4";
 
 /// `CANDIDATE_WINDOW` bounds fallback resolution cost on deep histories.
 /// A true match outside the window is unresolved at that rung.
@@ -53,7 +53,7 @@ pub struct ResolutionLadder<'s> {
     snapshot: &'s CheckoutSnapshot,
     budget: &'s EvalBudget,
     ancestry_cache: RefCell<HashMap<(ObjectId, ObjectId), Option<bool>>>,
-    window: RefCell<Option<Rc<[ObjectId]>>>,
+    window: RefCell<Option<CandidateWindow>>,
     /// A candidate's patch identity depends only on its commit.
     patch_id_cache: RefCell<HashMap<ObjectId, Option<String>>>,
 }
@@ -133,9 +133,24 @@ impl<'s> ResolutionLadder<'s> {
             WindowMatch::Ambiguous => CommitResolution::Uncertain,
             WindowMatch::Budget => CommitResolution::Uncertain,
             WindowMatch::Unreadable => CommitResolution::Uncertain,
-            WindowMatch::None if anchor_present => CommitResolution::NotReachable,
+            WindowMatch::None if anchor_present && self.window_scan_complete(capture) => {
+                CommitResolution::NotReachable
+            }
             WindowMatch::None => CommitResolution::Uncertain,
         }
+    }
+
+    /// A fallback miss is only conclusive when every reachable commit was
+    /// scanned; a window truncated at [`CANDIDATE_WINDOW`] can hide the
+    /// rewrite a capture would have matched.
+    fn window_scan_complete(&self, capture: Option<&AnchorCapture>) -> bool {
+        let has_fallback_data =
+            capture.is_some_and(|capture| capture.patch_id.is_some() || capture.tree_oid.is_some());
+        if !has_fallback_data {
+            return true;
+        }
+        self.candidate_window()
+            .is_some_and(|window| !window.truncated)
     }
 
     /// Patch-ID rung, then tree-hash rung, over the bounded candidate
@@ -157,7 +172,7 @@ impl<'s> ResolutionLadder<'s> {
             .filter(|patch| patch.algorithm == PATCH_ID_ALGORITHM);
         if let Some(stored) = stored_patch_id {
             match self.match_candidates(|candidate| {
-                if !self.commit_touches_paths(candidate, &capture.changed_paths) {
+                if !self.commit_touches_paths(candidate, &capture.changed_paths)? {
                     return Ok(false);
                 }
                 Ok(self
@@ -206,7 +221,7 @@ impl<'s> ResolutionLadder<'s> {
             return WindowMatch::Budget;
         };
         let mut found = None;
-        for candidate in window.iter().copied() {
+        for candidate in window.commits.iter().copied() {
             if self.budget.is_exhausted() {
                 return WindowMatch::Budget;
             }
@@ -222,30 +237,35 @@ impl<'s> ResolutionLadder<'s> {
             }
         }
         match found {
+            _ if self.budget.is_exhausted() => WindowMatch::Budget,
             Some(_) => WindowMatch::Exactly,
             None => WindowMatch::None,
         }
     }
 
     /// Returns up to [`CANDIDATE_WINDOW`] commits cached in `self.window`.
-    fn candidate_window(&self) -> Option<Rc<[ObjectId]>> {
+    fn candidate_window(&self) -> Option<CandidateWindow> {
         if let Some(window) = self.window.borrow().as_ref() {
-            return Some(Rc::clone(window));
+            return Some(window.clone());
         }
         let repo = self.snapshot.repo();
         let head = ObjectId::from_hex(self.snapshot.head().as_bytes()).ok()?;
         // The walk follows all parents: a rewrite reachable only through a
         // merge's non-first parent is still a fallback candidate.
         let walk = repo.rev_walk([head]).all().ok()?;
-        let mut window = Vec::new();
-        for info in walk.take(CANDIDATE_WINDOW) {
+        let mut commits = Vec::new();
+        let mut walk = walk.into_iter();
+        for info in walk.by_ref().take(CANDIDATE_WINDOW) {
             if self.budget.is_exhausted() {
                 return None;
             }
-            window.push(info.ok()?.id);
+            commits.push(info.ok()?.id);
         }
-        let window: Rc<[ObjectId]> = window.into();
-        *self.window.borrow_mut() = Some(Rc::clone(&window));
+        let window = CandidateWindow {
+            truncated: commits.len() == CANDIDATE_WINDOW && walk.next().is_some(),
+            commits: commits.into(),
+        };
+        *self.window.borrow_mut() = Some(window.clone());
         Some(window)
     }
 
@@ -262,22 +282,34 @@ impl<'s> ResolutionLadder<'s> {
 
     /// Whether `commit` changes any of `paths` relative to its first
     /// parent, by comparing tree entries at those paths — no content diff.
-    fn commit_touches_paths(&self, commit: ObjectId, paths: &[String]) -> bool {
+    fn commit_touches_paths(
+        &self,
+        commit: ObjectId,
+        paths: &[String],
+    ) -> Result<bool, ResolveObstacle> {
         if paths.is_empty() {
-            return true;
+            return Ok(true);
         }
         let repo = self.snapshot.repo();
         let Ok(commit) = repo.find_commit(commit) else {
-            return false;
+            return Err(ResolveObstacle::UnreadableObject);
         };
         let Ok(tree) = commit.tree() else {
-            return false;
+            return Err(ResolveObstacle::UnreadableObject);
         };
-        let parent_tree = commit
-            .parent_ids()
-            .next()
-            .and_then(|parent| repo.find_commit(parent.detach()).ok())
-            .and_then(|parent| parent.tree().ok());
+        let parent_tree = match commit.parent_ids().next() {
+            Some(parent) => {
+                let Some(tree) = repo
+                    .find_commit(parent.detach())
+                    .ok()
+                    .and_then(|parent| parent.tree().ok())
+                else {
+                    return Err(ResolveObstacle::UnreadableObject);
+                };
+                Some(tree)
+            }
+            None => None,
+        };
         // Mode is part of the comparison, since a diff reports a mode-only
         // change while the entry ids stay equal.
         let entry_at = |tree: &gix::Tree<'_>, path: &str| {
@@ -286,13 +318,21 @@ impl<'s> ResolutionLadder<'s> {
                 .flatten()
                 .map(|entry| (entry.object_id(), entry.mode().kind()))
         };
-        paths.iter().any(|path| {
+        for path in paths {
+            // The loop checks the budget for each path so a large path
+            // list can return `BudgetExhausted`.
+            if self.budget.is_exhausted() {
+                return Err(ResolveObstacle::BudgetExhausted);
+            }
             let new_entry = entry_at(&tree, path.as_str());
             let old_entry = parent_tree
                 .as_ref()
                 .and_then(|tree| entry_at(tree, path.as_str()));
-            new_entry != old_entry
-        })
+            if new_entry != old_entry {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn is_ancestor_or_equal_oid(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
@@ -328,6 +368,14 @@ impl<'s> ResolutionLadder<'s> {
         }
         Some(bases.iter().any(|base| base.detach() == ancestor))
     }
+}
+
+/// Reachable commits scanned by the fallback rungs. `truncated` records
+/// that more history existed beyond [`CANDIDATE_WINDOW`].
+#[derive(Clone)]
+struct CandidateWindow {
+    commits: Rc<[ObjectId]>,
+    truncated: bool,
 }
 
 /// Candidates that decide a fallback rung: exactly one match resolves,
@@ -394,14 +442,14 @@ fn first_parent_blob_changes(
     budget: &EvalBudget,
 ) -> Result<Option<Vec<gix::object::tree::diff::ChangeDetached>>, ResolveObstacle> {
     let Ok(commit) = repo.find_commit(commit) else {
-        return Ok(None);
+        return Err(ResolveObstacle::UnreadableObject);
     };
     let parents: Vec<_> = commit.parent_ids().collect();
     if parents.len() > 1 {
         return Ok(None);
     }
     let Ok(new_tree) = commit.tree() else {
-        return Ok(None);
+        return Err(ResolveObstacle::UnreadableObject);
     };
     let old_tree = match parents.first() {
         Some(parent) => {
@@ -410,14 +458,14 @@ fn first_parent_blob_changes(
                 .ok()
                 .and_then(|parent| parent.tree().ok())
             else {
-                return Ok(None);
+                return Err(ResolveObstacle::UnreadableObject);
             };
             tree
         }
         None => repo.empty_tree(),
     };
     let Ok(mut platform) = old_tree.changes() else {
-        return Ok(None);
+        return Err(ResolveObstacle::UnreadableObject);
     };
     platform.options(|options| *options = gix::diff::Options::default());
     let mut changes = Vec::new();
@@ -437,7 +485,7 @@ fn first_parent_blob_changes(
         | Err(gix::object::tree::diff::for_each::Error::Diff(
             gix::diff::tree_with_rewrites::Error::ForEach(_),
         )) => Err(ResolveObstacle::BudgetExhausted),
-        Err(_) => Ok(None),
+        Err(_) => Err(ResolveObstacle::UnreadableObject),
     }
 }
 
@@ -545,7 +593,12 @@ fn file_change_hash(
                     // Fixed-width inner digests keep content boundaries
                     // unambiguous.
                     let mut content = Sha256::new();
-                    hash_normalized_content(&mut content, &blob.data);
+                    if is_binary(&blob.data) {
+                        content.update(b"binary\0");
+                        content.update(&blob.data);
+                    } else {
+                        hash_normalized_content(&mut content, &blob.data);
+                    }
                     hash.update(b"blob\0");
                     hash.update(content.finalize());
                 }
@@ -555,6 +608,13 @@ fn file_change_hash(
         hash.update(b"\0");
     }
     Ok(Some(hash.finalize().into()))
+}
+
+/// Git's binary heuristic: a NUL byte within the leading window. Binary
+/// bytes are all data, so whitespace normalization only applies to text.
+fn is_binary(bytes: &[u8]) -> bool {
+    const BINARY_SNIFF_BYTES: usize = 8000;
+    bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0)
 }
 
 /// Feeds `bytes` to `hash` without ASCII whitespace, so formatting-only

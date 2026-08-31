@@ -402,6 +402,51 @@ fn dirty_submodules_fingerprint_their_head() {
     assert_ne!(first.dirty_fingerprint(), second.dirty_fingerprint());
 }
 
+#[cfg(unix)]
+#[test]
+fn assume_valid_mode_changes_alter_the_fingerprint() {
+    use gix::index::entry::Flags;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("trusted.sh", "echo hi\n")],
+        "seed",
+        1,
+    );
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let mut index = fixture.repo.open_index().expect("index opens");
+    let position = index
+        .entry_index_by_path("trusted.sh".into())
+        .expect("entry exists");
+    index.entries_mut()[position].flags |= Flags::ASSUME_VALID;
+    index
+        .write(gix::index::write::Options::default())
+        .expect("index writes");
+
+    let budget = EvalBudget::unbounded();
+    let before = snapshot_checkout(dir.path(), &budget).unwrap();
+
+    // The bytes stay equal; only the executable bit moves.
+    let file = fixture.repo.workdir().unwrap().join("trusted.sh");
+    let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    std::fs::set_permissions(&file, permissions).unwrap();
+
+    let after = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(
+        before.dirty_fingerprint(),
+        after.dirty_fingerprint(),
+        "chmod on an assume-valid file changes the key"
+    );
+}
+
 #[test]
 fn sparse_checkout_state_alters_the_fingerprint() {
     use std::io::Write;

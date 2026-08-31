@@ -327,12 +327,16 @@ fn true_match_outside_the_candidate_window_stays_unresolved() {
     let budget = EvalBudget::unbounded();
     let snapshot = checkout(&fixture, tip);
     let ladder = ResolutionLadder::new(&snapshot, &budget);
-    // The anchor commit is present (topic ref) but unreachable; its true
-    // match sits outside the bounded window, so no rung resolves it and the
-    // ancestry verdict stands.
+    // The truncated reachable history excludes the rewrite, so the miss
+    // is uncertain.
     assert_eq!(
         ladder.evaluate(&reachable_from(anchored, captures)),
-        GitConditionOutcome::DoesNotHold { historical: false }
+        GitConditionOutcome::Uncertain
+    );
+    assert_eq!(
+        ladder.evaluate(&reachable_from(anchored, BTreeMap::new())),
+        GitConditionOutcome::DoesNotHold { historical: false },
+        "without fallback data the truncated window changes nothing"
     );
 }
 
@@ -909,6 +913,28 @@ fn unreadable_candidate_blobs_leave_resolution_uncertain() {
         Err(ResolveObstacle::UnreadableObject),
         "an unavailable blob is an obstacle, not a missing identity"
     );
+}
+
+#[test]
+fn binary_contents_keep_whitespace_in_patch_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let budget = EvalBudget::unbounded();
+
+    // In binary content, whitespace bytes are data.
+    let base_one = commit_snapshot(repo, "x", &[], &[("f.bin", "old")], "base", 1);
+    let with_space = commit_snapshot(repo, "x", &[base_one], &[("f.bin", "\u{0}a b")], "edit", 2);
+    let base_two = commit_snapshot(repo, "y", &[], &[("f.bin", "old")], "base", 3);
+    let without_space = commit_snapshot(repo, "y", &[base_two], &[("f.bin", "\u{0}ab")], "edit", 4);
+
+    let one = compute_patch_id(repo, with_space, &budget)
+        .unwrap()
+        .unwrap();
+    let two = compute_patch_id(repo, without_space, &budget)
+        .unwrap()
+        .unwrap();
+    assert_ne!(one, two, "binary blobs are hashed without normalization");
 }
 
 #[test]
