@@ -67,7 +67,7 @@ rules:
     type: aws_access_key
   upstream_parity: true
 - name: magic-slack-token
-  regex: '\bxox[abeoprsuvc]-[A-Za-z0-9-]{8,}'
+  regex: '\b(?:xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*|xoxb-[0-9]{8,14}-[a-zA-Z0-9]{18,26}|xox[pe](?:-[0-9]{10,13}){3}-[a-zA-Z0-9-]{28,34}|xox[os]-[0-9]+-[0-9]+-[0-9]+-[a-fA-F0-9]+|xox[ar]-(?:[0-9]-)?[0-9a-zA-Z]{8,48}|(?i:xoxe-[0-9]-[A-Z0-9]{146})|(?i:xoxe\.xox[bp]-[0-9]-[A-Z0-9]{163,166}))'
   anchors: [xox]
   radius: 256
   entropy:

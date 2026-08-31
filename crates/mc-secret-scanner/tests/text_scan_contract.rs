@@ -591,11 +591,27 @@ fn slack_validation_rejects_malformed_bodies() {
         "xoxb-not-a-real-token",
         "xoxb-1234567890-not-a-real-token",
         "xoxb-GGGGGGGGGG",
+        "xoxb-1234567890-a",
         "xapp-notadigit-A012345-1234567890-abcdef",
     ] {
         assert!(
             scanner.scan(input).unwrap().findings.is_empty(),
             "{input} was reported as a Slack token"
+        );
+    }
+    // The corpus rule matches the leading `xoxa-abcdefgh` and reports it, so the
+    // overlay must report the same span rather than swallowing the trailing text.
+    let trailing = "xoxa-abcdefgh-not-a-real-token";
+    let findings = scanner.scan(trailing).unwrap().findings;
+    assert!(findings
+        .iter()
+        .any(|finding| finding.rule_id == "magic-slack-token"));
+    for finding in findings {
+        assert_eq!(
+            &trailing[finding.value_span.start()..finding.value_span.end()],
+            "xoxa-abcdefgh",
+            "{} reported past the token shape",
+            finding.rule_id
         );
     }
     // Bodies are joined to their prefix at run time so no line of this file holds
@@ -609,7 +625,6 @@ fn slack_validation_rejects_malformed_bodies() {
         "o-1-22-333-abcdef123456",
         "a-2-abc12345",
         "r-abc12345678",
-        "e-1-ABCDEF0123456789ABCDEF0123456789",
     ] {
         let input = format!("{prefix}{body}");
         assert!(
@@ -621,6 +636,14 @@ fn slack_validation_rejects_malformed_bodies() {
     assert!(
         !scanner.scan(&app).unwrap().findings.is_empty(),
         "{app} stopped reporting"
+    );
+    // slack-config-refresh-token fixes this body at 146 characters.
+    let body: String = "ABCDEF0123456789".repeat(10).chars().take(146).collect();
+    assert_eq!(body.len(), 146);
+    let refresh = format!("{prefix}e-1-{body}");
+    assert!(
+        !scanner.scan(&refresh).unwrap().findings.is_empty(),
+        "the config-refresh shape stopped reporting"
     );
 }
 

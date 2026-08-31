@@ -126,6 +126,7 @@ fn evaluate_candidate(
     if value_match.is_empty() {
         return Ok(None);
     }
+    let value_match = unquoted(rule, captures, value_match);
     let key_match = match rule.declaration.key_group.as_deref() {
         Some(name) => match captures.name(name) {
             Some(key) => Some(key),
@@ -302,6 +303,32 @@ fn evaluate_candidate(
 }
 
 // Unnamed captures hold secrets; named captures mark header fields. Ignore named captures so header-only rules return their whole match.
+// Fallback rules report an unnamed capture nested inside matching shell quotes; declared groups take precedence.
+fn unquoted<'a>(
+    rule: &Rule,
+    captures: &Captures<'a>,
+    selected: regex::bytes::Match<'a>,
+) -> regex::bytes::Match<'a> {
+    if rule.declaration.value_group.is_some() || rule.declaration.secret_group.is_some() {
+        return selected;
+    }
+    let bytes = selected.as_bytes();
+    let quoted = bytes.len() >= 2
+        && matches!(bytes[0], b'\'' | b'"' | b'`')
+        && bytes[bytes.len() - 1] == bytes[0];
+    if !quoted {
+        return selected;
+    }
+    rule.regex
+        .capture_names()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, name)| name.is_none())
+        .filter_map(|(index, _)| captures.get(index))
+        .find(|inner| inner.start() == selected.start() + 1 && inner.end() == selected.end() - 1)
+        .unwrap_or(selected)
+}
+
 fn first_unnamed_capture<'a>(
     rule: &Rule,
     captures: &Captures<'a>,
@@ -437,9 +464,25 @@ fn token_matches_key_name(token: &[u8], name: &[u8]) -> bool {
     };
     prefix_len > 0
         && token[prefix_len..].eq_ignore_ascii_case(name)
-        && KEY_QUALIFIERS
-            .iter()
-            .any(|qualifier| token[..prefix_len].eq_ignore_ascii_case(qualifier))
+        && prefix_is_qualifiers(&token[..prefix_len])
+}
+
+// One undelimited identifier can stack qualifiers, as `AWSSECRETACCESSKEY` stacks three, so the prefix is decomposed rather than compared whole.
+fn prefix_is_qualifiers(prefix: &[u8]) -> bool {
+    let mut reachable = vec![false; prefix.len() + 1];
+    reachable[0] = true;
+    for start in 0..prefix.len() {
+        if !reachable[start] {
+            continue;
+        }
+        for qualifier in KEY_QUALIFIERS {
+            let end = start + qualifier.len();
+            if end <= prefix.len() && prefix[start..end].eq_ignore_ascii_case(qualifier) {
+                reachable[end] = true;
+            }
+        }
+    }
+    reachable[prefix.len()]
 }
 
 fn key_tokens(key: &[u8]) -> impl Iterator<Item = &[u8]> {
