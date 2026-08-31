@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "0034e16f91e7481bd59a6e728d125d7c47dbff1844a0466c39f3e9ef8cc62d1c";
+    "30bf56f78179b6a51cc4ad958da2c23e23a2cfd5e1b71153cc1b91c20336678c";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -217,6 +217,8 @@ pub struct EvaluationInputs {
     pub candidate_sensitivity: Sensitivity,
     pub predecessor_sensitivity: Option<Sensitivity>,
     pub approval_valid: bool,
+    /// `approval_valid` alone cannot distinguish an absent approval from a rejected one.
+    pub authority_cited: bool,
     pub event: EventKind,
     pub has_evidence: bool,
 }
@@ -262,11 +264,28 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         .prior
         .map_or(Disposition::Active, |prior| prior.disposition);
     let ceiling = automatic_ceiling(input.source_class, input.taint_class);
+    // An invalid cited approval cannot preserve support above `ceiling`.
+    let carried_effective = if current_effective.rank() > ceiling.rank()
+        && input.authority_cited
+        && !input.approval_valid
+    {
+        ceiling
+    } else {
+        current_effective
+    };
     let (requested, requested_disposition, requested_outcome) = event_effect(input.event, current);
+    let automatic_target_ceiling =
+        event_automatic_ceiling(input.event, input.source_class, input.taint_class);
     let raises_support =
-        event_can_raise_support(input.event) && requested.rank() > current_effective.rank();
-    let requires_approval =
-        raises_support && (!auto_admit_event(input.event) || requested.rank() > ceiling.rank());
+        event_can_raise_support(input.event) && requested.rank() > carried_effective.rank();
+    // Leaving a restricted disposition makes restricted content searchable.
+    let relaxes_restriction = event_sets_disposition(input.event)
+        && disposition_is_restricted(current_disposition)
+        && !disposition_is_restricted(requested_disposition);
+    let requires_approval = (raises_support
+        && (!auto_admit_event(input.event) || requested.rank() > automatic_target_ceiling.rank()))
+        || relaxes_restriction
+        || event_exercises_authority(input.event);
     let denied = requires_approval && !input.approval_valid;
     let disposition = if denied || !event_sets_disposition(input.event) {
         current_disposition
@@ -281,11 +300,13 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
     } else if raises_support && !denied {
         requested
     } else {
-        current_effective
+        carried_effective
     };
     let effective = historical.min(supported);
     let outcome = if denied {
         Outcome::Deny
+    } else if effective.rank() < current_effective.rank() {
+        Outcome::DemoteSupport
     } else if historical.rank() > current.rank() || effective.rank() > current_effective.rank() {
         if input.prior.is_some() {
             Outcome::Promote
@@ -309,13 +330,16 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         )
         .max(input.predecessor_sensitivity.unwrap_or(Sensitivity::Normal));
     let visibility = visibility_row(effective, disposition);
-    let no_op = input.prior.is_some_and(|prior| {
-        prior.historical_maturity == historical
-            && prior.effective_maturity == effective
-            && prior.disposition == disposition
-            && prior.outcome == outcome
-            && prior.sensitivity == sensitivity
-    });
+    // Resulting state does not encode which event was denied, so denied events
+    // are never treated as replays.
+    let no_op = !denied
+        && input.prior.is_some_and(|prior| {
+            prior.historical_maturity == historical
+                && prior.effective_maturity == effective
+                && prior.disposition == disposition
+                && prior.outcome == outcome
+                && prior.sensitivity == sensitivity
+        });
 
     Ok(Evaluation {
         historical_maturity: historical,
@@ -390,6 +414,30 @@ const APPROVAL_OBJECT_PREDICATE: &str = "o.object_kind='decision'
 impl Envelope<'_> {
     #[cfg(feature = "test-support")]
     pub fn insert_admission_observation_for_test(
+        &mut self,
+        object_id: &str,
+        observation_kind: &str,
+        domain_id: &str,
+        source_kind: &str,
+        source_id: &str,
+        source_revision: i64,
+    ) -> Result<(), KernelError> {
+        if let Some(error) = self.already_poisoned() {
+            return Err(error);
+        }
+        let result = self.insert_admission_observation_for_test_inner(
+            object_id,
+            observation_kind,
+            domain_id,
+            source_kind,
+            source_id,
+            source_revision,
+        );
+        self.poison(result)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn insert_admission_observation_for_test_inner(
         &mut self,
         object_id: &str,
         observation_kind: &str,
@@ -736,6 +784,7 @@ impl Envelope<'_> {
             candidate_sensitivity: facts.sensitivity,
             predecessor_sensitivity: None,
             approval_valid,
+            authority_cited: request.event.approval_object_id.is_some(),
             event: if trigger_valid {
                 request.event.kind
             } else {
@@ -814,7 +863,7 @@ impl Envelope<'_> {
                      admission_decision_id,candidate_id,candidate_kind,candidate_payload_digest,
                      subject_object_id,source_kind,source_id,source_revision,source_class,
                      taint_class,maturity,effective_maturity,disposition,visibility,outcome,
-                     sensitivity,policy_revision,reason,evidence_id,approval_object_id,
+                     sensitivity_class,policy_revision,reason,evidence_id,approval_object_id,
                      commit_seq,decided_at
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,
                            ?20,?21,?22)",
@@ -862,6 +911,11 @@ impl Envelope<'_> {
             "sensitivity": prepared.evaluation.sensitivity.as_str(),
             "policy_revision": POLICY_REVISION,
             "trigger_object_id": trigger_object_id,
+            "subject_object_id": subject_object_id,
+            "candidate_id": prepared.facts.candidate_id(),
+            "source_class": prepared.source_class.as_str(),
+            "taint_class": prepared.taint_class.as_str(),
+            "approval_object_id": approval_object_id,
         });
         self.changes.push(PendingChange {
             object: ObjectRow {
@@ -922,6 +976,8 @@ impl SubjectFacts {
     }
 }
 
+/// Maps failed, canceled, abandoned, and lease-expired active staging rows to
+/// [`KernelError::NotFound`] because none can promote a candidate to canonical state.
 fn load_candidate_facts(
     envelope: &Envelope<'_>,
     candidate_id: &str,
@@ -935,8 +991,12 @@ fn load_candidate_facts(
                     c.provenance_witness,c.candidate_kind,c.payload
              FROM candidates c
              JOIN extraction_runs r USING(extraction_run_id)
-             WHERE c.candidate_id=?1",
-                [candidate_id.as_str()],
+             WHERE c.candidate_id=?1
+               AND (c.terminal_state IS NULL OR c.terminal_state='completed')
+               AND (r.terminal_state IS NULL OR r.terminal_state='completed')
+               AND (c.terminal_state IS NOT NULL OR c.lease_expires_at>?2)
+               AND (r.terminal_state IS NOT NULL OR r.lease_expires_at>?2)",
+                params![candidate_id.as_str(), current_time_ms()],
                 |row| {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
@@ -1018,7 +1078,7 @@ fn load_prior_decision(
         .query_row(
             &format!(
                 "SELECT maturity,effective_maturity,disposition,outcome,source_class,
-                        taint_class,sensitivity,policy_revision,approval_object_id
+                        taint_class,sensitivity_class,policy_revision,approval_object_id
                  FROM admission_decisions
                  WHERE {filter} AND commit_seq IS NOT NULL
                  ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
@@ -1084,9 +1144,9 @@ fn sensitivity_from_ledger(value: &str) -> Result<Sensitivity, KernelError> {
     }
 }
 
-/// Enforces [`MAX_APPROVAL_DEPENDENTS`] distinct dependent subjects per
-/// approval object. `subject_object_id` is excluded from the count so repeat
-/// decisions for an existing dependent stay admissible.
+/// Enforces [`MAX_APPROVAL_DEPENDENTS`] distinct dependent subjects per approval object.
+/// Excluding `subject_object_id` keeps repeat decisions for an existing dependent admissible.
+/// Counting only latest decisions releases capacity when a subject moves to another approval.
 fn enforce_approval_dependent_cap(
     envelope: &Envelope<'_>,
     approval_object_id: &str,
@@ -1095,9 +1155,13 @@ fn enforce_approval_dependent_cap(
     let dependents: i64 = envelope
         .tx
         .query_row(
-            "SELECT COUNT(DISTINCT subject_object_id) FROM admission_decisions
-             WHERE approval_object_id=?1 AND subject_object_id IS NOT NULL
-               AND subject_object_id IS NOT ?2",
+            &format!(
+                "SELECT COUNT(DISTINCT a.subject_object_id) FROM admission_decisions a
+                 WHERE a.approval_object_id=?1 AND a.subject_object_id IS NOT NULL
+                   AND a.subject_object_id IS NOT ?2
+                   AND a.commit_seq IS NOT NULL
+                   AND {LATEST_SUBJECT_DECISION_PREDICATE}"
+            ),
             params![approval_object_id, subject_object_id],
             |row| row.get(0),
         )
@@ -1160,6 +1224,7 @@ fn validate_approval(
                        AND a.effective_maturity IN ('approved','enforced')
                        AND a.disposition='active'
                        AND a.visibility='automatic'
+                       AND a.policy_revision={POLICY_REVISION}
                        AND a.commit_seq IS NOT NULL
                        AND {LATEST_SUBJECT_DECISION_PREDICATE}
                  )"
@@ -1279,6 +1344,35 @@ const fn auto_admit_event(event: EventKind) -> bool {
             | EventKind::CodeObserved
             | EventKind::ConfigObserved
     )
+}
+
+const fn event_exercises_authority(event: EventKind) -> bool {
+    matches!(event, EventKind::Approve | EventKind::Enforce)
+}
+
+const fn disposition_is_restricted(disposition: Disposition) -> bool {
+    matches!(
+        disposition,
+        Disposition::Rejected | Disposition::Contradicted | Disposition::Quarantined
+    )
+}
+
+/// A human-authored accepted ADR roots the approval chain and reaches `Approved` automatically.
+/// Every other route to `Approved` cites an existing approval, which is unavailable before the
+/// first one exists.
+const fn event_automatic_ceiling(
+    event: EventKind,
+    source: SourceClass,
+    taint: TaintClass,
+) -> Maturity {
+    let ceiling = automatic_ceiling(source, taint);
+    if matches!(event, EventKind::AcceptedAdr)
+        && matches!(source, SourceClass::ExplicitUser)
+        && matches!(taint, TaintClass::UserExplicit)
+    {
+        return ceiling.max(Maturity::Approved);
+    }
+    ceiling
 }
 
 const fn event_can_raise_support(event: EventKind) -> bool {
@@ -1446,6 +1540,7 @@ mod tests {
                     candidate_sensitivity: Sensitivity::Normal,
                     predecessor_sensitivity: None,
                     approval_valid: false,
+                    authority_cited: false,
                     event: EventKind::CodeObserved,
                     has_evidence: true,
                 };
@@ -1470,6 +1565,7 @@ mod tests {
                 assert_eq!(
                     evaluate_admission(EvaluationInputs {
                         approval_valid: true,
+                        authority_cited: true,
                         ..input
                     })
                     .unwrap()
@@ -1492,6 +1588,7 @@ mod tests {
                 candidate_sensitivity: Sensitivity::Normal,
                 predecessor_sensitivity: None,
                 approval_valid: false,
+                authority_cited: false,
                 event: *event,
                 has_evidence: false,
             });
@@ -1514,6 +1611,7 @@ mod tests {
             candidate_sensitivity: Sensitivity::Normal,
             predecessor_sensitivity: None,
             approval_valid: false,
+            authority_cited: false,
             event: EventKind::Verify,
             has_evidence: true,
         };
@@ -1528,6 +1626,7 @@ mod tests {
         assert_eq!(
             evaluate_admission(EvaluationInputs {
                 approval_valid: true,
+                authority_cited: true,
                 ..base
             })
             .unwrap()
@@ -1553,6 +1652,7 @@ mod tests {
             candidate_sensitivity: Sensitivity::Normal,
             predecessor_sensitivity: None,
             approval_valid: false,
+            authority_cited: false,
             event: EventKind::ApprovalRevoked,
             has_evidence: false,
         })
@@ -1579,6 +1679,7 @@ mod tests {
                 candidate_sensitivity: Sensitivity::Normal,
                 predecessor_sensitivity: None,
                 approval_valid: false,
+                authority_cited: false,
                 event: EventKind::Other,
                 has_evidence: false,
             }
@@ -1606,6 +1707,7 @@ mod tests {
             candidate_sensitivity: Sensitivity::Normal,
             predecessor_sensitivity: None,
             approval_valid: false,
+            authority_cited: false,
             event: EventKind::CodeObserved,
             has_evidence: true,
         })
@@ -1621,6 +1723,7 @@ mod tests {
                 candidate_sensitivity: Sensitivity::Normal,
                 predecessor_sensitivity: None,
                 approval_valid: false,
+                authority_cited: false,
                 event: EventKind::Other,
                 has_evidence: false,
             }),
@@ -1642,6 +1745,7 @@ mod tests {
             candidate_sensitivity: Sensitivity::Normal,
             predecessor_sensitivity: None,
             approval_valid: false,
+            authority_cited: false,
             event: EventKind::Quarantine,
             has_evidence: false,
         })
@@ -1691,11 +1795,173 @@ mod tests {
                 candidate_sensitivity: Sensitivity::Normal,
                 predecessor_sensitivity: None,
                 approval_valid: false,
+                authority_cited: false,
                 event: EventKind::Other,
                 has_evidence: false,
             })
             .unwrap();
             assert!(result.sensitivity >= Sensitivity::Sensitive);
+        }
+    }
+
+    /// Prior state for a subject that an approval lifted above its automatic ceiling.
+    fn approved_prior() -> PriorDecision {
+        PriorDecision {
+            historical_maturity: Maturity::Approved,
+            effective_maturity: Maturity::Approved,
+            disposition: Disposition::Active,
+            outcome: Outcome::Promote,
+            source_class: SourceClass::TrustedLocalCode,
+            taint_class: TaintClass::CurrentCode,
+            sensitivity: Sensitivity::Normal,
+        }
+    }
+
+    fn trusted_code_input(event: EventKind) -> EvaluationInputs {
+        EvaluationInputs {
+            source_class: SourceClass::TrustedLocalCode,
+            taint_class: TaintClass::CurrentCode,
+            prior: None,
+            candidate_sensitivity: Sensitivity::Normal,
+            predecessor_sensitivity: None,
+            approval_valid: false,
+            authority_cited: false,
+            event,
+            has_evidence: false,
+        }
+    }
+
+    #[test]
+    fn an_accepted_adr_roots_authority_only_from_an_explicit_user() {
+        let rooted = evaluate_admission(EvaluationInputs {
+            source_class: SourceClass::ExplicitUser,
+            taint_class: TaintClass::UserExplicit,
+            ..trusted_code_input(EventKind::AcceptedAdr)
+        })
+        .unwrap();
+        assert_eq!(rooted.effective_maturity.get(), Maturity::Approved);
+        assert_eq!(rooted.outcome, Outcome::Admit);
+        assert_eq!(rooted.visibility, VisibilityRow::Automatic);
+
+        // Only ExplicitUser/UserExplicit roots authority for an accepted ADR.
+        for (source_class, taint_class) in [
+            (SourceClass::ExplicitUser, TaintClass::UserInferred),
+            (SourceClass::TrustedLocalCode, TaintClass::CurrentCode),
+            (SourceClass::ModelInference, TaintClass::AssistantInference),
+        ] {
+            let denied = evaluate_admission(EvaluationInputs {
+                source_class,
+                taint_class,
+                ..trusted_code_input(EventKind::AcceptedAdr)
+            })
+            .unwrap();
+            assert_eq!(denied.outcome, Outcome::Deny, "{source_class:?}");
+            assert!(
+                denied.effective_maturity.get().rank() < Maturity::Approved.rank(),
+                "{source_class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaving_a_restricted_disposition_requires_authority() {
+        for restricted in [
+            Disposition::Rejected,
+            Disposition::Contradicted,
+            Disposition::Quarantined,
+        ] {
+            for event in [EventKind::MarkStale, EventKind::MarkDisputed] {
+                let prior = PriorDecision {
+                    disposition: restricted,
+                    ..approved_prior()
+                };
+                let input = EvaluationInputs {
+                    prior: Some(prior),
+                    ..trusted_code_input(event)
+                };
+                let denied = evaluate_admission(input).unwrap();
+                assert_eq!(denied.disposition, restricted, "{restricted:?}/{event:?}");
+                assert_eq!(denied.outcome, Outcome::Deny, "{restricted:?}/{event:?}");
+                assert!(!denied.no_op, "{restricted:?}/{event:?}");
+
+                let authorized = evaluate_admission(EvaluationInputs {
+                    approval_valid: true,
+                    authority_cited: true,
+                    ..input
+                })
+                .unwrap();
+                assert_ne!(
+                    authorized.disposition, restricted,
+                    "{restricted:?}/{event:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_authority_event_on_a_held_rung_is_denied_not_replayed() {
+        for event in [EventKind::Approve, EventKind::Enforce] {
+            let unauthorized = evaluate_admission(EvaluationInputs {
+                prior: Some(approved_prior()),
+                authority_cited: true,
+                has_evidence: true,
+                ..trusted_code_input(event)
+            })
+            .unwrap();
+            assert_eq!(unauthorized.outcome, Outcome::Deny, "{event:?}");
+            assert!(!unauthorized.no_op, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn revoked_authority_cannot_carry_support_above_the_automatic_ceiling() {
+        let input = EvaluationInputs {
+            prior: Some(approved_prior()),
+            authority_cited: true,
+            ..trusted_code_input(EventKind::CodeObserved)
+        };
+        let demoted = evaluate_admission(input).unwrap();
+        assert_eq!(demoted.historical_maturity, Maturity::Approved);
+        assert_eq!(demoted.effective_maturity.get(), Maturity::Verified);
+        assert_eq!(demoted.outcome, Outcome::DemoteSupport);
+        assert!(!demoted.no_op);
+
+        let retained = evaluate_admission(EvaluationInputs {
+            approval_valid: true,
+            ..input
+        })
+        .unwrap();
+        assert_eq!(retained.effective_maturity.get(), Maturity::Approved);
+
+        let uncited = evaluate_admission(EvaluationInputs {
+            prior: Some(PriorDecision {
+                historical_maturity: Maturity::Verified,
+                effective_maturity: Maturity::Verified,
+                ..approved_prior()
+            }),
+            ..trusted_code_input(EventKind::CodeObserved)
+        })
+        .unwrap();
+        assert_eq!(uncited.effective_maturity.get(), Maturity::Verified);
+    }
+
+    #[test]
+    fn distinct_denied_events_are_each_recorded() {
+        let prior = PriorDecision {
+            historical_maturity: Maturity::Candidate,
+            effective_maturity: Maturity::Candidate,
+            outcome: Outcome::Deny,
+            ..approved_prior()
+        };
+        for event in [EventKind::Corroborate, EventKind::Verify] {
+            let denied = evaluate_admission(EvaluationInputs {
+                prior: Some(prior),
+                ..trusted_code_input(event)
+            })
+            .unwrap();
+            assert_eq!(denied.outcome, Outcome::Deny, "{event:?}");
+            assert_eq!(denied.effective_maturity.get(), Maturity::Candidate);
+            assert!(!denied.no_op, "{event:?}");
         }
     }
 

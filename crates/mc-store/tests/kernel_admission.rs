@@ -3,7 +3,7 @@
 use mc_store::kernel::{
     AdmissionDomainSpec, AdmissionEvent, AdmissionRequest, CommitIntent, DomainSpec, EventKind,
     KernelError, KernelStore, Maturity, RepositoryProvenance, Sensitivity, SourceClass,
-    StagingCandidateSpec, TaintClass,
+    StagingCandidateSpec, StagingTerminalState, TaintClass,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -133,7 +133,7 @@ fn seed_approval(root: &std::path::Path) {
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
                  source_class,taint_class,maturity,effective_maturity,disposition,visibility,
-                 outcome,sensitivity,policy_revision,reason,commit_seq,decided_at
+                 outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
              ) VALUES (
                  'approval-admission','approval','fixture','approval',1,'explicit_user',
                  'user_explicit','approved','approved','active','automatic','admit','normal',
@@ -162,7 +162,7 @@ fn seed_dependent_approval(root: &std::path::Path) {
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
                  source_class,taint_class,maturity,effective_maturity,disposition,visibility,
-                 outcome,sensitivity,policy_revision,reason,approval_object_id,commit_seq,
+                 outcome,sensitivity_class,policy_revision,reason,approval_object_id,commit_seq,
                  decided_at
              ) VALUES (
                  'approval-b-admission','approval-b','fixture','approval-b',1,'explicit_user',
@@ -1067,7 +1067,7 @@ fn same_envelope_subject_decision_after_admission_uses_the_recorded_prior() {
         inspect(
             directory.path(),
             "SELECT COUNT(*) FROM admission_decisions
-             WHERE subject_object_id='object' AND sensitivity='secret'"
+             WHERE subject_object_id='object' AND sensitivity_class='secret'"
         ),
         0
     );
@@ -1159,7 +1159,7 @@ fn approval_dependent_capacity_blocks_new_grants_and_keeps_revocation_possible()
                 "INSERT INTO admission_decisions(
                      admission_decision_id,subject_object_id,source_kind,source_id,
                      source_revision,source_class,taint_class,maturity,effective_maturity,
-                     disposition,visibility,outcome,sensitivity,policy_revision,reason,
+                     disposition,visibility,outcome,sensitivity_class,policy_revision,reason,
                      approval_object_id,commit_seq,decided_at
                  ) VALUES (?1,?2,'fixture',?2,1,'model_inference','assistant_inference',
                            'verified','verified','active','explicit_labeled','promote',
@@ -1200,6 +1200,41 @@ fn approval_dependent_capacity_blocks_new_grants_and_keeps_revocation_possible()
         })
         .unwrap_err();
     assert_eq!(error, KernelError::AdmissionPolicy);
+
+    // A dependent whose latest decision no longer cites the approval releases its
+    // slot, so obsolete ledger history cannot exhaust a live approval forever.
+    drop(store);
+    {
+        let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        connection
+            .execute(
+                "INSERT INTO admission_decisions(
+                     admission_decision_id,subject_object_id,source_kind,source_id,
+                     source_revision,source_class,taint_class,maturity,effective_maturity,
+                     disposition,visibility,outcome,sensitivity_class,policy_revision,reason,
+                     commit_seq,decided_at
+                 ) VALUES ('admission-0000-moved','dependent-0000','fixture','dependent-0000',
+                           1,'model_inference','assistant_inference','verified','verified',
+                           'active','explicit_labeled','promote','normal',1,'moved on',1,2)",
+                [],
+            )
+            .unwrap();
+    }
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("overflow-after-release"), |envelope| {
+            envelope.admit_domain_candidate(
+                blocked,
+                AdmissionDomainSpec {
+                    domain_id: "domain-overflow".to_string(),
+                    object_id: "object-overflow".to_string(),
+                    name: "name-overflow".to_string(),
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
 
     store
         .commit(intent("revoke-at-capacity"), |envelope| {
@@ -1280,7 +1315,10 @@ fn unknown_ledger_vocabulary_is_refused_not_defaulted() {
     drop(store);
     Connection::open(directory.path().join("core.sqlite"))
         .unwrap()
-        .execute("UPDATE admission_decisions SET sensitivity='mystery'", [])
+        .execute(
+            "UPDATE admission_decisions SET sensitivity_class='mystery'",
+            [],
+        )
         .unwrap();
     let store = KernelStore::open(directory.path()).unwrap();
     let error = store
@@ -1290,4 +1328,319 @@ fn unknown_ledger_vocabulary_is_refused_not_defaulted() {
         })
         .unwrap_err();
     assert_eq!(error, KernelError::AdmissionPolicy);
+}
+
+/// Stages `candidate_id` and registers `kind` observation for its source at `revision`.
+fn stage_with_observation(
+    store: &KernelStore,
+    candidate_id: &str,
+    kind: &str,
+    revision: i64,
+    key: &str,
+) {
+    stage(store, candidate_id);
+    store
+        .commit(intent(key), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: format!("trigger-{candidate_id}"),
+                object_id: format!("trigger-object-{candidate_id}"),
+                name: format!("trigger {candidate_id}"),
+                source_kind: "fixture".to_string(),
+                source_id: format!("trigger-{candidate_id}"),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            envelope.insert_admission_observation_for_test(
+                &format!("observation-{candidate_id}"),
+                kind,
+                &format!("trigger-{candidate_id}"),
+                "repo",
+                &format!("source-{candidate_id}"),
+                revision,
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
+}
+
+fn admit(store: &KernelStore, request: AdmissionRequest, candidate_id: &str, key: &str) -> String {
+    let outcome = std::cell::RefCell::new(String::new());
+    store
+        .commit(intent(key), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                request.clone(),
+                AdmissionDomainSpec {
+                    domain_id: format!("domain-{candidate_id}"),
+                    object_id: format!("object-{candidate_id}"),
+                    name: format!("name-{candidate_id}"),
+                },
+            )?;
+            *outcome.borrow_mut() = decision.outcome.as_str().to_string();
+            Ok(String::new())
+        })
+        .unwrap();
+    outcome.into_inner()
+}
+
+#[test]
+fn a_config_observation_authorizes_only_a_config_event() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "config", "config_present", 1, "config-trigger");
+
+    // A `CodeObserved` event demands `code_present`, so a config observation cannot carry it.
+    let mut mismatched = request("config");
+    mismatched.taint_class = Some(TaintClass::CurrentConfig);
+    assert_eq!(
+        admit(&store, mismatched, "config", "config-as-code"),
+        "deny"
+    );
+
+    let mut matched = request("config");
+    matched.taint_class = Some(TaintClass::CurrentConfig);
+    matched.event.kind = EventKind::ConfigObserved;
+    assert_eq!(
+        admit(&store, matched, "config", "config-as-config"),
+        "promote"
+    );
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT effective_maturity FROM admission_decisions
+             WHERE subject_object_id='object-config'"
+        ),
+        "verified"
+    );
+}
+
+#[test]
+fn an_observation_at_another_source_revision_cannot_authorize() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    // `stage` pins the candidate at revision 1; the observation records revision 2.
+    stage_with_observation(&store, "skewed", "code_present", 2, "skewed-trigger");
+    assert_eq!(admit(&store, request("skewed"), "skewed", "skewed"), "deny");
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='object-skewed'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn an_invalidated_observation_cannot_authorize() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "stale-obs", "code_present", 1, "stale-obs-trigger");
+    // `invalidated_commit_seq` must reference a commit later than the observation's own.
+    store
+        .commit(intent("stale-obs-later-commit"), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "later".to_string(),
+                object_id: "later-object".to_string(),
+                name: "later".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "later".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE observations
+             SET invalidated_commit_seq=(SELECT MAX(commit_seq) FROM commit_log)
+             WHERE observation_id='observation-stale-obs'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        admit(&store, request("stale-obs"), "stale-obs", "stale-obs"),
+        "deny"
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM domains WHERE domain_id='domain-stale-obs'"
+        ),
+        0
+    );
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap()
+}
+
+/// `abandoned` is reached only by the lease sweep, so it has no `StagingTerminalState`.
+#[derive(Debug, Clone, Copy)]
+enum RunEnd {
+    Terminal(StagingTerminalState),
+    LeaseExpiry,
+}
+
+#[test]
+fn a_candidate_from_a_terminated_run_cannot_reach_canonical_state() {
+    for end in [
+        RunEnd::Terminal(StagingTerminalState::Failed),
+        RunEnd::Terminal(StagingTerminalState::Canceled),
+        RunEnd::LeaseExpiry,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KernelStore::open(directory.path()).unwrap();
+        stage_with_observation(&store, "doomed", "code_present", 1, "doomed-trigger");
+        match end {
+            RunEnd::Terminal(terminal) => {
+                store
+                    .finish_staging_run("run-doomed", terminal, now_ms() + 1_000)
+                    .unwrap();
+            }
+            RunEnd::LeaseExpiry => {
+                assert_eq!(
+                    store
+                        .abandon_expired_staging_runs(now_ms() + 120_000)
+                        .unwrap(),
+                    1
+                );
+            }
+        }
+
+        let error = store
+            .commit(intent("doomed"), |envelope| {
+                envelope.admit_domain_candidate(
+                    request("doomed"),
+                    AdmissionDomainSpec {
+                        domain_id: "domain-doomed".to_string(),
+                        object_id: "object-doomed".to_string(),
+                        name: "name-doomed".to_string(),
+                    },
+                )?;
+                Ok(String::new())
+            })
+            .unwrap_err();
+        assert!(matches!(error, KernelError::NotFound), "{end:?}");
+        assert_eq!(
+            inspect(directory.path(), "SELECT COUNT(*) FROM admission_decisions"),
+            0,
+            "{end:?}"
+        );
+    }
+}
+
+#[test]
+fn an_approval_from_another_policy_revision_cannot_authorize() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE admission_decisions SET policy_revision=2
+             WHERE admission_decision_id='approval-admission'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    stage(&store, "revision-skew");
+    let mut approved = request("revision-skew");
+    approved.event.kind = EventKind::Approve;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("approval".to_string());
+    assert_eq!(
+        admit(&store, approved, "revision-skew", "revision-skew"),
+        "deny"
+    );
+}
+
+#[test]
+fn revoking_an_approval_demotes_a_candidate_promoted_before_materialization() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "early", "code_present", 1, "early-trigger");
+
+    // The approval promotes the candidate while it is still unmaterialized, so the
+    // ledger row carries `candidate_id` and no `subject_object_id`.
+    let mut approved = request("early");
+    approved.event.kind = EventKind::Approve;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("approval".to_string());
+    store
+        .commit(intent("promote-early"), |envelope| {
+            let decision = envelope.record_admission(approved)?.unwrap();
+            assert_eq!(decision.effective_maturity, Maturity::Approved);
+            Ok(String::new())
+        })
+        .unwrap();
+
+    store
+        .commit(intent("revoke-early"), |envelope| {
+            envelope.revoke_approval("approval", "authority withdrawn")?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // Materialization after revocation keeps the historical rung but cannot
+    // publish support the revoked approval no longer grants.
+    store
+        .commit(intent("materialize-early"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                request("early"),
+                AdmissionDomainSpec {
+                    domain_id: "domain-early".to_string(),
+                    object_id: "object-early".to_string(),
+                    name: "name-early".to_string(),
+                },
+            )?;
+            assert_eq!(decision.historical_maturity, Maturity::Approved);
+            assert_eq!(decision.effective_maturity, Maturity::Verified);
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT effective_maturity FROM admission_decisions
+             WHERE subject_object_id='object-early'"
+        ),
+        "verified"
+    );
+}
+
+#[test]
+fn an_admission_event_carries_the_subject_it_changed() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "traced", "code_present", 1, "traced-trigger");
+    assert_eq!(
+        admit(&store, request("traced"), "traced", "traced"),
+        "admit"
+    );
+
+    // `change_event` records the projector payload; `outbox` carries the same bytes.
+    for table in ["change_event", "outbox"] {
+        let payload = inspect_text(
+            directory.path(),
+            &format!(
+                "SELECT CAST(payload AS TEXT) FROM {table}
+                 WHERE CAST(payload AS TEXT) LIKE '%\"admission_decision\"%'"
+            ),
+        );
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let audit = &payload["audit"];
+        assert_eq!(audit["subject_object_id"], "object-traced", "{table}");
+        assert_eq!(audit["candidate_id"], "traced", "{table}");
+        assert_eq!(audit["source_class"], "trusted_local_code", "{table}");
+    }
 }
