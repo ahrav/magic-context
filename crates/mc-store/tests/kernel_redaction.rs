@@ -845,3 +845,43 @@ fn a_changed_candidate_kind_is_not_an_idempotent_replay() {
         "observation"
     );
 }
+
+#[test]
+fn the_legacy_rewrite_commits_in_batches_past_one_batch_size() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    for index in 0..300 {
+        let mut spec = shared_run_candidate(&format!("candidate-{index}"), 1);
+        spec.payload = format!("clean-{index}");
+        store.stage_candidate(spec).unwrap();
+    }
+    drop(store);
+
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            r#"UPDATE candidates
+               SET redaction_metadata=CAST('{"request_digest":"deadbeefdeadbeef","detections":[]}' AS BLOB)"#,
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let _store = KernelStore::open(directory.path()).unwrap();
+    let remaining: i64 = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT COUNT(*) FROM candidates
+         WHERE substr(CAST(redaction_metadata AS TEXT),1,1)='{'",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "every legacy blob must be rewritten across batches, not just the first"
+    );
+}

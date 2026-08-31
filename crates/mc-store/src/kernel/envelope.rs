@@ -1350,38 +1350,70 @@ fn legacy_detections(metadata: &[u8]) -> Option<Vec<serde_json::Value>> {
 }
 
 /// Rewrites any candidate metadata still carrying the parent build's digest, which is an offline verifier for the redacted payload.
+///
+/// `candidates` is bounded only by retention, so the rewrite runs in committed
+/// batches rather than loading the table into one transaction. `secure_delete`
+/// zeroes the freed pages and the WAL is truncated afterwards, which shrinks the
+/// residue but does not by itself prove the old bytes are unrecoverable.
 pub(super) fn strip_legacy_candidate_verifiers(
     conn: &mut rusqlite::Connection,
 ) -> Result<usize, KernelError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
+    const BATCH: usize = 256;
+    let restore_secure_delete: i64 = conn
+        .query_row("PRAGMA secure_delete", [], |row| row.get(0))
         .map_err(map_sqlite)?;
-    let mut statement = tx
-        .prepare(
-            "SELECT candidate_id,redaction_metadata FROM candidates
-             WHERE substr(CAST(redaction_metadata AS TEXT),1,1)='{'",
-        )
+    conn.pragma_update(None, "secure_delete", "ON")
         .map_err(map_sqlite)?;
-    let legacy = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .map_err(map_sqlite)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(map_sqlite)?;
-    drop(statement);
     let mut rewritten = 0;
-    for (candidate_id, metadata) in legacy {
-        let detections = legacy_detections(&metadata).unwrap_or_default();
-        let replacement = serde_json::to_vec(&detections).map_err(|_| KernelError::Io)?;
-        tx.execute(
-            "UPDATE candidates SET redaction_metadata=?1 WHERE candidate_id=?2",
-            params![replacement, candidate_id],
-        )
-        .map_err(map_sqlite)?;
-        rewritten += 1;
+    loop {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite)?;
+        let mut statement = tx
+            .prepare(
+                "SELECT candidate_id,redaction_metadata FROM candidates
+                 WHERE substr(CAST(redaction_metadata AS TEXT),1,1)='{'
+                 LIMIT ?1",
+            )
+            .map_err(map_sqlite)?;
+        let batch = statement
+            .query_map([i64::try_from(BATCH).unwrap_or(i64::MAX)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(map_sqlite)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(map_sqlite)?;
+        drop(statement);
+        if batch.is_empty() {
+            tx.commit().map_err(map_sqlite)?;
+            break;
+        }
+        for (candidate_id, metadata) in &batch {
+            let detections = legacy_detections(metadata).unwrap_or_default();
+            let replacement = serde_json::to_vec(&detections).map_err(|_| KernelError::Io)?;
+            tx.execute(
+                "UPDATE candidates SET redaction_metadata=?1 WHERE candidate_id=?2",
+                params![replacement, candidate_id],
+            )
+            .map_err(map_sqlite)?;
+        }
+        rewritten += batch.len();
+        tx.commit().map_err(map_sqlite)?;
     }
-    tx.commit().map_err(map_sqlite)?;
+    if rewritten > 0 {
+        conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")
+            .map_err(map_sqlite)?;
+    }
+    conn.pragma_update(
+        None,
+        "secure_delete",
+        if restore_secure_delete == 0 {
+            "OFF"
+        } else {
+            "ON"
+        },
+    )
+    .map_err(map_sqlite)?;
     Ok(rewritten)
 }
 
