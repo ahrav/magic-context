@@ -63,9 +63,14 @@ pub struct BackupRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupManifest {
     pub captured_commit_seq: i64,
+    /// Evidence active at `captured_commit_seq`. Rows invalidated earlier are in the
+    /// artifact but are neither listed nor pinned.
     pub evidence_refs: Vec<String>,
     pub max_sensitivity: Sensitivity,
     pub capture_pin_id: Option<String>,
+    /// The requested directory joined with the published name. Publication goes
+    /// through a validated descriptor, so this resolves to the artifact unless the
+    /// destination directory is replaced concurrently.
     pub destination_path: PathBuf,
 }
 
