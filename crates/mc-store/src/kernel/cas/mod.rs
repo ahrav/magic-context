@@ -252,13 +252,6 @@ pub(super) fn prepare_layout(root: &Path) -> Result<PathBuf, KernelError> {
 }
 
 impl KernelStore {
-    pub(super) fn artifact_object_path(&self, digest: &str) -> PathBuf {
-        self.artifacts_path
-            .join("objects")
-            .join(&digest[..2])
-            .join(&digest[2..])
-    }
-
     /// A same-UID process can replace `artifacts` or `objects` with a symlink
     /// after the store is open, so neither is trusted as a path component.
     pub(super) fn open_objects_directory(&self) -> Result<File, StorageError> {

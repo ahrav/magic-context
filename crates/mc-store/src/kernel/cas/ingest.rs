@@ -1,7 +1,8 @@
-use std::fs::{self, File};
+use std::fs::File;
 
 use mc_core::redaction::Detection;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rustix::fs::{self as rfs, AtFlags, OFlags};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -247,7 +248,7 @@ impl KernelStore {
         let mut writer = self
             .lock_writer()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-        self.check_budget(&prepared.digest, byte_length)?;
+        self.check_budget(&objects, &prepared.digest, byte_length)?;
         let shard = open_or_create_secure_directory(&objects, &prepared.digest[..2])
             .map_err(|error| self.map_storage_error(error))?;
         let now = current_time_ms();
@@ -431,11 +432,14 @@ impl KernelStore {
         }
     }
 
-    fn check_budget(&self, digest: &str, byte_length: u64) -> Result<(), ArtifactError> {
-        let usage = regular_file_bytes(&self.artifacts_path.join("objects"))
-            .map_err(|error| self.map_storage_error(error))?;
-        let already_present = fs::symlink_metadata(self.artifact_object_path(digest))
-            .is_ok_and(|metadata| metadata.file_type().is_file());
+    fn check_budget(
+        &self,
+        objects: &File,
+        digest: &str,
+        byte_length: u64,
+    ) -> Result<(), ArtifactError> {
+        let usage = regular_file_bytes(objects).map_err(|error| self.map_storage_error(error))?;
+        let already_present = object_is_present(objects, digest);
         let projected = usage.saturating_add(if already_present { 0 } else { byte_length });
         if projected > self.artifact_cap {
             return Err(ArtifactError::capacity(usage, self.artifact_cap));
@@ -789,27 +793,69 @@ fn verify_object(shard: &File, name: &str, digest: &str) -> Result<(), ArtifactE
     Ok(())
 }
 
-fn regular_file_bytes(objects: &std::path::Path) -> Result<u64, StorageError> {
+fn storage_errno(source: rustix::io::Errno) -> StorageError {
+    classify_io(std::io::Error::from(source))
+}
+
+fn stat_bytes(stat: &rfs::Stat) -> u64 {
+    u64::try_from(stat.st_size).unwrap_or(0)
+}
+
+fn is_dot_entry(name: &std::ffi::CStr) -> bool {
+    matches!(name.to_bytes(), b"." | b"..")
+}
+
+fn open_shard_nofollow(objects: &File, name: impl rustix::path::Arg) -> Result<File, StorageError> {
+    rfs::openat(
+        objects,
+        name,
+        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rfs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(storage_errno)
+}
+
+fn regular_file_bytes(objects: &File) -> Result<u64, StorageError> {
     let mut bytes = 0_u64;
-    for entry in fs::read_dir(objects).map_err(classify_io)? {
-        let entry = entry.map_err(classify_io)?;
-        let metadata = entry.metadata().map_err(classify_io)?;
-        if metadata.file_type().is_file() {
-            bytes = bytes.saturating_add(metadata.len());
+    for entry in rfs::Dir::read_from(objects).map_err(storage_errno)? {
+        let entry = entry.map_err(storage_errno)?;
+        let name = entry.file_name();
+        if is_dot_entry(name) {
             continue;
         }
-        if !metadata.file_type().is_dir() {
+        let stat = rfs::statat(objects, name, AtFlags::SYMLINK_NOFOLLOW).map_err(storage_errno)?;
+        let kind = rfs::FileType::from_raw_mode(stat.st_mode);
+        if kind.is_file() {
+            bytes = bytes.saturating_add(stat_bytes(&stat));
             continue;
         }
-        for shard_entry in fs::read_dir(entry.path()).map_err(classify_io)? {
-            let shard_entry = shard_entry.map_err(classify_io)?;
-            let shard_metadata = shard_entry.metadata().map_err(classify_io)?;
-            if shard_metadata.file_type().is_file() {
-                bytes = bytes.saturating_add(shard_metadata.len());
+        if !kind.is_dir() {
+            continue;
+        }
+        let shard = open_shard_nofollow(objects, name)?;
+        for shard_entry in rfs::Dir::read_from(&shard).map_err(storage_errno)? {
+            let shard_entry = shard_entry.map_err(storage_errno)?;
+            let shard_name = shard_entry.file_name();
+            if is_dot_entry(shard_name) {
+                continue;
+            }
+            let shard_stat = rfs::statat(&shard, shard_name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(storage_errno)?;
+            if rfs::FileType::from_raw_mode(shard_stat.st_mode).is_file() {
+                bytes = bytes.saturating_add(stat_bytes(&shard_stat));
             }
         }
     }
     Ok(bytes)
+}
+
+fn object_is_present(objects: &File, digest: &str) -> bool {
+    let Ok(shard) = open_shard_nofollow(objects, &digest[..2]) else {
+        return false;
+    };
+    rfs::statat(&shard, &digest[2..], AtFlags::SYMLINK_NOFOLLOW)
+        .is_ok_and(|stat| rfs::FileType::from_raw_mode(stat.st_mode).is_file())
 }
 
 fn detection_metadata(detections: &[Detection]) -> Result<Vec<u8>, ArtifactError> {
