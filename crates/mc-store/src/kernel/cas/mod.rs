@@ -107,6 +107,7 @@ pub enum ArtifactErrorKind {
     CorruptObject,
     ReferenceUnavailable,
     ReferenceCommit,
+    UnredactableSecret,
     InvalidInput,
 }
 
@@ -201,6 +202,8 @@ impl fmt::Display for ArtifactError {
             ArtifactErrorKind::ReferenceCommit => {
                 formatter.write_str("artifact canonical reference commit failed")
             }
+            ArtifactErrorKind::UnredactableSecret => formatter
+                .write_str("artifact payload holds a recognized secret that cannot be redacted"),
             ArtifactErrorKind::InvalidInput => formatter.write_str("artifact input is invalid"),
         }
     }
