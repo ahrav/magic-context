@@ -3,7 +3,7 @@
 use mc_store::kernel::{
     AdmissionDomainSpec, AdmissionEvent, AdmissionRequest, CommitIntent, DomainSpec, EventKind,
     KernelError, KernelStore, Maturity, RepositoryProvenance, Sensitivity, SourceClass,
-    StagingCandidateSpec, StagingTerminalState, TaintClass,
+    StagingCandidateSpec, StagingTerminalState, TaintClass, STAGING_RETENTION_MS,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -1845,10 +1845,10 @@ fn a_revocation_reason_survives_without_dependents() {
         payload["audit"]["approval_object_id"], "approval",
         "{payload}"
     );
-    // The fan-out outcome is reported on the approval's own change, so a truncated
-    // walk is observable rather than silent.
+    // The fan-out outcome is reported on the approval's own change, so demotions it
+    // could not perform are observable rather than silent.
     assert_eq!(payload["audit"]["demoted"], 0, "{payload}");
-    assert_eq!(payload["audit"]["truncated"], false, "{payload}");
+    assert_eq!(payload["audit"]["deferred"], 0, "{payload}");
     assert!(
         payload.to_string().contains("superseded by policy review"),
         "{payload}"
@@ -2135,4 +2135,190 @@ fn a_revoked_root_leaves_no_dependent_approval_able_to_grant() {
         admit(&store, attempted, "post-revoke", "post-revoke"),
         "deny"
     );
+}
+
+#[test]
+fn a_materialization_binding_survives_staging_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "reused", "code_present", 1, "reused-trigger");
+    assert_eq!(
+        admit(&store, request("reused"), "reused", "reused"),
+        "admit"
+    );
+
+    // Retire the run and sweep it past the retention cutoff. `candidate_id` carries
+    // ON DELETE SET NULL, so the sweep erases it from the historical decision.
+    let terminal_at = now_ms() + 1_000;
+    store
+        .finish_staging_run("run-reused", StagingTerminalState::Completed, terminal_at)
+        .unwrap();
+    let mut swept = 0;
+    while store
+        .delete_aged_staging_runs(terminal_at + STAGING_RETENTION_MS)
+        .unwrap()
+        > 0
+    {
+        swept += 1;
+        assert!(swept < 10, "the sweep should converge");
+    }
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM admission_decisions WHERE candidate_id IS NULL"
+        ),
+        1,
+        "the sweep must have cleared candidate_id"
+    );
+
+    // Re-staging the same candidate id must not mint a second canonical object.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    let now = now_ms();
+    connection
+        .execute(
+            "INSERT INTO extraction_runs(
+                 extraction_run_id,extractor,source_kind,source_id,source_revision,
+                 sensitivity_class,provenance_witness,redaction_metadata,started_at,
+                 heartbeat_at,lease_expires_at
+             ) VALUES ('run-reused-2','fixture','repo','source-reused',1,'normal',
+                       ?1,X'7b7d',?2,?2,?3)",
+            rusqlite::params![
+                br#"{"kind":"repository","repository_id":"repo","revision":"abc123"}"#.to_vec(),
+                now,
+                now + 600_000
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO candidates(
+                 candidate_id,extraction_run_id,candidate_kind,payload,sensitivity_class,
+                 provenance_witness,redaction_metadata,created_at,heartbeat_at,lease_expires_at
+             ) VALUES ('reused','run-reused-2','domain',?1,'normal',?2,X'7b7d',?3,?3,?4)",
+            rusqlite::params![
+                b"name-reused".to_vec(),
+                br#"{"kind":"repository","repository_id":"repo","revision":"abc123"}"#.to_vec(),
+                now,
+                now + 600_000
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = store
+        .commit(intent("reused-again"), |envelope| {
+            envelope.admit_domain_candidate(
+                request("reused"),
+                AdmissionDomainSpec {
+                    domain_id: "domain-reused-again".to_string(),
+                    object_id: "object-reused-again".to_string(),
+                    name: "name-reused".to_string(),
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(error, KernelError::AdmissionPolicy);
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='object-reused-again'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn revocation_survives_a_dependent_on_a_superseded_policy_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "legacy");
+    let mut promoted = request("legacy");
+    promoted.source_class = Some(SourceClass::ModelInference);
+    promoted.taint_class = Some(TaintClass::AssistantInference);
+    promoted.event.kind = EventKind::Verify;
+    promoted.event.trigger_object_id = None;
+    promoted.event.approval_object_id = Some("approval".to_string());
+    assert_eq!(admit(&store, promoted, "legacy", "legacy"), "admit");
+
+    // Age the dependent's latest decision into a superseded policy revision. It can
+    // no longer be re-evaluated, and must not make the approval unrevokeable.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE admission_decisions SET policy_revision=policy_revision+1
+             WHERE subject_object_id='object-legacy'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    store
+        .commit(intent("revoke-with-legacy"), |envelope| {
+            let decisions = envelope.revoke_approval("approval", "withdrawn")?;
+            assert!(decisions.is_empty(), "{decisions:?}");
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // The root invalidation stands, so the approval cannot authorize anything more.
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry
+             WHERE object_id='approval' AND invalidated_commit_seq IS NOT NULL"
+        ),
+        1
+    );
+    let payload = inspect_text(
+        directory.path(),
+        "SELECT CAST(payload AS TEXT) FROM change_event WHERE change_kind='approval_revoke'",
+    );
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["audit"]["deferred"], 1, "{payload}");
+}
+
+#[test]
+fn an_unvisited_descendant_of_a_revoked_root_grants_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    seed_dependent_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    stage(&store, "orphan");
+    // `invalidated_commit_seq` must exceed the approval's own, so advance the log.
+    store
+        .commit(intent("orphan-advance-log"), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "orphan-advance".to_string(),
+                object_id: "orphan-advance-object".to_string(),
+                name: "orphan advance".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "orphan-advance".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+    // Invalidate the root directly, so no fan-out runs at all. Authority is derived
+    // from the chain, so `approval-b` must lose its grant regardless.
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "UPDATE object_registry
+             SET invalidated_commit_seq=(SELECT MAX(commit_seq) FROM commit_log)
+             WHERE object_id='approval';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut attempted = request("orphan");
+    attempted.source_class = Some(SourceClass::ModelInference);
+    attempted.taint_class = Some(TaintClass::AssistantInference);
+    attempted.event.kind = EventKind::Verify;
+    attempted.event.trigger_object_id = None;
+    attempted.event.approval_object_id = Some("approval-b".to_string());
+    assert_eq!(admit(&store, attempted, "orphan", "orphan"), "deny");
 }

@@ -390,13 +390,6 @@ const MAX_APPROVAL_DEPENDENTS: usize = 1_024;
 /// walk runs in the invalidating transaction.
 const MAX_AUTHORITY_DEMOTIONS: usize = 4_096;
 
-/// Authority-holding dependents one invalidation may demote. Reaching this bound
-/// fails the invalidation, because truncating it would leave an approval that still
-/// grants admissions while its own authority is revoked. Every such dependent is an
-/// accepted decision object, so the bound is not reachable by inflating ordinary
-/// admissions.
-const MAX_AUTHORITY_HOLDER_DEMOTIONS: usize = 1_024;
-
 /// Selects rows of `admission_decisions a` with no later committed decision
 /// for the same subject. `load_prior_decision` expresses this same rule as an
 /// ordered single-row seek; the two formulations must stay equivalent.
@@ -419,6 +412,33 @@ const APPROVAL_OBJECT_PREDICATE: &str = "o.object_kind='decision'
    AND o.invalidated_commit_seq IS NULL
    AND d.decision_kind='adr_accepted'
    AND d.invalidated_commit_seq IS NULL";
+
+/// Longest authority chain [`validate_approval`] walks. A chain is human-authored
+/// accepted decisions, so real ones are short; the bound only stops a pathological
+/// graph from making validation unbounded.
+const MAX_AUTHORITY_CHAIN_DEPTH: usize = 64;
+
+/// Whether the object named by `?1` qualifies as a live approval in its own right.
+/// Used per chain member, so it takes the id from the enclosing row rather than a
+/// bound parameter.
+fn approval_qualifies_predicate(object_column: &str) -> String {
+    format!(
+        "EXISTS(
+             SELECT 1
+             FROM object_registry o
+             JOIN decisions d ON d.object_id=o.object_id
+             JOIN admission_decisions a ON a.subject_object_id=o.object_id
+             WHERE o.object_id={object_column} AND {APPROVAL_OBJECT_PREDICATE}
+               AND a.taint_class='user_explicit'
+               AND a.effective_maturity IN ('approved','enforced')
+               AND a.disposition='active'
+               AND a.visibility='automatic'
+               AND a.policy_revision={POLICY_REVISION}
+               AND a.commit_seq IS NOT NULL
+               AND {LATEST_SUBJECT_DECISION_PREDICATE}
+         )"
+    )
+}
 
 impl Envelope<'_> {
     #[cfg(feature = "test-support")]
@@ -753,7 +773,7 @@ impl Envelope<'_> {
         });
 
         let audit_position = self.changes.len() - 1;
-        let (decisions, truncated) =
+        let (decisions, deferred) =
             self.demote_authority_dependents(&approval_object_id, reason)?;
         if let Some(audit) = self
             .changes
@@ -761,7 +781,7 @@ impl Envelope<'_> {
             .and_then(|change| change.audit.as_mut())
         {
             audit["demoted"] = serde_json::json!(decisions.len());
-            audit["truncated"] = serde_json::json!(truncated);
+            audit["deferred"] = serde_json::json!(deferred);
         }
         Ok(decisions)
     }
@@ -773,60 +793,45 @@ impl Envelope<'_> {
     /// future admissions but leaves C surfaced, so the closure follows dependents
     /// that are themselves approvals until no live authority remains.
     ///
-    /// `visited` bounds the walk over a cyclic authority graph and each level is
-    /// bounded by [`MAX_APPROVAL_DEPENDENTS`], but neither bounds their product.
+    /// `validate_approval` derives authority from the whole chain, so an unvisited
+    /// descendant of a revoked root already grants nothing. This walk therefore only
+    /// restores visibility, and may stop early without leaving live authority behind.
     ///
-    /// Dependents are therefore split by what their demotion protects.
-    /// [`validate_approval`] judges an approval by its own latest row and does not
-    /// examine its ancestors, so a dependent that still holds authority keeps
-    /// granting admissions until this walk demotes it. Those are demoted in full,
-    /// bounded by [`MAX_AUTHORITY_HOLDER_DEMOTIONS`]; a tree exceeding that bound
-    /// fails rather than leave live authority descending from a revoked root.
-    ///
-    /// Dependents that hold no authority can only lag in visibility, and
-    /// `evaluate_admission` clamps their support at their next decision. Those are
-    /// bounded by [`MAX_AUTHORITY_DEMOTIONS`] and truncated rather than failed,
-    /// because failing would roll back the invalidation that prompted the walk and
-    /// leave the root active for every identical retry. The returned flag reports
-    /// the truncation.
+    /// It never fails. Any error here would roll back the invalidation that prompted
+    /// it, leaving the root active and every identical retry failing on the same
+    /// graph — a permanently unrevokable approval. Dependents it cannot demote are
+    /// counted and reported instead: those past [`MAX_AUTHORITY_DEMOTIONS`], and
+    /// those whose latest decision was written under a superseded policy revision and
+    /// so cannot be re-evaluated under the current one.
     fn demote_authority_dependents(
         &mut self,
         authority_object_id: &str,
         reason: &str,
-    ) -> Result<(Vec<AdmissionDecision>, bool), KernelError> {
+    ) -> Result<(Vec<AdmissionDecision>, usize), KernelError> {
         let mut decisions = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut frontier = vec![authority_object_id.to_string()];
-        let mut authority_holders = 0usize;
-        let mut truncated = false;
+        let mut deferred = 0usize;
         visited.insert(authority_object_id.to_string());
         while let Some(authority) = frontier.pop() {
-            let mut leaves = Vec::new();
             for dependent in load_approval_dependents(self, &authority)? {
                 if !visited.insert(dependent.0.clone()) {
                     continue;
                 }
-                if validate_approval(self, Some(&dependent.0), None)? {
-                    authority_holders += 1;
-                    if authority_holders > MAX_AUTHORITY_HOLDER_DEMOTIONS {
-                        return Err(KernelError::AdmissionPolicy);
-                    }
-                    let subject = dependent.0.clone();
-                    self.demote_one_dependent(dependent, reason, &mut decisions)?;
-                    frontier.push(subject);
-                } else {
-                    leaves.push(dependent);
+                if decisions.len() >= MAX_AUTHORITY_DEMOTIONS
+                    || !dependent_is_current_revision(self, &dependent.0)?
+                {
+                    deferred += 1;
+                    continue;
                 }
-            }
-            for leaf in leaves {
-                if decisions.len() >= MAX_AUTHORITY_DEMOTIONS {
-                    truncated = true;
-                    break;
-                }
-                self.demote_one_dependent(leaf, reason, &mut decisions)?;
+                let subject = dependent.0.clone();
+                self.demote_one_dependent(dependent, reason, &mut decisions)?;
+                // Any dependent may itself have granted authority; a non-approval
+                // simply has no dependents of its own.
+                frontier.push(subject);
             }
         }
-        Ok((decisions, truncated))
+        Ok((decisions, deferred))
     }
 
     fn demote_one_dependent(
@@ -1022,15 +1027,16 @@ impl Envelope<'_> {
         self.tx
             .execute(
                 "INSERT INTO admission_decisions(
-                     admission_decision_id,candidate_id,candidate_kind,candidate_payload_digest,
-                     subject_object_id,source_kind,source_id,source_revision,source_class,
-                     taint_class,event_kind,maturity,effective_maturity,disposition,visibility,
-                     outcome,sensitivity_class,policy_revision,reason,evidence_id,
-                     approval_object_id,commit_seq,decided_at
+                     admission_decision_id,candidate_id,candidate_ref,candidate_kind,
+                     candidate_payload_digest,subject_object_id,source_kind,source_id,
+                     source_revision,source_class,taint_class,event_kind,maturity,
+                     effective_maturity,disposition,visibility,outcome,sensitivity_class,
+                     policy_revision,reason,evidence_id,approval_object_id,commit_seq,decided_at
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,
-                           ?20,?21,?22,?23)",
+                           ?20,?21,?22,?23,?24)",
                 params![
                     admission_decision_id,
+                    prepared.facts.candidate_id(),
                     prepared.facts.candidate_id(),
                     prepared.facts.candidate_kind,
                     candidate_payload_digest,
@@ -1141,9 +1147,11 @@ impl SubjectFacts {
     }
 }
 
-/// A candidate binds to at most one canonical object. Without this a repeat
-/// admission is not a no-op, because the first decision's `admit` outcome differs
-/// from the `promote` a later identical request produces.
+/// A candidate binds to at most one canonical object.
+///
+/// Reads `candidate_ref`, not `candidate_id`: the latter carries `ON DELETE SET NULL`,
+/// so the staging sweep erases it after the retention cutoff and a newly staged
+/// candidate reusing that id would materialize a second object.
 fn candidate_is_materialized(
     envelope: &Envelope<'_>,
     candidate_id: &str,
@@ -1153,7 +1161,7 @@ fn candidate_is_materialized(
         .query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM admission_decisions
-                 WHERE candidate_id=?1 AND subject_object_id IS NOT NULL
+                 WHERE candidate_ref=?1 AND subject_object_id IS NOT NULL
                    AND commit_seq IS NOT NULL
              )",
             [candidate_id],
@@ -1385,6 +1393,31 @@ fn subject_is_accepted_decision(
         .map_err(map_sqlite)
 }
 
+/// Whether `subject_object_id`'s latest decision was written under the current
+/// policy revision. A superseded row cannot be re-evaluated, and erroring on one
+/// would roll back the invalidation that prompted the walk.
+fn dependent_is_current_revision(
+    envelope: &Envelope<'_>,
+    subject_object_id: &str,
+) -> Result<bool, KernelError> {
+    envelope
+        .tx
+        .query_row(
+            &format!(
+                "SELECT EXISTS(
+                     SELECT 1 FROM admission_decisions a
+                     WHERE a.subject_object_id=?1
+                       AND a.commit_seq IS NOT NULL
+                       AND a.policy_revision={POLICY_REVISION}
+                       AND {LATEST_SUBJECT_DECISION_PREDICATE}
+                 )"
+            ),
+            [subject_object_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(map_sqlite)
+}
+
 /// Subjects whose latest decision still cites `approval_object_id`.
 ///
 /// `LIMIT` exceeds [`MAX_APPROVAL_DEPENDENTS`] by one so the caller can distinguish
@@ -1461,24 +1494,33 @@ fn validate_approval(
     if subject_object_id == Some(approval_object_id.as_str()) {
         return Ok(false);
     }
+    // Authority is transitive: an approval promoted by another approval holds no
+    // authority once that ancestor loses its own. Deriving this from the chain makes
+    // validity intrinsic, so revocation's demotion fan-out only has to restore
+    // visibility and may skip work without leaving a live grant behind.
+    let qualifies = approval_qualifies_predicate("chain.object_id");
+    let member_qualifies = approval_qualifies_predicate("member.object_id");
     envelope
         .tx
         .query_row(
             &format!(
-                "SELECT EXISTS(
-                     SELECT 1
-                     FROM object_registry o
-                     JOIN decisions d ON d.object_id=o.object_id
-                     JOIN admission_decisions a ON a.subject_object_id=o.object_id
-                     WHERE o.object_id=?1 AND {APPROVAL_OBJECT_PREDICATE}
-                       AND a.taint_class='user_explicit'
-                       AND a.effective_maturity IN ('approved','enforced')
-                       AND a.disposition='active'
-                       AND a.visibility='automatic'
-                       AND a.policy_revision={POLICY_REVISION}
+                "WITH RECURSIVE chain(object_id,depth) AS (
+                     SELECT ?1,0
+                     UNION
+                     SELECT a.approval_object_id,chain.depth+1
+                     FROM chain
+                     JOIN admission_decisions a ON a.subject_object_id=chain.object_id
+                     WHERE a.approval_object_id IS NOT NULL
                        AND a.commit_seq IS NOT NULL
+                       AND a.policy_revision={POLICY_REVISION}
                        AND {LATEST_SUBJECT_DECISION_PREDICATE}
-                 )"
+                       AND chain.depth<{MAX_AUTHORITY_CHAIN_DEPTH}
+                       AND {qualifies}
+                 )
+                 SELECT (SELECT COUNT(*) FROM chain)<={MAX_AUTHORITY_CHAIN_DEPTH}
+                    AND NOT EXISTS(
+                            SELECT 1 FROM chain member WHERE NOT {member_qualifies}
+                        )"
             ),
             [approval_object_id],
             |row| row.get::<_, bool>(0),

@@ -144,7 +144,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "e201f21ad37285caa6063543386e78fcebbd7d9a7e1ca95a93803ee7e98c9840";
+    "8be766a6b8689629c0d1774c853b918eaf07c64a9d1233b7846ef0120091aa64";
 
 #[test]
 fn cas_control_tables_and_lookup_indexes_are_frozen() {
