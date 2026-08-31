@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "bc2eeb9e60399154fda6092475aadbf65653b25c447ec237c1a64cd018e19b6e";
+    "6ed92732d44bb1079c818a45df24f56421c4cb7af342664fc9e9730766ef35fa";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -569,7 +569,7 @@ impl Envelope<'_> {
     /// Most subjects are not decision objects, and the chain walk cannot make one an
     /// authority. Settling the object kind first keeps the recursive query off the
     /// path of every ordinary admission.
-    fn subject_grants_authority(
+    pub(super) fn subject_grants_authority(
         &self,
         subject_object_id: Option<&str>,
     ) -> Result<bool, KernelError> {
@@ -584,7 +584,7 @@ impl Envelope<'_> {
 
     /// Quarantine, contradiction, rejection, and supersession break an approval's
     /// authority exactly as revocation does, so dependents still citing it follow.
-    fn demote_dependents_if_authority_lost(
+    pub(super) fn demote_dependents_if_authority_lost(
         &mut self,
         subject_object_id: Option<&str>,
         reason: &str,
@@ -991,7 +991,16 @@ impl Envelope<'_> {
             },
             has_evidence: request.event.evidence_id.is_some(),
         })?;
-        let supporting_approval = if approval_valid {
+        // A citation that did not lift support above what the subject already held
+        // contributed nothing, so it must not displace the approval that did. That
+        // holds for a valid citation too: revoking it would otherwise demote a subject
+        // whose real authority is untouched.
+        let prior_effective = prior.map_or(Maturity::Candidate, |prior| prior.effective_maturity);
+        let effective = evaluation.effective_maturity.get();
+        let supplied_support = approval_valid
+            && effective.rank() > prior_effective.rank()
+            && effective.rank() > automatic_ceiling(source_class, taint_class).rank();
+        let supporting_approval = if supplied_support {
             request.event.approval_object_id.clone()
         } else {
             stored
@@ -1288,7 +1297,8 @@ fn load_subject_facts(
         .tx
         .query_row(
             "SELECT domain_id,source_kind,source_id,source_revision,sensitivity_class
-             FROM object_registry WHERE object_id=?1",
+             FROM object_registry
+             WHERE object_id=?1 AND invalidated_commit_seq IS NULL",
             [subject_object_id.as_str()],
             |row| {
                 Ok(SubjectFacts {
@@ -1461,8 +1471,10 @@ fn load_approval_dependents(
         .prepare(&format!(
             "SELECT a.subject_object_id,a.source_class,a.taint_class,a.policy_revision
              FROM admission_decisions a
+             JOIN object_registry o ON o.object_id=a.subject_object_id
              WHERE a.approval_object_id=?1
                AND a.subject_object_id IS NOT NULL
+               AND o.invalidated_commit_seq IS NULL
                AND a.elevated_support=1
                AND a.commit_seq IS NOT NULL
                AND {LATEST_SUBJECT_DECISION_PREDICATE}
@@ -1524,13 +1536,15 @@ fn validate_approval(
         return Ok(false);
     };
     let approval_object_id = identity(approval_object_id)?;
-    if subject_object_id == Some(approval_object_id.as_str()) {
-        return Ok(false);
-    }
     // Authority is transitive: an approval promoted by another approval holds no
     // authority once that ancestor loses its own. Deriving this from the chain makes
     // validity intrinsic, so revocation's demotion fan-out only has to restore
     // visibility and may skip work without leaving a live grant behind.
+    //
+    // The subject is rejected anywhere in that chain, not merely as the approval
+    // itself. Granting from an approval that already descends from the subject would
+    // close a cycle, and the resulting decision would hold a rung no valid authority
+    // supports once the cycle is detected.
     let qualifies = approval_qualifies_predicate("chain.object_id");
     let member_qualifies = approval_qualifies_predicate("member.object_id");
     envelope
@@ -1553,9 +1567,12 @@ fn validate_approval(
                  SELECT (SELECT COUNT(*) FROM chain)<={MAX_AUTHORITY_CHAIN_DEPTH}+1
                     AND NOT EXISTS(
                             SELECT 1 FROM chain member WHERE NOT {member_qualifies}
+                        )
+                    AND NOT EXISTS(
+                            SELECT 1 FROM chain member WHERE member.object_id=?2
                         )"
             ),
-            [approval_object_id],
+            params![approval_object_id, subject_object_id],
             |row| row.get::<_, bool>(0),
         )
         .map_err(map_sqlite)

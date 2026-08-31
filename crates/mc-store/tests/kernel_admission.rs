@@ -2595,14 +2595,15 @@ fn an_inert_citation_does_not_consume_approval_capacity() {
         })
         .unwrap();
 
+    // `approval_object_id` names the approval that supports the decision, so a
+    // citation that supplied nothing does not occupy it.
     assert_eq!(
         inspect(
             directory.path(),
             "SELECT COUNT(*) FROM admission_decisions
-             WHERE subject_object_id='inert-object' AND approval_object_id='approval'"
+             WHERE subject_object_id='inert-object' AND approval_object_id IS NULL"
         ),
-        1,
-        "the citation is still recorded for audit"
+        1
     );
     assert_eq!(
         inspect(
@@ -2610,8 +2611,19 @@ fn an_inert_citation_does_not_consume_approval_capacity() {
             "SELECT elevated_support FROM admission_decisions
              WHERE subject_object_id='inert-object'"
         ),
-        0,
-        "but it derives no support from the approval"
+        0
+    );
+    // What the caller cited is still attributable, from the event payload.
+    let payload = inspect_text(
+        directory.path(),
+        "SELECT CAST(payload AS TEXT) FROM change_event
+         WHERE CAST(payload AS TEXT) LIKE '%inert-object%'
+           AND CAST(payload AS TEXT) LIKE '%cited_approval_object_id%'",
+    );
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        payload["audit"]["cited_approval_object_id"], "approval",
+        "{payload}"
     );
     // Revocation has nothing to demote for it either.
     store
@@ -2699,4 +2711,170 @@ fn an_authority_chain_past_the_depth_bound_is_refused() {
     deep.event.trigger_object_id = None;
     deep.event.approval_object_id = Some(format!("chain-{:03}", hops - 1));
     assert_eq!(admit(&store, deep, "deep", "deep"), "deny");
+}
+
+#[test]
+fn an_unused_valid_citation_does_not_replace_the_supporting_approval() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    seed_dependent_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "held");
+    let mut promoted = request("held");
+    promoted.source_class = Some(SourceClass::ModelInference);
+    promoted.taint_class = Some(TaintClass::AssistantInference);
+    promoted.event.kind = EventKind::Verify;
+    promoted.event.trigger_object_id = None;
+    promoted.event.approval_object_id = Some("approval".to_string());
+    assert_eq!(admit(&store, promoted, "held", "held"), "admit");
+
+    // `approval-b` is valid but contributes nothing to a non-raising event, so it
+    // must not become the recorded authority.
+    store
+        .commit(intent("unused-valid-citation"), |envelope| {
+            let mut inert = subject_request("object-held", EventKind::Other);
+            inert.source_class = Some(SourceClass::ModelInference);
+            inert.taint_class = Some(TaintClass::AssistantInference);
+            inert.event.approval_object_id = Some("approval-b".to_string());
+            envelope.record_admission(inert)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT approval_object_id FROM admission_decisions
+             WHERE subject_object_id='object-held'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "approval"
+    );
+
+    // Revoking the uninvolved approval therefore leaves the subject supported.
+    store
+        .commit(intent("revoke-uninvolved"), |envelope| {
+            envelope.revoke_approval("approval-b", "unrelated withdrawal")?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT effective_maturity FROM admission_decisions
+             WHERE subject_object_id='object-held'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "verified"
+    );
+}
+
+#[test]
+fn a_citation_whose_chain_reaches_the_subject_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    seed_dependent_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    // `approval-b` derives its authority from `approval`, so approving `approval`
+    // while citing `approval-b` would close a cycle.
+    store
+        .commit(intent("cycle-attempt"), |envelope| {
+            let mut cyclic = subject_request("approval", EventKind::Approve);
+            cyclic.source_class = Some(SourceClass::ExplicitUser);
+            cyclic.taint_class = Some(TaintClass::UserExplicit);
+            cyclic.event.approval_object_id = Some("approval-b".to_string());
+            let decision = envelope.record_admission(cyclic)?;
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // Both links keep the authority they legitimately held.
+    stage(&store, "after-cycle");
+    let mut granted = request("after-cycle");
+    granted.source_class = Some(SourceClass::ModelInference);
+    granted.taint_class = Some(TaintClass::AssistantInference);
+    granted.event.kind = EventKind::Verify;
+    granted.event.trigger_object_id = None;
+    granted.event.approval_object_id = Some("approval-b".to_string());
+    assert_eq!(
+        admit(&store, granted, "after-cycle", "after-cycle"),
+        "admit"
+    );
+}
+
+#[test]
+fn a_retired_subject_cannot_acquire_new_visibility() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("retire-target"), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "retired".to_string(),
+                object_id: "retired-object".to_string(),
+                name: "retired".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "retired".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+    // Retire it through the public path so the invalidating commit really exists.
+    store
+        .commit(intent("retire-it"), |envelope| {
+            envelope.retire_domain("retired-object")?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let error = store
+        .commit(intent("admit-retired"), |envelope| {
+            envelope
+                .record_admission(subject_request("retired-object", EventKind::CodeObserved))?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(error, KernelError::NotFound);
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM admission_decisions WHERE subject_object_id='retired-object'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn retiring_an_approval_demotes_its_dependents() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "retire-dep");
+    let mut promoted = request("retire-dep");
+    promoted.source_class = Some(SourceClass::ModelInference);
+    promoted.taint_class = Some(TaintClass::AssistantInference);
+    promoted.event.kind = EventKind::Verify;
+    promoted.event.trigger_object_id = None;
+    promoted.event.approval_object_id = Some("approval".to_string());
+    assert_eq!(admit(&store, promoted, "retire-dep", "promote"), "admit");
+
+    // `retire_decision` is a separate invalidation route and must run the same
+    // cascade that `revoke_approval` does.
+    store
+        .commit(intent("retire-approval"), |envelope| {
+            envelope.retire_decision("approval")?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT visibility FROM admission_decisions
+             WHERE subject_object_id='object-retire-dep'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "explicit_labeled"
+    );
 }

@@ -205,6 +205,7 @@ impl Envelope<'_> {
     ) -> Result<DecisionWriteOutcome, KernelError> {
         let replaced_object_id = redact(replaced_object_id);
         let old = load_live_typed_object(self.tx, &replaced_object_id.text, "decision")?;
+        let granted_before = self.subject_grants_authority(Some(&replaced_object_id.text))?;
         let replacement = RedactedDecision::new(replacement)?;
         validate_successor(
             &old,
@@ -233,10 +234,16 @@ impl Envelope<'_> {
         self.changes.push(PendingChange {
             object: replacement.object_row(self.commit_seq),
             kind: "decision_correct",
-            replaced_object_id: Some(replaced_object_id.text),
+            replaced_object_id: Some(replaced_object_id.text.clone()),
             redactions,
             audit: None,
         });
+        if granted_before {
+            self.demote_dependents_if_authority_lost(
+                Some(&replaced_object_id.text),
+                "authority corrected",
+            )?;
+        }
         Ok(outcome)
     }
 
@@ -301,6 +308,10 @@ impl Envelope<'_> {
     ) -> Result<RetirementOutcome, KernelError> {
         let object_id = redact(object_id);
         let mut object = load_live_typed_object(self.tx, &object_id.text, object_kind)?;
+        // Retiring an accepted decision withdraws any authority it granted, so its
+        // dependents follow exactly as they do for an explicit revocation. Sampled
+        // before the invalidation, which is what removes that authority.
+        let granted_before = self.subject_grants_authority(Some(&object_id.text))?;
         invalidate(
             self.tx,
             self.commit_seq,
@@ -319,6 +330,9 @@ impl Envelope<'_> {
             redactions: vec![("object_id".to_string(), object_id.clone())],
             audit: None,
         });
+        if granted_before {
+            self.demote_dependents_if_authority_lost(Some(&object_id.text), "authority retired")?;
+        }
         Ok(RetirementOutcome {
             object_id: object_id.text,
             object_kind: object_kind.to_string(),
