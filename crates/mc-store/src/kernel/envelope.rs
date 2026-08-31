@@ -6,7 +6,7 @@ use super::redaction::{clear_owner, clear_owner_kind, identity, record, redact, 
 use super::{map_sqlite, KernelError, KernelStore};
 use crate::current_time_ms;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Sensitivity {
     Normal,
@@ -15,7 +15,7 @@ pub enum Sensitivity {
 }
 
 impl Sensitivity {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
             Self::Sensitive => "sensitive",
@@ -24,7 +24,7 @@ impl Sensitivity {
     }
 
     /// An unrecognized stored class resolves to `Secret`, the strictest handling.
-    fn from_stored(value: &str) -> Self {
+    pub(super) fn from_stored(value: &str) -> Self {
         match value {
             "normal" => Self::Normal,
             "sensitive" => Self::Sensitive,
