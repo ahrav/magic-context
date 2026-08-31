@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import type { PairedCaseFact } from "../prospective-holdout/comparison";
-import { buildProspectiveReport } from "../prospective-holdout/report";
+import { buildProspectiveReport, pairedFactsFingerprint } from "../prospective-holdout/report";
 import type { ProspectiveCellResult } from "../prospective-holdout/runner";
 import { cellResultFixture, H1, H2, H3 } from "../prospective-holdout/test-fixtures";
 import {
@@ -23,7 +22,23 @@ const observations: FamilyDeltaObservation[] = [
     { coordinateId: "var-d:1", familyId: "fam-d", endpoint: "mc-on-vs-mc-off", delta: 0.4, runHealth: "completed" },
     { coordinateId: "var-e:0", familyId: "fam-e", endpoint: "mc-on-vs-mc-off", delta: -0.4, runHealth: "completed" },
     { coordinateId: "var-e:1", familyId: "fam-e", endpoint: "mc-on-vs-mc-off", delta: 0, runHealth: "completed" },
+    { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "mc-on-vs-compaction", delta: 0.4, runHealth: "completed" },
+    { coordinateId: "var-a:1", familyId: "fam-a", endpoint: "mc-on-vs-compaction", delta: 0.6, runHealth: "completed" },
+    { coordinateId: "var-b:0", familyId: "fam-b", endpoint: "mc-on-vs-compaction", delta: 0.1, runHealth: "completed" },
+    { coordinateId: "var-b:1", familyId: "fam-b", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
+    { coordinateId: "var-c:0", familyId: "fam-c", endpoint: "mc-on-vs-compaction", delta: -0.1, runHealth: "completed" },
+    { coordinateId: "var-c:1", familyId: "fam-c", endpoint: "mc-on-vs-compaction", delta: 0.1, runHealth: "completed" },
+    { coordinateId: "var-d:0", familyId: "fam-d", endpoint: "mc-on-vs-compaction", delta: 0.2, runHealth: "completed" },
+    { coordinateId: "var-d:1", familyId: "fam-d", endpoint: "mc-on-vs-compaction", delta: 0.4, runHealth: "completed" },
+    { coordinateId: "var-e:0", familyId: "fam-e", endpoint: "mc-on-vs-compaction", delta: -0.4, runHealth: "completed" },
+    { coordinateId: "var-e:1", familyId: "fam-e", endpoint: "mc-on-vs-compaction", delta: 0, runHealth: "completed" },
 ];
+
+const lane = {
+    poolManifestFingerprint: H1,
+    pinnedSnapshotId: "fixture-model-20260830",
+    policyFingerprint: H3,
+};
 
 function estimate(overrides: Partial<Parameters<typeof estimateFamilyDeltas>[0]> = {}): FamilyDeltaAnalysis {
     return estimateFamilyDeltas({
@@ -31,6 +46,7 @@ function estimate(overrides: Partial<Parameters<typeof estimateFamilyDeltas>[0]>
         minimumAnalyzableFamilyCount: 3,
         bootstrapSeed: 20260830,
         bootstrapResamples: 2000,
+        lane,
         noiseFloors: [
             { familyId: "fam-a", value: 0.2, interval: { lower: 0.1, upper: 0.3 } },
             { familyId: "fam-b", value: 0.4, interval: { lower: 0.3, upper: 0.5 } },
@@ -42,7 +58,11 @@ function estimate(overrides: Partial<Parameters<typeof estimateFamilyDeltas>[0]>
     });
 }
 
-function pair(status: "complete" | "incomplete" = "complete"): PairedCaseFact {
+function primaryEndpoint(analysis: FamilyDeltaAnalysis, endpoint: string) {
+    return analysis.endpoints.find((estimate) => estimate.endpoint === endpoint)!;
+}
+
+function pair(status: "complete" | "incomplete" = "complete", seed = 7): PairedCaseFact {
     const releaseN: ProspectiveCellResult = status === "complete"
         ? cellResultFixture("release-n")
         : cellResultFixture("release-n", {
@@ -55,7 +75,7 @@ function pair(status: "complete" | "incomplete" = "complete"): PairedCaseFact {
         familyId: "fam-a",
         implementationFingerprint: H2,
         model: "fixture/model",
-        seed: 7,
+        seed,
         platform: "linux-x64",
         releaseN,
         releaseNMinus1: cellResultFixture("release-n-minus-1"),
@@ -63,20 +83,16 @@ function pair(status: "complete" | "incomplete" = "complete"): PairedCaseFact {
     };
 }
 
-function pairedFactsFingerprint(pairs: readonly PairedCaseFact[]): string {
-    return canonicalFingerprint([...pairs].sort((left, right) =>
-        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`.localeCompare(
-            `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
-        )));
-}
-
 describe("family-clustered delta estimator", () => {
     it("computes exact family means and deterministic family-clustered intervals", () => {
         const first = estimate();
         const second = estimate();
         const changedSeed = estimate({ bootstrapSeed: 20260831 });
-        const endpoint = first.endpoints[0]!;
+        const endpoint = primaryEndpoint(first, "mc-on-vs-mc-off");
 
+        expect(first.endpoints.map(({ endpoint }) => endpoint)).toEqual([
+            "mc-on-vs-compaction", "mc-on-vs-mc-off",
+        ]);
         expect(endpoint.pointEstimate).toBeCloseTo(0.16, 12);
         expect(endpoint.families.map(({ familyId }) => familyId)).toEqual([
             "fam-a", "fam-b", "fam-c", "fam-d", "fam-e",
@@ -86,12 +102,12 @@ describe("family-clustered delta estimator", () => {
             expect(actual).toBeCloseTo(expected, 12);
         }
         expect(second).toEqual(first);
-        expect(changedSeed.endpoints[0]!.interval).not.toEqual(endpoint.interval);
+        expect(primaryEndpoint(changedSeed, "mc-on-vs-mc-off").interval).not.toEqual(endpoint.interval);
         expect(first.bootstrapResamples).toBe(2000);
     });
 
     it("keeps CI resolution and per-family noise-floor facts separate", () => {
-        const endpoint = estimate().endpoints[0]!;
+        const endpoint = primaryEndpoint(estimate(), "mc-on-vs-mc-off");
         const family = endpoint.families.find(({ familyId }) => familyId === "fam-b")!;
         expect(endpoint.resolution).toBe("unresolved");
         expect(family.noise).toEqual({
@@ -128,6 +144,32 @@ describe("family-clustered delta estimator", () => {
             ],
         })).toThrow(/observation: unanalyzable-var-a:bad/);
         expect(() => estimate({ bootstrapResamples: 1999 })).toThrow(/bootstrap-resamples-too-small/);
+        expect(() => estimate({ bootstrapSeed: 2 ** 32 })).toThrow(/bootstrap-seed-invalid/);
+        expect(() => estimate({ bootstrapSeed: -1 })).toThrow(/bootstrap-seed-invalid/);
+    });
+
+    it("treats a primary endpoint without observations as zero analyzable families", () => {
+        const result = estimate({
+            minimumAnalyzableFamilyCount: 1,
+            observations: observations.filter(({ endpoint }) => endpoint === "mc-on-vs-mc-off"),
+        });
+        expect(result.analyzableFamilyCount).toBe(0);
+        expect(result.evidenceSufficient).toBe(false);
+    });
+
+    it("never resolves a family or endpoint from a single observation", () => {
+        const result = estimate({
+            minimumAnalyzableFamilyCount: 1,
+            observations: [
+                { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "mc-on-vs-mc-off", delta: 0.4, runHealth: "completed" },
+                { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "mc-on-vs-compaction", delta: 0.4, runHealth: "completed" },
+            ],
+            noiseFloors: undefined,
+        });
+        for (const endpoint of result.endpoints) {
+            expect(endpoint.resolution).toBe("unresolved");
+            expect(endpoint.families.every(({ resolution }) => resolution === "unresolved")).toBe(true);
+        }
     });
 
     it("keeps retrieval provider-mixed and live regret inferentially separate", () => {
@@ -146,7 +188,8 @@ describe("family-clustered delta estimator", () => {
 });
 
 describe("bound prospective estimator adapter", () => {
-    const pairs = [pair()];
+    // Unsorted input order exercises the shared paired-facts sort before fingerprinting.
+    const pairs = [pair("complete", 9), pair("complete", 7)];
     const expectedPairedFactsFingerprint = pairedFactsFingerprint(pairs);
     const adapter = (analysis = estimate({ minimumAnalyzableFamilyCount: 1 })) =>
         createFamilyEstimatorAdapter({
@@ -154,17 +197,13 @@ describe("bound prospective estimator adapter", () => {
             pinnedSnapshotId: "fixture-model-20260830",
             policyFingerprint: H3,
             expectedPairedFactsFingerprint,
-            analysis: {
-                ...analysis,
-                poolManifestFingerprint: H1,
-                pinnedSnapshotId: "fixture-model-20260830",
-                policyFingerprint: H3,
-            },
+            analysis,
         });
 
     it("implements every projection row without leaking noise labels", () => {
         const belowFloor = adapter(estimate({ minimumAnalyzableFamilyCount: 6 })).analyze(pairs, H3);
         expect(belowFloor.evidenceSufficient).toBe(false);
+        expect(belowFloor.direction).toBe("no-change");
 
         const noChange = adapter(estimate({
             minimumAnalyzableFamilyCount: 1,
@@ -187,6 +226,27 @@ describe("bound prospective estimator adapter", () => {
             observations: observations.map((row) => ({ ...row, delta: -Math.abs(row.delta) - 0.2 })),
         })).analyze(pairs, H3);
         expect(negative.direction).toBe("regression");
+
+        const mixed = adapter(estimate({
+            minimumAnalyzableFamilyCount: 1,
+            observations: observations.map((row) => ({
+                ...row,
+                delta: row.endpoint === "mc-on-vs-mc-off"
+                    ? Math.abs(row.delta) + 0.2
+                    : -Math.abs(row.delta) - 0.2,
+            })),
+        })).analyze(pairs, H3);
+        expect(mixed.direction).toBe("no-change");
+    });
+
+    it("keeps direction unresolved when only one family excludes zero", () => {
+        // fam-a resolves positive while the pooled endpoint intervals straddle zero.
+        const outcome = adapter(estimate({ minimumAnalyzableFamilyCount: 1 })).analyze(pairs, H3);
+        const analysis = estimate({ minimumAnalyzableFamilyCount: 1 });
+        expect(analysis.endpoints.every(({ resolution }) => resolution === "unresolved")).toBe(true);
+        expect(analysis.endpoints.some(({ families }) =>
+            families.some(({ resolution }) => resolution === "resolved"))).toBe(true);
+        expect(outcome.direction).toBe("no-change");
     });
 
     it("binds pool, policy, and prospective facts with typed failures", () => {
@@ -195,13 +255,11 @@ describe("bound prospective estimator adapter", () => {
             pinnedSnapshotId: "fixture-model-20260830",
             policyFingerprint: H3,
             expectedPairedFactsFingerprint,
-            analysis: {
-                ...estimate(),
-                poolManifestFingerprint: H1,
-                pinnedSnapshotId: "fixture-model-20260830",
-                policyFingerprint: H3,
-            },
+            analysis: estimate(),
         }).analyze(pairs, H3)).toThrow(PairedDeltaEstimatorError);
+        expect(() => adapter(estimate({
+            lane: { ...lane, pinnedSnapshotId: "other-model-20260830" },
+        })).analyze(pairs, H3)).toThrow(/lane-binding-mismatch/);
         expect(() => adapter().analyze([pair("incomplete")], H3)).toThrow(/paired-facts-fingerprint-mismatch/);
         expect(() => adapter().analyze(pairs, H2)).toThrow(/policy-fingerprint-mismatch/);
     });
@@ -229,7 +287,7 @@ describe("bound prospective estimator adapter", () => {
         });
         expect(report.body.completeFamilyCount).toBe(1);
 
-        const changed = estimate();
+        const changed = estimate({ minimumAnalyzableFamilyCount: 1 });
         changed.endpoints[0]!.families[0]!.pointEstimate += 0.01;
         expect(adapter().analyze(pairs, H3).resultFingerprint).not.toBe(
             adapter(changed).analyze(pairs, H3).resultFingerprint,

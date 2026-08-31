@@ -71,6 +71,22 @@ export function completeFamilyCount(pairs: readonly PairedCaseFact[]): number {
     ).length;
 }
 
+// String `<` compares UTF-16 code units, avoiding locale-dependent `localeCompare` ordering.
+function comparePairKeys(left: PairedCaseFact, right: PairedCaseFact): number {
+    const leftKey = `${left.caseId}:${left.model}:${left.seed}:${left.platform}`;
+    const rightKey = `${right.caseId}:${right.model}:${right.seed}:${right.platform}`;
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+}
+
+// Fingerprint inputs use this sort order to produce a stable canonical order.
+export function sortPairedFacts(pairs: readonly PairedCaseFact[]): PairedCaseFact[] {
+    return [...pairs].sort(comparePairKeys);
+}
+
+export function pairedFactsFingerprint(pairs: readonly PairedCaseFact[]): string {
+    return canonicalFingerprint(sortPairedFacts(pairs));
+}
+
 function summarizePairs(pairs: readonly PairedCaseFact[]): {
     pairedFactsFingerprint: string;
     completeFamilyCount: number;
@@ -79,11 +95,7 @@ function summarizePairs(pairs: readonly PairedCaseFact[]): {
     pairCount: number;
     completePairCount: number;
 } {
-    const sortedPairs = [...pairs].sort((left, right) =>
-        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`.localeCompare(
-            `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
-        )
-    );
+    const sortedPairs = sortPairedFacts(pairs);
     const incompletePairs = sortedPairs.filter((pair) => pair.status === "incomplete");
     const incompleteCaseIds = [...new Set(incompletePairs.map((pair) => pair.caseId))];
     return {

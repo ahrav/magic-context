@@ -1,8 +1,8 @@
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { splitmix32 } from "../../../plugin/scripts/retrieval-benchmark/synthetic";
-import type { PairedCaseFact } from "../prospective-holdout/comparison";
 import {
     completeFamilyCount,
+    pairedFactsFingerprint,
     type Direction,
     type EstimatorOutcome,
     type FamilyEstimatorAdapter,
@@ -10,6 +10,8 @@ import {
 import type { RunHealth } from "./contract";
 
 export const MIN_BOOTSTRAP_RESAMPLES = 2000;
+// `splitmix32` consumes a 32-bit state, so wider seeds would silently alias.
+export const MAX_BOOTSTRAP_SEED = 0xFFFFFFFF;
 export const PRIMARY_ENDPOINTS = ["mc-on-vs-mc-off", "mc-on-vs-compaction"] as const;
 export const REGRET_ENDPOINTS = ["retrieval", "formation", "representation"] as const;
 export type PrimaryEndpoint = (typeof PRIMARY_ENDPOINTS)[number];
@@ -73,7 +75,13 @@ export interface RawRegretRecord {
     inferential: false;
 }
 
-export interface FamilyDeltaAnalysis {
+export interface LaneBinding {
+    poolManifestFingerprint: string;
+    pinnedSnapshotId: string;
+    policyFingerprint: string;
+}
+
+export interface FamilyDeltaAnalysis extends LaneBinding {
     bootstrapSeed: number;
     bootstrapResamples: number;
     minimumAnalyzableFamilyCount: number;
@@ -128,6 +136,13 @@ function includesZero(interval: Interval): boolean {
     return interval.lower <= 0 && interval.upper >= 0;
 }
 
+// String `<` compares UTF-16 code units, avoiding locale-dependent `localeCompare` ordering.
+// Ordering feeds both the bootstrap RNG consumption order and the fingerprinted
+// output arrays, so it must not vary across machines.
+function compareCodeUnits(left: string, right: string): number {
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function estimateEndpoint(
     endpoint: DeltaEndpoint,
     observations: readonly FamilyDeltaObservation[],
@@ -143,7 +158,7 @@ function estimateEndpoint(
         byFamily.set(observation.familyId, values);
     }
     const enoughFamilies = byFamily.size >= minimumAnalyzableFamilyCount;
-    const families = [...byFamily].sort(([left], [right]) => left.localeCompare(right))
+    const families = [...byFamily].sort(([left], [right]) => compareCodeUnits(left, right))
         .map(([familyId, values]): FamilyEstimate => {
             const pointEstimate = mean(values);
             const interval = bootstrapInterval(
@@ -156,7 +171,10 @@ function estimateEndpoint(
                 familyId,
                 pointEstimate,
                 interval,
-                resolution: enoughFamilies && !includesZero(interval) ? "resolved" : "unresolved",
+                // A nonzero singleton yields a zero-width interval without variance evidence; keep it unresolved.
+                resolution: enoughFamilies && values.length >= 2 && !includesZero(interval)
+                    ? "resolved"
+                    : "unresolved",
                 noise: {
                     label: floor === null
                         ? "no-noise-floor"
@@ -176,7 +194,9 @@ function estimateEndpoint(
         pointEstimate: mean(familyMeans),
         interval,
         familyCount: families.length,
-        resolution: enoughFamilies && !includesZero(interval) ? "resolved" : "unresolved",
+        resolution: enoughFamilies && familyMeans.length >= 2 && !includesZero(interval)
+            ? "resolved"
+            : "unresolved",
         families,
     };
 }
@@ -186,6 +206,7 @@ export function estimateFamilyDeltas(input: {
     minimumAnalyzableFamilyCount: number;
     bootstrapSeed: number;
     bootstrapResamples: number;
+    lane: LaneBinding;
     noiseFloors?: readonly FamilyNoiseFloor[];
 }): FamilyDeltaAnalysis {
     if (
@@ -194,7 +215,11 @@ export function estimateFamilyDeltas(input: {
     ) {
         throw new PairedDeltaEstimatorError("minimum-analyzable-family-count-invalid");
     }
-    if (!Number.isSafeInteger(input.bootstrapSeed)) {
+    if (
+        !Number.isSafeInteger(input.bootstrapSeed) ||
+        input.bootstrapSeed < 0 ||
+        input.bootstrapSeed > MAX_BOOTSTRAP_SEED
+    ) {
         throw new PairedDeltaEstimatorError("bootstrap-seed-invalid");
     }
     if (
@@ -202,6 +227,15 @@ export function estimateFamilyDeltas(input: {
         input.bootstrapResamples < MIN_BOOTSTRAP_RESAMPLES
     ) {
         throw new PairedDeltaEstimatorError("bootstrap-resamples-too-small");
+    }
+    if (!/^[0-9a-f]{64}$/.test(input.lane.poolManifestFingerprint)) {
+        throw new PairedDeltaEstimatorError("lane-pool-manifest-fingerprint-invalid");
+    }
+    if (!/^[0-9a-f]{64}$/.test(input.lane.policyFingerprint)) {
+        throw new PairedDeltaEstimatorError("lane-policy-fingerprint-invalid");
+    }
+    if (input.lane.pinnedSnapshotId.trim().length === 0) {
+        throw new PairedDeltaEstimatorError("lane-pinned-snapshot-id-invalid");
     }
     if (input.observations.length === 0) {
         throw new PairedDeltaEstimatorError("observations-empty");
@@ -243,12 +277,12 @@ export function estimateFamilyDeltas(input: {
         noiseFloors.set(floor.familyId, floor);
     }
 
-    const sorted = [...input.observations].sort((left, right) =>
-        `${left.endpoint}:${left.familyId}:${left.coordinateId}`.localeCompare(
-            `${right.endpoint}:${right.familyId}:${right.coordinateId}`,
-        ));
+    const sorted = [...input.observations].sort((left, right) => compareCodeUnits(
+        `${left.endpoint}:${left.familyId}:${left.coordinateId}`,
+        `${right.endpoint}:${right.familyId}:${right.coordinateId}`,
+    ));
     const estimates = [...new Set(sorted.map(({ endpoint }) => endpoint))]
-        .sort((left, right) => left.localeCompare(right))
+        .sort(compareCodeUnits)
         .map((endpoint) => estimateEndpoint(
             endpoint,
             sorted.filter((observation) => observation.endpoint === endpoint),
@@ -259,10 +293,19 @@ export function estimateFamilyDeltas(input: {
         ));
     const endpoints = estimates.filter(({ endpoint }) =>
         PRIMARY_ENDPOINTS.includes(endpoint as PrimaryEndpoint));
-    const analyzableFamilyCount = endpoints.length === 0
-        ? 0
-        : Math.min(...endpoints.map(({ familyCount }) => familyCount));
+    const familyCountByEndpoint = new Map(
+        endpoints.map(({ endpoint, familyCount }) => [endpoint, familyCount]),
+    );
+    // Every primary endpoint constrains the count; a primary endpoint with no
+    // observations contributes zero analyzable families rather than dropping
+    // out of the minimum.
+    const analyzableFamilyCount = Math.min(
+        ...PRIMARY_ENDPOINTS.map((endpoint) => familyCountByEndpoint.get(endpoint) ?? 0),
+    );
     return {
+        poolManifestFingerprint: input.lane.poolManifestFingerprint,
+        pinnedSnapshotId: input.lane.pinnedSnapshotId,
+        policyFingerprint: input.lane.policyFingerprint,
         bootstrapSeed: input.bootstrapSeed,
         bootstrapResamples: input.bootstrapResamples,
         minimumAnalyzableFamilyCount: input.minimumAnalyzableFamilyCount,
@@ -285,22 +328,14 @@ export function estimateFamilyDeltas(input: {
     };
 }
 
-function sortedPairs(pairs: readonly PairedCaseFact[]): PairedCaseFact[] {
-    return [...pairs].sort((left, right) =>
-        `${left.caseId}:${left.model}:${left.seed}:${left.platform}`.localeCompare(
-            `${right.caseId}:${right.model}:${right.seed}:${right.platform}`,
-        ));
-}
-
 function projectedDirection(analysis: FamilyDeltaAnalysis): Direction {
-    const directional = analysis.endpoints.flatMap(({ families }) =>
-        families.filter(({ interval }) => !includesZero(interval)));
-    if (directional.length === 0) return "no-change";
-    const hasPositive = directional.some(({ interval }) => interval.lower > 0);
-    const hasNegative = directional.some(({ interval }) => interval.upper < 0);
-    if (hasPositive && hasNegative) {
-        throw new PairedDeltaEstimatorError("projection: mixed-direction");
-    }
+    // Opposite-signed resolved endpoints are a heterogeneous outcome, not an
+    // impossible state, and project as "no-change".
+    const resolved = analysis.endpoints.filter(({ resolution }) => resolution === "resolved");
+    if (resolved.length === 0) return "no-change";
+    const hasPositive = resolved.some(({ interval }) => interval.lower > 0);
+    const hasNegative = resolved.some(({ interval }) => interval.upper < 0);
+    if (hasPositive && hasNegative) return "no-change";
     return hasPositive ? "improvement" : "regression";
 }
 
@@ -309,11 +344,7 @@ export function createFamilyEstimatorAdapter(input: {
     pinnedSnapshotId: string;
     policyFingerprint: string;
     expectedPairedFactsFingerprint: string;
-    analysis: FamilyDeltaAnalysis & {
-        poolManifestFingerprint: string;
-        pinnedSnapshotId: string;
-        policyFingerprint: string;
-    };
+    analysis: FamilyDeltaAnalysis;
 }): FamilyEstimatorAdapter {
     return {
         owner: "magic-context-x4l.14",
@@ -330,7 +361,7 @@ export function createFamilyEstimatorAdapter(input: {
             ) {
                 throw new PairedDeltaEstimatorError("adapter: policy-fingerprint-mismatch");
             }
-            if (canonicalFingerprint(sortedPairs(pairs)) !== input.expectedPairedFactsFingerprint) {
+            if (pairedFactsFingerprint(pairs) !== input.expectedPairedFactsFingerprint) {
                 throw new PairedDeltaEstimatorError("adapter: paired-facts-fingerprint-mismatch");
             }
             const evidenceSufficient =

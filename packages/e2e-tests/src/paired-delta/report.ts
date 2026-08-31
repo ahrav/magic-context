@@ -56,13 +56,18 @@ function requireHex64(value: string, label: string): void {
     }
 }
 
+// String `<` compares UTF-16 code units, avoiding locale-dependent `localeCompare` ordering.
+function compareCodeUnits(left: string, right: string): number {
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function sortedMetrics(metrics: ArmMetrics): ArmMetrics {
     if (Object.values(metrics).some((value) =>
         value === undefined || !Number.isFinite(value) || value < 0)) {
         throw new Error("paired-delta-report: metric-invalid");
     }
     return Object.fromEntries(
-        Object.entries(metrics).sort(([left], [right]) => left.localeCompare(right)),
+        Object.entries(metrics).sort(([left], [right]) => compareCodeUnits(left, right)),
     );
 }
 
@@ -86,8 +91,17 @@ export function buildPairedDeltaReport(input: {
     if (input.pinnedSnapshotId.trim().length === 0) {
         throw new Error("paired-delta-report: pinned-snapshot-id-invalid");
     }
-    const exclusions = [...input.exclusions].sort((left, right) =>
-        `${left.armId}:${left.reasonCode}`.localeCompare(`${right.armId}:${right.reasonCode}`));
+    if (
+        input.analysis.poolManifestFingerprint !== input.poolManifestFingerprint ||
+        input.analysis.pinnedSnapshotId !== input.pinnedSnapshotId ||
+        input.analysis.policyFingerprint !== policy.policyFingerprint
+    ) {
+        throw new Error("paired-delta-report: analysis-lane-binding-mismatch");
+    }
+    const exclusions = [...input.exclusions].sort((left, right) => compareCodeUnits(
+        `${left.armId}:${left.reasonCode}`,
+        `${right.armId}:${right.reasonCode}`,
+    ));
     if (exclusions.some(({ count }) => !Number.isSafeInteger(count) || count < 1)) {
         throw new Error("paired-delta-report: exclusion-count-invalid");
     }
@@ -115,7 +129,7 @@ export function buildPairedDeltaReport(input: {
             live: input.analysis.liveRegret,
             providerMixed: input.analysis.providerMixedRegret,
             raw: [...input.rawRegretRecords].sort((left, right) =>
-                left.coordinateId.localeCompare(right.coordinateId)),
+                compareCodeUnits(left.coordinateId, right.coordinateId)),
         },
     };
     return {

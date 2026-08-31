@@ -29,12 +29,19 @@ function report() {
         observations: [
             { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "mc-on-vs-mc-off", delta: 0.3, runHealth: "completed" },
             { coordinateId: "var-b:0", familyId: "fam-b", endpoint: "mc-on-vs-mc-off", delta: 0.1, runHealth: "completed" },
+            { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "mc-on-vs-compaction", delta: 0.3, runHealth: "completed" },
+            { coordinateId: "var-b:0", familyId: "fam-b", endpoint: "mc-on-vs-compaction", delta: 0.1, runHealth: "completed" },
             { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "retrieval", delta: 0.1, runHealth: "completed" },
             { coordinateId: "var-a:0", familyId: "fam-a", endpoint: "formation", delta: 0.2, runHealth: "completed" },
         ],
         minimumAnalyzableFamilyCount: 2,
         bootstrapSeed: 17,
         bootstrapResamples: 2000,
+        lane: {
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "anthropic-model-20260830",
+            policyFingerprint: policy.policyFingerprint,
+        },
     });
     return buildPairedDeltaReport({
         poolManifestFingerprint: H1,
@@ -97,6 +104,30 @@ describe("paired-delta report", () => {
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
+    });
+
+    it("rejects an analysis estimated for a different lane", () => {
+        const built = report();
+        expect(() => buildPairedDeltaReport({
+            poolManifestFingerprint: H1,
+            pinnedSnapshotId: "different-model-20260831",
+            policyDocument: {
+                schema: POLICY_OWNER_SCHEMA,
+                owner: "magic-context-x4l.14",
+                status: "ready",
+                policy: { minimumAnalyzableFamilyCount: 2, targetMinimumDetectableDelta: 0.1 },
+                policyFingerprint: built.body.policyFingerprint,
+            },
+            analysis: built.body.analysis,
+            exclusions: [],
+            secondaryMetrics: {
+                invalidSuccessRateByArm: {},
+                tokensByArm: {},
+                wallClockMsByArm: {},
+                turnsByArm: {},
+            },
+            rawRegretRecords: [],
+        })).toThrow(/analysis-lane-binding-mismatch/);
     });
 
     it("rejects a non-ready or wrongly owned pre-registration document", () => {
