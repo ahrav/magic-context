@@ -76,16 +76,20 @@ fn invalid_name() -> StorageError {
 }
 
 fn validate_name(name: &str) -> Result<(), StorageError> {
+    validate_os_name(OsStr::new(name))
+}
+
+// `OsStr` preserves non-UTF-8 names.
+fn validate_os_name(name: &OsStr) -> Result<(), StorageError> {
     let path = std::path::Path::new(name);
-    if name.is_empty() || name == "." || name == ".." || path.file_name() != Some(OsStr::new(name))
-    {
+    if name.is_empty() || name == "." || name == ".." || path.file_name() != Some(name) {
         return Err(invalid_name());
     }
     Ok(())
 }
 
-pub(super) fn create_secure_directory(parent: &File, name: &str) -> Result<File, StorageError> {
-    validate_name(name)?;
+pub(super) fn create_secure_directory(parent: &File, name: &OsStr) -> Result<File, StorageError> {
+    validate_os_name(name)?;
     rfs::mkdirat(parent, name, Mode::from_raw_mode(0o700)).map_err(classify_errno)?;
     let secured = (|| {
         let descriptor = rfs::openat(
@@ -253,7 +257,7 @@ mod tests {
     fn durable_publish_happy_path() {
         let root = tempfile::tempdir().unwrap();
         let root_dir = File::open(root.path()).unwrap();
-        let directory = create_secure_directory(&root_dir, "objects").unwrap();
+        let directory = create_secure_directory(&root_dir, OsStr::new("objects")).unwrap();
         let temp = temp_name("artifact");
         let mut file = create_new_file(&directory, &temp).unwrap();
         write_and_sync(&mut file, b"payload").unwrap();
@@ -336,14 +340,14 @@ mod tests {
         fs::create_dir(root.path().join("target")).unwrap();
         symlink("target", root.path().join("link")).unwrap();
 
-        assert!(create_secure_directory(&root_dir, "link").is_err());
+        assert!(create_secure_directory(&root_dir, OsStr::new("link")).is_err());
     }
 
     #[test]
     fn created_directories_and_files_are_owner_only() {
         let root = tempfile::tempdir().unwrap();
         let root_dir = File::open(root.path()).unwrap();
-        let directory = create_secure_directory(&root_dir, "objects").unwrap();
+        let directory = create_secure_directory(&root_dir, OsStr::new("objects")).unwrap();
         let file = create_new_file(&directory, "artifact").unwrap();
 
         assert_eq!(

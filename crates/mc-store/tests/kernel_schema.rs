@@ -144,7 +144,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "0ba154ed8894bb37d797bed095e0d72c99b6643c671740c725fdca4aecfcc95a";
+    "4fd51b9b2327b9f6ebcf167d24bbc8cba3666e376ef9486b3efaf92a0c56ed3c";
 
 #[test]
 fn cas_control_tables_and_lookup_indexes_are_frozen() {
@@ -528,6 +528,15 @@ fn plain_delete_backfill_barrier_does_not_require_a_purge_tombstone() {
         [],
     )
     .unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE deletion_backfill_barriers SET completed_at=NULL
+             WHERE barrier_id='plain-barrier'",
+            [],
+        )
+        .is_err(),
+        "a completed barrier cannot reopen"
+    );
     conn.execute(
         "INSERT INTO deletion_backfill_barriers(
              barrier_id,artifact_digest,artifact_reference,delete_commit_seq,created_at

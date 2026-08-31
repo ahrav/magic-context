@@ -1159,10 +1159,7 @@ fn allocate_recovery_dir(path: &Path) -> Result<PathBuf, KernelError> {
     let parent = File::open(parent_path).map_err(|_| KernelError::Io)?;
     for _ in 0..10_000 {
         let candidate = suffix_path(path, &format!("{RESTORE_INFIX}{}", next_unique_id()));
-        let name = candidate
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .ok_or(KernelError::Io)?;
+        let name = candidate.file_name().ok_or(KernelError::Io)?;
         match create_secure_directory(&parent, name) {
             Ok(_) => return Ok(candidate),
             Err(error) if error.raw_os_error() == Some(rustix::io::Errno::EXIST.raw_os_error()) => {
