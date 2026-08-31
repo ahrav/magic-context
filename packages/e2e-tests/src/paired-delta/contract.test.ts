@@ -120,6 +120,19 @@ describe("paired-delta scenario contract", () => {
         ).not.toThrow();
     });
 
+    it("rejects gold that falls outside the rendered field bound", () => {
+        const base = scenario();
+        const buried = `${"filler ".repeat(200)}alpha-17`;
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...base.interventions,
+                    r2: { memories: [{ claim: buried, evidence: buried }] },
+                },
+            })),
+        ).toThrow(/r2\.memories: answer-absent/);
+    });
+
     it("rejects a path answer satisfied only by a longer path", () => {
         const base = scenario();
         const withPath = (content: string): Partial<ScenarioDeclaration> => ({
@@ -133,7 +146,11 @@ describe("paired-delta scenario contract", () => {
                 r2: { memories: [{ claim: content, evidence: content }] },
             },
         });
-        for (const longer of ["at /srv/db/migrations/x.sql now", "at old/db/migrations/x.sql/backup"]) {
+        for (const longer of [
+            "at /srv/db/migrations/x.sql now",
+            "at old/db/migrations/x.sql/backup",
+            "at C:\\srv\\db/migrations/x.sql now",
+        ]) {
             expect(() => parseScenarioDeclaration(scenario(withPath(longer))))
                 .toThrow(/answer-absent/);
         }
@@ -511,5 +528,12 @@ describe("paired-delta manifest contract", () => {
         expect(() =>
             parsePairedDeltaManifest({ schema: PAIRED_DELTA_MANIFEST_SCHEMA, scenarios: [] }),
         ).toThrow(/manifest\.scenarios: empty/);
+        /** Release-only entries leave calibration and weekly with no measurements. commentlint: allow(JUDGE) */
+        expect(() =>
+            parsePairedDeltaManifest({
+                schema: PAIRED_DELTA_MANIFEST_SCHEMA,
+                scenarios: [{ ...entry, runModes: ["release"] }],
+            }),
+        ).toThrow(/manifest\.scenarios: run-mode-uncovered/);
     });
 });

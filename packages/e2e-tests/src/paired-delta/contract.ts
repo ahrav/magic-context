@@ -1,6 +1,9 @@
 import { CHARS_PER_TOKEN } from "../ballast";
 import { makeContractPrimitives } from "../contract-primitives";
-import { ID_SHAPED_QUERY_MAX_TOKENS } from "../../../plugin/src/features/magic-context/search";
+import {
+    boundDynamicField,
+    ID_SHAPED_QUERY_MAX_TOKENS,
+} from "../../../plugin/src/features/magic-context/search-bounds";
 import { normalizeMemoryContent } from "../../../plugin/src/features/magic-context/memory/normalize-hash";
 import { PUBLIC_CLAIM_ID_PREFIX } from "../../../plugin/src/features/magic-context/memory/claim-operation-contract";
 import {
@@ -232,12 +235,12 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     }
     const answerMatch = p.enumeration(root.answerMatch, ANSWER_MATCHES, "scenario.answerMatch");
     const leaks = (text: string): boolean => revealsAnswer(expectedAnswer, text);
-    /** Gold presence asks "can the arm derive the exact answer here", so only a complete value counts and a narrower match is the conservative one: `147` does not supply `47`. It also honors the declared casing policy, unlike the leak guard: under `exact` the verifier rejects a differently-cased answer, so folding here would certify gold the arm can never produce. Boundaries are code-point aware through `u`-flag lookaround rather than index arithmetic, which would read one UTF-16 unit and see an astral letter's low surrogate as a separator. Letters, numbers, combining marks, `_`, `-`, and `/` are value characters, so a longer path cannot satisfy a path answer; `.`, `;`, and `,` are not, so a trailing sentence period still matches. commentlint: allow(JUDGE) */
+    /** Gold presence asks "can the arm derive the exact answer here", so only a complete value counts and a narrower match is the conservative one: `147` does not supply `47`. It also honors the declared casing policy, unlike the leak guard: under `exact` the verifier rejects a differently-cased answer, so folding here would certify gold the arm can never produce. Boundaries are code-point aware through `u`-flag lookaround rather than index arithmetic, which would read one UTF-16 unit and see an astral letter's low surrogate as a separator. Letters, numbers, combining marks, `_`, `-`, `/`, and `\` are value characters, so a longer path cannot satisfy a path answer under either separator; `.`, `;`, and `,` are not, so a trailing sentence period still matches. commentlint: allow(JUDGE) */
     const suppliesAnswer = (text: string): boolean => {
         const fold = (value: string): string =>
             answerMatch === "exact" ? value : value.toLowerCase();
         const escaped = fold(expectedAnswer).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const valueChar = "[\\p{L}\\p{N}\\p{M}_/-]";
+        const valueChar = "[\\p{L}\\p{N}\\p{M}_/\\\\-]";
         /** A `.` bounded by value characters continues the value rather than ending it, so `47.5` does not supply `47`, while a terminal `.` still does. commentlint: allow(JUDGE) */
         const before = `(?<!${valueChar})(?<!${valueChar}\\.)`;
         const after = `(?!${valueChar})(?!\\.${valueChar})`;
@@ -300,7 +303,8 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         "scenario.interventions.r2.memories",
     );
     /** R2 seeds these as verified project memory and the `<project-memory>` renderer exposes the claim, not this declaration's `evidence` provenance. With no claim carrying the answer the arm receives no gold and reproduces R1, so `R2 - R1` and `R3 - R2` describe a malformed intervention. One claim suffices: gold may be spread across a multi-locator set. commentlint: allow(JUDGE) */
-    if (!memories.some(({ claim }) => suppliesAnswer(claim))) {
+    /** Checked against the rendered form: `ctx_search` bounds each field to MAX_RENDER_FIELD_BYTES, so an answer past that cut is never delivered and R1 would fail on truncation rather than retrieval while the row still satisfies the delivery gate by id. commentlint: allow(JUDGE) */
+    if (!memories.some(({ claim }) => suppliesAnswer(boundDynamicField(claim)))) {
         p.fail("scenario.interventions.r2.memories: answer-absent");
     }
     /** `r2.memories` is the declaration's only gold, so it is also what a runner seeds and resolves `r1.locatorIds` against. Unequal lengths leave a handle with no `publicClaimId` to map to and make R1 and R2 compare different gold sets; pairing is positional. commentlint: allow(JUDGE) */
@@ -471,6 +475,11 @@ export function parsePairedDeltaManifest(raw: unknown): PairedDeltaManifest {
     p.unique(scenarios.map(({ scenarioId }) => scenarioId), "manifest.scenarios");
     /** An empty pool matches an empty registry, so a removed or mis-generated index would freeze as valid and leave every run mode with no measurements instead of a contract failure. commentlint: allow(JUDGE) */
     if (scenarios.length === 0) p.fail("manifest.scenarios: empty");
+    /** The registry takes membership solely from here and `assertFrozenPool` permits run-mode edits without drift, so a mode losing its last member would run with no measurements while every freeze check stayed green. This constrains the pool to cover each mode once, not any entry to carry a particular mode. commentlint: allow(JUDGE) */
+    const covered = new Set(scenarios.flatMap(({ runModes }) => runModes));
+    if (RUN_MODES.some((mode) => !covered.has(mode))) {
+        p.fail("manifest.scenarios: run-mode-uncovered");
+    }
     return { schema: PAIRED_DELTA_MANIFEST_SCHEMA, scenarios };
 }
 
