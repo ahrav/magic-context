@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "69c4dc4b99aaf986fbd88515cfdc50a88f01c1eb8752034bf5e4433e88ee0e30";
+    "1d42ade668d79de167644fb03e635333ace015aa7431fb19c08bffa7606e8cbc";
 
 /// The enclosing query must bind `o` to `object_registry`.
 /// Serving and approval validation must agree on which decision governs an
@@ -19,24 +19,21 @@ const REVISION_1_SOURCE_DIGEST: &str =
 /// pins serving to a snapshot; authority checks pass an empty bound to read the
 /// latest committed decision.
 fn governing_decision_for_object_sql(commit_bound: &str) -> String {
+    let lineage = same_lineage_as_object("a");
     format!(
         "(
     SELECT latest.admission_decision_id FROM (
         SELECT a.admission_decision_id,a.commit_seq
         FROM admission_decisions a
         WHERE a.subject_object_id=o.object_id
-          AND a.source_kind=o.source_kind
-          AND a.source_id=o.source_id
-          AND a.source_revision=o.source_revision
+          AND {lineage}
           AND a.commit_seq IS NOT NULL
           {commit_bound}
         UNION ALL
         SELECT a.admission_decision_id,a.commit_seq
         FROM admission_decisions a
         WHERE a.subject_object_id IS NULL
-          AND a.source_kind=o.source_kind
-          AND a.source_id=o.source_id
-          AND a.source_revision=o.source_revision
+          AND {lineage}
           AND a.commit_seq IS NOT NULL
           {commit_bound}
     ) latest
@@ -436,6 +433,45 @@ struct PreparedDecision {
     evaluation: Evaluation,
 }
 
+/// The enclosing query must bind `o` to `object_registry`.
+/// The latest decision about the object itself. An object serves only on
+/// standing it earned, so this is a requirement, not a contribution.
+fn latest_own_decision_sql(commit_bound: &str) -> String {
+    let lineage = same_lineage_as_object("a");
+    format!(
+        "(
+    SELECT a.admission_decision_id
+    FROM admission_decisions a
+    WHERE a.subject_object_id=o.object_id
+      AND {lineage}
+      AND a.commit_seq IS NOT NULL
+      {commit_bound}
+    ORDER BY a.commit_seq DESC,a.admission_decision_id DESC
+    LIMIT 1
+)"
+    )
+}
+
+/// The enclosing query must bind `o` to `object_registry`.
+/// The latest source-scoped decision for an object's lineage. A rejection here
+/// binds every object on the lineage, including one whose own later decision
+/// would otherwise serve.
+fn latest_lineage_decision_sql(commit_bound: &str) -> String {
+    let lineage = same_lineage_as_object("a");
+    format!(
+        "(
+    SELECT a.admission_decision_id
+    FROM admission_decisions a
+    WHERE a.subject_object_id IS NULL
+      AND {lineage}
+      AND a.commit_seq IS NOT NULL
+      {commit_bound}
+    ORDER BY a.commit_seq DESC,a.admission_decision_id DESC
+    LIMIT 1
+)"
+    )
+}
+
 // policy-digest:authority-start
 /// Each approval may support at most 1,024 distinct subjects.
 const MAX_APPROVAL_DEPENDENTS: usize = 1_024;
@@ -485,44 +521,13 @@ const MAX_LINEAGE_AUTHORITY_BEARERS: usize = 64;
 
 const MAX_AUTHORITY_CHAIN_DEPTH: usize = 64;
 
-/// The enclosing query must bind `o` to `object_registry`.
-/// The latest decision about the object itself. An object serves only on
-/// standing it earned, so this is a requirement, not a contribution.
-fn latest_own_decision_sql(commit_bound: &str) -> String {
+/// Ties a decision to the registry row's lineage. The enclosing query must bind
+/// `o` to `object_registry`; `alias` binds the decision side.
+fn same_lineage_as_object(alias: &str) -> String {
     format!(
-        "(
-    SELECT a.admission_decision_id
-    FROM admission_decisions a
-    WHERE a.subject_object_id=o.object_id
-      AND a.source_kind=o.source_kind
-      AND a.source_id=o.source_id
-      AND a.source_revision=o.source_revision
-      AND a.commit_seq IS NOT NULL
-      {commit_bound}
-    ORDER BY a.commit_seq DESC,a.admission_decision_id DESC
-    LIMIT 1
-)"
-    )
-}
-
-/// The enclosing query must bind `o` to `object_registry`.
-/// The latest source-scoped decision for an object's lineage. A rejection here
-/// binds every object on the lineage, including one whose own later decision
-/// would otherwise serve.
-fn latest_lineage_decision_sql(commit_bound: &str) -> String {
-    format!(
-        "(
-    SELECT a.admission_decision_id
-    FROM admission_decisions a
-    WHERE a.subject_object_id IS NULL
-      AND a.source_kind=o.source_kind
-      AND a.source_id=o.source_id
-      AND a.source_revision=o.source_revision
-      AND a.commit_seq IS NOT NULL
-      {commit_bound}
-    ORDER BY a.commit_seq DESC,a.admission_decision_id DESC
-    LIMIT 1
-)"
+        "{alias}.source_kind=o.source_kind
+      AND {alias}.source_id=o.source_id
+      AND {alias}.source_revision=o.source_revision"
     )
 }
 
@@ -548,13 +553,12 @@ fn approval_row_fields(alias: &str) -> String {
 /// row that does not qualify on its own supplies none either.
 fn own_decision_qualifies_sql() -> String {
     let fields = approval_row_fields("own");
+    let lineage = same_lineage_as_object("own");
     format!(
         "EXISTS (
     SELECT 1 FROM admission_decisions own
     WHERE own.subject_object_id=o.object_id
-      AND own.source_kind=o.source_kind
-      AND own.source_id=o.source_id
-      AND own.source_revision=o.source_revision
+      AND {lineage}
       AND own.commit_seq IS NOT NULL
       AND {fields}
 )"
