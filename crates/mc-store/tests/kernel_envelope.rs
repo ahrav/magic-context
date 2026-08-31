@@ -2,10 +2,10 @@
 
 use std::cell::Cell;
 
-use mc_store::kernel::schema::{apply_kernel_connection_profile, apply_kernel_schema};
 use mc_store::kernel::{
-    AlignmentProjectionSpec, CommitFault, CommitIntent, DomainSpec, KernelError, KernelErrorKind,
-    KernelStore, Sensitivity,
+    AlignmentProjectionSpec, CommitFault, CommitIntent, DecisionPayload, DecisionSpec, DomainSpec,
+    KernelError, KernelErrorKind, KernelStore, ObservationDependencySpec, ObservationPayload,
+    ObservationSpec, Sensitivity,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -38,60 +38,70 @@ fn inspect(root: &std::path::Path, sql: &str) -> i64 {
     connection.query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
-fn seed_projection_inputs(root: &std::path::Path) {
-    let mut connection = Connection::open(root.join("core.sqlite")).unwrap();
-    apply_kernel_connection_profile(&mut connection, 5_000).unwrap();
-    apply_kernel_schema(&mut connection, "0123456789abcdef0123456789abcdef", 1).unwrap();
-    let transaction = connection.transaction().unwrap();
-    transaction
-        .execute(
-            "INSERT INTO commit_log(transaction_id,writer_epoch,recorded_at,actor,cause)
-             VALUES ('seed',1,1,'test','projection fixture')",
-            [],
-        )
+fn seed_projection_inputs(root: &std::path::Path) -> i64 {
+    let store = KernelStore::open(root).unwrap();
+    store
+        .commit(intent("projection-domain", '0'), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "domain".to_string(),
+                object_id: "domain-object".to_string(),
+                name: "fixture".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "domain".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
         .unwrap();
-    let commit_seq = transaction.last_insert_rowid();
-    transaction
-        .execute(
-            "INSERT INTO domains(domain_id,object_id,name,created_commit_seq,sensitivity_class)
-             VALUES ('domain','domain-object','fixture',?1,'normal')",
-            [commit_seq],
-        )
-        .unwrap();
-    for (object_id, object_kind, source_id) in [
-        ("domain-object", "domain", "domain"),
-        ("decision-object", "decision", "decision"),
-        ("observation-object", "observation", "observation"),
-    ] {
-        transaction
-            .execute(
-                "INSERT INTO object_registry(
-                     object_id,object_kind,domain_id,source_kind,source_id,source_revision,
-                     created_commit_seq,sensitivity_class
-                 ) VALUES (?1,?2,'domain','fixture',?3,1,?4,'normal')",
-                (object_id, object_kind, source_id, commit_seq),
-            )
-            .unwrap();
-    }
-    transaction
-        .execute(
-            "INSERT INTO decisions(
-                 decision_id,object_id,decision_kind,decision_payload,created_commit_seq,
-                 sensitivity_class
-             ) VALUES ('decision','decision-object','fixture',X'01',?1,'normal')",
-            [commit_seq],
-        )
-        .unwrap();
-    transaction
-        .execute(
-            "INSERT INTO observations(
-                 observation_id,object_id,observation_kind,observation_payload,observed_at,
-                 created_commit_seq,sensitivity_class
-             ) VALUES ('observation','observation-object','fixture',X'01',1,?1,'normal')",
-            [commit_seq],
-        )
-        .unwrap();
-    transaction.commit().unwrap();
+    store
+        .commit(intent("projection-pair", '1'), |envelope| {
+            envelope.insert_decision(DecisionSpec {
+                decision_id: "decision".to_string(),
+                object_id: "decision-object".to_string(),
+                domain_id: "domain".to_string(),
+                proposition_id: None,
+                scope_id: None,
+                anchor_id: None,
+                evidence_id: None,
+                decision_kind: "fixture".to_string(),
+                payload: DecisionPayload {
+                    summary: "fixture".to_string(),
+                    rationale: "projection replacement test".to_string(),
+                },
+                source_kind: "fixture".to_string(),
+                source_id: "decision".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            envelope.insert_observation(ObservationSpec {
+                observation_id: "observation".to_string(),
+                object_id: "observation-object".to_string(),
+                domain_id: "domain".to_string(),
+                proposition_id: None,
+                scope_id: None,
+                anchor_id: None,
+                evidence_id: None,
+                observation_kind: "fixture".to_string(),
+                payload: ObservationPayload {
+                    summary: "fixture".to_string(),
+                    classification: "implemented".to_string(),
+                },
+                observed_at: 1,
+                dependencies: vec![ObservationDependencySpec {
+                    dependency_object_id: "decision-object".to_string(),
+                    dependency_kind: "implements".to_string(),
+                    dependency_payload: None,
+                }],
+                source_kind: "fixture".to_string(),
+                source_id: "observation".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq
 }
 
 #[test]
@@ -466,16 +476,18 @@ fn envelope_persists_declared_sensitivity_across_canonical_and_outbox_rows() {
 #[test]
 fn projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events() {
     let directory = tempfile::tempdir().unwrap();
-    seed_projection_inputs(directory.path());
+    let built_through_commit_seq = seed_projection_inputs(directory.path());
     let store = KernelStore::open(directory.path()).unwrap();
     let baseline_commits = inspect(directory.path(), "SELECT COUNT(*) FROM commit_log");
+    let baseline_events = inspect(directory.path(), "SELECT COUNT(*) FROM change_event");
+    let baseline_outbox = inspect(directory.path(), "SELECT COUNT(*) FROM outbox");
 
     let first = AlignmentProjectionSpec {
         decision_id: "decision".to_string(),
         observation_id: "observation".to_string(),
         alignment_kind: "intended".to_string(),
         alignment_payload: Some("api_key=first-private-value".to_string()),
-        built_through_commit_seq: 1,
+        built_through_commit_seq,
     };
     assert_eq!(
         store.replace_alignment_projection(&[first]).unwrap().rows,
@@ -493,7 +505,7 @@ fn projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events()
         observation_id: "observation".to_string(),
         alignment_kind: "implemented".to_string(),
         alignment_payload: Some("password=second-private-value".to_string()),
-        built_through_commit_seq: 1,
+        built_through_commit_seq,
     };
     assert_eq!(
         store.replace_alignment_projection(&[second]).unwrap().rows,
@@ -506,9 +518,12 @@ fn projection_full_replace_is_coordinator_side_and_creates_no_commit_or_events()
     );
     assert_eq!(
         inspect(directory.path(), "SELECT COUNT(*) FROM change_event"),
-        0
+        baseline_events
     );
-    assert_eq!(inspect(directory.path(), "SELECT COUNT(*) FROM outbox"), 0);
+    assert_eq!(
+        inspect(directory.path(), "SELECT COUNT(*) FROM outbox"),
+        baseline_outbox
+    );
     let connection = Connection::open_with_flags(
         directory.path().join("core.sqlite"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
