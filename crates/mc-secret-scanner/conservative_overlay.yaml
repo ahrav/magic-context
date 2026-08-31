@@ -3,45 +3,76 @@ rules:
   regex: '\bsk-ant-(?:api03|admin01)-[A-Za-z0-9_-]{93}AA\b'
   anchors: [sk-ant-]
   radius: 256
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
 # The `T3BlbkFJ` marker prevents matches on `sk-ant-` keys and bare `sk-` identifiers.
+# A looser shape than the corpus `openai-api-key` rule would let this overlay report a candidate the corpus rejects.
 - name: magic-openai-api-key
-  regex: '\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}T3BlbkFJ[A-Za-z0-9_-]{20,}'
+  regex: '\b(?:sk-(?:proj|svcacct|admin)-(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})T3BlbkFJ(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})|sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20})\b'
   anchors: [T3BlbkFJ]
   radius: 256
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
 - name: magic-github-pat
   regex: '\bgithub_pat_[A-Za-z0-9_]{82}\b'
   anchors: [github_pat_]
   radius: 256
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   offline_validation:
     type: github_fine_grained_pat
 - name: magic-github-token
   regex: '\b(?:gh[opsu]|ghr)_[A-Za-z0-9]{36}\b'
   anchors: [ghp_, gho_, ghs_, ghu_, ghr_]
   radius: 256
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   offline_validation:
     type: crc32_base62
     prefix_skip: 4
     payload_len: 30
     checksum_len: 6
+# Digits are not part of the corpus `huggingface-access-token` alphabet.
 - name: magic-huggingface-token
-  regex: '\bhf_[A-Za-z0-9]{34}\b'
+  regex: '\bhf_[A-Za-z]{34}\b'
   anchors: [hf_]
   radius: 256
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
 # The 16 characters after the prefix are base32, so `0`, `1`, `8`, and `9` are invalid.
 - name: magic-aws-access-key-id
   regex: '\b(?:AKIA|ASIA)[A-Z2-7]{16}\b'
   anchors: [AKIA, ASIA]
   radius: 256
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   offline_validation:
     type: aws_access_key
 - name: magic-slack-token
   regex: '\bxox[abeoprsuvc]-[A-Za-z0-9-]{8,}'
   anchors: [xox]
   radius: 256
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   offline_validation:
     type: slack_token
+# Without a closing boundary an overlong identifier still reports a truncated prefix.
 - name: magic-google-api-key
-  regex: '\bAIza[A-Za-z0-9_-]{35}'
+  regex: '\bAIza[A-Za-z0-9_-]{35}\b'
   anchors: [AIza]
   radius: 256
   entropy:
@@ -62,8 +93,9 @@ rules:
   regex: '\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{10,}'
   anchors: [eyJ]
   radius: 256
+# A non-delimiting quote is content; each value class excludes only its delimiter.
 - name: magic-keyed-double-quoted
-  regex: '(?i)"(?P<key>[^"'']*(?:key|token|secret|password|auth|bearer|credential)[^"'']*)"\s*:\s*"(?P<value>[^"'']*)"'
+  regex: '(?i)"(?P<key>[^"]*(?:key|token|secret|password|auth|bearer|credential)[^"]*)"\s*:\s*"(?P<value>[^"]*)"'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   key_group: key
@@ -73,7 +105,7 @@ rules:
     'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
     'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
 - name: magic-keyed-single-quoted
-  regex: '(?i)''(?P<key>[^"'']*(?:key|token|secret|password|auth|bearer|credential)[^"'']*)''\s*:\s*''(?P<value>[^"'']*)'''
+  regex: '(?i)''(?P<key>[^'']*(?:key|token|secret|password|auth|bearer|credential)[^'']*)''\s*:\s*''(?P<value>[^'']*)'''
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   key_group: key
@@ -83,7 +115,7 @@ rules:
     'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
     'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
 - name: magic-keyed-double-single
-  regex: '(?i)"(?P<key>[^"'']*(?:key|token|secret|password|auth|bearer|credential)[^"'']*)"\s*:\s*''(?P<value>[^"'']*)'''
+  regex: '(?i)"(?P<key>[^"]*(?:key|token|secret|password|auth|bearer|credential)[^"]*)"\s*:\s*''(?P<value>[^'']*)'''
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   key_group: key
@@ -93,7 +125,7 @@ rules:
     'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
     'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
 - name: magic-keyed-single-double
-  regex: '(?i)''(?P<key>[^"'']*(?:key|token|secret|password|auth|bearer|credential)[^"'']*)''\s*:\s*"(?P<value>[^"'']*)"'
+  regex: '(?i)''(?P<key>[^'']*(?:key|token|secret|password|auth|bearer|credential)[^'']*)''\s*:\s*"(?P<value>[^"]*)"'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   key_group: key
@@ -103,7 +135,7 @@ rules:
     'redacted', 'REDACTED', 'dummy', 'DUMMY', 'notasecret', 'xxxx', 'XXXX', 'your-', 'your_',
     'YOUR-', 'YOUR_', 'insert_', 'INSERT_', 'todo', 'TODO', 'fixme', 'FIXME', '${', '{{']
 - name: magic-keyed-assignment
-  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*(?P<value>[^\s''"`]+)'
+  regex: '(?i)\b(?P<key>[A-Za-z0-9_.-]*(?:key|token|secret|password|auth|bearer|credential)[A-Za-z0-9_.-]*)\s*=\s*["'']?(?P<value>[^\s''"`]+)["'']?'
   anchors: [key, token, secret, password, auth, bearer, credential]
   radius: 256
   key_group: key

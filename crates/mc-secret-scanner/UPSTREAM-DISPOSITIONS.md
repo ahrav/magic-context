@@ -8,6 +8,13 @@ source updates.
 | --- | --- | --- | --- | --- |
 | Baseline | Repository start through `3d2869011138cd7812a12f893dc93635a961b0d7` | Accepted as lift baseline | Copied corpus and adapted direct-text semantics listed in `SOURCE-INVENTORY.md` | Local contract, canary, direct-rule regression, digest, and provenance tests; pinned evaluator parity remains unmet |
 | Baseline-defect-1 | `bittrex-access-key` and `bittrex-secret-key` at `3d2869011138cd7812a12f893dc93635a961b0d7` | Accepted with known defect | Corpus stays byte-identical; the two rules share one regex and body, so a Bittrex match emits two findings that consumers dedupe by value span | Rule bodies at `default_rules.yaml` lines 716-751 are identical apart from `name` |
+| Baseline-defect-2 | `nytimes-access-token` at `3d2869011138cd7812a12f893dc93635a961b0d7` | Accepted with known defect | Corpus stays byte-identical; the `new-york-times,` alternation branch requires a literal comma, so that spelling is unreachable and only `nytimes` and `newyorktimes` detect | `default_rules.yaml` line 3317 spells the branch `new-york-times,` while the `anchors` and `keywords_any` entries at lines 3321 and 3330 spell it without the comma |
+
+Recording a disposition for post-baseline drift requires naming both the watched
+source path and the digest the drift check observed, because
+`scripts/check-secret-scanner-upstream-drift.sh` clears a drifted source only
+when one row carries both. Record `absent` as the digest for a source that
+upstream deleted.
 
 No post-baseline drift has been reviewed in this branch.
 `scripts/check-secret-scanner-upstream-drift.sh` reports `fetch-unavailable`,

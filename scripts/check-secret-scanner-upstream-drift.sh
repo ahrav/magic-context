@@ -5,11 +5,15 @@
 #   source-inventory-mismatch inventory validation failed
 #   source-drift              watched source differs from the pinned digest
 #
+# Drift whose observed digest is already recorded in UPSTREAM-DISPOSITIONS.md prints
+# `source-drift-disposed` and does not fail, so a reviewed change unblocks release.
+#
 # Fetches land in a scratch git directory, so this repository is never written to.
 set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 inventory="$repo_root/crates/mc-secret-scanner/SOURCE-INVENTORY.md"
+dispositions="$repo_root/crates/mc-secret-scanner/UPSTREAM-DISPOSITIONS.md"
 upstream_url="https://github.com/ahrav/gossip-rs"
 watched_branch="main"
 
@@ -27,12 +31,38 @@ fail() {
     exit 1
 }
 
+# `sh` may be dash, which has no `pipefail`, so a failing `sha256sum` would otherwise
+# reach `cut` and yield an empty digest that reads as a mismatch rather than an I/O error.
 sha256_of() {
+    [ -f "$1" ] || fail source-inventory-mismatch "not a readable file: $1"
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$1" | cut -d' ' -f1
+        _digest=$(sha256sum "$1") || fail source-inventory-mismatch "sha256sum failed for $1"
     else
-        shasum -a 256 "$1" | cut -d' ' -f1
+        _digest=$(shasum -a 256 "$1") || fail source-inventory-mismatch "shasum failed for $1"
     fi
+    _digest=${_digest%% *}
+    case "$_digest" in
+        *[!0-9a-f]* | '') fail source-inventory-mismatch "unusable digest for $1" ;;
+    esac
+    [ ${#_digest} -eq 64 ] || fail source-inventory-mismatch "short digest for $1"
+    printf '%s\n' "$_digest"
+}
+
+# A row clears one drifted source when it names both the path and the digest observed
+# on the watched branch, so an unrelated review decision cannot silence a new change.
+disposition_recorded() {
+    awk -F'|' -v path="$1" -v digest="$2" '
+        /^\|/ {
+            row = $0
+            gsub(/[ `]/, "", row)
+            if (index(row, path) && index(row, digest) &&
+                (index(row, "Accepted") || index(row, "Rejected") || index(row, "Superseded"))) {
+                found = 1
+                exit
+            }
+        }
+        END { exit found ? 0 : 1 }
+    ' "$dispositions"
 }
 
 recorded_digest() {
@@ -49,14 +79,19 @@ recorded_digest() {
 }
 
 [ -f "$inventory" ] || fail source-inventory-mismatch "missing $inventory"
+[ -f "$dispositions" ] || fail source-inventory-mismatch "missing $dispositions"
 
 pinned_commit=$(sed -n 's/^Pinned commit: `\([0-9a-f]\{40\}\)`.*$/\1/p' "$inventory" | head -n1)
 if [ -z "$pinned_commit" ]; then
     fail source-inventory-mismatch "no pinned commit recorded"
 fi
 
-# The overlay digest is recorded as prose, not as a table row.
-overlay_recorded=$(grep -o '`[0-9a-f]\{64\}`' "$inventory" | tr -d '`' | tail -n1)
+# Anchoring on the label keeps this independent of where the line sits in the document
+# and of the 64-hex digests in the table.
+overlay_recorded=$(sed -n 's/^Overlay SHA-256: `\([0-9a-f]\{64\}\)`.*$/\1/p' "$inventory" | head -n1)
+if [ -z "$overlay_recorded" ]; then
+    fail source-inventory-mismatch "no overlay digest recorded"
+fi
 overlay_actual=$(sha256_of "$repo_root/crates/mc-secret-scanner/conservative_overlay.yaml")
 if [ "$overlay_recorded" != "$overlay_actual" ]; then
     fail source-inventory-mismatch "conservative_overlay.yaml hashes to $overlay_actual"
@@ -114,8 +149,12 @@ for source in $watched_sources; do
     fi
     watched_digest=$(upstream_digest "$watched_head" "$source")
     if [ "$watched_digest" != "$expected" ]; then
-        printf 'source-drift: %s is %s on %s\n' "$source" "$watched_digest" "$watched_branch" >&2
-        drift="$drift $source"
+        if disposition_recorded "$source" "$watched_digest"; then
+            printf 'source-drift-disposed: %s is %s on %s\n' "$source" "$watched_digest" "$watched_branch"
+        else
+            printf 'source-drift: %s is %s on %s\n' "$source" "$watched_digest" "$watched_branch" >&2
+            drift="$drift $source"
+        fi
     fi
 done
 
