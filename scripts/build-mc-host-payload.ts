@@ -1,33 +1,28 @@
 /**
- * U6 native payload builder and post-build trust generator (KTD7, KTD9, KTD10,
- * KTD23, R20-R26, R30, R48, R50).
+ * This module builds U6 native payloads and generates post-build trust records.
  *
  * Modes:
  *
- *   bun scripts/build-mc-host-payload.ts              # production payload build.
- *       Requires production-qualified U9 evidence (requireQualificationEvidence);
- *       fails closed today because release inputs are not production-qualified.
+ * The default command builds the production payload.
+ * The production build requires production-qualified U9 evidence through `requireQualificationEvidence`.
+ * The production build fails closed because its release inputs are not production-qualified.
  *
- *   bun scripts/build-mc-host-payload.ts --check      # repo validation, no writes.
- *       Validates payload package metadata against the U8 contract, the canonical
- *       payload-manifest / trust-index / stop-provenance schemas, U8/U9 digest
- *       citations, parent optional dependencies, payload-before-parent publication
- *       ordering, and size budgets. Performs no publish and no parent pack.
+ * The `--check` mode validates the repository without writing files.
+ * The `--check` mode validates payload metadata against the U8 contract and canonical schemas.
+ * The `--check` mode validates digest citations, optional dependencies, publication order, and size budgets without publishing or packing a parent.
  *
- *   bun scripts/build-mc-host-payload.ts --write-trust # regenerate the committed
- *       trust artifacts (release/mc-host-payload-index.json and
+ * The `--write-trust` mode regenerates the committed trust records.
+ * The `--write-trust` mode deterministically regenerates `release/mc-host-payload-index.json` and `release/mc-host-n-minus-one-stop.json`.
  *       release/mc-host-n-minus-one-stop.json) deterministically.
  *
- *   bun scripts/build-mc-host-payload.ts --dev [--out <dir>]
- *       Dev payload from the locally compiled ck-mc-host binary into an output
- *       directory (default tmp/mc-host-dev-payload), generating a real canonical
- *       payload manifest whose digest names the generation. Never a release input.
+ * The `--dev [--out <dir>]` mode builds a development payload from the locally compiled `ck-mc-host` binary.
+ * The default development-payload output directory is `tmp/mc-host-dev-payload`.
+ * Development payloads are never release inputs.
  *
- * Because production inputs are unqualified (U9 production_qualified: false), the
- * committed trust index is in a schema-valid but fail-closed state: every entry is
- * unpublished/unqualified with null digests, which consumers must reject before
- * executing any native byte. This is the first payload-bearing release, so the
- * committed stop-provenance record is the non-authorizing `genesis` tag (R48).
+ * Because U9 sets `production_qualified` to `false`, the committed trust index is schema-valid but fail-closed.
+ * Every committed trust-index entry has a null digest.
+ * Consumers must reject entries with null digests.
+ * The committed stop-provenance record uses the non-authorizing `genesis` tag.
  */
 
 import { createHash } from "node:crypto";
@@ -75,7 +70,6 @@ function fail(message: string): never {
 }
 
 // ---------------------------------------------------------------------------
-// Paths and target table.
 // ---------------------------------------------------------------------------
 
 export const OUTPUT_PATHS = {
@@ -94,15 +88,9 @@ const PARENT_DIRS: Record<string, string> = {
 export const LAUNCHER_PATH = "payload/bin/ck-mc-host";
 export const NATIVE_ADDON_PATH = "payload/native/mc_shm_native.node";
 
-/** Linux-only U9-gated production slots (R25). Corpus is a certification input,
- *  not a shipped file. Populated only from qualified locked bytes; never committed.
+/** U9 qualification gates these Linux production slots.
  *
- *  `bundle_manifest` ships because the daemon requires it: `synapse_component`
- *  disables the lane outright when the generation carries no
- *  `payload/model/<model>/manifest.json`, and that file is what names and hashes
- *  every other model artifact. Omitting it from an exactly-enforced file set made
- *  a conforming production payload one the certified Synapse lane could never
- *  activate over, while the manifest still claimed `synapse: certified_cpu`. */
+ * */
 export const LINUX_PRODUCTION_PAYLOAD_SLOTS: Record<string, string> = {
     ort_runtime: "payload/ort/libonnxruntime.so",
     bundle_manifest: "payload/model/gte-modernbert-base-f16/manifest.json",
@@ -158,13 +146,12 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 const FORBIDDEN_LIFECYCLE_SCRIPTS = ["preinstall", "install", "postinstall"];
 
 // ---------------------------------------------------------------------------
-// Release context: U8 contract + U9 citations + registry-gate reservations.
 // ---------------------------------------------------------------------------
 
 export interface ReleaseContext {
     contract: ReleaseContract;
     u8Digest: string;
-    /** sha256 of the committed U9 lock file bytes. */
+    /* */
     lockSha256: string;
     lock: {
         production_qualified: boolean;
@@ -183,7 +170,7 @@ export interface ReleaseContext {
         >;
     };
     productionQualified: boolean;
-    /** Inert non-GA reservation versions that can never be release ancestry (R50). */
+    /* */
     reservationVersions: string[];
 }
 
@@ -205,7 +192,6 @@ function parseJson(relative: string, text: string): Record<string, unknown> {
     ) {
         fail(`${relative} must be a JSON object`);
     }
-    // SAFETY: guarded above — parsed is a non-null, non-array object.
     return parsed as Record<string, unknown>;
 }
 
@@ -215,7 +201,7 @@ function readJson(rootDir: string, relative: string): Record<string, unknown> {
     return parseJson(relative, readFileSync(path, "utf8"));
 }
 
-/** Load and cross-verify the U8/U9 artifacts every U6 output cites (KTD7). */
+/** U6 outputs cite these U8/U9 artifacts. */
 export function loadReleaseContext(rootDir: string): ReleaseContext {
     const contract = buildContract();
     const canonicalContract = canonicalJson(contract);
@@ -263,14 +249,12 @@ export function loadReleaseContext(rootDir: string): ReleaseContext {
         },
     };
 
-    // Local evidence is optional only for a committed fail-closed lock.
+    // Local evidence is optional only when the lock is committed and fail-closed.
     const evidencePath = join(rootDir, U9_OUTPUT_PATHS.evidence);
     let artifacts: Record<string, { path?: unknown; sha256?: unknown }> | undefined;
     if (existsSync(evidencePath)) {
         const evidence = readJson(rootDir, U9_OUTPUT_PATHS.evidence);
-        // The identity rules are shared with `requireQualificationEvidence`
-        // (the U2/U6 consumption gate) so the two validators of this document
-        // cannot drift apart.
+        // `qualificationEvidenceIdentityMismatch` and `requireQualificationEvidence` share identity rules.
         const identityMismatch = qualificationEvidenceIdentityMismatch(
             evidence,
             contract,
@@ -341,14 +325,14 @@ export function loadReleaseContext(rootDir: string): ReleaseContext {
 }
 
 // ---------------------------------------------------------------------------
-// Canonical per-target payload manifest.
+// Each manifest defines the canonical payload for one target.
 // ---------------------------------------------------------------------------
 
 export interface PayloadFileEntry {
     path: string;
     type: "file";
     size: number;
-    /** Octal permission string; launcher is "755", everything else "644". */
+    /* */
     mode: "644" | "755";
     sha256: string;
 }
@@ -366,7 +350,7 @@ export interface PayloadManifest {
     files: PayloadFileEntry[];
 }
 
-/** The manifest digest that names a staged generation (KTD9). */
+/** The manifest digest names a staged generation. */
 export function payloadManifestDigest(manifest: PayloadManifest): string {
     return sha256Hex(canonicalJson(manifest));
 }
@@ -411,7 +395,7 @@ function assertExactKeys(
 
 const PATH_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-/** Relative, payload-rooted, traversal-free file path (R29/R30). */
+/** A file path is relative to the payload root and cannot traverse directories. */
 export function assertSafePayloadPath(path: string): void {
     if (typeof path !== "string" || path.length === 0 || path.length > 512) {
         fail(`unsafe payload path ${JSON.stringify(path)}`);
@@ -436,10 +420,6 @@ export function assertSafePayloadPath(path: string): void {
 }
 
 /**
- * Validate one canonical per-target payload manifest against the release
- * context: schema, target identity, floor, launcher, file entries (sorted,
- * unique, traversal-free, real digests), Synapse byte rules, and the unpacked
- * size budget from the U9 lock.
  */
 export function validatePayloadManifest(
     manifest: unknown,
@@ -461,8 +441,6 @@ export function validatePayloadManifest(
         ],
         "payload manifest",
     );
-    // SAFETY: assertExactKeys proved the exact PayloadManifest key set; every
-    // field's type is validated below before use.
     const m = manifest as unknown as PayloadManifest;
     if (m.schema !== "magic-context.mc-host-payload-manifest/v1") {
         fail("unknown payload-manifest schema");
@@ -575,9 +553,7 @@ export function validatePayloadManifest(
 }
 
 /**
- * Verify staged payload bytes against a validated manifest: every listed file
- * exists with exact size/sha256/mode, no symlink appears anywhere, and no
- * unlisted file exists under payload/. One-byte mutation anywhere fails.
+ * Validation rejects unlisted files under `payload/` and any one-byte mutation.
  */
 export function verifyPayloadDir(
     packageRoot: string,
@@ -601,10 +577,8 @@ export function verifyPayloadDir(
         }
         const digest = createHash("sha256").update(bytes).digest("hex");
         if (digest !== entry.sha256) fail(`${entry.path}: digest drift`);
-        // The manifest declares each file's permission bits, and its digest is
-        // what certifies the staged tree. Checking only the bytes would let a
-        // non-executable launcher — or an overly permissive data file — inherit
-        // that certification while contradicting the manifest it is verified
+        // The manifest digest commits to each file's mode and SHA-256.
+        // Without mode validation, a non-executable launcher or permissive data file could pass verification.
         // against.
         const actualMode = stat.mode & 0o777;
         const expectedMode = Number.parseInt(entry.mode, 8);
@@ -631,7 +605,6 @@ export function verifyPayloadDir(
 }
 
 // ---------------------------------------------------------------------------
-// Platform package metadata (KTD10, R20, R23, plan scenario 2/9).
 // ---------------------------------------------------------------------------
 
 export function validatePayloadPackageDir(
@@ -670,7 +643,7 @@ export function validatePayloadPackageDir(
     } else if ("libc" in pkg) {
         fail(`${where}: libc is Linux-only metadata`);
     }
-    // No lifecycle scripts of any kind: install filtering only (R23).
+    // No lifecycle scripts are allowed; installation uses filtering only.
     if ("scripts" in pkg) {
         const scripts = Object.keys(pkg.scripts as Record<string, unknown>);
         const lifecycle = scripts.filter((name) =>
@@ -716,8 +689,6 @@ export function validatePayloadPackageDir(
             fail(`${target.dir}: missing or empty ${doc}`);
         }
     }
-    // No tarball and no committed payload bytes: production bytes exist only
-    // after qualification, and U6 never packs parents (R50).
     for (const name of readdirSync(join(rootDir, target.dir))) {
         if (name.endsWith(".tgz"))
             fail(`${target.dir}: unexpected tarball ${name}`);
@@ -742,8 +713,8 @@ export function validatePayloadPackageDir(
     }
 }
 
-/** Each parent must declare all three payload packages at the exact
- *  synchronized version — no ranges, tags, or workspace specifiers (R20). */
+/**
+ * Each parent must declare every payload package at the exact release version. */
 export function validateParentManifests(
     rootDir: string,
     contract: ReleaseContract,
@@ -786,7 +757,7 @@ export function validateParentManifests(
                 fail(`${where}: unknown payload optional dependency ${name}`);
             }
         }
-        // npm continues when optionalDependencies installation fails, so an addon listed in optionalDependencies overrides its required entry. commentlint: allow(JUDGE)
+        // npm continues when optionalDependencies installation fails, so an addon listed in optionalDependencies overrides its required entry.
         for (const addon of contract.packages.addons) {
             if (addon in optional) {
                 fail(
@@ -823,7 +794,6 @@ export function validateParentManifests(
 }
 
 // ---------------------------------------------------------------------------
-// Current-release trust index (R30) and tagged stop-provenance record (R48).
 // ---------------------------------------------------------------------------
 
 export function buildTrustArtifacts(
@@ -895,7 +865,6 @@ export function buildTrustArtifacts(
         production_inputs_lock_sha256: context.lockSha256,
         production_qualified: context.productionQualified,
         publication: {
-            // U6 publishes nothing; U7 must publish every payload before any parent.
             payloads_before_parents: true,
             published: false,
             order: [
@@ -905,8 +874,6 @@ export function buildTrustArtifacts(
         },
         entries,
     };
-    // First payload-bearing release: non-authorizing genesis record binding the
-    // current U8 release identity and nothing else (R48).
     const stop = {
         release_version: contract.release.version,
         tag: "genesis",
@@ -920,13 +887,7 @@ export function buildTrustArtifacts(
 }
 
 /**
- * Full trust-index validation: schema, release identity, cited digests, and
- * every target entry's package identity, platform floors, and size budgets.
  *
- * Takes only the fields it reads rather than a whole `ReleaseContext`, for the
- * same reason `validateStopRecord` does: the wider type is what kept this
- * validator reachable only from the payload builder, leaving the evidence
- * verifier to hand-roll a weaker summary check over the same file.
  */
 export function validateTrustIndex(
     index: unknown,
@@ -1068,8 +1029,6 @@ export function validateTrustIndex(
                 }
             }
         } else if (entry.qualified === false) {
-            // Fail-closed unpublished state: no digest may exist, publication is
-            // impossible, and a machine-readable reason is required.
             if (
                 entry.published !== false ||
                 entry.payload_manifest_digest !== null ||
@@ -1088,20 +1047,10 @@ export function validateTrustIndex(
 }
 
 /**
- * Validate the tagged `genesis | predecessor` stop-provenance record beyond the
- * U8 schema: reservation versions can never be ancestry, a predecessor can
- * never be self-authored, must name a supported target and the exact expected
- * adjacent N-1 release (N-2/skipped rejected), must use the pinned legacy proof
- * version, and its embedded manifest must hash to the cited digest (modified
  * N-1 rejected).
  */
 /**
- * Full stop-record validation: schema plus this release's ancestry rules.
  *
- * Takes only the contract and the reservation versions rather than a whole
- * `ReleaseContext`, because that is its real dependency set — the wider type
- * kept this validator reachable only from the payload builder, which is why the
- * evidence verifier previously had to settle for the schema-level
  * `validateStopProvenance` alone.
  */
 export function validateStopRecord(
@@ -1173,16 +1122,10 @@ export function validateStopRecord(
 }
 
 // ---------------------------------------------------------------------------
-// Dev payload build (U7-style local smokes and TS bootstrap tests consume this).
 // ---------------------------------------------------------------------------
 
 /**
- * Runtime glibc version, or `null` when this host does not link glibc.
  *
- * `process.platform` is `"linux"` for both glibc and musl systems, so the
- * platform/arch pair alone cannot name a `-gnu` target. The report header
- * carries `glibcVersionRuntime` only when the process is glibc-linked, which
- * makes its absence the musl (or other non-glibc) signal.
  */
 function runtimeGlibcVersion(): string | null {
     const report = (
@@ -1207,10 +1150,6 @@ export function hostTarget(): PayloadTarget {
     );
     if (target === undefined)
         fail(`no payload target for host ${key} (R24 matrix)`);
-    // The only Linux target in the R24 matrix is glibc, and the release
-    // contract declares `libc: ["glibc"]`. Selecting it from platform/arch
-    // alone would stamp a musl-linked launcher with the glibc target and its
-    // glibc_min floor, so establish glibc rather than assume it.
     if (target.target.endsWith("-gnu") && runtimeGlibcVersion() === null) {
         fail(
             `host is Linux ${process.arch} but not glibc-linked, so ${target.target} ` +
@@ -1231,7 +1170,7 @@ export interface DevPayloadResult {
 
 export interface ProductionPayloadResult extends DevPayloadResult {
     manifest: PayloadManifest & { mode: "production" };
-    /** True only when both immutable-input and registry gates ran normally. */
+    /* */
     releaseQualified: boolean;
 }
 
@@ -1250,7 +1189,7 @@ export interface ProductionPayloadSources {
             { size_bytes: number; sha256: string }
         >
     >;
-    /** Deterministic pathname-replacement seam; tests only. */
+    /* */
     afterSourceOpenForTest?: (relative: string, sourcePath: string) => void;
 }
 
@@ -1352,9 +1291,6 @@ function copyPayloadSource(
 }
 
 /**
- * Assemble one target from already-qualified source paths. This low-level
- * function is deterministic and independently verifies the copied tree; the
- * public production entrypoint below first enforces U9 evidence.
  */
 export function assembleProductionPayload(
     context: ReleaseContext,
@@ -1709,9 +1645,6 @@ export function packProductionPayload(
 }
 
 /**
- * Stage a dev payload from a locally compiled ck-mc-host binary and emit a real
- * canonical payload manifest whose digest names the generation. Dev payloads
- * are never release inputs and never contain ORT/model bytes.
  */
 export function buildDevPayload(
     rootDir: string,
@@ -1791,7 +1724,6 @@ export function buildDevPayload(
 }
 
 // ---------------------------------------------------------------------------
-// Check / trust-write drivers.
 // ---------------------------------------------------------------------------
 
 export interface CheckResult {
@@ -1805,8 +1737,6 @@ export function runCheck(
     options: { write: boolean; payloadRoot?: string },
 ): CheckResult {
     const context = loadReleaseContext(rootDir);
-    // Drift-only, same as contract generation: structure is checked on every
-    // change, release readiness only where bytes are actually published.
     validateRegistryGateShape(
         readJson(rootDir, REGISTRY_GATE_PATH),
         context.contract,
@@ -1821,7 +1751,6 @@ export function runCheck(
         options.payloadRoot,
     );
     validateTrustIndex(index, context);
-    // First payload-bearing release: only genesis is acceptable ancestry.
     validateStopRecord(stop, context, null);
 
     const expected = { index: indexText, stop: stopText } as const;
@@ -1844,8 +1773,6 @@ export function runCheck(
             );
         }
     }
-    // Re-validate the committed artifacts as parsed JSON so a hand-edited but
-    // byte-diverging file reports schema problems, not only drift.
     if (drift.length === 0 && !options.write) {
         validateTrustIndex(readJson(rootDir, OUTPUT_PATHS.index), context);
         validateStopRecord(readJson(rootDir, OUTPUT_PATHS.stop), context, null);
@@ -1857,7 +1784,7 @@ export function runCheck(
     };
 }
 
-/** Build the current host target after the U9 qualification gate passes. */
+/* */
 export function buildProductionPayloads(
     rootDir: string,
     outDir: string = join(rootDir, "tmp", "mc-host-production-payload"),

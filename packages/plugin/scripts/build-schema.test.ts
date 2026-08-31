@@ -4,15 +4,7 @@ import * as path from "node:path";
 import { buildSchema } from "./build-schema";
 
 /**
- * Drift guard: the published JSON Schema (`assets/magic-context.schema.json`) is
- * generated from the Zod `MagicContextConfigSchema` via `build-schema.ts`. This
- * test fails if the committed file is out of sync with what the generator
- * produces — i.e. someone changed the Zod config (added a field, changed a
- * default/constraint/description) without re-running `bun build-schema.ts`.
  *
- * This is the structural fix for the class of bug where a config key exists at
- * runtime but is missing from the published schema (e.g. `auto_update`, issue
- * #109): the schema can no longer drift from the runtime validator.
  */
 describe("magic-context JSON schema", () => {
     const schemaPath = path.resolve(
@@ -32,13 +24,12 @@ describe("magic-context JSON schema", () => {
 
     test("every top-level Zod config key appears in the schema", async () => {
         const { MagicContextConfigSchema } = await import("../src/config/schema/magic-context");
-        // Unwrap the .transform() to reach the underlying object shape.
-        // biome-ignore lint/suspicious/noExplicitAny: zod internal shape access for the drift guard.
+        // MagicContextConfigSchema wraps its object shape in `.transform()`.
+        // biome-ignore lint/suspicious/noExplicitAny: `_def` and `def` are untyped Zod internals used to unwrap `.transform()`.
         const def: any = (MagicContextConfigSchema as any)._def ?? (MagicContextConfigSchema as any).def;
-        // The schema is `z.object({...}).transform(...)`; reach the inner object.
-        // biome-ignore lint/suspicious/noExplicitAny: zod internal shape access.
+        // biome-ignore lint/suspicious/noExplicitAny: `innerType` and `schema` are untyped Zod internals.
         const inner: any = def?.innerType ?? def?.schema ?? MagicContextConfigSchema;
-        // biome-ignore lint/suspicious/noExplicitAny: zod internal shape access.
+        // biome-ignore lint/suspicious/noExplicitAny: `shape` is an untyped Zod internal.
         const shape = (inner as any).shape ?? (inner as any)._def?.shape ?? (inner as any).def?.shape;
         const zodKeys =
             typeof shape === "function" ? Object.keys(shape()) : Object.keys(shape ?? {});
@@ -48,7 +39,6 @@ describe("magic-context JSON schema", () => {
         };
         const schemaKeys = new Set(Object.keys(schema.properties));
 
-        // Every zod top-level field must be a documented schema property.
         const missing = zodKeys.filter((k) => !schemaKeys.has(k));
         expect(missing).toEqual([]);
     });

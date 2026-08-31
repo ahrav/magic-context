@@ -28,9 +28,7 @@ describe("migrateDreamerV2", () => {
     });
 
     it("a v2 record MISSING verify-broad gets it backfilled (coupled to verify)", () => {
-        // A v2 tasks-object predating the verify-broad split must gain the task
-        // rather than silently inheriting Zod's default-on — otherwise a user who
-        // disabled verify would get unintended weekly broad verification.
+        // `verify-broad` must be added explicitly instead of inheriting Zod's default.
         const v2 = { dreamer: { tasks: { verify: { schedule: "0 3 * * *" } } } };
         const { out, warnings } = migrate(structuredClone(v2));
         expect(tasks(out)["verify-broad"].schedule).toBe("0 4 * * 0");
@@ -50,8 +48,6 @@ describe("migrateDreamerV2", () => {
     });
 
     it("listed tasks get the base cron; OMITTED canonical tasks are DISABLED", () => {
-        // Deliberate selection: only consolidate + verify. Legacy canonical tasks are disabled;
-        // the new classify task defaults on daily because it did not exist in v1.
         const { out } = migrate({
             dreamer: { schedule: "03:30-06:00", tasks: ["consolidate", "verify"] },
         });
@@ -66,7 +62,6 @@ describe("migrateDreamerV2", () => {
         const { out } = migrate({ dreamer: { schedule: "02:00-06:00" } });
         const t = tasks(out);
         expect(t.verify.schedule).toBe("0 2 * * *");
-        // verify enabled → verify-broad defaults ON weekly; broad_interval_days gone.
         expect(t["verify-broad"].schedule).toBe("0 4 * * 0");
         expect(t.verify.broad_interval_days).toBeUndefined();
         expect(t.curate.schedule).toBe("0 2 * * *");
@@ -104,7 +99,6 @@ describe("migrateDreamerV2", () => {
                 pin_key_files: { enabled: true, token_budget: 8000, min_reads: 6 },
             },
         });
-        // key-files was removed (feature moved to AFT's dreamer).
         expect("key-files" in tasks(out)).toBe(false);
         expect("pin_key_files" in (out.dreamer as Record<string, unknown>)).toBe(false);
     });
@@ -205,7 +199,6 @@ describe("migrateDreamerV2", () => {
         });
         const t = tasks(out);
         expect(t.verify.schedule).toBe("0 3 * * *");
-        // verify present+enabled → verify-broad defaults ON weekly.
         expect(t["verify-broad"].schedule).toBe("0 4 * * 0");
         expect(t.verify.broad_interval_days).toBeUndefined();
         expect(t.curate.schedule).toBe("0 * * * *");
@@ -226,7 +219,7 @@ describe("migrateDreamerV2", () => {
         });
         const t = tasks(out);
         expect(t.verify.schedule).toBe("");
-        // verify off → verify-broad must be off, NOT the schema default 0 4 * * 0.
+        // `verify-broad` is disabled when `verify` is disabled to prevent Zod from applying `0 4 * * 0`.
         expect(t["verify-broad"].schedule).toBe("");
     });
 
@@ -258,7 +251,6 @@ describe("migrateDreamerV2", () => {
             },
         };
         const { out } = migrate(input);
-        // Unchanged → returns the SAME object reference (no churn on every load).
         expect(out).toBe(input);
     });
 
@@ -277,7 +269,7 @@ describe("migrateDreamerV2", () => {
         const t = tasks(out);
         expect(t.verify.schedule).toBe("0 5 * * *");
         expect(t.verify.model).toBe("x/y");
-        // The legacy broad_interval_days knob is dropped; broad is its own task.
+        // The legacy `broad_interval_days` knob is dropped because `verify-broad` is its own task.
         expect(t.verify.broad_interval_days).toBeUndefined();
         expect(t["verify-broad"].schedule).toBe("0 4 * * 0");
         expect(t.curate.schedule).toBe("0 5 * * *");

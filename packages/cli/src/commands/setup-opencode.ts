@@ -35,12 +35,6 @@ import { confirm, intro, log, note, outro, promptIO, spinner } from "../lib/prom
 const DCP_PLUGIN_NAME = "@tarquinen/opencode-dcp";
 
 /**
- * Resolve the MC compaction mode for CLI writers (setup/doctor/fixer) using
- * the SAME loader the plugin uses and the SAME accessor. On load failure the
- * writer takes the preserve-existing-native-fields branch: it returns `false`
- * so the writer/fixer skip any native compaction write/flip (never assuming
- * either mode) and emits a diagnostic. This is distinct from the boot/TUI
- * path, which fails toward mode-on when it cannot supply the resolved value.
  */
 function resolveCompactionEnabledForWriter(): boolean {
     try {
@@ -56,7 +50,6 @@ function resolveCompactionEnabledForWriter(): boolean {
     }
 }
 
-// ─── Helpers ──────────────────────────────────────────────
 
 function ensureDir(dir: string): void {
     if (!existsSync(dir)) {
@@ -64,24 +57,17 @@ function ensureDir(dir: string): void {
     }
 }
 
-// ─── Config Manipulators ──────────────────────────────────
 
 export function addPluginToOpenCodeConfig(
     configPath: string,
     _format: "json" | "jsonc" | "none",
     removeDcp = false,
     /**
-     * The resolved MC compaction mode. When `false` (compaction-off mode), the
-     * writer MUST NOT write `compaction.auto=false` / `compaction.prune=false`
-     * into opencode.jsonc — native compaction (or nothing) is the user's chosen
-     * window manager, so pre-existing native compaction fields are left
-     * byte-for-byte as found. Default `true` (mode-on) preserves today's write
-     * behavior for call sites that cannot supply the resolved mode.
+     * When compactionEnabled is false, the writer does not write compaction.auto or compaction.prune.
+     * When compactionEnabled is false, the writer does not change compaction fields.
      */
     compactionEnabled = true,
 ): void {
-    // The detection result predates interactive prompts. Re-read at commit time so
-    // a config created while the wizard was open is merged instead of overwritten.
     const existsAtCommit = existsSync(configPath);
     const existing = existsAtCommit ? readJsoncConfigForUpdate(configPath) : {};
     if (!existsAtCommit) {
@@ -138,8 +124,8 @@ export function addPluginToOpenCodeConfig(
         changed = true;
     }
 
-    // In compaction-off mode native fields are never changed. In mode-on, update
-    // existing booleans in place so comments and the rest of the file stay intact.
+    // When compactionEnabled is false, the writer does not change compaction fields.
+    // When compactionEnabled is true, the writer sets compaction.auto and compaction.prune to false.
     if (compactionEnabled) {
         const compaction = existing.compaction;
         const hasCompactionObject =
@@ -164,7 +150,6 @@ export function addPluginToOpenCodeConfig(
 }
 
 export function addPluginToTuiConfig(configPath: string, _format: "json" | "jsonc" | "none"): void {
-    // Config discovery may be stale after prompts; merge the commit-time contents.
     const existsAtCommit = existsSync(configPath);
     const existing = existsAtCommit ? readJsoncConfigForUpdate(configPath) : {};
     if (!existsAtCommit) {
@@ -237,17 +222,15 @@ export function writeMagicContextConfig(
         historianModel: string | null;
         dreamerEnabled: boolean;
         dreamerModel: string | null;
-        /** Per-task schedule overrides (Dreamer v2); undefined keeps schema defaults. */
+        /* */
         dreamerTasks?: Record<string, { schedule: string }>;
         sidekickEnabled: boolean;
         sidekickModel: string | null;
         claudeMax: boolean;
     },
 ): void {
-    // A malformed existing file must abort rather than become an empty config.
     const config = readJsoncConfigForUpdate(configPath);
 
-    // Always set $schema for editor autocomplete/validation
     if (!config.$schema) {
         config.$schema =
             "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json";
@@ -266,9 +249,6 @@ export function writeMagicContextConfig(
         if (options.dreamerModel) {
             dreamer.model = options.dreamerModel;
         }
-        // Dreamer v2 per-task schedules. Only written when the user declined the
-        // recommended defaults — otherwise we leave `tasks` unset so the schema
-        // defaults apply (and the config stays small).
         if (options.dreamerTasks) {
             dreamer.tasks = options.dreamerTasks;
         }
@@ -300,7 +280,6 @@ export function writeMagicContextConfig(
 
     writeFileAtomic(configPath, `${stringifyJsonc(config, null, 2)}\n`);
 }
-// ─── Main Setup Flow ──────────────────────────────────────
 
 export async function runSetup(dryRun = false): Promise<number> {
     intro("Magic Context — Setup");
@@ -319,7 +298,6 @@ export async function runSetup(dryRun = false): Promise<number> {
         }
     }
 
-    // ─── Step 1: Check OpenCode ─────────────────────────
     const s = spinner();
     s.start("Checking OpenCode installation");
 
@@ -336,10 +314,6 @@ export async function runSetup(dryRun = false): Promise<number> {
             return 1;
         }
     } else if (detection.kind === "desktop") {
-        // OpenCode Desktop ships no invocable `opencode` CLI on any OS (its
-        // server runs as a JS sidecar inside Electron), so `opencode models`
-        // and `opencode --version` are unavailable. Recognize the install and
-        // fall through to manual model entry instead of claiming OpenCode is
         // absent.
         s.stop("OpenCode Desktop detected (CLI not installed)");
         log.info(
@@ -350,13 +324,8 @@ export async function runSetup(dryRun = false): Promise<number> {
         s.stop(`OpenCode ${version ?? ""} detected`);
     }
 
-    // ─── Step 2: Get available models ───────────────────
     s.start("Fetching available models");
 
-    // Only the CLI can enumerate the authed/resolved model list; Desktop-only
-    // installs have no on-disk equivalent, so models stay empty and the model
-    // prompts fall back to free-text entry. Use the resolved binary path so a
-    // stock CLI that is not on PATH still enumerates.
     const allModels = detection.kind === "cli" ? getAvailableModels(detection.binary) : [];
     if (allModels.length > 0) {
         s.stop(`Found ${allModels.length} models`);
@@ -365,7 +334,6 @@ export async function runSetup(dryRun = false): Promise<number> {
         log.warn("You can configure models manually in magic-context.jsonc later");
     }
 
-    // ─── Step 3: Detect config paths ────────────────────
     const paths = detectConfigPaths();
     const hadExistingSetup =
         paths.opencodeConfigFormat !== "none" ||
@@ -374,7 +342,6 @@ export async function runSetup(dryRun = false): Promise<number> {
 
     if (!dryRun) {
         try {
-            // Fail before touching any setup target if one existing file is malformed.
             assertJsoncConfigsParseable([
                 paths.opencodeConfig,
                 paths.magicContextConfig,
@@ -387,20 +354,12 @@ export async function runSetup(dryRun = false): Promise<number> {
         }
     }
 
-    // ─── Step 4: Check for DCP plugin conflict before mutating setup files ────────
     const removeDcp = dryRun
         ? false
         : await resolveDcpConflictBeforeSetup(paths.opencodeConfig, paths.opencodeConfigFormat);
 
-    // Resolve the MC compaction mode once for all writer/fixer/summary calls.
-    // CLI writers load user-tier config through the same loader the plugin uses
-    // and read through the same accessor; on load failure the helper takes the
-    // preserve-existing-native-fields branch (returns false) and emits a
-    // diagnostic, never assuming either mode.
     const compactionEnabled = resolveCompactionEnabledForWriter();
 
-    // Collect every interactive choice before applying setup writes. A cancelled
-    // wizard can then unwind without leaving only some target files updated.
     if (dryRun) {
         log.message(
             compactionEnabled
@@ -439,13 +398,9 @@ export async function runSetup(dryRun = false): Promise<number> {
         }
     }
 
-    // ─── Step 5: Historian model ────────────────────────
-    // pickModel shows the full discovered list when non-empty; when discovery
-    // returns [] it still runs and offers free-text provider/model entry (same as Pi setup).
     const historianModel = await pickModel(promptIO, allModels, "historian");
     log.success(`Historian: ${historianModel}`);
 
-    // ─── Step 6: Dreamer ────────────────────────────────
     const dreamerEnabled = await confirm("Enable dreamer?", true);
     let dreamerModel: string | null = null;
     let dreamerTasks: Record<string, { schedule: string }> | undefined;
@@ -455,7 +410,6 @@ export async function runSetup(dryRun = false): Promise<number> {
         dreamerTasks = result.tasks;
     }
 
-    // ─── Step 7: Sidekick ───────────────────────────────
     const sidekickEnabled = await confirm("Enable sidekick?", false);
     let sidekickModel: string | null = null;
     if (sidekickEnabled) {
@@ -463,7 +417,6 @@ export async function runSetup(dryRun = false): Promise<number> {
         log.success(`Sidekick: ${sidekickModel}`);
     }
 
-    // ─── Claude Max subscription ────────────────────────
     const hasAnthropic = allModels.some((m) => m.startsWith("anthropic/"));
     let claudeMax = false;
     if (hasAnthropic) {
@@ -576,7 +529,6 @@ export async function runSetup(dryRun = false): Promise<number> {
         }
     }
 
-    // ─── Summary ────────────────────────────────────────
     const summary = [
         `Plugin: ${PLUGIN_NAME}`,
         compactionEnabled

@@ -22,9 +22,7 @@ function message(id: string, role: string, parts: unknown[]): MessageLike {
 }
 
 const SENTINEL = { type: "text", text: "" };
-// Whole-message sentinel: defaults to "[dropped]" because `providerID` is
-// not passed in these tests. Anthropic-only optimization (text="") is
-// covered by dedicated provider-aware tests below.
+// Without `providerID`, whole-message drops use `"[dropped]"`.
 const WHOLE_MESSAGE_SENTINEL = { type: "text", text: "[dropped]" };
 
 describe("strip-content", () => {
@@ -61,7 +59,6 @@ describe("strip-content", () => {
                         [third, thirdReasoning],
                     ]);
 
-                    // maxTag=10, clearReasoningAge=5 => ageCutoff=5 => tags 1,3 are <=5 (cleared), tag 8 is >5 (kept)
                     const messageTagNumbers = new Map<MessageLike, number>([
                         [first, 1],
                         [second, 3],
@@ -230,10 +227,9 @@ describe("strip-content", () => {
         describe("#given a thinking part with no thinking or text fields", () => {
             describe("#when stripping cleared reasoning", () => {
                 it("#then preserves it defensively — undefined fields are not a cleared shell", () => {
-                    // Edge-case shape: a future provider (or upstream bug) could
-                    // emit a thinking-type part carrying only non-standard fields
-                    // like `data` or `signature`, with neither `thinking` nor
-                    // `text` set. Must preserve — we cannot prove it is cleared.
+                    // The stripper preserves thinking parts without `thinking` or `text` because it cannot identify them as cleared.
+                    // The stripper preserves thinking parts containing only non-standard fields such as `data` or `signature`.
+                    // The stripper preserves thinking parts without `thinking` or `text` because it cannot identify them as cleared.
                     const undefinedFieldsPart = {
                         type: "thinking",
                         signature: "opaque-provider-signature",
@@ -353,7 +349,7 @@ describe("strip-content", () => {
 
                     expect(result.stripped).toBe(2);
                     expect(result.newlyStrippedIds.sort()).toEqual(["m-1", "m-3"]);
-                    // Array lengths preserved
+                    // Stripping preserves array lengths.
                     expect(user1.parts).toHaveLength(1);
                     expect(user2.parts).toHaveLength(1);
                     expect(user1.parts[0]).toEqual(SENTINEL);
@@ -361,9 +357,9 @@ describe("strip-content", () => {
                 });
 
                 it("#then a DEFER pass (detect=false) does NOT first-strip an aged image, but a frozen id does", () => {
-                    // This is the regression: an aged, processed image must never
-                    // be first-removed on a defer pass (Anthropic cache bust). It
-                    // only strips once its id was frozen on a cache-busting pass.
+                    // A defer pass strips a processed image only when its ID was frozen during a cache-busting pass.
+                    // A defer pass must not remove an aged processed image before a cache-busting pass freezes its ID.
+                    // A defer pass strips an aged processed image only after a cache-busting pass freezes the image ID.
                     const user = message("m-1", "user", [
                         { type: "file", mime: "image/png", url: buildDataUrl(2000) },
                     ]);
@@ -384,7 +380,7 @@ describe("strip-content", () => {
                     expect(deferResult.stripped).toBe(0);
                     expect((user.parts[0] as { type: string }).type).toBe("file");
 
-                    // Same defer pass but the id is frozen → replayed strip fires.
+                    // A defer pass strips the image when its ID was frozen during a cache-busting pass.
                     const replayResult = stripProcessedImages([user, assistant], new Set(["m-1"]), {
                         detect: false,
                         watermark: 5,
@@ -431,7 +427,7 @@ describe("strip-content", () => {
 
                     expect(result.stripped).toBe(1);
                     expect(user1.parts[0]).toEqual(SENTINEL);
-                    // Recent user's image survives
+                    // The stripper preserves a user's image when its age is below the image-age threshold.
                     expect((recentUser.parts[0] as { type: string }).type).toBe("file");
                 });
             });
@@ -541,7 +537,7 @@ describe("strip-content", () => {
 
                 expect(result.stripped).toBe(0);
                 expect(result.sentineledIds).toEqual([]);
-                // User message preserved exactly
+                // The stripper preserves user messages exactly.
                 expect(user.parts).toEqual([{ type: "text", text: "[dropped §5§]" }]);
             });
         });
@@ -556,9 +552,7 @@ describe("strip-content", () => {
 
                 expect(result.stripped).toBe(1);
                 expect(result.sentineledIds).toEqual(["m-a"]);
-                // Default (no providerID): non-empty `[dropped]` placeholder
-                // so providers that don't filter empties (Kimi, openai-compat)
-                // don't get a 400 "must not be empty" rejection.
+                // Whole-message drops without `providerID` use `"[dropped]"`.
                 expect(assistant.parts).toEqual([WHOLE_MESSAGE_SENTINEL]);
             });
         });
@@ -633,9 +627,8 @@ describe("strip-content", () => {
 
         describe("#given an assistant message whose text merely contains a [truncated] word", () => {
             it("#then it does NOT neutralize (only the exact [dropped §N§] placeholder matches)", () => {
-                // The strip pattern must match ONLY our canonical placeholder,
-                // never arbitrary content that happens to contain the word
-                // "truncated" (e.g. a model quoting tool output).
+                // The strip pattern must match only the canonical placeholder.
+                // The strip pattern must not match arbitrary content containing `"truncated"`.
                 const assistant = message("m-a", "assistant", [
                     { type: "text", text: "[truncated §3§] ..." },
                 ]);
@@ -663,13 +656,9 @@ describe("strip-content", () => {
     describe("stripReasoningFromMergedAssistants (sentinel-based groupIntoBlocks workaround)", () => {
         describe("#given a leading whitespace-only text block before the reasoning", () => {
             it("#then keeps the reasoning — whitespace text is sentinel-invisible to the keep-rule", () => {
-                // Regression shape after OpenCode's Anthropic adapter normalizes
-                // structural sentinels: [" ", thinking, tool_use, " "]. Treating
-                // the leading " " as content made the keep-rule skip the
-                // thinking block, so the assistant kept reasoning while newest
-                // (exempt) and lost it on the first pass after — a byte change at
-                // a new position every turn, re-creating the provider cache from
-                // that point on every pass.
+                // The Anthropic adapter normalizes structural sentinels to `[" ", thinking, tool_use, " "]`.
+                // The Anthropic adapter normalizes structural sentinels to `[" ", thinking, tool_use, " "]`.
+                // The keep-rule must retain the thinking block after the assistant is no longer newest.
                 const u = message("m-u", "user", [{ type: "text", text: "hi" }]);
                 const a1 = message("m-a", "assistant", [
                     { type: "text", text: " " },
@@ -684,8 +673,8 @@ describe("strip-content", () => {
                     { type: "tool", callID: "c2", tool: "bash", state: { status: "completed" } },
                 ]);
 
-                // Not exempt: a1 is no longer the newest assistant — the exact
-                // transition that previously stripped it.
+                // a1 is not the newest assistant and is eligible for stripping.
+                // a1 is no longer the newest assistant and is eligible for stripping.
                 const stripped = stripReasoningFromMergedAssistants(
                     [u, a1, u2, newest],
                     "anthropic",
@@ -1118,13 +1107,6 @@ describe("strip-content", () => {
         });
 
         describe("#given providerID gate (anthropic-only workaround)", () => {
-            // Verifies the Kimi/Moonshot fix: stripReasoningFromMergedAssistants
-            // is an Anthropic-AI-SDK-specific workaround for groupIntoBlocks.
-            // For openai-compatible providers like Kimi, stripping reasoning
-            // from non-first merged assistants triggers
-            // "thinking is enabled but reasoning_content is missing in
-            // assistant tool call message at index N". The function MUST be a
-            // no-op for non-anthropic providers.
 
             it("#then is a no-op when providerID is undefined", () => {
                 const u = message("m-u", "user", [{ type: "text", text: "hi" }]);
@@ -1140,7 +1122,6 @@ describe("strip-content", () => {
                 const stripped = stripReasoningFromMergedAssistants([u, a1, a2]);
 
                 expect(stripped).toBe(0);
-                // Both reasoning parts preserved
                 expect(a1.parts[0]).toEqual({ type: "reasoning", text: "first reasoning" });
                 expect(a2.parts[0]).toEqual({ type: "reasoning", text: "second reasoning" });
             });
@@ -1185,7 +1166,6 @@ describe("strip-content", () => {
                 const stripped = stripReasoningFromMergedAssistants([u, a1, a2], "anthropic");
 
                 expect(stripped).toBe(1);
-                // First kept, second sentineled
                 expect(a1.parts[0]).toEqual({ type: "reasoning", text: "first reasoning" });
                 expect(a2.parts[0]).toEqual(SENTINEL);
             });

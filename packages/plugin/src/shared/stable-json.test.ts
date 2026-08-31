@@ -16,8 +16,7 @@ describe("stableStringify", () => {
 
     test("object keys sort by code-point order, not locale", () => {
         // 'Z' (0x5a) sorts before 'a' (0x61) by code-point.
-        // localeCompare would sort 'a' before 'Z' in many locales.
-        // We want code-point semantics.
+        // localeCompare can sort 'a' before 'Z'.
         const input = { Z: 1, a: 2 };
         expect(stableStringify(input)).toBe('{"Z":1,"a":2}');
     });
@@ -70,7 +69,7 @@ describe("stableStringify", () => {
 
     test("Unicode key sort by code-point, not by collation", () => {
         // 'ä' (U+00E4) sorts AFTER 'z' (U+007A) by code-point.
-        // localeCompare in many locales would put 'ä' near 'a'.
+        // localeCompare can sort 'ä' before 'z'.
         const input = { z: 1, ä: 2 };
         const result = stableStringify(input);
         expect(result).toBe('{"z":1,"ä":2}');

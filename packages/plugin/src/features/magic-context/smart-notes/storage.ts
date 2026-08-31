@@ -43,19 +43,13 @@ export function commitSmartNoteState(
         write: () => void;
     },
 ): boolean {
-    // BEGIN IMMEDIATE, not a plain (deferred) transaction: the lease check reads
-    // before the write, and a deferred read→write lock upgrade returns
-    // SQLITE_BUSY immediately when another writer holds the lock — busy_timeout
-    // does not apply to upgrades, so concurrent processes produced spurious
-    // "database is locked" failures here. Taking the write lock at BEGIN time
-    // waits under busy_timeout like every other writer.
+    // BEGIN IMMEDIATE acquires the write lock before the lease check, so busy_timeout applies when another writer holds it.
+    // A deferred transaction upgrades from a read lock only when it writes; another writer can cause that upgrade to return SQLITE_BUSY without waiting under busy_timeout.
     db.exec("BEGIN IMMEDIATE");
     let leaseLost = false;
     let committed = false;
     try {
-        // State transitions surface notes or change future scheduling. The lease
-        // check and compare-and-set guard share the write transaction so neither
-        // ownership nor the user's source state can change before the update.
+        // The transaction makes `claimExpectedState` and `args.write` atomic with respect to the matching note state.
         if (args.leaseHeld && !args.leaseHeld()) {
             leaseLost = true;
         } else if (claimExpectedState(db, args.expected)) {
@@ -67,7 +61,6 @@ export function commitSmartNoteState(
         try {
             db.exec("ROLLBACK");
         } catch {
-            // Connection-level failures leave nothing to roll back.
         }
         throw error;
     }
@@ -93,8 +86,6 @@ function claimExpectedState(db: Database, expected: SmartNoteCommitExpectation):
 }
 
 /**
- * Pending notes eligible for phase selection. A retina handoff skips notes it
- * already compiled. Mirrors `eligible` in the Rust port
  * (crates/mc-module/src/smart_note_evaluation.rs).
  */
 function eligibleSmartNotes(

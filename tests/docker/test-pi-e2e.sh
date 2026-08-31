@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
 # ----------------------------------------------------------------------
-# Magic Context — Pi E2E test runner (runs inside Docker).
 #
 # Two scenarios:
-#   SETUP_SMOKE    — fresh-install path via `magic-context doctor --harness pi --force`
-#   SESSION_SMOKE  — single-turn `pi --print --mode json` against aimock
 #
-# Both assertions check the shared SQLite DB at
 #   ~/.local/share/cortexkit/magic-context/context.db
-# rather than scraping logs, so failures are unambiguous.
+# The assertions query the shared DB rather than logs, so log formatting cannot affect their result.
 # ----------------------------------------------------------------------
 
 set -euo pipefail
@@ -42,8 +38,6 @@ section() {
 }
 
 # ----------------------------------------------------------------------
-# Phase 0: verify Pi version meets the >= 0.71.0 floor we declare in
-# the Pi extension's peer dependency.
 # ----------------------------------------------------------------------
 section "Phase 0: Pi installation sanity"
 # Pi 0.71.x writes --version output to stderr, so capture both 2>&1.
@@ -52,15 +46,10 @@ echo "  Pi version: ${PI_VERSION:-unknown}"
 check "pi --version returns a value" "test -n \"$PI_VERSION\""
 
 # ----------------------------------------------------------------------
-# Phase 1: SETUP_SMOKE — non-interactive doctor --force.
-# Since v0.16.1 the CLI is unified into @cortexkit/magic-context with
-# `--harness pi` selecting the Pi-specific doctor pipeline. The
-# `magic-context` binary was symlinked into /usr/local/bin in the
 # Dockerfile.
 # ----------------------------------------------------------------------
 section "Phase 1: SETUP_SMOKE — magic-context doctor --harness pi --force on a clean machine"
 
-# Pre-condition: no Magic Context state exists.
 rm -rf "$HOME/.local/share/cortexkit" "$PLUGIN_LOG"
 
 DOCTOR_OUT=$(magic-context doctor --harness pi --force 2>&1 || true)
@@ -75,28 +64,18 @@ check "Pi user config created at ~/.config/cortexkit/magic-context.jsonc" \
 check "Pi settings.json registered the magic-context package" \
     "grep -q 'pi-magic-context' $HOME/.pi/agent/settings.json"
 
-# Doctor should report Pi version meets the 0.71.0 floor (we installed
-# >= 0.71.0 in the Dockerfile).
 check "doctor confirms Pi version meets 0.71.0 floor" \
     "echo \"\$DOCTOR_OUT\" | grep -qE 'PASS Pi version meets minimum'"
 
-# Doctor's summary line uses "FAIL <n>". 0 failures is acceptable; only
-# infra issues (no Pi, no DB) should fail at this point.
+# A Doctor summary with `FAIL 0` reports no failures.
 check "doctor reports zero hard failures" \
     "echo \"\$DOCTOR_OUT\" | grep -qE 'FAIL 0'"
 
 # ----------------------------------------------------------------------
-# Phase 2: SESSION_SMOKE — run a single Pi turn against aimock with
-# the Magic Context extension loaded.
 # ----------------------------------------------------------------------
 section "Phase 2: SESSION_SMOKE — single-turn pi --print with aimock"
 
-# The Magic Context Pi extension was already pre-installed via
-# `pi install /test/mc-pi` during the Dockerfile build, so it's
-# registered in ~/.pi/agent/settings.json with the correct file
-# path. Doctor's settings rewrite (which adds the npm: prefix) gets
-# overridden here back to the local install — without this, Pi
-# would try to npm-install a package that doesn't exist on npm yet.
+# Keep the local registration so Pi does not resolve the extension through npm.
 node -e '
   const fs = require("node:fs");
   const path = "/root/.pi/agent/settings.json";
@@ -110,11 +89,7 @@ node -e '
   }
 '
 
-# Magic Context config: minimal — just enable the extension. Subagents
-# are off because the session-smoke is single-turn; aimock is for the
-# main turn only. Written to the shared CortexKit location (the hard
-# cutover target the Pi extension now reads); overwrite-in-place is fine
-# since Phase 1's doctor already created this same file.
+# SESSION_SMOKE disables subagents because it contains one main turn and configures aimock only for that turn.
 mkdir -p "$HOME/.config/cortexkit"
 cat > "$HOME/.config/cortexkit/magic-context.jsonc" <<'JSON'
 {
@@ -126,9 +101,7 @@ cat > "$HOME/.config/cortexkit/magic-context.jsonc" <<'JSON'
 }
 JSON
 
-# Register a custom OpenAI-compatible provider pointed at aimock via
-# Pi's models.json (the supported way to add custom providers without
-# writing an extension).
+# Pi reads custom OpenAI-compatible providers from `models.json`.
 cat > "$HOME/.pi/agent/models.json" <<'JSON'
 {
   "providers": {
@@ -151,13 +124,11 @@ cat > "$HOME/.pi/agent/models.json" <<'JSON'
 }
 JSON
 
-# Start aimock in the background.
 node /test/aimock-server.cjs > /tmp/aimock.log 2>&1 &
 AIMOCK_PID=$!
 # shellcheck disable=SC2064
 trap "kill $AIMOCK_PID 2>/dev/null || true" EXIT
 
-# Wait for aimock to be ready (max 15s).
 for _ in $(seq 1 15); do
     if curl -fsS http://127.0.0.1:4010/v1/models > /dev/null 2>&1; then
         break
@@ -169,9 +140,6 @@ check "aimock /v1/models responds" \
 
 echo ""
 set +e
-# The extension was registered via `pi install` in the Dockerfile, so
-# Pi auto-loads it from settings.json. The mock provider/model is
-# defined in models.json (above).
 timeout --signal=KILL 60 pi --print --mode json --no-session \
     --provider mock \
     --model "mock/mock-model" \

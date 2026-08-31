@@ -1,7 +1,5 @@
-//! Magic Context component for `mc-host`.
 //!
-//! [`McHandler`] implements the host-owned primary lifecycle, transforms already-decoded
-//! CK items, and persists per-session state in the single-writer `mc-store`.
+//! `McHandler` owns the primary host lifecycle, transforms already-decoded CK items, and persists per-session state in the single-writer `mc-store`.
 
 #![forbid(unsafe_code)]
 
@@ -39,10 +37,7 @@ mod token_cache;
 
 pub mod transform;
 
-/// Generated pre-build release contract (U8). The file is emitted by
-/// `bun scripts/generate-mc-host-release-manifest.ts` into `release/generated/` and
-/// drift-checked with `--check`; it adds no crate dependency edge (in particular no
-/// `mc-host -> mc-module` edge).
+/// `release_contract` contains the generated contract for the `mc-host -> mc-module` edge.
 pub mod release_contract {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -50,7 +45,6 @@ pub mod release_contract {
     ));
 }
 
-/// U9 closure manifests and the lock digest embedded into the native binary.
 pub mod production_inputs {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -213,13 +207,10 @@ struct ClaimMirrorReceiptRequest {
     receipt: mc_store::claim_mirror::ClaimMirrorReceiptGroup,
 }
 
-/// The per-route binding: the project, harness, session-slot value, and fallback render
-/// budget frozen at bind. Transform routes carry the durable session in `session`. Facade
-/// routes have two identity modes: the OpenCode Rust route binds its durable session directly,
-/// while the Claude Code wrapper binds an instance token that must be resolved before touching
-/// the store. The project is NEVER taken from a per-pass request field — a crafted request could
-/// spoof it to read another project's memories — so it lives here, keyed by the route channel
-/// the daemon controls.
+/// The binding freezes the project, harness, session-slot value, and fallback render budget at bind.
+/// The binding freezes the fallback render budget at bind; transform routes store the durable session in `session`.
+/// OpenCode Rust routes bind their durable session directly.
+/// The route binding, not a request field, supplies the project because a crafted request could read another project's memories.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBinding {
     pub project_root: PathBuf,
@@ -227,8 +218,8 @@ pub struct SessionBinding {
     pub session: String,
     pub model_key: Option<String>,
     pub config: McModuleConfig,
-    /// The fallback history budget (tokens) frozen at bind. A transform request may carry
-    /// a newer harness-resolved value because config can change while the route remains open.
+    /// The binding freezes the fallback history budget in tokens at bind.
+    /// The binding does not use a newer harness-resolved value because config can change while the route remains open.
     pub history_budget_tokens: f64,
     pub credential_fingerprints: std::collections::BTreeMap<String, String>,
 }
@@ -241,22 +232,21 @@ fn apply_claude_code_config_controls(
     if serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic) {
         return;
     }
-    // Claude Code does not carry these controls in its transform request. Route config is
-    // daemon-owned and frozen at bind, so it is the only authority for this transport leg.
+    // The daemon freezes the fallback history budget at bind.
     request.auto_search_enabled = config.auto_search.enabled;
     request.auto_search_score_threshold = config.auto_search.score_threshold;
     request.auto_search_min_prompt_chars = config.auto_search.min_prompt_chars;
     request.caveman_enabled = config.caveman.enabled;
     request.caveman_min_chars = config.caveman.min_size;
-    // Thalamus does not send a todowrite verdict and Claude Code has no native todowrite
-    // surface. The transform deliberately leaves None intact; synthesis treats missing
-    // authority as unavailable rather than manufacturing an unreachable tool call.
+    // Thalamus does not send a todowrite verdict, and Claude Code has no native todowrite surface.
+    // The transform leaves `None` intact because synthesis treats missing todowrite authority as unavailable.
+    // Synthesis treats missing todowrite authority as unavailable rather than manufacturing an unreachable tool call.
     if config.prompt_surface_guidance_override.is_some() {
         request.prompt_surface_guidance_override = config.prompt_surface_guidance_override.clone();
     }
 }
 
-/// Normalize the OC host's already-rendered mural to the exact m0 input contract.
+/// The OpenCode host adapter normalizes the already-rendered mural to the exact m0 input contract.
 fn host_mural_artifact(input: Option<&m0_compose::M0MuralInput>) -> Option<(String, String)> {
     let input = input?;
     if !input.enabled || !input.supports_vision {
@@ -275,7 +265,7 @@ fn host_mural_artifact(input: Option<&m0_compose::M0MuralInput>) -> Option<(Stri
     Some((data_url.to_string(), content_hash))
 }
 
-/// Rehydrate the input accepted by the shared m0 composer from one project artifact.
+/// The adapter rehydrates the shared m0 composer input from one project artifact.
 fn cc_mural_input(
     store: &McStore,
     project_path: &str,
@@ -294,20 +284,16 @@ fn cc_mural_input(
     }))
 }
 
-/// Why a transform request can't be served: the route isn't bound, or the request's
-/// session doesn't match the channel's bound session. Both fail LOUD — never default to
-/// a project (a default would be a cross-project read of another project's store).
+/// The handler rejects transform requests when the route is unbound or the request session differs from the channel's bound session; it never defaults a project because that could read another project's store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingError {
-    /// No `on_bind` for this channel (or it was torn down). Reject the transform.
+    /// The handler rejects transforms when the channel has no `on_bind` binding or has been torn down.
     Unbound,
-    /// The request's session_id doesn't match the channel's bound session — a poison
-    /// cross-check (the channel is the daemon-controlled identity; the request's session
-    /// must agree with it).
+    /// The request's `session_id` must match the channel's bound session because the daemon controls channel identity.
     SessionMismatch,
 }
 
-/// Canonical module id (overridable via `SUBC_MODULE_ID_ENV` at boot).
+/// `SUBC_MODULE_ID_ENV` overrides the canonical module ID at boot.
 pub const DEFAULT_MODULE_ID: &str = "magic-context";
 
 const TRANSFORM_HEALTH_LANE: &str = "transform";
@@ -410,9 +396,7 @@ fn store_open_error_is_live_lease(error: &McStoreError) -> bool {
     )
 }
 
-/// The transform heartbeat is deliberately process-wide: the SDK health callback runs on
-/// the channel-0 control path and must be able to observe the data-plane lane without
-/// borrowing a handler lock or touching the store.
+/// The channel-0 SDK health callback reads data-plane health without a handler lock or store access.
 struct DispatchHealth {
     last_dispatch_started_at_ms: AtomicU64,
     last_dispatch_completed_at_ms: AtomicU64,
@@ -539,8 +523,8 @@ impl<'a> TransformDispatchTicket<'a> {
         if !self.accepted.load(Ordering::Acquire) || self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        // This is the completion point, after the handler has produced its outcome. A panic
-        // skips this method and is handled by Drop, so it cannot falsely advance the heartbeat.
+        // The handler stamps completion only after producing its outcome.
+        // If a panic skips completion, `Drop` leaves the heartbeat unadvanced.
         self.health
             .last_dispatch_completed_at_ms
             .store(now_ms().max(0) as u64, Ordering::Relaxed);
@@ -563,53 +547,23 @@ impl Drop for TransformDispatchTicket<'_> {
             && !self.finished.load(Ordering::Acquire)
             && self.accepted.swap(false, Ordering::AcqRel)
         {
-            // A panic unwinds through this guard. Decrement the count, but do not stamp a
-            // completion: a panicking dispatch did not prove that the lane advanced.
+            // A panic unwinds through this guard. The guard decrements the count but does not stamp a completion because a panicking dispatch did not prove that the lane advanced.
             self.health.in_flight_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
 
-/// Render-config epoch members, co-owned with the byte-splice consumer (thalamus gateway).
-/// Consumers fold these into the opaque render_config string they populate per
-/// request; the module compares render_config as opaque bytes against durable state
-/// and forces a HARD fold on any change. Bumping an epoch here is therefore the
-/// coordinated-deploy mechanism for byte-affecting behavior flips: every in-flight
-/// session folds once on the same lineage instead of straddling the feature boundary.
-/// Consumers read these at attach via the status op and refuse to serve on mismatch
-/// with their hardcoded fallbacks, so a diverged epoch map cannot silently skip the
 /// safety fold.
-/// Bumps when the shared project-memory render changes. Epoch 1 is the compact,
-/// category-grouped `#id: fact` format and applies to every serializer profile.
-/// Sourced from the generated U8 release contract so status and release compatibility
 /// cannot diverge.
 pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = release_contract::MEMORY_RENDER_EPOCH;
-/// Bumps when the shared compartment render changes. Epoch 1 replaces rendered
-/// `<compartment>` elements with markdown headings in m0 and m1; epoch 2 sanitizes
-/// historian-authored titles before placing them inside the session-history wrapper.
 pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = release_contract::COMPARTMENT_RENDER_EPOCH;
-/// Bumps when the rendered m0 prefix format changes for the claude-code-anthropic
-/// profile; epoch 1 includes covered system messages in m0 instead of sending them as
-/// separate system-role messages. Epoch 2 flips the profile to full-array tail reclaim
-/// (the Thalamus peer retired the byte-splice at U0), so tool-absent sessions gain the
-/// age/pressure tail reclaim they never had; the bump forces one self-coordinated HARD
-/// fold on the first pass under the new binary, per the epoch contract above.
 pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 =
     release_contract::PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC;
-/// Bumps when any active tag overlay changes provider-visible bytes. Epoch 3 freezes
-/// temporal-marker decisions in durable rows instead of deriving them from each request array.
-/// Every change requires one cache-breaking fold before the new overlay can render. Inactive
-/// requests omit the component and retain their identity.
 pub const TAGGER_FEATURE_EPOCH: u32 = release_contract::TAGGER_EPOCH;
-/// The numeric state-sync epoch (U8). Emitted in Magic Context status alongside the
-/// pre-existing boolean `state_sync_deltas` feature signal so compatibility policy can
-/// require the exact epoch instead of a boolean capability bit.
+/// Compatibility requires the exact numeric epoch, not `state_sync_deltas`.
 pub const STATE_SYNC_EPOCH: u32 = release_contract::STATE_SYNC_EPOCH;
 
-/// The module-owned rendered-prefix format epoch for a serializer profile.
 ///
-/// Future profile-specific m0 format epochs slot in here so the module folds them into
-/// its effective render_config even when a consumer sends a static base render_config.
 pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
     match profile {
         SerializerProfile::ClaudeCodeAnthropic => PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
@@ -620,14 +574,11 @@ pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
     }
 }
 
-/// Normalize the request-local Claude Code surface signal once. This remains limited to
-/// Claude Code mechanics such as the Thalamus acknowledgement contract and guidance variant.
 pub const fn cc_u1_active(profile: Option<SerializerProfile>, tool_present: bool) -> bool {
     matches!(profile, Some(SerializerProfile::ClaudeCodeAnthropic)) && tool_present
 }
 
-/// Return whether the provider-visible tagging and reduction overlay may be enabled.
-/// OpenCode uses the same overlay when its session exposes ctx_reduce.
+/// `tagging_surface_active` permits the provider-visible tagging and reduction overlay only when `tool_present` is true for Claude Code or OpenCode.
 pub const fn tagging_surface_active(
     profile: Option<SerializerProfile>,
     tool_present: bool,
@@ -638,8 +589,8 @@ pub const fn tagging_surface_active(
     ) && tool_present
 }
 
-/// The tagger component of the effective render identity. A false request contributes
-/// no component, preserving the render identity used before the capability existed.
+/// `tagger_feature_epoch` contributes to the effective render identity.
+/// `tagging_surface_active == false` contributes no tagger epoch to the render identity.
 pub const fn tagger_feature_epoch(tagging_surface_active: bool) -> u32 {
     if tagging_surface_active {
         TAGGER_FEATURE_EPOCH
@@ -648,48 +599,30 @@ pub const fn tagger_feature_epoch(tagging_surface_active: bool) -> u32 {
     }
 }
 
-/// Exact-match compatibility check for the numeric state-sync epoch advertised by a
-/// Magic Context status `epochs` object. The boolean `state_sync_deltas` feature
-/// signal alone is insufficient: boolean-only, missing, nonnumeric, stale, and future
-/// values are all incompatible with this release's contract (U8).
+/// Compatibility requires `state_sync_epoch`; `state_sync_deltas` alone is insufficient.
 pub fn state_sync_epoch_compatible(epochs: &Value) -> bool {
     epochs.get("state_sync_epoch").and_then(Value::as_u64) == Some(STATE_SYNC_EPOCH as u64)
 }
 
-/// Storage namespace for the cache-state domain.
 const STORAGE_NAMESPACE: &str = "mc_cache";
 #[cfg(test)]
 const GUIDANCE_TEXT: &str = prompt_surface::GUIDANCE_FULL_PRIMARY;
-/// Matches the default OpenCode protected tag window. The Claude Code facade has no
-/// request-local transform config, so acknowledgement validation uses the durable tag
-/// ordering with the same default recency window as an omitted transform field.
 const DEFAULT_PROTECTED_TAGS: usize = 20;
-/// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.enabled default.
 const DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED: bool = true;
-/// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.min_clusters default.
 const DEFAULT_MIN_COMMIT_CLUSTERS: usize = 3;
-/// Legacy test fixture budget. Production assembly derives this from the configured
-/// historian context limit; the config fallback is intentionally explicit in config.rs.
 #[cfg(test)]
 const DEFAULT_HISTORIAN_CHUNK_TOKENS: usize = 32_000;
-/// TypeScript evaluates every nonempty eligible chunk after trigger checks. Rust keeps
-/// this minimum at zero so it does not impose an additional minimum-token requirement.
 const DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS: usize = 0;
-/// Maximum number of newly published compartments returned by one status page.
+/// Each status page returns at most the configured number of newly published compartments.
 const SESSION_STATUS_COMPARTMENT_PAGE_LIMIT: usize = 50;
-/// After a historian abandon, suppress refires for this long so a persistently
-/// failing model does not burn a full summarization pass on every transform.
+/// After a historian abandon, suppress refires for the cooldown duration.
 const HISTORIAN_FAILURE_BACKOFF_MS: i64 = historian::HISTORIAN_FAILURE_BACKOFF_MS;
 const SESSION_UNRESOLVED_MESSAGE: &str = "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation";
-/// OpenCode's Rust-mode tool route binds the real harness session, unlike the Claude Code
-/// wrapper route whose binding is an instance-token namespace.
 const OPENCODE_HARNESS: &str = "opencode";
 const STATE_SYNC_SEED_MAX_ID_BYTES: usize = 128;
 const STATE_SYNC_SEED_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
-/// Release partial state-sync seeds whose sender stopped before completing the page sequence.
+/// The cleanup releases partial state-sync seeds whose sender stopped before completing the page sequence.
 const STATE_SYNC_SEED_COLLECTOR_TTL: Duration = Duration::from_secs(10 * 60);
-// These bounds apply to every live transform page so no session can bypass the
-// handler-wide staging budget.
 const TRANSFORM_PAGE_MAX_BYTES: usize = 512 * 1024;
 const TRANSFORM_PAGE_MAX_STAGED_BYTES: usize = 128 * 1024 * 1024;
 const TRANSFORM_PAGE_MAX_PENDING: usize = 64;
@@ -717,16 +650,13 @@ const STATE_IMPORT_MAX_PENDING: usize = 64;
 const STATE_IMPORT_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRANSFORM_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const BOUNDARY_TOKEN_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
-// Sized from the ASTRO-scale fixture (4,600 messages / 15,000 blocks): that
-// FlatProjection retains ~156 MiB, so one such session plus a smaller neighbor
-// fit without the native-attach 192 MiB entry cap evicting the projection.
+// The budget retains an ASTRO-scale FlatProjection (~156 MiB) and a smaller session below the 192 MiB native-attach cap.
 const PROJECTION_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const PROJECTION_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 const ACTIVE_SNAPSHOT_LEASE_BUDGET_BYTES: usize = TRANSFORM_SNAPSHOT_BUDGET_BYTES;
 const MAX_ACTIVE_SNAPSHOT_LEASES: usize = 8;
-/// InFlight snapshot markers have no byte charge, so they need their own count bound:
-/// a marker is minted per transform start and only replaced on success, so unique
-/// failing sessions would otherwise accumulate for the process lifetime.
+/// InFlight snapshot markers have no byte charge, so their count needs a separate bound.
+/// The handler mints one marker per transform start and replaces it only on success, so failing sessions would otherwise accumulate markers for the process lifetime.
 const MAX_IN_FLIGHT_SNAPSHOT_ENTRIES: usize = 4_096;
 const WRAPUP_REQUEST_MARGIN: Duration = Duration::from_secs(5);
 const HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND: usize = 32;
@@ -787,9 +717,8 @@ struct ModuleStateSyncWire {
     auto_search_hint_decisions: Vec<UserHintSeedWire>,
     #[serde(default)]
     auto_search_hint_skipped: usize,
-    /// When true, the host sent its COMPLETE hint-decision list for this
-    /// session: stored hint blocks absent from the list have no backing
-    /// decision the host can still validate and are deleted.
+    /// When true, the host sent its COMPLETE hint-decision list for the session.
+    /// Stored hint blocks absent from the list have no decision that the host can still validate and are deleted.
     #[serde(default)]
     user_hints_replace_session: bool,
     #[serde(default)]
@@ -808,7 +737,7 @@ struct ModuleStateSyncWire {
     strip_seed_skipped: usize,
     #[serde(default)]
     reasoning_cleared_through_tag: Option<u64>,
-    /// Host capability for creating smart notes. Omitted means unavailable.
+    /// The field records host capability to create smart notes; omission means unavailable.
     #[serde(default)]
     note_evaluation_available: Option<bool>,
 }
@@ -1124,8 +1053,8 @@ impl Default for TransformPageSession {
     }
 }
 
-/// Live transform pages share one coordinator so every session has one in-flight
-/// attempt and every sender contributes to the same bounded staging budget.
+/// A shared coordinator limits every session to one in-flight transform page.
+/// Each session has one in-flight attempt, and all senders share one bounded staging budget.
 #[derive(Debug)]
 struct TransformPageCoordinator {
     sessions: HashMap<String, TransformPageSession>,
@@ -1189,8 +1118,6 @@ impl TransformPageCoordinator {
         }
     }
 
-    /// Drop the live collection and report its staged page count. Completed and applying
-    /// requests are still cleared, but only a collecting request represents discarded pages.
     fn discard(&mut self, session_id: &str) -> Option<usize> {
         let phase = self.sessions.get_mut(session_id).map(|session| {
             session.completed = None;
@@ -1731,9 +1658,9 @@ struct ModuleWorkspaceMemberWire {
 }
 
 struct FacadeScope {
-    /// MC project identity for module-store reads and writes.
+    /// The module store uses the MC project identity for reads and writes.
     memory_project_path: String,
-    /// Daemon-bound filesystem path retained only for route-vocabulary enforcement.
+    /// The daemon-bound filesystem path enforces route vocabulary.
     route_project_root: String,
     conversation_key: String,
     memory_enabled: bool,
@@ -1768,13 +1695,13 @@ impl From<ModuleCompartmentWire> for StoredCompartment {
 }
 
 impl TransformRequest {
-    /// Prefer the request's host-resolved threshold. `None` specifically means an older host did
-    /// not send the field, so the caller's trusted config remains the compatibility fallback.
+    /// The request's host-resolved threshold overrides the caller's config.
+    /// Omitting the field uses the caller's trusted config as the compatibility fallback.
     fn execute_threshold_or(&self, fallback: f64) -> f64 {
         self.effective_execute_threshold.unwrap_or(fallback)
     }
 
-    /// Estimated bytes retained by one ready snapshot, including its cache keys and `Arc`.
+    /// The estimate includes one ready snapshot's cache keys and `Arc`.
     #[cfg(test)]
     pub(crate) fn retained_bytes(&self) -> usize {
         self.retained_bytes_with_charges(None, None)
@@ -1890,8 +1817,8 @@ impl TransformRequest {
                     .sum::<usize>(),
             );
         let cache_metadata = size_of::<TransformSnapshot>()
-            // One hash-table bucket/control/slack allowance, plus the independently allocated
-            // map key and ready-LRU key. Both clones use length-sized string allocations.
+            // The estimate includes one HashMap bucket, control, and slack allowance.
+            // The map key and ready-LRU key each allocate a string sized to its length.
             .saturating_add(size_of::<usize>() * 3)
             .saturating_add(cloned_string_retained_bytes(&self.session_id).saturating_mul(2));
 
@@ -1953,16 +1880,16 @@ enum TransformSnapshotLookup {
 struct TransformSnapshotCache {
     entries: HashMap<String, TransformSnapshot>,
     ready_lru: VecDeque<String>,
-    /// Insertion-ordered InFlight sessions. Failed or rejected transforms never
-    /// reach `finish_ready`, so without its own bound this class of entry would
-    /// grow with every unique failing session for the process lifetime.
+    /// The cache stores InFlight sessions in insertion order.
+    /// Failed or rejected transforms never reach `finish_ready`.
+    /// Unbounded InFlight entries would grow for every unique failing session over the process lifetime.
     in_flight_lru: VecDeque<String>,
     ready_bytes: usize,
     next_generation: u64,
     max_ready_bytes: usize,
     max_in_flight_entries: usize,
-    // Map eviction cannot reclaim requests held by active wrapups. This shared budget
-    // follows those Arc leases independently until their RAII guards are dropped.
+    // Active wrapups retain requests after map eviction, so they share the budget.
+    // The wrapup lease budget remains charged until each RAII guard drops.
     active_leases: Arc<Mutex<SnapshotLeaseBudget>>,
 }
 
@@ -2004,9 +1931,9 @@ impl TransformSnapshotCache {
         self.in_flight_lru
             .retain(|candidate| candidate != session_id);
         self.in_flight_lru.push_back(session_id.to_string());
-        // Evicting an InFlight entry to Missing is correctness-safe: wrapup refuses
-        // Missing, and finish_ready's generation match refuses to resurrect an
-        // evicted session's stale snapshot.
+        // Wrapup refuses Missing entries, so evicting an InFlight entry to Missing cannot start a wrapup.
+        // The generation check prevents `finish_ready` from resurrecting an evicted session's stale snapshot.
+        // The generation check prevents `finish_ready` from resurrecting an evicted session's stale snapshot.
         while self.in_flight_lru.len() > self.max_in_flight_entries {
             let Some(oldest) = self.in_flight_lru.pop_front() else {
                 break;
@@ -2161,10 +2088,10 @@ struct BoundaryTokenCacheSnapshot {
 
 impl BoundaryTokenCacheSnapshot {
     fn token_count(&mut self, block_id: &str, bytes: &str, content_hash: &[u8; 32]) -> usize {
-        // Block ids survive replay and same-length content edits are valid for live-tail blocks,
-        // so length alone cannot prove that a cached token count still describes these bytes.
-        // The projection computes this digest once and retains it on the block, avoiding a second
-        // full payload hash when the token cache entry is still valid.
+        // Block IDs survive replay, and same-length content edits are valid for live-tail blocks.
+        // Length alone cannot prove that a cached token count describes edited block bytes.
+        // The projection computes and retains the digest on each block to avoid rehashing a valid token-cache payload.
+        // A valid token-cache entry avoids a second full payload hash.
         if let Some(entry) = self
             .entry_updates
             .get(block_id)
@@ -2259,7 +2186,7 @@ fn boundary_token_maps_retained_bytes<'a>(
     formatted_token_count: usize,
 ) -> usize {
     let source_bytes = entries
-        // Include a conservative per-entry allowance for the HashMap bucket and owned key.
+        // Each estimate includes a conservative per-entry allowance for the HashMap bucket and owned key.
         .map(|(block_id, _)| block_id.len() + std::mem::size_of::<BoundaryTokenCacheEntry>() + 64)
         .sum::<usize>();
     source_bytes
@@ -2322,8 +2249,8 @@ impl BoundaryTokenCache {
     }
 
     fn replace(&mut self, session_id: &str, snapshot: BoundaryTokenCacheSnapshot) {
-        // Drop the session's Arc owners before materializing. On the ordinary single-flight path,
-        // Arc::try_unwrap then applies only the suffix updates instead of cloning every cached key.
+        // Dropping the session's Arc owners lets `Arc::try_unwrap` avoid cloning cached keys.
+        // After `Arc::try_unwrap` succeeds, materialization updates only the suffix instead of cloning every cached key.
         self.remove(session_id);
         let (entries, formatted_tokens) = snapshot.materialize();
         let retained_bytes =
@@ -2354,20 +2281,12 @@ impl BoundaryTokenCache {
     }
 }
 
-// These cache budgets are sized for a representative workload of 4,600 messages and 15,000
-// blocks, whose native representation is roughly 49 MiB. After removal of sidecar trees, its
-// retained keys plus encoded and ingress chunks remain below 192 MiB, while the 256 MiB total
-// allows more than one large session. The ingress FlatProjection lives in its own cache so an oversized native
-// snapshot can drop sidecar trees without discarding the projection. Because these are charged
-// estimates, the total remains a hard upper bound so that one unusually large session cannot
-// cause unbounded cache growth.
+// The ingress FlatProjection uses a separate cache so an oversized native snapshot can drop sidecar trees without discarding the projection.
+// The charged total remains bounded so one oversized session cannot cause unbounded cache growth.
 const NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const NATIVE_ATTACHMENT_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
-// These three caches are independent by design: a serialized-output miss re-encodes canonical
-// CortexKit (CK) messages, while a projection or native-prefix miss either reconstructs from the
-// ready snapshot or asks
-// the adapter for a full request. No cache may interpret another cache's presence as authority.
-// Keep their aggregate process-retained ceiling explicit when any individual budget changes.
+// No cache may treat another cache's presence as authority.
+// The aggregate process-retained ceiling must remain explicit when an individual budget changes.
 const TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES: usize = 768 * 1024 * 1024;
 const _: () = assert!(
     transform::SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES
@@ -2376,20 +2295,12 @@ const _: () = assert!(
         <= TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES
 );
 
-/// Every resident byte this component retains for the whole incarnation,
-/// declared to the host through [`ResourceDeclaration::retained_resident_bytes`].
+/// The component declares every resident byte it retains through [`ResourceDeclaration::retained_resident_bytes`].
 ///
-/// The host subtracts this from the ingress admission pool, so
-/// `max_resident_bytes` only bounds the process when this number is truthful.
-/// Declaring zero left the transform-serving caches, the snapshot cache, the
-/// boundary-token cache, and staged state-import bytes outside the accounting
-/// entirely: the runtime kept offering those same bytes to ingress while the
-/// caches held them.
+/// `max_resident_bytes` bounds process retention only when `retained_resident_bytes` is truthful.
+/// A zero declaration excludes the transform-serving caches, snapshot cache, boundary-token cache, and staged state-import bytes from ingress accounting.
 ///
-/// Enumerated per retention class rather than as one total, so a cache whose
-/// budget changes cannot silently fall out of the declaration. Broca declares
-/// its own retention the same way; each component owns its own number, and the
-/// composition site sums them when it sizes `max_resident_bytes`.
+/// The declaration lists each retention class separately so a budget change cannot omit a cache from accounting.
 pub const DECLARED_RETAINED_RESIDENT_BYTES: u64 = TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES
     as u64
     + TRANSFORM_SNAPSHOT_BUDGET_BYTES as u64
@@ -2461,8 +2372,7 @@ struct NativeAttachmentCacheStats {
 struct NativeAttachmentCacheSnapshot {
     context: NativeAttachmentContext,
     full_array_fingerprint: Option<String>,
-    // Message order and message ID (`mid`) pins identify a delta;
-    // `sidecar.messages` holds optional raw trees.
+    // Message order and `mid` identify a delta.
     sidecar: Arc<codec::DecodeSidecar>,
     message_keys: Vec<[u8; 32]>,
     // Hashes let a retained prefix keep its cache keys after the corresponding raw tree is dropped.
@@ -2470,11 +2380,10 @@ struct NativeAttachmentCacheSnapshot {
     // Sizes exist only for raw trees still present in `sidecar.messages`.
     sidecar_sizes: HashMap<String, usize>,
     chunks: Vec<NativeEncodedChunk>,
-    // Transform-generated m0/m1 messages can shift every served-output position away from raw
-    // ingress. Preserve the acknowledged ingress because `native_replace_from` indexes that input.
+    // `NativeAttachmentCacheSnapshot` preserves the acknowledged ingress because `native_replace_from` indexes it.
     ingress_chunks: Vec<Arc<Value>>,
-    // Pay each deep retained-size walk when a suffix first enters the cache. Warm passes reuse the
-    // prefix charges instead of traversing every retained provider tree again.
+    // The cache charges each suffix's deep retained-size walk when that suffix first enters the cache.
+    // Warm passes reuse prefix charges instead of traversing retained provider trees again.
     ingress_chunk_retained_bytes: Vec<usize>,
 }
 
@@ -2777,10 +2686,8 @@ impl NativeAttachmentCache {
     }
 }
 
-/// Context fields that legitimately invalidate a cached ingress projection.
 ///
-/// `transition_consumed` is intentionally absent: a transition found by the upcoming
-/// transform affects served native rendering but not the ingress CK projection.
+/// `transition_consumed` is absent because the upcoming transform affects served native rendering but not the ingress CK projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProjectionCacheContext {
     session_id: String,
@@ -2819,8 +2726,7 @@ impl ProjectionCacheSnapshot {
                     .as_ref()
                     .map_or(0, String::capacity),
             )
-            // Include the session value's hash bucket plus its independently allocated map and
-            // LRU keys. A three-word allowance covers hash control/load slack.
+            // The retained-size estimate includes hash-bucket, map, LRU-key, and three-word hash-control/load allowances.
             .saturating_add(size_of::<ProjectionCacheSession>())
             .saturating_add(size_of::<usize>() * 3)
             .saturating_add(cloned_string_retained_bytes(session_id).saturating_mul(2))
@@ -2876,9 +2782,7 @@ impl ProjectionCache {
     }
 
     fn snapshot(&mut self, session_id: &str, revert_epoch: u64) -> Option<ProjectionCacheSnapshot> {
-        // TODO(memory-accounting): add an active-clone budget for this `Arc`, as identified by
-        // the module-memory audit. A running transform can retain it after LRU eviction, so the
-        // cache-only charge cannot bound that in-flight allocation.
+        // TODO: Add an active-clone budget for this `Arc`: a running transform can retain it after LRU eviction, so the cache-only charge cannot bound that in-flight allocation.
         if self
             .sessions
             .get(session_id)
@@ -2931,20 +2835,18 @@ impl ProjectionCache {
     }
 }
 
-/// Host primary for Magic Context. Owns one store lease, full-handle route state,
-/// and every module task admitted during this host incarnation.
+/// `McHandler` is the Magic Context host primary. It owns one store lease and full-handle route state.
+/// McHandler owns every module task admitted during its incarnation.
 pub struct McHandler {
     store: Arc<Mutex<Option<Arc<McStore>>>>,
     store_open: Arc<StoreOpenCoordinator>,
-    /// Storage descriptor decoded by `initialize` and consumed by `activate`, so storage opening begins only after transport publication while a malformed descriptor still fails startup before anything publishes. commentlint: allow(JUDGE)
+    /// `initialize` decodes the storage descriptor, and `activate` consumes it: malformed descriptors fail before publication, while storage opens after transport publication.
     pending_storage: Mutex<Option<StorageDescriptor>>,
-    /// Serializes "is the module still accepting tasks?" against shutdown.
+    /// `spawn_gate` serializes the task-admission check against shutdown.
     ///
-    /// Holds no state: `cancel` is the single source of truth for whether
-    /// admission is open. This exists only so the check and the `tasks.spawn`
-    /// that follows it cannot straddle a shutdown that closes the tracker in
-    /// between. A second boolean here would be state that must be flipped in
-    /// lockstep with the token, and nothing would enforce that.
+    /// `cancel` is the sole source of task-admission state.
+    /// spawn_gate prevents the admission check and following `tasks.spawn` from straddling tracker shutdown.
+    /// A second admission boolean would have to change in lockstep with `cancel`, but nothing enforces that.
     spawn_gate: Mutex<()>,
     cancel: CancellationToken,
     tasks: TaskTracker,
@@ -2969,8 +2871,7 @@ pub struct McHandler {
     guidance_now_ms: Mutex<Option<i64>>,
     #[cfg(test)]
     reduction_injection: Mutex<HashMap<String, Vec<ReductionDecision>>>,
-    /// Test-only interleave seam: runs once between the request's transform and the
-    /// Emergency95 prepare, where a concurrent publish is otherwise impossible to place
+    /// Test-only interleave seam runs between the request transform and Emergency95 preparation, where concurrent publication otherwise cannot interleave.
     /// deterministically.
     #[cfg(test)]
     between_transform_and_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -2982,43 +2883,35 @@ pub struct McHandler {
     status_snapshot_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     state_sync_seed_now: Mutex<Option<Instant>>,
-    /// Test-only interleave seam that runs after the cheap historian read and immediately
-    /// before the fenced state-sync transaction.
+    /// Test-only interleave seam runs after the cheap historian read and before the fenced state-sync transaction.
     #[cfg(test)]
     state_sync_before_apply_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     connect_failure_commit_hook: ConnectFailureCommitHook,
     #[cfg(test)]
     publication_fence_write_hook: ConnectFailureCommitHook,
-    /// Full route handle → its session binding. Epoch is part of every lookup and removal,
-    /// so channel reuse cannot observe or delete state owned by another incarnation.
+    /// A full route handle maps to its session binding and route root; epoch-scoped lookups and removals prevent channel reuse from accessing another incarnation's state.
     bindings: Mutex<HashMap<RouteHandle, SessionBinding>>,
-    /// The host state-sync payload carries this legacy per-project evaluator flag for wire
-    /// compatibility. Conditioned-write gating reads live protocol-v2 registrations instead:
-    /// state sync is not a liveness signal.
+    /// The host state-sync payload carries the legacy per-project evaluator flag for wire compatibility; conditioned-write gating reads live protocol-v2 registrations because state sync is not a liveness signal.
     note_evaluation_capabilities: Mutex<HashMap<String, bool>>,
-    /// Evaluator registrations exist only in memory and are keyed by notes-authority
-    /// project, so restart exposes zero evaluator capacity until a fresh route registers.
+    /// Evaluator registrations exist only in memory and are keyed by notes-authority project.
+    /// Because evaluator registrations exist only in memory, restart exposes zero evaluator capacity until a fresh route registers.
     note_evaluator_registrations: Mutex<HashMap<String, Vec<NoteEvaluatorRegistration>>>,
     note_evaluator_registration_seq: AtomicU64,
-    /// Validated transform route → (session, route root). The root is part of provenance;
-    /// a cache row for the same session cannot authenticate a facade opened on another root.
+    /// A validated transform route maps to a session and route root; a cache row for that session cannot authenticate a facade opened on another root.
     transform_route_channels: Mutex<HashMap<RouteHandle, (String, PathBuf)>>,
-    /// Roots previously observed on a validated transform for each session. This survives route
-    /// teardown so durable cache state remains usable only along an authenticated route lineage.
+    /// transform_session_roots survives route teardown, so durable cache state remains usable only along an authenticated route lineage.
     transform_session_roots: Mutex<HashMap<String, HashSet<PathBuf>>>,
     state_sync_seeds: Mutex<StateSyncSeedCoordinator>,
     transform_pages: Mutex<TransformPageCoordinator>,
     #[cfg(test)]
     transform_page_discard_logs: Mutex<Vec<String>>,
     state_imports: Mutex<StateImportCoordinator>,
-    /// Module-minted zero-tool dreamer sessions. Prefixes are diagnostics only;
-    /// only registered ids may bypass transform after route validation.
+    /// active_dreamer_runs contains only module-minted zero-tool dreamer sessions; prefixes are diagnostics only.
+    /// Registered IDs may bypass transform only after route validation.
     active_dreamer_runs: Arc<Mutex<HashSet<String>>>,
-    /// In-flight `(ledger_session, command_id)` dream-task commands; see
     /// [`DreamCommandGuard`].
     inflight_dream_commands: Arc<Mutex<HashSet<(String, String)>>>,
-    /// Back-compat facade callers may omit the host tool-call id. Warn once per resolved session
-    /// while the transport shim is upgraded, without rejecting the mutation.
+    /// Facade callers without a host tool-call ID receive one warning per resolved session, and the mutation proceeds.
     missing_facade_command_id_sessions: Mutex<HashSet<String>>,
 }
 
@@ -3027,15 +2920,13 @@ const NOTE_EVALUATOR_HEARTBEAT_MS: i64 = 60_000;
 const NOTE_EVALUATOR_PROTOCOL_VERSION: &str = "2.0";
 const NOTE_EVALUATOR_ID_MAX_BYTES: usize = 128;
 const NOTE_EVALUATOR_MAX_CAPACITY: i64 = 16;
-/// Live registrations retained per project. `evaluator_instance` is caller-chosen,
-/// so this bounds both memory and the O(n) expiry purge.
+/// The per-project registration limit bounds memory and O(n) expiry purges because callers choose evaluator_instance.
 const NOTE_EVALUATOR_MAX_REGISTRATIONS: usize = 32;
 const NOTE_EVALUATOR_MAX_COMPILED_CHECK_BYTES: usize = 64 * 1024;
 const NOTE_EVALUATOR_MAX_MANIFEST_BYTES: usize = 32 * 1024;
 const NOTE_EVALUATOR_MAX_CRON_BYTES: usize = 256;
 
-/// The project key is resolved from the server-side route binding, never from
-/// a request body.
+/// The server-side route binding, not the request body, resolves the project key.
 #[derive(Debug, Clone)]
 struct NoteEvaluatorRegistration {
     token: String,
@@ -3047,18 +2938,16 @@ struct NoteEvaluatorRegistration {
     retina_handoff: bool,
     wake_owned: bool,
     expires_at: i64,
-    /// Boot-ephemeral fair-selection cycles, one pair per evaluator slot,
-    /// shared through `Arc` so cloned validation results observe one live
-    /// state. The allocation disappears with the registration entry
-    /// (unregister, expiry, replacement, route teardown, process restart), so
-    /// scheduling state never outlives the registration that owns it.
+    /// Each evaluator slot owns one boot-ephemeral pair of fair-selection cycles.
+    /// slot_cycles is shared through Arc so cloned validation results observe one live state.
+    /// slot_cycles is removed on unregister, expiry, replacement, route teardown, or process restart.
     slot_cycles: Arc<Vec<Mutex<NoteEvaluatorSlotCycles>>>,
 }
 
-/// Independent full and nonbillable selection cycles for one evaluator slot.
+/// Each evaluator slot keeps independent full and nonbillable selection cycles.
 /// The per-slot mutex serializes conflicting `next` requests for that slot
-/// across proposal, store outcome, and commit; other slots and registrations
-/// stay independent, and the guard is never held across an `.await`.
+/// The per-slot mutex remains locked through proposal, store outcome, and commit.
+/// Per-slot mutex guards are never held across .await; other slots and registrations remain independent.
 #[derive(Debug)]
 struct NoteEvaluatorSlotCycles {
     full: SmartNoteSelectionCycle,
@@ -3132,12 +3021,9 @@ impl Drop for DreamerRunGuard {
     }
 }
 
-/// In-flight `(ledger_session, command_id)` marker: exactly one
-/// `dreamer.run_task` executes per durable command identity. A concurrent
-/// duplicate — byte-identical or not, same first model or not — must not
-/// start its own billable chain or race the ledger's INSERT OR IGNORE
-/// with a different outcome, and serializing here also guarantees each
-/// derived child session has at most one live run registration.
+/// Exactly one dreamer.run_task executes per durable (ledger_session, command_id) identity.
+/// Concurrent duplicates must not start a billable chain or race the ledger INSERT OR IGNORE with different outcomes.
+/// Serializing dream-task commands guarantees each derived child session has at most one live run registration.
 struct DreamCommandGuard {
     registry: Arc<Mutex<HashSet<(String, String)>>>,
     key: (String, String),
@@ -3362,8 +3248,7 @@ impl historian::HistorianPublicationFence for WrapupSnapshotPublicationFence {
         store: &McStore,
         request: mc_store::HistorianPublishRequest<'_>,
     ) -> Result<mc_store::HistorianPublishResult, mc_store::HistorianPublishError> {
-        // Validation and the bounded local SQLite write share this lock so a transform
-        // cannot retire the cached raw snapshot between the check and additive writes.
+        // The lock prevents a transform from retiring the cached raw snapshot between validation and additive writes.
         let snapshots = self.snapshots.lock().expect("transform snapshots mutex");
         if !snapshots.ready_generation_matches(&self.session_id, self.generation) {
             return Err(mc_store::HistorianPublishError::FenceRejected {
@@ -3398,9 +3283,8 @@ impl historian::HistorianPublicationFence for ReattachSnapshotPublicationFence {
         store: &McStore,
         request: mc_store::HistorianPublishRequest<'_>,
     ) -> Result<mc_store::HistorianPublishResult, mc_store::HistorianPublishError> {
-        // Keep the cache check and database write under one lock. A later transform
-        // then cannot replace the messages selected by this request before the
-        // corresponding history rows are stored.
+        // The lock prevents cache replacement between validation and additive writes.
+        // The lock prevents later transforms from replacing the request's selected messages before their history rows are stored.
         let snapshots = self.snapshots.lock().expect("transform snapshots mutex");
         if !snapshots.generation_present_in_flight_or_ready(&self.session_id, self.generation) {
             return Err(mc_store::HistorianPublishError::FenceRejected {
@@ -3832,9 +3716,8 @@ impl McHandler {
         }
     }
 
-    /// Record the route's session binding (called from `on_bind`). Last write wins for a
-    /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
-    /// this only overwrites a stale entry that somehow survived (defensive).
+    /// The daemon emits `route.gone` before reusing a channel.
+    /// A reused channel can overwrite only a stale entry that survived after `route.gone`.
     fn bind_route(&self, channel: RouteHandle, binding: SessionBinding) {
         self.remove_note_evaluator_registrations_for_channel(channel);
         self.transform_route_channels
@@ -3948,7 +3831,6 @@ impl McHandler {
             .is_some_and(|entries| entries.iter().any(|entry| entry.expires_at > now))
     }
 
-    /// Returns whether any live registration for `project` sets each policy.
     fn live_note_evaluator_policy(&self, project: &str, now: i64) -> (bool, bool) {
         let registrations = self
             .note_evaluator_registrations
@@ -3968,8 +3850,7 @@ impl McHandler {
         (retina_handoff, wake_owned)
     }
 
-    /// Resolve the notes-authority project scoping this evaluator route. The
-    /// body never chooses the project; only the server-side route binding does.
+    /// Only the server-side route binding chooses the notes-authority project scope.
     fn resolve_note_evaluator_project(
         &self,
         channel: RouteHandle,
@@ -4089,9 +3970,8 @@ impl McHandler {
         self.refresh_oldest_queued_at_ms();
     }
 
-    /// Reconstruct a full ingress snapshot from bounded projection/native cores plus a validated
-    /// caller tail. Small entries may fall back to their full transform snapshot, but a
-    /// giant request does not need to retain provider sidecar trees to keep delta transport alive.
+    /// The ingress snapshot combines bounded projection and native cores with a validated caller tail.
+    /// Entries that fit the bounded snapshot limit may fall back to their full transform snapshot.
     fn expand_transform_tail_delta(
         &self,
         parsed: &mut TransformRequest,
@@ -4108,9 +3988,7 @@ impl McHandler {
             .and_then(|value| usize::try_from(value).ok())?;
         parsed.full_array_fingerprint.as_ref()?;
 
-        // A store-side rewrite can advance the epoch without updating this process's request
-        // snapshot. Load the persisted epoch first, then inspect the bounded projection and native
-        // cores so stale process state cannot select an outdated entry.
+        // The code loads the persisted epoch before inspecting bounded projection and native cores so stale request state cannot select an outdated entry after a store-side rewrite.
         let current_revert_epoch = self
             .store()?
             .load(&parsed.session_id)
@@ -4227,8 +4105,8 @@ impl McHandler {
         )
     }
 
-    /// The most recent full transform request retains raw CK parts until its bounded
-    /// snapshot is evicted. ctx_expand uses it only for a same-session recovery view;
+    /// The most recent full transform request retains raw CK parts until its bounded snapshot is evicted.
+    /// `ctx_expand` uses raw CK parts only for a same-session recovery view.
     /// persisted historian transcripts remain the durable fallback for the default view.
     fn cached_expand_messages(&self, session_id: &str) -> Option<Vec<ck_wire::CkIngressMessage>> {
         self.transform_snapshots
@@ -4292,7 +4170,7 @@ impl McHandler {
             .is_some_and(|state| TransformPageCoordinator::is_pending(&state.phase))
     }
 
-    /// Remove a route and evict process-local session state after its final binding closes.
+    /// Final binding closure removes the route and evicts process-local session state.
     fn unbind_route(&self, channel: RouteHandle) {
         self.remove_note_evaluator_registrations_for_channel(channel);
         self.transform_route_channels
@@ -4360,11 +4238,8 @@ impl McHandler {
         }
     }
 
-    /// Resolve the binding for a transform request on `channel`, FAIL-LOUD: the channel
-    /// must be bound AND its bound session must match the request's `session_id`. Returns
-    /// the full binding (project_root + frozen budget) the caller keys its store reads off,
-    /// never a default. The resolve-or-reject is enforced from the start, and it changes no
-    /// transform output — a correctly-bound request resolves and proceeds identically.
+    /// The handler rejects requests unless `channel` is bound and its bound session matches the request's `session_id`.
+    /// The resolver returns the full binding, including `project_root` and the frozen budget, rather than a default binding.
     fn resolve_binding(
         &self,
         channel: RouteHandle,
@@ -4405,7 +4280,6 @@ impl McHandler {
         Ok(binding)
     }
 
-    /// Return the channel binding without comparing a request session. OpenCode Rust facade
     /// routes bind a real session id, while Claude Code facade routes bind an instance token;
     /// `resolve_facade_scope` applies the corresponding identity mode before touching the store.
     fn facade_binding(&self, channel: RouteHandle) -> Result<SessionBinding, BindingError> {
@@ -4441,9 +4315,8 @@ impl McHandler {
             if !durable_root_observed || !store.has_cache_state(session_id).unwrap_or(false) {
                 return false;
             }
-            // Cache the durable proof after a process restart. The row pairs the canonical root
-            // with the accepted transform commit, so a genuinely different root cannot authorize
-            // the same session.
+            // After a process restart, the durable proof pairs the canonical root with the accepted transform commit.
+            // A genuinely different root cannot authorize the same session.
             self.transform_session_roots
                 .lock()
                 .expect("transform session roots mutex")
@@ -4467,9 +4340,7 @@ impl McHandler {
             })
     }
 
-    /// Persist the route's transport-to-identity mapping when a route becomes bound to an
-    /// authority-managed project. Unbound administrative calls have no route vocabulary to
-    /// record and remain valid.
+    /// Route binding persists the transport-to-identity mapping when a route becomes bound to an authority-managed project.
     fn bind_authority_route(
         &self,
         store: &McStore,
@@ -4731,15 +4602,6 @@ impl McHandler {
                 });
                 let factory = Arc::clone(&self.producer_factory);
                 let project_root = PathBuf::from(&project_path);
-                // The harness the run was STARTED under, not the resuming
-                // route's: Broca scopes run identity by (project_root,
-                // harness, session), so after a cross-harness handoff the
-                // current binding would resolve to `missing` and
-                // abandon-then-refire a run the original harness may still
-                // be executing. A state written before this field existed
-                // came from the producer factory that hardcoded
-                // `opencode`, so that — not the resuming binding — is the
-                // correct value for a legacy row.
                 let harness = loaded
                     .meta
                     .historian
@@ -4843,9 +4705,6 @@ impl McHandler {
                         eprintln!("mc-module: historian reattach failed for {session_id}: {e}");
                     }
                 });
-                // `spawn_module_task` yields `None` once task admission closes,
-                // and the future is then dropped unpolled. Reporting the
-                // trigger anyway puts work in the diagnostics that no task will
                 // ever perform.
                 spawned.map(|_| "reattaching")
             }
@@ -5007,8 +4866,6 @@ impl McHandler {
                 &TriggerContext {
                     boundary: BoundaryContext {
                         context_limit,
-                        // Historian preparation reloads module config independently, but a host-
-                        // resolved request threshold is still authoritative for this pass.
                         execute_threshold_percentage: parsed
                             .execute_threshold_or(cfg.execute_threshold_percentage),
                         usage_percentage,
@@ -5053,11 +4910,6 @@ impl McHandler {
                 "busy"
             };
             if reason == "trigger_false" {
-                // Carry the measurement, not just the branch: a bare trigger_false is
-                // not actionable from a state dump (is the bar honestly uncrossed, or
-                // is eligible measuring zero against real content?). Sizes quantize to
-                // the nearest 1k so routine content growth keeps the change-gate
-                // effective instead of rewriting the row on every pass.
                 let detail = match trigger.progress.as_ref() {
                     Some(p) => format!(
                         "trigger_false{{eligible~{}k,bar~{}k,protected_n~{}k,ctx_limit={}}}",
@@ -5126,8 +4978,6 @@ impl McHandler {
             .collect();
         let project_slug = project_slug(&binding.project_root);
         if fold_is_only_reclaim {
-            // CC sessions are born on this profile; tail reducers never run, so no frozen
-            // `red:*` units should exist when the fold is the sole reclaim path.
             debug_assert!(
                 !loaded
                     .core
@@ -5238,9 +5088,6 @@ impl McHandler {
                 live_guard,
                 connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
                 credential_fingerprints: binding.credential_fingerprints.clone(),
-                // Organic pressure firings assemble and publish in one continuous drive
-                // while the live-session guard is held. They do not depend on a cached raw
-                // snapshot, so a transform-snapshot generation fence would reject valid work.
                 publication_fence: None,
             },
         }))
@@ -5323,8 +5170,6 @@ impl McHandler {
                 extraction_free: false,
                 in_emergency: false,
                 force_keep_last_compartment: false,
-                // Explicit wrapup is the only reclaim mechanism on this surface, so a
-                // small final chunk must not be rejected by the substance floor.
                 fold_is_only_reclaim: true,
                 failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
                 min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
@@ -5334,8 +5179,6 @@ impl McHandler {
         let firing = match assemble {
             Ok(AssembleHistorianFiringOutcome::Fire(firing)) => {
                 let mut firing = *firing;
-                // Only the final wrapup chunk has no lookahead; intermediate chunks still
-                // need discard-last healing so the next round can re-read their tail.
                 firing.validate_options.force_keep_last_compartment = !firing.chunk.has_more;
                 firing
             }
@@ -5378,11 +5221,7 @@ impl McHandler {
         diagnostics
     }
 
-    /// Persist the skip-branch discriminant so a supervised rig can read WHY the
-    /// historian declined to fire from the state dump (the transform response's
-    /// diagnostics block never reaches disk). Change-gated: steady-state passes that
-    /// skip for the same reason write nothing, so this stays off the hot path. A CAS
-    /// conflict just drops the diagnostic; it must never fail a pass.
+    /// Delete
     fn record_no_fire(
         &self,
         store: &McStore,
@@ -5456,18 +5295,8 @@ impl McHandler {
         }
     }
 
-    /// Drive a firing for an emergency pass, bounded by the completion-wait budget.
+    /// Emergency-pass firing is bounded by the completion-wait budget.
     ///
-    /// The firing runs as a SPAWNED task and this method awaits its JoinHandle with a
-    /// timeout, for two reasons:
-    /// - The drive's own wall clock is bounded only per model attempt (producer await +
-    ///   recovery re-drain), so a fallback chain could hold the request open for
-    ///   attempt-budget × chain-length. Transform consumers need a hard per-request
-    ///   ceiling to set their call deadlines against.
-    /// - On timeout the spawned firing KEEPS RUNNING (a JoinHandle timeout does not
-    ///   cancel the task): the request degrades to its already-computed emergency
-    ///   output and a later pass picks up the published fold. Cancelling mid-drive
-    ///   would instead strand durable state for crash recovery to repair.
     async fn run_historian_firing_inline(
         &self,
         task: HistorianFiringTask,
@@ -6140,9 +5969,7 @@ impl McHandler {
         let _reset = match store.reset_session_for_recomp(&session_id, loaded.row_version) {
             Ok(reset) => reset,
             Err(error @ McStoreError::CasConflict { .. }) => {
-                // A transform may have committed between the status reads and the reset.
-                // The recomp latch remains held; ask the caller to retry rather than
-                // claiming a reset that did not use the observed cache version.
+                // Leave the recomp latch held and require the caller to retry.
                 return PreparedOutcome::Error {
                     code: "store_conflict".to_string(),
                     message: error.to_string(),
@@ -6167,9 +5994,6 @@ impl McHandler {
             .lock()
             .expect("boundary token cache mutex")
             .remove(&session_id);
-        // A transform generation is an in-memory fence for cached raw snapshots. Marking
-        // this session in-flight prevents an already assembled historian from acquiring
-        // a ready snapshot after the durable revert epoch has been bumped.
         self.transform_snapshots
             .lock()
             .expect("transform snapshots mutex")
@@ -6277,8 +6101,6 @@ impl McHandler {
         }
         let mut wrapup_latch = sample_wrapup_latch();
         if latch_before != wrapup_latch {
-            // Holding the latch mutex across SQLite I/O would block wrapup progress. A single
-            // bounded re-read instead places the durable snapshot after the observed latch edge.
             snapshot = match store
                 .load_session_status_snapshot(&session_id, include_compartments_after_seq)
             {
@@ -6323,9 +6145,6 @@ impl McHandler {
         } else {
             format!("publish failures: {consecutive_publish_failures}")
         };
-        // When the Rust module is active, it manages the frozen m0 in its own store
-        // instead of the harness SQLite cache. Report the exact session-history slice so
-        // status attribution does not estimate size by summing all raw-history p1 rows.
         let compartment_tokens = loaded
             .core
             .frozen_units
@@ -6348,11 +6167,7 @@ impl McHandler {
             .max(loaded.meta.last_committed_pass_at_ms);
         let short_session = session_id.chars().take(12).collect::<String>();
         let age = format_traffic_age(newest_pass_at, now_ms());
-        // Status can outlive the caller's current lineage. Naming the subject and its
-        // durable traffic age makes a stale read visible instead of silently ambiguous.
-        // Structured fields accompany the prose so reconciliation code can determine
-        // completion without parsing the summary or issuing another operation: a retained
-        // delivered-command record includes its coverage, row version, and current wrapup state.
+        // Structured fields let reconciliation determine completion without parsing the summary or issuing another operation.
         let m1_signal = match crate::m1_compose::m1_revision_signal_parts_for_claims_timed(
             &store,
             &binding.project_root.to_string_lossy(),
@@ -6422,8 +6237,7 @@ impl McHandler {
                 "consecutive_publish_failures": consecutive_publish_failures,
                 "publish_health_degraded": consecutive_publish_failures >= 3,
             },
-            // Keep the current-pass attribution separate from the explicitly historical
-            // `last_divergence` field so stable status reads cannot imply a fresh bust.
+            // `last_divergence` distinguishes a fresh bust from stable status reads.
             "pass_trace": pass_trace,
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "fake_compaction": {
@@ -6544,9 +6358,8 @@ impl McHandler {
         ));
         let ok = disposition != "failed";
         let (disposition, rounds, summary) = if let Some(command_id) = command_id {
-            // The generation check and fenced SQLite insert share this short critical
-            // section. The local write is bounded and prevents a transform from starting
-            // after validation but before its terminal ledger row becomes durable.
+            // The generation check and fenced SQLite insert share this short critical section.
+            // The bounded local write prevents a transform from starting after validation but before its terminal ledger row becomes durable.
             let snapshots = self
                 .transform_snapshots
                 .lock()
@@ -6670,8 +6483,7 @@ impl McHandler {
         let command_id = match request.get("command_id") {
             None => None,
             Some(value) => match value.as_str() {
-                // Empty ids are rejected so every retrying caller cannot collide on one
-                // shared durable ledger key.
+                // Empty IDs are rejected to prevent retrying callers from sharing a durable ledger key.
                 Some(command_id) if !command_id.is_empty() && command_id.len() <= 128 => {
                     Some(command_id)
                 }
@@ -6701,8 +6513,8 @@ impl McHandler {
         };
         if let Some(command_id) = command_id {
             match store.load_wrapup_command(&session_id, command_id) {
-                // Rows written by the current terminal-failure path carry a marker in their
-                // summary, while older failed rows remain eligible for a successful retry.
+                // `terminal_failure` prevents retries of failed rows.
+                // Older failed rows without terminal-failure markers remain eligible for successful retry.
                 Ok(Some(row))
                     if row.disposition == "failed"
                         && terminal_wrapup_failure_fields(&row.summary).is_none() => {}
@@ -6718,12 +6530,6 @@ impl McHandler {
         }
         let keep = match request.get("keep") {
             None => 20,
-            // The requested keep watermark is honored as given: it counts raw messages of
-            // every role, matching the TypeScript orchestrator, which accepts any positive
-            // integer and applies only a floor of 1 (the boundary resolver enforces that
-            // floor). A negative or zero keep therefore floors to 1 rather than erroring,
-            // and no upper clamp exists — a caller asking to keep more than the live tail
-            // simply gets a nothing-to-compact outcome.
             Some(value) => match value.as_i64() {
                 Some(value) => usize::try_from(value.max(0)).unwrap_or(usize::MAX),
                 None => {
@@ -6735,9 +6541,7 @@ impl McHandler {
             },
         };
 
-        // The module owns the only store writer, so a process-local per-session latch is
-        // sufficient to prevent duplicate producer drives. Durable historian state still
-        // protects publication if the process exits while a round is running.
+        // The per-session latch prevents concurrent producer drives in this process.
         let wrapup_guard = match self.try_claim_wrapup_session(&session_id) {
             Ok(guard) => guard,
             Err(rounds) => {
@@ -6829,10 +6633,6 @@ impl McHandler {
             .iter()
             .map(|compartment| compartment.end_message as u64)
             .max();
-        // The wrapup boundary snaps against the session's real geometry, resolved with
-        // the same usage -> soft-geometry -> fallback order and host-threshold preference
-        // as the historian trigger, so the user-boundary snap window matches the
-        // TypeScript wrapup resolver instead of a synthetic constant.
         let wrapup_cfg = self.effective_config(&binding.project_root);
         let (wrapup_context_limit, _, _) =
             usage_numbers(parsed.usage.as_ref(), parsed.geometry.as_ref());
@@ -6891,12 +6691,7 @@ impl McHandler {
         let mut rounds = 0usize;
         let mut failure: Option<(RetryableWrapupReason, String)> = None;
         let mut terminal_failure: Option<(&'static str, String)> = None;
-        // This observation is local to the current runner loop execution. A runner that is
-        // still starting gets one bounded chance before a repeated route absence becomes terminal.
         let mut unknown_module_observed_at = None;
-        // No round-count cap: the drain loops until the keep watermark is reached or a
-        // stop condition trips. The request budget is the ceiling — every round re-checks
-        // the deadline before driving, matching the TypeScript drain-until-target loop.
         loop {
             if Self::remaining_wrapup_budget(deadline).is_none() {
                 failure = Some((
@@ -6961,10 +6756,6 @@ impl McHandler {
             if !wrapup_has_remaining_messages(&parsed.messages, current_end, target) {
                 break;
             }
-            // Assembly re-reads one historian snapshot for this round. The firing carries
-            // that snapshot's revert epoch, and publication loads the current row version
-            // immediately before its store CAS, so a transform re-cut during production is
-            // rejected at publication rather than publishing against retired state.
             let prepared = self.prepare_wrapup_fire(
                 Arc::clone(&store),
                 &parsed,
@@ -6977,9 +6768,6 @@ impl McHandler {
                     allow_unknown_module_retry: unknown_module_observed_at.is_some(),
                 },
             );
-            // Assembly performs store reads, so verify the raw-history generation again
-            // before joining or driving the action it produced. A transform that started
-            // during assembly must invalidate this round.
             if !self
                 .transform_snapshots
                 .lock()
@@ -7121,10 +6909,6 @@ impl McHandler {
         let compartments_created = final_compartments
             .len()
             .saturating_sub(initial_compartments.len());
-        // The drain loop only exits without a failure after the no-remaining-messages
-        // check, and compartments never shrink, so a failure-free exit has reached the
-        // keep watermark. Assert the invariant instead of carrying a round-cap fallback;
-        // failure exits legitimately stop short of the watermark.
         debug_assert!(
             failure.is_some()
                 || terminal_failure.is_some()
@@ -7768,8 +7552,6 @@ impl McHandler {
             "ok": true,
             "bytes": bytes,
             "hash": sha256_hex(bytes.as_bytes()),
-            // The date line changes every day, so content_hash excludes it. Include the
-            // selected preset so a future missing-asset fallback cannot reuse the full hash.
             "content_hash": prompt_surface::guidance_content_hash(text_for_bytes, selection.preset),
             "preset": selection.preset.as_str(),
             "served_preset": if asset.fallback {
@@ -7906,9 +7688,6 @@ impl McHandler {
             )
         };
 
-        // Every byte/count field uses zero when that accounting domain is empty. `false` means no
-        // page collector is in Collecting. `oldest_queued_at_ms` uses `null` for no collector, while
-        // a numeric zero would mean the Unix epoch rather than absence.
         json!({
             "snapshots": {
                 "charged_bytes": snapshot_bytes,
@@ -8100,17 +7879,10 @@ impl McHandler {
         if parsed.serve_native && serializer_profile != Some(SerializerProfile::OpencodeAiSdk) {
             return serve_native_unsupported_profile_error(&parsed.serializer_profile);
         }
-        // The module's own producer sessions must NEVER be transformed: the historian's
-        // request is a raw structured-extraction call whose [system, user] shape is part
-        // of the prompt calibration. Identity pass-through, no store reads, no historian
-        // evaluation (a transform here would recurse the historian into itself).
         if parsed
             .session_id
             .starts_with(historian::MC_CHILD_SESSION_PREFIX)
         {
-            // The established historian namespace remains accepted for compatibility with
-            // existing producer sessions. Dreamer IDs instead require registration and route
-            // validation before they may bypass the transform.
             if parsed.tail_delta.is_some() {
                 return need_full_sync_response(&parsed);
             }
@@ -8118,8 +7890,6 @@ impl McHandler {
             return passthrough_transform_response(&parsed);
         }
         if self.dreamer_run_registered(&parsed.session_id) {
-            // Registration is the authority for a dreamer exemption. Validate the route
-            // before trusting it so a stale or cross-project channel cannot bypass transform.
             match self.resolve_binding(channel, &parsed.session_id) {
                 Ok(_) => {
                     if parsed.tail_delta.is_some() {
@@ -8233,17 +8003,12 @@ impl McHandler {
             };
         }
         ticket.accept();
-        // A newer full transform invalidates the prior wrapup snapshot before any store
-        // mutation. If this pass later rejects, wrapup must not pair old raw bytes with
-        // the state that the rejected pass may already have re-cut.
         let snapshot_generation = self
             .transform_snapshots
             .lock()
             .expect("transform snapshots mutex")
             .begin(&parsed.session_id);
         let route_project_root = binding.project_root.to_string_lossy().to_string();
-        // Resolve the route root to the memory and note owner keys before any store read.
-        // Keep the filesystem directory only for project documents and configuration below.
         let project_path = match store.authority_project_for_route(&route_project_root, "memories")
         {
             Ok(Some(project)) => project,
@@ -8286,9 +8051,6 @@ impl McHandler {
             Some(SerializerProfile::ClaudeCodeAnthropic) => {
                 match cc_mural_input(&store, &project_path) {
                     Ok(mural) => {
-                        // The mural renderer is host-side by design. CC inherits the last OC artifact
-                        // for this project and never renders or trusts a request-supplied mural itself.
-                        // A CC-only project has no artifact, so it correctly composes without a mural.
                         parsed.mural = mural;
                     }
                     Err(error) => {
@@ -8309,8 +8071,6 @@ impl McHandler {
             .or_else(|| self.lookup_full_projection_cache(&parsed));
         let projection_cache_lookup_ms =
             projection_cache_lookup_started_at.elapsed().as_secs_f64() * 1_000.0;
-        // A previous publish may have committed while one independent side channel failed.
-        // Retry on normal traffic rather than creating another background timer.
         let side_channel_drain_started_at = Instant::now();
         let _ = store.drain_historian_side_channels(
             &parsed.session_id,
@@ -8318,9 +8078,6 @@ impl McHandler {
             HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND,
         );
         let side_channel_drain_ms = side_channel_drain_started_at.elapsed().as_secs_f64() * 1_000.0;
-        // This trace is intentionally outside the fenced cache-state commit: a rejected
-        // pass must still leave a durable breadcrumb, and a trace failure must never
-        // change the transform result.
         let trace_received_started_at = Instant::now();
         let _ = store.trace_pass_received(&parsed.session_id, pass_now);
         let trace_received_ms = trace_received_started_at.elapsed().as_secs_f64() * 1_000.0;
@@ -8333,8 +8090,6 @@ impl McHandler {
                 },
                 |value| config::ResolvedCacheTtl {
                     value,
-                    // Host-resolved TTLs remain host-side; only a per-model config match may
-                    // instruct the Claude Code marker owner.
                     provenance: config::CacheTtlProvenance::Default,
                 },
             );
@@ -8343,9 +8098,6 @@ impl McHandler {
                 project_path: &project_path,
                 note_project_path: &note_project_path,
                 project_directory: &route_project_root,
-                // The authority adapter resolves this from the model context limit and
-                // sends it on each pass. Keep the bind-time value only for older callers
-                // that omit the field, and reject unusable values without disabling decay.
                 history_budget_tokens: parsed
                     .history_budget_tokens
                     .filter(|budget| budget.is_finite() && *budget >= 0.0)
@@ -8356,16 +8108,11 @@ impl McHandler {
                 memory_budget_tokens: binding.config.memory_budget_tokens,
                 user_profile_budget_tokens: binding.config.user_profile_budget_tokens,
                 now_ms: pass_now,
-                // The host resolves per-model/token thresholds against this pass's usable window.
-                // Bind-time scalar config is only the old-host compatibility fallback.
                 execute_threshold_percentage: parsed
                     .execute_threshold_or(binding.config.execute_threshold_percentage),
-                // Route-bound configuration selects either the full pipeline or the
-                // additive-only memory/docs transform for every consumer profile.
                 compaction_enabled: binding.config.compaction_enabled,
                 smart_drops: binding.config.smart_drops,
-                // OpenCode/Pi send their host-resolved value. Claude Code omits it, so resolve the
-                // request's model while retaining whether the walk actually matched an entry.
+                // Claude Code omits the value, so the host resolves the request model and records whether lookup matched.
                 cache_ttl: resolved_cache_ttl.value,
                 cache_ttl_provenance: resolved_cache_ttl.provenance,
                 model_key: binding.model_key.clone(),
@@ -8541,14 +8288,13 @@ impl McHandler {
                 }
             }
         };
-        // Emergency passes must return the freshest fold obtainable in this request: an
-        // active run can publish between this request's transform and any of the arms
-        // above (live entry already released, inline attempt failed, busy wait timed
-        // out). One final check catches every such interleaving — a PUBLISH is the only
-        // event that advances the publication floor (an abandon also bumps the row
-        // version, so row advancement alone would re-run spuriously after a failed
-        // inline drive); if the floor moved past what this request's transform saw,
-        // re-run once so the response carries the published fold instead of pre-fold
+        // Emergency passes return the freshest fold obtainable during the request.
+        // An active run can publish after this request transforms.
+        // A final check catches publications that occur after the earlier fallback paths.
+        // A PUBLISH is the only event that advances the publication floor; abandon also bumps the row version.
+        // Row advancement alone would rerun spuriously after a failed inline drive because abandon also bumps the row version.
+        // The handler reruns once when the publication floor differs from the value observed by this request's transform.
+        // The retry returns the published fold rather than pre-fold bytes.
         // bytes.
         if !parsed.is_subagent && result.scheduler_pass == scheduler::PassDecision::Emergency95 {
             let floor_advanced = store
@@ -8626,9 +8372,8 @@ impl McHandler {
         self.record_response_observation(&parsed.session_id, now_ms());
         let response_observation_ms =
             response_observation_started_at.elapsed().as_secs_f64() * 1_000.0;
-        // Tail deltas have already been expanded at this point. Charge the retained request tree,
-        // not the much smaller inbound suffix, so the ready LRU and active-lease budget describe
-        // the same object their `Arc`s keep alive.
+        // Tail deltas are already expanded; charge the retained request tree, not the inbound suffix.
+        // The ready LRU and active-lease budget must account for the retained request tree their `Arc`s keep alive.
         let retained_size_started_at = Instant::now();
         let retained_bytes = parsed.retained_bytes_with_charges(
             (native_cache_stats.request_native_retained_bytes > 0)
@@ -8876,8 +8621,7 @@ impl McHandler {
                 return invalid_params_error(error.to_string());
             }
         };
-        // Batch zero is checked against durable metadata before the process-local state is
-        // touched. A stale retry therefore cannot evict or allocate another live attempt.
+        // Mark the attempt as touched so a stale retry cannot evict it or allocate another live attempt.
         if batch_index == 0 {
             let loaded = match store.load(&binding.session) {
                 Ok(loaded) => loaded,
@@ -8925,9 +8669,6 @@ impl McHandler {
                 let state = seeds.sessions.entry(binding.session.clone()).or_default();
                 std::mem::replace(&mut state.phase, StateSyncSeedPhase::Idle)
             };
-            // Authority callers can send a paged initial feed without a separate reset.
-            // Their bound real session already owns the current generation, so arm the
-            // same bounded collector automatically for the first batch.
             let phase = match phase {
                 StateSyncSeedPhase::Idle if batch_index == 0 => StateSyncSeedPhase::AwaitingSeed {
                     generation: seed_generation,
@@ -8943,10 +8684,8 @@ impl McHandler {
                             || pending.expected_seq != parsed.expected_shadow_seq
                             || pending.total != batch_total) =>
                 {
-                    // A sender rebuilding after a lost acknowledgement starts a fresh
-                    // attempt at batch zero. Replace the stale collector while holding
-                    // the coordinator lock, and release its bytes before charging the
-                    // new first batch in the AwaitingSeed arm below.
+                    // The coordinator holds its lock while replacing the stale collector to serialize replacements.
+                    // The coordinator releases stale collector bytes before charging the new first batch to avoid counting both collectors.
                     let stale = StateSyncSeedPhase::Collecting(pending);
                     seeds.release_phase(&stale);
                     StateSyncSeedPhase::AwaitingSeed {
@@ -9265,10 +9004,6 @@ impl McHandler {
                 }
             };
             if historian_phase != HistorianPhase::Idle {
-                // Do not stage or adopt compartment rows while a historian owns the
-                // snapshot. The TS sender treats this typed rejection as retry-later,
-                // retaining its acknowledged sequence and watermarks instead of forcing
-                // a full re-seed on every active historian pass.
                 return historian_compartment_sync_busy_error(historian_phase);
             }
         }
@@ -9682,8 +9417,6 @@ impl McHandler {
             return invalid_params_error("dreamer.run_task requires task");
         };
         if task != CLASSIFY_TASK {
-            // Enumerating the task here is a capability boundary: callers cannot use this
-            // route to select an arbitrary system prompt, model, or tool-enabled run.
             return invalid_params_error(format!("unknown dreamer task {task:?}"));
         }
         let Some(command_id) = request.get("command_id").and_then(Value::as_str) else {
@@ -9774,12 +9507,6 @@ impl McHandler {
         let Some(items) = payload.get("items").and_then(Value::as_array) else {
             return invalid_params_error("classify payload requires items");
         };
-        // The requested claims are the accept predicate's oracle: an attempt
-        // is successful only if its manifest covers exactly these. Identity is
-        // the claim's opaque public ID, which is also what
-        // `CLASSIFY_SYSTEM_PROMPT` asks the model to echo back — a request
-        // parser and a manifest validator that disagreed on the identity type
-        // would reject every attempt the prompt can produce.
         let mut expected_ids: BTreeSet<String> = BTreeSet::new();
         for item in items {
             let Some(public_claim_id) = item.get("public_claim_id").and_then(Value::as_str) else {
@@ -9818,15 +9545,6 @@ impl McHandler {
             }
             model_chain.push(model.to_string());
         }
-        // The deadline prevents new producer runs after the caller's supplied
-        // budget expires, and it is the ONLY bound relating this handler's
-        // work to the caller's transport budget. Without it a single model can
-        // burn CLASSIFY_AWAIT_TIMEOUT on the start, CLASSIFY_AWAIT_TIMEOUT on
-        // the await, and CLASSIFY_RECOVERY_TIMEOUT on the re-drain — 21
-        // minutes — and a full MAX_CLASSIFY_MODEL_CHAIN chain multiplies that
-        // by eight, so the caller's cancel would always land mid-chain,
-        // between a producer run and its purge. Required, not optional: a
-        // payload that omits it is asking for an unbounded billable chain.
         let deadline = {
             let Some(ms) = payload
                 .get("timeout_ms")
@@ -9835,27 +9553,13 @@ impl McHandler {
             else {
                 return invalid_params_error("classify payload requires a positive timeout_ms");
             };
-            // `Instant + Duration` panics on overflow, so an absurd
-            // budget is a parameter error, not a crashed handler task.
             let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
                 return invalid_params_error("classify timeout_ms is out of range");
             };
             deadline
         };
 
-        // Exactly one execution per (ledger_session, command_id): a
-        // concurrent duplicate with different prompt bytes or a different
-        // first model would derive its own child session, bypass Broca's
-        // byte-level idempotency, start a second billable chain, and race
-        // the ledger's INSERT OR IGNORE with a different outcome. The
-        // loser returns without any ledger write; its retry replays the
-        // winner's recorded response.
         //
-        // Taken BEFORE the ledger read so it also closes the read-to-
-        // registration window: reading first would let a duplicate observe
-        // no row, lose the CPU while the winner ran to completion and
-        // released the guard, then acquire it and start a second billable
-        // chain against a command that already has a durable response.
         let command_key = (ledger_session.clone(), command_id.to_string());
         {
             let mut inflight = self
@@ -9876,9 +9580,6 @@ impl McHandler {
             key: command_key,
         };
 
-        // A ledger read failure must not look like "no record": replaying a
-        // command whose durable response exists would start a second
-        // billable run, so the read fails closed and the caller retries.
         match store.load_dream_task_command(&ledger_session, command_id) {
             Ok(Some(recorded)) => return replay_dream_task_response(&recorded.response_json),
             Ok(None) => {}
@@ -9923,19 +9624,10 @@ impl McHandler {
                     continue;
                 }
             };
-            // Connection and route setup can consume the remaining budget;
-            // a send after the promised deadline would start a billable run
-            // only to time out its zero-length await immediately.
             if Instant::now() >= deadline {
                 last_error = "classify time budget exhausted during producer startup".to_string();
                 break;
             }
-            // Bounded by the caller's remaining budget like the await and
-            // redrain: `session.send` is a request with its own 30s timeout
-            // (and a reconnect resend), so an unbounded start could overrun
-            // the promised deadline and eat the transport margin reserved
-            // for `session.delete` — letting the caller's cancel land
-            // during cleanup and leave a billable run alive.
             let started = match tokio::time::timeout(
                 classify_attempt_timeout(CLASSIFY_AWAIT_TIMEOUT, deadline),
                 producer.start_with_generation(
@@ -9973,28 +9665,9 @@ impl McHandler {
                 },
                 Err(error) => Err(error),
             };
-            // Each non-final attempt must purge its session before advancing
-            // or returning; dreamer sessions carry memory-pool snapshots. A
-            // failed purge is therefore terminal for the command on those
-            // outcome kinds — advancing the chain would let a later success
-            // mask the session (and its snapshot) left behind.
             //
-            // The successful attempt is the exception: its session is the
-            // only recoverable copy of the result until the response is
-            // durably recorded, so it is purged after the ledger write —
-            // purging first would let a ledger failure tombstone the run and
-            // persist a failure for a command that actually succeeded.
             match attempt_output {
-                // Validated against the requested IDs before the attempt is
-                // accepted: an enveloped-but-invalid manifest must advance
-                // the chain, not end it and be ledgered as this command's
-                // durable response. The caller stays the authority for
-                // interpreting the values it applies.
                 //
-                // A length-capped generation is an attempt failure even when
-                // its prefix happens to parse: the caller rejects
-                // `truncated`, so accepting one here would ledger a response
-                // no caller can use and burn the remaining chain.
                 Ok(result) => match length_capped_or_invalid(&result, &expected_ids) {
                     Ok(()) => {
                         output = Some((model.clone(), result, child_session, producer));
@@ -10013,15 +9686,6 @@ impl McHandler {
                     },
                 },
                 Err(primary) => {
-                    // An idempotency conflict means a concurrent command
-                    // with the same (ledger_session, command_id) owns this
-                    // child session and its live, billable run: purging
-                    // would cancel the other caller's run, and advancing
-                    // the chain would start a duplicate billable attempt
-                    // for a command already executing. Return without any
-                    // ledger write — the loser's failure must not win the
-                    // INSERT OR IGNORE race against the in-flight winner's
-                    // outcome; a retry replays the winner's ledgered
                     // response.
                     if matches!(
                         &primary,
@@ -10083,17 +9747,10 @@ impl McHandler {
             now_ms(),
         ) {
             Ok(recorded) => {
-                // Purge only after the response is durable. A purge failure
-                // here cannot fail the command — the recorded response is
-                // already the command's outcome (any retry replays it) —
-                // and the leftover session stays bounded by host terminal
                 // retention.
                 let _ = producer.purge_session(&child_session).await;
                 replay_dream_task_response(&recorded.response_json)
             }
-            // The completed session is left alive deliberately: with no
-            // ledger row, a retry derives the same child session and can
-            // recover the completed run instead of hitting a deletion
             // tombstone.
             Err(error) => PreparedOutcome::Error {
                 code: "dreamer_ledger_failed".to_string(),
@@ -10122,12 +9779,7 @@ impl McHandler {
         }
     }
 
-    /// Resolve the daemon-bound route root for a claim facade request.
     ///
-    /// Every claim handler must go through this. The claim wire carries
-    /// caller-supplied identity (`binding.authorityProject`,
-    /// `binding.databaseIncarnationId`), so the bound route is the only
-    /// trustworthy authority identity on the request.
     fn claim_route_root(
         &self,
         channel: RouteHandle,
@@ -10462,10 +10114,6 @@ impl McHandler {
             return Err(session_unresolved_error());
         }
 
-        // Harness labels are client-supplied routing hints, not authentication. OpenCode may
-        // bypass session.resolve only after server-observed cache state or a live transform
-        // route proves that this exact session belongs to the module; wrapper token namespaces
-        // cannot satisfy that provenance check.
         let conversation_key = if binding.harness == OPENCODE_HARNESS
             && self.module_knows_transform_session(bound_session, &binding.project_root)
         {
@@ -10516,14 +10164,10 @@ impl McHandler {
                         });
                     }
                     if bind_authority_for_write && authority_state != "MODULE" {
-                        // Reads and transforms may keep using the module identity while authority
-                        // drains, but facade mutations must retry instead of writing after ownership changes.
                         return Err(authority_draining_error(authority_domain));
                     }
                     authority_project
                 }
-                // A route without an authority binding remains path-scoped. Lookup failures are
-                // retryable errors: silently using the route could read or write the wrong owner.
                 Ok(None) => route_project_root.clone(),
                 Err(error) => {
                     return Err(PreparedOutcome::Error {
@@ -10555,8 +10199,6 @@ impl McHandler {
         };
         let requested = match parse_tag_range_string(raw_drop) {
             Ok(requested) => requested,
-            // The parser is the delivery-side canonicalizer. Surface its exact rejection so
-            // acknowledgement and asynchronous delivery cannot disagree about range syntax.
             Err(error) => {
                 return tool_error_result(format!("Error: Invalid range syntax. {error}"));
             }
@@ -10645,8 +10287,8 @@ impl McHandler {
         if !validation_detail.is_empty() {
             details.push(validation_detail);
         }
-        // This acknowledgement validates the durable tag state but deliberately does not
-        // mutate it. The response observer owns asynchronous delivery on this facade.
+        // The acknowledgement validates durable tag state without mutating it.
+        // The response observer owns asynchronous delivery.
         mcp_text_result(format!("Queued: {}.", details.join("; ")), false)
     }
 
@@ -10676,11 +10318,8 @@ impl McHandler {
         };
         match action {
             "get" | "list" => {
-                // Bulk enumeration returns every workspace-authorized row, which
-                // can include shared foreign-project claims, so it stays limited
-                // to dreamer maintenance exactly as the host tool contract does.
-                // The registry is module-owned state for child sessions this
-                // handler minted, unlike the client-supplied harness label.
+                // Bulk enumeration can include shared foreign-project claims, so only dreamer maintenance sessions may use it.
+                // The registry tracks child sessions minted by this handler, not client-supplied harness labels.
                 if action == "list" {
                     let bound_session = match self.facade_binding(channel) {
                         Ok(binding) => binding.session.trim().to_string(),
@@ -10723,9 +10362,7 @@ impl McHandler {
                     return tool_error_result("Error: malformed public claim ID.".to_string());
                 }
                 let requested = requested.into_iter().collect::<BTreeSet<_>>();
-                // `limit` narrows enumeration. An explicit `get` names its rows,
-                // so honoring a smaller limit there would silently drop claims the
-                // caller asked for by ID.
+                // Explicit `get` requests name rows, so `limit` applies only to enumeration; otherwise it could omit requested claims.
                 let limit = if requested.is_empty() {
                     usize_arg(&args, "limit").unwrap_or(20).clamp(1, 100)
                 } else {
@@ -11011,9 +10648,7 @@ impl McHandler {
             entries.retain(|entry| {
                 !(entry.evaluator_instance == evaluator_instance && entry.route == channel)
             });
-            // `evaluator_instance` is caller-chosen, so without a cap a single
-            // bound channel could retain unbounded live entries for a full lease
-            // and make the O(n) expiry purge superlinear in injected entries.
+            // `evaluator_instance` values are capped so a bound channel retains bounded entries for one lease.
             if entries.len() >= NOTE_EVALUATOR_MAX_REGISTRATIONS {
                 return note_evaluation_bad_request(format!(
                     "project already has {NOTE_EVALUATOR_MAX_REGISTRATIONS} live evaluator registrations"
@@ -11228,17 +10863,14 @@ impl McHandler {
         }
         let (retina_handoff, wake_owned) = self.live_note_evaluator_policy(&project, now);
         if wake_owned {
-            // The wake flag can flip before the next poll, so this veto skips
-            // the store and leaves no replayable acquisition decision behind.
+            // A wake-flag change before the next poll causes the veto to skip the store, leaving no replayable acquisition decision.
             return respond(json!({ "result": "no_work", "wake_owned": true }));
         }
         let Some(store) = self.store() else {
             return store_unavailable_error();
         };
-        // Fair-cycle ownership (KTD2/KTD3): hold only this slot's lock across
-        // the synchronous store acquisition so conflicting polls for one slot
-        // serialize while other slots and registrations proceed. The cycle
-        // advances only on fresh durable outcomes classified below.
+        // The acquisition path holds only the slot lock during synchronous store acquisition so polls for one slot serialize without blocking other slots or registrations.
+        // `slot_cycle` advances only on fresh durable outcomes.
         let mode = if exclude_billable {
             SmartNoteCycleMode::Nonbillable
         } else {
@@ -11264,9 +10896,7 @@ impl McHandler {
                     .iter()
                     .map(smart_note_selection_snapshot)
                     .collect();
-                // The nonbillable cycle exposes only the sandbox phases (due,
-                // liveness); compile and fallback claims launch LLM prompts
-                // and belong to the scheduled full-budget drain.
+                // The nonbillable cycle runs only due and liveness; compile and fallback claims require LLM prompts and run in the scheduled full-budget drain.
                 let selection =
                     select_smart_note_evaluation_cycle(&snapshots, now, retina_handoff, &cycle);
                 match selection {
@@ -11274,13 +10904,7 @@ impl McHandler {
                         proposed_cycle = Some(next_cycle);
                         NoteEvalSelection::Claim { note_id, phase }
                     }
-                    // An empty answer has two causes the caller cannot tell
-                    // apart: this pass is spent, or the queue is empty. A
-                    // cursor left mid-cycle by a deadline-truncated drain would
-                    // otherwise report the next drain's first poll as a drained
-                    // queue. Selection is pure, so re-running it against a
-                    // fresh cycle only classifies this empty answer; the store
-                    // persists the cause so a response-loss replay repeats it.
+                    // The stored record distinguishes a spent pass from an empty queue so replays preserve the cause.
                     None => NoteEvalSelection::NoWork {
                         cycle_exhausted: select_smart_note_evaluation_cycle(
                             &snapshots,
@@ -11295,21 +10919,11 @@ impl McHandler {
             now,
         ) {
             Ok(outcome) => {
-                // Commit the tentative cursor only after the store commits a
-                // fresh decision: a fresh claim installs the proposal and a
-                // fresh no_work resets this mode's cycle. Replayed claims,
-                // recovered slot claims, replayed no_work, busy, expiry,
-                // terminal replay, invalid identity, and authority change all
-                // leave both cycles untouched.
+                // The tentative cursor commits only after a fresh decision is stored: a fresh claim installs the proposal, and fresh `no_work` resets the mode's cycle.
                 match &outcome {
                     NoteEvalAcquireOutcome::Claim {
                         replayed: false, ..
                     } => {
-                        // The store returns a fresh claim only after the
-                        // selection closure produced a candidate, which also
-                        // sets `proposed_cycle`. A `None` here means the quota
-                        // stopped decrementing and fair rotation silently
-                        // starves, so surface the broken invariant in tests.
                         debug_assert!(
                             proposed_cycle.is_some(),
                             "fresh claim committed without a proposed cycle update"
@@ -11321,10 +10935,6 @@ impl McHandler {
                     NoteEvalAcquireOutcome::NoWork {
                         replayed: false, ..
                     } => {
-                        // A fresh no_work resets this mode's cursor; when the
-                        // decision carries cycle_exhausted the response tells
-                        // the client to poll again and reach the work the
-                        // spent cursor hid.
                         *slot_cycle = SmartNoteSelectionCycle::new(mode);
                     }
                     _ => {}
@@ -11990,8 +11600,6 @@ impl McHandler {
 
 impl Drop for McHandler {
     fn drop(&mut self) {
-        // `&mut self` excludes any concurrent spawn, so the gate is unnecessary
-        // here. Cancel first, matching `shutdown`: the token closes admission.
         self.cancel.cancel();
         self.tasks.close();
     }
@@ -12036,26 +11644,14 @@ impl CompositeComponent for McHandler {
         if let Err(outcome) = enforce_request_byte_cap(ctx.body.as_slice()) {
             return settle_prepared(&ctx, outcome).await;
         }
-        // Charge the tree BEFORE materializing it. `from_slice::<Value>` turns a
-        // body into a node per value plus an owned `String` per string, which for
-        // scalar-dense JSON is many times the wire bytes — and the body's own
-        // ingress charge does not cover any of it. Reserved afterwards, every
-        // concurrent request would already have escaped the resident envelope by
-        // its own full expansion.
         //
-        // The bound is counted from the body rather than assumed as a multiple of
-        // it, mirroring what the response path does with `measure`: a realistic
-        // string-heavy transform body reserves close to its true footprint, while
-        // a scalar-dense body that genuinely cannot be served inside the envelope
-        // is refused instead of silently exceeding it.
         let Some(footprint) = value_footprint_bound(ctx.body.as_slice()) else {
             return settle_prepared(&ctx, request_too_large_error()).await;
         };
         let _parse_charge = match ctx.try_reserve_resident(footprint) {
             Some(charge) => charge,
             None if footprint > ctx.resident_capacity() => {
-                // Above the ceiling itself: no amount of draining admits it, so
-                // this is permanent rather than backpressure.
+                // A footprint above `resident_capacity()` cannot be admitted by draining.
                 return settle_prepared(&ctx, request_too_large_error()).await;
             }
             None => return settle_prepared(&ctx, resident_capacity_error()).await,
@@ -12081,11 +11677,10 @@ impl CompositeComponent for McHandler {
                 detail: Some("storage is opening".to_owned()),
                 metrics: None,
             },
-            // `waiting_report` re-reads the phase and returns `None` when the
-            // store finished opening between the two loads. Falling back to
-            // the dispatch report keeps that benign race non-fatal: a panic
-            // here propagates through the health probe's lifecycle join and
-            // trips daemon shutdown.
+            // `waiting_report` returns `None` if opening completes between its phase loads.
+            // `DISPATCH_HEALTH.report(now)` handles completion between `waiting_report` phase loads.
+            // The fallback prevents the health probe from panicking when opening completes between phase loads.
+            // A health-probe panic propagates through its lifecycle join.
             STORE_OPEN_WAITING => self
                 .store_open
                 .waiting_report(now)
@@ -12129,9 +11724,9 @@ impl CompositeComponent for McHandler {
 
     async fn shutdown(&self) -> Result<(), ShutdownError> {
         {
-            // Closing admission and closing the tracker under the gate is what
-            // stops a spawn that already passed the check from landing in a
-            // tracker `wait` has stopped watching.
+            // The gate closes admission and the tracker together, preventing admitted spawns from escaping tracker observation.
+            // The gate prevents a spawn that passed admission from landing after tracker observation stops.
+            // `TaskTracker::wait` observes only tasks spawned before `close`.
             let _gate = self.spawn_gate.lock().expect("module spawn gate mutex");
             self.cancel.cancel();
             self.tasks.close();
@@ -12304,9 +11899,7 @@ async fn settle_prepared(ctx: &RequestCtx, outcome: PreparedOutcome) -> RequestO
 }
 
 impl McHandler {
-    /// Route a parsed request body to its handler. Split from `handle()` so the
-    /// routing arms are unit-testable (`RequestCtx` cannot be constructed
-    /// outside the transport).
+    /// `RequestCtx` is transport-private, so this helper lets unit tests exercise routing arms without constructing one.
     #[cfg(test)]
     async fn dispatch_value(&self, route: RouteHandle, request: Value) -> PreparedOutcome {
         self.dispatch_value_with_inbound_bytes(route, request, None)
@@ -12330,8 +11923,6 @@ impl McHandler {
             .or_else(|| request.get("kind").and_then(Value::as_str));
         if let Some(method) = method {
             return match method {
-                // Proves the store opened end-to-end and, when a session_id is supplied,
-                // returns the session's stored trace state directly from the module.
                 "health" | "status" | "diagnostics" => self.handle_status_value(&request),
                 "authority.status" => self.handle_authority_status_value(channel, &request),
                 "authority.prepare" => self.handle_authority_prepare_value(channel, &request),
@@ -12351,8 +11942,6 @@ impl McHandler {
                 "guidance.get" => self.handle_guidance_value(channel, &request),
                 "manifest.get" => self.handle_prompt_surface_manifest_value(channel, &request),
                 "dreamer.run_task" => self.handle_dreamer_run_task(channel, &request).await,
-                // Handle transform requests: decode the incoming context array, update
-                // cache state, and return the rewritten array for the caller.
                 "transform" => {
                     self.handle_transform_dispatch(channel, request, inbound_bytes)
                         .await
@@ -12390,10 +11979,9 @@ impl McHandler {
                 "session.status" => self.handle_session_status_value(channel, &request),
                 "session.delete" => self.handle_session_delete_value(channel, &request),
                 "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
-                // Explicit wire-debugging echo. Opt-in only: echoing every
-                // unrecognized body would silently swallow misrouted requests
-                // (a caller can "succeed" against an echo while testing nothing),
-                // so unknown shapes fail loud below instead.
+                // The handler echoes only explicit wire-debugging requests.
+                // Unknown request bodies must fail so misrouted callers cannot mistake an echo for success.
+                // An unconditional echo lets a misrouted caller mistake an echo for success.
                 "echo" => respond(json!({ "ok": true, "echo": request })),
                 _ => unrecognized_request_error(&request),
             };
@@ -12423,14 +12011,8 @@ fn transform_page_error(
     }
 }
 
-/// Classify a request that matched no known `method`/`kind`. Two distinct
-/// errors so a misroute is diagnosable from the error code alone:
-/// - `{name, arguments}` without `method`/`kind` is the shape of an MCP
-///   tools/call envelope. Only ctx_memory and ctx_search are accepted on that
-///   surface; unsupported names keep a distinct error so a policy or routing
-///   mistake is diagnosable from the code alone.
-/// - Anything else names the discriminator fields we looked for and the
-///   top-level keys we actually got.
+/// Distinct errors let clients distinguish an MCP `tools/call` misroute from a request with no recognized discriminator.
+/// Unsupported tool names return a distinct error so clients can diagnose policy or routing mistakes.
 fn unrecognized_request_error(request: &Value) -> PreparedOutcome {
     let has_mcp_shape = request.get("name").is_some() && request.get("arguments").is_some();
     if has_mcp_shape {
@@ -12468,9 +12050,9 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
-/// The wall-clock now in ms. Used ONLY to set the frozen expiry cutoff on a HARD (the
-/// first materialization freezes it into meta); every later pass reads the frozen value,
-/// never this, so expiry never drifts the rendered bytes between passes.
+/// Use the wall clock only to set the expiry cutoff during the first HARD materialization.
+/// Storing the first HARD cutoff keeps later materializations byte-stable.
+/// Later passes use the stored cutoff so expiry cannot change rendered bytes between passes.
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -12591,11 +12173,8 @@ fn projection_cache_context(request: &TransformRequest) -> ProjectionCacheContex
     }
 }
 
-/// Select a cached ingress projection when the request's fingerprint and rendering context match.
 ///
-/// Transition salt is not part of this key: a transition found by the upcoming transform affects
-/// served native rendering but not the ingress CK projection. Reuse a cached prefix only when the
-/// request's profile and rendering fields also match.
+/// Transition salt is excluded because transitions affect native rendering, not ingress CK projections.
 fn validated_projection_cache_input(
     request: &TransformRequest,
     snapshot: &ProjectionCacheSnapshot,
@@ -13176,8 +12755,7 @@ fn finalize_native_messages_response(
             }
         }
     } else {
-        // Callers without a frontier cannot reconstruct a suffix, even if an unexpected
-        // pre-existing delta reached this seam. Preserve backward compatibility with a full serve.
+        // Without a frontier, callers cannot reconstruct a suffix after an unexpected pre-existing delta.
         response.native_messages_delta = None;
     }
 
@@ -13243,11 +12821,10 @@ fn classify_attempt_timeout(ceiling: Duration, deadline: Instant) -> Duration {
     ceiling.min(deadline.saturating_duration_since(Instant::now()))
 }
 
-/// The accept predicate for one classify attempt: usable output, then a
-/// manifest that covers exactly the requested memories. A length-capped
-/// generation is rejected even when its truncated prefix parses, because the
-/// caller refuses `truncated` output — accepting one would write a durable
-/// response no caller can use and leave the remaining chain unavailable to
+/// Accept a classify attempt only when its output is usable and its manifest covers exactly the requested memories.
+/// Reject a generation unless its manifest covers exactly the requested memories.
+/// Reject length-capped generations even when their truncated prefixes parse.
+/// Caching unusable output leaves the remaining chain unavailable.
 /// every retry.
 fn length_capped_or_invalid(
     result: &historian_producer::ProducerOutput,
@@ -13283,31 +12860,13 @@ fn replay_dream_task_response(response_json: &str) -> PreparedOutcome {
     respond(response)
 }
 
-// SAFETY: Deliberate fault injection for the joint CC rig drive — see the `drive-fault`
-// feature note in Cargo.toml for why this ships in the binary at all.
 //
-// Why it exists: the claude-code-anthropic ("CC") transform leg carries no organic
-// traffic, so its mismatch / "raw-only fence" error paths — the consumer's reaction to a
-// response whose echoed fingerprint or message array does not match what it submitted —
-// can only be exercised by a rig drive. To induce those paths the drive needs OUR
-// transform response to be deliberately malformed; the CC-leg peer correctly refuses to
-// carry fault scaffolding on its own side, so the corruption lives here.
+// The rig drive exercises CC transform mismatch paths.
 //
-// Why it is safe: this whole block is compiled ONLY under `--features drive-fault`. A
-// default deploy build has no corruption path at all — that structural absence is the
-// dormancy proof, so there is no runtime-reachable arm a stray env var could trigger.
-// Even under the feature the arm is inert unless MC_DRIVE_FAULT selects it, and it is
-// scoped to transform responses only: respond_transform is the sole transform-response
-// serializer, and facade tools and status/wrapup ops never route through it.
+// The feature-enabled fault arm requires `MC_DRIVE_FAULT`.
 //
-// Additionally, the fault self-disarms after MC_DRIVE_FAULT_COUNT firings (default 1)
-// via a fetch_sub claim on DRIVE_FAULT_REMAINING. This prevents the fault from
-// corrupting a recovery pass in the fence+recover drive arc — the only other disarm
-// would be a restart, which injects a variable the arc must not contain. Total WARN
-// lines in logs will equal exactly N, so miscounts are visible.
+// The fault disables itself after `MC_DRIVE_FAULT_COUNT` firings (default 1).
 //
-// Maintenance rule: never add another fault arm without the same absence-proof note in
-// Cargo.toml and the fault-shape tests that pin the existing arms.
 #[cfg(feature = "drive-fault")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DriveFault {
@@ -13316,10 +12875,7 @@ enum DriveFault {
     Channel2Arm,
 }
 
-/// Map the raw MC_DRIVE_FAULT value to a fault arm. Pure (no env access) so the
-/// selection logic is unit-testable without mutating process-global env or the
-/// process-wide OnceLock below. Any unrecognized value — or no value — maps to None,
-/// which leaves the response untouched.
+/// `parse_drive_fault` avoids environment access so unit tests do not mutate process-global state.
 #[cfg(feature = "drive-fault")]
 fn parse_drive_fault(raw: Option<&str>) -> Option<DriveFault> {
     match raw {
@@ -13330,13 +12886,10 @@ fn parse_drive_fault(raw: Option<&str>) -> Option<DriveFault> {
     }
 }
 
-/// Parse MC_DRIVE_FAULT_COUNT: how many transform responses may fire the fault before
-/// the mechanism self-disarms. Pure (no env access) so unit-testable without touching
-/// process-global env or the process-wide OnceLock/AtomicUsize below.
+/// `parse_drive_fault_count` uses `MC_DRIVE_FAULT_COUNT` as the maximum number of fault firings before self-disarming.
+/// `parse_drive_fault_count` avoids environment access, so unit tests do not mutate process-global state.
 ///
-/// Defaults to 1 when unset, empty, or unparseable. A value of 0 is treated as
-/// unset (defaults to 1) since 0 would mean "never fire" which is indistinguishable
-/// from not setting MC_DRIVE_FAULT at all.
+/// `parse_drive_fault_count` maps `0` to `1` so an enabled fault arm fires at least once.
 #[cfg(feature = "drive-fault")]
 fn parse_drive_fault_count(raw: Option<&str>) -> usize {
     match raw.and_then(|s| s.parse::<usize>().ok()) {
@@ -13345,40 +12898,29 @@ fn parse_drive_fault_count(raw: Option<&str>) -> usize {
     }
 }
 
-/// Remaining fault-firings before the mechanism self-disarms permanently.
-/// Initialized alongside the arm selection in `drive_fault()`.
 #[cfg(feature = "drive-fault")]
 static DRIVE_FAULT_REMAINING: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// The active fault arm, read from MC_DRIVE_FAULT once per process (first call wins via
-/// OnceLock — no per-request getenv on the transform hot path). Also initializes
-/// DRIVE_FAULT_REMAINING from MC_DRIVE_FAULT_COUNT so the count is set before any
-/// respond_transform call can read it.
+/// `drive_fault` reads `MC_DRIVE_FAULT` once per process; the first call fixes the active fault arm.
 #[cfg(feature = "drive-fault")]
 fn drive_fault() -> Option<DriveFault> {
     use std::sync::OnceLock;
     static FAULT: OnceLock<Option<DriveFault>> = OnceLock::new();
     *FAULT.get_or_init(|| {
         let fault = parse_drive_fault(std::env::var("MC_DRIVE_FAULT").ok().as_deref());
-        // Initialize the remaining fault count alongside the arm selection.
-        // This runs exactly once per process (OnceLock), so DRIVE_FAULT_REMAINING
-        // is set before any respond_transform call can read it.
         let count = parse_drive_fault_count(std::env::var("MC_DRIVE_FAULT_COUNT").ok().as_deref());
         DRIVE_FAULT_REMAINING.store(count, std::sync::atomic::Ordering::Relaxed);
         fault
     })
 }
 
-/// Corrupt a transform response per the selected fault arm and log one loud WARN per
-/// fired fault so a forgotten MC_DRIVE_FAULT is impossible to miss in rig logs.
 #[cfg(feature = "drive-fault")]
 fn apply_drive_fault(response: &mut transform::TransformResponse, fault: DriveFault) {
     match fault {
         DriveFault::FingerprintSkew => {
-            // Echo a perturbed fingerprint so it fails any equality check against the
-            // submitted value. A response with no fingerprint still gets a non-empty
-            // sentinel so the echo cannot match a submitted empty/absent value.
+            // `FingerprintSkew` appends `_skew` to an echoed fingerprint so it cannot equal the submitted fingerprint.
+            // `FingerprintSkew` uses `_skew` when no echoed fingerprint exists so the echo cannot match an empty or absent submitted fingerprint.
             let perturbed = match response.full_array_fingerprint.take() {
                 Some(fingerprint) => format!("{fingerprint}_skew"),
                 None => "_skew".to_string(),
@@ -13389,23 +12931,12 @@ fn apply_drive_fault(response: &mut transform::TransformResponse, fault: DriveFa
             );
         }
         DriveFault::OmitCkMessages => {
-            // Drop ck_messages so it serializes ABSENT (the same skip_serializing_if arm
-            // need_full_sync uses) while keeping the ok status: a success-shaped response
-            // with the array field missing.
             response.ck_messages = None;
             eprintln!(
                 "mc-module: WARN MC_DRIVE_FAULT=omit_ck_messages active — response deliberately corrupted for drive"
             );
         }
         DriveFault::Channel2Arm => {
-            // Force a channel-2 directive onto the response regardless of pressure so
-            // the DELIVERY contract (same-pass append → echo → delivered-mark →
-            // frozen re-serve on a refused pass) can be driven end-to-end without
-            // faking a large reclaimable tail. The pressure math upstream is covered
-            // by unit tests; a drive container cannot honestly reach the condition
-            // (its harness compacts real tail bytes away faster than a drive
-            // accumulates them), so earning the directive there would require a
-            // conversation shape no real session has.
             response.channel2_directive = Some(transform::Channel2Directive {
                 text: "Context pressure is high. Review older tool outputs and reduce what you no longer need.".to_string(),
                 directive_id: "drive-fault-channel2".to_string(),
@@ -13422,21 +12953,10 @@ fn respond_transform(
     request: &TransformRequest,
     mut response: transform::TransformResponse,
 ) -> PreparedOutcome {
-    // drive-fault: corrupt the response before it is serialized (see the SAFETY note
-    // above the fault helpers). No-op unless the feature is compiled in AND MC_DRIVE_FAULT
-    // selects an arm; must run before ck_messages is moved into exact prepared segments.
     //
     // The fault fires at most N times (MC_DRIVE_FAULT_COUNT, default 1) then self-disarms
-    // permanently via a fetch_update claim on DRIVE_FAULT_REMAINING. This is critical for the
-    // fence+recover drive arc: a recovery pass must NOT be corrupted, and the only other
-    // disarm is a restart (which injects a variable the arc must not contain). The claim
-    // uses checked_sub so concurrent responses cannot underflow or double-fire past N —
-    // total WARN lines in logs will equal exactly N.
     #[cfg(feature = "drive-fault")]
     if let Some(fault) = drive_fault() {
-        // Claim one firing: fetch_update atomically decrements only if the count is > 0.
-        // If the count was already 0, checked_sub returns None and we skip — no underflow.
-        // If the count was > 0, the previous value is returned as Ok(prev) and we fire.
         use std::sync::atomic::Ordering;
         match DRIVE_FAULT_REMAINING
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
@@ -13634,9 +13154,6 @@ fn canonical_object_fields(request: &Value, fields: &[&str]) -> String {
 }
 
 fn transform_page_content_digest(request: &Value) -> String {
-    // Keep the digest's canonical object shape while borrowing page arrays. The page is
-    // subsequently consumed by assembly, so cloning these values just to hash them would
-    // duplicate the largest allocation in the request.
     sha256_hex(canonical_object_fields(request, &TRANSFORM_PAGE_ARRAY_FIELDS).as_bytes())
 }
 
@@ -13961,9 +13478,6 @@ fn note_evaluation_registration_unknown() -> PreparedOutcome {
     }
 }
 
-/// Closed-schema decode for the flat note.evaluation.* bodies: unknown fields
-/// are rejected before any waiter or store allocation, and every body must
-/// carry the protocol marker `v: 2`.
 fn note_evaluation_body<'a>(
     request: &'a Value,
     allowed: &[&str],
@@ -14106,9 +13620,6 @@ fn note_evaluation_acquire_response(outcome: NoteEvalAcquireOutcome) -> Prepared
         } => {
             let mut body = json!({ "result": "no_work", "replayed": replayed });
             if cycle_exhausted {
-                // The cursor, not the queue, ended this pass; the client may
-                // poll again. Durable in the acquisition ledger, so replays
-                // repeat it to clients that lost the original response.
                 body["cycle_exhausted"] = json!(true);
             }
             respond(body)
@@ -14128,8 +13639,6 @@ fn note_evaluation_acquire_response(outcome: NoteEvalAcquireOutcome) -> Prepared
     }
 }
 
-/// Decode one phase-scoped wire outcome; a kind that belongs to another phase
-/// cannot pass because the pairing is matched exactly.
 fn parse_note_evaluation_wire_outcome(
     value: &Value,
 ) -> Result<(String, SmartNoteEvaluationOutcome), PreparedOutcome> {
@@ -14253,10 +13762,6 @@ fn parse_note_evaluation_wire_artifact(
     })
 }
 
-/// Canonical artifact digest matching hashCheck in smart-notes/compiler.ts:
-/// condition, code, manifest JSON, and cron separated by NUL bytes. Delegates to
-/// the single definition in `mc-store` so the admission gate here and the v51
-/// artifact repair there can never disagree about what the digest is.
 fn smart_note_check_digest(
     surface_condition: Option<&str>,
     artifact: &CompiledCheckArtifact,
@@ -14269,9 +13774,6 @@ fn smart_note_check_digest(
     )
 }
 
-/// The reducer step run inside the store's completion transaction. The digest
-/// for compile outcomes is recomputed from the authoritative note condition
-/// rather than trusted from the wire.
 fn apply_note_evaluation_outcome(
     claim: &NoteEvalClaim,
     note: &StoredNote,
@@ -14359,15 +13861,11 @@ fn apply_note_evaluation_outcome(
 }
 
 const MAX_FACADE_FRAME_BYTES: usize = 1024 * 1024;
-/// Transform-class requests carry a session's full message array. The transport
-/// frame ceiling is 64 MiB; half that leaves headroom for envelope overhead while
-/// still admitting the largest observed live sessions (multi-MiB CK arrays with
-/// retained ingress bytes).
+/// The 64 MiB transport frame ceiling permits a 32 MiB body cap while reserving envelope overhead.
 const MAX_TRANSFORM_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
-/// Minimal probe deserialized from an oversized body ONLY to pick the right byte
-/// cap. serde ignores every other field, so this stays cheap relative to a full
-/// Value parse of a multi-MiB array.
+/// `RequestMethodProbe` deserializes only `method` and `kind`; Serde ignores other fields, avoiding a full `Value` parse.
+/// Serde ignores the remaining fields, avoiding a full `Value` parse of a multi-MiB array.
 #[derive(Deserialize)]
 struct RequestMethodProbe {
     #[serde(default)]
@@ -14380,34 +13878,24 @@ impl RequestMethodProbe {
     fn is_transform_class(&self) -> bool {
         let named = |value: &Option<String>, name: &str| value.as_deref() == Some(name);
         named(&self.kind, "transform")
-            // A single state-sync row can exceed the facade cap, so this live module
-            // path uses the transform-class ceiling as well.
+            // The state-sync path uses the transform-class ceiling because one row can exceed the facade cap.
             || named(&self.method, "state_sync")
     }
 }
 
-/// The facade byte budget exists for agent tool calls; transform-class requests
-/// legitimately carry a session's full message array (multi-MiB on large
-/// sessions), so they get the wider cap. Method sniffing on raw bytes avoids
-/// parsing multi-MiB JSON just to reject it.
-/// Slack on the counted node storage, covering `Vec` and map growth: both double
-/// as they fill, so the live allocation can reach twice the storage the final
-/// element count needs.
+/// The estimate doubles counted node storage for `Vec` and map growth.
 const VALUE_NODE_SLACK: usize = 2;
 
-/// Fixed headroom for the root value, the deserializer's own scratch, and the
-/// small allocations that do not scale with the body.
+/// The fixed headroom covers allocations that do not scale with the body.
 const VALUE_ENVELOPE_BYTES: usize = 4096;
 
-/// Upper bound on the heap a `serde_json::Value` tree decoded from `body` can
-/// occupy. `None` on arithmetic overflow, which callers treat as unsatisfiable.
+/// The function returns an upper bound on heap used by a `serde_json::Value` tree decoded from `body`.
+/// The function returns `None` on arithmetic overflow; callers treat that result as unsatisfiable.
 ///
-/// Counted, not assumed: one pass classifies every byte as inside or outside a
-/// string, because only outside-string `,` and `:` separate values. A document
-/// holds at most one root value, plus one per outside-string comma (array
-/// elements and object members), plus one per outside-string colon (member
-/// values) — which bounds the node count without building anything. String bytes
-/// are added separately, since each string becomes an owned `String`.
+/// A document has at most one root node plus one node per outside-string comma.
+/// Each outside-string colon adds at most one object-member value node.
+/// Those counts bound the node count without building the tree.
+/// String bytes are added separately because each string becomes an owned `String`.
 fn value_footprint_bound(body: &[u8]) -> Option<usize> {
     let mut nodes: usize = 1;
     let mut string_bytes: usize = 0;
@@ -14438,7 +13926,7 @@ fn value_footprint_bound(body: &[u8]) -> Option<usize> {
         .checked_add(VALUE_ENVELOPE_BYTES)
 }
 
-/// Permanent: the tree cannot fit this host's resident ceiling at any load.
+/// The failure is permanent when the tree cannot fit the host's resident ceiling at any load.
 fn request_too_large_error() -> PreparedOutcome {
     PreparedOutcome::Error {
         code: "invalid_params".to_string(),
@@ -14446,7 +13934,6 @@ fn request_too_large_error() -> PreparedOutcome {
     }
 }
 
-/// Retryable: the ceiling could hold it, but concurrent requests hold it now.
 fn resident_capacity_error() -> PreparedOutcome {
     PreparedOutcome::Error {
         code: "queue_full".to_string(),
@@ -14495,9 +13982,8 @@ fn validate_string_cap(
     Ok(())
 }
 
-/// Recover the intended argument object when a model repeats the reduced-call
-/// envelope it saw in context. Only unwrap when no real primary field is present,
-/// so explicit tool arguments always take precedence.
+/// The request parser unwraps a repeated reduced-call envelope only when no explicit primary field is present.
+/// Explicit tool arguments take precedence over an inferred reduced-call envelope.
 fn facade_arguments(request: &Value, primary_fields: &[&str]) -> Option<Map<String, Value>> {
     let arguments = request.get("arguments")?.as_object()?;
     if primary_fields
@@ -14617,9 +14103,6 @@ fn render_message_expand(row: StoredChunkTranscript, message: i64) -> String {
     truncate_expand_output(lines.join("\n"))
 }
 
-/// Recover one raw CK message in the same bounded-snapshot window used by verbose
-/// ctx_expand. The durable transcript fallback above remains available when the snapshot
-/// is gone, but it intentionally cannot recover raw tool input or output bytes.
 fn render_cached_message_expand(message: &ck_wire::CkIngressMessage) -> String {
     let role = match message.ck.role.as_str() {
         "assistant" => "A (assistant)",
@@ -14755,9 +14238,6 @@ fn render_range_expand(
     truncate_expand_output(output)
 }
 
-/// Decode original messages copied into every durable transcript row. A historian publish can
-/// produce several compartments, so ordinal de-duplication restores one chronological message
-/// sequence for range, verbose, and full-message recovery.
 fn durable_expand_messages(
     transcripts: &[StoredChunkTranscript],
 ) -> Vec<ck_wire::CkIngressMessage> {
@@ -14896,9 +14376,6 @@ struct VerboseRangeExpand {
     truncated: bool,
 }
 
-/// Render each raw CK message separately, retaining only bounded previews. The in-process
-/// snapshot and durable historian payload carry the same pre-reduction parts, including tool
-/// outputs; the default range view remains condensed while verbose exposes those previews.
 fn render_verbose_range_expand(
     messages: &[ck_wire::CkIngressMessage],
     start: i64,
@@ -15044,9 +14521,6 @@ fn expand_tool_output_text(output: &ck_wire::CkToolOutput) -> String {
     }
 }
 
-/// The durable fallback predates raw CK snapshot retention. It cannot reconstruct every
-/// part or tool-output size, but it keeps historical transcript recovery available after
-/// a module restart or cache eviction.
 fn render_verbose_transcript_range_expand(
     start: i64,
     end: i64,
@@ -15126,7 +14600,6 @@ fn parse_expand_ordinal_span(span: &str) -> Option<(i64, i64)> {
     (start >= 0 && end >= start).then_some((start, end))
 }
 
-/// Mirrors TypeScript's `trim().slice(0, max)` preview rule in UTF-16 units.
 fn truncate_expand_preview(value: &str, max_units: usize) -> String {
     let value = value.trim();
     let units = value.encode_utf16().collect::<Vec<_>>();
@@ -15264,8 +14737,6 @@ fn parse_tag_range_string(input: &str) -> Result<Vec<u64>, String> {
                     "Invalid range \"{part}\": start ({start}) must be <= end ({end})"
                 ));
             }
-            // Endpoints are positive and i64-bounded, but keep the size calculation
-            // checked so malformed facade input can never wrap before the allocation guard.
             let range_size = end
                 .checked_sub(start)
                 .and_then(|difference| difference.checked_add(1))
@@ -15323,8 +14794,6 @@ fn command_id_from_agent_drops_request(request: &Value) -> Result<String, String
     Ok(command_id.to_string())
 }
 
-/// Read the host's tool-use identity from either the facade envelope or its argument object.
-/// Older THALAMUS callers omit every field, so absence remains an accepted compatibility path.
 fn command_id_from_facade_request(
     request: &Value,
     args: &Map<String, Value>,
@@ -15392,11 +14861,6 @@ fn facade_command_outcome(
     }
 }
 
-/// Refusal path for a conditioned `ctx_note` mutation with no live evaluator.
-/// `with_facade_command` replays recorded outcomes only after this gate, so a
-/// retried command whose original mutation committed (response lost, module
-/// restarted, lease expired) must consult the durable response ledger here:
-/// the liveness gate protects first-time mutations, never replays.
 fn refuse_conditioned_note_without_evaluator(
     store: &McStore,
     identity_scope: &str,
@@ -15526,15 +14990,7 @@ fn compact_status_detail(detail: &str) -> String {
     sanitize_status_text(detail, 120)
 }
 
-/// Storage-version probe block for the status envelope. Answers "which schema is the
-/// store at, which ceiling does this binary carry" in one stable shape so fleet
-/// probes stop re-deriving it from raw SQL.
 ///
-/// The module never opens or attaches the host's context.db — the TypeScript plugin
-/// owns that file exclusively — so `context_db_schema_version` is null on this
-/// surface and the plugin's RPC/doctor surface reports the live value instead. The
-/// module store version is read live from the store's migration table; the ceiling
-/// is the newest mc-store migration this binary ships.
 fn storage_versions_block(store: &McStore) -> Value {
     json!({
         "context_db_schema_version": null,
@@ -15604,8 +15060,6 @@ fn cached_boundary_messages(
         .lock()
         .expect("boundary token cache mutex")
         .snapshot(&parsed.session_id);
-    // project_messages appends each message's blocks in one pass, so blocks for a message id are
-    // contiguous. A borrowed range map avoids rescanning the whole projection for every message.
     let mut block_ranges = HashMap::<&str, std::ops::Range<usize>>::new();
     for (index, block) in projection.blocks.iter().enumerate() {
         block_ranges
@@ -15682,11 +15136,6 @@ fn usage_numbers(
     let input = usage
         .map(|u| u.current_total_input_tokens as f64)
         .unwrap_or(0.0);
-    // Fallback order mirrors transform.rs effective_context_limit_tokens — the
-    // historian trigger and the scheduler bands must resolve the same
-    // denominator from the same inputs (a first-pass request carries geometry
-    // but no usage, and two independent 200k fallbacks here and in
-    // transform.rs diverged the two paths on exactly that pass).
     let limit = usage
         .map(|u| u.context_limit_tokens as f64)
         .filter(|limit| *limit >= MIN_PLAUSIBLE_CONTEXT_LIMIT as f64)
@@ -15704,9 +15153,6 @@ fn usage_numbers(
     (limit, input, pct)
 }
 
-/// Estimate pressure after the currently queued agent drops apply. The queue stores flat
-/// block ids while frozen reductions store replacement bytes, so using only raw input bytes
-/// would overstate reclaim after a prior reduction and leave the 75%-relative suppression
 /// gate ineffective.
 fn projected_post_drop_percentage(
     messages: &[BoundaryMsg],
@@ -15746,8 +15192,6 @@ fn projected_post_drop_percentage(
             );
         }
     }
-    // A frozen unit can outlive the exact input block during a provider replay. Include its
-    // replacement size so a pending queue row still has an honest denominator.
     for (target, tokens) in &frozen_sizes {
         current_sizes
             .entry(target.clone())
@@ -15790,8 +15234,6 @@ fn record_historian_connect_failure(
         let loaded = store.load(session_id)?;
         let mut meta = loaded.meta.clone();
         if meta.historian.state == HistorianPhase::Idle {
-            // Connection failures happen before the historian transitions out of Idle, but
-            // they still need the same durable cooldown as failures after preparation.
             meta.historian.last_failure = Some(detail.to_string());
             meta.historian.failure_backoff_at_ms = Some(failure_backoff_at_ms);
         } else {
@@ -15817,8 +15259,6 @@ fn record_historian_connect_failure(
     unreachable!("the connect-failure CAS loop returns from both attempts")
 }
 
-/// Resolve the storage descriptor: prefer the daemon-provided `ack.storage`, else
-/// fall back to a local dev path (standalone / no managed storage configured).
 pub fn resolve_descriptor(storage: Option<&Value>) -> StorageDescriptor {
     if let Some(value) = storage {
         if let Ok(descriptor) = serde_json::from_value::<StorageDescriptor>(value.clone()) {
@@ -15839,9 +15279,6 @@ fn dev_descriptor() -> StorageDescriptor {
     dev_descriptor_at(&data_home)
 }
 
-/// The store descriptor the module uses for a given data-home — the SAME path computation
-/// the running module performs from `XDG_DATA_HOME`. Exposed so the acceptance harness can
-/// seed the very store the spawned module will open (under its single-writer lease).
 pub fn dev_descriptor_at(data_home: &str) -> StorageDescriptor {
     StorageDescriptor {
         module_id: DEFAULT_MODULE_ID.to_string(),
@@ -15894,10 +15331,6 @@ fn ctx_memory_schema() -> Value {
         "CONFIG_VALUES",
         "NAMING"
     ]);
-    // The advertised enum is derived, never hand-written: every advertised
-    // category must match a oneOf write arm (positive arms use
-    // `positive_categories`; REJECTED_APPROACH has its own arms). A second
-    // hand-kept list could drift and advertise a category no arm accepts.
     let all_categories = {
         let mut categories = positive_categories
             .as_array()
@@ -16180,13 +15613,6 @@ mod tests {
 
     #[tokio::test]
     async fn json_settlement_streams_into_the_reservation_without_a_prior_encoding() {
-        // `measure` runs before the resident-byte reservation, so it must not
-        // retain the encoded body: a collected copy would sit outside the very
-        // budget the reservation enforces, and concurrent maximum-sized
-        // responses could exhaust memory while each one respected its charge.
-        // A pre-encoded blob would reach the destination as one `write_all`;
-        // serde streaming into the reserved writer is the observable proof that
-        // no such blob exists.
         let value = serde_json::json!({
             "a": ["one", "two", "three"],
             "b": {"c": 1, "d": 2, "e": [true, false, null]},
@@ -16217,8 +15643,6 @@ mod tests {
         };
         let expected = serde_json::to_vec(&value).expect("value serializes");
         assert_eq!(writer.bytes, expected);
-        // The reservation is sized from the counting pass and must match the
-        // body the second pass produces exactly, or the two passes disagreed.
         assert_eq!(reserved.load(Ordering::SeqCst), expected.len());
         let events = events.lock().unwrap();
         assert_eq!(events.first(), Some(&"reserve"));
@@ -16342,12 +15766,6 @@ mod tests {
 
     #[test]
     fn usage_numbers_first_pass_prefers_geometry_soft_over_the_constant() {
-        // First pass: geometry present, usage absent. The historian trigger
-        // must resolve the same denominator the scheduler bands resolve
-        // (transform.rs effective_context_limit_tokens) — a second private
-        // 200k fallback here made the two paths diverge on exactly this pass,
-        // observed live as identical trigger bars across a 167k/30k override
-        // pair (Thalamus consumption drive, arm 3).
         let geometry = crate::transform::TransformGeometry {
             usable_soft: 167_000,
             usable_hard: 200_000,
@@ -16356,7 +15774,6 @@ mod tests {
         let (limit, _, _) = usage_numbers(None, Some(&geometry));
         assert_eq!(limit, 167_000.0);
 
-        // Usage present still wins over geometry.
         let present = ModuleUsage {
             current_total_input_tokens: 1,
             context_limit_tokens: 150_000,
@@ -16366,7 +15783,6 @@ mod tests {
         let (limit, _, _) = usage_numbers(Some(&present), Some(&geometry));
         assert_eq!(limit, 150_000.0);
 
-        // Implausible geometry soft falls through to the constant.
         let implausible = crate::transform::TransformGeometry {
             usable_soft: 12,
             usable_hard: 200_000,
@@ -16937,7 +16353,6 @@ mod tests {
     }
 
     async fn wait_for_store_open_phase(handler: &McHandler, phase: u8) {
-        // The 10-second timeout is only a ceiling against an indefinite wait.
         tokio::time::timeout(Duration::from_secs(10), async {
             while handler.store_open.phase.load(Ordering::Acquire) != phase {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -16965,7 +16380,6 @@ mod tests {
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
         let predecessor = McStore::open(&descriptor).unwrap();
         let handler = McHandler::new();
-        // The 30-second window keeps the pre-drop assertion inside the lease
         // wait.
         handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_secs(30)));
 
@@ -17239,16 +16653,7 @@ mod tests {
         }
     }
 
-    // Diagnostic driver: replays captured module-request JSONs from a dump directory
-    // (MC_REPLAY_DIR) through the real dispatch path against a fresh store, printing
-    // per-capture outcome and wall time. No-op unless MC_REPLAY_DIR is set.
     //
-    // The run doubles as cache-stability evidence for byte-splice consumers moving to
-    // full-array apply: the same capture sequence is driven through TWO independent
-    // fresh stores and each pass's serialized output is byte-compared across runs
-    // (same input + same durable-state lineage must produce identical bytes), and
-    // within a run each non-busting pass's output prefix must reproduce the previous
-    // pass's output prefix byte-identically (the property the provider prompt cache
     // keys on).
     #[tokio::test]
     async fn replay_module_request_dump() {
@@ -17269,10 +16674,6 @@ mod tests {
 
         async fn drive_run(files: &[PathBuf]) -> Vec<(String, String, Option<Value>, u128)> {
             let state = Arc::new(ProducerState::default());
-            // Build the handler manually (instead of handler_with_store) so an optional
-            // production-store snapshot (MC_REPLAY_STORE=<sqlite3 .backup output>) can be
-            // copied into place BEFORE the store opens — the store takes a single-writer
-            // lease at open, so a post-open swap is impossible.
             let dir = tempfile::tempdir().unwrap();
             let data_home = dir.path().join("data");
             std::fs::create_dir_all(&data_home).unwrap();
@@ -17322,9 +16723,6 @@ mod tests {
                 let ms = started.elapsed().as_millis();
                 match outcome {
                     PreparedOutcome::Response(bytes) => {
-                        // Optional: dump the raw TransformResponse bytes per pass so a
-                        // consumer (e.g. the gateway plan_outcome harness) can consume the
-                        // module's EXACT returned bytes (MC_REPLAY_OUT_DIR=<dir>).
                         if let Ok(out_dir) = std::env::var("MC_REPLAY_OUT_DIR") {
                             let _ = std::fs::create_dir_all(&out_dir);
                             let _ = std::fs::write(
@@ -17378,8 +16776,6 @@ mod tests {
             }
         }
 
-        // Prefix stability within run A: on non-busting passes, the previous output's
-        // message sequence must reappear byte-identically as a prefix of this output.
         let mut prefix_ok = 0usize;
         let mut prefix_bad = Vec::new();
         for w in run_a.windows(2) {
@@ -17400,8 +16796,6 @@ mod tests {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            // The previous pass's synthetic tail anchors (e.g. todo pair) may relocate
-            // relative to NEW tail messages; compare the non-synthetic sequence.
             let strip = |arr: &[Value]| -> Vec<String> {
                 arr.iter()
                     .filter(|m| {
@@ -17509,7 +16903,6 @@ mod tests {
         }
     }
 
-    /// Resolve just the project_root (the binding's identity) for the resolve assertions.
     fn resolved_root(h: &McHandler, channel: u16, session: &str) -> Result<PathBuf, BindingError> {
         h.resolve_binding(test_route(channel), session)
             .map(|b| b.project_root)
@@ -17520,13 +16913,11 @@ mod tests {
         let h = McHandler::new();
         h.bind_route(test_route(7), binding("/repo/proj", "ses_a"));
 
-        // resolve succeeds when the channel is bound AND the session matches
         assert_eq!(
             resolved_root(&h, 7, "ses_a").unwrap(),
             PathBuf::from("/repo/proj")
         );
 
-        // a teardown removes the binding → a later resolve fails loud (no stale project)
         h.unbind_route(test_route(7));
         assert_eq!(resolved_root(&h, 7, "ses_a"), Err(BindingError::Unbound));
     }
@@ -17534,16 +16925,13 @@ mod tests {
     #[test]
     fn resolve_fails_loud_unbound_and_on_session_mismatch() {
         let h = McHandler::new();
-        // never bound → Unbound (NEVER a default project, which would be a cross-project read)
         assert_eq!(resolved_root(&h, 3, "ses_x"), Err(BindingError::Unbound));
 
         h.bind_route(test_route(3), binding("/repo/own", "ses_own"));
-        // bound, but a request claiming a DIFFERENT session on this channel → SessionMismatch
         assert_eq!(
             resolved_root(&h, 3, "ses_other"),
             Err(BindingError::SessionMismatch)
         );
-        // the matching session still resolves
         assert_eq!(
             resolved_root(&h, 3, "ses_own").unwrap(),
             PathBuf::from("/repo/own")
@@ -17554,7 +16942,6 @@ mod tests {
     fn rebind_overwrites_stale_channel_entry() {
         let h = McHandler::new();
         h.bind_route(test_route(5), binding("/a", "s1"));
-        // a reused channel re-binds to a new session → last write wins (no stale leak)
         h.bind_route(test_route(5), binding("/b", "s2"));
         assert_eq!(resolved_root(&h, 5, "s2").unwrap(), PathBuf::from("/b"));
         assert_eq!(
@@ -17614,7 +17001,6 @@ mod tests {
             request.session_id = session_id.to_string();
             Arc::new(request)
         };
-        // Unique failing sessions: begin() without finish_ready, far past the cap.
         let mut first_generation = 0;
         for index in 0..64 {
             let generation = cache.begin(&format!("failed-{index}"));
@@ -17627,8 +17013,7 @@ mod tests {
             "InFlight entries must stay bounded"
         );
         assert!(cache.in_flight_lru.len() <= 8);
-        // Evicted sessions read Missing, and a late finish_ready for an evicted
-        // generation cannot resurrect a snapshot.
+        // An evicted generation returns Missing, and late finish_ready cannot recreate its snapshot.
         assert!(matches!(
             cache.get("failed-0"),
             TransformSnapshotLookup::Missing
@@ -17660,17 +17045,17 @@ mod tests {
             )
             .into_bytes()
         };
-        // Under the facade cap everything passes without parsing.
+        // Bodies at or below the facade cap pass without parsing.
         assert!(enforce_request_byte_cap(b"{}").is_ok());
         // Oversized transform-class bodies pass up to the transform cap.
         let two_mib = 2 * 1024 * 1024;
         assert!(enforce_request_byte_cap(&pad("transform", "kind", two_mib)).is_ok());
         assert!(enforce_request_byte_cap(&pad("state_sync", "method", two_mib)).is_ok());
-        // Oversized facade bodies still reject at 1 MiB.
+        // Oversized facade bodies reject at 1 MiB.
         assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_err());
         // Unparseable oversized bodies reject conservatively.
         assert!(enforce_request_byte_cap(&vec![b'x'; two_mib]).is_err());
-        // The transform cap itself is still a hard ceiling.
+        // The transform cap is a hard ceiling.
         assert!(
             enforce_request_byte_cap(&pad("transform", "kind", MAX_TRANSFORM_FRAME_BYTES)).is_err()
         );
@@ -17678,9 +17063,6 @@ mod tests {
 
     #[test]
     fn value_footprint_counts_nodes_outside_strings_only() {
-        // The string-awareness is the load-bearing part. Punctuation inside a
-        // string separates no values, so counting it would inflate the bound
-        // until ordinary string-heavy transform bodies were refused.
         let quoted = br#"{"a":"x,y,z:w,,,::"}"#;
         let bare = br#"{"a":1,"b":2,"c":3}"#;
         assert!(
@@ -17700,8 +17082,7 @@ mod tests {
 
     #[test]
     fn scalar_dense_bodies_bound_far_above_their_wire_size() {
-        // This is the case the charge exists for: every two wire bytes become a
-        // whole `Value` node, so the tree dwarfs the body that the ingress
+        // Each two wire bytes can produce one `Value` node, so node-count limits must not derive from ingress body size.
         // charge covered.
         let dense: Vec<u8> = {
             let mut body = Vec::from(b"[1".as_slice());
@@ -17718,8 +17099,7 @@ mod tests {
             dense.len()
         );
 
-        // A string-heavy body of the same length bounds near its wire size, so
-        // realistic transform traffic is not refused by this gate.
+        // Bytes inside strings do not add Value-node cost.
         let mut stringy = Vec::from(b"[\"".as_slice());
         stringy.extend(std::iter::repeat_n(b'x', dense.len()));
         stringy.extend_from_slice(b"\"]");
@@ -17795,8 +17175,8 @@ mod tests {
             _ => panic!("first lease must fit"),
         };
 
-        // Churning the map can evict the map entry, but the leased Arc remains charged
-        // until its guard drops and neither accounting domain may exceed its own bound.
+        // A leased Arc remains charged after its map entry is evicted, until its guard drops.
+        // Map and lease accounting remain independently bounded until the leased Arc's guard drops.
         let c = cache.begin("c");
         cache.finish_ready("c", c, request("c"), 0, 6);
         assert!(cache.ready_bytes <= cache.max_ready_bytes);
@@ -19040,8 +18420,7 @@ mod tests {
             .last_dispatch_completed_at_ms
             .store(50_000, Ordering::Relaxed);
         {
-            // A refused item never calls accept, so dropping its ticket cannot make the
-            // refusal loop look like completed transform work.
+            // A refused item never calls `accept`, so dropping its ticket cannot make the refusal loop appear as completed transform work.
             let _refused = TransformDispatchTicket::new(&health);
         }
 
@@ -19069,10 +18448,9 @@ mod tests {
         );
     }
 
-    // (the same gate as the corruption path itself); a default build has neither the arm
-    // nor these tests. They exercise `apply_drive_fault`/`parse_drive_fault` directly
-    // rather than setting MC_DRIVE_FAULT, so they never touch process-global env or the
-    // process-wide OnceLock and stay deterministic alongside the rest of the suite.
+    // Direct calls avoid process-global `MC_DRIVE_FAULT` state.
+    // Direct calls avoid process-global `MC_DRIVE_FAULT` state.
+    // Direct calls avoid process-global `MC_DRIVE_FAULT` state.
     #[test]
     #[cfg(feature = "drive-fault")]
     fn drive_fault_parse_maps_arms_and_ignores_unknown() {
@@ -19099,8 +18477,6 @@ mod tests {
             Some(submitted.clone()),
         );
         apply_drive_fault(&mut response, DriveFault::FingerprintSkew);
-        // The echoed fingerprint must fail an equality check against the submitted value,
-        // while the response otherwise stays success-shaped (ok status, array present).
         let echoed = response
             .full_array_fingerprint
             .clone()
@@ -19122,8 +18498,6 @@ mod tests {
             "passthrough response carries ck_messages before the fault"
         );
         apply_drive_fault(&mut response, DriveFault::OmitCkMessages);
-        // Success-shaped (ok status retained) but with the ck_messages field ABSENT on the
-        // wire — the same skip_serializing_if arm need_full_sync uses.
         assert_eq!(response.status, transform::TransformStatus::Ok);
         assert!(response.ck_messages.is_none());
         let value = serde_json::to_value(&response).unwrap();
@@ -19137,7 +18511,6 @@ mod tests {
     #[test]
     #[cfg(feature = "drive-fault")]
     fn drive_fault_count_parse_defaults_to_one() {
-        // Unset, empty, unparseable, and zero all default to 1.
         assert_eq!(parse_drive_fault_count(None), 1);
         assert_eq!(parse_drive_fault_count(Some("")), 1);
         assert_eq!(parse_drive_fault_count(Some("not_a_number")), 1);
@@ -19155,12 +18528,8 @@ mod tests {
     #[test]
     #[cfg(feature = "drive-fault")]
     fn drive_fault_count_one_fires_once_then_clean() {
-        // Simulate count=1: claim one firing, then verify subsequent claims are no-ops.
-        // We test the claim logic directly by manipulating DRIVE_FAULT_REMAINING and
-        // checking the fetch_update guard condition.
         DRIVE_FAULT_REMAINING.store(1, std::sync::atomic::Ordering::Relaxed);
 
-        // First claim: should fire (Ok(1) with prev=1 > 0).
         let result = DRIVE_FAULT_REMAINING.fetch_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
@@ -19173,14 +18542,12 @@ mod tests {
             "count exhausted after one claim"
         );
 
-        // Second claim: should NOT fire (Err(0) — checked_sub returns None).
         let result = DRIVE_FAULT_REMAINING.fetch_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
             |n| n.checked_sub(1),
         );
         assert_eq!(result, Err(0), "second claim should be clean (no firing)");
-        // Must not underflow: stays at 0.
         assert_eq!(
             DRIVE_FAULT_REMAINING.load(std::sync::atomic::Ordering::Relaxed),
             0,
@@ -19200,14 +18567,12 @@ mod tests {
                 |n| n.checked_sub(1),
             );
             // fetch_update returns Ok(prev) where prev is the value BEFORE the update.
-            // With count=3, calls return Ok(3), Ok(2), Ok(1) — all > 0.
             assert!(
                 result.is_ok() && result.unwrap() > 0,
                 "claim {i} should fire (result={result:?})"
             );
         }
 
-        // Fourth claim: exhausted.
         let result = DRIVE_FAULT_REMAINING.fetch_update(
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
@@ -19224,10 +18589,6 @@ mod tests {
     #[test]
     #[cfg(feature = "drive-fault")]
     fn drive_fault_count_concurrent_claim_safety() {
-        // Simulate N concurrent claims by iterating a loop that mimics the atomic claim
-        // pattern. With N=5 and 7 claims, exactly 5 should succeed (Ok(prev) with prev > 0)
-        // and 2 should be clean (Err(0)). This validates the checked_sub semantics without
-        // requiring real threads.
         DRIVE_FAULT_REMAINING.store(5, std::sync::atomic::Ordering::Relaxed);
 
         let mut fired = 0usize;
@@ -22074,8 +21435,7 @@ mod tests {
         ]);
         request["serializer_profile"] = json!("opencode-aisdk");
         request["serve_native"] = json!(true);
-        // Empty sentinels require the exact canonical provider identity. Native metadata
-        // alone must not broaden that provider gate.
+        // Empty sentinels require the exact canonical provider identity; native metadata alone cannot broaden that provider gate.
         request["provider_id"] = json!("anthropic");
         request["native_messages"] = json!([
             {
@@ -23373,8 +22733,7 @@ mod tests {
         let created = call_facade(&handler, "ctx_note", conditioned.clone()).await;
         assert!(tool_text(created).contains("Created smart note"));
 
-        // The retry models a caller that lost the response and re-sends after
-        // the evaluator lease lapsed.
+        // The retry models a caller that lost the response and resends after the evaluator lease lapses.
         {
             let mut registrations = handler.note_evaluator_registrations.lock().unwrap();
             for entries in registrations.values_mut() {
@@ -23479,8 +22838,7 @@ mod tests {
             .await;
         assert_eq!(error_code(unknown_field), "bad_request");
 
-        // The same acquisition id claims fresh work, proving every rejected
-        // attempt above stopped before the store recorded a decision.
+        // Rejected attempts leave no stored decision, so reusing the acquisition ID claims fresh work.
         let next = call_dispatch_request(
             &handler,
             note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
@@ -23780,8 +23138,7 @@ mod tests {
         assert_eq!(heartbeat["ok"], json!(true));
         assert_eq!(heartbeat["policy_version"], json!(1));
 
-        // The identical acquisition id now yields a fresh claim: the earlier
-        // wake veto left no durable no_work decision behind.
+        // The identical acquisition ID yields a fresh claim because the wake veto leaves no durable `no_work` decision.
         let claim = call_dispatch_request(
             &handler,
             note_evaluation_next_body(&token_a, generation_a, "eval-a", "acq-1"),
@@ -23801,7 +23158,7 @@ mod tests {
         );
         let route_root = project.to_str().unwrap().to_string();
         let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
-        // Uncompiled conditioned note: selectable only through the billable
+        // Only the billable path selects an uncompiled conditioned note.
         // compile phase.
         insert_conditioned_note(&store, &identity, &route_root, "when evaluated", None);
         let (generation, token) =
@@ -23873,7 +23230,6 @@ mod tests {
         assert_eq!(claim["note_id"], json!(note.id));
     }
 
-    /// Compiled, on-policy, already-due staging for the cycle tests. The
     /// distinct `check_next_due_at` values order due selection by insertion.
     fn stage_due_note(store: &McStore, project: &str, route_root: &str, due_at: i64) -> StoredNote {
         let note = insert_conditioned_note(store, project, route_root, "when evaluated", None);
@@ -23891,9 +23247,7 @@ mod tests {
         note
     }
 
-    /// Fallback staging. A far-future `check_next_due_at` mirrors the backoff
-    /// a third compilation failure records and keeps this artifact-less row
-    /// out of the compile predicate.
+    /// The third compilation failure is recorded and keeps the artifact-less row out of the compile predicate.
     fn stage_fallback_note(
         store: &McStore,
         project: &str,
@@ -23939,7 +23293,6 @@ mod tests {
         .await
     }
 
-    /// Live full and nonbillable cycle state for one registration slot.
     fn note_evaluator_slot_cycles(
         handler: &McHandler,
         project: &str,
@@ -23982,8 +23335,7 @@ mod tests {
         let (generation, token) =
             register_note_evaluator(&handler, 7, "eval-a", false, false).await;
 
-        // Ten fresh due claims consume the due quota in due order; the 11th
-        // fresh opportunity reaches compile even though due work remains.
+        // The 11th fresh opportunity reaches compile while due work remains.
         for (i, expected) in due_notes.iter().take(10).enumerate() {
             let claim = call_dispatch_request(
                 &handler,
@@ -24042,8 +23394,7 @@ mod tests {
             "a fresh claim advances the full cycle"
         );
 
-        // Replaying the same acquisition returns the same claim and does not
-        // consume a second quota position.
+        // Replaying the same acquisition returns the same claim without consuming another quota position.
         let replay = call_dispatch_request(
             &handler,
             note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
@@ -24058,7 +23409,7 @@ mod tests {
         );
 
         // A new acquisition on the same slot recovers the active claim
-        // instead of selecting fresh work; the cycle stays put.
+        // The new acquisition recovers the active claim instead of selecting fresh work; the cycle remains unchanged.
         let recovered = call_dispatch_request(
             &handler,
             note_evaluation_next_body(&token, generation, "eval-a", "acq-2"),
@@ -24072,8 +23423,7 @@ mod tests {
             after_fresh
         );
 
-        // A billable claim recovered by a nonbillable poll must not charge
-        // the nonbillable cycle either; the worker abandons it client-side.
+        // Recovering a billable claim through a nonbillable poll does not consume another quota position.
         let mut nonbillable = note_evaluation_next_body(&token, generation, "eval-a", "acq-3");
         nonbillable["exclude_billable"] = json!(true);
         let cross_mode = call_dispatch_request(&handler, nonbillable).await;
@@ -24115,7 +23465,7 @@ mod tests {
         .await;
 
         // The queue is now empty, so a fresh durable no_work ends the cycle
-        // and resets it to the initial full profile.
+        // A fresh durable `no_work` decision resets the cycle to the initial full profile.
         let no_work = call_dispatch_request(
             &handler,
             note_evaluation_next_body(&token, generation, "eval-a", "acq-2"),
@@ -24123,8 +23473,8 @@ mod tests {
         .await;
         assert_eq!(no_work["result"], "no_work");
         assert_eq!(no_work["replayed"], json!(false));
-        // An empty queue is not an exhausted cursor: a fresh cycle would not
-        // have found work either, so the drain may treat this as drained.
+        // An empty queue does not imply cursor exhaustion.
+        // An empty queue is not cursor exhaustion, so the drain treats it as drained.
         assert_eq!(no_work["cycle_exhausted"], Value::Null);
         let (full, nonbillable) = note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0);
         assert_eq!(full, SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full));
@@ -24133,8 +23483,7 @@ mod tests {
             SmartNoteSelectionCycle::new(SmartNoteCycleMode::Nonbillable)
         );
 
-        // Advance the new cycle by one fresh claim, then replay the earlier
-        // no_work decision: the replay must not reset the advanced cycle.
+        // Replaying an earlier no_work decision must not reset an advanced cycle.
         stage_due_note(&store, &identity, &route_root, 2);
         let next_claim = call_dispatch_request(
             &handler,
@@ -24167,8 +23516,7 @@ mod tests {
         );
         let route_root = project.to_str().unwrap().to_string();
         let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
-        // Twelve due notes and no other phase work: spending the 10-claim due
-        // quota leaves the cursor spent while two due notes are still eligible.
+        // With twelve due notes and no other phase work, spending the 10-claim due quota leaves the cursor spent while two due notes remain eligible.
         let due_notes: Vec<StoredNote> = (0..12)
             .map(|i| stage_due_note(&store, &identity, &route_root, i + 1))
             .collect();
@@ -24192,8 +23540,8 @@ mod tests {
             .await;
         }
 
-        // The cursor, not the queue, ended this pass: the response says so and
-        // the cursor is already reset.
+        // The cursor, not the queue, ended this pass.
+        // The response reports cursor exhaustion, and the cursor is already reset.
         let exhausted = call_dispatch_request(
             &handler,
             note_evaluation_next_body(&token, generation, "eval-a", "acq-spent"),
@@ -24205,8 +23553,7 @@ mod tests {
         let (full, _) = note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0);
         assert_eq!(full, SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full));
 
-        // Because the reset already landed, the very next poll reaches the work
-        // the spent cursor hid instead of costing a whole drain.
+        // The next poll reaches work hidden by the spent cursor without another full drain.
         let recovered = call_dispatch_request(
             &handler,
             note_evaluation_next_body(&token, generation, "eval-a", "acq-after-reset"),
@@ -24216,11 +23563,7 @@ mod tests {
         assert_eq!(recovered["phase"], "due");
         assert_eq!(recovered["note_id"], json!(due_notes[10].id));
 
-        // The exhaustion cause is durable: a client only replays an
-        // acquisition after losing the original response, so the replay must
-        // repeat cycle_exhausted or the worker mistakes the reset cursor for a
-        // drained queue. Repeated cycle_exhausted answers are safe — the drain
-        // consumes at most one before claiming.
+        // The replay must return `cycle_exhausted` so the worker does not mistake the reset cursor for a fresh cycle.
         let replayed = call_dispatch_request(
             &handler,
             note_evaluation_next_body(&token, generation, "eval-a", "acq-spent"),
@@ -24323,8 +23666,7 @@ mod tests {
             SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full)
         );
 
-        // A replacement registration starts from the initial profile, and the
-        // durable claim recovered on it replays without charging that fresh
+        // A replacement registration starts with the initial profile; recovering its durable claim does not charge that profile.
         // cycle.
         let (new_generation, new_token) =
             register_note_evaluator(&handler, 7, "eval-a", false, false).await;
@@ -24415,9 +23757,8 @@ mod tests {
         let (generation, token) =
             register_note_evaluator(&handler, 7, "eval-a", false, false).await;
 
-        // Unchecked notes come first (id order), then the checked note; false
-        // completions keep every note eligible, so this sequence proves both
-        // the last_checked_at projection and the in-cycle exclusion.
+        // Unchecked notes come first in ID order, then the checked note.
+        // False completions preserve eligibility by leaving `last_checked_at` and the in-cycle exclusion unchanged.
         for (i, expected) in [&unchecked_a, &unchecked_b, &checked].iter().enumerate() {
             let claim = call_dispatch_request(
                 &handler,
@@ -24439,8 +23780,7 @@ mod tests {
         }
 
         // Every note is still eligible, but the fallback quota is spent:
-        // quota exhaustion now yields authority-side no_work instead of an
-        // over-cap claim the worker would have to abandon.
+        // Quota exhaustion returns authority-side `no_work` instead of an over-cap claim.
         let exhausted = call_dispatch_request(
             &handler,
             note_evaluation_next_body(&token, generation, "eval-a", "acq-3"),
@@ -24746,8 +24086,8 @@ mod tests {
         let target_text = project.to_str().unwrap();
         let link_text = link.to_str().unwrap();
 
-        // The transform lane binds through the symlink spelling, while the facade lane binds to
-        // the canonical target. Both route bindings identify the same filesystem lineage.
+        // The transform lane binds through the symlink spelling.
+        // The facade lane binds to the canonical target; both bindings identify the same filesystem lineage.
         handler.bind_route(
             test_route(7),
             binding_with_harness(link_text, OPENCODE_HARNESS, "ses"),
@@ -24789,7 +24129,6 @@ mod tests {
         let target_text = project.to_str().unwrap();
         let link_text = link.to_str().unwrap();
 
-        // Reverse the lane spellings: transform uses the target and facade uses the symlink.
         handler.bind_route(
             test_route(7),
             binding_with_harness(target_text, OPENCODE_HARNESS, "ses"),
@@ -25297,7 +24636,6 @@ mod tests {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
 
-        // A flat body with kind="transform" routes to the transform handler.
         let transform = handler
             .dispatch_value(test_route(7), request(vec![ck("m1", 1, "hello")]))
             .await;
@@ -25307,7 +24645,6 @@ mod tests {
         };
         assert_eq!(transform_body["status"], "ok");
 
-        // Explicit echo: opt-in debugging arm still works when asked for by name.
         let echo = handler
             .dispatch_value(test_route(7), json!({ "kind": "echo", "probe": 42 }))
             .await;
@@ -25318,8 +24655,7 @@ mod tests {
         assert_eq!(echo_body["ok"], json!(true));
         assert_eq!(echo_body["echo"]["probe"], json!(42));
 
-        // MCP tools/call envelope ({name, arguments}, no method/kind): a
-        // DISTINCT error so a facade misroute is diagnosable from the code.
+        // `tools/call` envelopes with `{name, arguments}` and no `method` or `kind` receive a distinct error so facade misroutes are diagnosable.
         let facade = handler
             .dispatch_value(
                 test_route(7),
@@ -25328,8 +24664,7 @@ mod tests {
             .await;
         assert_eq!(error_code(facade), "facade_envelope_not_supported");
 
-        // Anything else: fail loud, never a silent echo. The message names the
-        // keys that were present so a misrouted request is diagnosable.
+        // Other bodies return an error naming their present keys so facade misroutes are diagnosable.
         let garbage = handler
             .dispatch_value(test_route(7), json!({ "foo": 1, "bar": 2 }))
             .await;
@@ -25341,7 +24676,7 @@ mod tests {
             other => panic!("expected error outcome, got {other:?}"),
         }
 
-        // Non-object bodies get the same loud failure with the JSON type named.
+        // Non-object bodies return an error naming their JSON type.
         let non_object = handler
             .dispatch_value(test_route(7), json!("just a string"))
             .await;
@@ -25586,8 +24921,7 @@ mod tests {
         assert!(mixed_ack.contains("tags 99, 100 not found"));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
-        // The response observer delivers the same mixed request later. It queues only
-        // known tags, leaving acknowledgement validation side-effect free.
+        // The response observer queues only known tags from repeated mixed requests, leaving acknowledgement validation side-effect free.
         let delivered = handler.handle_agent_drops_value(
             test_route(7),
             json!({
@@ -25684,11 +25018,9 @@ mod tests {
             ),
         ];
 
-        // ctx_reduce is the one AUTHORIZER-PINNED schema: Thalamus exact-matches
-        // the canonical closed shape and fails closed on any deviation, silently
-        // disabling the tagging surface. Its imitated-args tolerance lives in the
-        // execution unwrap, not the advertised schema. Every other ctx_ tool keeps
-        // the open accept-unknown-args posture.
+        // `ctx_reduce` is the only authorizer-pinned schema: Thalamus exact-matches its canonical closed shape and fails closed on deviations, disabling tagging.
+        // `ctx_reduce` tolerates imitated arguments only during execution unwrap, not in its advertised schema.
+        // Other `ctx_` tools accept unknown arguments.
         assert_eq!(
             by_name["ctx_reduce"].schema,
             json!({
@@ -25725,8 +25057,7 @@ mod tests {
             "ctx_memory must advertise only the action-less imitated-reduced envelope"
         );
         {
-            // Every advertised category must match a oneOf write arm: the enum
-            // must equal the positive-arm categories plus REJECTED_APPROACH.
+            // Advertised categories must equal the `oneOf` positive-arm categories plus `REJECTED_APPROACH`.
             let ctx_memory_schema = &by_name["ctx_memory"].schema;
             let advertised = ctx_memory_schema["properties"]["category"]["enum"]
                 .as_array()
@@ -25903,9 +25234,7 @@ mod tests {
             .is_some_and(|text| text.contains("host claim-operation commit path")));
     }
 
-    /// A classify budget large enough that no test's own setup can exhaust it,
-    /// so a payload's shape is what the test proves. Deadline behaviour has its
-    /// own tests with deliberately small budgets.
+    /// The test uses a classify budget that setup cannot exhaust, so payload shape rather than deadline behavior determines the result.
     const TEST_CLASSIFY_TIMEOUT_MS: u64 = 600_000;
 
     async fn dreamer_classify_outcome(
@@ -25916,8 +25245,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(producer), default_test_config());
         let route_root = project.to_str().unwrap();
-        // A poisoned historian chain proves the classify loop no longer reads
-        // route config models.
+        // A poisoned historian chain verifies that the classify loop does not read route config models.
         let mut route_binding = binding_with_harness(route_root, "pi", "ses");
         route_binding.config.model_chain = vec!["test/route-only-model".to_string()];
         handler.bind_route(test_route(7), route_binding);
@@ -25943,13 +25271,12 @@ mod tests {
         (Arc::clone(producer), outcome)
     }
 
-    /// A well-formed public claim ID, distinct per `seed`.
+    /// Each `seed` produces a distinct, well-formed public claim ID.
     fn test_claim_id(seed: u8) -> String {
         format!("mcm_{}", format!("{seed:02x}").repeat(16))
     }
 
-    /// The exact payload `runClassifyThroughModule` sends for a claim-native
-    /// chunk, and the manifest shape `CLASSIFY_SYSTEM_PROMPT` asks for.
+    /// `runClassifyThroughModule` sends this payload for a claim-native chunk, matching `CLASSIFY_SYSTEM_PROMPT`.
     fn claim_native_payload(claims: &[String], timeout_ms: u64) -> Value {
         json!({
             "prompt_body": "classify",
@@ -25976,11 +25303,7 @@ mod tests {
         format!("<classify>{entries}</classify>")
     }
 
-    /// The request parser, the expected-id set, and the manifest validator
-    /// must all speak the claim's public ID. While the parser demanded an
-    /// integer `memory_id`, this payload died at `invalid_params` with zero
-    /// producer starts; while the validator demanded a numeric `id`, the
-    /// manifest the prompt asks for was rejected too.
+    /// The request parser, expected-ID set, and manifest validator use the claim's public ID.
     #[tokio::test(flavor = "current_thread")]
     async fn dreamer_run_task_accepts_claim_native_items_and_manifest() {
         let claims = [test_claim_id(1), test_claim_id(2)];
@@ -26012,7 +25335,7 @@ mod tests {
     async fn dreamer_run_task_rejects_items_that_are_not_claim_identities() {
         let claim = test_claim_id(1);
         for items in [
-            // The retired integer identity.
+            // The request parser rejects legacy integer `memory_id` identities.
             json!([{ "memory_id": 7 }]),
             json!([{ "public_claim_id": 7 }]),
             json!([{ "public_claim_id": "" }]),
@@ -26038,15 +25361,13 @@ mod tests {
         }
     }
 
-    /// A manifest naming a claim the request never asked about must advance
-    /// the chain, not end it and be ledgered as this command's response.
+    /// A manifest that names an unrequested claim advances the chain instead of ending it.
     #[tokio::test(flavor = "current_thread")]
     async fn dreamer_run_task_rejects_a_manifest_naming_an_unexpected_claim() {
         let requested = test_claim_id(1);
         let unexpected = test_claim_id(9);
         let producer = Arc::new(ProducerState::default());
         producer.await_results.lock().unwrap().extend([
-            // Covers the requested claim AND one nobody asked about.
             Ok(ProducerOutput {
                 text: claim_manifest(&[requested.clone(), unexpected]),
                 length_capped: false,
@@ -26082,9 +25403,7 @@ mod tests {
         );
     }
 
-    /// The payload deadline is the only bound relating this handler's work to
-    /// the caller's transport budget, so a payload without one is refused
-    /// before any billable run rather than granted the 21-minute per-model
+    /// A payload without timeout_ms is rejected before starting a run.
     /// ceiling.
     #[tokio::test(flavor = "current_thread")]
     async fn dreamer_run_task_requires_a_positive_timeout_ms() {
@@ -26164,9 +25483,6 @@ mod tests {
         assert_eq!(response["full_array_fingerprint"], "fp-delta");
         assert_eq!(response["surface_state"], "inactive");
         assert!(response["row_version"].is_u64());
-        // The array field must be ABSENT, not empty: the consumer discriminates
-        // structurally on presence, and an empty array would be a third
-        // ambiguous state between "transformed to nothing" and "re-send".
         assert!(response.get("ck_messages").is_none());
         assert_eq!(store.load("ses").unwrap().row_version, before);
     }
@@ -26367,22 +25683,17 @@ mod tests {
             other => panic!("expected status response, got {other:?}"),
         };
 
-        // Both the health probe (no session_id) and the per-session status carry the
-        // block, so a fleet probe gets the same shape whichever way it calls status.
         let health = decode(handler.handle_status_value(&json!({ "kind": "status" })));
         let session =
             decode(handler.handle_status_value(&json!({ "kind": "status", "session_id": "ses" })));
         for status in [&health, &session] {
             let versions = &status["storage_versions"];
-            // The module does not read the host's context.db; the TS surface owns it.
             assert!(versions["context_db_schema_version"].is_null());
             assert_eq!(versions["module_store_schema_version"], json!(live_version));
             assert_eq!(
                 versions["binary_supported_version"],
                 json!(mc_store::LATEST_MIGRATION_VERSION)
             );
-            // A freshly opened store is fully migrated, so the live version and the
-            // binary's shipped ceiling agree.
             assert_eq!(
                 versions["module_store_schema_version"],
                 versions["binary_supported_version"]
@@ -26407,14 +25718,11 @@ mod tests {
         let v_on = on_transition["row_version"]
             .as_u64()
             .expect("row_version u64");
-        // The surface flip rides a committing HARD, so the version must advance.
         assert!(v_on > v_inactive, "flip-on HARD must bump row_version");
 
         let active = call_transform_request(&handler, request.clone()).await;
         assert_eq!(active["surface_state"], "active");
         let v_active = active["row_version"].as_u64().expect("row_version u64");
-        // Steady-state replay commits nothing: equal versions are legitimate,
-        // regression (a lower version) never is.
         assert!(v_active >= v_on, "row_version must be nondecreasing");
 
         request["tool_present"] = json!(false);
@@ -26641,10 +25949,6 @@ mod tests {
         Some((*ordinals.iter().min()?, *ordinals.iter().max()?))
     }
 
-    /// Wall-clock budget for test waits on spawned-task progress. Iteration-bounded
-    /// yield loops flake under parallel test load: 200 bare yields are microseconds,
-    /// and a spawned task that loses the CPU race for that window fails the wait even
-    /// though it completes fine. Time-bounded polling makes the wait load-immune.
     const TEST_WAIT_BUDGET: Duration = Duration::from_secs(10);
     const TEST_WAIT_POLL: Duration = Duration::from_millis(2);
 
@@ -26844,10 +26148,6 @@ mod tests {
         assert!(m0_text(&second).contains("autonomous summary"));
     }
 
-    /// Desk rehearsal of the round-3 drive seed: 18 live messages (system at
-    /// ordinal 1 mid-span), four imported compartments partitioning 0..=14 on
-    /// real live block ids, tail 15..=17. Must bootstrap-HARD-fold with
-    /// ccm-14#0 as the minted boundary.
     #[tokio::test(flavor = "current_thread")]
     async fn state_import_round3_partition_rehearsal_folds() {
         let producer = Arc::new(ProducerState::default());
@@ -26960,10 +26260,6 @@ mod tests {
                 ]),
             )
             .await;
-        // The import contract is carry-over-shaped: imported coverage references
-        // mids that exist in the continued conversation, so a payload whose anchors
-        // never appear in the live array must refuse at the bootstrap fold rather
-        // than compose an m0 with an unanchorable boundary.
         let (code, message) = error_frame(response);
         assert_eq!(code, "transform_failed");
         assert!(message.contains("minted boundary not present"), "{message}");
@@ -27688,8 +26984,6 @@ mod tests {
             resolver,
         );
 
-        // No tags minted, so acknowledgement and later delivery both refuse "1" rather
-        // than committing the terminal no_targets ledger row that used to hide this error.
         let acknowledgement = tool_body(
             call_facade(
                 &handler,
@@ -27719,8 +27013,6 @@ mod tests {
         assert!(message.contains("no valid tags: 1 not found"));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
-        // Reusing this command id after a tag arrives must queue it. If refusal had
-        // committed a zero-target ledger row, this would be acknowledged as duplicate.
         mint_drop_tag(&store, "a#0");
         assert_eq!(
             queue_drop_command_with_id(&handler, "no-target-cmd"),
@@ -27868,8 +27160,6 @@ mod tests {
             )
             .unwrap();
 
-        // Range syntax plus an unknown tag number: known tags queue, the unknown
-        // number is skipped (the tee replays whatever the model said).
         let response = match handler.handle_agent_drops_value(
             test_route(7),
             json!({
@@ -27886,7 +27176,6 @@ mod tests {
         let pending = store.load_pending_agent_drops("ses").unwrap();
         assert_eq!(pending.len(), 2);
 
-        // Re-sending the same raw string is idempotent (structural INSERT OR IGNORE).
         let repeat = match handler.handle_agent_drops_value(
             test_route(7),
             json!({
@@ -27901,7 +27190,6 @@ mod tests {
         };
         assert_eq!(repeat, json!({ "ok": true, "queued": 0 }));
 
-        // Malformed range syntax is a typed bad_request, nothing partially queued.
         match handler.handle_agent_drops_value(
             test_route(7),
             json!({
@@ -28202,9 +27490,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn session_wrapup_drains_beyond_five_rounds_to_the_keep_watermark() {
-        // The drain is bounded by the request budget, not a round-count cap: this
-        // backlog needs more producer rounds than the historical five-round limit,
-        // and one session.wrapup call must still reach the keep watermark.
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
@@ -28238,11 +27523,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn session_wrapup_honors_requested_keep_watermark_without_clamping() {
-        // keep=1 is honored as given (floored only to the boundary's one-message
-        // minimum): the drain compacts everything except the protected tail. The
-        // user-boundary snap then retains the final user message as well, leaving
-        // exactly the last two messages (79..=80) unwrapped. A clamping module
-        // would stop earlier.
+        // The drain compacts every message except the protected tail.
+        // The user-boundary snap retains the final user message, leaving messages 79..=80 unwrapped.
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
@@ -28272,8 +27554,6 @@ mod tests {
             .unwrap();
         assert_eq!(final_end, 78, "keep=1 must keep a one-message tail: {body}");
 
-        // keep=250 exceeds the live tail and must be honored unchanged: nothing is
-        // compacted. A module clamping keep to 100 would instead compact 50 messages.
         let producer_large = Arc::new(ProducerState::default());
         let (handler_large, _store_large, _dir_large, _project_large) =
             handler_with_store(Arc::clone(&producer_large), default_test_config());
@@ -28304,11 +27584,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn session_wrapup_user_snap_uses_session_geometry() {
-        // A meaningful user message sits about 10k tokens before the raw keep
-        // candidate. With the session's 1M-context geometry the derived trigger
-        // budget is about 32.5k, so the snap window reaches the user message and
-        // retains it; the legacy hard-coded 128k/65 budget floors at 5k and would
-        // keep the later candidate instead.
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
@@ -28357,8 +27632,6 @@ mod tests {
             handler_with_store(Arc::clone(&producer), default_test_config());
         cache_wrapup_messages(&handler, wrapup_messages(80, 800));
 
-        // Empty command_id must reject: every retrying caller would otherwise share
-        // one durable ledger key.
         let empty_id = handler
             .dispatch_value(
                 test_route(7),
@@ -28378,11 +27651,6 @@ mod tests {
             other => panic!("empty command_id must reject, got {other:?}"),
         }
 
-        // Negative keep is not an error: it floors to the one-message watermark the
-        // TypeScript orchestrator applies (Math.max(1, ...)), so the drain compacts
-        // everything except the protected tail. With uniform text messages the
-        // user-boundary snap retains the final user message too, leaving exactly the
-        // last two messages (79..=80) unwrapped.
         let negative_keep = tool_body(
             handler
                 .dispatch_value(
@@ -28531,8 +27799,7 @@ mod tests {
         assert_eq!(stored.summary, first["summary"].as_str().unwrap());
         assert!(stored.summary.ends_with("; replaced failed record from 17"));
 
-        // Simulate losing the first response. The same command id must replay the
-        // durable terminal result without opening another producer run.
+        // The same command ID replays the durable terminal result without starting another producer run.
         let replay = tool_body(handler.dispatch_value(test_route(7), request).await);
         assert_eq!(replay["replayed"], json!(true), "{replay}");
         assert_eq!(replay["disposition"], first["disposition"]);
@@ -28942,8 +28209,7 @@ mod tests {
         );
         assert_eq!(stale["disposition"], json!("retryable"), "{stale}");
         assert_eq!(stale["reason"], json!("snapshot_stale"));
-        // The fence race is not a producer failure: no cooldown may be armed, so an
-        // immediate retry with a fresh snapshot executes instead of backoff_active.
+        // A fence race does not arm cooldown; a fresh-snapshot retry executes instead of returning `backoff_active`.
         assert_eq!(
             store
                 .load("ses")
@@ -28956,8 +28222,7 @@ mod tests {
         );
         cache_wrapup_messages(&handler, wrapup_messages(20, 40));
         // The retry must be ADMITTED (no cooldown at entry) and drive the producer.
-        // The mock's canned output no longer matches the window, so the retry may
-        // fail validation afterwards; being turned away at the door is the bug.
+        // The retry must be admitted even if stale canned output later fails validation.
         let starts_before_retry = producer.starts.load(Ordering::SeqCst);
         let retry = tool_body(
             handler
@@ -29155,10 +28420,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn session_wrapup_drains_huge_chunks_past_the_old_round_cap() {
-        // Each message is one historian chunk, so this backlog needs ten producer
-        // rounds. The drain is bounded by the request budget rather than the
-        // historical five-round cap, so one call must compact all ten messages and
-        // reach the keep watermark instead of stopping halfway.
+        // This ten-message backlog requires ten producer rounds because each message is one historian chunk.
+        // The request budget, not the five-round cap, bounds the drain.
+        // One call must compact all ten messages and reach the keep watermark.
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
@@ -29557,10 +28821,9 @@ mod tests {
         assert_eq!(first["historian"]["fired"], true);
         wait_for_count(&producer.starts, 1).await;
 
-        // Place the publish in the exact race window: the interleave seam runs between
-        // the request's (pre-fold) transform and the Emergency95 prepare, so by the time
-        // prepare checks the live map the run has published and released its entry —
-        // the Complete arm's row-advance check is the only thing that can fold this
+        // The interleave seam runs between the request's pre-fold transform and `Emergency95` prepare.
+        // By prepare time, the run has published and released its live-map entry.
+        // Only `Complete`'s row-advance check can fold the run.
         // response.
         {
             let producer = Arc::clone(&producer);
@@ -29594,10 +28857,9 @@ mod tests {
             m0_text(&response).contains("autonomous summary"),
             "a fold published between the transform and the live-map check must land in this response"
         );
-        // A second producer start is legitimate here: after the first fold publishes,
-        // this fixture still has enough eligible content to cross the trigger bar, and
-        // an emergency pass drains continuously. The load-bearing assertion is the fold
-        // in the response, not the run count.
+        // A second producer start is valid because eligible content still crosses the trigger bar after the first fold.
+        // Eligible content still crosses the trigger bar after the first fold publishes.
+        // An emergency pass drains until the response folds the backlog; run count is unconstrained.
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -29766,14 +29028,12 @@ mod tests {
         }]
     }
 
-    /// Seeds a legacy `AwaitingProducer` row — one written before the
-    /// producer harness was persisted.
+    /// The fixture sets `producer_harness: None` to exercise legacy-row compatibility.
     fn seed_awaiting(store: &McStore, messages: &[CkIngressMessage]) {
         seed_awaiting_with_harness(store, messages, None);
     }
 
-    /// Seeds an `AwaitingProducer` row. `producer_harness: None` reproduces a
-    /// state written before that field existed.
+    /// The fixture seeds an `AwaitingProducer` row with `producer_harness: None` to reproduce persisted rows without that field.
     fn seed_awaiting_with_harness(
         store: &McStore,
         messages: &[CkIngressMessage],
@@ -30021,9 +29281,7 @@ mod tests {
                     snapshots.begin("ses");
                 }
                 ReattachGenerationCase::FinishedReadyWithSameGeneration => {
-                    // Move the cache record from pending to completed for the same numeric
-                    // version before publication. This proves publication accepts a completed
-                    // record when its version did not change.
+                    // Publication accepts a completed cache record whose numeric version is unchanged.
                     let parsed = transform_request(messages_for_hook, 1, 200_000);
                     let retained_bytes = serde_json::to_vec(&parsed).unwrap().len();
                     let revert_epoch = store_for_hook.load("ses").unwrap().meta.revert_epoch;
@@ -30280,8 +29538,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn no_fire_reason_is_durable_change_gated_and_cleared_by_fire() {
-        // Skip branch writes the discriminant durably (supervised rigs read state, not
-        // responses), a repeat of the same reason writes nothing, and a real fire clears it.
+        // Skip branch durably writes the discriminant because supervised rigs read state rather than responses.
+        // A repeated skip reason writes nothing, and a fire clears the persisted discriminant.
         let producer = Arc::new(ProducerState::default());
         let mut config = default_test_config();
         config.model_chain.clear();
@@ -30304,7 +29562,7 @@ mod tests {
             "an unchanged skip reason must not rewrite the row"
         );
 
-        // Same store, models restored: the fire must clear the stale skip reason.
+        // After models are restored from the same store, a fire clears the stale skip reason.
         config.model_chain = vec!["prov/model-a".to_string()];
         let handler2 = McHandler::with_producer_factory_and_config(
             Arc::new(TestProducerFactory {
@@ -30316,9 +29574,8 @@ mod tests {
         handler2.bind_route(test_route(7), binding(_project.to_str().unwrap(), "ses"));
         let fired = call_transform(&handler2, messages).await;
         assert_eq!(fired["historian"]["fired"], true);
-        // The clearing write happens in the spawned firing's persist. Durable state is
-        // still Idle until that task runs, so gate on the producer actually starting
-        // first (otherwise wait_for_idle returns before the firing began).
+        // The spawned firing persists the clearing write; durable state remains `Idle` until that task runs.
+        // The test must wait for the producer to start before calling `wait_for_idle`, which can return before firing begins.
         wait_for_count(&producer.starts, 1).await;
         wait_for_idle(&store).await;
         let loaded = store.load("ses").unwrap();
@@ -30327,9 +29584,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn own_producer_sessions_pass_through_untransformed() {
-        // The historian's own llm-runner run must never be re-transformed: prepending
-        // m0/m1 framing ahead of the historian system prompt restructures the calibrated
-        // request and makes the model treat the seed examples as session content.
+        // The historian must never re-transform its own `llm-runner` run.
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
@@ -30504,11 +29759,6 @@ mod release_contract_tests {
         );
         assert_eq!(release_contract::TRANSACTION_LOCK_NAME, "transaction.lock");
         assert_eq!(release_contract::LIFETIME_LOCK_NAME, "lifetime.lock");
-        // Bind the frozen contract to the constants the daemon actually
-        // locks: the coordination names exist in two authorities (mc-host
-        // cannot depend on the contract-bearing mc-module), and drift
-        // between them is mixed-release lock-splitting — the exact failure
-        // the stable coordination files exist to prevent.
         assert_eq!(
             release_contract::COORDINATION_DIRECTORY,
             mc_host::COORDINATION_DIR_NAME

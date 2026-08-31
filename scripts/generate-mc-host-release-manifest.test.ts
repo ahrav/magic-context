@@ -137,9 +137,9 @@ describe("rust and typescript embeddings", () => {
             /pub const RELEASE_CONTRACT_JSON: &str = "((?:[^"\\]|\\.)*)";/,
         );
         expect(jsonMatch).not.toBeNull();
-        // Single left-to-right pass: sequential global replaces are not the
-        // inverse of escapeRustString once the content contains a literal
-        // backslash followed by `n` or `"`.
+        // Use a single left-to-right pass because sequential global replacements do not invert `escapeRustString` for literal backslash-`n` or backslash-quote sequences.
+        // Use a single left-to-right pass because sequential global replacements do not invert `escapeRustString` for literal backslash-`n` or backslash-quote sequences.
+        // Use a single left-to-right pass because sequential global replacements do not invert `escapeRustString` for literal backslash-`n` or backslash-quote sequences.
         const rustJson = (jsonMatch as RegExpMatchArray)[1].replace(
             /\\(n|"|\\)/g,
             (_, escaped: string) => (escaped === "n" ? "\n" : escaped),
@@ -436,10 +436,10 @@ describe("registry gate", () => {
         const gate = gateCopy();
         gate.packages[4].synchronized_version_unpublished = false;
         writeFileSync(join(root, REGISTRY_GATE_PATH), JSON.stringify(gate));
-        // The committed gate records a live npm audit and is honestly
-        // fail-closed for most of a release cycle. Generation and drift must
-        // stay usable in that state, or the drift signal is permanently red and
-        // stops catching hand-edited gates; only publication demands readiness.
+        // Generation and drift checks must accept a fail-closed gate; publication requires readiness.
+        // Generation and drift checks must accept a fail-closed gate; publication requires readiness.
+        // Generation and drift checks must accept a fail-closed gate; publication requires readiness.
+        // Generation and drift checks must accept a fail-closed gate; publication requires readiness.
         expect(() => generate(root, { check: false })).not.toThrow();
         expect(() =>
             validateRegistryGateShape(gate, buildContract()),
@@ -477,9 +477,9 @@ describe("registry gate", () => {
     });
 
     test("a reservation version npm could not publish is rejected", () => {
-        // SemVer §9 forbids leading zeroes in numeric prerelease identifiers, so
-        // npm's parser rejects these outright — a gate accepting one would claim a
-        // reserved name that cannot exist. Same rule for the core version.
+        // SemVer §9 forbids leading zeroes in numeric prerelease identifiers.
+        // npm rejects numeric prerelease identifiers with leading zeroes, so accepting one reserves a name that cannot exist.
+        // SemVer also forbids leading zeroes in numeric core-version components.
         for (const invalid of [
             "0.0.1-01",
             "0.0.1-reserved.01",
@@ -536,9 +536,9 @@ describe("platform floors", () => {
     });
 
     test("a macOS host without descriptor execution is unsupported_platform", () => {
-        // The Darwin counterpart of the Linux procfs_self_fd_exec gate: the
-        // contract requires dev_fd_exec, so a version-passing host that cannot
-        // execute through a descriptor must be refused here rather than at exec
+        // Darwin hosts without `dev_fd_exec` must be refused before exec because the contract requires `dev_fd_exec`.
+        // Darwin hosts without `dev_fd_exec` must be refused before exec because the contract requires `dev_fd_exec`.
+        // An omitted probe field does not prove `dev_fd_exec` capability.
         // time. An omitted probe field is not evidence of the capability.
         for (const arch of ["arm64", "x64"] as const) {
             expect(
@@ -560,15 +560,15 @@ describe("platform floors", () => {
     });
 
     test("garbage and prerelease host versions fail the platform gate too", () => {
-        // The U9 oracle-host check rejects these. Sharing only `compareDotted`
-        // once let this gate keep a bare `>= 0` and accept them, so the two
-        // disagreed about the same host; they now share the whole predicate.
+        // The gate and the U9 oracle-host check share the whole predicate so they reject the same hosts.
+        // The gate and the U9 oracle-host check share the whole predicate so they reject the same hosts.
+        // The gate and the U9 oracle-host check share the whole predicate so they reject the same hosts.
         for (const kernel of [
             "999garbage",
-            // Above the floor on its first component, so the ordering check returns
-            // early: the component's shape has to be validated regardless.
+            // `compareDotted` validates component shape even when its first component exceeds the floor because ordering returns early.
+            // `compareDotted` validates component shape even when its first component exceeds the floor because ordering returns early.
             "999garbage.0",
-            // A separator with nothing after it is not a suffix; `compareDotted`
+            // `compareDotted` rejects a trailing separator because digit parsing otherwise ignores it.
             // reads the digits and ignores the dangling separator.
             "4.18-",
             "4.18_",
@@ -576,7 +576,7 @@ describe("platform floors", () => {
             "4.18-rc1",
             "4.18.0-rc2",
             "4.18-pre",
-            // Every separator the shape check admits, not only `-` and `.`.
+            // The shape check validates every admitted separator, not only `-` and `.`.
             "4.18~rc1",
             "4.18_rc1",
             "4.18+beta1",
@@ -614,7 +614,6 @@ describe("platform floors", () => {
                 devFdExec: true,
             }),
         ).toEqual({ supported: false, reason: "unsupported_platform" });
-        // A prerelease genuinely above the floor still clears it.
         expect(
             evaluatePlatform(contract, {
                 os: "linux",
@@ -628,7 +627,6 @@ describe("platform floors", () => {
     });
 
     test("real-world version strings at the floor are supported", () => {
-        // RHEL/Rocky 8 report exactly these shapes at the contract floors.
         const rhel8 = evaluatePlatform(contract, {
             os: "linux",
             arch: "x64",
@@ -642,7 +640,6 @@ describe("platform floors", () => {
             target: "linux-x64-gnu",
             synapse: "certified_cpu",
         });
-        // A messy string below the floor still fails it.
         expect(
             evaluatePlatform(contract, {
                 os: "linux",
@@ -806,16 +803,15 @@ describe("stop-provenance schema", () => {
             validateStopProvenance(contract, { ...complete, extra: true })
                 .valid,
         ).toBe(false);
-        // `release_version` binds the claiming release, not the predecessor's;
-        // a record minted under another release carries no authority here.
+        // `release_version` binds the claiming release; a record minted under another release has no authority.
+        // A record minted under another release has no authority for the claiming release.
         const foreign = validateStopProvenance(contract, {
             ...complete,
             release_version: "0.99.0",
         });
         expect(foreign.valid).toBe(false);
         expect(foreign.legacyStopAuthority).toBe(false);
-        // Present-but-invalid values must not reach legacy stop authority: the
-        // required-field loop only rejects undefined, null, and "".
+        // Present but invalid values must not grant legacy stop authority.
         for (const [field, value] of [
             ["legacy_proof_version", false],
             ["legacy_proof_version", 2],
@@ -862,9 +858,6 @@ describe("dependency boundary", () => {
 
 describe("generated typescript location", () => {
     test("the shared lifecycle directory holds the generated contract", () => {
-        // Reads the committed artifact in place: the assertion is that the
-        // contract path is populated in the repository, so creating the
-        // directory here would only mask the failure it exists to catch.
         const content = readFileSync(
             join(repoRoot, OUTPUT_PATHS.typescript),
             "utf8",

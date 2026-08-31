@@ -31,8 +31,7 @@ function attachJsonSchemaOverride(schema: SchemaWithJsonSchemaOverride): void {
 }
 
 /**
- * Patches each arg schema with a toJSONSchema override so that
- * property-level descriptions from .describe() survive JSON Schema serialization.
+ * The override preserves property-level `.describe()` descriptions during JSON Schema serialization.
  */
 export function normalizeToolArgSchemas<TDefinition extends Pick<ToolDefinition, "args">>(
     toolDefinition: TDefinition,

@@ -1,12 +1,9 @@
 /**
- * Pi transform-time auto-search hint runner.
+ * The runner appends a `ctx_search` hint only when the evaluated message produces a non-empty hint.
  *
- * This is the Pi-shaped counterpart to OpenCode's
- * `auto-search-runner.ts`: when a context event carries a new meaningful
- * user message, run the shared `unifiedSearch()` over the stripped user
- * prompt, build the shared vague-recall hint, and append that hint to the
- * latest user message. The hint is deliberately not inline retrieved data;
- * it nudges the agent to call `ctx_search` for full context if relevant.
+ * For each new meaningful user message, `unifiedSearch()` receives the stripped prompt.
+ * The hint omits retrieved data.
+ * The hint directs the agent to call `ctx_search` for full context.
  *
  * ## Per-turn dedup
  *
@@ -22,19 +19,13 @@
  * timeout the `AbortController` is fired so `unifiedSearch()` can cancel
  * the underlying embedding fetch.
  *
- * ## Mutation strategy
  *
- * The function returns an `AgentMessage[]`, but mutates only the targeted
- * latest user message in place. That keeps the standalone API easy for the
- * future integrator: callers can pass Pi's mutable event array and return
- * the same reference. We preserve Pi's existing user-content shape instead
- * of normalizing everything to arrays: string content gets a direct string
- * append; array content appends to the first text block or pushes a new
- * `TextContent` block if the user message is image-only. This avoids
- * changing legacy string messages into array messages solely because a hint
+ * The runner mutates only the targeted latest user message in place.
+ * Callers can pass Pi's mutable event array and receive the same reference.
+ * The runner preserves Pi's existing user-content shape instead of normalizing all content to arrays.
+ * Appending a hint does not convert legacy string content to an array.
  * was added.
  *
- * ## Idempotency and augmentation stacking
  *
  * Before appending, we check whether the target message already contains
  * the exact hint or any `<ctx-search-hint>` block. Before searching, we
@@ -77,19 +68,13 @@ import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
 /**
- * Pi's full AgentMessage union, sourced from the live SDK ContextEvent
- * payload. Using the SDK's type (instead of a re-declared structural alias)
- * keeps this module type-compatible with the rest of the Pi plugin without
- * a per-version maintenance burden — when pi-coding-agent's types shift,
- * we get build errors here at the import site instead of silent runtime
+ * Deriving `AgentMessage` from `ContextEvent` keeps the alias synchronized with Pi's SDK type.
  * mismatches.
  */
 export type AgentMessage = ContextEvent["messages"][number];
 
 /**
- * Extract just the `user` variant of AgentMessage so internal helpers
- * can mutate `content` without re-narrowing on every call. Pi's user
- * message carries `string | (TextContent|ImageContent)[]` for content.
+ * The `UserMessage` alias narrows `AgentMessage` to `user` messages so helpers can mutate `content` without re-narrowing.
  */
 type UserMessage = Extract<AgentMessage, { role: "user" }>;
 
@@ -130,24 +115,18 @@ function findLatestMeaningfulUserMessage(
 		if (msg?.role !== "user") continue;
 		if (collectUserPromptParts(msg).trim().length === 0) continue;
 
-		// Reference-identity resolution takes precedence: `entryIds` is positional
-		// against the pre-splice array, but `messages` may have been spliced since
-		// (compartment trim / placeholder strip), so index i can be stale. The
-		// ref-map resolves the actual current message correctly.
+		// The runner uses reference identity because splicing can make positional `entryIds` stale.
 		if (entryIdByRef) {
 			const byRef =
 				msg && typeof msg === "object"
 					? entryIdByRef.get(msg as object)
 					: undefined;
 			if (typeof byRef === "string") return { message: msg, messageId: byRef };
-			// Ref-map MISS with a ref-map present: do NOT fall back to the stale
-			// positional `entryIds[i]` — after a splice it points at the wrong
-			// message and would anchor the auto-search hint to the wrong user turn.
-			// Treat as unresolved (degraded: no fresh hint this pass).
+			// The runner does not fall back to `entryIds[i]` when the ref-map misses because splicing can identify another user turn.
 			return null;
 		}
 
-		// No ref-map (pre-mutation caller): positional entryIds is authoritative.
+		// Positional `entryIds` are authoritative when no ref-map is available.
 		const messageId = entryIds[i];
 		if (typeof messageId === "string") return { message: msg, messageId };
 		return null;
@@ -184,11 +163,7 @@ function appendHintToUserMessage(message: UserMessage, hint: string): boolean {
 }
 
 /**
- * Run Pi auto-search hinting against the latest meaningful user message.
  *
- * The returned array is the same mutable array received in `args.messages`;
- * callers should still return it to Pi so the API shape remains compatible
- * if this implementation later switches to copy-on-write.
  */
 export async function runAutoSearchHintForPi(args: {
 	sessionId: string;
@@ -196,9 +171,7 @@ export async function runAutoSearchHintForPi(args: {
 	messages: AgentMessage[];
 	entryIds?: readonly (string | undefined)[] | null;
 	/**
-	 * Splice-safe message→entryId map keyed by AgentMessage reference. Resolved
-	 * against branch entries; correct even though `messages` was spliced since
-	 * the positional `entryIds` was computed. Takes precedence over `entryIds`.
+	 * The runner maps `AgentMessage` references to entry IDs because splicing invalidates positional `entryIds`.
 	 */
 	entryIdByRef?: ReadonlyMap<object, string> | null;
 	options: PiAutoSearchOptions;
@@ -229,9 +202,7 @@ export async function runAutoSearchHintForPi(args: {
 	if (found === null) return messages;
 
 	const { message: userMsg, messageId: userMsgId } = found;
-	// A persisted hint replays only while every contributing memory is still
-	// auto_search-eligible: a later policy transition must not keep sending
-	// the fragment through the stored text. Mirrors the OpenCode runner.
+	// A persisted hint replays only while every contributing memory remains auto_search-eligible; later policy transitions require a fresh search.
 	const replayHintIfEligible = (decision: AutoSearchHintDecision): void => {
 		if (decision.decision !== "hint") return;
 		if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
@@ -330,8 +301,6 @@ export async function runAutoSearchHintForPi(args: {
 			AUTO_SEARCH_TIMEOUT_MS,
 		);
 	} catch (error) {
-		// Retryable failure — do not persist a permanent no-hint decision, or the
-		// same user message would be suppressed even though a later pass may succeed.
 		log(
 			`[auto-search] unified search failed for session ${sessionId} (will retry next pass): ${error instanceof Error ? error.message : String(error)}`,
 		);
@@ -339,7 +308,6 @@ export async function runAutoSearchHintForPi(args: {
 	}
 
 	if (results === null) {
-		// Timeout is also retryable, matching OpenCode's auto-search runner.
 		sessionLog(
 			sessionId,
 			`auto-search: timed out after ${AUTO_SEARCH_TIMEOUT_MS}ms, skipping hint for this turn (will retry)`,
@@ -373,8 +341,6 @@ export async function runAutoSearchHintForPi(args: {
 	// Prefix with double newline so the hint is a separate block, matching
 	// OpenCode's auto-search runner.
 	const payload = `\n\n${packed.text}`;
-	// Any anti-memory fragment marks the persisted decision as non-replayable.
-	// Warning delivery always requires a fresh search rather than stored text.
 	const { warningResults, memoryFragments } = collectAntiMemoryWarningFragments(
 		packed.delivered,
 	);
@@ -385,9 +351,7 @@ export async function runAutoSearchHintForPi(args: {
 		memoryFragments,
 	});
 	if (!outcome.ok) return messages;
-	// Deliver this call's fresh CAS winner directly. Concurrently persisted
-	// decisions replay only when they contain no anti-memory fragment.
-	// Mirrors the OpenCode runner's delivery contract.
+	// The runner delivers the fresh compare-and-swap winner directly.
 	if (outcome.kind === "appended" && warningResults.length > 0) {
 		appendHintToUserMessage(userMsg, payload);
 		recordDeliveredAntiMemoryUsage(db, warningResults);
@@ -407,5 +371,4 @@ export async function runAutoSearchHintForPi(args: {
  * and are cleared by `clearSession()`.
  */
 export function clearAutoSearchForPiSession(_sessionId: string): void {
-	// Auto-search decisions live in session_meta and are cleared by clearSession().
 }

@@ -274,7 +274,7 @@ describe("runSetup", () => {
                 getPiUserExtensionsPath: () => join(agentDir, "settings.json"),
             },
         };
-        // confirms: configurePi=true, dreamerEnabled=true, useRecommendedSchedules=true, sidekickEnabled=false
+        // MockPrompts consumes confirmations as configurePi=true, dreamerEnabled=true, useRecommendedSchedules=true, and sidekickEnabled=false.
         const prompts = new MockPrompts({ confirms: [true, true, true, false] });
 
         const code = await runSetup({ prompts, env });
@@ -296,9 +296,8 @@ describe("runSetup", () => {
             sidekick?: { enabled?: boolean; disable?: boolean };
             embedding?: { provider?: string; model?: string };
         };
-        // No recommendation tree anymore: the picker shows the full model list
-        // sorted, and the mock selects the first option — alphabetically
-        // "anthropic/claude-haiku-4-5" for BOTH historian and dreamer.
+        // The picker shows the full model list sorted alphabetically.
+        // The mock selects "anthropic/claude-haiku-4-5" for both historian and dreamer.
         expect(config.historian?.model).toBe("anthropic/claude-haiku-4-5");
         expect(config.historian?.thinking_level).toBeUndefined();
         expect(config.dreamer).toEqual({
@@ -329,9 +328,9 @@ describe("runSetup", () => {
                 getPiUserExtensionsPath: () => join(agentDir, "settings.json"),
             },
         };
-        // confirms: configurePi=true, dreamerEnabled=FALSE, sidekickEnabled=false.
-        // The picker is invoked once (historian); a 2nd autocomplete call would
-        // mean the dreamer model was wrongly requested after the user declined.
+        // MockPrompts consumes confirmations as configurePi=true, dreamerEnabled=false, and sidekickEnabled=false.
+        // The historian invokes `selectAutocomplete` once.
+        // A second `selectAutocomplete` call means setup requested a dreamer model after the user declined Dreamer.
         let autocompleteCalls = 0;
         const prompts = new MockPrompts({ confirms: [true, false, false] });
         const origAuto = prompts.selectAutocomplete.bind(prompts);
@@ -362,7 +361,7 @@ describe("runSetup", () => {
         const env: SetupEnvironment = {
             detectPiBinary: () => ({ path: join(root, "bin", "pi"), source: "path" }),
             getPiVersion: () => "0.74.0",
-            // Only one model so the model picker has a single deterministic choice.
+            // The single available model makes the picker deterministic.
             getAvailableModels: () => ["github-copilot/gpt-5.4"],
             paths: {
                 getPiAgentConfigDir: () => agentDir,
@@ -372,7 +371,7 @@ describe("runSetup", () => {
             },
         };
         // selectOne picks the recommended option ("medium" for thinking_level)
-        // confirms: configurePi=true, dreamerEnabled=true, useRecommendedSchedules=true, sidekickEnabled=false
+        // MockPrompts consumes confirmations as configurePi=true, dreamerEnabled=true, useRecommendedSchedules=true, and sidekickEnabled=false.
         const prompts = new MockPrompts({ confirms: [true, true, true, false] });
 
         const code = await runSetup({ prompts, env });
@@ -383,7 +382,7 @@ describe("runSetup", () => {
         ) as {
             historian?: { model?: string; thinking_level?: string };
         };
-        // github-copilot model — thinking_level must be set by setup wizard
+        // The setup wizard must set thinking_level for github-copilot models.
         expect(config.historian?.model).toBe("github-copilot/gpt-5.4");
         expect(config.historian?.thinking_level).toBe("medium");
     });
@@ -427,7 +426,7 @@ describe("runSetup", () => {
                 getPiUserExtensionsPath: () => join(agentDir, "settings.json"),
             },
         };
-        // One confirm: continue-anyway prompt → false (user declines)
+        // `false` declines the continue-anyway prompt.
         const prompts = new MockPrompts({ confirms: [false] });
 
         const code = await runSetup({ prompts, env });
@@ -455,8 +454,7 @@ describe("runSetup", () => {
                 getPiUserExtensionsPath: () => join(agentDir, "settings.json"),
             },
         };
-        // confirms: continue-anyway=true, configurePi=true,
-        //           dreamerEnabled=true, useRecommendedSchedules=true, sidekickEnabled=false
+        // The confirmations are continue-anyway=true, configurePi=true, dreamerEnabled=true, useRecommendedSchedules=true, and sidekickEnabled=false.
         const prompts = new MockPrompts({ confirms: [true, true, true, true, false] });
 
         const code = await runSetup({ prompts, env });

@@ -1,33 +1,33 @@
-//! Setup-handshake transcript shared by `mc-host` and `mc-shm-native`, so the two handshake implementations cannot desynchronize. commentlint: allow(JUDGE)
+//! Setup-handshake transcript shared by `mc-host` and `mc-shm-native`, so the two handshake implementations cannot desynchronize.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-/// Wire version stamped into a grant and echoed by the activating peer. commentlint: allow(JUDGE)
+/// Wire version stamped into a grant and echoed by the activating peer.
 pub const PROTOCOL_VERSION: u8 = 2;
 
-/// Nonce bytes each side contributes. commentlint: allow(JUDGE)
+/// Nonce bytes each side contributes.
 pub const NONCE_LEN: usize = 32;
-/// Proof bytes carried by each auth message. commentlint: allow(JUDGE)
+/// Proof bytes carried by each auth message.
 pub const PROOF_LEN: usize = 32;
-/// Daemon identity bytes bound into every proof. commentlint: allow(JUDGE)
+/// Daemon identity bytes bound into every proof.
 pub const DAEMON_ID_LEN: usize = 16;
 
-/// Upper bound on one authentication message body. commentlint: allow(JUDGE)
+/// Upper bound on one authentication message body.
 pub const MAX_AUTH_MESSAGE_LEN: usize = 4096;
-/// Upper bound on one setup message body. commentlint: allow(JUDGE)
+/// Upper bound on one setup message body.
 pub const MAX_SETUP_MESSAGE_LEN: usize = 16 * 1024;
-/// Descriptors a grant transfers: one ring per direction. commentlint: allow(JUDGE)
+/// Descriptors a grant transfers: one ring per direction.
 pub const RING_DESCRIPTOR_COUNT: usize = 2;
 
-/// Separates the host's key-possession proof from other MAC inputs. commentlint: allow(JUDGE)
+/// Separates the host's key-possession proof from other MAC inputs.
 pub const SERVER_PROOF_DOMAIN: &str = "subc-server-v1";
-/// Separates the peer's key-possession proof from other MAC inputs. commentlint: allow(JUDGE)
+/// Separates the peer's key-possession proof from other MAC inputs.
 pub const CLIENT_AUTH_DOMAIN: &str = "subc-client-v1";
-/// Role string a connecting peer presents. commentlint: allow(JUDGE)
+/// Role string a connecting peer presents.
 pub const DEFAULT_CLIENT_ROLE: &str = "client";
 
-/// Including `daemon_ver` in the MAC prevents peers without the key from altering the reported daemon version. The length prefix keeps the version boundary unambiguous, so no two distinct (version, id) pairs produce the same MAC input. commentlint: allow(JUDGE)
+/// Including `daemon_ver` in the MAC prevents peers without the key from altering the reported daemon version. The length prefix keeps the version boundary unambiguous, so no two distinct (version, id) pairs produce the same MAC input.
 pub fn compute_proof(
     key: &[u8],
     domain: &str,
@@ -49,26 +49,26 @@ pub fn compute_proof(
     mac.finalize().into_bytes().into()
 }
 
-/// Committed proof vectors, exposed outside `cfg(test)` so both ends assert against these literals rather than against their own output. commentlint: allow(JUDGE)
+/// Committed proof vectors, exposed outside `cfg(test)` so both ends assert against these literals rather than against their own output.
 pub mod vectors {
     use super::{DAEMON_ID_LEN, NONCE_LEN, PROOF_LEN};
 
-    /// Daemon version the committed proofs are computed over. commentlint: allow(JUDGE)
+    /// Daemon version the committed proofs are computed over.
     pub const DAEMON_VER: &str = "mc-host/0.1.0";
 
-    /// Host proof over the committed inputs. commentlint: allow(JUDGE)
+    /// Host proof over the committed inputs.
     pub const SERVER_PROOF: [u8; PROOF_LEN] = [
         64, 154, 84, 68, 23, 100, 116, 189, 2, 121, 137, 79, 177, 172, 107, 52, 108, 174, 152, 208,
         218, 25, 249, 160, 154, 212, 42, 68, 91, 108, 85, 131,
     ];
 
-    /// Peer proof over the committed inputs. commentlint: allow(JUDGE)
+    /// Peer proof over the committed inputs.
     pub const CLIENT_AUTH: [u8; PROOF_LEN] = [
         184, 138, 243, 55, 0, 189, 88, 52, 54, 27, 4, 112, 129, 214, 202, 57, 252, 146, 75, 221,
         119, 177, 247, 0, 193, 206, 206, 26, 90, 147, 247, 187,
     ];
 
-    /// Key `00..1f`, client nonce `20..3f`, server nonce `40..5f`, daemon ID `60..6f`. commentlint: allow(JUDGE)
+    /// Key `00..1f`, client nonce `20..3f`, server nonce `40..5f`, daemon ID `60..6f`.
     pub fn inputs() -> (
         [u8; 32],
         [u8; NONCE_LEN],

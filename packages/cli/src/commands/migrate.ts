@@ -15,20 +15,18 @@ import { getOmpSessionsRoot, getPiSessionsRoot } from "../lib/paths";
 
 export interface MigrateOpenCodeSessionToPiOptions {
     /**
-     * OpenCode source DB handle. Read-only operations: session, message,
-     * part rows. Owns nothing about Magic Context state — that lives in
-     * the cortexkit DB below.
+     * The migrator reads OpenCode session, message, and part rows through db.
+     * The cortexkit DB owns Magic Context state.
      */
     db?: DatabaseLike;
     /**
-     * Magic Context shared-DB handle (`~/.local/share/cortexkit/magic-context/context.db`).
-     * The migrator reads source compartments + facts under
-     * `harness='opencode'` keyed by source session_id and writes copies
-     * keyed by the new Pi session_id under `harness='pi'`. When omitted,
+     * cortexkitDb accesses Magic Context's shared database at `~/.local/share/cortexkit/magic-context/context.db`.
+     * The migrator reads compartments and facts with `harness='opencode'`.
+     * The migrator keys source rows by the source `session_id`.
+     * The migrator writes copies under `harness='pi'` keyed by the new Pi `session_id`.
      * the migrator opens the canonical path read-write.
      *
-     * Pass `null` explicitly to skip the cortexkit copy entirely (the
-     * legacy V1 behavior — JSONL only).
+     * A null cortexkitDb skips the cortexkit copy; the migrator writes JSONL only.
      */
     cortexkitDb?: DatabaseLike | null;
     fs?: FileSystemLike;
@@ -42,8 +40,8 @@ export interface MigrateOpenCodeSessionToPiOptions {
     provider?: string;
     modelId?: string;
     /**
-     * Target harness recorded in the migration journal key. Defaults to "pi";
-     * pass "omp" when the session JSONL is written into OMP's sessions root.
+     * The migration journal key records targetHarness; targetHarness defaults to "pi".
+     * Callers pass "omp" when the session JSONL is written into OMP's sessions root.
      */
     targetHarness?: "pi" | "omp";
 }
@@ -54,35 +52,34 @@ export interface MigrationResult {
     messageCount: number;
     byteCount: number;
     sourceMessageCount: number;
-    /** Number of OpenCode compartments copied to the new Pi session_id. */
+    /** compartmentsCopied counts OpenCode compartments copied to the new Pi session_id. */
     compartmentsCopied: number;
-    /** Number of OpenCode session_facts copied to the new Pi session_id. */
+    /** factsCopied counts OpenCode session_facts copied to the new Pi session_id. */
     factsCopied: number;
-    /** Number of compartment boundaries that were nearest-at-or-before remapped (vs exact match). */
+    /** boundariesApproximated counts boundaries remapped to the nearest entry at or before the source boundary instead of exactly matched. */
     boundariesApproximated: number;
     compactionMarkerWritten: boolean;
     compactionBoundaryEntryId?: string;
     compactionFirstKeptEntryId?: string;
-    /** Records the shared database's persisted schema version before and after migration so callers can verify it stays within the running plugin's supported limit. */
+    /** cortexkitSchemaVersionBefore and cortexkitSchemaVersionAfter let callers verify that schema versions stay within the plugin's supported limit. */
     cortexkitSchemaVersionBefore?: number;
     cortexkitSchemaVersionAfter?: number;
     /**
-     * Journal key (hash of source session + target harness) when the shared-DB
-     * crash-recovery journal tracked this migration. Absent for dry runs and
-     * JSONL-only migrations without a cortexkit database.
+     * The journal key hashes the source session and target harness.
+     * The key is absent for dry runs.
+     * The key is absent for JSONL-only migrations without a cortexkit database.
      */
     migrationKey?: string;
     /** True when a journal row from an earlier interrupted attempt supplied the Pi session identity. */
     journalResumed?: boolean;
-    /** Recovery sweep reconciled before this migration ran (only when the journal is active). */
+    /** The migrator runs the recovery sweep before this migration when the journal is active. */
     recovery?: MigrationSweepReport;
     dryRun: boolean;
 }
 
 /**
- * One in-flight row of the `migration_pending` journal. Column names avoid a
- * bare `session_id` on purpose: the structural clearSession contract wipes
- * every table carrying that column, and session deletion must not destroy
+ * `migration_pending` records in-flight migrations.
+ * `source_session_id` lets `clearSession` remove crash-recovery records.
  * crash-recovery records.
  */
 export interface MigrationPendingRow {
@@ -97,17 +94,16 @@ export interface MigrationPendingRow {
     created_at: number;
 }
 
-/** Outcome of reconciling interrupted migrations by journal phase. */
+/** MigrationSweepReport reports reconciliation of interrupted migrations by journal phase. */
 export interface MigrationSweepReport {
-    /** Finished migrations whose journal row outlived the final rename. */
+    /** completed counts finished migrations whose journal row outlived the final rename. */
     completed: number;
-    /** db_committed rows roll-forwarded (stage file renamed to its final path). */
+    /** rolledForward counts db_committed rows whose stage file was renamed to its final path. */
     rolledForward: number;
-    /** staged rows rolled back (stage file removed; shared state provably absent). */
+    /** rolledBack counts staged rows whose stage file was removed after shared state was proven absent. */
     rolledBack: number;
     /**
-     * db_committed rows whose stage AND final files are both missing. The shared
-     * state committed but the session bytes were lost; these are reported, never
+     * `db_committed` rows with neither stage nor final file have committed shared state but lost session bytes.
      * silently deleted.
      */
     lost: MigrationPendingRow[];
@@ -230,11 +226,7 @@ const MIGRATION_COMPACTION_SUMMARY =
     "Magic Context compacted prior conversation. See <session-history> block for the structured summary.";
 const PART_LOOKUP_CHUNK_SIZE = 900;
 /**
- * Directory name for staged migration JSONL, created as a SIBLING of the
- * target sessions root (e.g. `~/.pi/agent/.mc-migrations` for the default Pi
- * layout). Staging outside the sessions tree keeps half-written migrations
- * away from any harness that scans session files by suffix, while staying on
- * the same filesystem so the stage→final rename remains atomic.
+ * The migrator creates the staging directory as a sibling of the target sessions root.
  */
 const MIGRATION_STAGE_DIRNAME = ".mc-migrations";
 
@@ -283,10 +275,8 @@ function shortId(): string {
 }
 
 /**
- * Stable identity for one (source session, target harness) migration. Hashed
- * so the journal's PRIMARY KEY is fixed-size and filesystem-neutral; identical
- * across retries, which is what lets a re-run resume the original attempt's
- * Pi session identity instead of minting a second one.
+ * The SHA-256 hash gives each (source session, target harness) migration a stable identity.
+ * The hash fixes the journal PRIMARY KEY size and makes it filesystem-neutral.
  */
 export function migrationKeyFor(sourceSessionId: string, targetHarness: string): string {
     return createHash("sha256").update(`${sourceSessionId}\n${targetHarness}`).digest("hex");
@@ -302,22 +292,11 @@ function hasMigrationJournal(db: DatabaseLike): boolean {
 }
 
 /**
- * Reconcile interrupted migrations recorded in `migration_pending`, by phase
- * and with NO time thresholds — a row is only ever reconciled by what its
- * phase and files prove:
+ * The reconciler uses each journal row's phase and files to recover interrupted migrations.
+ * The reconciler uses no time thresholds.
  *
- *   final file present            → done (crash between rename and row
- *                                    deletion): delete the row.
- *   phase=db_committed + stage    → ROLL FORWARD: the shared-DB state
- *                                    committed, so finish the rename and
- *                                    delete the row.
- *   phase=staged                  → ROLL BACK: delete stage file + row. The
- *                                    shared-DB state is provably absent
- *                                    because the phase only advances inside
- *                                    the same transaction that writes it.
- *   phase=db_committed, no files  → the staged bytes were lost after the DB
- *                                    commit. Report loudly and keep the row —
- *                                    the checksum names what was lost; never
+ * When the final file exists, recovery deletes the journal row because the rename completed before the crash.
+ * When phase is `db_committed` and no files exist, recovery retains the row and reports the lost staged bytes.
  *                                    silently delete.
  *
  * Idempotent: running it against an already-clean journal is a no-op.
@@ -344,7 +323,7 @@ export function sweepPendingMigrations(
 
     for (const row of rows) {
         if (fs.existsSync(row.final_path)) {
-            // Finished: the rename landed but the journal row deletion didn't.
+            // The rename completed, but the journal row remains because deletion did not run.
             stmt(db, "DELETE FROM migration_pending WHERE migration_key = ?").run(
                 row.migration_key,
             );
@@ -353,7 +332,7 @@ export function sweepPendingMigrations(
         }
         if (row.phase === "db_committed") {
             if (fs.existsSync(row.stage_path)) {
-                // Roll forward: shared state is committed; complete the rename.
+                // Shared state is committed, so recovery completes the rename.
                 fs.mkdirSync(dirname(row.final_path), { recursive: true });
                 fs.renameSync(row.stage_path, row.final_path);
                 stmt(db, "DELETE FROM migration_pending WHERE migration_key = ?").run(
@@ -361,18 +340,16 @@ export function sweepPendingMigrations(
                 );
                 report.rolledForward += 1;
             } else {
-                // Lost: committed state with no recoverable session bytes.
+                // Committed state has no recoverable session bytes.
                 report.lost.push(row);
             }
             continue;
         }
-        // phase === "staged": roll back. Best-effort stage removal — a missing
-        // stage file is fine (the row still goes away).
+        // Rollback deletes the journal row even when the stage file is missing.
         try {
             fs.unlinkSync(row.stage_path);
         } catch {
-            // The staged file may already be gone; the row deletion below is
-            // the authoritative rollback.
+            // A failed stage-file deletion does not block rollback.
         }
         stmt(db, "DELETE FROM migration_pending WHERE migration_key = ?").run(row.migration_key);
         report.rolledBack += 1;
@@ -392,20 +369,8 @@ function readPendingMigration(
 }
 
 /**
- * Claim the journal identity for this migration key BEFORE building the
- * session content: mint the Pi uuid on first attempt and persist it in a
- * phase=staged row, or reuse the persisted row on retry. The content embeds
- * the identity (session entry + filename), so the identity must be settled
- * first — and a re-run must never mint a second identity for the same key.
  *
- * The checksum is still unknown at claim time (the bytes are built after);
- * the row lands with an empty placeholder and `commitStagedChecksum` fills it
- * once the content exists, before the stage file is written. A crash in that
- * window leaves a plain staged row, which the sweep rolls back safely.
  *
- * The insert is upsert-shaped (ON CONFLICT DO NOTHING + re-read) so two
- * racing first attempts converge on ONE identity: the loser adopts the
- * winner's persisted row instead of carrying a second uuid into the content.
  */
 function claimJournalIdentity(args: {
     db: DatabaseLike;
@@ -438,8 +403,6 @@ function claimJournalIdentity(args: {
         join(args.stageDir, `${args.migrationKey}.jsonl`),
         args.now,
     );
-    // Re-read: a concurrent writer may have won the insert race, in which case
-    // THEIR identity is authoritative (this attempt resumes it).
     const row = readPendingMigration(args.db, args.migrationKey);
     if (!row) {
         throw new Error("migration journal row disappeared during insert; aborting migration");
@@ -448,11 +411,9 @@ function claimJournalIdentity(args: {
 }
 
 /**
- * Step (1) completion: record the checksum of the bytes about to be staged.
- * For a resumed row this refreshes the checksum to describe THIS attempt's
- * content; the phase is deliberately left untouched — a row that already
- * reached db_committed must never regress to staged, because sweep roll-back
- * trusts staged to mean "no shared state was committed".
+ * Resumed rows update `content_sha256` without changing `phase`.
+ * A `db_committed` row must not regress to `staged`.
+ * A `db_committed` row must not regress to `staged`, because sweep rollback trusts `staged` to mean no shared state was committed.
  */
 function commitStagedChecksum(db: DatabaseLike, migrationKey: string, contentSha256: string): void {
     stmt(db, "UPDATE migration_pending SET content_sha256 = ? WHERE migration_key = ?").run(
@@ -506,7 +467,6 @@ function extractModel(rows: OpenCodeMessageRow[]): {
             const modelId = data.modelID ?? data.model?.modelID;
             if (provider && modelId) return { provider, modelId };
         } catch {
-            // Ignore malformed rows; conversion below will surface concrete row errors.
         }
     }
     return { provider: DEFAULT_PROVIDER, modelId: DEFAULT_MODEL };
@@ -531,19 +491,15 @@ function normalizeOpenCodeTool(part: OpenCodePartData): {
 }
 
 /**
- * Build a Pi-shaped `usage` object from OpenCode `message.tokens`.
  *
- * OpenCode shape: `{ total, input, output, reasoning, cache: { read, write } }`.
- * Pi shape: `{ input, output, cacheRead, cacheWrite, totalTokens, cost: {...} }`.
+ * OpenCode exposes usage as `{ total, input, output, reasoning, cache: { read, write } }`.
+ * Pi exposes usage as `{ input, output, cacheRead, cacheWrite, totalTokens, cost: {...} }`.
  *
- * Pi's interactive footer reads `entry.message.usage.input` on every
- * assistant render. Without realistic numbers, `getContextUsage()` reports
- * 0% of the model's window because Pi sums these per-turn input fields.
- * Real numbers from the source session let the scheduler + historian
- * trigger correctly the moment a migrated session loads.
+ * Pi's interactive footer reads `entry.message.usage.input` for every assistant render.
+ * Without source token counts, `getContextUsage()` reports 0% because Pi sums per-turn input fields.
+ * The importer preserves source token counts so scheduler and historian thresholds apply when the session loads.
  *
- * Cost is set to zeroes — recovering OpenCode pricing is non-trivial and
- * Pi's footer aggregator handles missing cost gracefully.
+ * OpenCode message data provides no pricing, so all cost fields are zero.
  */
 function tokensToPiUsage(tokens: OpenCodeMessageTokens | undefined): Record<string, unknown> {
     const input = tokens?.input ?? 0;
@@ -703,23 +659,17 @@ interface BuildEntriesResult {
     entries: PiJson[];
     piSessionId: string;
     /**
-     * Map from OpenCode message_id → the FIRST Pi entry id derived from that
-     * source message. Compartment START boundaries remap through this map so a
-     * source message that expands into several Pi entries keeps its whole
-     * expansion inside the compartment (a last-entry-only remap would silently
-     * shrink the start span).
+     * START boundaries use the first derived Pi entry so they include every entry derived from the source message.
      */
     messageIdToFirstPiEntryId: Map<string, string>;
     /**
-     * Map from OpenCode message_id → the LAST Pi entry id derived from
-     * that source message. Compartment END boundaries remap through this map
-     * (it captures all parts of that source message).
+     * END boundaries use the last derived Pi entry so they include every entry derived from the source message.
+     * `messageIdToLastPiEntryId` lets END boundaries include every Pi entry derived from each source message.
      */
     messageIdToLastPiEntryId: Map<string, string>;
     /**
-     * Source-message ids in chronological order. Used for nearest-at-or-before
-     * remapping when a compartment's start_message_id doesn't directly
-     * match (e.g. its part-only synthetic boundary).
+     * `orderedSourceMessageIds` orders source-message IDs chronologically for nearest-at-or-before remapping.
+     * `orderedSourceMessageIds` lets a START boundary without an exact source ID remap to the nearest preceding source message.
      */
     orderedSourceMessageIds: string[];
 }
@@ -732,9 +682,7 @@ function buildPiEntries(params: {
     provider: string;
     modelId: string;
     /**
-     * The Pi session identity for the migrated JSONL. Minted by the caller (or
-     * reused from the migration journal on retry) rather than here, so the
-     * journal's persisted identity stays authoritative across attempts.
+     * The caller mints `piSessionId` or reuses the migration journal's persisted value so retries retain the same Pi session identity.
      */
     piSessionId: string;
 }): BuildEntriesResult {
@@ -758,9 +706,7 @@ function buildPiEntries(params: {
         },
     ];
 
-    // Migration boundary marker — appears as the first user message in
-    // the migrated session. This is intentionally stub usage (zeros)
-    // because no real LLM produced it; it's a synthetic marker only.
+    // `boundary` uses zero token and cost values because it is synthetic and no LLM produced it.
     const boundary = makeMessageEntry(
         "user",
         `<!-- migrated from OpenCode session ${params.session.id} at ${nowIso} -->\n\nThe following conversation was migrated from a different harness. Reasoning context from prior turns may be incomplete; tool calls reference tools that may not exist in this environment.`,
@@ -856,8 +802,7 @@ function fetchRows(db: DatabaseLike, sessionId: string, maxMessages: number | un
         const messages = newestFirst.reverse();
         const ids = messages.map((row) => row.id);
         const parts: OpenCodePartRow[] = [];
-        // Keep every lookup inside this deferred transaction while bounding each
-        // IN list below SQLite's conservative 999-variable configurations.
+        // The deferred transaction performs all lookups and limits each `IN` list to fewer than 999 variables to support SQLite configurations with a 999-variable limit.
         for (let offset = 0; offset < ids.length; offset += PART_LOOKUP_CHUNK_SIZE) {
             const chunk = ids.slice(offset, offset + PART_LOOKUP_CHUNK_SIZE);
             parts.push(
@@ -880,31 +825,18 @@ function fetchRows(db: DatabaseLike, sessionId: string, maxMessages: number | un
         try {
             db.exec("ROLLBACK");
         } catch {
-            // Preserve the read failure if the transaction already closed.
+            // A closed transaction causes the deferred read to fail.
         }
         throw error;
     }
 }
 
 /**
- * Translate an OpenCode boundary id to the equivalent Pi entry id.
  *
- * Strategy (in order):
- *   1. If the OpenCode message id maps directly to a Pi entry, use that.
- *      The EDGE selects which derived entry: a START boundary maps to the
- *      FIRST Pi entry derived from the source message and an END boundary to
- *      the LAST, so a source message that expands into several Pi entries
- *      stays fully inside the compartment on both sides.
- *   2. Otherwise find the nearest source message whose chronological
- *      position is at-or-before the missing one and use ITS LAST Pi entry —
- *      the closest point still at-or-before the missing boundary, for start
- *      and end edges alike. "At-or-before" is by index in
+ * At-or-before uses lexicographic comparison of message IDs.
  *      `orderedSourceMessageIds`.
- *   3. If no message at-or-before exists (boundary precedes the
- *      earliest migrated message), return undefined and the caller
- *      drops the compartment.
  *
- * Returns `{ piEntryId, exact }` so the caller can count approximations.
+ * `exact` distinguishes direct mappings from at-or-before fallbacks.
  */
 function remapBoundaryId(
     openCodeMessageId: string,
@@ -917,10 +849,6 @@ function remapBoundaryId(
     const direct = directMap.get(openCodeMessageId);
     if (direct !== undefined) return { piEntryId: direct, exact: true };
 
-    // Boundary id wasn't a top-level message id — find nearest at-or-before.
-    // Use string comparison as a proxy for chronological order: OpenCode
-    // message ids are ULID-ish (`msg_${time}_${random}`), so lexicographic
-    // order matches creation order for messages in the same session.
     let nearestAtOrBefore: string | undefined;
     for (const id of orderedSourceMessageIds) {
         if (id <= openCodeMessageId) {
@@ -960,24 +888,14 @@ interface RemappedCompartment {
 }
 
 /**
- * The remapped state to copy, plus a committer that performs all writes
- * inside a single transaction. The plan is computed without writing so the
- * caller can (a) read `lastCompartmentEndPiEntryId` for the compaction marker,
- * (b) derive runtime-basis ordinals into `remappedCompartments` AFTER the
- * compaction marker mutates the entry array, and (c) write the Pi JSONL file
- * FIRST, then call `commit()` only after the file persists — so an
- * interruption never leaves orphaned shared-DB rows with no usable session
+ * `commit()` writes state in one transaction only after the Pi JSONL file persists, preventing database rows without a session file after interruption.
  * file.
  *
- * Pass the journal's `migration_key` to `commit()` to advance that row's phase
- * to `db_committed` INSIDE the same transaction as the state writes — the
- * ordering the crash-recovery sweep relies on.
+ * Pass the journal's `migration_key` to `commit()` so it advances that row to `db_committed` in the state-write transaction.
  */
 interface CopyMagicContextStatePlan extends CopyMagicContextStateResult {
     /**
-     * Remapped rows awaiting runtime-basis ordinals (start_message /
-     * end_message) before commit. Exposed so the caller derives them from the
-     * FINAL entry array (post compaction-marker insertion).
+     * `remappedCompartments` requires `start_message` and `end_message` ordinals derived after compaction-marker insertion.
      */
     remappedCompartments: RemappedCompartment[];
     commit: (journalKey?: string) => void;
@@ -1026,19 +944,12 @@ function insertCompactionMarker(
 }
 
 /**
- * Copy compartments + session_facts from the source OpenCode session
- * into a new Pi session keyed by the migrated session UUID. Boundary
- * IDs are remapped from OpenCode message ids to Pi entry ids (the
- * runtime path also stores entry.id; see read-session-pi.ts and
- * inject-compartments-pi.ts for the consumer).
  *
- * The shared cortexkit DB is treated as already-initialized (Magic
- * Context creates it on first plugin load). We only INSERT here —
- * never CREATE TABLE — because the schema migration system owns that
+ * Magic Context initializes the shared cortexkit DB on first plugin load.
+ * The schema migration system owns table creation.
  * lifecycle.
  *
- * On dry runs we still read source state and compute the remap so the
- * result counts are accurate, but we don't write anything to the DB.
+ * Dry runs compute the remap and result counts without writing to the DB.
  */
 function copyMagicContextState(args: {
     cortexkitDb: DatabaseLike;
@@ -1086,10 +997,6 @@ function copyMagicContextState(args: {
             args.messageIdToLastPiEntryId,
             args.orderedSourceMessageIds,
         );
-        // If either boundary doesn't translate (precedes our migrated
-        // range entirely), skip that compartment. The remaining compartments
-        // still form a contiguous prefix from the perspective of the trim
-        // machinery, just shorter.
         if (!startRemap || !endRemap) continue;
         if (!startRemap.exact || !endRemap.exact) boundariesApproximated++;
         remappedCompartments.push({
@@ -1121,11 +1028,8 @@ function copyMagicContextState(args: {
         return { ...result, remappedCompartments, commit: () => {} };
     }
 
-    // Defer all writes into a single transaction the caller runs AFTER the Pi
-    // JSONL file persists. Insert compartments + facts under
-    // (harness='pi', session_id=<new>). The shared DB schema includes
-    // `harness TEXT NOT NULL DEFAULT 'opencode'` on both tables, and
-    // (session_id, sequence) is UNIQUE on compartments.
+    // The caller commits all writes in one transaction.
+    // Both tables default harness to 'opencode', so migrated rows must set harness='pi'.
     const commit = (journalKey?: string) => {
         const insertCompartment = stmt(
             args.cortexkitDb,
@@ -1144,12 +1048,10 @@ function copyMagicContextState(args: {
         );
         args.cortexkitDb.exec("BEGIN IMMEDIATE");
         try {
-            // Upsert-shaped replay: a resumed attempt reuses the journal's
-            // pi_session_id, and a crash AFTER this transaction committed (but
-            // before the staged file reached its final path) leaves rows under
-            // it. Replacing any prior rows for this session inside the same
-            // transaction keeps the replay idempotent — no UNIQUE collision on
-            // compartments(session_id, sequence), no duplicated facts.
+            // A resumed attempt reuses the journal's pi_session_id.
+            // A crash after the transaction commits can leave rows for the journal's Pi session.
+            // The transaction replaces prior rows for the Pi session to keep resumed replays idempotent.
+            // Replacing prior rows prevents duplicate facts and compartments(session_id, sequence) collisions on resumed replays.
             stmt(
                 args.cortexkitDb,
                 "DELETE FROM compartments WHERE session_id = ? AND harness = 'pi'",
@@ -1172,11 +1074,9 @@ function copyMagicContextState(args: {
                     c.p2,
                     c.p3,
                     c.p4,
-                    // Preserve v2 metadata so the decay renderer tiers/decays
-                    // migrated history. Without these, rows land legacy=0 + NULL
-                    // tiers and the renderer falls back to full `content` for every
-                    // tier (no decay, prompt bloat). importance mirrors the schema
-                    // default when absent.
+                    // v2 metadata preserves renderer tiers and decay for migrated history.
+                    // Without v2 metadata, migrated rows use legacy=0 with NULL tiers.
+                    // NULL tiers make the renderer use full content for every tier, disabling decay and increasing prompt size.
                     typeof c.importance === "number" ? c.importance : 50,
                     c.episode_type,
                     c.legacy,
@@ -1187,9 +1087,9 @@ function copyMagicContextState(args: {
                 insertFact.run(args.piSessionId, f.category, f.content, f.created_at, f.updated_at);
             }
             if (journalKey !== undefined) {
-                // Advance the journal phase INSIDE this transaction: the sweep's
-                // roll-forward arm (db_committed ⇒ shared state committed) is
-                // only true because the two writes commit atomically.
+                // The transaction advances the journal phase so the sweep can treat db_committed as shared-state committed.
+                // The sweep treats `db_committed` as shared-state committed only when the transaction atomically commits the journal phase and shared state.
+                // The transaction commits the journal phase and shared state atomically.
                 stmt(
                     args.cortexkitDb,
                     "UPDATE migration_pending SET phase = 'db_committed' WHERE migration_key = ?",
@@ -1206,23 +1106,14 @@ function copyMagicContextState(args: {
 }
 
 /**
- * Replicate the ordinal basis the Pi runtime reader produces, so migrated
- * compartment ordinals match what `readSessionChunk` consumes at runtime.
+ * derivePiRuntimeOrdinals reproduces the Pi runtime reader's ordinal basis.
  *
- * The Pi reader (`convertEntriesToRawMessages` in pi-plugin's
- * read-session-pi.ts) walks the JSONL entries and counts RawMessages:
- *   - non-`message` entries (session, model_change, compaction, …) carry no
- *     ordinal at all;
+ * convertEntriesToRawMessages determines the runtime RawMessage ordinal from JSONL entry order.
+ * Non-`message` entries have no runtime ordinal.
  *   - each user or assistant message entry gets its own ordinal;
- *   - `toolResult` entries get NONE — they fold into the next user entry
- *     (sharing its ordinal), or into a synthetic user turn emitted ahead of
- *     the next assistant entry (consuming its own ordinal), or into a
- *     trailing synthetic user turn;
+ * `toolResult` entries share the next user's ordinal, or consume a synthetic user's ordinal before the next assistant entry or at the end.
  *   - unknown roles get their own ordinal without folding pending results.
  *
- * Returns entry-id → ordinal for every entry that participates in a
- * RawMessage. MUST stay in lockstep with the reader; the migration tests
- * resolve expected ordinals through the reader itself, never this helper.
  */
 function derivePiRuntimeOrdinals(entries: readonly PiJson[]): Map<string, number> {
     const ordinalByEntryId = new Map<string, number>();
@@ -1253,8 +1144,7 @@ function derivePiRuntimeOrdinals(entries: readonly PiJson[]): Map<string, number
         }
 
         if (role === "assistant" && pendingToolResultIds.length > 0) {
-            // The reader emits a synthetic user turn for the pending results
-            // BEFORE this assistant message; that turn consumes an ordinal.
+            // Before an assistant entry following pending results, the reader emits a synthetic user turn that consumes an ordinal.
             foldPendingInto(nextOrdinal);
             nextOrdinal += 1;
         }
@@ -1276,18 +1166,11 @@ function derivePiRuntimeOrdinals(entries: readonly PiJson[]): Map<string, number
 }
 
 /**
- * Fill each remapped compartment's start_message/end_message with ordinals
- * derived from the FINAL entry array — after insertCompactionMarker ran — so
+ * applyRuntimeOrdinals must receive entries whose order matches the Pi runtime reader.
  * the stored ordinals are in the exact basis the Pi runtime reader produces.
- * Boundary entry ids come from the entries built in this same run, so a
- * missing ordinal is a migrator bug and fails loudly (before anything is
+ * Each compartment boundary entry ID must have a runtime ordinal.
  * written).
  *
- * FUTURE-ONLY fix: this corrects ordinal derivation for migrations written by
- * this and later versions. Raw-copy rows shipped by earlier migrators (which
- * copied the source session's ordinals verbatim) are deliberately NOT
- * backfilled here — a repair needs field evidence that mis-based sessions
- * exist, and none has been reported.
  */
 function applyRuntimeOrdinals(
     remappedCompartments: RemappedCompartment[],
@@ -1349,9 +1232,6 @@ export function migrateOpenCodeSessionToPi(
         throw new Error(`OpenCode database not found at ${opencodeDbPath}; nothing to migrate.`);
     }
 
-    // Cortexkit DB: when not provided explicitly, open the canonical
-    // shared DB read-write (we'll INSERT into compartments + session_facts).
-    // Pass null to skip the cortexkit copy entirely (legacy V1 behavior).
     let cortexkitDb: DatabaseLike | null;
     let ownsCortexkitDb = false;
     let cortexkitSchemaVersionBefore: number | null = null;
@@ -1384,10 +1264,9 @@ export function migrateOpenCodeSessionToPi(
         const outputDir = join(piSessionsRoot, projectPathToPiDirSlug(cwd));
         const targetHarness = opts.targetHarness ?? "pi";
 
-        // Journal-backed runs (real cortexkit DB, not a dry run) reconcile any
-        // interrupted attempts FIRST, then claim this migration's identity.
-        // The sweep runs by phase with no time thresholds; see
-        // sweepPendingMigrations for the reconciliation arms.
+        // Journal-backed runs reconcile interrupted attempts before claiming this migration's identity.
+        // Journal-backed runs reconcile interrupted attempts before claiming this migration's identity.
+        // The sweep reconciles each phase without time thresholds.
         const journalActive = cortexkitDb !== null && !opts.dryRun;
         let recovery: MigrationSweepReport | undefined;
         let migrationKey: string | undefined;
@@ -1410,9 +1289,7 @@ export function migrateOpenCodeSessionToPi(
                 targetHarness,
                 finalPathFor: (id) =>
                     join(outputDir, `${formatPiFilenameTimestamp(now)}_${id}.jsonl`),
-                // Sibling of the sessions root: outside any directory a harness
-                // scans for session files, on the same filesystem so the
-                // stage→final rename stays atomic.
+                // The migration stores staged files beside the sessions root so harness scans ignore them and stage-to-final renames stay atomic.
                 stageDir: join(dirname(piSessionsRoot), MIGRATION_STAGE_DIRNAME),
                 now: now.getTime(),
             });
@@ -1435,8 +1312,6 @@ export function migrateOpenCodeSessionToPi(
             modelId,
             piSessionId,
         });
-        // Copy magic-context durable state (compartments + facts) to the
-        // new Pi session_id when the cortexkit DB is reachable.
         let copyResult: CopyMagicContextStateResult = {
             compartmentsCopied: 0,
             factsCopied: 0,
@@ -1462,9 +1337,9 @@ export function migrateOpenCodeSessionToPi(
             copyResult.lastCompartmentEndPiEntryId,
         );
 
-        // Compartment ordinals are derived from the POST-INSERTION entry array
-        // (the compaction marker above has mutated it) in the runtime reader's
-        // ordinal basis, so what the DB stores is exactly what the Pi read path
+        // applyRuntimeOrdinals uses entries after insertCompactionMarker so DB ordinals match Pi runtime positions.
+        // The compaction marker changes entry positions before applyRuntimeOrdinals runs.
+        // The DB stores ordinals in the Pi runtime reader's basis.
         // will consume.
         if (plan) applyRuntimeOrdinals(plan.remappedCompartments, buildResult.entries);
 
@@ -1473,29 +1348,24 @@ export function migrateOpenCodeSessionToPi(
         if (!opts.dryRun) {
             if (journalActive && cortexkitDb !== null && migrationKey !== undefined && plan) {
                 const contentSha256 = createHash("sha256").update(jsonl, "utf8").digest("hex");
-                // (1) journal row committed at phase=staged with the checksum of
-                //     the bytes about to be staged (row + identity were claimed
-                //     before content build).
+                // commitStagedChecksum records the staged JSONL checksum while the journal phase is staged.
                 commitStagedChecksum(cortexkitDb, migrationKey, contentSha256);
-                // (2) stage the JSONL outside the sessions root.
+                // The staged JSONL remains outside the sessions root until finalization.
                 fs.writeFileAtomic(stagePath, jsonl);
-                // (3) shared-DB state transaction, advancing phase→db_committed
-                //     INSIDE the same transaction.
-                // (4) rename stage→final (same filesystem ⇒ atomic).
-                // A failure between (2) and (4) leaves a journal row the sweep
-                // reconciles by phase: staged rolls back (shared state provably
-                // absent), db_committed rolls forward. No same-run cleanup —
-                // one reconciliation code path for crashes and for retries.
+                // plan.commit advances the journal phase to db_committed in the shared-state transaction.
+                // stagePath and finalPath share a filesystem, so renameSync is atomic.
+                // If staging succeeds but finalization fails, the sweep reconciles the remaining journal row by phase.
+                // The sweep rolls back a staged row because shared state is absent.
+                // The sweep rolls forward a db_committed row.
+                // Crashes and retries use the same reconciliation path.
                 plan.commit(migrationKey);
                 fs.mkdirSync(dirname(finalPath), { recursive: true });
                 fs.renameSync(stagePath, finalPath);
-                // (5) delete the journal row.
                 stmt(cortexkitDb, "DELETE FROM migration_pending WHERE migration_key = ?").run(
                     migrationKey,
                 );
             } else {
-                // No journal (JSONL-only migration without a cortexkit DB):
-                // write the session file directly.
+                // Without a cortexkit DB, the migration writes JSONL directly without a journal.
                 fs.writeFileAtomic(finalPath, jsonl);
             }
         }
@@ -1503,13 +1373,9 @@ export function migrateOpenCodeSessionToPi(
         return {
             outputPath: finalPath,
             piSessionId,
-            // entries.length - 2 subtracts the leading "session" + "model_change"
-            // entries that every Pi JSONL file starts with. The result counts
-            // every USER-VISIBLE entry: boundary marker, all migrated message
-            // entries, and (when present) the trailing compaction marker. This
-            // matches what users see as "migrated entries" in CLI output.
-            // Audit tools sometimes flag this as off-by-N because they don't
-            // know which entries are structural — that's a false positive.
+            // Pi JSONL files begin with session and model_change entries, so messageCount excludes them.
+            // messageCount includes boundary markers and migrated message entries.
+            // messageCount includes a trailing compaction marker when present.
             messageCount: buildResult.entries.length - 2,
             byteCount: Buffer.byteLength(jsonl, "utf8"),
             sourceMessageCount,
@@ -1595,7 +1461,7 @@ export function printMigrateHelp(): void {
 `);
 }
 
-/** Human-readable summary lines for a recovery sweep (used by migrate + doctor). */
+/* */
 export function formatMigrationSweepLines(report: MigrationSweepReport): string[] {
     const lines: string[] = [];
     if (report.rolledForward > 0) {

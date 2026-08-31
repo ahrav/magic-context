@@ -117,7 +117,7 @@ describe("compartment state lease", () => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                // Ignore EBUSY on Windows
+                // Windows can report EBUSY while removing the temporary directory.
             }
         }
     });
@@ -153,7 +153,7 @@ describe("compartment state lease", () => {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
             } catch {
-                // Ignore EBUSY on Windows
+                // Windows can report EBUSY while removing the temporary directory.
             }
         }
     });

@@ -32,8 +32,8 @@ describe("iterateSyntheticDocuments", () => {
     });
 
     it("matches the pinned golden stream hash for the smoke descriptor", () => {
-        // The pinned hash detects changes to the generated stream itself,
-        // which same-process rerun comparisons cannot see.
+        // The pinned hash detects generated-stream changes.
+        // Same-process rerun comparisons cannot detect generated-stream changes.
         expect(syntheticStreamHash(profile())).toBe(
             "2a1ac6853363fdd069e34508c81e1ff3cd636b100ea67c90fe837cb44ac17d47",
         );
@@ -91,8 +91,7 @@ describe("iterateSyntheticDocuments", () => {
     });
 
     it("rejects a source distribution whose total weight overflows", () => {
-        // Each weight passes the positive-finite schema, but the sum is
-        // Infinity: every draw would silently land on the last source kind.
+        // Each weight is positive and finite, but their sum is Infinity.
         expect(() => [
             ...iterateSyntheticDocuments({
                 ...profile(),
@@ -119,8 +118,8 @@ describe("judged-loader separation", () => {
             grade: 2,
             provenance: { judge: "human", pooledFrom: ["manual"] },
         });
-        // The synthetic id is rejected as a dangling reference (it can never
-        // name a corpus document); a bare toThrow could pass for any reason.
+        // A synthetic ID cannot name a corpus document.
+        // A bare toThrow could accept an unrelated error.
         expect(() => validateRelease(corpus, judgments)).toThrow(/dangling/);
     });
 });

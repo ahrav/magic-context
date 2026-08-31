@@ -74,9 +74,6 @@ fn main() {
     let executable = std::env::current_exe().unwrap();
     let mut attempts = Vec::new();
     for scheduling in ["hot", "cold"] {
-        // Fallback records carry the same canonical schedule label as child
-        // measurements, so grouping by `scheduling` never splits an arm
-        // between the CLI token and the canonical name.
         let canonical_scheduling = scheduling_name(match scheduling {
             "hot" => SchedulingMode::HotPinnedPoll,
             _ => SchedulingMode::ColdParkWake,

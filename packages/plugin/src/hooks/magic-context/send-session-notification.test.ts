@@ -42,9 +42,8 @@ describe("sendIgnoredMessage", () => {
         }
     });
 
-    // A titled session whose last assistant turn used a specific provider/model/
-    // variant. `messages` feeds resolvePromptContext; `get` returns a real title
-    // so the post is not skipped.
+    // `messages` supplies the last assistant turn to `resolvePromptContext`.
+    // `get` supplies a title so `sendIgnoredMessage` does not skip the session.
     function titledClientWithLastTurn() {
         const prompt = mock(async () => ({}));
         const get = mock(async () => ({ title: "Real title" }));
@@ -156,9 +155,6 @@ describe("sendIgnoredMessage", () => {
     });
 
     it("pins the session's last turn for a startup config warning too (no pinContext opt-out)", async () => {
-        // The config warning previously opted out of pinning, which made OpenCode
-        // record the DEFAULT agent/model — mis-attributing the notice and
-        // switching the model on the user's next turn. It now pins like any other
         // notification.
         const session = titledClientWithLastTurn();
         const result = await sendIgnoredMessage({ session }, "ses-titled", "config warning", {});
@@ -181,7 +177,6 @@ describe("sendIgnoredMessage", () => {
         expect(body.agent).toBe("plan");
         expect(body.model).toEqual({ providerID: "openai", modelID: "gpt-5.5" });
         expect(body.variant).toBe("high");
-        // Fully supplied → no resolution needed.
         expect(session.messages).not.toHaveBeenCalled();
     });
 });

@@ -23,8 +23,6 @@ md5 = "0.7"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [features]
-# Public seed helpers for sibling crates' tests (mc-module composes over this store
-# and needs to populate it). Gated so the writers never ship in production builds.
 test-support = []
 
 [dev-dependencies]

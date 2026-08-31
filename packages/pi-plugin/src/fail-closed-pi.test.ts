@@ -103,14 +103,12 @@ describe("registerPiFailClosedSurface", () => {
 			},
 		});
 
-		// First context pass re-probes (pass count 1) and heals.
 		await expect(
 			fake.emit("context", { messages: [] }, {}),
 		).resolves.toBeUndefined();
 		expect(recovered).toBe(true);
 		expect(opens).toBe(1);
 
-		// Later passes stay quiet once recovered.
 		await expect(
 			fake.emit("context", { messages: [] }, {}),
 		).resolves.toBeUndefined();

@@ -85,7 +85,7 @@ function moduleArgs(db: Database, projectIdentity: string): ClassifyArgs {
     return args;
 }
 
-/** One `dreamer.run_task` classify payload as it reaches the module. */
+/** `CapturedCall` records one `dreamer.run_task` classify payload received by the module. */
 interface CapturedCall {
     promptBytes: number;
     timeoutMs: number | undefined;
@@ -98,8 +98,8 @@ interface CapturedCall {
     }>;
 }
 
-/** A module client that answers every chunk with the manifest shape
- *  `CLASSIFY_SYSTEM_PROMPT` demands, recording what the caller sent. */
+/** `CLASSIFY_SYSTEM_PROMPT` requires a `<classify>` manifest.
+ * */
 function capturingModuleClient(calls: CapturedCall[]): NonNullable<ClassifyArgs["moduleClient"]> {
     return {
         call: async ({ body, timeoutMs }) => {
@@ -137,8 +137,8 @@ function count(
     return (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
 }
 
-/** The current revision's stored policy decision: the maturity rung and the
- *  automatic-surface bit that gate injection. */
+/** The current revision stores the maturity rung and automatic-surface bit that gate injection.
+ * */
 function currentPolicy(
     db: Database,
     publicClaimId: string,
@@ -159,7 +159,7 @@ function currentPolicy(
     return { revision: claim.revision, ...row };
 }
 
-/** Public claim ids the automatic-injection surface would publish. */
+/** The automatic-injection surface publishes these public claim IDs. */
 function autoInjectIds(db: Database, projectIdentity: string): string[] {
     const [projectId] = resolveProjectIdsForIdentities(db, [projectIdentity]);
     if (projectId === undefined) return [];
@@ -294,10 +294,8 @@ describe("claim-native classification", () => {
     });
 });
 
-/** Classification only ever rewrites importance/scope/sharing, never the claim
- *  bytes. A revision carrying identical bytes keeps the evidence that supports
- *  them, so metadata upkeep cannot quietly demote a trusted memory off the
- *  automatic surfaces — nor promote model-authored bytes onto them. */
+/** Classification preserves claim bytes, so unchanged-content revisions retain prior evidence without granting automatic-surface eligibility to model-authored content.
+ * */
 describe("classification and claim trust", () => {
     test("metadata-only classification keeps a verified memory injectable", () => {
         const db = freshDb();
@@ -324,9 +322,7 @@ describe("classification and claim trust", () => {
             ).toEqual({ classified: 1, changed: 1 });
 
             // A new revision is minted, so the rung is re-derived from scratch.
-            // The carried explicit-user observation is what keeps it at VERIFIED;
-            // the revision's own origin stays honestly DREAMER_INFERENCE, which
-            // does not gate the automatic surfaces.
+            // Carried explicit-user evidence keeps the revision VERIFIED even though its DREAMER_INFERENCE origin does not gate automatic surfaces.
             expect(currentPolicy(db, publicClaimId)).toEqual({
                 revision: 2,
                 maturity: "VERIFIED",
@@ -335,9 +331,7 @@ describe("classification and claim trust", () => {
             });
             expect(autoInjectIds(db, projectIdentity)).toEqual([publicClaimId]);
 
-            // Both observations support the identical bytes, and because the
-            // dreamer re-states that same content they are not an independent
-            // pair — carrying evidence forward must not inflate corroboration.
+            // Identical user and Dreamer observations are not independent, so carried evidence does not increase corroboration.
             const evidence = db
                 .prepare(
                     `SELECT observations.source_trust_class AS trust
@@ -359,8 +353,8 @@ describe("classification and claim trust", () => {
         try {
             const projectIdentity = "git:classify-trust-trap";
             const publicClaimId = seedClaim(db, projectIdentity, 1);
-            // A content rewrite replaces the bytes the user asserted, so the
-            // explicit-user observation must NOT follow it.
+            // A content rewrite replaces the bytes the user asserted, so explicit-user observations must not follow it.
+            // `explicit_user` observations must not follow a content rewrite.
             reviseProjectMemoryClaim(
                 db,
                 { producer: "test", operationKey: "model-rewrite" },
@@ -397,9 +391,7 @@ describe("classification and claim trust", () => {
                 ),
             ).toEqual({ classified: 1, changed: 1 });
 
-            // Carrying the prior revision's evidence forward is safe: those
-            // observations are model inference, and the explicit-user standing
-            // was already severed by the rewrite.
+            // Prior evidence is carried only when it contains no explicit-user observation, which content rewrites sever.
             expect(currentPolicy(db, publicClaimId)).toEqual({
                 revision: 3,
                 maturity: "CANDIDATE",
@@ -413,9 +405,8 @@ describe("classification and claim trust", () => {
     });
 });
 
-/** `dreamer.run_task` rejects a classify payload whose `model_chain` is missing
- *  or empty, and the chain is the only path by which the dreamer-level default
- *  model reaches classify. */
+/** `dreamer.run_task` requires a nonempty `model_chain`; it is the only route for the Dreamer default model to reach classify.
+ * */
 describe("module-route classify model chain", () => {
     test("sends the resolved chain verbatim, including the dreamer-level default", async () => {
         const db = freshDb();
@@ -442,7 +433,7 @@ describe("module-route classify model chain", () => {
                     };
                 },
             };
-            // Exactly the production wiring: task override → dreamer default → fallbacks.
+            // Resolution checks the task override, then the Dreamer default, then fallbacks.
             args.modelChain = buildClassifyModelChain("prov/task", "prov/dreamer", [
                 "prov/fallback",
             ]);
@@ -473,7 +464,7 @@ describe("module-route classify model chain", () => {
                     return {};
                 },
             };
-            // Every model key unset or malformed resolves to an empty chain.
+            // Resolution returns an empty chain when every model key is unset or malformed.
             args.modelChain = buildClassifyModelChain(undefined, "flat-model", undefined);
             expect(args.modelChain).toEqual([]);
 
@@ -482,12 +473,10 @@ describe("module-route classify model chain", () => {
                 (caught: unknown) => caught,
             );
             expect((error as Error | null)?.message).toMatch(/no effective model chain/);
-            // Pre-flighted: no session is spawned and no module call is attempted.
+            // Validation returns before spawning a session or calling the module.
             expect(called).toBe(false);
-            // Permanent, not transient. It is thrown outside the per-chunk catch, so
-            // it is never wrapped in DreamerModuleFailureError (transient = true), and
-            // its wording avoids classifyFailure's transient vocabulary — the task
-            // advances to its next cron slot instead of hot-retrying a config error.
+            // The validation error is thrown outside the per-chunk catch, so `DreamerModuleFailureError` does not wrap it as transient.
+            // The task advances to its next cron slot instead of hot-retrying the configuration error.
             expect((error as { transient?: unknown } | null)?.transient).toBeUndefined();
             expect((error as Error | null)?.name).not.toBe("DreamerModuleFailureError");
             expect((error as Error | null)?.message ?? "").not.toMatch(
@@ -499,10 +488,9 @@ describe("module-route classify model chain", () => {
     });
 });
 
-/** The module route's request items, its manifest identities, the prompt byte
- *  cap, and the module-side deadline are one contract: the handler's request
- *  parser, its expected-id set, and its manifest validator all key on the
- *  claim's public id, and it refuses a prompt over the cap or a payload without
+/** The route requires request items, manifest identities, prompt limits, and deadlines.
+ * The request parser, expected-ID set, and manifest validator use the claim's public ID.
+ * The route rejects prompts over the byte cap and payloads without deadlines.
  *  a deadline. */
 describe("module-route classify wire contract", () => {
     test("a claim-identity payload round-trips and applies", async () => {
@@ -522,8 +510,8 @@ describe("module-route classify wire contract", () => {
 
             expect(result).toMatchObject({ classified: 10, remaining: 0, complete: true });
             expect(calls).toHaveLength(1);
-            // Every item is a claim identity: the opaque public id plus the
-            // revision binding, with no integer memory id anywhere.
+            // Each item uses the opaque public claim ID and its revision binding.
+            // The module contract exposes claims only by public ID.
             expect(new Set(calls[0]?.items.map((item) => item.public_claim_id))).toEqual(seeded);
             const byId = new Map(snapshots.map((claim) => [claim.publicClaimId, claim]));
             expect(
@@ -535,7 +523,6 @@ describe("module-route classify wire contract", () => {
                         !("memory_id" in item),
                 ),
             ).toBe(true);
-            // The `claim="mcm_..."` manifest was accepted and applied.
             for (const publicClaimId of seeded) {
                 expect(getProjectMemoryClaimByPublicId(db, publicClaimId)?.revision).toBe(2);
             }
@@ -561,7 +548,6 @@ describe("module-route classify wire contract", () => {
                         .join("");
                     return {
                         result: {
-                            // One claim nobody asked about rides along.
                             manifest_text: `<classify>${entries}<memory claim="mcm_${"9".repeat(32)}" importance="80"/></classify>`,
                         },
                     };
@@ -584,9 +570,8 @@ describe("module-route classify wire contract", () => {
         try {
             const projectIdentity = "git:classify-module-bytes";
             const seeded = new Set<string>();
-            // Ten entries stay under the 100-entry chunk bound, so only the
-            // byte bound can split them. Together they are ~400 KiB, well over
-            // the module's 256 KiB prompt_body cap.
+            // Ten entries are below the 100-entry chunk limit, so only the byte limit can split them.
+            // The ten entries exceed the module's 256 KiB `prompt_body` cap.
             for (let index = 0; index < 10; index += 1) {
                 seeded.add(
                     seedClaim(db, projectIdentity, index, `fact ${index} `.padEnd(40_000, "x")),
@@ -602,7 +587,7 @@ describe("module-route classify wire contract", () => {
             for (const call of calls) {
                 expect(call.promptBytes).toBeLessThanOrEqual(MAX_CLASSIFY_PROMPT_BYTES);
             }
-            // Splitting must not drop or duplicate work.
+            // Splitting emits each claim exactly once.
             const sent = calls.flatMap((call) => call.items.map((item) => item.public_claim_id));
             expect(new Set(sent)).toEqual(seeded);
             expect(sent).toHaveLength(seeded.size);
@@ -620,9 +605,9 @@ describe("module-route classify wire contract", () => {
             for (let index = 0; index < 9; index += 1) {
                 fitting.add(seedClaim(db, projectIdentity, index));
             }
-            // Larger than the whole pool byte budget, so no split can ever make
-            // it fit: a byte-aware chunker that only kept splitting would make
-            // no progress and this claim would never classify on any run.
+            // The claim exceeds the pool byte budget, so splitting cannot make it fit.
+            // Repeated byte-aware splitting would make no progress.
+            // Without progress, this claim would never classify on any run.
             const oversized = seedClaim(db, projectIdentity, 99, "big ".padEnd(200_000, "x"));
             const args = moduleArgs(db, projectIdentity);
             const calls: CapturedCall[] = [];
@@ -633,8 +618,8 @@ describe("module-route classify wire contract", () => {
             const sent = calls.flatMap((call) => call.items.map((item) => item.public_claim_id));
             expect(new Set(sent)).toEqual(fitting);
             expect(sent).not.toContain(oversized);
-            // The skip is durable evidence, not just a log line: a zero-effect
-            // rejection receipt names the claim, its size, and the budget.
+            // The skip writes a durable zero-effect rejection receipt instead of only a log line.
+            // The rejection receipt identifies the rejected claim and pool-budget violation.
             const receipts = db
                 .prepare(
                     `SELECT result_json AS resultJson FROM claim_operation_receipts
@@ -645,8 +630,8 @@ describe("module-route classify wire contract", () => {
             expect(reasons).toContain(oversized);
             expect(reasons).toMatch(/over the \d+-byte pool budget/);
             expect(getProjectMemoryClaimByPublicId(db, oversized)?.revision).toBe(1);
-            // The skipped claim is not counted as outstanding work, so the pass
-            // completes instead of hot-retrying a chunk that can never fit.
+            // The skipped claim is excluded from outstanding work.
+            // The rejection receipt completes the chunk instead of retrying a claim that cannot fit.
             expect(result).toMatchObject({ classified: 9, remaining: 0, complete: true });
         } finally {
             closeQuietly(db);
@@ -670,10 +655,7 @@ describe("module-route classify wire contract", () => {
             expect(typeof transportMs).toBe("number");
             expect(typeof payloadMs).toBe("number");
             expect(payloadMs as number).toBeGreaterThan(0);
-            // The gap is the module's cleanup reserve: without it the transport
-            // cancels first, between the producer run and `purge_session`, so
-            // nothing is recorded, no fallback completes, and the attempt's
-            // billable run stays alive.
+            // The cleanup reserve makes the module deadline 40,000 ms shorter than the transport budget.
             expect((transportMs as number) - (payloadMs as number)).toBe(40_000);
             expect(payloadMs as number).toBeLessThan(transportMs as number);
         } finally {
@@ -687,8 +669,8 @@ describe("module-route classify wire contract", () => {
             const projectIdentity = "git:classify-module-short-slice";
             for (let index = 0; index < 10; index += 1) seedClaim(db, projectIdentity, index);
             const args = moduleArgs(db, projectIdentity);
-            // Positive, so the pass starts, but under the cleanup reserve: a
-            // call here could only hand the module a non-positive deadline.
+            // The deadline is positive but below the cleanup reserve.
+            // Calling the module with a deadline below the cleanup reserve would provide a non-positive deadline.
             args.deadline = Date.now() + 5_000;
             const calls: CapturedCall[] = [];
             args.moduleClient = capturingModuleClient(calls);
@@ -696,8 +678,7 @@ describe("module-route classify wire contract", () => {
             const result = await runClassify(args);
 
             expect(calls).toHaveLength(0);
-            // The chunk stays unbanked and eligible on the next pass rather
-            // than being counted as done.
+            // The chunk remains eligible on the next pass instead of being counted as done.
             expect(result).toMatchObject({ classified: 0, remaining: 10, complete: false });
         } finally {
             closeQuietly(db);

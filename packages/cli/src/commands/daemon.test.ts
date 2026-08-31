@@ -161,7 +161,6 @@ describe("daemon command contract", () => {
         expect(h.stderr).toEqual([]);
         expect(h.stdout).toHaveLength(1);
         const rendered = h.stdout[0] ?? "";
-        // Human mode renders text, never the JSON object.
         expect(() => JSON.parse(rendered)).toThrow();
         expect(rendered).toContain("Daemon status: wedged (native_probe_unavailable)");
         expect(rendered).toContain("Remediation: run_daemon_restart");
@@ -355,9 +354,7 @@ describe("daemon command contract", () => {
             result(command, {
                 versions: {
                     release: "0.38.0",
-                    // A non-string value makes the redaction chain throw for
-                    // this entry; the command must substitute a placeholder
-                    // and still emit one complete v1 object.
+                    // A non-string version value must produce a placeholder without aborting the v1 response.
                     proof: 10n as unknown as string,
                     daemon: "mc-host/0.1.0",
                     magic_context: null,
@@ -380,8 +377,7 @@ describe("daemon command contract", () => {
     test("rendering failures produce bounded stderr without a partial v1 object", async () => {
         const h = harness((command) =>
             result(command, {
-                // A BigInt outside the redacted versions block makes
-                // JSON.stringify throw, exercising the guarded render region.
+                // A BigInt outside `versions` prevents JSON rendering.
                 checks: [10n] as unknown as DaemonResultV1["checks"],
             }),
         );

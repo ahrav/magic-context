@@ -1,16 +1,10 @@
 /**
- * Load the shared SQLite selector before importing doctor implementations.
  *
- * The selector uses top-level dynamic import so plugin startup still fails fast
- * when neither supported backend exists. The CLI must probe it separately:
- * otherwise importing a doctor module would throw before doctor can print the
  * compatibility diagnosis.
  */
 export type SqliteProbe = () => Promise<unknown>;
 
 export async function probeSqliteBackend(): Promise<void> {
-    // Keep this specifier literal so the published single-file CLI bundle
-    // includes the selector instead of leaving an unresolved package import.
     await import("@magic-context/core/shared/sqlite");
 }
 

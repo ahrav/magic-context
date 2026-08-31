@@ -1,4 +1,3 @@
-//! Deterministic caveman-style text compression.
 //!
 //! Two artifacts define the byte-level output contract: the committed
 //! differential fixture (`testdata/caveman-golden.json`) and the naive
@@ -813,7 +812,6 @@ fn normalize_whitespace(text: &str) -> String {
     output
 }
 
-/// Compress `text` using the same deterministic rules as the TypeScript oracle.
 pub fn compress(text: &str, level: CavemanLevel) -> String {
     if text.is_empty() {
         return text.to_string();

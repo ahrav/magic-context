@@ -7,31 +7,19 @@ import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 import { isHistorianRequest } from "../src/cache-analysis";
 
 /**
- * Historian publishes a compartment end-to-end.
  *
- * This test drives:
- *   - 11 user turns, each with meaningful text
- *   - Turn 11 carries 90K tokens to cross the 40% execute threshold AND
- *     make the tail eligible (>=12 messages)
- *   - Mock historian returns a VALID response matching the chunk
+ * Turn 11 contains 90K tokens to exceed the 40% execution threshold.
+ * The 90K-token turn makes the tail eligible at 12 messages.
  *
  * Assertions:
- *   - At least one historian request was issued
- *   - The compartments table has a row after historian finishes
- *   - session_meta.compartment_in_progress is cleared
  *
- * This verifies the full write path: event-handler trigger → transform starts
- * historian → historian runs → response is validated → compartment is
- * persisted → in-progress flag is cleared.
  */
 
 /** Extract the message ordinals historian was asked to process from the body. */
 function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
     const messages = body.messages as Array<{ role: string; content: unknown }> | undefined;
     if (!messages) return null;
-    // Historian prompt is sent as a single user message whose content holds
-    // the <new_messages> block with lines like "[3] U: ...". Extract all
-    // bracketed ordinals and return min/max.
+    // Historian sends one user message containing `[n]` lines in `<new_messages>`.
     for (const m of messages) {
         const contentArr = Array.isArray(m.content) ? m.content : [];
         for (const block of contentArr) {
@@ -67,14 +55,11 @@ describe("historian success path", () => {
         async () => {
             h.mock.reset();
 
-            // Dynamic historian response: parse the request to find the
-            // actual ordinal range and return a compartment covering it.
+            // The mock derives compartment bounds from the historian request because the ordinal range varies.
             h.mock.addMatcher((body) => {
                 if (!isHistorianRequest(body)) return null;
                 const range = findOrdinalRange(body);
                 if (!range) {
-                    // Shouldn't happen in practice, but fall back to a safe
-                    // zero-compartment empty response.
                     return {
                         text: "<output><compartments></compartments><facts></facts><unprocessed_from>1</unprocessed_from></output>",
                         usage: {
@@ -114,10 +99,8 @@ describe("historian success path", () => {
 
             const sessionId = await h.createSession();
 
-            // Each build turn carries ~3K tokens of REAL text ballast: the v3
-            // protected-tail boundary measures true-raw content, not the
-            // mock's fabricated usage numbers — without content mass the
-            // boundary finds no eligible head and the historian (correctly)
+            // The protected-tail boundary uses raw content rather than mock usage, so each turn includes about 3K tokens of ballast.
+            // The protected-tail boundary uses raw content rather than mock usage.
             // never starts.
             for (let i = 1; i <= 10; i++) {
                 await h.sendPrompt(
@@ -138,9 +121,8 @@ describe("historian success path", () => {
             });
             await h.sendPrompt(sessionId, "turn 11: trigger turn with real content.");
 
-            // Reset to small responses so subsequent turns don't keep piling
-            // on pressure. The 90K spike on turn 11 set compartment_in_progress;
-            // historian actually STARTS on the next transform pass, which we
+            // Small responses keep later turns below the execution threshold.
+            // Historian starts on the next transform pass after turn 11 sets compartment_in_progress.
             // provide below.
             h.mock.setDefault({
                 text: "after-trigger",
@@ -151,37 +133,22 @@ describe("historian success path", () => {
                     cache_read_input_tokens: 500,
                 },
             });
-            // Turn 12: gives the transform a fresh pass to actually start
-            // historian after the event handler flipped compartment_in_progress.
-            // Historian was previously kicked off implicitly by the 80%
-            // emergency nudge's promptAsync call; since that path was removed
-            // in v0.14.1, tests need to provide the follow-up turn explicitly.
+            // Send turn 12 because the historian starts on the pass after `compartment_in_progress` is set.
             await h.sendPrompt(sessionId, "turn 12: post-trigger follow-up.");
 
-            // The main-agent requests and trigger setup are fold-independent. In
-            // Rust mode the producer runs outside this mock, so completion belongs
-            // to rust-historian-producer.test.ts rather than this mock-capture test.
+            // In Rust mode, `rust-historian-producer.test.ts` covers producer completion because the producer runs outside this mock.
             const mainRequests = h.mock.requests().filter((request) => !isHistorianRequest(request.body));
             expect(mainRequests.length).toBeGreaterThanOrEqual(12);
             if (process.env.MC_E2E_MODE === "rust") {
-                // The hermetic producer bypasses this OpenCode model mock; report
-                // that this mock-capture assertion is intentionally not applicable.
+                // The hermetic producer bypasses this OpenCode model mock in Rust mode.
                 console.log(`[rust-e2e] historian publication assertions SKIPPED: ${FOLD_SKIP_REASON}`);
                 return;
             }
 
-            // Wait for the historian run to REACH ITS TERMINAL STATE: at least
-            // one compartment published AND compartment_in_progress cleared.
-            // These are NOT simultaneous — the compartment row is COMMITted
-            // (compartment-runner-incremental.ts BEGIN IMMEDIATE..COMMIT) well
-            // before the flag clears at the end of the same async run, with an
-            // `await ensureProjectRegistered` + embedding/signal/marker work in
-            // between. Waiting only on the compartment count (the old check)
-            // raced that window: on a slower runner the row exists while the
-            // flag is still 1. The flag always ends at 0 on a finished run
-            // (success path clears it; any throw clears it via the runner's
-            // catch), so the terminal invariant is "compartment present AND flag
-            // cleared". Wait for both.
+            // The compartment row commits before `compartment_in_progress` clears.
+            // `ensureProjectRegistered`, embedding, signaling, and marker work run before the flag clears.
+            // Waiting only for the compartment count can observe a committed row while `compartment_in_progress` is 1.
+            // A finished historian run leaves `compartment_in_progress` at 0.
             await h.waitFor(
                 () => {
                     const row = h

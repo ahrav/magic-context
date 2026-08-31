@@ -43,30 +43,19 @@ function warn(message: string): void {
 /**
  * Auto-update checker.
  *
- * Trigger model (rewritten in v0.17.1):
  *
- * The check fires from plugin initialization itself via a `setTimeout`
- * scheduled when this hook is created. We do NOT gate on
- * `session.created` events — that gate was unreliable because:
+ * The checker must not gate update checks on `session.created`.
  *
  *   - TUI restart with a resumed session never fires `session.created`
  *     (the event fires on session creation, not on plugin reload).
- *   - Multi-project plugin reloads each get their own plugin lifetime
- *     with `hasChecked = false`, so only whichever project happens to
- *     create a fresh session first ever runs the check.
- *   - Sidebar/status polling and idle TUI use also never fire
+ * Sidebar polling and idle TUI use do not emit `session.created`.
  *     `session.created`.
  *
- * Multi-project coordination is now handled by an on-disk timestamp at
- * `<storageDir>/last-update-check.json`. Every plugin instance reads
- * the timestamp before checking; if it's within `checkIntervalMs` of
- * now, the check is skipped. The first instance to claim the slot
- * writes the timestamp atomically (temp + rename) so concurrent
- * instances don't all hit npm.
+ * The timestamp suppresses checks from plugin instances that share `storageDir`.
+ * The checker skips the check when the timestamp is less than `checkIntervalMs` old.
+ * A caller that claims the slot performs the check.
+ * The timestamp write uses a temporary file and rename to avoid partial timestamp files.
  *
- * The returned event hook is preserved as a no-op so existing tests
- * that pass synthetic events keep working — the hook itself never
- * triggers a check now.
  */
 export function createAutoUpdateCheckerHook(
     ctx: PluginInput,
@@ -85,16 +74,15 @@ export function createAutoUpdateCheckerHook(
     } = options;
 
     if (!enabled) {
-        // Disabled — never check. Preserve the event-hook signature so
-        // existing wiring keeps working without breakage.
+        // The disabled checker returns a no-op event hook to preserve the hook API.
         return async (_input: { event: OpenCodeEvent }) => {
             // intentionally empty
         };
     }
 
-    // Schedule the check on plugin init, not on any event. The setTimeout
-    // intentionally returns control to OpenCode immediately so plugin init
-    // never blocks on the npm round-trip.
+    // The checker schedules the check from plugin initialization rather than an event.
+    // The timer returns control to OpenCode before the npm request starts.
+    // The deferred `maybeRunCheck` call never blocks plugin initialization on the npm request.
     const initTimer = setTimeout(() => {
         void maybeRunCheck(ctx, {
             showStartupToast,
@@ -110,12 +98,12 @@ export function createAutoUpdateCheckerHook(
         });
     }, initDelayMs);
 
-    // Don't keep the Node event loop alive just for this timer.
+    // Calling `unref()` prevents the timer from keeping the Node event loop alive.
     if (typeof initTimer === "object" && initTimer !== null && "unref" in initTimer) {
         (initTimer as { unref: () => void }).unref();
     }
 
-    // Cancel the pending check if the host aborts (plugin shutdown).
+    // `signal` abort prevents a scheduled check that has not started.
     signal.addEventListener(
         "abort",
         () => {
@@ -124,9 +112,7 @@ export function createAutoUpdateCheckerHook(
         { once: true },
     );
 
-    // Event hook is now a no-op. Kept for API/test compatibility.
     return async (_input: { event: OpenCodeEvent }) => {
-        // intentionally empty — see hook comment
     };
 }
 
@@ -136,8 +122,8 @@ async function maybeRunCheck(
 ): Promise<void> {
     if (options.signal.aborted) return;
 
-    // Honor the cross-process dedup window first. If another plugin
-    // instance recently checked, skip silently.
+    // `maybeRunCheck` checks the cross-process deduplication window before contacting npm.
+    // `maybeRunCheck` skips the npm request when another plugin instance checked within the deduplication window.
     if (!claimCheckSlot(options.storageDir, options.checkIntervalMs)) {
         log("[auto-update-checker] Skipping check (another instance ran one recently)");
         return;
@@ -147,19 +133,15 @@ async function maybeRunCheck(
 }
 
 /**
- * Try to claim the next check slot via the on-disk timestamp file.
+ * `claimCheckSlot` uses the on-disk timestamp file to claim the next check slot.
  *
- * Returns true if this caller should run the check. Returns false if
- * another instance already claimed the slot inside `intervalMs` of now,
- * or if the storage directory isn't usable (we fail open in that case
- * by returning true — the worst outcome is a duplicate npm hit, not a
+ * `claimCheckSlot` returns false when the timestamp age is less than `intervalMs`.
+ * Storage errors return true, allowing the check to proceed.
  * missed check).
  *
- * Race semantics: read → check window → write. With concurrent plugin
- * inits, two callers can race here and both pass the window check before
- * either writes. That's tolerable: at worst we hit npm twice in one
- * launch. The atomic temp+rename write ensures the file is always
- * fully-formed JSON for the next read, even mid-race.
+ * `claimCheckSlot` is not atomic: concurrent initializations can both pass the window check.
+ * Two concurrent callers can trigger two npm requests.
+ * The atomic temp-file rename keeps the timestamp valid JSON even when concurrent writers race.
  */
 function claimCheckSlot(storageDir: string | null, intervalMs: number): boolean {
     if (!storageDir) return true; // No storage available — fail open.
@@ -175,7 +157,6 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): boolean 
                     return false;
                 }
             } catch {
-                // Corrupt timestamp file — overwrite it below.
             }
         }
         mkdirSync(dirname(file), { recursive: true });
@@ -247,7 +228,6 @@ function consumePendingUpdateMarker(storageDir: string | null, loadedVersion: st
         try {
             rmSync(path, { force: true });
         } catch {
-            // Best-effort cleanup of an invalid bookkeeping marker.
         }
         warn(`[auto-update-checker] Discarded corrupt pending update marker: ${String(err)}`);
     }

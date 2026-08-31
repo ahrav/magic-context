@@ -1,13 +1,11 @@
 /**
- * Shared public shapes for the mc-host consumer client.
  *
- * Leaf module: imports nothing from connection or facade code. Wire semantics
- * come from `docs/mc-host-wire-protocol.md`.
+ * The wire-protocol definitions come from `docs/mc-host-wire-protocol.md`.
  */
 
 /**
- * Route identity supplied by the caller on `route.open`. Scoping metadata
- * only; it grants no authority (wire doc Section 2).
+ * The caller supplies this route identity on `route.open`.
+ * `BindIdentity` only scopes routes; it grants no authority.
  */
 export interface BindIdentity {
     project_root: string;
@@ -16,24 +14,23 @@ export interface BindIdentity {
     credential_fingerprints?: Readonly<Record<string, string>>;
 }
 
-/** Serde-compatible route target (`tag = "kind"`, snake_case). */
+/** `RouteTarget` serializes with `kind` as its snake_case tag. */
 export type RouteTarget =
     | { kind: "tool_provider"; module_id: string }
     | { kind: "management_surface"; module_id: string }
     | { kind: "internal_service"; module_id: string; service_id: string };
 
-/** Target kinds the managed `call()` path can open. */
+/* */
 export type ManagedRouteKind = "management_surface" | "tool_provider";
 
-/** Optional supervised-launch claim sent with `route.open`. */
+/* */
 export interface ConsumerIdentity {
     module_id: string;
     launch_nonce: string;
 }
 
 /**
- * One entry of a tagged `catalog.list` response. Consumers read `control_ops`
- * fail-open: only an affirmative capability entry changes behavior.
+ * `CatalogEntry` represents one tagged `catalog.list` response entry.
  */
 export interface CatalogEntry {
     module_id: string;
@@ -92,13 +89,12 @@ export interface SharedMemoryDiagnostics {
 }
 
 /**
- * AuthenticatedPeer retains handshake-authenticated identity separately from
- * untrusted connection-file `daemon_ver` and `pid` metadata.
+ * `AuthenticatedPeer` retains handshake-authenticated identity separately from connection-file metadata.
+ * Connection-file `daemon_ver` and `pid` are untrusted metadata.
  *
- * The daemon id is non-null by construction: it is the fencing identity every
- * consumer authorizes against, so a connection whose handshake produced no
- * daemon id has no authenticated peer at all and `McHostClient.authenticated`
- * reports null instead of a partial record.
+ * `daemonId` is non-null because every consumer authorizes against it as a fencing identity.
+ * A connection whose handshake produces no daemon ID has no authenticated peer.
+ * `McHostClient.authenticated` reports null instead of a partial record when the handshake produces no daemon ID.
  */
 export interface AuthenticatedPeer {
     daemonVer: string;
@@ -107,9 +103,6 @@ export interface AuthenticatedPeer {
 }
 
 /**
- * Single owner of the daemon-incarnation equality predicate every fence uses.
- * Absent bytes on either side are never equal, so a caller that cannot name an
- * identity cannot accidentally satisfy the comparison.
  */
 export function sameDaemonId(
     left: Uint8Array | null | undefined,
@@ -126,8 +119,7 @@ export interface PublicationDiagnostics {
 }
 
 /**
- * Scheduling priority carried in flags bits 1-2. Runtime const object plus a
- * union type (never a TypeScript enum) so bundled Node/Bun loading needs no
+ * `Priority` uses flags bits 1–2.
  * enum transform.
  */
 export const Priority = {
@@ -137,7 +129,7 @@ export const Priority = {
 } as const;
 export type Priority = (typeof Priority)[keyof typeof Priority];
 
-/** Admission behavior carried in flags bits 4-5. */
+/** `AdmissionClass` uses flags bits 4–5. */
 export const AdmissionClass = {
     Normal: 0,
     Expedite: 1,
@@ -145,33 +137,33 @@ export const AdmissionClass = {
 } as const;
 export type AdmissionClass = (typeof AdmissionClass)[keyof typeof AdmissionClass];
 
-/** Options for `McHostClient.connect()` as used by current repo consumers. */
+/* */
 export interface ConnectOptions {
     connectionFile: string;
     handshakeTimeoutMs?: number;
-    /** Default route identity used by managed `call()`; overridable per call. */
+    /** `ConnectOptions.identity` supplies the default identity for managed `call()` and permits per-call overrides. */
     identity?: BindIdentity;
-    /** Default managed route target kind; defaults to `management_surface`. */
+    /** `ConnectOptions.targetKind` defaults to `management_surface`. */
     targetKind?: ManagedRouteKind;
-    /** Current provider rows; only connection-keyed fingerprints leave the client. */
+    /** `credentialSource` contains current provider rows; only connection-keyed fingerprints leave the client. */
     credentialSource?: Record<string, string | undefined>;
 }
 
-/** Per-request options for the raw routed `request()` path. */
+/* */
 export interface RequestOptions {
     priority?: Priority;
     admissionClass?: AdmissionClass;
     timeoutMs?: number;
     /** The facade attaches `McHostCallError.cleanup` when this signal aborts the request. */
     signal?: AbortSignal;
-    /** Reject before publication unless the active authenticated generation has this daemon ID. */
+    /** When `expectedDaemonId` is set, the client rejects before publication unless it matches the active authenticated daemon ID. */
     expectedDaemonId?: Uint8Array;
 }
 
-/** Options for the managed `call()` path (embedding-synapse usage). */
+/* */
 export interface ManagedCallOptions extends RequestOptions {
-    /** Overrides the per-client identity used for route.open before this call. */
+    /** `ManagedCallOptions.identity` overrides the per-client identity for this `route.open` call. */
     identity?: BindIdentity;
-    /** Defaults to `management_surface`. */
+    /** `ManagedCallOptions.targetKind` defaults to `management_surface`. */
     targetKind?: ManagedRouteKind;
 }

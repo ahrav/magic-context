@@ -1,13 +1,8 @@
 /**
- * Content-addressed canonical relevance identities and scoped alias
- * resolution (KTD3, R41).
+ * Aliases resolve to canonical relevance identities within project and session scopes.
  *
- * Relevance truth follows the immutable semantic payload, not the storage
- * row: `relevance:v1:<sha256(projection)>`. Physical locators — current
- * production strings, characterization-test spellings, and future
- * claim/revision/retrieval-document locators — are aliases that resolve onto
- * one canonical identity, and only the first ranked occurrence of an
- * identity earns metric credit.
+ * The canonical identity depends on `semanticPayload`, not document storage fields.
+ * Only the highest-ranked occurrence of each canonical identity earns metric credit.
  */
 
 import {
@@ -19,7 +14,7 @@ import type { CorpusDocument } from "./contract";
 
 export const RELEVANCE_PROJECTION_VERSION = "relevance-payload/v1";
 
-/** Derive the canonical relevance identity for a semantic payload. */
+/* */
 export function relevanceIdentity(semanticPayload: unknown): string {
     return `relevance:v1:${canonicalFingerprint({
         projection: RELEVANCE_PROJECTION_VERSION,
@@ -27,10 +22,8 @@ export function relevanceIdentity(semanticPayload: unknown): string {
     })}`;
 }
 
-/** Benchmark-only namespace spellings (characterization tests, simulated
- *  post-migration locators). Production spellings are NOT listed here — they
- *  come straight from `PHYSICAL_LOCATOR_KINDS`, so a production prefix change
- *  propagates into the dialect table instead of silently diverging. */
+/**
+ * Changes to `PHYSICAL_LOCATOR_KINDS` also update `NAMESPACE_DIALECTS`. */
 const BENCHMARK_DIALECTS: Record<string, string> = {
     compartment: "chunk",
     git_commit: "commit",
@@ -39,9 +32,7 @@ const BENCHMARK_DIALECTS: Record<string, string> = {
     "retrieval-document": "retrieval-document",
 };
 
-/** Locator-namespace spellings that name the same physical store. Keys are
- *  accepted dialects (production, characterization tests, future migration);
- *  values canonicalize dialect-specific namespace spellings.
+/** `NAMESPACE_DIALECTS` treats each key and its value as names for the same physical store.
  *  `dialectNamespace` uses `Object.hasOwn` to reject prototype-named inputs
  *  (`constructor`, `toString`). */
 const NAMESPACE_DIALECTS: Record<string, string> = {
@@ -49,10 +40,8 @@ const NAMESPACE_DIALECTS: Record<string, string> = {
     ...BENCHMARK_DIALECTS,
 };
 
-/** Canonicalize a dialect namespace spelling, or null for unknown ones.
- *  Exported so contract validation shadows aliases with the SAME
- *  canonicalization the resolver applies (compartment and chunk are one
- *  namespace, not two). */
+/**
+ * */
 export function dialectNamespace(raw: string): string | null {
     return Object.hasOwn(NAMESPACE_DIALECTS, raw) ? NAMESPACE_DIALECTS[raw] : null;
 }
@@ -67,17 +56,16 @@ function aliasKey(namespace: string, locator: string, scope: ScenarioScope): str
 }
 
 export interface AliasIndex {
-    /** aliasKey -> document. */
+    /* */
     byAlias: Map<string, { documentId: string; canonicalId: string }>;
-    /** documentId -> canonical relevance identity. */
+    /* */
     canonicalByDocument: Map<string, string>;
 }
 
 export class AliasIndexError extends Error {}
 
 /**
- * Build the scoped alias index for a corpus. Each (namespace, locator,
- * project scope, session scope) tuple must map to exactly one document.
+ * Each `(namespace, locator, projectScope, sessionScope)` tuple must map to exactly one document.
  */
 export function buildAliasIndex(documents: readonly CorpusDocument[]): AliasIndex {
     const byAlias = new Map<string, { documentId: string; canonicalId: string }>();
@@ -112,13 +100,9 @@ export type ResolvedRankedResult =
     | { status: "unresolved"; rank: number; reason: "malformed" | "unknown-alias" };
 
 /**
- * Resolve a ranked physical result list against the alias index under one
- * scenario scope. Session-scoped aliases are tried first, then the
- * project-only scope, so a chunk alias bound to its session does not leak
- * across sessions. Later occurrences of an already-credited canonical
- * identity come back as `duplicate` (AE5: aliases earn credit once).
- * `rank` is ONE-based, matching IR metric conventions: reciprocal rank and
- * nDCG discounts consume it directly without an off-by-one adjustment.
+ * The resolver applies aliases only within the supplied `ScenarioScope`.
+ * Later occurrences of a credited canonical identity return `duplicate`.
+ * IR metrics consume one-based `rank` values directly, so they need no off-by-one adjustment.
  */
 export function resolveRankedLocators(
     ranked: readonly string[],
@@ -128,8 +112,6 @@ export function resolveRankedLocators(
     const seen = new Set<string>();
     return ranked.map((raw, position) => {
         const rank = position + 1;
-        // Production spellings go through the frozen production parser;
-        // benchmark-only dialect spellings fall back to the dialect table.
         const parsed = parsePhysicalResultLocator(raw);
         let namespace: string;
         let locator: string;

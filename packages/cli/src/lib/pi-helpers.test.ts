@@ -72,9 +72,6 @@ describe("parseModelListOutput", () => {
 });
 
 describe("Pi command execution", () => {
-    // Spawns three real subprocesses; under heavy machine load (parallel release
-    // gates) the default 5s test timeout produced false reds. The subprocesses
-    // are trivial shell scripts, so a generous ceiling costs nothing when idle.
     it("routes cmd shims through ComSpec and parses their output", () => {
         const root = mkdtempSync(join(tmpdir(), "mc-pi-command-"));
         tempDirs.push(root);

@@ -2,15 +2,9 @@ import { chmodSync, mkdirSync, renameSync, statSync, writeFileSync } from "node:
 import { dirname } from "node:path";
 
 /**
- * Write a file atomically: temp sibling + rename. Preserves prior mode when the
- * target already exists so user chmod settings survive doctor/setup rewrites.
+ * When targetPath names a file and chmodSync succeeds, writeFileAtomic copies its 0o777 permission bits to tmpPath.
  *
- * Ensures the parent directory exists first: the temp-sibling write (and rename)
- * both fail with ENOENT if the directory is missing. This matters for the
- * CortexKit config location (~/.config/cortexkit/, <project>/.cortexkit/), which
- * does not pre-exist on a fresh machine — so the very first setup must create it.
- * Doing it here kills the whole missing-parent class for every caller rather than
- * relying on each call site to remember an ensureDir.
+ * Callers need not create the parent directory.
  */
 export function writeFileAtomic(targetPath: string, data: string): void {
     mkdirSync(dirname(targetPath), { recursive: true });
@@ -22,7 +16,7 @@ export function writeFileAtomic(targetPath: string, data: string): void {
             chmodSync(tmpPath, mode);
         }
     } catch {
-        // New file — default umask applies.
+        // If statSync or chmodSync throws, writeFileAtomic still attempts renameSync(tmpPath, targetPath).
     }
     renameSync(tmpPath, targetPath);
 }

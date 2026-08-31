@@ -9,10 +9,8 @@ export interface RegisterCtxEnforceDeps {
 	db: ContextDatabase;
 	projectDir: string;
 	projectIdentity: string;
-	/** Resolve the project for the invoking context: Pi can `/cd` between
-	 * projects after boot, so enforcement must target the ACTIVE project (and
-	 * evaluate artifacts under its filesystem root), not the
-	 * registration-time one. Absent resolver falls back to boot values. */
+	/**
+	 * */
 	resolveProject?: (ctx: { cwd: string }) => {
 		projectDir: string;
 		projectIdentity: string;

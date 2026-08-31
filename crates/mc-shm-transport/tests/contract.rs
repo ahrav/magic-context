@@ -461,9 +461,7 @@ fn released_admissions_recompute_active_span_charge() {
         pinned_workers: 0,
     }));
 
-    // The active span charge is the maximum over live admissions: it drops
-    // to the widest survivor on release and reaches zero only once every
-    // admission is gone.
+    // The active span charge equals the maximum among live admissions.
     let wide_admission = controller.admit(&wide, None).unwrap();
     let narrow_admission = controller.admit(&narrow, None).unwrap();
     assert_eq!(controller.snapshot().unwrap().active.spans_per_frame, 2);
@@ -472,7 +470,7 @@ fn released_admissions_recompute_active_span_charge() {
     drop(narrow_admission);
     assert_eq!(controller.snapshot().unwrap().active.spans_per_frame, 0);
 
-    // Quarantine moves the span charge out of the active maximum too.
+    // Quarantine removes the span charge from the active maximum.
     let wide_admission = controller.admit(&wide, None).unwrap();
     let _quarantine = wide_admission.quarantine().unwrap();
     let snapshot = controller.snapshot().unwrap();
@@ -576,8 +574,7 @@ fn sample_prefix_rejects_every_truncation_point_and_bounds_the_body() {
         );
     }
 
-    // Documented capacity slack: extra allocation bytes are legal but stay
-    // outside the validated body range.
+    // Extra allocation bytes are legal but lie outside the validated body range.
     let mut slack = payload.clone();
     slack.extend_from_slice(&[0xEE; 7]);
     let validated = SamplePrefix::snapshot(&slack)
@@ -680,8 +677,8 @@ fn sample_prefix_rejects_identity_schema_length_and_wire_failures() {
         );
     }
 
-    // An excessive declared body beyond the allocation is rejected even when
-    // it stays under the frame maximum.
+    // An excessive declared body beyond the allocation is rejected.
+    // Debug and error output must not expose sentinel values.
     let excessive = sample_payload(
         DESCRIPTOR_SCHEMA_VERSION,
         header(1024),
@@ -765,8 +762,8 @@ fn harness_replays_terminate_on_arbitrary_lengths() {
 
 #[test]
 fn sample_errors_redact_every_sentinel() {
-    // Provider-controlled bytes spell the sentinel across the wire header,
-    // incarnation, and body fields.
+    // Debug and error output must not expose sentinel values.
+    // Debug and error output must not expose sentinel values.
     let sentinel = b"SENTINEL";
     let mut wire = [0u8; WIRE_V2_HEADER_BYTES];
     wire[..sentinel.len()].copy_from_slice(sentinel);

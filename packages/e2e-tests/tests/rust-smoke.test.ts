@@ -22,8 +22,6 @@ describe.skipIf(!prereqs.ok)("rust-mode lane smoke", () => {
     it("boots Rust mode and transforms a real session through McHostModuleTransport", async () => {
         const sessionId = await h.createSession();
 
-        // A handful of small turns — enough for the Rust transform to run and
-        // emit its per-pass decision log without approaching any threshold.
         for (let i = 1; i <= 3; i += 1) {
             h.mock.setDefault({
                 text: `assistant ${i}`,
@@ -32,12 +30,8 @@ describe.skipIf(!prereqs.ok)("rust-mode lane smoke", () => {
             await h.sendPrompt(sessionId, `turn ${i}: ${h.ballast(400)}`);
         }
 
-        // Primary signal: the plugin actually issued requests to the provider.
         expect(h.mainRequests().length).toBeGreaterThanOrEqual(3);
 
-        // Secondary signal: the RUST transform ran (not the TS pipeline). The
-        // rust-pass diagnostic line is emitted only by createRustModeTransform,
-        // so its presence proves the plugin routed through the module.
         const passes = await h.waitFor(
             () => {
                 const p = h.readRustPasses();
@@ -47,13 +41,9 @@ describe.skipIf(!prereqs.ok)("rust-mode lane smoke", () => {
         );
         expect(passes.length).toBeGreaterThan(0);
 
-        // The module served real bytes on at least one pass (transform, not a
-        // parked raw pass-through). served_from=transform is the module's own
-        // verdict that it produced the wire.
         const served = h.readRustPasses().filter((p) => p.servedFrom === "transform");
         expect(served.length).toBeGreaterThan(0);
 
-        // No permanent park: the lane never reported a parked decision on a
         // healthy module.
         expect(h.readRustPasses().every((p) => p.decision !== "parked")).toBe(true);
     }, 300_000);

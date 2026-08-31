@@ -160,8 +160,7 @@ async function resolveCombinedTodowriteVerdict(
             );
             setPersistedTodoPermissionDenied(deps.db, sessionId, permissionDenied);
         } catch (error) {
-            // A failed SDK read cannot turn a prior denial into an allow. Keep the last
-            // in-memory or durable verdict until a later pass obtains authoritative data.
+            // A failed SDK read leaves the last in-memory or durable verdict unchanged until a later read obtains authoritative data.
             sessionLog(
                 sessionId,
                 "todowrite permission read failed; retaining the last successful verdict:",
@@ -187,7 +186,7 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
     authorityStatus?(args: {
         context_store_uuid: string;
         project: string;
-        /** Bound route root for this authority query. */
+        /** `projectRoot` is the bound route root for this authority query. */
         projectRoot?: string;
         domain: "memories" | "notes";
     }): Promise<{ authority: AuthorityStatus | null }>;
@@ -264,16 +263,16 @@ interface RustWireCache {
     rawLastId: string | null;
     rawLastSignature: string | null;
     rawLastVisible: boolean;
-    /** Content-sensitive per-message snapshots for the whole raw array. Delta passes
-     * re-verify every reused message so in-place edits cannot ride a stale prefix. */
+    /** `inputSnapshots` stores content-sensitive snapshots for every raw message.
+     * Each pass re-verifies reused messages so in-place edits cannot reuse a stale prefix. */
     rawContentSnapshots: MessageContentSnapshot[];
     ckFingerprint: string;
     ckPrefixFingerprintBeforeLast: string;
     nativeFingerprint: string;
     nativePrefixFingerprintBeforeLast: string;
     fingerprint: string;
-    /** Previous acknowledged module output. The array is reused by reference and supplies the
-     * prefix for a validated native-output delta; eviction falls back to a full response. */
+    /** The previous acknowledged module output is reused by reference as the prefix for a validated native-output delta.
+     * The array supplies the prefix for a validated native-output delta; eviction requires a full response. */
     nativeOutput?: unknown[];
 }
 
@@ -284,15 +283,15 @@ interface RustSessionState extends ModuleStateSyncState {
     parked: boolean;
     passesSincePark: number;
     warningSent: boolean;
-    /** Set when the module answered need_full_sync: the next pass must send the
-     * full wire array (delta eligibility bypassed) until a pass applies. Wire-layer
-     * only — never triggers a state re-seed. */
+    /** `need_full_sync` forces the next pass to send the full wire array until a pass applies.
+     * `need_full_sync` bypasses delta eligibility until a pass applies.
+     * `need_full_sync` never triggers a state re-seed. */
     forceFullWire: boolean;
     ordinalMemoAnchor: RawMessageOrdinalAnchor | null;
     ordinalMemoStoredCount: number | null;
     ordinalMemoCanonicalCount: number;
-    /** Durable prior-lineage tail returned by the module after descent. Fresh arrays
-     * continue after this base instead of regenerating index+1 ordinals. */
+    /** The module returns a durable prior-lineage tail after descent.
+     * The loop continues after `base` without regenerating `index + 1` ordinals. */
     ordinalContinuationBase: number | null;
     failureCount: number;
     parkCount: number;
@@ -315,18 +314,18 @@ export interface RustModeTransformOptions {
     notifyParked?: (sessionId: string, message: string) => void;
     moduleTimeoutMs?: number;
     /**
-     * Invoked with each project that reaches rust-mode authority preparation, so the
-     * host can lazily register per-project services (the smart-note evaluator bridge)
-     * for projects other than the plugin's launch directory. `projectRoot` is the
-     * route root the authority was prepared with; per-project services must bind
-     * their transports and filesystem scope to it.
+     * The host lazily registers per-project services for every project that reaches rust-mode authority preparation.
+     * The host registers the smart-note evaluator bridge for projects outside the plugin launch directory.
+     * `projectRoot` is the route root used to prepare authority.
+     * Per-project services must bind their transports and filesystem scope to `projectRoot`.
+     * Per-project services must bind their transports and filesystem scope to `projectRoot`.
      */
     onProjectPrepared?: (projectPath: string, projectRoot: string) => void;
-    /** Test-only escape hatch for transform-wire tests without an authority transport. */
+    /** Transform-wire tests use this escape hatch when no authority transport is available. */
     allowAuthorityProtocolBypassForTests?: boolean;
-    /** Override only for deterministic capture scheduling in tests. */
+    /** Tests override this only for deterministic capture scheduling. */
     scheduleLkgCapture?: (capture: () => void) => void;
-    /** Override only to exercise raw-fallback estimator failures in tests. */
+    /** Tests override this only to exercise raw-fallback estimator failures. */
     rawFallbackEstimatorForTests?: typeof estimateFinalWireInputTokens;
 }
 
@@ -336,8 +335,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * OpenCode retains the original messages array when it serializes a transform result.
- * Mutate that array in place so the module response reaches the wire, while returning
- * the same array for callers that also consume the hook result.
+ * OpenCode requires in-place mutation of its original `messages` array for the module response to reach the wire.
  */
 function replaceMessagesInPlace(output: { messages: unknown[] }, next: unknown[]): unknown[] {
     const target = output.messages;
@@ -453,7 +451,7 @@ function signatureForFields(fields: readonly LkgContentField[]): string {
     return hash.toString(16).padStart(8, "0");
 }
 
-/** Capture an exact field snapshot plus its compact content-sensitive rolling hash. */
+/* */
 function messageContentSnapshot(message: MessageLike): MessageContentSnapshot {
     const fields = messageContentFields(message);
     return { signature: signatureForFields(fields), fields };
@@ -592,8 +590,8 @@ function formatRustPassLog(args: {
         timings.transport +
         timings.apply +
         timings.lkgSnapshot;
-    // Mirror stages run after appliedAt and are excluded from elapsed, so they
-    // must not be subtracted into `other` or they would hide leftover serve work.
+    // The elapsed calculation excludes mirror stages after `appliedAt`.
+    // The calculation excludes mirror stages from `other` so they do not hide leftover serve work.
     const unattributed = Math.max(0, args.elapsedMs - measured);
     const rowVersion = Number.isSafeInteger(args.rowVersion) ? args.rowVersion : 0;
     return `rust pass: decision=${args.decision} reason=${args.reason} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)}`;
@@ -635,10 +633,7 @@ function assertNativeBoundary(output: unknown[], sessionId: string, boundaryId: 
     const synthetic =
         parts.length > 0 && parts.every((part) => isRecord(part) && part.synthetic === true);
     if (info.role === "user" && info.sessionID === sessionId && synthetic) return;
-    // The failure arm names WHICH clause failed and what the head actually was:
-    // without it, every violation reads identically and the defect is
-    // undiagnosable from logs alone (a live incident required a binary
-    // bisect that a single log line would have answered).
+    // The failure arm logs the failed clause and actual head so violations are distinguishable.
     const headSummary = output.slice(0, 3).map((message) => {
         const mi = messageInfo(message);
         const mParts = isRecord(message) && Array.isArray(message.parts) ? message.parts : [];
@@ -863,7 +858,7 @@ function getSessionDirectory(
                 return { directory, resolvedFromHost: true };
             }
         } catch {
-            // The launch directory is a safe non-fatal fallback for module routing.
+            // Module routing falls back to the launch directory without failing.
         }
         return { directory: deps.directory ?? process.cwd(), resolvedFromHost: false };
     });
@@ -944,9 +939,8 @@ function shouldDisarmRustEmergencyRecovery(input: {
         input.usageEntry?.hasUsageTokens === true &&
         (input.recoveryArmedAt === null || input.usageEntry.updatedAt > input.recoveryArmedAt)
     ) {
-        // A missing process-local arm timestamp means the durable arm predates this
-        // process; persisted usage is loaded with hasUsageTokens=false, so true can
-        // only come from a provider response observed after restart.
+        // A missing process-local arm timestamp means the durable arm predates this process.
+        // A missing process-local arm timestamp means the durable arm predates this process.
         return "fresh-usage";
     }
     return null;
@@ -1030,7 +1024,7 @@ async function prepareRustMemoryAuthority(args: {
     projectRoot: string;
     state: RustSessionState;
     allowProtocolBypassForTests?: boolean;
-    /** Fires after authority is ready so hosts can register per-project services. */
+    /** The callback fires after authority is ready so hosts can register per-project services. */
     onProjectPrepared?: (projectPath: string, projectRoot: string) => void;
 }): Promise<void> {
     const { db, module, projectPath, projectRoot, state } = args;
@@ -1054,10 +1048,9 @@ async function prepareRustMemoryAuthority(args: {
         );
     }
 
-    // Call through the module object on every invocation: these may be real class
-    // methods whose implementations depend on their instance, so detaching them into
-    // locals would sever `this` and only fail at runtime (test fakes are object
-    // literals and cannot catch the difference).
+    // The caller must invoke methods through the module object because class-method implementations may depend on their instance.
+    // The caller must invoke methods through the module object because class-method implementations may depend on their instance.
+    // Extracting a method and calling it directly would lose `module` as `this`; object-literal test fakes would not expose the failure.
     const authorityModule: AuthorityModuleClient = {
         authorityStatus: (request) => {
             const method = module.authorityStatus;
@@ -1142,9 +1135,7 @@ async function prepareRustMemoryAuthority(args: {
         statuses.set(domain, null);
     }
 
-    // Do not return before finishing authority restore: if some domains are still
-    // DRAINING and others MODULE, reinstall the on-disk authority_managed marker and
-    // re-apply write fences on remaining MODULE domains before any tools run.
+    // Do not return from authority restore while any domain is `DRAINING`: reinstall the on-disk `authority_managed` marker and reapply write fences to remaining `MODULE` domains before tools run.
     if (!resumedDrain) {
         for (const domain of domains) {
             const current = statuses.get(domain);
@@ -1234,7 +1225,7 @@ function mirrorRustSyntheticTodoAnchor(args: {
     }
 }
 
-/** Single response-field seam for the parallel module encode-back contract. */
+/* */
 function hasNativeResponseContent(response: Record<string, unknown>): boolean {
     if (typeof response.native_messages === "string" || Array.isArray(response.native_messages)) {
         return true;
@@ -1263,8 +1254,7 @@ export function applyNativeMessagesVerbatim(
         return replaceMessagesInPlace(output, parsed);
     }
     if (Array.isArray(nativeMessages)) {
-        // The module owns healing, ordering, and codec fidelity. Do not clone,
-        // normalize, or otherwise inspect the returned native message array.
+        // The module owns healing, ordering, and codec fidelity; do not clone, normalize, or inspect the returned native message array.
         return replaceMessagesInPlace(output, nativeMessages);
     }
     const delta = response.native_messages_delta;
@@ -1340,9 +1330,7 @@ function buildTransformBody(args: {
         serializer_profile: "opencode-aisdk",
         serve_native: true,
         session_id: args.sessionId,
-        // Model/provider and system-prompt changes are provider-cache eviction signals;
-        // send the same identity inputs used by the TypeScript materializer instead of
-        // leaving the native identity blank.
+        // Model, provider, and system-prompt changes evict provider caches; send the native module the identity inputs used by the TypeScript materializer rather than leaving the native identity blank.
         render_config: [
             args.providerId ? `provider:${args.providerId}` : "",
             args.modelKey ? `model:${args.modelKey}` : "",
@@ -1400,8 +1388,8 @@ function buildTransformBody(args: {
         caveman_enabled: args.passInputs.caveman_enabled === true,
         caveman_min_chars: args.passInputs.caveman_min_chars ?? 500,
         cache_ttl: args.passInputs.cache_ttl,
-        // Thalamus owns these values. The plugin neither interprets nor recomposes the edge;
-        // explicit pass-through keeps mixed direct/plugin deployments wire-compatible.
+        // Pass Thalamus-owned values through unchanged; do not interpret or recompose them.
+        // Pass-through keeps mixed direct/plugin deployments wire-compatible.
         lineage_switched: args.passInputs.lineage_switched === true,
         descent_edge_id: args.passInputs.descent_edge_id,
         prior_conversation_key: args.passInputs.prior_conversation_key,
@@ -1650,9 +1638,7 @@ export function createRustModeTransform(
         ) {
             return "superseded";
         }
-        // Steady passes append one message onto an unchanged prefix. Reuse the
-        // previous slot's digests for every id+content-signature match and hash
-        // only from the first changed entry so the deferred commit stays off the
+        // Steady passes append one message to an unchanged prefix. Reuse previous digests for matching id/content signatures; hash from the first changed entry.
         // event-loop budget.
         const prior = getSlot(plan.sessionId);
         const inputContentSignatures = plan.inputSnapshots.map((snapshot) => snapshot.signature);
@@ -1717,8 +1703,7 @@ export function createRustModeTransform(
         let rowVersion = 0;
         let appliedAt: number | undefined;
         let emergencyFailClosed = false;
-        // Parking must not hide pressure from the recovery policy. Usage is cheap to read
-        // and is the same value copied onto the module request when this pass runs.
+        // Parking must not hide pressure from the recovery policy; copy the same usage value onto the module request for this pass.
         const passUsageSnapshot = loadContextUsage(deps.contextUsageMap, deps.db, sessionId);
         requestInputTokens = Math.max(0, Math.floor(passUsageSnapshot.inputTokens));
         let preflightError: unknown;
@@ -1770,8 +1755,7 @@ export function createRustModeTransform(
                     piModelRefToCanonical(modelKey ?? "");
             const hasProviderProof =
                 (overflowState.detectedContextLimit > 0 && detectedLimitMatchesModel) ||
-                // An unknown persisted arm alone is not proof. A second provider rejection
-                // while that arm is durable records the process-local reconfirmation.
+                // An unknown persisted arm is insufficient evidence; record process-local reconfirmation only after a second provider rejection while that arm remains durable.
                 isProviderOverflowReconfirmed(sessionId);
             emergencyFailClosed ||=
                 overflowState.needsEmergencyRecovery &&
@@ -1796,12 +1780,10 @@ export function createRustModeTransform(
                         agentName: deps.getNotificationParams?.(sessionId)?.agent,
                     });
                 } catch {
-                    // The byte proxy below remains available when tokenization does not.
+                    // The byte proxy remains available when tokenization does not.
                 }
                 const rawBytes = rawFallbackSerializedBytes(messages);
-                // The local tokenizer is telemetry-grade and can materially undercount a new
-                // provider tokenizer. Four serialized bytes per context token is an independent,
-                // conservative risk budget for a raw full-history fallback.
+                // The local tokenizer can undercount a new provider tokenizer; use four serialized bytes per context token as an independent risk budget for raw full-history fallback.
                 const proxyTokens =
                     rawBytes === null
                         ? contextLimit + 1
@@ -1904,8 +1886,7 @@ export function createRustModeTransform(
                         `native_cache_encoded=${stage("native_cache_encoded_messages")}`,
                 );
             }
-            // If the module took at least one second, log every other numeric timing
-            // field so the slow stage can be identified.
+            // Log numeric timing fields to identify the slow stage.
             if (timings && moduleElapsedMs >= 1000) {
                 const detail = Object.entries(timings)
                     .filter(
@@ -1919,8 +1900,7 @@ export function createRustModeTransform(
         };
         if (state.parked) {
             state.passesSincePark += 1;
-            // The fifth live pass is the first retry opportunity after the
-            // three-failure park; later retries use the same global cadence.
+            // The fifth live pass is the first retry opportunity after a three-failure park.
             if (
                 !emergencyFailClosed &&
                 passUsageSnapshot.percentage < RUST_PARK_PROBE_PRESSURE_BYPASS_PCT &&
@@ -1949,9 +1929,9 @@ export function createRustModeTransform(
             }
         }
         const reduceAvailability = resolveCtxReduceAvailability(sessionId);
-        // Freeze the native todo-tool map verdict before state sync reads it, then combine it
-        // with OpenCode's live permission decision. The module receives one authoritative bool;
-        // provisional or missing host evidence fails closed for synthesis.
+        // Resolve the native task-list-tool verdict before state synchronization reads it.
+        // Pass the module one bool combining the frozen map verdict and OpenCode's live permission decision.
+        // Synthesis fails closed when host evidence is provisional or missing.
         resolveTodowriteAvailabilityFromMessages(sessionId, messages);
         const todoAvailability = resolveTodowriteAvailability(sessionId);
         const toolPresent = reduceAvailability.frozen && reduceAvailability.callable;
@@ -2067,11 +2047,8 @@ export function createRustModeTransform(
             ) {
                 const appending = messages.length > previousWireCache.rawCount;
                 const lastMessage = messages.at(-1);
-                // Delta transport is only sound when the prefix the module would reuse is
-                // byte-identical to what OpenCode holds NOW. Count/last-signature checks
-                // cover the tail; this covers in-place mutation of an older message (an
-                // ephemeral reminder wrapper, a late tool completion) which must force a
-                // full send instead of riding a stale-prefix delta.
+                // Use delta transport only when the reusable prefix byte-identically matches OpenCode's copy.
+                // Count and last-signature checks validate the appended tail.
                 const prefixGuardStartedAt = performance.now();
                 const prefixIntact = prefixContentSnapshotsMatch(
                     messages,
@@ -2148,8 +2125,6 @@ export function createRustModeTransform(
             });
             logStage(sessionId, "ordinalResolve", ordinalStartedAt, timings);
             if (!resolved.ok) {
-                // A removal or persistence race can invalidate every durable memo field.
-                // Retry once from a clean full-array prime on both delta and full attempts.
                 wireDelta = undefined;
                 resetOrdinalMemo(state);
                 const fullOrdinalStartedAt = performance.now();
@@ -2309,8 +2284,6 @@ export function createRustModeTransform(
                     ckPrefixFingerprintBeforeLast,
                     nativeFingerprint,
                     nativePrefixFingerprintBeforeLast,
-                    // Preserve snapshots for messages reused from the previous wire cache,
-                    // and recompute them only for messages included in this request's suffix.
                     rawContentSnapshots: [
                         ...previousWireCache.rawContentSnapshots.slice(0, wireDelta.rawStart),
                         ...contentSnapshotsFor(messages.slice(wireDelta.rawStart)),
@@ -2318,9 +2291,6 @@ export function createRustModeTransform(
                     fingerprint: `${ckFingerprint}|${nativeFingerprint}`,
                 };
             })();
-            // Final-wire estimation is only needed while the host's durable overflow
-            // latch is armed. It can then clear that latch, never arm one, so normal
-            // large-payload passes avoid an unnecessary full-wire tokenization.
             const finalWireEstimate =
                 passInputs.emergency_recovery_armed === true
                     ? estimateFinalWireInputTokens({
@@ -2401,8 +2371,6 @@ export function createRustModeTransform(
                             projectRoot,
                             method: "transform",
                             body: page,
-                            // A reconnect discards a collecting page series. Page zero can be
-                            // retried safely, but later pages must make the caller restart it.
                             generationSensitive: paged && index > 0,
                         });
                     } catch (error) {
@@ -2479,8 +2447,6 @@ export function createRustModeTransform(
             const nativeContentOmitted = !hasNativeResponseContent(response);
             if (needFullSync || nativeContentOmitted) {
                 if (needFullSync) {
-                    // A module restart can retain durable state while changing the accepted
-                    // state-sync shape, so the next sync must re-probe its capabilities.
                     options.moduleClient.invalidateStateSyncCapabilities?.();
                 } else {
                     sessionLog(
@@ -2488,9 +2454,6 @@ export function createRustModeTransform(
                         "native_delta_fallback_reason=adapter_response_omitted_native_content retry=full",
                     );
                 }
-                // A wire-cache miss or an invalid successful response says nothing about
-                // context.db state. Retry the transform with complete arrays, but do not
-                // re-seed durable state; that costs tens of seconds on giant sessions.
                 state.forceFullWire = true;
                 if (wireDelta) {
                     const retryOrdinalStartedAt = performance.now();
@@ -2568,10 +2531,6 @@ export function createRustModeTransform(
                 logStage(sessionId, "wireBuild", retryWireBuildStartedAt, timings, "retry=full");
                 captureResponseTelemetry(response);
                 if (isNeedFullSync(response)) {
-                    // The retry was a genuine full send; a second need_full_sync means
-                    // the module cannot serve at all. Throwing routes this through the
-                    // failure ladder (LKG replay now, park after three) instead of
-                    // letting an empty-output response masquerade as a served pass.
                     throw new Error("rust module still requires full sync after a full-array send");
                 }
                 if (!hasNativeResponseContent(response)) {
@@ -2606,16 +2565,11 @@ export function createRustModeTransform(
                 decisionUpper === "HARD" ||
                 decisionUpper === "MIGRATE_HARD" ||
                 decisionUpper === "EXECUTE" ||
-                // SOFT re-renders m1 (delta folds, coverage folds): the served bytes changed,
-                // so the previous last-known-good (LKG) snapshot is already stale.
                 decisionUpper === "SOFT" ||
                 !explicitDecision;
             let appliedMessages: unknown[];
             const applyStartedAt = performance.now();
             try {
-                // Validate and postprocess the module result before touching the caller-owned
-                // array. This keeps failure recovery O(1) on the steady path: no defensive
-                // full-array clone is needed just in case boundary validation rejects it.
                 appliedMessages = applyNativeMessagesVerbatim(
                     { messages: [] },
                     response,
@@ -2660,14 +2614,9 @@ export function createRustModeTransform(
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
                 const lkgSnapshotStartedAt = performance.now();
-                // When the response changes the served bytes, discard the previous last-known-good
-                // snapshot before scheduling the new capture. Otherwise, a transport failure on the
-                // next turn could replay obsolete output.
                 if (cacheBustingPass) {
                     dropSlot(sessionId, "lkg_cache_bust_pending_capture");
                 }
-                // Reuse the wire-cache field snapshots for this input. Serialize the served
-                // response here, but defer hashing so LKG work does not block installing the result.
                 const capturePlan = prepareRustCapture(
                     state,
                     sessionId,
@@ -2751,8 +2700,6 @@ export function createRustModeTransform(
                 try {
                     await sendNoteDeliveryDisposition("transform.ack");
                 } catch (ackError) {
-                    // Leave the delivery unacknowledged when the acknowledgement transport
-                    // fails; the module will re-serve those bytes on a later natural bust.
                     sessionLog(sessionId, "rust note delivery ack failed (will retry):", ackError);
                 }
             }
@@ -2778,24 +2725,16 @@ export function createRustModeTransform(
             state.parked = false;
             state.passesSincePark = 0;
             state.warningSent = false;
-            // An applied pass proves the module reconstructed the wire; delta
-            // transport may resume on the next pass.
             state.forceFullWire = false;
 
             const directiveText = directiveTextOf(response);
             if (syntheticTurn) {
-                // A pending lease must not escape the breaker through the terminal
-                // event handler while synthetic turns are cascading.
                 try {
                     casChannel2NudgeState(deps.db, sessionId, "pending", "");
                     deps.channel2DirectiveTextBySession?.delete(sessionId);
                 } catch {
-                    // The delivery lease remains authoritative if another sender owns it.
                 }
             } else if (directiveText) {
-                // The module only recommends Channel 2 here. Delivery must wait for the
-                // terminal message.updated boundary, where the host's shared claim/CAS
-                // path revalidates the lease and coalesces the synthetic user turn.
                 try {
                     casChannel2NudgeState(deps.db, sessionId, "", "pending");
                     deps.channel2DirectiveTextBySession?.set(sessionId, directiveText);
@@ -2807,10 +2746,6 @@ export function createRustModeTransform(
                     );
                 }
             }
-            // Provider overflow proves the prior wire failed, so successful local
-            // materialization is not enough to clear recovery. Require either provider
-            // usage observed after the arm or a trusted estimate of the bytes actually
-            // returned by the module; persisted percentages can outlive failed requests.
             const currentOverflowState = getOverflowState(deps.db, sessionId, modelKey);
             const disarmEvidence = currentOverflowState.needsEmergencyRecovery
                 ? shouldDisarmRustEmergencyRecovery({
@@ -2831,12 +2766,10 @@ export function createRustModeTransform(
                         `rust pass disarmed emergency recovery via ${disarmEvidence} after ${materializeReason} at ${passUsageSnapshot.percentage.toFixed(1)}% usage`,
                     );
                 } catch {
-                    // Best-effort: a later pass with current recovery evidence retries the clear.
                 }
             }
             wireCaches.set(sessionId, pendingWireCache);
             appliedAt = performance.now();
-            // The detached task prevents a slow mirror page from delaying the transform hook.
             const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
             if (getCompartmentsAfter) {
                 void (async () => {
@@ -2883,8 +2816,6 @@ export function createRustModeTransform(
                 );
             }
             if (emergencyFailClosed) {
-                // At 95% of a trusted limit, or while provider overflow recovery is armed,
-                // any adapter failure aborts. Parking controls retry cadence, not fallback admission.
                 sessionLog(sessionId, "mc_rust_emergency_refusal before_lkg");
                 markFailure(sessionId, state, error);
                 finishPass(false, false);
@@ -2893,8 +2824,6 @@ export function createRustModeTransform(
                     { cause: error },
                 );
             }
-            // Validation happens before the caller-owned array is replaced, so the
-            // original live array is still available for fail-open replay.
             const replayed = replayLastGood(
                 sessionId,
                 messages,

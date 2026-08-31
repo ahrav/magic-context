@@ -1,11 +1,9 @@
 #!/usr/bin/env bun
 /**
- * Build and validate the git project-identity golden corpus.
  *
- * The fixture is intentionally derived from real git repositories rather than the
- * project-identity test hooks. The expected values are collected with an independent
- * git probe, then the TypeScript resolver is checked against those values before the
- * fixture is written (or compared with the already committed bytes).
+ * The fixture comes from real Git repositories, not project-identity test hooks.
+ * An independent Git probe collects expected values.
+ * The script verifies the TypeScript resolver before writing or byte-comparing the fixture.
  */
 
 import { execFileSync } from "node:child_process";
@@ -106,8 +104,7 @@ function visibleGitMetadata(directory: string): boolean {
 }
 
 function independentExpectedAnchor(directory: string): string {
-    // This is deliberately separate from resolveProjectIdentityStrict: it is the
-    // real-git oracle used to make sure the TypeScript resolver agrees with git.
+    // independentExpectedAnchor uses Git rather than resolveProjectIdentityStrict so resolver checks compare against Git.
     if (!visibleGitMetadata(directory)) return "NONE";
     try {
         const roots = git(["rev-list", "--max-parents=0", "HEAD"], directory)
@@ -194,8 +191,8 @@ function makeCases(tempRoot: string): GeneratedCase[] {
     const bareSource = makeRepository(tempRoot, "bare-source", "bare.txt", "bare\n");
     const bare = join(tempRoot, "bare-repository.git");
     git(["clone", "-q", "--bare", bareSource.directory, bare]);
-    // A bare repository has no `.git` entry for the resolver's stat-walk fast
-    // path. Its linked worktree is the resolvable form of the same repository.
+    // A bare repository has no `.git` entry for the resolver's stat-walk fast path.
+    // The linked worktree is the resolvable form of the same repository.
     add("bare-repository-direct-path-is-none", bare, "NONE");
     const bareWorktree = join(tempRoot, "bare-linked-worktree");
     git(["--git-dir", bare, "worktree", "add", "-q", "--detach", bareWorktree, "main"]);
@@ -312,8 +309,7 @@ try {
         writeFileSync(fixturePath, generatedBytes);
     }
 
-    // Keep the resolver validation independent of fixture creation: this is also
-    // the check used by the committed fixture's regeneration gate.
+    // The regeneration gate validates the resolver independently of fixture creation.
     validateResolver(generatedCases, generatedFixture);
     console.log(`git-dedup-goldens: validated ${generatedFixture.length} cases`);
 } finally {
@@ -321,11 +317,7 @@ try {
     rmSync(tempRoot, { recursive: true, force: true });
 }
 
-// Cross-repo pin guard: the spec's "Fixture content pin" section must carry
-// the SHA-256 of the fixture this generator just wrote. A regeneration that
-// forgets to update the spec pin would let path-referenced consumers
-// (entorhinal) silently assert against a moved target, so the generator
-// fails loud on mismatch instead of relying on the rule being remembered.
+// The spec's `Fixture content pin` must equal the SHA-256 of the generated fixture.
 import { createHash as __pinHash } from "node:crypto";
 import { readFileSync as __pinRead } from "node:fs";
 {

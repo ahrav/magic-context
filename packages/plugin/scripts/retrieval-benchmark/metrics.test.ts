@@ -18,8 +18,6 @@ import {
 
 import type { ResolvedRankedResult } from "./identity";
 
-// Hand-built resolver outputs: documentId doubles as canonicalId because the
-// corpus maps them 1:1; duplicates reuse the first occurrence's identity.
 function hit(rank: number, documentId: string): ResolvedRankedResult {
     return { status: "resolved", rank, canonicalId: `c-${documentId}`, documentId };
 }
@@ -42,8 +40,6 @@ function cutoff(metrics: QueryMetrics, n: number) {
     return found;
 }
 
-// Golden constants, hand-calculated:
-// log2(3) = 1.5849625007211562
 // idcg for grades {2, 1}: 2/log2(2) + 1/log2(3) = 2 + 0.6309297535714574
 const IDCG_2_1 = 2 + 1 / Math.log2(3);
 
@@ -60,8 +56,7 @@ describe("computeQueryMetrics", () => {
         expect(cutoff(metrics, 50).recall).toBe(0);
         expect(metrics.reciprocalRank).toBe(0);
         expect(metrics.firstRelevantPhysicalRank).toBeNull();
-        // Unjudged entries are OMITTED from the condensed view — they are
-        // never coerced to grade 0.
+        // `condensed` omits unjudged entries instead of assigning grade 0.
         expect(cutoff(metrics, 10).condensed).toHaveLength(0);
         expect(cutoff(metrics, 10).coverage).toEqual({
             judged: 0,
@@ -91,7 +86,6 @@ describe("computeQueryMetrics", () => {
     });
 
     it("multiple grades: golden condensed linear-gain nDCG", () => {
-        // Physical: d2(g1) @1, unjudged @2, d1(g2) @3, d3(g0) @4.
         // Condensed: d2 cr1, d1 cr2, d3 cr3 (unjudged omitted).
         const metrics = computeQueryMetrics({
             queryId: "q-multi",
@@ -120,11 +114,10 @@ describe("computeQueryMetrics", () => {
             judgedGrades: judged,
         });
         const at10 = cutoff(metrics, 10);
-        // The duplicate stays visible at physical rank 2...
         expect(at10.physical[1]).toMatchObject({ rank: 2, status: "duplicate" });
         expect(at10.coverage.duplicates).toBe(1);
         expect(at10.duplicateRate).toBeCloseTo(1 / 3, 12);
-        // ...but is excluded from condensed credit: recall counts d1 once.
+        // The duplicate alias is excluded from condensed credit, so recall counts d1 once.
         expect(at10.relevantRetrieved).toBe(2);
         expect(at10.recall).toBe(1);
         expect(at10.condensed.map((c) => c.documentId)).toEqual(["d1", "d2"]);
@@ -165,9 +158,9 @@ describe("computeQueryMetrics", () => {
     });
 
     it("condensation ignores physical gaps: a judged hit behind unjudged noise", () => {
-        // d1(g2) at physical rank 3 behind two unjudged entries condenses to
-        // rank 1: perfect condensed nDCG. Coercing unjudged to grade 0 would
-        // instead discount d1 at rank 3 — this pins the difference.
+        // `d1` at physical rank 3 condenses to rank 1 because preceding unjudged entries do not consume condensed ranks.
+        // The query has nDCG 1 because unjudged entries do not consume condensed ranks.
+        // `d1` would be discounted at rank 3 if unjudged entries received grade 0.
         const metrics = computeQueryMetrics({
             queryId: "q-condense",
             resolved: [hit(1, "d8"), hit(2, "d9"), hit(3, "d1")],
@@ -228,8 +221,8 @@ describe("computeRerankerLift", () => {
         const lift = computeRerankerLift(before, after, judged);
         expect(lift.status).toBe("computed");
         if (lift.status !== "computed") return;
-        // before condensed: d2 cr1, d1 cr2 -> dcg = 1 + 2/log2(3)
-        // after condensed: d1 cr1, d2 cr2 -> dcg = 2 + 1/log2(3) = idcg
+        // `before` condenses d2 to rank 1 and d1 to rank 2, so DCG = 1 + 2 / log2(3).
+        // `after` condenses d1 to rank 1 and d2 to rank 2, so DCG = 2 + 1 / log2(3) = IDCG.
         expect(lift.ndcgBefore).toBeCloseTo((1 + 2 / Math.log2(3)) / IDCG_2_1, 12);
         expect(lift.ndcgAfter).toBe(1);
         expect(lift.delta).toBeCloseTo(1 - (1 + 2 / Math.log2(3)) / IDCG_2_1, 12);
@@ -296,8 +289,8 @@ describe("macroAggregate", () => {
             scored("q-b1", "pg-b", "holdout", "explicit", 1),
         ]);
         expect(aggregates).toHaveLength(1);
-        // Micro average would be 2/3; the macro answer weighs each base
-        // intent equally: (0.5 + 1) / 2.
+        // Micro averaging yields 2/3; macro averaging gives each base intent equal weight.
+        // Macro aggregation gives each base intent equal weight: `(0.5 + 1) / 2`.
         expect(aggregates[0].recallAt10).toBe(0.75);
         expect(aggregates[0].mrr).toBe(0.75);
         expect(aggregates[0].queryCount).toBe(3);
@@ -317,7 +310,7 @@ describe("macroAggregate", () => {
             ["holdout", "automatic"],
             ["holdout", "explicit"],
         ]);
-        // Gate aggregates: holdout only — development stays diagnostic and a
+        // The gate aggregates holdout results only; development results remain diagnostic.
         // strong explicit cell cannot mask the automatic cell.
         const gates = gateAggregates(aggregates);
         expect(gates.map((aggregate) => aggregate.partition)).toEqual(["holdout", "holdout"]);

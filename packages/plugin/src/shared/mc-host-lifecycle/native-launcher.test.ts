@@ -28,8 +28,7 @@ function scriptBinary(dir: string, body: string): string {
 function probeResultJson(ok: boolean): string {
     return JSON.stringify({
         schema: "magic-context.daemon/v1",
-        // The `probe` argv is answered as `status`: that is the contracted name
-        // for the read-only observation, and the command union has no `probe`.
+        // The launcher answers `probe` argv with `status`, the contracted read-only command.
         command: "status",
         ok,
         state: ok ? "running" : "stopped",
@@ -58,11 +57,6 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         const binary = scriptBinary(dir, `echo '${probeResultJson(false)}'\nexit 1`);
         const fd = openSync(binary, constants.O_RDONLY | constants.O_NOFOLLOW);
         try {
-            // A host outside the certified namespace table has no
-            // retained-descriptor exec path at all, so it must fail as a
-            // platform reason rather than as a spawn error against a path that
-            // cannot exist. The linux and darwin arms are covered end to end by
-            // the inherited-fd test below, which runs the real path.
             await expect(
                 runNativeLifecycle(
                     { kind: "retained-fd", fd },
@@ -203,10 +197,8 @@ describe("native launcher output handling (U3 scenario 17)", () => {
     }, 10_000);
 
     test("an exhausted deadline is rejected before any child is spawned", async () => {
-        // setTimeout coerces a nonpositive or non-finite delay to 1ms, so
-        // without a pre-spawn check a mutating transaction would start and be
-        // SIGKILLed a millisecond later, leaving effects behind for a call that
-        // had no budget. The sentinel proves no child ran.
+        // The launcher rejects nonpositive or non-finite deadlines before spawn because `setTimeout` coerces them to 1 ms.
+        // The launcher rejects nonpositive or non-finite deadlines before spawn because `setTimeout` coerces them to 1 ms.
         const sentinel = path.join(dir, "exhausted-deadline-ran");
         const binary = scriptBinary(dir, `touch ${sentinel}`);
         for (const deadlineMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
@@ -225,10 +217,9 @@ describe("native launcher output handling (U3 scenario 17)", () => {
     }, 10_000);
 
     test("relative launch paths are rejected before a child is spawned", async () => {
-        // The child runs with cwd: "/", so a relative value silently changes
-        // meaning instead of failing. A first segment colliding with a real root
-        // entry is the dangerous case: "bin/echo" resolves to /bin/echo and
-        // executes the WRONG binary, surfacing later as malformed output.
+        // The child runs with `cwd: "/"`, so a relative executable path resolves from `/` instead of failing.
+        // A relative executable path whose first segment matches a root entry can resolve to an unintended executable.
+        // For example, `bin/echo` resolves to `/bin/echo` when `/bin` exists.
         const sentinel = path.join(dir, "relative-path-ran");
         const absolute = scriptBinary(dir, `touch ${sentinel}\necho '${probeResultJson(false)}'`);
         const relative = path.relative(process.cwd(), absolute);
@@ -258,16 +249,13 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         expect(payloadError?.code).toBe("usage_error");
         expect(payloadError?.message).toContain("payload directory is not absolute");
 
-        // Neither call reached a child.
         expect(existsSync(sentinel)).toBe(false);
     }, 10_000);
 
     test("byte-invalid stdout fails closed instead of decoding to U+FFFD", async () => {
-        // Buffer.toString("utf8") substitutes U+FFFD for an invalid byte, so a
-        // corrupt byte inside an otherwise well-formed JSON string would parse,
-        // validate, and be accepted as a conforming result carrying a silently
-        // mangled value. The payload here is contract-valid except that one byte
-        // of `versions.release` is 0xFF, which is not legal UTF-8.
+        // The parser uses fatal UTF-8 decoding because `Buffer.toString("utf8")` replaces invalid bytes with U+FFFD.
+        // The fixture is contract-valid except that one byte of `versions.release` is `0xFF`, which is invalid UTF-8.
+        // The fixture is contract-valid except that one byte of `versions.release` is `0xFF`, which is invalid UTF-8.
         const valid = probeResultJson(false);
         const marker = '"release":"0.38.0"';
         expect(valid).toContain(marker);
@@ -279,7 +267,7 @@ describe("native launcher output handling (U3 scenario 17)", () => {
             Buffer.from('8.0"', "utf8"),
             Buffer.from(tail, "utf8"),
         ]);
-        // Sanity: lossy decoding really would accept this, which is the bug.
+        // Lossy UTF-8 decoding accepts payloads containing invalid UTF-8.
         expect(() => JSON.parse(payload.toString("utf8"))).not.toThrow();
 
         const payloadFile = path.join(dir, "corrupt-stdout.bin");
@@ -341,9 +329,7 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         }
         expect(error).toBeInstanceOf(NativeLaunchError);
         expect(error?.code).toBe("usage_error");
-        // Serializing after the spawn would let the raw serialization throw
-        // escape with a live child that nothing collects or kills; the absent
-        // marker proves no child ever ran.
+        // The launcher serializes before spawning so serialization errors cannot leave an uncollected child.
         await new Promise((resolve) => setTimeout(resolve, 500));
         expect(existsSync(sentinel)).toBe(false);
     }, 10_000);
@@ -364,9 +350,9 @@ describe("native launcher output handling (U3 scenario 17)", () => {
     });
 
     test("stderr past the cap is discarded without killing a healthy child", async () => {
-        // Stderr must stay drained, not closed: this child writes far past the
-        // cap and then its conforming object, so a closed read end would take
-        // the write side down with EPIPE/SIGPIPE before stdout ever arrives.
+        // The launcher continues draining stderr after its capture cap so the child can emit its stdout result.
+        // The launcher continues draining stderr after its capture cap so the child can emit its stdout result.
+        // Closing the child's stderr read end causes its large stderr write to fail with EPIPE or SIGPIPE before it emits stdout.
         const binary = scriptBinary(
             dir,
             [
@@ -413,14 +399,13 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         } catch (caught) {
             error = caught as NativeLaunchError;
         }
-        // Neither procfs_self_fd_exec nor dev_fd_exec: report the real reason
-        // instead of spawning a path that cannot exist.
+        // The launcher reports `unsupported_platform` when neither `procfs_self_fd_exec` nor `dev_fd_exec` is available.
         expect(error?.code).toBe("unsupported_platform");
     });
 
     test("darwin resolves the retained descriptor through /dev/fd, not procfs", async () => {
-        // The contract gives darwin `dev_fd_exec` and linux
-        // `procfs_self_fd_exec`; a darwin launch must not reach /proc.
+        // The contract assigns `dev_fd_exec` to darwin and `procfs_self_fd_exec` to linux.
+        // A darwin launch must use `dev_fd_exec`, not `/proc`.
         let error: NativeLaunchError | null = null;
         try {
             await runNativeLifecycle(
@@ -430,9 +415,6 @@ describe("native launcher output handling (U3 scenario 17)", () => {
         } catch (caught) {
             error = caught as NativeLaunchError;
         }
-        // On this linux host /dev/fd/3 is not an executable image, so the
-        // spawn fails; the point is that it was attempted at all rather than
-        // rejected as an unsupported platform.
         expect(error).toBeInstanceOf(NativeLaunchError);
         expect(error?.code).not.toBe("unsupported_platform");
     });

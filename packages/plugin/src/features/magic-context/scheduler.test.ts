@@ -128,7 +128,6 @@ describe("createScheduler", () => {
             cacheTtl: "never",
             lastResponseTime: BASE_TIME - 10_000,
         });
-        // At threshold — should still execute.
         const contextUsage = createContextUsage(65);
 
         const decision = scheduler.shouldExecute(sessionMeta, contextUsage, BASE_TIME);

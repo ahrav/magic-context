@@ -56,10 +56,10 @@ pub fn per_connection_limits() -> ShmHostLimits {
     }
 }
 
-/// Ceiling on ring arena bytes this process admits at once. An admitted arena is prefaulted before activation, so it is resident memory, and `max_resident_bytes` does not bound the product of `max_connections` and the per-connection arena. commentlint: allow(JUDGE)
+/// Ceiling on ring arena bytes this process admits at once. An admitted arena is prefaulted before activation, so it is resident memory, and `max_resident_bytes` does not bound the product of `max_connections` and the per-connection arena.
 pub const MAX_RING_RESIDENT_BYTES: u64 = 1 << 30;
 
-/// Admission limits for `connections` concurrent rings, reduced to the count whose arenas fit `MAX_RING_RESIDENT_BYTES`. One connection stays admissible, so a profile wider than the ceiling still serves. commentlint: allow(JUDGE)
+/// Admission limits for `connections` concurrent rings, reduced to the count whose arenas fit `MAX_RING_RESIDENT_BYTES`. One connection stays admissible, so a profile wider than the ceiling still serves.
 pub fn process_limits(connections: usize) -> Option<ShmHostLimits> {
     let one = per_connection_limits();
     let affordable = MAX_RING_RESIDENT_BYTES
@@ -209,7 +209,7 @@ impl RingTransport {
 
     /// Test hook: install a publication observer for connections prepared
     /// after this call. The hook runs on the endpoint thread after the ring
-    /// commit. commentlint: allow(JUDGE)
+    /// commit.
     #[doc(hidden)]
     pub fn set_publish_hook(&self, hook: PublishHook) {
         *self.publish_hook.lock().expect("publish hook lock") = Some(hook);

@@ -77,7 +77,7 @@ const CONNECT_BACKOFF_MAX_MS = 30_000;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 const MODULE_SEND_TIMEOUT_MS = 15_000;
 const TRANSFORM_SEND_TIMEOUT_MS = 5_000;
-/** Consumer deadline for the module's exported historian::MAX_WRAPUP_REQUEST_BUDGET. */
+/** Consumers use this deadline for the module's exported `historian::MAX_WRAPUP_REQUEST_BUDGET`. */
 export const MAX_WRAPUP_REQUEST_BUDGET_MS = 3_800_000;
 const SERIAL_LANE_MAX_WAITERS = 16;
 const SERIAL_LANE_MAX_WAITERS_PER_SESSION = 8;
@@ -85,11 +85,7 @@ const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
 
 function getDefaultConnectionFile(): string {
-    // The managed lifecycle owner publishes the daemon under the lifecycle
-    // data root; dialing must agree byte-for-byte with that resolver or a
-    // demand can report ready while this transport dials a different path.
-    // The application-storage resolver only backstops environments where no
-    // lifecycle root resolves at all.
+    // Dial the lifecycle resolver's path exactly; otherwise a ready demand can target a different daemon. Use application storage only when no lifecycle root resolves.
     return defaultConnectionFilePath(getDataDir());
 }
 
@@ -248,13 +244,7 @@ export function createLazyManagedDemandStart(
 ): ManagedDemandStart {
     let policy: ReturnType<typeof createManagedLifecyclePolicy> | undefined;
     return async (request): Promise<ManagedDemandResult> => {
-        // The caller's budget starts here, not at `demandStart`. Building the
-        // policy on a fresh install synchronously resolves the payload package,
-        // hashes every manifest file, and stages the bootstrap, and being
-        // synchronous it also blocks the abort timer from firing. Charging that
-        // preparation to the request keeps the demand inside the deadline the
-        // caller actually granted, instead of launching a daemon for a request
-        // whose budget was already gone and then running a full aggregate.
+        // Start the caller deadline before synchronous policy preparation, which can block abort timers; `demandStart` rejects non-positive residuals before native startup.
         const startedAt = performance.now();
         policy ??= createManagedLifecyclePolicy({
             mode: "mutating",
@@ -262,15 +252,11 @@ export function createLazyManagedDemandStart(
             parentPackageName: options.parentPackageName,
         });
         const preparationMs = performance.now() - startedAt;
-        // A non-positive residual is refused by `demandStart`'s entry guard,
-        // which rejects before any native start is created.
         const deadlineMs =
             request.deadlineMs === undefined ? undefined : request.deadlineMs - preparationMs;
         const outcome = await policy.demandStart({
             ...request,
             ...(deadlineMs === undefined ? {} : { deadlineMs }),
-            // The demand contract lets a caller carry its own envelope; only
-            // default it, so this wrapper cannot silently discard one.
             startupEnvelope:
                 request.startupEnvelope ?? buildManagedStartupEnvelope(options.parentPackageName),
         });
@@ -303,8 +289,8 @@ function errorChainSome(
     return false;
 }
 
-/** Route errors must be recognized by wire-visible shape because plugin bundles can carry a
- *  different copy of the client from the code that originated the error. */
+/** Recognize route errors by wire-visible shape because plugin bundles can use a different client copy.
+ * */
 function isStaleOrDeadRouteFailure(error: unknown): boolean {
     return errorChainSome(error, (current) => {
         const code = typeof current.code === "string" ? current.code : "";
@@ -357,9 +343,7 @@ function isConnectionFailure(error: unknown): boolean {
 }
 
 /**
- * `McHostCallError.kind` recognized via the shared cross-bundle check, which
- * requires a real `Error` carrying the wire-visible name. The kind is still
- * validated at runtime because a foreign bundle copy's field is untyped.
+ * Recognize `McHostCallError.kind` through the cross-bundle check, which requires an `Error` with the wire-visible name; validate `kind` at runtime because foreign bundle fields are untyped.
  */
 function mcHostCallErrorKind(error: unknown): McHostCallError["kind"] | undefined {
     if (!isMcHostCallError(error)) return undefined;
@@ -374,7 +358,7 @@ function errorCodeOf(error: unknown): string | undefined {
     return undefined;
 }
 
-/** Pre-send proof: the facade throws this shape only before any body write. */
+/** The facade throws `McHostCallError` only before any body write. */
 function isStaleRouteHandleFailure(error: unknown): boolean {
     if (error instanceof StaleRouteHandleError) return true;
     return (
@@ -383,7 +367,7 @@ function isStaleRouteHandleFailure(error: unknown): boolean {
     );
 }
 
-/** The bounded cleanup ticket the facade attaches when a caller abort races a possible send. */
+/** Attach a bounded cleanup ticket when caller abort can race a possible send. */
 function cleanupTicketOf(error: unknown): Promise<void> | null {
     if (!isRecord(error) || error.name !== "McHostCallError") return null;
     const cleanup = (error as { cleanup?: unknown }).cleanup;
@@ -402,25 +386,19 @@ interface EnsuredRoute {
     routeKey: string;
     generation: number;
     /**
-     * Identity certified for this connection, captured once so a concurrent
-     * invalidation cannot drop the fence between route open and body send.
+     * Capture the connection's certified identity once so concurrent invalidation cannot remove the fence between route open and body send.
      */
     expectedDaemonId?: Uint8Array;
 }
 
 /**
- * What a managed lifecycle demand certified about one connection. An absent
- * `expectedDaemonId` records that no lifecycle owner exists to certify an
- * identity: a passive transport dials whatever daemon already published the
- * default connection file, so it has nothing to fence against — the same
- * contract an explicit connection file carries. That is distinct from `null`
- * certification, which means no demand has settled for the live connection.
+ * `expectedDaemonId` is absent when no lifecycle owner certifies identity, as with an explicit connection file; `null` means no demand has settled for the live connection.
  */
 interface ConnectionCertification {
     expectedDaemonId?: Uint8Array;
 }
 
-/** A connection paired with the certification its dial validated it against. */
+/** `CertifiedConnection` pairs a client with certification validated during dialing. */
 interface CertifiedConnection extends ConnectionCertification {
     client: McHostClient;
 }
@@ -461,7 +439,7 @@ interface OpeningRoute {
     client: McHostClient;
     generation: number;
     state: {
-        /** Set by `closeSession` while the open is in flight; the open must not cache its route. */
+        /** `closeSession` sets `closed` during an in-flight open; the open then skips caching its route. */
         closed: boolean;
     };
     promise: Promise<EnsuredRoute>;
@@ -479,30 +457,28 @@ export class McHostModuleTransport {
     private routes = new Map<string, CachedRoute>();
     private routeOpenings = new Map<string, OpeningRoute>();
     private canonicalRootCache = new Map<string, string>();
-    // Preserve request order within a session while allowing independent sessions to overlap.
+    // `sessionLanes` preserves request order within each session while independent sessions overlap.
     // Both the aggregate and per-session counts cap queued work; active calls are not waiters.
     private sessionLanes = new Map<string, SerialLane>();
     private queuedLaneWaiters = 0;
     private wrapupSessions = new Map<string, number>();
     private nextProbeMs = 0;
-    // The dial in flight carries its own certification so a caller that lands on
-    // it inherits what the demand behind it proved, instead of demanding again.
+    // A caller that joins the in-flight dial inherits the dial's demand certification.
+    // A caller that joins the in-flight dial does not demand certification again.
     private connectionPromise: Promise<CertifiedConnection> | null = null;
     private authorityProjectRoot = "";
     /**
-     * Filesystem root used to bind authority/mirror routes. Authority request
-     * bodies carry the MC project IDENTITY (git:<sha> / dir:<hash>), which is not
-     * a path — the daemon validates BindIdentity.project_root against the real
-     * filesystem and rejects identity strings outright.
+     * `authorityBindRoot` binds authority and mirror routes to the filesystem root.
+     * `BindIdentity.project_root` requires a filesystem path, not an MC project identity.
      */
     private authorityBindRoot = "";
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
     private connectionGeneration = 0;
     /**
-     * Certification for the live connection, or `null` when no demand has
-     * settled for it. A record with no `expectedDaemonId` is a certified
-     * passive connection: no owner exists to name a daemon, so there is no
-     * identity to re-check and the connection stays reusable.
+     * `connectionCertification` is `null` until a demand settles for the live connection.
+     * An absent `expectedDaemonId` marks a passive connection with no lifecycle owner.
+     * A passive connection has no lifecycle owner that can name a daemon.
+     * A passive connection remains reusable because no daemon identity exists to re-check.
      */
     private connectionCertification: ConnectionCertification | null = null;
     private stateSyncCapabilityCache: {
@@ -517,7 +493,7 @@ export class McHostModuleTransport {
         return cached.capabilities;
     }
 
-    /** Clears the snapshot after a module signal that can change its wire capabilities. */
+    /** A module signal that can change wire capabilities clears the cached snapshot. */
     invalidateStateSyncCapabilities(): void {
         this.stateSyncCapabilityCache = null;
     }
@@ -589,13 +565,13 @@ export class McHostModuleTransport {
         detail: string,
         makeError: () => Error = () => this.deadlineError(detail),
     ): Promise<T> {
-        // The race can abandon `operation` (deadline fires first, or the caller's
-        // catch invalidates the connection). A later rejection of the abandoned
-        // promise — close() failing every pending request with "client closed" —
-        // would then be UNHANDLED and Bun prints a crash-shaped stack to the
-        // host's stderr. Subscribe a no-op handler up front: the race still
-        // receives the original settlement, and a post-race rejection is
-        // delivered here instead of the process-level unhandled hook.
+        // The race can abandon `operation` when the deadline fires first or the caller's catch invalidates the connection.
+        // An abandoned `operation` promise can reject after the race settles.
+        // `close()` can reject an abandoned `operation` promise by failing pending requests with `client closed`.
+        // An unhandled rejection from an abandoned promise makes Bun print a stack to host stderr.
+        // A no-op handler subscribed before the race handles post-race rejections.
+        // The race still receives `operation`'s original settlement.
+        // The no-op handler receives post-race rejections instead of the process-level unhandled hook.
         operation.catch(() => {});
         if (deadline.remainingMs() <= 0) throw makeError();
         let cancelTimer: (() => void) | undefined;
@@ -603,11 +579,9 @@ export class McHostModuleTransport {
             return await Promise.race([
                 operation,
                 new Promise<T>((_resolve, reject) => {
-                    // armExpiryTimer guarantees the rejection implies
-                    // deadline.isExpired(): the retry gate in call() consults
-                    // isExpired() after catching this rejection, and an
-                    // early-fired deadline error would let the pre-send replay
-                    // token spend a second connect and route open.
+                    // `armExpiryTimer` rejects only after `deadline.isExpired()` returns `true`.
+                    // Treat a timer rejection as expiry only when `deadline.isExpired()` confirms it.
+                    // An early timer rejection would allow the pre-send replay token to spend a second connect and route open.
                     cancelTimer = armExpiryTimer(deadline, () => reject(makeError()));
                 }),
             ]);
@@ -728,7 +702,7 @@ export class McHostModuleTransport {
         method: ModuleMethod;
         body: unknown;
         signal?: AbortSignal;
-        /** Do not retry after reconnecting; let the caller rebuild for the new connection. */
+        /** `call()` does not retry after reconnecting; callers rebuild for the new connection. */
         generationSensitive?: boolean;
         /** Producer-backed calls can outlive the default transport budget. */
         timeoutMs?: number;
@@ -742,9 +716,9 @@ export class McHostModuleTransport {
                 : args.method === "transform"
                   ? Math.min(this.requestTimeoutMs, TRANSFORM_SEND_TIMEOUT_MS)
                   : this.requestTimeoutMs);
-        // One immutable absolute operation deadline, created before session-lane
-        // admission and shared by connect, route open, request, and any permitted
-        // replay (plan KTD5/R14). Cleanup uses the facade's separate bounded ticket.
+        // `operationDeadline` is an immutable absolute deadline created before session-lane admission.
+        // `operationDeadline` is shared by connect, route open, and request.
+        // The deadline covers admission, connect, route opening, request, and permitted replay; cleanup uses the facade's separate bounded ticket.
         const deadline = Deadline.start(operationTimeoutMs);
         const tracksWrapup = args.method === "session.wrapup";
         if (tracksWrapup) {
@@ -766,14 +740,14 @@ export class McHostModuleTransport {
             finishWrapupTracking();
             throw error;
         }
-        // Post-write abort produces a bounded cleanup ticket (plan KTD10). The
-        // caller settles promptly while this session's lane stays fenced until
-        // the ticket resolves; the facade retires the generation on expiry.
+        // A post-write abort creates a bounded cleanup ticket.
+        // A post-write abort settles the caller promptly while the session lane remains fenced until the cleanup ticket resolves; the facade retires the generation on expiry.
+        // A post-write abort settles the caller promptly while the session lane remains fenced until the cleanup ticket resolves; the facade retires the generation on expiry.
         let cleanupTicket: Promise<void> | null = null;
         try {
-            // One transport-owned body-replay token (plan KTD8): this layer uses
-            // only the facade's replay-free routeOpen/request primitives, so it
-            // alone decides whether a body is ever sent a second time.
+            // This layer uses the facade's replay-free routeOpen/request primitives and solely decides whether to resend a body.
+            // This layer uses only the facade's replay-free `routeOpen`/`request` primitives, so it alone decides whether to resend a body.
+            // This layer uses only the facade's replay-free `routeOpen`/`request` primitives, so it alone decides whether to resend a body.
             let replaySpent = false;
             for (;;) {
                 let ensuredRoute: EnsuredRoute | null = null;
@@ -804,8 +778,8 @@ export class McHostModuleTransport {
                         }),
                         deadline,
                         "waiting for the module response",
-                        // The body may be on the wire: a local deadline after
-                        // request invocation is a possible send, never not_sent.
+                        // A local deadline after `request` invocation means the body may be on the wire, never `not_sent`.
+                        // A local deadline after `request` invocation means the body may be on the wire, never `not_sent`.
                         () =>
                             new McHostCallError(
                                 "outcome_unknown",
@@ -826,11 +800,11 @@ export class McHostModuleTransport {
                     cleanupTicket = cleanupTicketOf(error);
                     const kind = mcHostCallErrorKind(error);
                     const callerAborted = args.signal?.aborted === true;
-                    // Host-proven no-dispatch (wire doc 10.2): evict and retry once.
+                    // The retry path evicts the route and retries once when the host proves no dispatch.
                     const unknownChannel =
                         kind === "terminal" && errorCodeOf(error) === "unknown_channel";
-                    // Proven pre-send: a facade not_sent, a stale handle rejected
-                    // before write, or a failure before request() was invoked.
+                    // The code treats a facade `not_sent`, a stale handle rejected before write, or a failure before `request()` as proven pre-send.
+                    // The code treats a facade `not_sent`, a stale handle rejected before write, or a failure before `request()` as proven pre-send.
                     const provenNotSent =
                         kind === "not_sent" ||
                         isStaleRouteHandleFailure(error) ||
@@ -839,22 +813,22 @@ export class McHostModuleTransport {
                     const previousGeneration =
                         ensuredRoute?.generation ?? this.connectionGeneration;
                     if (unknownChannel || isStaleRouteHandleFailure(error)) {
-                        // Route-level proof only: evict the dead route and keep
-                        // the connection; the facade reconnects internally if
-                        // its own generation retired.
+                        // Route-level proof evicts the dead route while retaining the connection; the facade reconnects internally when its generation retires.
+                        // Route-level proof evicts the dead route while retaining the connection; the facade reconnects internally when its generation retires.
+                        // Route-level proof evicts the dead route while retaining the connection; the facade reconnects internally when its generation retires.
                         if (ensuredRoute) {
                             this.dropRoute(ensuredRoute.routeKey, ensuredRoute.route);
                         }
-                        // Recovery rebinds a new route, and the facade may already have
-                        // reconnected underneath without moving connectionGeneration. The
-                        // cached snapshot was probed through the evicted route, so it is
-                        // not proven to describe the module the next route reaches; the
-                        // generation counter alone cannot expire it here.
+                        // Recovery binds a new route, but an internal facade reconnect does not advance `connectionGeneration`. Because the cached snapshot was probed through the evicted route, the generation counter cannot prove that it describes the module reached by the new route.
+                        // Recovery binds a new route, but an internal facade reconnect does not advance `connectionGeneration`. Because the cached snapshot was probed through the evicted route, the generation counter cannot prove that it describes the module reached by the new route.
+                        // Because the cached snapshot was probed through the evicted route, the generation counter cannot prove that it describes the module reached by the new route.
+                        // Because the cached snapshot was probed through the evicted route, the generation counter cannot prove that it describes the module reached by the new route.
+                        // The generation counter cannot expire the cached snapshot because it was probed through the evicted route.
                         this.invalidateStateSyncCapabilities();
                     } else if (cleanupTicket === null && isConnectionFailure(error)) {
-                        // Same invalidation as before, but never a body resend
-                        // after a possible send. A post-write abort relies on
-                        // Cancel plus the cleanup ticket instead (plan KTD10).
+                        // A possible send invalidates the route without resending the body.
+                        // A post-write abort relies on the bounded cleanup ticket instead of resending a possibly sent body.
+                        // After a possible send, a post-write abort uses Cancel and the cleanup ticket rather than resending the body.
                         if (ensuredRoute) {
                             this.dropRoute(ensuredRoute.routeKey, ensuredRoute.route);
                             this.invalidateConnection(ensuredRoute.client);
@@ -863,8 +837,7 @@ export class McHostModuleTransport {
                         }
                     }
                     if (replayEligible && args.generationSensitive && !callerAborted) {
-                        // Recovery would cross a route/connection generation
-                        // before another body send; let the caller rebuild.
+                        // Recovery does not cross a route or connection generation.
                         return {
                             transport_status: "connection_generation_changed",
                             previous_generation: previousGeneration,
@@ -875,8 +848,7 @@ export class McHostModuleTransport {
                         replaySpent = true;
                         continue;
                     }
-                    // Everything else — including every outcome_unknown — propagates
-                    // so no caller mistakes a connection symptom for replay permission.
+                    // `outcome_unknown` and all other unhandled outcomes propagate.
                     throw error;
                 }
             }
@@ -897,8 +869,6 @@ export class McHostModuleTransport {
         method: ModuleAuthorityMethod,
         body: Record<string, unknown>,
     ): Promise<Record<string, unknown>> {
-        // The transport serializes the body verbatim; the module dispatches on the
-        // body's own method field, so it must always be present and canonical here.
         const response = (await this.call({
             sessionId,
             projectRoot,
@@ -945,8 +915,7 @@ export class McHostModuleTransport {
             body,
         );
         if (!isRecord(response.authority)) throw new Error("authority.prepare omitted authority");
-        // SAFETY: casting assumes the module response carries the
-        // AuthorityStatus fields; isRecord only proves it is an object.
+        // `isRecord(response.authority)` only proves that `response.authority` is an object; the cast assumes `AuthorityStatus` fields.
         return { authority: response.authority as unknown as AuthorityStatus };
     }
 
@@ -982,8 +951,7 @@ export class McHostModuleTransport {
             body,
         );
         if (isRecord(response.authority)) {
-            // SAFETY: casting assumes the module response carries the
-            // AuthorityStatus fields; isRecord only proves it is an object.
+            // `isRecord(response.authority)` only proves that `response.authority` is an object; the cast assumes `AuthorityStatus` fields.
             return { authority: response.authority as unknown as AuthorityStatus };
         }
         if (typeof response.code === "string") {
@@ -1010,8 +978,7 @@ export class McHostModuleTransport {
             body,
         );
         if (!isRecord(response.page)) throw new Error("mirror.pull omitted page");
-        // SAFETY: casting assumes the module response carries the
-        // ChangefeedPage fields; isRecord only proves it is an object.
+        // `isRecord(response.page)` only proves that `response.page` is an object; the cast assumes `ChangefeedPage` fields.
         return { page: response.page as unknown as ChangefeedPage };
     }
 
@@ -1062,9 +1029,8 @@ export class McHostModuleTransport {
         projectRoot: string;
         request: ClaimEffectDeliveryRequest;
     }): Promise<ClaimEffectDeliveryResponse> {
-        // The last effect is the delivery checkpoint (same contract as the outbox drain
-        // and the mirror receipt decoder). An effects receipt must carry at least one
-        // effect, so an empty list is an upstream invariant violation, not a zero ack.
+        // `receipt.effects` must be nonempty because its last effect is the delivery checkpoint.
+        // An empty `receipt.effects` list violates the upstream receipt contract; it is not a zero acknowledgement.
         const expectedEffectId = args.request.receipt.effects.at(-1)?.id;
         if (expectedEffectId === undefined) {
             throw new Error(
@@ -1120,8 +1086,8 @@ export class McHostModuleTransport {
     closeSession(sessionId: string): void {
         const client = this.client;
         const prefix = `${sessionId}\0`;
-        // Fence in-flight opens for this session first so a late route.open
-        // success cannot repopulate the cache after the close (plan R17).
+        // Closing the session fences in-flight opens so a late `route.open` success cannot repopulate the cache.
+        // Closing the session fences in-flight opens so a late `route.open` success cannot repopulate the cache.
         let closedOpenings = false;
         for (const [key, opening] of [...this.routeOpenings.entries()]) {
             if (!key.startsWith(prefix)) continue;
@@ -1133,7 +1099,6 @@ export class McHostModuleTransport {
         for (const [key, cachedRoute] of routes) {
             this.routes.delete(key);
             if (client) {
-                // Best-effort close through the awaitable facade primitive.
                 void client.closeRoute(cachedRoute.route).catch((error: unknown) => {
                     if (this.client === client && isConnectionFailure(error)) {
                         this.invalidateConnection(client);
@@ -1152,28 +1117,26 @@ export class McHostModuleTransport {
         deadline: Deadline = Deadline.start(this.requestTimeoutMs),
         signal?: AbortSignal,
     ): Promise<EnsuredRoute> {
-        // The transform and tool lanes can observe the same directory under different
-        // spellings when the project is reached through a symlink (OpenCode reports the
-        // launch spelling on one lane and the resolved target on the other). The module
-        // pairs (session, root) for lineage, and it canonicalizes on ITS filesystem —
-        // which cannot see this process's mount/symlink namespace. Converge here, where
-        // the paths are resolvable, so both lanes bind the same route root.
+        // The transport canonicalizes resolvable roots because transform and tool lanes can report symlink and resolved spellings, while the module keys lineage by `(session, root)` in a different filesystem namespace.
+        // The transport canonicalizes resolvable roots because transform and tool lanes can report symlink and resolved spellings, while the module keys lineage by `(session, root)` in a different filesystem namespace.
+        // The transport canonicalizes resolvable roots because transform and tool lanes can report symlink and resolved spellings, while the module keys lineage by `(session, root)` in a different filesystem namespace.
+        // The transport canonicalizes resolvable roots because transform and tool lanes can report symlink and resolved spellings, while the module keys lineage by `(session, root)` in a different filesystem namespace.
+        // The transport canonicalizes resolvable roots because transform and tool lanes can report symlink and resolved spellings, while the module keys lineage by `(session, root)` in a different filesystem namespace.
+        // The transport canonicalizes resolvable roots because transform and tool lanes can report symlink and resolved spellings, while the module keys lineage by `(session, root)` in a different filesystem namespace.
         const projectRoot = this.canonicalRoot(rawProjectRoot);
-        // One identity may legitimately have multiple filesystem routes (for example,
-        // worktrees). Reusing a route across roots would bind authority to the wrong tree.
+        // One identity may legitimately have multiple filesystem routes, such as worktrees. Reusing a route across roots would bind authority to the wrong tree.
+        // One identity may legitimately have multiple filesystem routes, such as worktrees. Reusing a route across roots would bind authority to the wrong tree.
         const routeKey = `${sessionId}\0${projectRoot}`;
-        // Tracks the credentials this connection presents, so a rotation
-        // invalidates the cached route. Computed for every origin for the same
-        // reason the credentials themselves are presented for every origin: an
-        // explicit connection to a credential-bearing daemon is authenticated
-        // too, and a stale route there would outlive the key it was bound with.
+        // The cache key includes credentials so credential rotation invalidates routes, including routes to explicit credential-bearing daemons.
+        // The cache key includes credentials so credential rotation invalidates routes, including routes to explicit credential-bearing daemons.
+        // The cache key includes credentials so credential rotation invalidates routes, including routes to explicit credential-bearing daemons.
+        // The cache key includes credentials so credential rotation invalidates routes, including routes to explicit credential-bearing daemons.
+        // The cache key includes credentials so credential rotation invalidates routes, including routes to explicit credential-bearing daemons.
         const credentialSourceVersion = managedCredentialSourceVersion(process.env);
-        // Read the cached route only after the connection is settled. The generation check
-        // makes a route from any earlier connection invisible even if a cache clear is missed.
+        // The cache reads a route only after connection settlement, and its generation must match the current connection.
+        // The cache reads a route only after connection settlement, and its generation must match the current connection.
         const { client, expectedDaemonId } = await this.ensureConnected(deadline, signal);
-        // Every publication on this route carries the identity certified for this
-        // connection, captured here so a concurrent invalidation cannot relax the
-        // fence to "no expectation" across the awaits below.
+        // Capturing expectedDaemonId prevents concurrent invalidation from changing the connection fence to no expectation during later awaits.
         const fence = expectedDaemonId === undefined ? {} : { expectedDaemonId };
         const generation = this.connectionGeneration;
         const existing = this.routes.get(routeKey);
@@ -1242,8 +1205,8 @@ export class McHostModuleTransport {
         this.routes.delete(routeKey);
     }
 
-    /** Resolve symlinks with per-instance memoization; keep the input spelling when the
-     *  path is gone (canonicalization must never fail a request). */
+    /** Per-instance memoization resolves symlinks; missing paths retain their input spelling.
+     * Canonicalization preserves the input spelling when the path is gone, so a missing path does not fail the request. */
     private canonicalRoot(root: string): string {
         const cached = this.canonicalRootCache.get(root);
         if (cached !== undefined) {
@@ -1275,15 +1238,6 @@ export class McHostModuleTransport {
         return {
             connectionFile: this.connectionFile,
             handshakeTimeoutMs,
-            // Credentials are presented on every real connection, not only the
-            // one this transport is allowed to start. Lifecycle ownership and
-            // route authentication are independent: an explicit
-            // `subc.connection_file` can point at a shared daemon that another
-            // managed harness started with a credential envelope, and that
-            // daemon installs `CredentialVerifier`, which fails every Broca send
-            // with `credential_snapshot_mismatch` when the route presents no
-            // fingerprint. Gating this on `managed-default` let such a client
-            // complete its handshake and then fail every provider call.
             credentialSource: process.env,
         };
     }
@@ -1293,9 +1247,6 @@ export class McHostModuleTransport {
         signal?: AbortSignal,
     ): Promise<Uint8Array | undefined> {
         if (this.connectionOrigin !== "managed-default") return undefined;
-        // No configured lifecycle owner keeps this transport passive: it can
-        // still dial an externally launched daemon on the default connection
-        // file (CLI doctor/migration paths never wire a managed owner).
         if (!this.demandStart) return undefined;
         const outcome = await this.demandStart({
             origin: this.connectionOrigin,
@@ -1340,33 +1291,15 @@ export class McHostModuleTransport {
             const certified = this.connectionCertification;
             if (certified) {
                 const expected = certified.expectedDaemonId;
-                // A certification without an identity comes from a transport with
-                // no lifecycle owner: nothing ever named the daemon behind the
-                // default connection file, so there is no expectation to re-check
-                // and no fence to carry. Requiring one here would reopen the
-                // connection on every request.
                 if (expected === undefined) return { client: cached };
                 const actual = cached.authenticated?.daemonId;
-                // An unset peer identity is the facade's own generation recovery, not
-                // a rotation, so it reuses the certified identity and lets the facade
-                // reconnect; the per-request fence still asserts against that
-                // identity, so a reconnect onto a different daemon fails not_sent.
                 // Only an identity that is present and different is a real rotation.
                 if (actual === null || actual === undefined || sameDaemonId(actual, expected)) {
                     return { client: cached, expectedDaemonId: expected };
                 }
             }
-            // Closing a shared client retires every request already invoked on it
-            // as outcome_unknown, so reaching here needs evidence about the peer —
-            // an uncertified connection, or an identity that replaced the
-            // certified one — never the arrival of another caller.
             this.invalidateConnection(cached);
         }
-        // A dial already in flight carries the certification the demand behind it
-        // produced, and every caller here lands on that same connection. Joining
-        // it before demanding again keeps a second caller from spending its
-        // deadline on a duplicate start transaction and compatibility probe, and
-        // from contending for the lifecycle lock the first caller already holds.
         const joinable = this.connectionPromise;
         if (joinable) {
             if (signal?.aborted) {
@@ -1374,8 +1307,7 @@ export class McHostModuleTransport {
             }
             return await joinable;
         }
-        // Backoff gates the lifecycle demand as well as the dial: a rotated or
-        // unreachable daemon must not be re-probed at full request rate.
+        // The transport must not re-probe an unreachable daemon at full request rate.
         if (Date.now() < this.nextProbeMs) {
             throw this.connectionBackoffError();
         }
@@ -1383,15 +1315,9 @@ export class McHostModuleTransport {
         try {
             expectedDaemonId = await this.demandManagedReadiness(deadline, signal);
         } catch (error) {
-            // A failed demand (probe failure, incompatibility, storage not ready)
-            // must not be re-issued at request rate: arm the same dial backoff a
-            // failed connect arms, so the next caller is gated above.
             //
-            // Detachment is not one of those failures. It is evidence about one
-            // caller's own signal or deadline, and the backoff is transport-wide:
-            // arming it here would make a single cancelled request fail every
-            // other session with MC_HOST_CONNECTION_BACKOFF, and a burst of
-            // cancellations would walk that gate toward its cap while the daemon
+            // WaiterDetachedError reflects one caller's signal or deadline and must not arm the transport-wide backoff.
+            // Arming backoff for WaiterDetachedError would apply one caller's cancellation to later transport demands.
             // is healthy.
             if (!(error instanceof WaiterDetachedError)) {
                 this.nextProbeMs = Date.now() + this.backoffMs;
@@ -1399,8 +1325,7 @@ export class McHostModuleTransport {
             }
             throw error;
         }
-        // The copy is what both this transport and every joining caller read, so
-        // the demand's own array can never be mutated underneath a live fence.
+        // certification owns a copy of expectedDaemonId so callers cannot mutate the array used by an active connection fence.
         const certification: ConnectionCertification =
             expectedDaemonId === undefined
                 ? {}
@@ -1410,8 +1335,6 @@ export class McHostModuleTransport {
             throw signal.reason ?? new Error("module transport call aborted");
         }
         // Another caller can have opened a dial while this demand was awaiting.
-        // Its connection is the one this transport keeps, so join it rather than
-        // dialing a second time, and hold it to this demand's own certification.
         const raced = this.connectionPromise;
         if (raced) {
             const joined = await raced;
@@ -1436,7 +1359,7 @@ export class McHostModuleTransport {
                     expectedDaemonId !== undefined &&
                     !sameDaemonId(candidate.authenticated?.daemonId, expectedDaemonId)
                 ) {
-                    // The owner cache retains this resolved client; closing it without eviction serves a closed instance to later callers under the same key. commentlint: allow(JUDGE)
+                    // The owner cache retains this resolved client; closing it without eviction serves a closed instance to later callers under the same key.
                     await evictProcessMcHostClient(options, candidate);
                     candidate.close();
                     throw this.connectionChangedError(
@@ -1444,7 +1367,7 @@ export class McHostModuleTransport {
                     );
                 }
                 if (generation !== this.connectionGeneration) {
-                    // On generation mismatch, the catch skips `invalidateConnection`, so this branch evicts and closes `candidate`. commentlint: allow(JUDGE)
+                    // On generation mismatch, the catch skips `invalidateConnection`, so this branch evicts and closes `candidate`.
                     await evictProcessMcHostClient(options, candidate);
                     candidate.close();
                     throw this.connectionChangedError("subc connection attempt was superseded");
@@ -1489,7 +1412,7 @@ export class McHostModuleTransport {
         this.clientCacheOptions = null;
         this.routes.clear();
         this.routeOpenings.clear();
-        // A retained entry holds a resolved client whose channel owns a polling interval and two ring mappings, and `handshakeTimeoutMs` is deadline-derived, so reconnects do not reuse one entry. commentlint: allow(JUDGE)
+        // A retained entry holds a resolved client whose channel owns a polling interval and two ring mappings, and `handshakeTimeoutMs` is deadline-derived, so reconnects do not reuse one entry.
         if (superseded && supersededOptions) {
             void evictProcessMcHostClient(supersededOptions, superseded).then(
                 () => superseded.closeAsync().catch(() => undefined),

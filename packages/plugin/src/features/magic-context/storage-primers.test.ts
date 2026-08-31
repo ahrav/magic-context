@@ -176,7 +176,7 @@ describe("primer candidate storage", () => {
 
     it("updatePrimerAnswer is cache-neutral and does not bump the project epoch", () => {
         const db = freshDb();
-        // Seed an epoch row so a bump would be observable.
+        // The test seeds an epoch row so a bump is observable.
         bumpProjectMemoryEpoch(db, "git:abc");
         const epochBefore = getProjectState(db, "git:abc")?.project_memory_epoch ?? 0;
         const primerId = createPrimer(db, {

@@ -1,26 +1,21 @@
-//! Operation counters and disqualification reason codes. commentlint: allow(JUDGE)
-
 use crate::descriptor::SchedulingMode;
 
-/// Operation counters used to produce disqualification reason codes. commentlint: allow(JUDGE)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OperationCounters {
     /// Transport-body copies.
     pub body_copies: u64,
-    /// Native transport heap allocations.
     pub native_allocations: u64,
     /// Timed-path syscalls.
     pub syscalls: u64,
     /// Park/wake transitions.
     pub park_wakes: u64,
-    /// Generic queue hops. commentlint: allow(JUDGE)
     pub generic_queue_hops: u64,
     /// Scheduler handoffs.
     pub scheduler_handoffs: u64,
 }
 
 impl OperationCounters {
-    /// Returns one reason code for each nonzero forbidden operation. commentlint: allow(JUDGE)
+    /// disqualifications returns one reason code for each nonzero forbidden operation.
     pub fn disqualifications(
         self,
         scheduling: SchedulingMode,

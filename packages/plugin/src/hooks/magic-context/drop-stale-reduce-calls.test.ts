@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 import { describe, expect, it } from "bun:test";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
 import { isSentinel } from "./sentinel";
@@ -36,18 +35,15 @@ describe("dropStaleReduceCalls (frozen-set replay)", () => {
                     makeMessage("user", [makeTextPart("continue")]),
                 ];
 
-                //#when — detect on a cache-busting pass
                 const result = dropStaleReduceCalls(messages, NO_FROZEN, { detect: true });
 
                 //#then
                 expect(result.didDrop).toBe(true);
                 expect(result.newlyStrippedIds).toEqual(["reduce-1"]);
-                // Array length preserved — proxy cache stability invariant
                 expect(messages).toHaveLength(4);
                 expect(messages[0].parts[0]).toEqual(makeTextPart("hello"));
                 expect(messages[1].parts[0]).toEqual(makeTextPart("thinking..."));
                 expect(messages[3].parts[0]).toEqual(makeTextPart("continue"));
-                // The ctx_reduce-only message became a single-sentinel shell
                 expect(messages[2].parts).toHaveLength(1);
                 expect(isSentinel(messages[2].parts[0])).toBe(true);
             });
@@ -125,31 +121,25 @@ describe("dropStaleReduceCalls (frozen-set replay)", () => {
                     makeMessage("tool", [makeToolPart("ctx_reduce", "Queued: drop §5§")], "r-new"),
                 ];
 
-                //#when — protect last 2 messages
                 const result = dropStaleReduceCalls(messages, NO_FROZEN, {
                     detect: true,
                     protectedCount: 2,
                 });
 
-                //#then — only the old reduce call (index 1) is detected + sentineled
                 expect(result.didDrop).toBe(true);
                 expect(result.newlyStrippedIds).toEqual(["r-old"]);
                 expect(messages[1].parts).toHaveLength(1);
                 expect(isSentinel(messages[1].parts[0])).toBe(true);
-                // Protected reduce call stays a real tool_use
                 expect((messages[3].parts[0] as { tool: string }).tool).toBe("ctx_reduce");
             });
         });
     });
 
-    // ── The cache-bust regression: frozen replay vs. moving boundary ──
 
     describe("#given a ctx_reduce call frozen on a prior cache-busting pass", () => {
         describe("#when a later DEFER pass replays with tail growth (detect=false)", () => {
             it("#then re-strips the SAME frozen id and never newly strips a grown-past call", () => {
-                //#given — pass 1 (cache-busting): reduce-1 aged past protection, detected+frozen.
-                // The conversation has since grown so reduce-2, previously protected, now sits
-                // outside a live `messages.length - protectedCount` window.
+                // Two additional turns place `reduce-2` outside the live protection window.
                 const reduce1 = makeMessage(
                     "tool",
                     [makeToolPart("ctx_reduce", "Queued: drop §1§")],
@@ -165,25 +155,23 @@ describe("dropStaleReduceCalls (frozen-set replay)", () => {
                     reduce1,
                     makeMessage("assistant", [makeTextPart("b")], "a-b"),
                     reduce2,
-                    // tail grew by two turns since reduce-2 was protected
                     makeMessage("user", [makeTextPart("c")], "u-c"),
                     makeMessage("assistant", [makeTextPart("d")], "a-d"),
                 ];
                 const frozen = new Set<string>(["reduce-1"]);
 
-                //#when — DEFER pass: detect MUST be false, only the frozen set replays
+                // With detect: false, only frozen IDs replay.
                 const result = dropStaleReduceCalls(messages, frozen, {
                     detect: false,
                     protectedCount: 2,
                 });
 
-                //#then — reduce-1 is re-stripped (frozen); reduce-2 is UNTOUCHED even though a
-                // live moving boundary would have stripped it → no mid-prefix defer-pass bust.
+                // Defer passes strip only ids in the frozen set.
+                // Defer passes do not strip newly aged unfrozen calls.
                 expect(result.didDrop).toBe(true);
                 expect(result.newlyStrippedIds).toEqual([]);
                 expect(messages[1].parts).toHaveLength(1);
                 expect(isSentinel(messages[1].parts[0])).toBe(true);
-                // reduce-2 still a real tool_use — the bug-free invariant
                 expect((messages[3].parts[0] as { tool: string }).tool).toBe("ctx_reduce");
             });
         });
@@ -200,13 +188,11 @@ describe("dropStaleReduceCalls (frozen-set replay)", () => {
                     makeMessage("user", [makeTextPart("z")], "u-z"),
                 ];
 
-                //#when — execute pass detects r-1
                 const executeMsgs = buildMessages();
                 const exec = dropStaleReduceCalls(executeMsgs, NO_FROZEN, {
                     detect: true,
                     protectedCount: 2,
                 });
-                // defer pass: caller has persisted the frozen id, detect=false
                 const frozen = new Set<string>(exec.newlyStrippedIds);
                 const deferMsgs = buildMessages();
                 const defer = dropStaleReduceCalls(deferMsgs, frozen, {
@@ -214,7 +200,6 @@ describe("dropStaleReduceCalls (frozen-set replay)", () => {
                     protectedCount: 2,
                 });
 
-                //#then — same id frozen, both produce a sentinel shell at index 1
                 expect(exec.newlyStrippedIds).toEqual(["r-1"]);
                 expect(exec.didDrop).toBe(true);
                 expect(defer.didDrop).toBe(true);
@@ -230,7 +215,6 @@ describe("dropStaleReduceCalls (frozen-set replay)", () => {
     describe("#given a frozen id no longer present (compaction trimmed it)", () => {
         describe("#when replaying on a defer pass", () => {
             it("#then it is a safe no-op", () => {
-                //#given — frozen set references an id not in the current array
                 const messages = [
                     makeMessage("user", [makeTextPart("hello")], "u-1"),
                     makeMessage("assistant", [makeTextPart("world")], "a-1"),
@@ -269,7 +253,6 @@ describe("dropStaleReduceCalls (frozen-set replay)", () => {
                     protectedCount: 1,
                 });
 
-                //#then — untouched, not reported
                 expect(result.didDrop).toBe(false);
                 expect(result.newlyStrippedIds).toEqual([]);
                 expect((noId.parts[0] as { tool: string }).tool).toBe("ctx_reduce");
@@ -280,7 +263,6 @@ describe("dropStaleReduceCalls (frozen-set replay)", () => {
     describe("#given an already-sentineled message in the frozen set", () => {
         describe("#when replayed again", () => {
             it("#then it is idempotent (no new mutation)", () => {
-                //#given — message already a sentinel shell from a prior pass
                 const messages = [
                     makeMessage("tool", [{ type: "text", text: "" }], "r-1"),
                     makeMessage("user", [makeTextPart("hello")], "u-1"),

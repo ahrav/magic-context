@@ -26,8 +26,8 @@ use napi_buffers::ExternalRef;
 
 const PROFILE: &str = mc_shm_transport::profile::MC_HOST_RING_PROFILE;
 
-/// The one bounded, redacted failure every malformed raw descriptor maps
-/// to. Grant bytes, pids, fds, and key names never reach error messages.
+/// Malformed raw descriptors always return this bounded, redacted error.
+/// Grant bytes, PIDs, FDs, and key names never reach error messages.
 const DESCRIPTOR_ERROR: &str = "invalid shared-memory descriptor";
 
 #[napi(object)]
@@ -62,8 +62,8 @@ struct Channel {
     // every reservation that borrows `to_host` is dropped before `to_host`.
     producers: HashMap<u32, ActiveProducer>,
     active: HashMap<u32, ActiveLease>,
-    // Aliases whose detachment failed; retained so the channel entry (and its
-    // mapping) stays alive while a JS view may still be attached.
+    // The channel retains aliases whose detachment failed.
+    // The channel entry and its shared-memory mapping stay alive while a JS view may remain attached.
     stranded: Vec<ExternalRef>,
     to_host: Box<Ring>,
     from_host: Ring,
@@ -77,11 +77,9 @@ struct Channel {
     _reservation: Option<GrantReservation>,
 }
 
-/// Process-wide claim on the encoded grants backing live channels.
+/// `GrantReservation` claims encoded grants process-wide while channels are live.
 ///
-/// Attachment exclusivity must span worker threads: each thread consults its
-/// own `REGISTRY`, but every thread maps the same shared memory, so a grant
-/// active on any thread is a concurrently duplicated descriptor on all of
+/// Each thread has its own `REGISTRY`; `ACTIVE_GRANTS` rejects grants already claimed by another thread.
 /// them.
 static ACTIVE_GRANTS: Mutex<BTreeSet<Vec<u8>>> = Mutex::new(BTreeSet::new());
 
@@ -136,9 +134,8 @@ fn descriptor_error() -> Error {
     error(DESCRIPTOR_ERROR)
 }
 
-/// Swallows a JavaScript exception thrown by a hostile accessor or Proxy
-/// trap during a raw property read, so the bounded descriptor error — not
-/// provider-authored text — is what reaches the caller.
+/// `clear_pending_exception` swallows JavaScript exceptions from hostile accessors and Proxy traps during raw property reads.
+/// The caller receives the bounded descriptor error instead of provider-authored exception text.
 fn clear_pending_exception(env: &Env) {
     let mut pending = false;
     // SAFETY: env is the current environment.
@@ -156,8 +153,8 @@ fn cleared_descriptor_error(env: &Env) -> Error {
     descriptor_error()
 }
 
-/// Reads one raw property exactly once. Missing/undefined properties and
-/// throwing getters both map to the bounded descriptor error.
+/// The function reads each raw property exactly once.
+/// Missing or undefined properties and throwing getters return the bounded descriptor error.
 fn descriptor_field<'env>(env: &Env, object: &Object<'env>, name: &str) -> Result<Unknown<'env>> {
     match object.get::<Unknown<'env>>(name) {
         Ok(Some(value)) => Ok(value),
@@ -166,11 +163,10 @@ fn descriptor_field<'env>(env: &Env, object: &Object<'env>, name: &str) -> Resul
     }
 }
 
-/// Decodes one raw numeric field without N-API numeric narrowing: the
-/// value must already be a JavaScript number whose exact double is a
-/// non-negative-zero integer inside `[min, max]`. `NaN`, infinities,
-/// fractions, `-0`, and out-of-range values are all rejected before any
-/// truncating cast exists.
+/// The decoder avoids N-API numeric narrowing.
+/// The decoder accepts only a JavaScript number whose exact double is a non-negative-zero integer in `[min, max]`.
+/// The decoder rejects `NaN`, infinities, fractions, `-0`, and out-of-range values.
+/// The decoder rejects invalid values before any truncating cast.
 fn integer_field(env: &Env, object: &Object<'_>, name: &str, min: f64, max: f64) -> Result<f64> {
     let value = descriptor_field(env, object, name)?;
     if value
@@ -193,8 +189,7 @@ fn integer_field(env: &Env, object: &Object<'_>, name: &str, min: f64, max: f64)
     Ok(number)
 }
 
-/// Decodes one raw string field, bounding its length BEFORE materializing
-/// it so a hostile oversized string is rejected without allocation.
+/// The decoder rejects an oversized hostile string without allocating its contents.
 fn string_field(env: &Env, object: &Object<'_>, name: &str, max_len: usize) -> Result<String> {
     let value = descriptor_field(env, object, name)?;
     if value
@@ -259,8 +254,7 @@ fn cleanup_created_refs(
 ) -> Result<()> {
     if napi_buffers::detach_all(env, &buffers).is_err() {
         // A failed detach leaves JS views possibly attached to ring memory.
-        // The references move into `stranded` so their lifetime records (and
-        // the channel entry holding the mapping) survive until a later
+        // The references move into `stranded` so their lifetime records and the channel entry holding the mapping survive until a later detachment succeeds.
         // detachment succeeds.
         ring.enter_quarantine();
         stranded.extend(buffers);
@@ -275,9 +269,7 @@ fn cleanup_created_refs(
     Ok(())
 }
 
-// Retries detachment of aliases stranded by an earlier failed cleanup. Entries
-// leave `stranded` only once detachment succeeds, so the channel stays
-// registered while any alias may still be attached.
+// `stranded` entries keep the channel registered until detachment succeeds.
 fn detach_stranded(env: &Env, channel: &mut Channel) -> Result<()> {
     if channel.stranded.is_empty() {
         return Ok(());
@@ -356,7 +348,7 @@ fn close_channel(env: &Env, channel: &mut Channel) -> Result<()> {
 
 fn quarantine_channel(env: &Env, channel: &mut Channel) -> Result<()> {
     channel.closed = true;
-    // The quarantine retains the mapping, not the peer. Holding `setup` keeps the host's connection permit and both rings for the process lifetime. commentlint: allow(JUDGE)
+    // The quarantine retains the mapping, not the peer. Holding `setup` keeps the host's connection permit and both rings for the process lifetime.
     if let Some(mut setup) = channel.setup.take() {
         setup::goodbye(&mut setup);
     }
@@ -391,13 +383,11 @@ fn cleanup_env(raw_env: usize) {
         if let Ok(mut registry) = registry.try_borrow_mut() {
             registry.channels.retain(|_, channel| {
                 if close_channel(&env, channel).is_err() {
-                    // Env teardown offers no later retry, so a failed close
-                    // leaves both directions' alias state unknown.
+                    // Env teardown offers no later retry, so a failed close leaves both directions' alias state unknown.
                     channel.to_host.enter_quarantine();
                     channel.from_host.enter_quarantine();
                 }
-                // Same retention rule as close: only alias-free channels may
-                // drop their mapping.
+                // Only alias-free channels may drop their mapping.
                 !(channel.producers.is_empty()
                     && channel.active.is_empty()
                     && channel.stranded.is_empty())
@@ -495,10 +485,7 @@ pub fn active_channel_count() -> Result<u32> {
 pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
     {
         const GRANT_HEX_LEN: usize = RingGrant::encoded_len() * 2;
-        // The argument is decoded as a RAW value — before any bindgen
-        // numeric narrowing or property coercion — and every check below
-        // runs before the first fd open, mapping, prefault, or registry
-        // insertion, so a rejected descriptor has zero side effects.
+        // `Unknown` bypasses bindgen numeric narrowing and property coercion; validation precedes fd opens, mappings, prefaulting, and registry insertion.
         if descriptor.get_type().map_err(|_| descriptor_error())? != ValueType::Object {
             return Err(descriptor_error());
         }
@@ -532,15 +519,11 @@ pub fn attach(env: &Env, descriptor: Unknown<'_>) -> Result<u32> {
             .ok_or_else(descriptor_error)?,
         )
         .map_err(|_| descriptor_error())?;
-        // Both directions form one duplex pair over two distinct backing
-        // objects; an aliased fd or grant collapses them onto one ring.
+        // Both directions form one duplex pair over two distinct backing objects; an aliased fd or grant collapses them onto one ring.
         if host_to_peer_fd == peer_to_host_fd || host_to_peer_grant == peer_to_host_grant {
             return Err(descriptor_error());
         }
-        // Exclusive active attachment: a grant already backing a live
-        // channel anywhere in this process is a replayed or concurrently
-        // duplicated descriptor. The claim is process-wide because worker
-        // threads each hold their own `REGISTRY` yet map the same memory.
+        // A grant backing a live channel anywhere in this process is a replayed or concurrently duplicated descriptor because worker threads use separate `REGISTRY` instances for the same memory.
         let reservation = GrantReservation::claim(
             host_to_peer_grant.encode().to_vec(),
             peer_to_host_grant.encode().to_vec(),
@@ -581,7 +564,7 @@ pub fn connect_setup(env: &Env, options: NativeSetupOptions) -> Result<u32> {
         Duration::from_millis(u64::from(options.timeout_ms)),
     )
     .map_err(|failure| {
-        // `setup::connect` reports identity mismatch as its only `PermissionDenied` failure, so the kind alone selects the message. commentlint: allow(JUDGE)
+        // `setup::connect` reports identity mismatch as its only `PermissionDenied` failure, so the kind alone selects the message.
         if failure.kind() == std::io::ErrorKind::PermissionDenied {
             error("shared-memory identity mismatch")
         } else {
@@ -748,8 +731,7 @@ pub fn produce(
             return Err(build_error);
         }
         let written = fill.call(views);
-        // The callback error carries the actionable diagnosis; a cleanup
-        // failure is appended rather than replacing it.
+        // The callback appends cleanup failures to preserve its error.
         if let Err(cleanup_error) =
             cleanup_created_refs(env, &channel.to_host, &mut channel.stranded, refs)
         {
@@ -836,8 +818,7 @@ pub fn reserve(
             },
         );
         if let Err(callback_error) = deliver.call(FnArgs::from((token, views))) {
-            // The callback error carries the actionable diagnosis; a cleanup
-            // failure is appended rather than replacing it.
+            // The callback appends cleanup failures to preserve its error.
             match detach_producer(env, channel, token) {
                 Ok(reservation) => reservation.abort(),
                 Err(cleanup_error) => {
@@ -1019,8 +1000,7 @@ pub fn poll(
             }
             Ok::<(), Error>(())
         });
-        // The callback error carries the actionable diagnosis; a cleanup
-        // failure is appended rather than replacing it.
+        // The callback appends cleanup failures to preserve its error.
         if let Err(cleanup_error) = cleanup {
             return Err(Error::new(
                 Status::GenericFailure,
@@ -1046,7 +1026,7 @@ pub fn release(env: &Env, channel_id: u32, token: u32) -> Result<()> {
     })
 }
 
-/// A full ring is ordinary backpressure, so it carries a distinct message the caller can classify as retryable instead of terminal. commentlint: allow(JUDGE)
+/// A full ring is ordinary backpressure, so it carries a distinct message the caller can classify as retryable instead of terminal.
 fn reservation_error(failure: ProducerError) -> Error {
     match failure {
         ProducerError::Exhausted | ProducerError::Deadline => error("shared-memory ring is full"),
@@ -1082,11 +1062,10 @@ pub fn close(env: &Env, channel_id: u32) -> Result<()> {
             .get_mut(&channel_id)
             .ok_or_else(|| error("native channel is closed"))?;
         let result = close_channel(env, channel);
-        // The entry is removed once no tracked alias remains, even if
-        // reference deletion or release reporting failed. A detach failure
-        // leaves its token or stranded alias behind, and the entry must then
-        // stay registered so the mapping outlives the still-attached JS
-        // views; a later close retries the detachment.
+        // The registry removes the entry when no tracked aliases remain, even if reference deletion or release reporting fails.
+        // A failed detach leaves a token or stranded alias in the registry.
+        // The entry remains registered while attached JS views require its mapping.
+        // A later close retries detachment while JS views may remain attached.
         if channel.producers.is_empty() && channel.active.is_empty() && channel.stranded.is_empty()
         {
             registry.channels.remove(&channel_id);
@@ -1106,7 +1085,6 @@ pub fn force_close(env: &Env, channel_id: u32) -> Result<()> {
             .get_mut(&channel_id)
             .ok_or_else(|| error("native channel is closed"))?;
         let result = quarantine_channel(env, channel);
-        // Same retention rule as close: only alias-free channels may drop
         // their mapping.
         if channel.producers.is_empty() && channel.active.is_empty() && channel.stranded.is_empty()
         {

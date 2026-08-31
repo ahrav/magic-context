@@ -1,37 +1,29 @@
 /**
- * In-memory migration of the legacy v1 dreamer config shape to the Dreamer v2
- * per-task shape (shared OpenCode + Pi; runs on every config load, like
- * migrate-experimental). Doctor performs the on-disk equivalent.
+ * The loader migrates v1 dreamer configs to v2 in memory.
  *
- * v1 shape (any subset):
+ * A v1 dreamer block may contain any subset of these fields.
  *   dreamer: {
- *     schedule: "02:00-06:00",            // a TIME WINDOW
- *     tasks: ["consolidate","verify"],    // an ARRAY of agentic task names
+ * The legacy schedule is a time window.
+ * The legacy `tasks` field lists task names.
  *     task_timeout_minutes: 20,
  *     max_runtime_minutes: 120,
- *     user_memories: { enabled, promotion_threshold },
- *     pin_key_files: { enabled, token_budget, min_reads },
  *   }
  *
  * v2 shape:
  *   dreamer: {
- *     tasks: { <task>: { schedule: "<cron>"|"", model?, timeout_minutes?, ... } }
+ * Each v2 task stores its schedule and optional task settings.
  *   }
  *
- * Rules (see dreamer-v2-AB-spec.md):
- *  - Base cron derived from the WINDOW START: "02:00-06:00" → "0 2 * * *".
- *  - Legacy `tasks` array PRESENT → it is the user's deliberate selection: each
- *    LISTED agentic task gets the base cron; each OMITTED canonical task gets ""
- *    (disabled). Built-in defaults are used ONLY when `tasks` is absent.
- *  - user_memories.enabled false → review-user-memories "" ; true → base cron
- *    (promotion_threshold carried). A legacy pin_key_files block is dropped
- *    (key-files pinning moved out of Magic Context).
- *  - classify-memories is NEW in v2 and defaults ON daily at 06:00, unless the
- *    whole dreamer block is disabled.
- *  - evaluate-smart-notes → base cron (it always ran on pending notes).
- *  - task_timeout_minutes → each task's timeout_minutes default; max_runtime_minutes dropped.
- *  - Object-shaped A+B configs carrying retired memory task keys are folded into
- *    verify + curate before schema parsing strips unknown keys.
+ * The migration derives the base cron from the window start.
+ * The migration treats a present legacy `tasks` array as the selected task set.
+ * The migration assigns listed tasks the base cron and omitted canonical tasks an empty schedule.
+ * The migration uses built-in defaults only when `tasks` is absent.
+ * The migration disables `review-user-memories` when `user_memories.enabled` is false and otherwise assigns the base cron.
+ * The migration carries `promotion_threshold` and drops `pin_key_files`.
+ * The migration schedules `classify-memories` daily at 06:00 unless the dreamer block is disabled.
+ * The migration assigns `evaluate-smart-notes` the base cron.
+ * The migration uses `task_timeout_minutes` as each task's default `timeout_minutes` and drops `max_runtime_minutes`.
+ * The migration folds retired memory task keys into `verify` and `curate` before schema parsing strips them.
  */
 
 const OLD_VERIFY_TASK = "verify";
@@ -58,8 +50,8 @@ const DEFAULT_CLASSIFY_CRON = "0 6 * * *";
 const DEFAULT_RETROSPECTIVE_CRON = "0 5 * * *";
 const DEFAULT_VERIFY_BROAD_CRON = "0 4 * * 0"; // weekly — replaces the old broad_interval_days cadence
 
-/** "02:00-06:00" → "0 2 * * *". Falls back to the default base cron on any
- *  unparseable window (never throws — config migration is fail-open). */
+/**
+ * `windowToCron` returns the default cron instead of throwing so config migration continues. */
 function windowToCron(schedule: unknown): string {
     if (typeof schedule !== "string") return DEFAULT_BASE_CRON;
     const m = /^(\d{1,2}):(\d{2})\s*-/.exec(schedule.trim());
@@ -103,10 +95,8 @@ function withoutBroadInterval(entry: Record<string, unknown>): Record<string, un
     return rest;
 }
 
-/** Surgical reconcile for an already-v2 tasks-object config (no legacy keys):
- *  backfill `verify-broad` (coupled to verify's enabled state) and strip the
- *  dead `broad_interval_days` from every task. Returns rawConfig UNCHANGED when
- *  nothing needs touching (so an already-reconciled config is a stable no-op /
+/**
+ * `reconcileV2TasksObject` backfills `verify-broad` from `verify`'s enabled state and removes `broad_interval_days`.
  *  idempotent). */
 function reconcileV2TasksObject(
     rawConfig: Record<string, unknown>,
@@ -117,7 +107,6 @@ function reconcileV2TasksObject(
     const hasBroadIntervalAnywhere = Object.values(tasksObject).some(
         (v) => asObject(v) && "broad_interval_days" in (v as Record<string, unknown>),
     );
-    // key-files was removed (feature moved to AFT); strip any stale task entry.
     const hasStaleKeyFiles = "key-files" in tasksObject;
     if (hasVerifyBroad && !hasBroadIntervalAnywhere && !hasStaleKeyFiles) return rawConfig;
 
@@ -157,18 +146,10 @@ export function migrateDreamerV2(
             "task_timeout_minutes" in dreamer ||
             "max_runtime_minutes" in dreamer;
         if (!hasLegacyOutsideTasks) {
-            // Already a v2 tasks-object, no legacy keys → only a SURGICAL touch-up
-            // is needed (don't reshape an otherwise-valid config): add a
-            // `verify-broad` task coupled to verify's enabled state, and strip the
-            // dead `broad_interval_days` knob. Without this, a user who DISABLED
-            // verify but never wrote verify-broad gets Zod's default `0 4 * * 0`
-            // and unintended weekly full-pool LLM verification.
             return reconcileV2TasksObject(rawConfig, dreamer, tasksObject);
         }
     }
 
-    // Nothing legacy to migrate (no window/array/blocks) → leave as-is; the
-    // schema default fills `tasks`.
     const hasLegacy =
         "schedule" in dreamer ||
         Array.isArray(dreamer.tasks) ||
@@ -225,9 +206,7 @@ export function migrateDreamerV2(
             });
         }
 
-        // The old internal broad cadence becomes its own task. If verify is
-        // enabled (broad used to run inside it), default verify-broad ON weekly;
-        // if verify is disabled, leave verify-broad disabled.
+        // The migration enables `verify-broad` weekly when `verify` is enabled.
         if (!tasks["verify-broad"]) {
             const verifyEnabled =
                 typeof tasks.verify?.schedule === "string" && tasks.verify.schedule.trim() !== "";
@@ -265,9 +244,8 @@ export function migrateDreamerV2(
             }
         }
     } else {
-        // Agentic memory maintenance: array present → old verify enables verify,
-        // old consolidate/improve/archive-stale enable curate; array absent →
-        // historical default suite on.
+        // Any `OLD_CURATE_TASKS` member in `dreamer.tasks` enables `curate`.
+        // Omitting `dreamer.tasks` enables `verify` and `curate`.
         const legacyArray = Array.isArray(dreamer.tasks)
             ? (dreamer.tasks as unknown[]).filter((t): t is string => typeof t === "string")
             : null;
@@ -295,14 +273,10 @@ export function migrateDreamerV2(
         });
     }
 
-    // map-memories (one-time backfill) defaults on so it prepares verify; gated
-    // by "unmapped memories exist", so it drains then no-ops.
     tasks["map-memories"] ??= withTimeout({ schedule: baseCron });
 
-    // evaluate-smart-notes always ran post-suite on pending notes.
     tasks["evaluate-smart-notes"] ??= withTimeout({ schedule: baseCron });
 
-    // review-user-memories ← user_memories block (default enabled in v1).
     const um = asObject(dreamer.user_memories);
     const umEnabled = um ? um.enabled !== false : true;
     if (um || !tasks["review-user-memories"]) {
@@ -315,12 +289,7 @@ export function migrateDreamerV2(
         });
     }
 
-    // key-files was removed (the feature moved to AFT's dreamer): any legacy
-    // pin_key_files block is simply dropped below with the other retired keys —
-    // no key-files task is emitted.
 
-    // Build the new dreamer block: keep agent-config keys (model, disable, etc.),
-    // drop the retired scheduling keys, add the tasks record.
     const {
         schedule: _schedule,
         tasks: _tasks,

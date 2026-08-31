@@ -1,8 +1,6 @@
-# Test isolation: force the shared cortexkit DB onto a throwaway temp dir for the
-# whole test process so NO cli test can read or migrate the user's real shared
-# database (shared with OpenCode + Pi). The CLI imports plugin storage via
-# @magic-context/core, so a bare openDatabase() here would otherwise hit the live
-# DB. resolveDatabasePath() also has a NODE_ENV=test backstop; this keeps the
-# redirect canonical. See packages/plugin/test-preload.ts for the full rationale.
+# The preload redirects cortexkit's shared database to a temporary directory so CLI tests cannot read or migrate the user's database.
+# The CLI imports plugin storage through @magic-context/core.
+# A bare openDatabase() call would otherwise resolve the live database path.
+# resolveDatabasePath() also redirects when NODE_ENV=test.
 [test]
 preload = ["../plugin/test-preload.ts"]

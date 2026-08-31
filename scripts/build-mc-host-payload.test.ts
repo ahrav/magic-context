@@ -257,11 +257,9 @@ describe("payload package metadata", () => {
     });
 
     test("the committed fail-closed gate passes drift but blocks publication", () => {
-        // `runCheck` is the drift lane (`release:payload:check`), which runs on
-        // every change. The committed gate records a live npm audit that is
-        // honestly fail-closed between releases, so asserting readiness here
-        // would leave the drift signal permanently red and unable to catch a
-        // hand-edited gate. Readiness is asserted where bytes get published.
+        // `runCheck` is the drift lane (`release:payload:check`).
+        // The committed gate's live npm audit fails closed between releases.
+        // Asserting readiness in `runCheck` would keep the drift signal red and hide hand-edited gates.
         const root = freshRoot();
         expect(() => runCheck(root, { write: false })).not.toThrow();
         expect(() =>
@@ -551,9 +549,7 @@ describe("staged payload verification", () => {
         writeFileSync(launcher, bytes);
         manifest.files[0].size = Buffer.byteLength(bytes);
         manifest.files[0].sha256 = sha256Hex(bytes);
-        // A staged tree that contradicts its own manifest's declared mode is
-        // not a valid starting point for the drift cases below: the mode check
-        // would fire first and mask the mutation each one targets.
+        // The drift tests require a tree whose declared mode matches its manifest; otherwise the mode check masks each test's intended mutation.
         chmodSync(launcher, Number.parseInt(manifest.files[0].mode, 8));
         return root;
     }
@@ -571,13 +567,12 @@ describe("staged payload verification", () => {
         const root = stage(manifest, "mc-host\n");
         const launcher = join(root, LAUNCHER_PATH);
         expect(() => verifyPayloadDir(root, manifest)).not.toThrow();
-        // Right bytes, wrong permissions: a launcher staged non-executable
-        // still carries the manifest digest that certifies the tree.
+        // A non-executable launcher retains its content digest, so the mode check detects the mutation.
         chmodSync(launcher, 0o644);
         expect(() => verifyPayloadDir(root, manifest)).toThrow(
             /mode drift \(644 != 755\)/,
         );
-        // Over-permissive fails the same way; the manifest names one mode.
+        // An over-permissive launcher fails because the manifest declares exactly one mode.
         chmodSync(launcher, 0o777);
         expect(() => verifyPayloadDir(root, manifest)).toThrow(
             /mode drift \(777 != 755\)/,
@@ -1134,8 +1129,7 @@ describe("production payload assembly", () => {
 });
 
 describe("dev payload build", () => {
-    // `process.platform` reads "linux" on musl systems too, so the only signal
-    // separating them is whether the running process is glibc-linked.
+    // On Linux, `process.platform` is `"linux"` for both glibc and musl; the running process's glibc linkage distinguishes them.
     function withReportHeader<T>(header: unknown, body: () => T): T {
         const host = process as unknown as { report?: unknown };
         const original = host.report;
@@ -1160,8 +1154,8 @@ describe("dev payload build", () => {
         expect(withReportHeader({ glibcVersionRuntime: "2.28" }, () => hostTarget().target)).toBe(
             "linux-x64-gnu",
         );
-        // A musl host reports no runtime glibc version. Selecting linux-x64-gnu
-        // anyway would stamp a musl-linked launcher with the glibc floor.
+        // A musl host reports no runtime glibc version.
+        // On a musl host, selecting `linux-x64-gnu` stamps a musl-linked launcher with the glibc floor.
         expect(() => withReportHeader({}, () => hostTarget())).toThrow(/not glibc-linked/);
         expect(() => withReportHeader(undefined, () => hostTarget())).toThrow(
             /not glibc-linked/,

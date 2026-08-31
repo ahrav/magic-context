@@ -4,16 +4,9 @@ import { createRequire } from "node:module";
 import { dirname, join, sep } from "node:path";
 
 /**
- * Detects whether the local-embedding native runtime (`onnxruntime-node`) is
- * actually present and usable in an installed plugin tree.
  *
- * Why this check exists (issue #128): the plugin's `@huggingface/transformers`
- * Node entry does a STATIC `import "onnxruntime-node"`. When that package — or
- * its platform-specific native binary — failed to install (seen on Windows when
- * the binary download is interrupted), the import throws
- * `Cannot find package 'onnxruntime-node'` on EVERY embedding attempt, and the
- * runtime can only degrade. Doctor surfaces it ahead of time with an actionable
- * fix instead of leaving users to decode the cryptic resolver error.
+ * `@huggingface/transformers` statically imports `onnxruntime-node`; a missing package prevents it from loading.
+ * The import fails before local embeddings run.
  */
 
 export type LocalEmbeddingRuntimeStatus =
@@ -121,7 +114,7 @@ function parseOnnxProbeVerdict(output: string): { ok: boolean; reason?: string }
                 };
             }
         } catch {
-            // Keep scanning; native loaders may print extra lines before the verdict.
+            // The parser keeps scanning because native loaders can print lines before the verdict.
         }
     }
     return null;
@@ -204,10 +197,8 @@ export function formatLocalEmbeddingRuntimeDoctorWarning(
 }
 
 /**
- * Maps `process.platform`/`process.arch` to onnxruntime-node's on-disk binary
- * layout: `bin/napi-v6/<platform>/<arch>/onnxruntime_binding.node`. The dir
- * names match Node's platform/arch tokens directly (linux/darwin/win32,
- * x64/arm64), so no translation is needed beyond filtering to what ships.
+ * `onnxruntime-node` stores its native binary at `bin/napi-v6/<platform>/<arch>/onnxruntime_binding.node`.
+ * The package uses Node's platform and architecture tokens: `linux`, `darwin`, `win32`, `x64`, and `arm64`.
  */
 function expectedBinaryRelPath(platform: NodeJS.Platform, arch: string): string | null {
     const supportedPlatform = platform === "linux" || platform === "darwin" || platform === "win32";
@@ -217,8 +208,7 @@ function expectedBinaryRelPath(platform: NodeJS.Platform, arch: string): string 
 }
 
 /**
- * Check a single install root (the directory that owns `node_modules`) for a
- * usable onnxruntime-node. `npm`/Bun hoist transitive deps, so the package lands
+ * `npm` and Bun can hoist transitive dependencies into a candidate root's `node_modules`.
  * at `<installRoot>/node_modules/onnxruntime-node`.
  */
 export function checkLocalEmbeddingRuntimeAt(
@@ -232,8 +222,6 @@ export function checkLocalEmbeddingRuntimeAt(
     }
     const rel = expectedBinaryRelPath(platform, arch);
     if (rel === null) {
-        // Unknown platform/arch — the package is present, but a direct package
-        // load can still prove whether its own native-loader path works.
         return probeOnnxRuntimeNodeLoad(packageDir) ?? { state: "ok", binaryPath: packageDir };
     }
     const binaryPath = join(packageDir, rel);
@@ -244,10 +232,7 @@ export function checkLocalEmbeddingRuntimeAt(
 }
 
 /**
- * Check across candidate install roots (a plugin can be cached under
- * `@pkg@latest/...` or `@pkg/...`). Returns the first `ok`; otherwise the first
- * informative failure; `unknown` only when no candidate root even exists (we
- * can't introspect the install, so we stay silent rather than false-alarm).
+ * Plugin caches can be stored under either `@pkg@latest/...` or `@pkg/...`.
  */
 export function checkLocalEmbeddingRuntime(
     installRoots: string[],
@@ -270,9 +255,8 @@ export function checkLocalEmbeddingRuntime(
     return firstFailure ?? { state: "unknown", reason: "no candidate roots" };
 }
 
-/** Slice a resolved module path back to its package directory (the dir that
- *  owns `node_modules/<pkg>`), so we can locate the platform binary relative to
- *  it regardless of how deep the resolved entry (`dist/index.js`) sits. */
+/**
+ * The resolved entry can be nested, such as `dist/index.js`. */
 function packageDirFromResolved(resolvedPath: string, packageName: string): string {
     const marker = `node_modules${sep}${packageName.split("/").join(sep)}`;
     const idx = resolvedPath.indexOf(marker);
@@ -280,23 +264,8 @@ function packageDirFromResolved(resolvedPath: string, packageName: string): stri
 }
 
 /**
- * Resolution-based variant for harnesses whose install layout is NOT a single
- * deterministic `<root>/node_modules/onnxruntime-node` (Pi: dev-path bun
- * workspace, npm-hoisted user/project install, or pnpm strict store — verified
- * empirically that the physical path differs across all three). Instead of
- * guessing a path, it asks Node's resolver exactly as the plugin would at
- * runtime: resolve onnxruntime-node FROM the installed plugin dir, then locate
- * the platform binary relative to the resolved package.
  *
- * Two resolution attempts, both layout-agnostic:
- *   A. resolve `onnxruntime-node` directly from the plugin (works when hoisted
- *      or visible to the plugin — npm/bun default).
- *   B. resolve `@huggingface/transformers` (a direct plugin dep that OWNS
- *      onnxruntime-node), then resolve onnxruntime-node from THERE — covers
- *      pnpm-strict where the transitive dep isn't visible to the plugin itself.
  *
- * Returns `unknown` (caller stays SILENT) when the plugin dir doesn't exist or
- * neither resolution succeeds in a way we can introspect — never a false alarm.
  */
 export function checkLocalEmbeddingRuntimeByResolution(
     pluginDir: string,
@@ -312,27 +281,20 @@ export function checkLocalEmbeddingRuntimeByResolution(
     try {
         const reqPlugin = createRequire(join(pluginDir, "package.json"));
         try {
-            // A: direct (hoisted / bun / npm)
             onnxDir = packageDirFromResolved(
                 reqPlugin.resolve("onnxruntime-node"),
                 "onnxruntime-node",
             );
         } catch {
-            // B: through the transformers package that owns it (pnpm strict)
             const tfResolved = reqPlugin.resolve("@huggingface/transformers");
             const tfDir = packageDirFromResolved(tfResolved, "@huggingface/transformers");
             const reqTf = createRequire(join(tfDir, "package.json"));
             onnxDir = packageDirFromResolved(reqTf.resolve("onnxruntime-node"), "onnxruntime-node");
         }
     } catch (error) {
-        // Read `.code` directly off the thrown object — do NOT gate on
-        // `instanceof Error`: Bun's resolver throws a `ResolveMessage` that is
-        // NOT an Error instance (code "MODULE_NOT_FOUND"), Node throws
-        // "ERR_MODULE_NOT_FOUND" (ESM) / "MODULE_NOT_FOUND" (CJS createRequire).
+        // Bun's resolver can throw a non-`Error` `ResolveMessage` with code `MODULE_NOT_FOUND`.
+        // Node uses `ERR_MODULE_NOT_FOUND` for ESM and `MODULE_NOT_FOUND` for CJS `createRequire`.
         resolveError = (error as { code?: string } | null)?.code;
-        // onnxruntime-node genuinely not resolvable from the installed plugin =
-        // the #128 missing-package case (only meaningful because we confirmed
-        // the plugin dir exists above).
         if (resolveError === "ERR_MODULE_NOT_FOUND" || resolveError === "MODULE_NOT_FOUND") {
             return {
                 state: "package-missing",
@@ -351,8 +313,7 @@ export function checkLocalEmbeddingRuntimeByResolution(
 
     const rel = expectedBinaryRelPath(platform, arch);
     if (rel === null) {
-        // Unknown platform/arch — package resolves, but a direct package load can
-        // still prove whether its own native-loader path works.
+        // For unsupported platform/arch pairs, loading the resolved package still tests its native-loader path.
         return probeOnnxRuntimeNodeLoad(onnxDir) ?? { state: "ok", binaryPath: onnxDir };
     }
     const binaryPath = join(onnxDir, rel);

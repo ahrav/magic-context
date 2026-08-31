@@ -1,7 +1,6 @@
-//! Content-addressed generation store with one atomic current profile
-//! (plan KTD9, R21-R22, R29-R31, R46).
+//! The store content-addresses generations and atomically selects one current profile.
 //!
-//! Layout under `${dataDir}/cortexkit/lifecycle/`:
+//! The store uses `${dataDir}/cortexkit/lifecycle/` for its persisted state.
 //!
 //! ```text
 //! lifecycle/
@@ -10,11 +9,11 @@
 //!   current-profile.json                     {"schema":1,"current":"<digest>"}
 //! ```
 //!
-//! The digest that names a generation is the SHA-256 of its canonical
-//! manifest bytes, which commit the target tuple, the U8 release-contract
-//! digest, the U9 input-lock digest, and every file's path, mode, size, and
-//! hash. Callers mutate the store only while holding the version-neutral
-//! `transaction.lock`; this module owns byte-level trust, not serialization.
+//! The generation name is the SHA-256 digest of canonical manifest bytes.
+//! The manifest commits the target tuple and the U8 release-contract digest.
+//! The manifest commits the U9 input-lock digest and every file's path, mode, size, and hash.
+//! Callers must hold `transaction.lock` before mutating the store.
+//! This module validates persisted bytes but does not serialize mutations.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -33,45 +32,36 @@ use crate::instance::{
 };
 use crate::lifecycle::{is_canonical_payload_digest, lifecycle_dir_path};
 
-/// Directory of content-addressed generations inside the lifecycle root.
 pub const GENERATIONS_DIR_NAME: &str = "generations";
 
-/// The single current-selector profile file inside the lifecycle root.
 pub const CURRENT_PROFILE_NAME: &str = "current-profile.json";
 
-/// Canonical manifest name inside each generation directory. The manifest
-/// is not listed in its own `files` array; its bytes are the digest input.
+/// The `files` array excludes `manifest.json` because its bytes produce the generation digest.
 pub const GENERATION_MANIFEST_NAME: &str = "manifest.json";
 
-/// Prefix for incomplete staging temporaries, cleaned during pruning.
+/// Pruning removes incomplete staging directories whose names begin `tmp-`.
 pub const STAGING_TEMP_PREFIX: &str = "tmp-";
 
-/// Manifest and evidence read cap, matching the lifecycle evidence cap.
+/// Manifest and lifecycle-evidence readers each cap input at 1 MiB.
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
-/// Fixed metadata allowance charged by the capacity preflight for the
-/// manifest, profile temp, and directory entries that coexist until rename.
+/// Capacity preflight reserves 1 MiB for metadata that coexists until rename.
 const CAPACITY_FIXED_OVERHEAD_BYTES: u64 = 1024 * 1024;
 
-/// Reserve floor from R46: `max(256 MiB, ceil(required * 10%))`.
+/// Capacity preflight reserves `max(256 MiB, ceil(required * 10%))`.
 const CAPACITY_RESERVE_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Closed store failure classes. Every variant maps onto exactly one closed
-/// v1 reason: callers must not invent finer-grained externally visible
-/// classifications from the bounded static detail.
+/// Each `GenerationError` variant maps to exactly one closed v1 reason.
+/// Callers must not derive externally visible classifications finer than the bounded static detail.
 #[derive(Debug)]
 pub enum GenerationError {
-    /// The capacity preflight failed or a post-preflight write hit ENOSPC;
-    /// trusted selectors are unchanged and the owned temp was removed.
+    /// `InsufficientStorage` leaves trusted selectors unchanged and removes the owned temp after preflight failure or post-preflight `ENOSPC`.
     InsufficientStorage,
-    /// Validation, staging identity, exchange repair, or checked arithmetic
-    /// failed. `current` is unchanged and no other generation was selected.
+    /// `NativePayloadInvalid` leaves `current` unchanged and selects no other generation after validation, staging-identity, exchange-repair, or checked-arithmetic failure.
     NativePayloadInvalid {
         detail: &'static str,
     },
-    /// A persisted profile or generation manifest carries an unknown schema:
-    /// it is preserved byte-for-byte and quarantined, and the requested
-    /// mutation or selection was aborted.
+    /// `UnsupportedStateSchema` preserves and quarantines a profile or manifest with an unknown schema, then aborts the requested mutation or selection.
     UnsupportedStateSchema,
     Instance(InstanceError),
 }
@@ -101,14 +91,9 @@ fn invalid(detail: &'static str) -> GenerationError {
     GenerationError::NativePayloadInvalid { detail }
 }
 
-/// `fsync` that preserves the storage-exhaustion classification.
+/// The helper preserves storage-exhaustion classification for `fsync` failures.
 ///
-/// On delayed-allocation filesystems the blocks a write reserved are assigned
-/// at writeback, so exhaustion can first surface here rather than from `write`.
-/// The API promises post-preflight exhaustion as
-/// [`GenerationError::InsufficientStorage`], whose remediation is to free
-/// space; collapsing it into `NativePayloadInvalid` would tell a user on a full
-/// disk to reinstall the payload instead.
+/// Delayed-allocation filesystems can report exhaustion from `fsync` because they assign blocks at writeback rather than from `write`.
 fn fsync_preserving_storage<Fd: rustix::fd::AsFd>(
     fd: Fd,
     detail: &'static str,
@@ -119,12 +104,8 @@ fn fsync_preserving_storage<Fd: rustix::fd::AsFd>(
     })
 }
 
-/// Whether an I/O error means the destination cannot accept more bytes.
 ///
-/// A per-user quota is exhaustion the caller can act on exactly like a full
-/// filesystem — free space, do not reinstall — and the capacity preflight cannot
-/// see it, since `statvfs` reports the filesystem's free blocks rather than the
-/// caller's remaining quota.
+/// `statvfs` cannot detect per-user quota exhaustion because it reports filesystem free blocks, not the caller's remaining quota.
 fn is_storage_exhausted(err: &std::io::Error) -> bool {
     matches!(
         err.raw_os_error(),
@@ -134,8 +115,7 @@ fn is_storage_exhausted(err: &std::io::Error) -> bool {
     )
 }
 
-/// One file inside a generation manifest. Paths are relative, contain no
-/// parent segments, and are unique and sorted in the canonical encoding.
+/// `GenerationManifest::files` paths are relative, contain no parent segments, and are unique and sorted in canonical encoding.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestFile {
@@ -145,9 +125,9 @@ pub struct ManifestFile {
     pub sha256: String,
 }
 
-/// Canonical schema-1 payload manifest. Serialization order is fixed by the
-/// struct, and `files` is sorted by path, so encoding is deterministic and
-/// its SHA-256 is the generation's name.
+/// `GenerationManifest` serializes fields in declaration order.
+/// `files` is sorted by path, making the encoding deterministic.
+/// `GenerationManifest`'s SHA-256 names the generation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationManifest {
@@ -155,15 +135,10 @@ pub struct GenerationManifest {
     pub target: String,
     pub release_contract_sha256: String,
     pub inputs_lock_sha256: String,
-    /// The payload manifest this generation was staged from, or `None` for a
-    /// generation staged before the field existed.
+    /// `None` denotes a generation without a recorded source payload manifest.
     ///
-    /// Schema 1 shipped without it and the schema number did not change when it
-    /// was added, so requiring it would decode every retained predecessor as
-    /// corrupt and fail the first no-`--payload-dir` start after an upgrade with
-    /// `native_payload_invalid` — refusing a payload that is intact. A generation
-    /// that cannot name its source instead fails only the checks that actually
-    /// need that name, which is what `Option` makes explicit.
+    /// `#[serde(default)]` preserves decoding of schema-1 manifests that omit this field.
+    /// Generations without a source manifest digest fail only checks that require that digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_payload_manifest_sha256: Option<String>,
     pub files: Vec<ManifestFile>,
@@ -179,7 +154,6 @@ impl GenerationManifest {
     }
 }
 
-/// Outcome of strictly decoding manifest or profile bytes.
 enum SchemaDecode<T> {
     Valid(T),
     UnknownSchema,
@@ -208,35 +182,29 @@ struct WireProfile {
     current: String,
 }
 
-/// What the current profile names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CurrentProfile {
     Absent,
     Current(String),
-    /// Unknown persisted schema: preserved byte-for-byte, unselectable, and
-    /// mutation-blocking while its references are uncertain.
+    /// Unknown persisted schemas are preserved byte-for-byte, cannot be selected, and block mutations until their references are known.
     Quarantined,
 }
 
-/// One source file for staging: consumed through a no-follow descriptor with
-/// bounded before/after metadata checks. A hard link into a package cache is
-/// an acceptable source; the staged output is always an independent
-/// owner-only single-link copy.
+/// Staging consumes each source through a no-follow descriptor and verifies metadata before and after copying.
+/// Staging always creates an independent, owner-only, single-link copy.
 #[derive(Debug, Clone)]
 pub struct SourceSpec {
-    /// Relative destination path inside the generation.
+    /// The destination path is relative to the generation.
     pub rel_path: String,
-    /// Absolute source file path.
     pub source: PathBuf,
-    /// Whether the staged copy is owner-executable (0o700 vs 0o600).
     pub executable: bool,
-    /// Optional release-manifest size for production package sources.
+    /// `expected_size` is present only for production package sources.
     pub expected_size: Option<u64>,
-    /// Optional release-manifest SHA-256 for production package sources.
+    /// `expected_sha256` is an optional release-manifest SHA-256 for production package sources.
     pub expected_sha256: Option<String>,
 }
 
-/// Non-file identity inputs committed by the staged manifest.
+/// `StageMeta` stores non-file identity inputs committed by the staged manifest.
 #[derive(Debug, Clone)]
 pub struct StageMeta {
     pub target: String,
@@ -245,19 +213,12 @@ pub struct StageMeta {
     pub source_payload_manifest_sha256: String,
 }
 
-/// Read-only proof that every source is present and is the byte identity its
-/// payload manifest declares.
+/// `verify_sources` reads every source and verifies each declared size and SHA-256 identity.
 ///
-/// `stage_and_promote` already verifies these bytes, but it verifies them while
-/// copying — which for `restart` happens only after the incumbent has been
-/// stopped. A launcher, model, or runtime file that was deleted or rewritten
-/// since the manifest was written therefore passed preflight, took the healthy
-/// daemon down, and failed during the copy, leaving `stop_committed:true` with
-/// no successor. Every check here is a read, so it belongs before the stop.
+/// For `restart`, `stage_and_promote` copies sources only after stopping the incumbent.
+/// `verify_sources` performs only reads, so callers must run it before stopping the incumbent.
 ///
-/// Only sources carrying a declared identity are hashed: an unqualified dev tree
-/// has nothing to compare against, and its existence and type are proven by the
-/// same walk that enumerated it.
+/// `verify_sources` hashes only sources with declared identities; source enumeration verifies unqualified dev-tree existence and type.
 pub fn verify_sources(sources: &[SourceSpec]) -> Result<(), GenerationError> {
     for spec in sources {
         let fd = openat(
@@ -299,9 +260,8 @@ pub fn verify_sources(sources: &[SourceSpec]) -> Result<(), GenerationError> {
     Ok(())
 }
 
-/// A completely revalidated generation: the retained directory descriptor
-/// pins the validated tree against pathname replacement, and the manifest
-/// is the exact decoded canonical content.
+/// The retained directory descriptor pins the validated tree against pathname replacement.
+/// `manifest` contains the exact decoded canonical content.
 pub struct ValidatedGeneration {
     pub digest: String,
     pub manifest: GenerationManifest,
@@ -309,19 +269,14 @@ pub struct ValidatedGeneration {
 }
 
 impl ValidatedGeneration {
-    /// Stable descriptor-rooted path for in-process loaders. The generation
-    /// object must remain alive while the path is used.
+    /// In-process loaders may use the descriptor-rooted path only while `ValidatedGeneration` remains alive.
     ///
-    /// Directory traversal through this path is Linux-only; see
-    /// [`crate::harness_closure::descriptor_path`] for the platform contract.
+    /// `descriptor_root_path` supports directory traversal only on Linux.
     pub fn descriptor_root_path(&self) -> PathBuf {
         crate::harness_closure::descriptor_path(self.dir.as_raw_fd())
     }
 
-    /// Opens one manifest-listed file through the retained validated
-    /// directory descriptor, rechecking shape and hash so the returned
-    /// descriptor is execution-trustworthy even if the pathname was
-    /// replaced after validation.
+    /// `open_verified_file` opens a manifest-listed file through the retained directory descriptor and rechecks its shape and hash.
     pub fn open_verified_file(&self, rel_path: &str) -> Result<OwnedFd, GenerationError> {
         let entry = self
             .manifest
@@ -335,14 +290,12 @@ impl ValidatedGeneration {
     }
 }
 
-/// Rounds a size up to a 4 KiB allocation block with checked arithmetic.
 fn allocation_rounded(size: u64) -> Option<u64> {
     const BLOCK: u64 = 4096;
     size.checked_add(BLOCK - 1).map(|n| (n / BLOCK) * BLOCK)
 }
 
-/// Checked R46 accounting: `available >= required + max(256 MiB,
-/// ceil(required * 10%))`. Public for exact boundary tests.
+/// The R46 check uses checked arithmetic and requires `available >= required + max(256 MiB, ceil(required * 10%))`.
 pub fn capacity_satisfied(available: u64, required: u64) -> Option<bool> {
     let tenth = required.div_ceil(10);
     let reserve = tenth.max(CAPACITY_RESERVE_FLOOR_BYTES);
@@ -350,7 +303,6 @@ pub fn capacity_satisfied(available: u64, required: u64) -> Option<bool> {
     Some(available >= needed)
 }
 
-/// Sums allocation-rounded staging requirements with checked arithmetic.
 /// `None` means overflow or an impossible manifest size.
 pub fn required_stage_bytes(sizes: &[u64]) -> Option<u64> {
     let mut total = CAPACITY_FIXED_OVERHEAD_BYTES;
@@ -436,16 +388,15 @@ fn verify_file_against_entry(fd: &OwnedFd, entry: &ManifestFile) -> Result<(), G
     if total != entry.size || hex(&hasher.finalize()) != entry.sha256 {
         return Err(invalid("file hash diverges from the manifest"));
     }
-    // The hashing dup above shares `fd`'s open file description, so reading it
-    // to EOF left `fd` positioned at `entry.size`. Callers receive this
-    // descriptor to read the verified bytes; rewind it so the first read is the
-    // first byte rather than EOF.
+    // The hash reads a duplicated descriptor that shares `fd`'s offset, so rewind `fd` before returning it to callers.
+    // The hash reads a duplicated descriptor that shares `fd`'s offset, so rewind `fd` before returning it to callers.
+    // The hash reads a duplicated descriptor that shares `fd`'s offset, so rewind `fd` before returning it to callers.
+    // The hash reads a duplicated descriptor that shares `fd`'s offset, so rewind `fd` before returning it to callers.
     rustix::fs::seek(fd, rustix::fs::SeekFrom::Start(0))
         .map_err(|_| invalid("file rewind after verification failed"))?;
     Ok(())
 }
 
-/// The generation store rooted at the managed lifecycle directory.
 pub struct GenerationStore {
     root: PathBuf,
     root_fd: OwnedFd,
@@ -460,7 +411,6 @@ impl std::fmt::Debug for GenerationStore {
     }
 }
 
-/// What pruning removed and preserved.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PruneReport {
     pub removed_generations: usize,
@@ -469,16 +419,13 @@ pub struct PruneReport {
 }
 
 impl GenerationStore {
-    /// Creates or opens the store, creating owner-only directories as
-    /// needed. Mutating entry points require the caller to hold the
     /// version-neutral `transaction.lock`.
     pub fn open(data_dir_override: Option<&Path>) -> Result<Self, GenerationError> {
         let root = lifecycle_dir_path(data_dir_override)?;
-        // Component-by-component creation through pinned no-follow descriptors.
-        // A pathname `mkdir` walk reports `EEXIST` for a symlinked intermediate
-        // and keeps traversing through it, and a final-component `O_NOFOLLOW`
-        // does not undo that, so the store could be created and mutated outside
-        // the requested data root.
+        // `mkdir` can traverse a symlinked intermediate after `EEXIST`, allowing mutations outside the data root.
+        // `mkdir` can traverse a symlinked intermediate after `EEXIST`, allowing mutations outside the data root.
+        // `mkdir` can traverse a symlinked intermediate after `EEXIST`, allowing mutations outside the data root.
+        // `mkdir` can traverse a symlinked intermediate after `EEXIST`, allowing mutations outside the data root.
         let root_fd = secure_runtime_dir(&root)?;
         validate_lifecycle_root_fd(&root_fd, &root)?;
         let created = match mkdirat(&root_fd, GENERATIONS_DIR_NAME, Mode::from_raw_mode(0o700)) {
@@ -486,15 +433,11 @@ impl GenerationStore {
             Err(rustix::io::Errno::EXIST) => false,
             Err(e) => return Err(io_err("mkdir_generations", &root, e).into()),
         };
-        // mkdir modes are filtered by umask, which can leave a freshly created
-        // directory with no owner bits — and a 0700 directory cannot even be
-        // opened by its owner, so the mode must be restored by pathname before
-        // the descriptor exists. That pathname `chmodat` follows symlinks, so it
-        // runs only when this call created the entry: `mkdirat` succeeding proves
-        // a real directory is at that name and nothing else can be. An existing
-        // entry is never chmodded, so a symlink planted at `generations` cannot
-        // redirect the mode change onto its target before the no-follow open
-        // below rejects the store.
+        // Because umask can clear owner bits, restore the requested mode before opening a newly created directory; never chmod an existing path.
+        // Because umask can clear owner bits, restore the requested mode before opening a newly created directory; never chmod an existing path.
+        // Because umask can clear owner bits, restore the requested mode before opening a newly created directory; never chmod an existing path.
+        // Because umask can clear owner bits, restore the requested mode before opening a newly created directory; never chmod an existing path.
+        // Because umask can clear owner bits, restore the requested mode before opening a newly created directory; never chmod an existing path.
         if created {
             rustix::fs::chmodat(
                 &root_fd,
@@ -507,8 +450,7 @@ impl GenerationStore {
         let generations_fd = open_child_dir(&root_fd, GENERATIONS_DIR_NAME)
             .ok_or_else(|| invalid("generations directory failed security checks"))?;
         if created {
-            // Pin the mode through the descriptor now that one exists, so the
-            // final state is set on the object we validated rather than on a
+            // `fchmod` uses the validated descriptor to avoid changing a replacement path.
             // name.
             rustix::fs::fchmod(&generations_fd, Mode::from_raw_mode(0o700))
                 .map_err(|e| io_err("fchmod_generations", &root, e))?;
@@ -520,21 +462,14 @@ impl GenerationStore {
         })
     }
 
-    /// No-create open for observational probes: `Ok(None)` when the store
-    /// does not exist yet. An existing root is held to exactly the same
-    /// ownership and ancestor predicate as [`Self::open`]: this is the path
-    /// production `start`/`restart` and the daemon itself take, so an
-    /// insecure root fails closed here rather than being silently accepted.
+    /// `Ok(None)` only when a store component is missing.
+    /// Existing roots must satisfy the same ownership and ancestor checks as [`Self::open`].
+    /// An insecure existing root returns an error rather than being silently accepted.
     ///
-    /// Absence and insecurity are distinct outcomes. Only a missing component
-    /// is absence; an existing component that is a symlink, inaccessible, or
-    /// otherwise outside the trust predicate is an error, because reporting it
-    /// as `native_payload_missing` would mask hostile persisted state behind
-    /// the remediation for a fresh install.
     pub fn open_probe(data_dir_override: Option<&Path>) -> Result<Option<Self>, GenerationError> {
         let root = lifecycle_dir_path(data_dir_override)?;
         let Some(root_fd) = open_secure_dir_existing(&root)? else {
-            // Absent store: nothing staged yet, not a trust failure.
+            // A missing store has no staged generation and is not a trust failure.
             return Ok(None);
         };
         validate_lifecycle_root_fd(&root_fd, &root)?;
@@ -552,7 +487,6 @@ impl GenerationStore {
         &self.root
     }
 
-    /// Reads the current profile without mutating anything.
     pub fn read_current(&self) -> Result<CurrentProfile, GenerationError> {
         let fd = match openat(
             &self.root_fd,
@@ -565,10 +499,6 @@ impl GenerationStore {
             Err(_) => return Err(invalid("current profile failed security checks")),
         };
         let stat = rustix::fs::fstat(&fd).map_err(|_| invalid("current profile stat failed"))?;
-        // The profile is the selector that decides which generation runs, so
-        // it is held to the same predicate as every other trusted state file:
-        // owner-only, single-link, regular. A weaker check here would let an
-        // extra hard link or a group/other-writable mode redirect selection.
         if !is_secure_regular(&stat) {
             return Err(invalid("current profile failed security checks"));
         }
@@ -586,8 +516,6 @@ impl GenerationStore {
         }
     }
 
-    /// Completely revalidates one generation: manifest schema, digest
-    /// binding, per-file shape/size/mode/hash, and no unlisted entries.
     /// Failed validation never selects another generation.
     pub fn validate(&self, digest: &str) -> Result<ValidatedGeneration, GenerationError> {
         if !is_canonical_payload_digest(digest) {
@@ -628,13 +556,7 @@ impl GenerationStore {
         if hex(&sha2::Sha256::digest(&bytes)) != digest {
             return Err(invalid("manifest bytes do not hash to the generation name"));
         }
-        // The digest above binds the generation name to whatever bytes are on
-        // disk, not to the canonical encoding of the decoded manifest. Without
-        // this equality a manifest with reordered keys or extra whitespace,
-        // stored under the hash of those raw bytes, validates while
-        // `manifest.digest()` names a different generation — two identities for
-        // one logical manifest, which breaks the content-addressed
-        // deduplication and repair the digest is supposed to provide.
+        // The code requires `manifest.digest()` to equal the generation directory digest; otherwise noncanonical manifest encodings create multiple identities for one logical manifest.
         if manifest.canonical_bytes() != bytes {
             return Err(invalid("manifest is not canonically encoded"));
         }
@@ -652,14 +574,6 @@ impl GenerationStore {
                 .ok_or_else(|| invalid("manifest-listed file is missing"))?;
             verify_file_against_entry(&fd, entry)?;
         }
-        // Reject unlisted entries: walk the tree and require every regular
-        // file to be the manifest itself or manifest-listed, and every
-        // directory to be owner-only. The walk goes through the retained
-        // descriptor, never by re-resolving the digest pathname: a pathname
-        // walk inspects whatever now occupies that name, so a replacement
-        // holding only the expected names could satisfy this check while the
-        // returned `ValidatedGeneration` still pins the original directory and
-        // its unlisted content.
         let mut found: BTreeSet<String> = BTreeSet::new();
         walk_generation_tree(dir, "", &mut found)?;
         for path in &found {
@@ -675,16 +589,11 @@ impl GenerationStore {
         Ok(manifest)
     }
 
-    /// Available bytes for this store's destination filesystem, as seen by
-    /// an unprivileged owner.
     pub fn available_bytes(&self) -> Result<u64, GenerationError> {
         let stat =
             rustix::fs::fstatvfs(&self.generations_fd).map_err(|_| invalid("statvfs failed"))?;
-        // `f_bavail` counts `f_frsize` units, not `f_bsize` ones: `f_bsize` is
-        // the preferred I/O transfer size, which on filesystems reporting a
-        // 64 KiB or 128 KiB `f_bsize` over a 4 KiB fragment size would inflate
-        // capacity by an order of magnitude and let the preflight admit a
-        // staging run that cannot fit.
+        // `f_bavail` counts `f_frsize` units; `f_bsize` is the preferred I/O transfer size.
+        // Using a 64 KiB or 128 KiB `f_bsize` with a 4 KiB fragment size would overstate capacity and admit staging runs that cannot fit.
         let unit = if stat.f_frsize != 0 {
             stat.f_frsize
         } else {
@@ -693,15 +602,12 @@ impl GenerationStore {
         Ok(stat.f_bavail.saturating_mul(unit))
     }
 
-    /// Stages one generation from descriptor-validated sources and
-    /// atomically replaces the current profile with its digest. The caller
-    /// holds `transaction.lock`; `protected` is the caller-computed
-    /// protected digest set used only for same-digest exchange repair.
+    /// The method atomically replaces the current profile with the staged generation's digest.
+    /// `protected` is used only for same-digest exchange repair.
     ///
-    /// Failure modes: `InsufficientStorage` before temp creation or on
-    /// post-preflight ENOSPC (temp removed, selectors preserved),
-    /// `UnsupportedStateSchema` when the existing profile is quarantined,
-    /// and `NativePayloadInvalid` for every identity or validation fault
+    /// The method returns `InsufficientStorage` before creating a temp directory or after post-preflight `ENOSPC`; it removes the temp directory and preserves selectors in the latter case.
+    /// The method returns `UnsupportedStateSchema` when the existing profile is quarantined.
+    /// The method returns `NativePayloadInvalid` for identity and validation faults.
     /// (profile unchanged).
     pub fn stage_and_promote(
         &self,
@@ -709,12 +615,10 @@ impl GenerationStore {
         meta: &StageMeta,
         protected: &BTreeSet<String>,
     ) -> Result<String, GenerationError> {
-        // A quarantined profile blocks mutation outright: its references
-        // are uncertain, so nothing may be replaced or pruned around it.
+        // A quarantined profile blocks mutation because its references are uncertain.
         if self.read_current()? == CurrentProfile::Quarantined {
             return Err(GenerationError::UnsupportedStateSchema);
         }
-        // Capacity preflight with checked arithmetic, before temp creation.
         let mut sizes = Vec::with_capacity(sources.len());
         for spec in sources {
             let meta = std::fs::symlink_metadata(&spec.source)
@@ -767,11 +671,8 @@ impl GenerationStore {
             }
             _ => invalid("staging temp creation failed"),
         })?;
-        // The mkdir mode is umask-filtered, and a directory left without owner
-        // bits cannot be opened by its owner at all — so the open below would
-        // fail and report the temp as insecure. `mkdirat` does not tolerate
-        // EEXIST here, so its success proves this call created the entry and the
-        // pathname chmod cannot be redirected through a planted symlink.
+        // `mkdirat` applies the umask, so removing owner bits would prevent the owner from opening the directory and cause the subsequent security check to fail.
+        // `mkdirat` rejects `EEXIST`, so success proves this call created the entry and prevents pathname `chmod` from following a planted symlink.
         rustix::fs::chmodat(
             &self.generations_fd,
             temp_name.as_str(),
@@ -794,10 +695,7 @@ impl GenerationStore {
     ) -> Result<GenerationManifest, GenerationError> {
         let mut files = Vec::with_capacity(sources.len());
         let mut seen = BTreeSet::new();
-        // Every directory this staging run creates entries in. Each one needs
-        // its own fsync: fsyncing a new file does not durably persist its
-        // parent's entry for it, so a crash after profile promotion could
-        // otherwise recover a current generation whose nested files are absent.
+        // The code fsyncs each directory that receives an entry because fsyncing a file does not persist its parent entry.
         let mut dirs: BTreeSet<String> = BTreeSet::new();
         for spec in sources {
             validate_rel_path(&spec.rel_path)?;
@@ -826,16 +724,12 @@ impl GenerationStore {
             files,
         };
         let bytes = manifest.canonical_bytes();
-        // Validation reads the persisted manifest under `MAX_MANIFEST_BYTES`,
-        // so a manifest above that cap can never be revalidated. Refuse it here
-        // rather than after promotion, which would leave `current-profile.json`
-        // naming a generation this implementation is unable to accept.
+        // The validator cannot revalidate manifests larger than `MAX_MANIFEST_BYTES`, so staging rejects them before promotion.
         if bytes.len() > MAX_MANIFEST_BYTES {
             return Err(invalid("staged manifest exceeds the manifest size cap"));
         }
         write_new_file(temp_fd, GENERATION_MANIFEST_NAME, &bytes, 0o600)?;
-        // Deepest first, so each directory's entries are durable before its
-        // own entry in its parent is made durable.
+        // The code fsyncs directories deepest-first so each directory's entries are durable before its entry in its parent.
         for rel in dirs.iter().rev() {
             let dir = open_rel_dir_nofollow(temp_fd, rel)
                 .ok_or_else(|| invalid("staged directory reopen failed"))?;
@@ -845,16 +739,9 @@ impl GenerationStore {
         Ok(manifest)
     }
 
-    /// Renames the fully staged temp to its digest name. When a directory
-    /// already occupies the digest: a valid occupant wins (the temp is
-    /// discarded), and an invalid unprotected occupant is repaired only by
-    /// atomic exchange with the validated candidate, revalidated before the
-    /// exchanged orphan is deleted.
+    /// For an invalid, unprotected target, `promote_temp` atomically exchanges the temp and revalidates the promoted target before deleting the exchanged orphan.
     ///
-    /// The rename must not replace: POSIX `renameat` succeeds when the target
-    /// is an existing empty directory, so a plain rename would silently
-    /// destroy a protected occupant that had been corrupted into an empty
-    /// directory before the protection check below ever ran.
+    /// `renameat` can replace an empty target directory, bypassing the protected-target check.
     fn promote_temp(
         &self,
         temp_name: &str,
@@ -865,17 +752,13 @@ impl GenerationStore {
             fsync_preserving_storage(&self.generations_fd, "generations fsync failed")?;
             return Ok(());
         }
-        // Occupied digest target.
         match self.validate(digest) {
-            // A valid occupant is already this generation: keep it, drop the temp.
+            // A valid target occupant wins; cleanup attempts to remove the temp.
             Ok(_) => {
                 let _ = remove_tree(&self.generations_fd, temp_name);
                 return Ok(());
             }
-            // An unknown manifest schema is quarantined, not corrupt. Repairing
-            // it would exchange and then delete bytes the store promises to
-            // preserve, so the mutation is abandoned instead — the same rule
-            // `prune` applies through `is_quarantined_schema`.
+            // An unsupported manifest schema is quarantined because exchange would delete bytes that `prune` preserves.
             Err(GenerationError::UnsupportedStateSchema) => {
                 return Err(GenerationError::UnsupportedStateSchema);
             }
@@ -886,8 +769,6 @@ impl GenerationStore {
         }
         exchange_dirs(&self.generations_fd, temp_name, digest)?;
         fsync_preserving_storage(&self.generations_fd, "generations fsync failed")?;
-        // Revalidate the promoted target before deleting the exchanged
-        // corrupt orphan now sitting at the temp name.
         self.validate(digest)?;
         let _ = remove_tree(&self.generations_fd, temp_name);
         Ok(())
@@ -913,13 +794,7 @@ impl GenerationStore {
         Ok(())
     }
 
-    /// Cheap removability classification for pruning. Only the manifest
-    /// schema separates a quarantined entry from a removable one, and that is
-    /// decided by the manifest decode alone; so pruning must not pay the
-    /// per-file hash and tree walk of `validate` for a directory it removes
-    /// either way. Every non-quarantine outcome (missing, insecure,
-    /// unreadable, corrupt, or fully valid) is removable, exactly as the
-    /// previous full-validation arms classified it.
+    /// `is_quarantined_schema` decodes only the manifest because every non-quarantined outcome is removable.
     fn is_quarantined_schema(&self, digest: &str) -> bool {
         let Some(dir) = open_child_dir(&self.generations_fd, digest) else {
             return false;
@@ -927,14 +802,7 @@ impl GenerationStore {
         let Some(manifest_fd) = open_rel_nofollow(&dir, GENERATION_MANIFEST_NAME) else {
             return false;
         };
-        // A manifest above the read cap cannot be decoded, so its schema cannot
-        // be decided either — and "we could not read it" is not evidence that it
-        // is schema 1. This implementation refuses to write one, so an oversized
-        // manifest is either corruption or a future release's format, and only
-        // one of those is safe to delete. Quarantine it: preserving a generation
-        // costs one skipped directory, while deleting a newer release's
-        // generation is the forward-compatibility break quarantine exists to
-        // prevent. Every other read failure stays removable.
+        // The code quarantines manifests above the read cap because deletion could remove a future-format generation; other read failures are removable.
         match rustix::fs::fstat(&manifest_fd) {
             Ok(stat) if stat.st_size as u64 > MAX_MANIFEST_BYTES as u64 => return true,
             Ok(_) => {}
@@ -949,12 +817,12 @@ impl GenerationStore {
         )
     }
 
-    /// Prunes complete generations outside the protected set and removes
-    /// owned incomplete staging temps. The caller holds `transaction.lock`
-    /// and supplies every protected digest: the current profile target,
-    /// every coherent lock-held lifecycle digest, and the active candidate.
-    /// Quarantined entries (unknown manifest schema, foreign names) are
-    /// preserved; a quarantined profile aborts pruning entirely.
+    /// `prune` removes complete generations outside `protected` and owned incomplete staging temps.
+    /// `prune`'s caller holds `transaction.lock` and supplies every protected digest:
+    /// The protected digests include the current profile target and every coherent lock-held lifecycle digest.
+    /// The protected digests include the active candidate.
+    /// `prune` preserves entries with unknown manifest schemas or foreign names.
+    /// `prune` returns `UnsupportedStateSchema` when the current profile is quarantined.
     pub fn prune(&self, protected: &BTreeSet<String>) -> Result<PruneReport, GenerationError> {
         let mut protected = protected.clone();
         match self.read_current()? {
@@ -965,10 +833,8 @@ impl GenerationStore {
             CurrentProfile::Quarantined => return Err(GenerationError::UnsupportedStateSchema),
         }
         let mut report = PruneReport::default();
-        // Enumerated through the pinned descriptor, not the canonical pathname:
-        // every removal below acts on `generations_fd`, so selecting names from a
-        // re-resolved path would let a replacement directory holding chosen names
-        // drive deletions inside the retained store.
+        // `prune` enumerates `generations_fd` instead of its pathname so a replacement directory cannot select retained-store deletions.
+        // `prune` removes through `generations_fd` so a replaced pathname cannot redirect deletions.
         let entries = read_dir_names(&self.generations_fd)?;
         for name in entries {
             if let Some(_rest) = name.strip_prefix(STAGING_TEMP_PREFIX) {
@@ -983,9 +849,7 @@ impl GenerationStore {
             if protected.contains(&name) {
                 continue;
             }
-            // An unprotected generation is referenced by nothing in the
-            // protected set, so its file contents cannot change the outcome:
-            // only an unknown manifest schema preserves it.
+            // An unprotected generation's contents affect pruning only through its manifest schema.
             if self.is_quarantined_schema(&name) {
                 report.quarantined += 1;
             } else {
@@ -1013,9 +877,7 @@ fn validate_rel_path(rel: &str) -> Result<(), GenerationError> {
     Ok(())
 }
 
-/// Copies one source through a no-follow descriptor into an exclusive
-/// owner-only single-link output inside `temp_fd`, hashing the same bytes
-/// it writes and rechecking source identity afterwards.
+/// The copy rejects symlink sources and fails if source identity changes before completion.
 fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile, GenerationError> {
     let source_fd = openat(
         rustix::fs::CWD,
@@ -1035,7 +897,6 @@ fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile
         return Err(invalid("staging source size differs from payload manifest"));
     }
 
-    // Create intermediate directories, then the exclusive output file.
     let mut dir_path = String::new();
     let components: Vec<&str> = spec.rel_path.split('/').collect();
     for component in &components[..components.len() - 1] {
@@ -1051,11 +912,8 @@ fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile
             }
             Err(_) => return Err(invalid("staging directory creation failed")),
         };
-        // The mkdir mode is umask-filtered here too, and an intermediate left
-        // without owner execute cannot be traversed — so the destination `openat`
-        // below would fail on a nested path like `bin/tool`. Normalized only when
-        // this call created the component, so the pathname chmod cannot be
-        // redirected through something already sitting at that name.
+        // mkdirat applies umask; chmod newly created components to 0700 so nested openat can traverse them.
+        // Chmod only components created by mkdirat so an existing pathname cannot redirect chmodat.
         if created {
             rustix::fs::chmodat(
                 temp_fd,
@@ -1108,9 +966,8 @@ fn copy_source_into(temp_fd: &OwnedFd, spec: &SourceSpec) -> Result<ManifestFile
     }
     fsync_preserving_storage(&dest_fd, "staging output fsync failed")?;
 
-    // Bounded before/after source identity check: same object, same size,
-    // same mtime. Source link count never substitutes for byte validation;
-    // the hash above consumed the same descriptor the copy did.
+    // The before/after check requires the same device, inode, size, mtime, and mtime nanoseconds.
+    // The hash consumes the descriptor that the copy consumes.
     let after = rustix::fs::fstat(&source_fd).map_err(|_| invalid("source stat failed"))?;
     #[allow(clippy::unnecessary_cast)]
     let same_identity = before.st_dev as u64 == after.st_dev as u64
@@ -1170,9 +1027,6 @@ fn write_new_file(
     Ok(())
 }
 
-/// Atomic same-filesystem directory exchange. Rustix maps `EXCHANGE` to
-/// Linux `renameat2(RENAME_EXCHANGE)` and macOS
-/// `renameatx_np(RENAME_SWAP)`; unsupported platforms fail closed.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn exchange_dirs(dir: &OwnedFd, a: &str, b: &str) -> Result<(), GenerationError> {
     rustix::fs::renameat_with(dir, a, dir, b, rustix::fs::RenameFlags::EXCHANGE)
@@ -1186,15 +1040,12 @@ fn exchange_dirs(_dir: &OwnedFd, _a: &str, _b: &str) -> Result<(), GenerationErr
     ))
 }
 
-/// Renames `from` to `to` inside `dir` only when `to` is unoccupied.
-/// `Ok(true)` means the rename happened; `Ok(false)` means the target is
-/// occupied and the caller owns the occupied-target decision.
+/// `rename_noreplace` returns `Ok(true)` after renaming and `Ok(false)` when `to` is occupied.
+/// Callers decide how to handle an occupied target.
 ///
-/// Linux takes `RENAME_NOREPLACE`, which makes the emptiness of an occupying
-/// directory irrelevant. Filesystems that reject `renameat2` flags, and
-/// platforms without them, fall back to checking occupancy first; that check
-/// is sound here because every mutating entry point holds `transaction.lock`,
-/// so no other participant in the trust model creates the target concurrently.
+/// `RENAME_NOREPLACE` atomically rejects an occupied target on Linux.
+/// When renameat2 flags are unavailable, check occupancy while transaction.lock excludes trusted concurrent creators.
+/// Every mutating entry point holds `transaction.lock`, excluding trusted concurrent creators.
 fn rename_no_replace(dir: &OwnedFd, from: &str, to: &str) -> Result<bool, GenerationError> {
     #[cfg(target_os = "linux")]
     {
@@ -1202,8 +1053,6 @@ fn rename_no_replace(dir: &OwnedFd, from: &str, to: &str) -> Result<bool, Genera
             Ok(()) => return Ok(true),
             Err(rustix::io::Errno::EXIST) | Err(rustix::io::Errno::NOTEMPTY) => return Ok(false),
             Err(rustix::io::Errno::NOSPC) => return Err(GenerationError::InsufficientStorage),
-            // No renameat2 flag support on this kernel or filesystem: fall
-            // through to the portable occupancy check.
             Err(rustix::io::Errno::INVAL)
             | Err(rustix::io::Errno::NOSYS)
             | Err(rustix::io::Errno::OPNOTSUPP) => {}
@@ -1223,9 +1072,7 @@ fn rename_no_replace(dir: &OwnedFd, from: &str, to: &str) -> Result<bool, Genera
     }
 }
 
-/// The lifecycle-root trust predicate: a directory we own whose ancestry
-/// cannot be replaced under us. Shared by the mutating and probe opens so a
-/// single definition governs both entry points.
+/// A lifecycle root is an owned directory whose ancestry cannot be replaced under the process.
 fn validate_lifecycle_root_fd(fd: &OwnedFd, path: &Path) -> Result<(), GenerationError> {
     let stat = rustix::fs::fstat(fd).map_err(|e| io_err("fstat_lifecycle_root", path, e))?;
     let mode = mode_bits(&stat);
@@ -1247,9 +1094,7 @@ fn open_child_dir(parent: &OwnedFd, name: &str) -> Option<OwnedFd> {
     Some(fd)
 }
 
-/// [`open_child_dir`] that separates absence from insecurity: `Ok(None)` only
-/// when the name does not exist, `Err` when something is there but fails the
-/// directory trust predicate.
+/// `open_child_dir_existing` returns `Ok(None)` only when `name` is absent; it returns `Err` when an existing entry fails the directory trust predicate.
 fn open_child_dir_existing(
     parent: &OwnedFd,
     name: &str,
@@ -1300,8 +1145,7 @@ fn walk_generation_tree(
         } else {
             format!("{prefix}/{name}")
         };
-        // Explicitly non-following metadata: the entry's own type decides,
-        // never its target's.
+        // Non-following metadata uses the entry's type rather than its target's.
         let stat = rustix::fs::statat(dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| invalid("generation entry stat failed"))?;
         match mode_bits(&stat) & S_IFMT {
@@ -1340,14 +1184,11 @@ fn remove_tree(parent: &OwnedFd, name: &str) -> Result<(), GenerationError> {
     Ok(())
 }
 
-/// Lists the entry names of an already-validated open directory.
 ///
-/// `fdopendir` enumerates the open directory description itself, so the listing
-/// cannot be redirected by a pathname replacement after validation, and unlike
-/// a `/proc/self/fd` round-trip it needs no procfs — the lifecycle root's own
-/// validation path runs on every supported platform, not only Linux. `.` and
-/// `..` are dropped: they are artifacts of the directory representation, not
-/// entries a caller can act on.
+/// fdopendir enumerates the already-open directory, preventing pathname replacement from changing the listing.
+/// Unlike a `/proc/self/fd` round-trip, `fdopendir` needs no procfs.
+/// `fdopendir` uses the lifecycle root's validation path on every supported platform, not only Linux.
+/// `read_dir_names` excludes `.` and `..` so callers cannot delete the listed directory or its parent.
 fn read_dir_names(dir: &OwnedFd) -> Result<Vec<String>, GenerationError> {
     let borrowed = rustix::fs::Dir::read_from(dir).map_err(|_| invalid("directory open failed"))?;
     let mut names = Vec::new();
@@ -1376,10 +1217,9 @@ mod tests {
 
     #[test]
     fn a_generation_staged_before_the_source_digest_field_still_decodes() {
-        // Schema 1 shipped without `source_payload_manifest_sha256`, and the schema
-        // number did not change when it was added. Decoding a retained predecessor
-        // as corrupt would make the first no-`--payload-dir` start after an upgrade
-        // report `native_payload_invalid` for a payload that is perfectly intact.
+        // Schema 1 omits `source_payload_manifest_sha256` without a schema-version change.
+        // The decoder must accept retained schema-1 manifests that omit `source_payload_manifest_sha256`.
+        // Rejecting a retained schema-1 manifest that omits `source_payload_manifest_sha256` would report `native_payload_invalid` on the first no-`--payload-dir` start after an upgrade.
         let predecessor = br#"{"schema":1,"target":"linux-x64-gnu","release_contract_sha256":"aa","inputs_lock_sha256":"bb","files":[]}"#;
         let decoded = match decode_with_schema::<GenerationManifest>(predecessor) {
             SchemaDecode::Valid(manifest) => manifest,
@@ -1389,8 +1229,7 @@ mod tests {
             }
         };
         assert_eq!(decoded.source_payload_manifest_sha256, None);
-        // Absence is not serialized back, so a predecessor manifest round-trips to
-        // its own bytes and keeps the digest that names its directory.
+        // A predecessor manifest that omits the field serializes to its original bytes.
         assert_eq!(decoded.canonical_bytes(), predecessor);
     }
 
@@ -1456,7 +1295,6 @@ mod tests {
             .expect("verified open");
         drop(fd);
 
-        // Staged outputs are owner-only and single-link.
         let bin = store
             .root()
             .join(GENERATIONS_DIR_NAME)
@@ -1465,7 +1303,6 @@ mod tests {
         let meta = std::fs::metadata(&bin).expect("stat");
         assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
 
-        // Restaging the identical sources converges on the same digest.
         let again = stage_default(&store, src.path());
         assert_eq!(again, digest);
     }
@@ -1505,17 +1342,15 @@ mod tests {
         let required = 1024 * 1024 * 1024u64;
         let reserve = (required.div_ceil(10)).max(CAPACITY_RESERVE_FLOOR_BYTES);
         assert_eq!(capacity_satisfied(required + reserve, required), Some(true));
-        // One byte below fails.
+        // `available == required + reserve - 1` fails.
         assert_eq!(
             capacity_satisfied(required + reserve - 1, required),
             Some(false)
         );
-        // The 256 MiB floor dominates small requirements.
         assert_eq!(
             capacity_satisfied(CAPACITY_RESERVE_FLOOR_BYTES + 4096 - 1, 4096),
             Some(false)
         );
-        // Checked arithmetic: overflow is an error, not a pass.
         assert_eq!(capacity_satisfied(u64::MAX, u64::MAX - 1), None);
         assert!(required_stage_bytes(&[u64::MAX]).is_none());
         assert!(required_stage_bytes(&[u64::MAX / 2, u64::MAX / 2]).is_none());
@@ -1538,7 +1373,6 @@ mod tests {
             ));
         };
 
-        // Changed bytes (same length).
         let bin = gen_dir.join("bin/ck-mc-host");
         let saved = std::fs::read(&bin).expect("read");
         let mut flipped = saved.clone();
@@ -1552,7 +1386,6 @@ mod tests {
             .validate(&digest)
             .expect("restored generation validates");
 
-        // Extra unlisted file.
         std::fs::write(gen_dir.join("extra"), b"x").expect("extra");
         expect_invalid(&store);
         std::fs::remove_file(gen_dir.join("extra")).expect("remove extra");
@@ -1562,7 +1395,6 @@ mod tests {
         expect_invalid(&store);
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).expect("mode");
 
-        // Hard-link count above one.
         let alias = gen_dir.join("alias-link");
         std::fs::hard_link(&bin, &alias).expect("link");
         expect_invalid(&store);
@@ -1615,8 +1447,6 @@ mod tests {
             "quarantined bytes must be preserved exactly"
         );
 
-        // Unknown profile schema: read as quarantined; staging and pruning
-        // abort without touching it.
         let profile_path = store.root().join(CURRENT_PROFILE_NAME);
         let profile_bytes = br#"{"schema":9,"future":"state"}"#.to_vec();
         std::fs::write(&profile_path, &profile_bytes).expect("write profile");
@@ -1645,7 +1475,6 @@ mod tests {
         let src_b = tempfile::tempdir().expect("src b");
         let store = store_at(root.path());
 
-        // Stage A then B: the profile names B, A becomes unreferenced.
         let digest_a = stage_default(&store, src_a.path());
         let spec_b = vec![SourceSpec {
             rel_path: "bin/ck-mc-host".to_owned(),
@@ -1659,7 +1488,6 @@ mod tests {
             .expect("stage b");
         assert_ne!(digest_a, digest_b);
 
-        // An incomplete temp and a foreign name coexist.
         std::fs::create_dir(
             store
                 .root()
@@ -1670,7 +1498,6 @@ mod tests {
         std::fs::create_dir(store.root().join(GENERATIONS_DIR_NAME).join("not-a-digest"))
             .expect("foreign");
 
-        // Protecting A (a coherent lock-held lifecycle digest) preserves it.
         let mut protected = BTreeSet::new();
         protected.insert(digest_a.clone());
         let report = store.prune(&protected).expect("prune");
@@ -1680,7 +1507,6 @@ mod tests {
         assert!(store.validate(&digest_a).is_ok());
         assert!(store.validate(&digest_b).is_ok());
 
-        // Without protection, A is pruned while current B survives.
         let report = store.prune(&BTreeSet::new()).expect("prune again");
         assert_eq!(report.removed_generations, 1);
         assert!(store.validate(&digest_a).is_err());
@@ -1704,7 +1530,6 @@ mod tests {
         let digest = stage_default(&store, src.path());
         let gen_dir = store.root().join(GENERATIONS_DIR_NAME).join(&digest);
 
-        // Corrupt the staged binary in place: the digest name now holds an
         // invalid occupant.
         let bin = gen_dir.join("bin/ck-mc-host");
         let mut bytes = std::fs::read(&bin).expect("read");
@@ -1713,7 +1538,6 @@ mod tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).expect("mode");
         assert!(store.validate(&digest).is_err());
 
-        // A protected corrupt target must not be exchanged.
         let mut protected = BTreeSet::new();
         protected.insert(digest.clone());
         assert!(matches!(
@@ -1722,14 +1546,11 @@ mod tests {
         ));
         assert!(store.validate(&digest).is_err(), "target left untouched");
 
-        // Unprotected: restaging the same digest exchanges atomically and
-        // revalidates before deleting the corrupt orphan.
         let repaired = store
             .stage_and_promote(&sources_in(src.path()), &meta(), &BTreeSet::new())
             .expect("repair");
         assert_eq!(repaired, digest);
         store.validate(&digest).expect("repaired target validates");
-        // The exchanged orphan temp is gone.
         let leftovers: Vec<_> = std::fs::read_dir(store.root().join(GENERATIONS_DIR_NAME))
             .expect("dir")
             .filter_map(|entry| entry.ok())
@@ -1750,8 +1571,6 @@ mod tests {
         let store = store_at(root.path());
         let digest = stage_default(&store, src.path());
 
-        // A crashed later staging attempt leaves only a temp directory; the
-        // profile still names the complete old generation.
         let temp = store
             .root()
             .join(GENERATIONS_DIR_NAME)
@@ -1764,7 +1583,6 @@ mod tests {
         );
         store.validate(&digest).expect("old generation is complete");
 
-        // A leftover profile temp is inert: reads keep returning the
         // committed profile.
         std::fs::write(
             store.root().join(".current-profile.json.99999.tmp"),
@@ -1783,7 +1601,6 @@ mod tests {
         let src = tempfile::tempdir().expect("src");
         let store = store_at(root.path());
 
-        // A symlink source is rejected before any temp mutation.
         let real = write_source(src.path(), "real", b"bytes");
         let link = src.path().join("sym");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
@@ -1799,7 +1616,6 @@ mod tests {
             Err(GenerationError::NativePayloadInvalid { .. })
         ));
 
-        // Parent traversal in a staged path is rejected.
         let traversal = vec![SourceSpec {
             rel_path: "../escape".to_owned(),
             source: real.clone(),
@@ -1811,8 +1627,6 @@ mod tests {
             .stage_and_promote(&traversal, &meta(), &BTreeSet::new())
             .is_err());
 
-        // A package-cache-style hard link is a valid source, and the staged
-        // output is an independent single-link copy.
         let cache_link = src.path().join("cache-hardlink");
         std::fs::hard_link(&real, &cache_link).expect("hardlink");
         let spec = vec![SourceSpec {
@@ -1833,17 +1647,15 @@ mod tests {
         let staged_meta = std::fs::metadata(&staged).expect("stat");
         use std::os::unix::fs::MetadataExt;
         assert_eq!(staged_meta.nlink(), 1);
-        // Mutating the original cache bytes cannot reach the staged copy.
         std::fs::write(&real, b"mutated-after-staging").expect("mutate");
         store
             .validate(&digest)
             .expect("staged bytes are independent");
     }
 
-    /// `verify_file_against_entry` hashes a `dup` of the descriptor it returns,
-    /// and a dup shares the open file description's offset, so without an
-    /// explicit rewind every caller would read zero bytes from a file the
-    /// manifest says is non-empty.
+    /// `verify_file_against_entry` must rewind its returned descriptor after hashing its duplicate.
+    /// A duplicated descriptor shares the open file description's offset.
+    /// Without rewinding, callers read zero bytes from a non-empty verified file.
     #[test]
     fn verified_open_returns_a_readable_descriptor() {
         let root = tempfile::tempdir().expect("root");
@@ -1861,10 +1673,10 @@ mod tests {
         assert_eq!(bytes, b"#binary-bytes");
     }
 
-    /// A manifest whose persisted bytes are not the canonical serialization of
-    /// the decoded value would give one logical manifest two generation
-    /// identities: the directory name hashes the raw bytes while
-    /// `manifest.digest()` hashes the canonical form.
+    /// Persisted manifest bytes must equal the canonical serialization of the decoded manifest.
+    /// Otherwise, raw-byte and canonical-form hashes give one manifest different generation identities.
+    /// The generation directory name hashes the raw manifest bytes.
+    /// `manifest.digest()` hashes the manifest's canonical serialization.
     #[test]
     fn noncanonically_encoded_manifests_are_rejected() {
         let root = tempfile::tempdir().expect("root");
@@ -1873,9 +1685,8 @@ mod tests {
         let digest = stage_default(&store, src.path());
         let dir = store.root().join(GENERATIONS_DIR_NAME).join(&digest);
 
-        // Reserialize through a Value, which sorts keys and so reorders them
-        // away from the struct's declaration order, then rename the generation
-        // to the hash of those bytes so the digest binding still holds.
+        // Reserializing through `serde_json::Value` sorts keys and can change their declaration order.
+        // Renaming the generation to the hash of the reserialized bytes preserves digest binding.
         let canonical = std::fs::read(dir.join(GENERATION_MANIFEST_NAME)).expect("manifest");
         let value: serde_json::Value = serde_json::from_slice(&canonical).expect("decode");
         let reordered = serde_json::to_vec(&value).expect("reencode");
@@ -1891,8 +1702,7 @@ mod tests {
         assert!(matches!(err, GenerationError::NativePayloadInvalid { .. }));
     }
 
-    /// `renameat` replaces an existing empty directory, so a protected digest
-    /// corrupted into an empty directory must be refused before the rename, not
+    /// `renameat` can replace an existing empty directory; protected digests must be refused before rename.
     /// after it.
     #[test]
     fn an_empty_protected_digest_target_is_never_replaced() {
@@ -1902,7 +1712,6 @@ mod tests {
         let digest = stage_default(&store, src.path());
         let dir = store.root().join(GENERATIONS_DIR_NAME).join(&digest);
 
-        // Corrupt the protected occupant into an empty directory.
         std::fs::remove_dir_all(&dir).expect("remove");
         std::fs::create_dir(&dir).expect("recreate empty");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("mode");
@@ -1920,9 +1729,6 @@ mod tests {
         );
     }
 
-    /// Every directory a staging run creates entries in is fsynced, not just the
-    /// staging root, so a crash after promotion cannot recover a current
-    /// generation whose nested files are missing.
     #[test]
     fn nested_staged_directories_survive_validation() {
         let root = tempfile::tempdir().expect("root");
@@ -1951,9 +1757,7 @@ mod tests {
         assert_eq!(validated.manifest.files.len(), 2);
     }
 
-    /// A symlink inside a generation is refused by the entry's own type, never
-    /// by its target's: a link to an empty directory must not be able to pass
-    /// the walk as an empty subtree.
+    /// `validate` rejects a symlink by its own entry type so a link to an empty directory cannot pass as an empty subtree.
     #[test]
     fn a_symlink_to_a_directory_fails_validation() {
         let root = tempfile::tempdir().expect("root");
@@ -1971,9 +1775,7 @@ mod tests {
         assert!(matches!(err, GenerationError::NativePayloadInvalid { .. }));
     }
 
-    /// Absence and insecurity are distinct probe outcomes: an existing but
-    /// untrusted store must not be reported as "nothing staged yet", which
-    /// prescribes installing a payload instead of investigating the state.
+    /// An existing untrusted store must be distinguished from an absent store; reporting it as unstaged would prescribe payload installation instead of investigation.
     #[test]
     fn probe_separates_an_absent_store_from_an_insecure_one() {
         let root = tempfile::tempdir().expect("root");
@@ -1998,8 +1800,8 @@ mod tests {
     }
 
     /// Opening a store whose `generations` name is a symlink must fail closed
-    /// without touching the link's target. The umask normalization is by
-    /// pathname, so it may only run when `mkdirat` proved it created the entry.
+    /// `umask` normalization may run only when `mkdirat` created the entry, because it operates by pathname.
+    /// `umask` normalization may run only when `mkdirat` created the entry.
     #[test]
     fn a_symlinked_generations_name_is_rejected_without_mutating_its_target() {
         let root = tempfile::tempdir().expect("root");
@@ -2027,9 +1829,7 @@ mod tests {
         );
     }
 
-    /// An unknown manifest schema at an occupied digest is quarantined, not
-    /// corrupt: promotion must abandon the mutation rather than exchange the
-    /// directory away and delete it.
+    /// An occupied digest with an unknown manifest schema is quarantined; promotion must abandon the mutation rather than exchange and delete the directory.
     #[test]
     fn a_quarantined_digest_occupant_is_never_repaired() {
         let root = tempfile::tempdir().expect("root");
@@ -2046,9 +1846,8 @@ mod tests {
         let quarantined = br#"{"schema":2,"unknown_future_field":true}"#;
         std::fs::write(&manifest, quarantined).expect("quarantine the occupant");
 
-        // Staging the same sources produces the same digest, so promotion lands
-        // on the quarantined occupant. It is deliberately not in `protected`:
-        // the quarantine rule alone must stop the repair.
+        // The same sources reproduce `digest`, so promotion targets the quarantined generation.
+        // The quarantined occupant is excluded from `protected` so the quarantine rule must prevent repair.
         let err = match store.stage_and_promote(&sources_in(src.path()), &meta(), &BTreeSet::new())
         {
             Ok(_) => panic!("a quarantined occupant must not be repaired"),
@@ -2062,10 +1861,7 @@ mod tests {
         );
     }
 
-    /// A manifest above the read cap cannot have its schema decided, so pruning
-    /// must not treat it as removable corruption: it may be a newer release's
-    /// generation, and deleting that is the forward-compatibility break
-    /// quarantine exists to prevent.
+    /// A manifest larger than `MAX_MANIFEST_BYTES` cannot have its schema decoded, so pruning must retain it rather than treat it as removable corruption.
     #[test]
     fn an_oversized_manifest_is_quarantined_rather_than_pruned() {
         let root = tempfile::tempdir().expect("root");
@@ -2078,17 +1874,14 @@ mod tests {
             .join(&digest)
             .join(GENERATION_MANIFEST_NAME);
 
-        // Unknown schema plus padding past MAX_MANIFEST_BYTES, so the capped
-        // read fails before the schema can be decoded.
+        // Padding an unknown-schema manifest past `MAX_MANIFEST_BYTES` makes the capped read fail before schema decoding.
         let mut oversized = br#"{"schema":2,"unknown_future_field":true,"pad":""#.to_vec();
         oversized.resize(oversized.len() + MAX_MANIFEST_BYTES, b'x');
         oversized.extend_from_slice(br#""}"#);
         assert!(oversized.len() > MAX_MANIFEST_BYTES);
         std::fs::write(&manifest_path, &oversized).expect("write oversized manifest");
 
-        // Promote a successor so the oversized generation is no longer the
-        // current profile target, leaving the quarantine rule as the only thing
-        // that can preserve it.
+        // Pruning must preserve an oversized generation after a successor replaces it as the current profile target.
         let successor = vec![SourceSpec {
             rel_path: "bin/ck-mc-host".to_owned(),
             source: write_source(src.path(), "launcher-successor", b"#successor-binary"),

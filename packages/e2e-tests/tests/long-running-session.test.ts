@@ -249,30 +249,19 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
     const turn = ++turnCounter;
     const reqsBefore = h.mock.requests().length;
     const startedAt = Date.now();
-    // [LR-DIAG] console.error flushes immediately on CI even when console.log is buffered
     console.error(`[LR-DIAG] turn ${turn} START prompt="${prompt.slice(0, 60)}" mockReqs=${reqsBefore}`);
 
-    // OC-DIAG: every 50 mock requests, query opencode's session DB to see
-    // what its filterCompacted/latest() actually returns. This tells us why
-    // OpenCode's loop break condition isn't firing.
     let lastDumpAt = 0;
-    // Runaway detector: if a single turn generates >100 mock requests, it's
-    // pathological. Normal turns generate 1-3 requests. Fire 1 diagnostic
-    // then fail the test fast — much better than waiting for 600s timeout.
     let runawayAborted = false;
     const dumpTimer = setInterval(() => {
         const now = Date.now();
         const reqs = h.mock.requests().length;
-        // Fire diagnostic as soon as we see >=25 unexpected requests, then
-        // every 5s while the hang persists. The earlier we capture data the
-        // less likely it is to be lost to a job-level CI timeout.
+        // The early diagnostic preserves request state before a CI timeout.
         if (reqs > reqsBefore + 25 && now - lastDumpAt > 5000) {
             lastDumpAt = now;
-            // Open opencode's session DB directly (Database is imported at top of file)
             try {
                 const ocDbPath = join(h.opencode.env.dataDir, "opencode", "opencode.db");
                 const ocDb = openTestDb(ocDbPath, { readonly: true });
-                // Get latest messages in the session
                 const rows = ocDb.prepare(
                     "SELECT id, json_extract(data, '$.role') AS role, json_extract(data, '$.finish') AS finish, json_extract(data, '$.summary') AS summary FROM message WHERE session_id = ? ORDER BY id DESC LIMIT 6",
                 ).all(sessionId) as Array<{ id: string; role: string; finish: string | null; summary: number | null }>;
@@ -281,8 +270,6 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
                     .join("  ");
                 console.error(`[LR-DIAG] OC-STATE turn=${turn} mockReqs=${reqs}  topMsgs(newest first):  ${stateStr}`);
 
-                // Dump parts of the TOP 3 newest messages — reveals source of mystery user messages
-                // (compaction marker? autocontinue text? tool result? synthetic ignored notification?)
                 try {
                     const ocDb2 = openTestDb(ocDbPath, { readonly: true });
                     const topIds = rows.slice(0, 3).map((r) => r.id);
@@ -312,9 +299,6 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
             } catch (e) {
                 console.error(`[LR-DIAG] OC-STATE turn=${turn} mockReqs=${reqs} DB read failed: ${e instanceof Error ? e.message : String(e)}`);
             }
-            // After the dump fires AND we have >100 unexpected requests, abort
-            // the turn to give the test a clean failure within ~30s instead of
-            // hanging for the full 600s sendPrompt budget.
             if (reqs > reqsBefore + 100 && !runawayAborted) {
                 runawayAborted = true;
                 console.error(`[LR-DIAG] RUNAWAY DETECTED turn=${turn} mockReqs=+${reqs - reqsBefore}; aborting sendPrompt`);
@@ -323,11 +307,7 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
     }, 2000);
 
     try {
-        // Per-prompt budget: 180s. Was 600s — but the long-running runaway
-        // condition produces 1700+ mock requests over 600s, draining a whole
-        // CI cycle. With the runaway-detector firing the OC-PARTS diagnostic
-        // at +25 and aborting at +100 unexpected requests, 180s is more than
-        // enough for the diagnostic to capture state and fail-fast.
+        // The 180 s prompt budget allows the runaway detector to capture diagnostics before aborting.
         await h.sendPrompt(sessionId, prompt, { timeoutMs: 180_000 });
         clearInterval(dumpTimer);
         const elapsed = Date.now() - startedAt;
@@ -339,7 +319,7 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
         const reqsAfter = h.mock.requests().length;
         const sinceStart = h.mock.requests().slice(reqsBefore);
         console.error(`[LR-DIAG] turn ${turn} FAIL after ${elapsed}ms; mockReqs delta=${reqsAfter - reqsBefore}`);
-        // Show first 5 + last 5 requests (more useful than first 50 identical)
+        // The diagnostic logs the first and last five requests to expose both initial and terminal request state.
         const ofInterest: Array<{ i: number; r: typeof sinceStart[number] }> = [];
         for (let i = 0; i < Math.min(5, sinceStart.length); i += 1) ofInterest.push({ i, r: sinceStart[i]! });
         if (sinceStart.length > 10) {
@@ -368,19 +348,9 @@ async function send(sessionId: string, prompt: string, text: string, usage: Mock
 }
 
 describe("long-running OpenCode Magic Context session", () => {
-    // TODO(ci-hang): on Linux GitHub-hosted runners, OpenCode 1.15.x
-    // sometimes binds its server port and prints "Database migration
-    // complete" but then never responds to HTTP requests, so the harness
-    // sits waiting until the per-test budget expires. Same OpenCode
-    // version on macOS local runs the same 23 turns in ~6 seconds. The
-    // bug is in OpenCode's HTTP server bring-up under Linux+Bun-compiled
-    // binary, not in Magic Context, but it blocks our CI gate.
-    // Skip on CI until OpenCode either ships a fix or we can pin to a
-    // verified-good build (1.15.4 was tried; the symptom returned).
-    // The infinite-loop production bug this test originally caught
-    // (95% emergency notification re-firing) is fixed and locked in
-    // by transform-compartment-phase.test.ts ("95% emergency
-    // notification idempotency" describe block).
+    // TODO: Investigate OpenCode HTTP startup hangs on Linux GitHub-hosted runners with OpenCode 1.15.x.
+    // OpenCode 1.15.4 hangs during HTTP startup on Linux GitHub-hosted runners.
+    // Emergency notifications at 95% are idempotent.
     it.skipIf(Boolean(process.env.CI))("exercises execute, notes, reduce, historian, todo synthesis, and auto-search over one realistic session", async () => {
         h.mock.reset();
 
@@ -402,11 +372,8 @@ describe("long-running OpenCode Magic Context session", () => {
 
         const sessionId = await h.createSession();
 
-        // Phase 1: Warm-up turns 1-3 stay below threshold; the cached prefix is
-        // byte-identical. Each carries ~2.5K tokens of REAL text ballast: the
-        // v3 protected-tail boundary measures true-raw content (not mock usage
-        // numbers), so phase 5's historian force-fire needs genuine content
-        // mass beyond the scaled protected tail or the head resolves empty.
+        // Each turn includes ~2.5K tokens of real-text ballast.
+        // The protected-tail boundary uses raw content, not mock usage.
         for (let i = 1; i <= 3; i += 1) {
             await send(
                 sessionId,
@@ -420,7 +387,6 @@ describe("long-running OpenCode Magic Context session", () => {
         expect(new Set(warmup.slice(1, 3).map((request) => serialize(request.body.system))).size).toBe(1);
         expect(readMeta<{ last_context_percentage: number }>(sessionId, "last_context_percentage")?.last_context_percentage ?? 100).toBeLessThan(20);
 
-        // Phase 2: First execute. Turn 4 records high pressure; turn 5 executes cleanup; turn 6 recovers stability.
         const beforeExecutePressure = readMeta<{ last_context_percentage: number }>(sessionId, "last_context_percentage")?.last_context_percentage ?? 0;
         emitToolOnce(/^ctx_search$/, { query: "phase two harmless cleanup probe", limit: 1 }, FORCE_CLEANUP_USAGE);
         await send(sessionId, "turn 4: raise pressure with a harmless tool call so the next pass must execute", "phase 2 pressure", FORCE_CLEANUP_USAGE);
@@ -428,26 +394,17 @@ describe("long-running OpenCode Magic Context session", () => {
         expect(beforeExecutePressure).toBeLessThan(20);
         expect(afterExecutePressure).toBeGreaterThanOrEqual(20);
         await send(sessionId, "turn 5: execute pass should run heuristic cleanup", "phase 2 execute cleanup");
-        // No routine drops anymore: need-blind age-drops were removed with the
-        // tiered emergency-drop redesign. An execute pass with no droppable
-        // tool pile (one tiny ctx_search output here) must drop NOTHING —
-        // reduction is the agent's job (ctx_reduce, phase 4) with the ≥85%
-        // tiered drop as the safety net (covered end-to-end by
-        // short-context-overflow.test.ts). The execute pass still runs; the
-        // invariant kept here is that it doesn't spuriously evict and the
-        // cache recovers on the following defer pass.
+        // Routine cleanup does not age-drop messages.
+        // An execute pass with no droppable tool output must not evict messages; the following defer pass restores the cache.
         await send(sessionId, "turn 6: defer after first execute should recover cache", "phase 2 cache recovery");
         const phase2Tail = mainRequests().slice(-2);
         expect(phase2Tail.length).toBe(2);
         expect(serialize(phase2Tail[1]!.body.messages?.[0])).toBe(serialize(phase2Tail[0]!.body.messages?.[0]));
-        // Drops here are legitimate, from two designed ≥85% paths (85K usage on
-        // the 100K test limit): the tiered emergency drop may evict tool
-        // outputs, and the force-fired historian publishes a compartment whose
-        // covered messages are queue-dropped. The invariant that matters is the
-        // byte-identical cache recovery asserted above — NOT a drop count
-        // (routine need-blind age-drops are gone; these are need-driven).
+        // At ≥85% usage, tiered emergency drops and historian queue drops may evict messages; cache recovery must remain byte-identical.
+        // The test requires byte-identical cache recovery, not a drop count.
+        // Only the ≥85% pressure paths may drop messages in this test.
 
-        // Phase 3: ctx_note write plus terminal todo trigger. The nudge is delayed to a fresh user turn and then replayed.
+        // The nudge is delayed to a fresh user turn and then replayed.
         emitToolOnce(/^ctx_note$/, { action: "write", content: "Revisit the long-running OpenCode assertions after verification." });
         await send(sessionId, "turn 7: write a deferred session note with ctx_note", "phase 3 after note write");
         expect(
@@ -469,12 +426,11 @@ describe("long-running OpenCode Magic Context session", () => {
         expect(readMeta<{ note_nudge_anchors: string }>(sessionId, "note_nudge_anchors")?.note_nudge_anchors ?? "").toContain("deferred note");
         // The 15-minute cooldown uses process-local wall-clock time; this long test cannot advance it without sleeping.
 
-        // Phase 4: ctx_reduce queues a real drop; the next execute materializes a dropped shell and suppresses cleanup nudges.
+        // ctx_reduce queues a real drop; the next execute materializes a dropped shell and suppresses cleanup nudges.
         let reduceTarget: number;
         let reduceNeedle: string;
         if (RUST_MODE) {
-            // 20ac0630 moved tag authority out of context.db. Select a live tag
-            // from the actual provider wire so this remains a non-vacuous drop.
+            // The test selects a live provider tag to make the drop non-vacuous.
             const wire = JSON.stringify(mainRequests().at(-1)!.body.messages ?? []);
             const match = wire.match(/§(\d+)§ (phase 1 assistant \d+)/);
             expect(match).not.toBeNull();
@@ -517,14 +473,12 @@ describe("long-running OpenCode Magic Context session", () => {
         await send(sessionId, "turn 16: ctx_reduce defer replay remains stable", "phase 4 stable replay");
         expect(JSON.stringify(mainRequests().at(-1)!.body)).not.toContain(reduceNeedle);
 
-        // Phase 5: Historian publishes; OpenCode writes a deferred marker that drains only on a later execute pass.
+        // Historian publishes; OpenCode writes a deferred marker that drains only on a later execute pass.
         await send(sessionId, "turn 17: historian trigger pressure with eligible long tail", "phase 5 historian trigger", HISTORIAN_TRIGGER_USAGE);
         await send(sessionId, "turn 18: follow-up starts historian publication", "phase 5 historian follow-up");
         let pendingBeforeDefer: string | null = null;
         if (RUST_MODE) {
-            // a5b7d61d publishes through the out-of-band module stack; context.db
-            // is not the Rust compartment authority. Observe the committed count
-            // directly rather than waiting on a legacy TypeScript mirror row.
+            // The Rust module stack, not context.db, is the compartment authority.
             const stack = h.mcHostStack;
             if (!stack) throw new Error("Rust historian check requires the hermetic module stack");
             const deadline = Date.now() + 120_000;
@@ -570,7 +524,7 @@ describe("long-running OpenCode Magic Context session", () => {
             pendingBeforeDefer = markerAfterPublish?.pending_compaction_marker_state ?? null;
         }
 
-        // Phase 6: Synthetic todowrite rides the next cache-busting pass, while the marker drains with that pass.
+        // The synthetic todowrite forces the next cache-busting pass, which drains the marker.
         emitToolOnce(/todo.*write|write.*todo|todowrite/i, { todos: ACTIVE_TODOS });
         await send(sessionId, "turn 19: active todowrite snapshot while marker must remain pending", "phase 6 active todos");
         if (pendingBeforeDefer !== null) {
@@ -597,12 +551,11 @@ describe("long-running OpenCode Magic Context session", () => {
             expect(JSON.stringify(mainRequests().at(-1)!.body)).toContain("Ship long-running OpenCode fixture");
         }
 
-        // Phase 7: Auto-search hint from a seeded memory is appended and persisted for same-turn replay.
+        // Same-turn replay appends and persists the seeded-memory auto-search hint.
         const autoSearchMemory =
             "zebra cache ritual: when debugging long sessions, inspect prefix bytes before changing runtime code";
         if (RUST_MODE) {
-            // f5a0f403 routed Rust memory writes through the module backend. Use
-            // the public tool, then verify the local read-model mirror caught up.
+            // Rust memory writes go through the module backend.
             emitToolOnce(/^ctx_memory$/, {
                 action: "create",
                 category: "PROJECT_RULES",
@@ -634,7 +587,6 @@ describe("long-running OpenCode Magic Context session", () => {
             expect(autoSearchDecisions).toContain("ctx-search-hint");
         }
 
-        // Phase 8: Compressor is intentionally disabled for this file to keep the long e2e under the 10-15 minute budget.
         await send(sessionId, "turn 24: final low-pressure defer confirms session still works", "phase 8 compressor skipped");
     }, 900_000);
 });

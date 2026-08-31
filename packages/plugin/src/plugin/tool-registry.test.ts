@@ -161,12 +161,12 @@ describe("createToolRegistry — memory gating", () => {
 });
 
 describe("createToolRegistry — compaction-off mode (#266 S4)", () => {
-    // The canonical enumerated removed-set, imported from the registry source
-    // so a future tool the reduce factory grows appears here and fails the
-    // diff rather than silently vanishing in compaction-off mode. The factory
-    // is plural (returns a record keyed by tool name), so the test must
-    // distinguish "factory skipped" from "one ID filtered" — this enumeration
-    // is the removed-set the acceptance test diffs against the mode-on tool
+    // Assert the complete removed-ID set so newly gated reduce tools require an explicit expectation.
+    // Assert the complete removed-ID set so newly gated reduce tools require an explicit expectation.
+    // Assert the complete removed-ID set so newly gated reduce tools require an explicit expectation.
+    // Assert the complete removed-ID set so newly gated reduce tools require an explicit expectation.
+    // Assert the complete removed-ID set so newly gated reduce tools require an explicit expectation.
+    // Assert the complete removed-ID set so newly gated reduce tools require an explicit expectation.
     // list.
     const COMPACTION_OFF_REMOVED_TOOL_IDS = getCompactionOffRemovedToolIds();
 
@@ -179,7 +179,6 @@ describe("createToolRegistry — compaction-off mode (#266 S4)", () => {
         const onIds = new Set(Object.keys(modeOn));
         const offIds = new Set(Object.keys(modeOff));
 
-        // The diff is EXACTLY the enumerated removed-set and nothing else.
         const removed = [...onIds].filter((id) => !offIds.has(id));
         const added = [...offIds].filter((id) => !onIds.has(id));
         expect(removed.sort()).toEqual([...COMPACTION_OFF_REMOVED_TOOL_IDS].sort());

@@ -1,12 +1,8 @@
 /**
- * Shared token-budgeted rendering for explicit `ctx_search` output.
+ * This module renders explicit `ctx_search` output under a token budget.
  *
- * OpenCode and Pi both render through this module so caps, ordering, and
- * formatted text cannot drift between harnesses (R39-R40). Each dynamic
- * result field is bounded to MAX_DYNAMIC_FIELD_BYTES of valid UTF-8 before
- * any tokenization, and packing keeps a ranked prefix of complete result
- * blocks under MAX_RENDERED_RESULT_TOKENS with reserved header, expand
- * hints, and omission notice.
+ * The renderer bounds each dynamic result field to `MAX_DYNAMIC_FIELD_BYTES` of valid UTF-8 before tokenization.
+ * Packing retains a ranked prefix of complete result blocks under `MAX_RENDERED_RESULT_TOKENS`.
  */
 
 import type {
@@ -106,7 +102,7 @@ function formatResult(
     ].join("\n");
 }
 
-/** Body parts (blocks + applicable expand hints) for a rendered prefix. */
+/* */
 function bodyPartsFor(
     blocks: readonly string[],
     rendered: readonly UnifiedSearchResult[],
@@ -135,8 +131,8 @@ function assemble(header: string, parts: readonly string[]): string {
 
 export type ExplicitDeliveryReason = "delivered" | "empty-results" | "packer-empty";
 
-/** `delivered` contains exactly the results whose complete blocks appear in
- *  `text`, in rendered order. */
+/** The `delivered` array contains exactly the results whose complete blocks appear in `text`, in rendered order.
+ * */
 export interface PackedSearchResults {
     text: string;
     delivered: UnifiedSearchResult[];
@@ -146,17 +142,15 @@ export interface PackedSearchResults {
 }
 
 /**
- * Packs the response under MAX_RENDERED_RESULT_TOKENS. Over-budget output
- * keeps a prefix of complete blocks and appends an omission notice — no
- * block is partially emitted. Empty results and a packer that cannot fit
- * even one block are completed empty-delivery outcomes, not failures.
+ * The packer appends an omission notice when it excludes result blocks.
+ * Empty results and failure to fit any block produce an empty delivery rather than an error.
  */
 export function packSearchResults(
     query: string,
     results: UnifiedSearchResult[],
     currentSessionId: string,
-    /** Reference clock for age wording; injectable so a fingerprinted
-     *  benchmark scenario renders identical bytes on any day. */
+    /** Callers inject `nowMs` so age wording is deterministic across dates.
+     * */
     nowMs: number = Date.now(),
 ): PackedSearchResults {
     const boundedQuery = boundDynamicField(query);
@@ -196,9 +190,6 @@ export function packSearchResults(
             noticeFor(results.length - kept),
         ]);
 
-    // Token count grows monotonically with the kept prefix, so the largest
-    // fitting prefix is found by binary search instead of re-tokenizing the
-    // whole candidate once per dropped block.
     const bestIndex = binarySearchLargestFit(
         results.length - 2,
         (index) => estimateTokens(candidateFor(index + 1)) <= MAX_RENDERED_RESULT_TOKENS,

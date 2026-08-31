@@ -1,6 +1,5 @@
-/// <reference types="bun-types" />
 
-/** FM-OC-1: a real module SIGKILL serves the last-known-good wire once, loudly. */
+/* */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";
@@ -65,8 +64,7 @@ describe.skipIf(!active)("rust failure-mode drill FM-OC-1: LKG after SIGKILL", (
                 expect(recoveredWire.slice(0, priorWire.length)).toEqual(priorWire);
                 expect(lines.some((line) => line.includes("lkg_replay_served"))).toBe(true);
             } else {
-                // OpenCode may revise the prior message while appending the new
-                // turn; the shipped seam rejects that LKG and serves loud raw.
+                // A changed prior-message prefix rejects LKG replay.
                 expect(lines.some((line) => line.includes("lkg_content_mismatch"))).toBe(true);
             }
             assertMessagesHaveNoPlaceholders(h.lastMainMessages(), sessionId);

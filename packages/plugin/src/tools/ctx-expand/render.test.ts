@@ -13,7 +13,6 @@ function provide(messages: RawMessage[]): () => void {
     });
 }
 
-// OpenCode-shaped tool part: { type:"tool", tool, callID, state:{input,output} }
 function ocTool(tool: string, callID: string, input: unknown, output: unknown): unknown {
     return { type: "tool", tool, callID, state: { input, output } };
 }
@@ -39,13 +38,10 @@ describe("renderVerboseRange", () => {
         ]);
         try {
             const out = renderVerboseRange(SESSION, 10, 11, 15_000);
-            // Each message rendered separately, addressed by ordinal in the header.
             expect(out.text).toContain("[10] U (user)");
             expect(out.text).toContain("[11] A (assistant)");
-            // Tool call shown with its name+arg and output size, not raw output.
             expect(out.text).toContain("tool read(config.ts)");
             expect(out.text).toMatch(/→ output ~\d+ tok/);
-            // Preview is a preview — the raw multi-line output isn't dumped here.
             expect(out.text).not.toContain("line2");
             expect(out.lastOrdinal).toBe(11);
             expect(out.truncated).toBe(false);
@@ -71,9 +67,7 @@ describe("renderVerboseRange", () => {
     });
 
     test("token budget truncates across many messages and reports continuation", () => {
-        // Verbose previews are capped per-part, so truncation is driven by the
-        // NUMBER of messages, not one giant message. Each block here is ~tens of
-        // tokens; a tight budget fits the first but not the second.
+        // With a 30-token budget, the first block fits and the second does not.
         const text = "word ".repeat(40);
         const cleanup = provide([
             { ordinal: 1, id: "m1", role: "user", parts: [{ type: "text", text }] },
@@ -82,7 +76,6 @@ describe("renderVerboseRange", () => {
         ]);
         try {
             const out = renderVerboseRange(SESSION, 1, 3, 30);
-            // First block always emitted (never an empty result), then truncates.
             expect(out.text).toContain("[1] U (user)");
             expect(out.truncated).toBe(true);
             expect(out.lastOrdinal).toBe(1);
@@ -107,7 +100,6 @@ describe("renderMessageByOrdinal", () => {
             const out = renderMessageByOrdinal(SESSION, 7);
             expect(out).toContain("[7] A (assistant)");
             expect(out).toContain("[tool: bash #bash:9]");
-            // FULL output present, not a preview/size.
             expect(out).toContain(fullOutput.trim().slice(0, 30));
             expect(out).toContain("input:");
         } finally {
@@ -145,7 +137,6 @@ describe("renderMessageByOrdinal", () => {
         ]);
         try {
             const out = renderMessageByOrdinal(SESSION, 9);
-            // Tool data present, incl. the non-empty description line.
             expect(out).toContain("[tool: read #read:3]");
             expect(out).toContain("description: Read a.ts");
             expect(out).toContain("the recovered output");

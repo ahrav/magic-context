@@ -31,12 +31,9 @@ const VALID_SOURCES: ReadonlySet<CtxSearchSource> = new Set([
     "note",
 ]);
 
-/** Validate and normalize the `sources` arg. Drops unknown strings (the enum
- *  constraint catches them at the schema layer, but we still want a safe
- *  runtime check for plugins/tests that call this directly). Returns
- *  `undefined` only when the caller OMITTED `sources`; an explicit [] must stay
- *  [] so unifiedSearch honors the documented "no sources" meaning instead of
- *  widening back to "all sources". */
+/**
+ * `undefined` means `sources` was omitted; preserve [] so `unifiedSearch` searches no sources.
+ * */
 function normalizeSources(sources?: string[]): CtxSearchSource[] | undefined {
     if (sources === undefined) return undefined;
     const result: CtxSearchSource[] = [];
@@ -69,8 +66,8 @@ const ctxSearchArgsShape = {
         ),
 };
 // The tool definition exposes only the documented argument shape to the model
-// provider, but older callers may still send extra arguments. Parse with
-// passthrough so execute() can receive those fields without advertising them.
+// Callers may still send extra arguments.
+// `passthrough()` lets `execute()` receive fields that the model cannot see in the argument schema.
 const ctxSearchArgsSchema = tool.schema.object(ctxSearchArgsShape).passthrough();
 
 export interface CtxSearchCallContext {
@@ -78,10 +75,9 @@ export interface CtxSearchCallContext {
     directory: string;
 }
 
-/** Structured explicit-delivery outcome. `invalid` carries the same error
- *  text the tool returns; `complete` carries the rendered text plus the
- *  pre-pack ranking and the results whose blocks survived packing. A search
- *  failure propagates as a thrown error — incomplete evidence, never an
+/**
+ * `complete` includes rendered text, the pre-pack ranking, and results whose blocks survived packing.
+ * Search failures throw instead of returning an empty ranking.
  *  empty ranking. */
 export type CtxSearchExecution =
     | { status: "invalid"; text: string }
@@ -96,10 +92,6 @@ export type CtxSearchExecution =
       };
 
 /**
- * Execute one explicit ctx_search call. The tool's `execute` delegates here,
- * so direct-ID lookup, multi-probe recall, source filters, visible-memory
- * filtering, ordinal cutoffs, and token packing stay on one shared path
- * whether the caller wants text or the structured outcome.
  */
 export async function executeCtxSearch(
     deps: CtxSearchToolDeps,
@@ -109,9 +101,7 @@ export async function executeCtxSearch(
     const parsedArgs = ctxSearchArgsSchema.safeParse(rawArgs);
     let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxSearchArgs;
     args = normalizeCtxSearchArgs(args);
-    // Exactly one normalization pass (shared with recovery), then
-    // the type-safe preflight: a model-supplied non-string query
-    // reads as missing instead of throwing out of tool execution.
+    // Non-string model-supplied `query` values are treated as missing rather than throwing.
     const preflight = prepareQueryFromNormalizedArgs(args);
     if (!preflight.ok) {
         return { status: "invalid", text: `Error: ${describeQueryBoundsViolation(preflight)}` };
@@ -121,26 +111,16 @@ export async function executeCtxSearch(
         return { status: "invalid", text: "Error: 'query' is required." };
     }
 
-    // Only search message history up to the last compartment boundary —
-    // anything after that (the live tail, including the current turn) is
-    // still in context and already visible to the agent. When NO compartment
-    // exists yet, the historian hasn't scrolled anything out of context, so
-    // the boundary is 0: every indexed message (ordinals are 1-based) is in
-    // the live tail and must be excluded. A negative sentinel here would mean
-    // "search everything" and leak the current prompt back to the agent — the
-    // exact opposite of the intent (issue #131).
+    // Search only messages before the last compartment boundary; the live tail is already visible to the agent.
+    // When no compartment exists, use boundary `0` to exclude every indexed message.
+    // A negative sentinel would search everything and leak the current prompt back to the agent.
     const lastCompartmentEnd = getLastCompartmentEndMessage(deps.db, toolContext.sessionID);
     const messageOrdinalCutoff = lastCompartmentEnd >= 0 ? lastCompartmentEnd : 0;
 
-    // Hard-filter claims already rendered in the injected baseline.
-    // They're visible in message[0], so returning them wastes output
-    // tokens and crowds out high-signal raw-history hits.
+    // The search hard-filters claims already rendered in the injected baseline.
+    // Claims in `message[0]` are already visible, so excluding them preserves tokens for raw-history hits.
     const visibleRevisionLocators = getVisibleRevisionLocators(deps.db, toolContext.sessionID);
 
-    // Resolve the session's actual project from `toolContext.directory`
-    // each call. OpenCode's top-level `ctx.directory` (the launch dir)
-    // can differ from the session's working directory when the user
-    // runs `opencode -s <id>` from outside the project.
     const projectPath = deps.resolveProjectPath(toolContext.directory);
     if (!projectPath) {
         return { status: "invalid", text: "Error: Could not resolve project identity for search." };
@@ -168,20 +148,14 @@ export async function executeCtxSearch(
         };
     };
 
-    // Exact-locator short-circuit: when the whole query is one or more
-    // claim/revision locators, bypass the lexical+semantic lanes and
-    // resolve them through the current-state provider. The agent is given
-    // locators everywhere (<project-memory> lines, dashboard, guidance).
-    // Whole-query locator list only — `parseLocatorShapedQuery` returns
-    // null for ordinary text so it still searches the corpus. If no
-    // locator resolves (foreign hidden, missing) the call falls through
-    // to the normal lanes.
+    // `parseLocatorShapedQuery` accepts locator lists only when they occupy the whole query.
+    // `parseLocatorShapedQuery` returns null for ordinary text, allowing `unifiedSearch` to search the corpus.
+    // If no locator resolves, the call falls through to `unifiedSearch`.
     //
-    // Source restriction binds here too. This path runs BEFORE
-    // `normalizeSources` reaches `unifiedSearch`, so without the check a
-    // locator-shaped query would return claim content under `sources: []`
-    // — documented as searching no sources — or under a restriction naming
-    // only non-memory sources.
+    // The locator path must honor `args.sources`.
+    // `sources: []` must not return claim content.
+    // `sources: []` must not return claim content.
+    // `sources: []` must not return claim content.
     const requestedSources = normalizeSources(args.sources);
     const memorySourceAllowed =
         requestedSources === undefined || requestedSources.includes("memory");
@@ -191,10 +165,8 @@ export async function executeCtxSearch(
             db: deps.db,
             projectPath,
             locators: locatorShape,
-            // The requested limit applies here exactly as it does to every other
-            // search path. Raising the cap to the locator count let `limit: 1`
-            // with two ids return both, and a long enough locator list slip past
-            // the shared hard ceiling.
+            // `limit: 1` must return at most one locator result.
+            // `limit: 1` must return at most one locator result.
             limit: normalizeSearchResultLimit(args.limit),
             visibleRevisionLocators,
         });
@@ -216,9 +188,6 @@ export async function executeCtxSearch(
         maxMessageOrdinal: messageOrdinalCutoff,
         gitCommitsEnabled,
         sources: requestedSources,
-        // Explicit agent search → enable literal-probe multi-query
-        // recall for symbol/command/path lookups. Auto-search hints
-        // (the hot path) leave this off to protect their latency.
         explicitSearch: true,
     });
 

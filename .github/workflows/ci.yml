@@ -11,30 +11,22 @@ env:
 permissions:
   contents: read
 
-# Pipeline shape on every push to main and every PR:
 #
 #   check-plugin, check-pi-plugin
-#   (unit tests + lint + typecheck, parallel)
 #                  ↓
 #   e2e-opencode, e2e-pi
-#   (Docker install + smoke, parallel — gated by unit)
 #                  ↓
 #   e2e-host-opencode, e2e-host-pi
-#   (host behavior suite from packages/e2e-tests, parallel — gated by Docker)
 #
-# Two e2e layers cover different concerns:
-#   - Docker e2e: fresh-install smoke (plugin loads, doctor clean, one mock
-#     turn writes DB rows under cortexkit path with right harness). Catches
-#     packaging / install-flow regressions.
-#   - Host e2e: behavior suite with byte-level wire assertions, multi-turn
-#     cache stability, historian publish behavior, tag-owner collision,
-#     synthetic todowrite, cross-harness memory, etc. Spawns real
-#     `opencode serve` / Pi subprocesses against an embedded mock provider.
-#     Catches cache-stability + correctness regressions that the smoke layer
+# Docker e2e verifies a fresh install, clean doctor output, and one mock turn that writes database rows under the cortexkit path.
+# Docker e2e catches packaging and install-flow regressions.
+# Host e2e asserts byte-level wire behavior and multi-turn cache stability.
+# Host e2e verifies historian publishing and tag-owner collision behavior.
+# Host e2e covers synthetic `todowrite` and cross-harness memory behavior.
+# Host e2e spawns real `opencode serve` and Pi subprocesses against an embedded mock provider.
+# Host e2e catches cache-stability regressions that Docker smoke tests cannot detect.
 #     cannot see.
 #
-# Docker e2e was previously in a separate workflow (e2e-docker.yml). Folding
-# it here means every PR and main push exercises the full unit → Docker → host
 # gauntlet.
 
 jobs:
@@ -82,10 +74,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # The contract is committed in four byte-coupled forms (canonical
-      # JSON, the include!-able Rust constants that feed production epoch
-      # values, and two TypeScript embeddings). This is the only gate that
-      # proves they were regenerated together.
+      # The release contract has four byte-coupled representations: canonical JSON, Rust epoch constants, and two TypeScript embeddings.
+      # The Rust constants supply production epoch values.
+      # The release-contract check verifies that all four representations were regenerated together.
       - name: Check generated release contract for drift
         run: bun run release:contract:check
 
@@ -281,14 +272,13 @@ jobs:
             --test host_adapter \
             --test lifecycle_cli
 
-      # The release ships darwin payloads, so this leg proves the native
-      # lifecycle binary compiles and links for darwin and that its
-      # argument-parsing and version/release-metadata contract holds there.
-      # It asserts nothing about lifecycle state: those proofs need a
-      # published daemon, which requires Broca's `/proc` process identity,
-      # and a data root the `O_NOFOLLOW` lifecycle path walk accepts, which
-      # the darwin temporary directory's `/var` symlink is not, so they
-      # compile out here.
+      # The Darwin leg verifies that the native lifecycle binary compiles and links for Darwin.
+      # The Darwin leg verifies the lifecycle binary's argument-parsing and version/release-metadata contract.
+      # The Darwin leg asserts nothing about lifecycle state.
+      # Lifecycle-state proofs require a published daemon, which requires Broca's `/proc` process identity.
+      # The daemon also requires a data root that the `O_NOFOLLOW` lifecycle path walk accepts.
+      # The Darwin temporary directory's `/var` symlink fails the `O_NOFOLLOW` path walk.
+      # The lifecycle-state proofs compile out of the Darwin leg.
       - name: Native lifecycle binary and CLI contract (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -305,8 +295,8 @@ jobs:
         with:
           bun-version: latest
 
-      # node:sqlite (the Pi / OpenCode-Desktop SQLite backend) is only reachable
-      # under Node, not Bun. Node 24 also strips the smoke script's inline TS.
+      # `node:sqlite` is reachable only under Node.
+      # Node 24 also strips the smoke script's inline TypeScript.
       - uses: actions/setup-node@v4
         with:
           node-version: "24.18.0"
@@ -326,18 +316,16 @@ jobs:
       - name: Check compiled TUI freshness
         run: bun run --cwd packages/plugin check:tui-compiled
 
-      # `bun run test` ends in test:release, whose dependency-boundary check
-      # shells out to `cargo tree -p mc-host`. cargo refuses to load the
-      # workspace until every path-dep manifest exists, including the
-      # ../commons cortexkit crates. Metadata-only stubs satisfy the manifest
-      # graph; nothing in this job compiles them.
+      # `test:release` runs `cargo tree -p mc-host`, which requires every path-dependency manifest.
+      # `cargo tree` refuses to load the workspace unless every path-dependency manifest exists.
+      # Every path dependency, including the `../commons` cortexkit crates, requires a manifest.
+      # Metadata-only stubs satisfy Cargo's manifest graph without compiling the crates.
+      # Nothing in this job compiles the stubs.
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
-      # Pins the cargo used by the warm-up below and by the same `cargo tree`
-      # inside test:release, matching every other cargo-invoking job. Without
-      # it both resolve to whatever rustc the runner image ships, so an image
-      # change surfaces as a cargo failure inside a TypeScript job.
+      # The toolchain action pins Cargo for the warm-up and for `test:release`'s `cargo tree`.
+      # Without the toolchain action, the warm-up and `test:release` resolve to the runner image's Cargo.
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Warm mc-host dependency graph
@@ -346,38 +334,31 @@ jobs:
       - name: Test
         run: bun run test
 
-      # Exercise the node:sqlite branch of shared/sqlite.ts under REAL Node —
-      # bun test only covers the bun:sqlite branch, so the transaction() shim,
-      # readonly→readOnly mapping, and the array-bind normalization (#151) would
-      # otherwise ship unverified on Pi/Desktop.
+      # Node tests exercise the `node:sqlite` branch of `shared/sqlite.ts`.
+      # Bun tests do not exercise Node-specific SQLite compatibility behavior.
+      # bun test only covers the bun:sqlite branch, so the `transaction()` shim, `readonly`→`readOnly` mapping, and array-bind normalization would otherwise ship unverified on Pi/Desktop.
       - name: Smoke (node:sqlite backend)
         run: node packages/plugin/scripts/smoke-node-sqlite.ts
 
-      # The smart-note QuickJS sandbox loads a ~1MB WASM. `bun test` runs it
-      # from src (wasm resolves via node_modules), so it cannot catch a
-      # BUNDLING break where the wasm isn't embedded in dist. This bundles
-      # sandbox-runner exactly like the package build and runs a real check
-      # against the bundle.
+      # `bun test` resolves the smart-note WASM from `node_modules` when running source, so it cannot detect a missing bundled WASM in `dist`.
+      # The test bundles `sandbox-runner` as the package build does and validates the bundle.
       - name: Smoke (smart-note wasm bundle)
         run: bun packages/plugin/scripts/smoke-smartnote-wasm.ts
 
-      # The raw-TSX ./tui entry imports @opentui/solid's JSX runtime. `bun test`
-      # never imports it, so a missing/mismatched OpenTUI or Solid dep (as broke
-      # on OpenCode 1.17.10's OpenTUI 0.4.2 bump) ships a TUI that won't load.
-      # Import the entry the way OpenCode loads the ./tui export to catch it.
+      # `./tui` requires `@opentui/solid`'s JSX runtime at import time.
+      # `bun test` never imports `@opentui/solid`'s JSX runtime, so dependency mismatches can make `./tui` fail to load.
+      # The smoke test imports the entry as OpenCode loads the `./tui` export to catch missing or mismatched OpenTUI and Solid dependencies.
       - name: Smoke (TUI entry import)
         run: bun packages/plugin/scripts/smoke-tui-import.ts
 
-      # The dev-path import above cannot catch packaging breaks: OpenTUI's Solid
-      # transform skips node_modules sources, so only a packed PROD install
-      # exercises the resolution path OpenCode's plugin cache uses (v0.31.1
-      # shipped without runtime deps and passed every dev-path check).
+      # The dev-path import cannot catch packaging breaks because OpenTUI's Solid transform skips `node_modules`.
+      # Only a packed production install exercises the resolution path OpenCode's plugin cache uses.
       - name: Smoke (TUI packaged install import)
         run: bun packages/plugin/scripts/smoke-tui-pack-install.ts
 
-      # Tokenizer loading is lazy, so an import-only smoke misses resolution
-      # failures. Pack + npm-install prod deps, then exercise an estimate from a
-      # compiled Bun host matching OpenCode's /$bunfs/root runtime.
+      # Tokenizer loading is lazy, so import-only smoke tests do not resolve it.
+      # The smoke test packs and npm-installs production dependencies before estimating tokens.
+      # The smoke test runs the estimate from a compiled Bun host to match OpenCode's `/$bunfs/root` runtime.
       - name: Smoke (tokenizer packaged install estimate)
         run: bun packages/plugin/scripts/smoke-tokenizer-pack-install.ts
 
@@ -448,13 +429,11 @@ jobs:
         with:
           bun-version: latest
 
-      # The release-script suite asserts the mc-host -> mc-module dependency
-      # boundary through `cargo tree`, which needs a resolvable workspace.
+      # The release-script suite needs a resolvable workspace because it checks the `mc-host` -> `mc-module` boundary with `cargo tree`.
       - uses: dtolnay/rust-toolchain@stable
 
-      # Production payload packing refuses any npm outside the certified 11.x
-      # line, and this job otherwise inherits whichever npm the runner image
-      # ships. Node 24 carries npm 11.
+      # Node 24 supplies npm 11.x, which production payload packing requires.
+      # The runner image's npm version is not controlled by this job.
       - uses: actions/setup-node@v4
         with:
           node-version: "24.18.0"
@@ -465,35 +444,28 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
-      # Same script `check:all` runs, so a contributor's local pass covers
-      # exactly what this gate covers.
       - name: Release script unit tests
         run: bun run test:release
 
       - name: U8 release contract drift
         run: bun run release:contract:check
 
-      # Drift-only: byte verification needs the real production artifacts,
-      # which live on the qualifying host, so --check stays portable here and
-      # guards the committed lock/credentials/evidence digests.
+      # Byte verification needs production artifacts from the qualifying host.
+      # Byte verification requires artifacts from the qualifying host, so `--check` remains portable.
       - name: U9 production-input qualification drift
         run: bun run release:qualify:check
 
-      # The payload packages carry the optionalDependencies that resolve native
-      # bytes, and the trust index is what bootstrap decides against. Without
-      # this step, edited payload package metadata, exact-pin drift in a
-      # parent's optionalDependencies, or a hand-edited trust artifact merges
+      # Payload packages declare the `optionalDependencies` that resolve native bytes.
+      # Bootstrap selects payloads without consulting the trust index.
+      # Payload metadata and trust-index validation prevent edited payload metadata, parent optionalDependencies pin drift, and hand-edited trust artifacts from merging.
       # unchecked.
       - name: U6 payload package + trust index drift
         run: bun run release:payload:check
 
-  # Its own job, not a step in prospective-release-holdout: steps in one job
-  # short-circuit, so an unrelated contract lane failing first would skip this
-  # one and leave the historian-eval gate silently unenforced — which is the
-  # state this job exists to end. Nothing invoked test:historian-eval-unit
-  # before: test:e2e selects --mode ts and test:opencode-e2e runs the green
-  # manifest, and neither reaches historianEvalUnitFiles(), so the contract and
-  # freeze lint could regress with every other lane green.
+  # The `historian-eval-contracts` job runs independently so `prospective-release-holdout` failures cannot skip its gate.
+  # A failure in an earlier `prospective-release-holdout` step would skip a later historian-eval step.
+  # Neither `test:e2e` nor `test:opencode-e2e` invokes `historianEvalUnitFiles()`.
+  # The `historian-eval-contracts` job runs the historian contract and freeze lint independently so other jobs cannot mask their regressions.
   #
   # Every deterministic historian-eval gate lives HERE, and the job declares no
   # `needs`, for the same reason: a gate placed in a separate job downstream of
@@ -579,11 +551,10 @@ jobs:
   # step fails, and a gate placed downstream of check-plugin is skipped whenever
   # check-plugin fails — both reproduce silent non-enforcement one hop away.
   #
-  # Nothing invoked test:dreamer-eval-unit before: test:e2e selects --mode ts
-  # and test:opencode-e2e runs the harness manifests, and neither reaches
-  # dreamerEvalUnitFiles(), so the scenario contract, seeder, scorer, and
-  # mutation battery could regress with every other lane green. The suites are
-  # credential-free and make no live model calls; live scenario runs stay out of
+  # Neither `test:e2e` nor `test:opencode-e2e` invokes `test:dreamer-eval-unit`.
+  # Neither `test:e2e` nor `test:opencode-e2e` reaches `dreamerEvalUnitFiles()`.
+  # Without this job, the scenario contract, seeder, scorer, and mutation battery can regress while other lanes pass.
+  # These suites require no credentials or live model calls; live scenarios do not run in PR CI.
   # per-PR CI.
   dreamer-eval-contracts:
     name: Dreamer eval lane contracts
@@ -654,15 +625,13 @@ jobs:
       - name: Provision metadata-only sibling stubs
         run: sh scripts/provision-rust-ci-stubs.sh
 
-      # fmt resolves the workspace from metadata alone, so it works against the
-      # sibling stubs. Clippy would have to compile the cortexkit-* siblings,
-      # which the stubs cannot support, so it stays in the local lint:rust gate.
+      # `cargo fmt` resolves the workspace from metadata without compiling the sibling stubs.
+      # Clippy remains in `lint:rust` because it must compile the `cortexkit-*` siblings, which the stubs cannot support.
       - name: Format check (root workspace)
         run: cargo fmt --check
 
-      # Every workspace member takes mc-core with default features, so a plain
-      # --workspace pass never compiles the cache-core-off configuration; this
-      # check keeps that feature gate building. Without default features,
+      # Every workspace member enables `mc-core` default features.
+      # `cargo check -p mc-core --no-default-features` builds the cache-core-off configuration.
       # mc-core does not depend on the stubbed cortexkit crates.
       - name: mc-core feature-off build
         run: cargo check -p mc-core --no-default-features
@@ -671,11 +640,11 @@ jobs:
     name: Benchmark (retrieval, deterministic CI profile)
     runs-on: ubuntu-latest
     needs: [check-plugin]
-    # Three check runs (each self-bounded at the profile's 10-minute
-    # maxWallTimeMs) plus checkout, install, the regression comparison, and
-    # artifact upload. 45 leaves real margin over the 30-minute worst-case
-    # run budget so the CLI's clean self-interrupt fires before GitHub's
-    # hard non-diagnostic kill.
+    # The three checks each cap execution at the profile's `maxWallTimeMs` value of 10 minutes.
+    # Checkout, installation, regression comparison, and artifact upload also consume the job timeout.
+    # A 45-minute timeout exceeds the three-check 30-minute budget by 15 minutes.
+    # The 15-minute timeout reserve lets the CLI self-interrupt before GitHub terminates the job.
+    # The CLI self-interrupts before GitHub's hard non-diagnostic timeout kill.
     timeout-minutes: 45
     permissions:
       contents: read
@@ -691,10 +660,8 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # Three complete runs because the regression CLI takes exactly three
-      # candidate reports (median-of-three latency rule); on the ci profile
-      # latency stays informational, so without --require-latency the gate
-      # is quality: pass/quality-only exit 0, a quality policy-fail exits 1.
+      # The CLI requires exactly three candidate reports because it computes latency as their median.
+      # Without `--require-latency`, latency is informational; the gate exits 0 for a quality pass and 1 for a quality policy failure.
       - name: Retrieval benchmark check (ci profile, three runs)
         run: |
           mkdir -p benchmark-artifacts
@@ -718,8 +685,7 @@ jobs:
             --candidate benchmark-artifacts/retrieval-check-report-3.json \
             --out benchmark-artifacts/retrieval-regression.json
 
-      # The CLI writes the report before it sets a failing exit code, so a
-      # failed check still produces the artifact that explains the failure.
+      # Failed checks still upload the diagnostic artifact.
       - name: Archive report and candidate pool
         if: always()
         uses: actions/upload-artifact@v4
@@ -749,8 +715,7 @@ jobs:
         run: bun run --cwd packages/plugin build
 
       - name: Build CLI
-        # The CLI is its own package (@cortexkit/magic-context) since
-        # v0.16.1; Dockerfile.opencode COPYs packages/cli/dist/ in.
+        # `Dockerfile.opencode` requires `packages/cli/dist/`.
         run: bun run --cwd packages/cli build
 
       - name: Build E2E image
@@ -785,15 +750,12 @@ jobs:
         run: bun run --cwd packages/pi-plugin build
 
       - name: Build CLI
-        # The CLI moved to its own package (@cortexkit/magic-context) in
-        # v0.16.1. Dockerfile.pi COPYs packages/cli/dist/ in for the
-        # `magic-context doctor --harness pi` test invocation.
+        # `Dockerfile.pi` requires `packages/cli/dist/` for `magic-context doctor --harness pi`.
         run: bun run --cwd packages/cli build
 
       - name: Build E2E image
         # The Pi Dockerfile installs runtime deps fresh inside the image
-        # (better-sqlite3 builds against linux/amd64), so no host-side
-        # `npm install` is needed.
+        # The image builds `better-sqlite3` for linux/amd64, so host-side `npm install` is unnecessary.
         run: |
           docker build \
             --platform linux/amd64 \
@@ -843,13 +805,9 @@ jobs:
   e2e-host-opencode:
     name: E2E (OpenCode, host behavior)
     runs-on: ubuntu-latest
-    # Gated on Docker e2e: no point exercising the deep behavior suite if
-    # the simpler install+smoke path is broken.
+    # The Docker install-and-smoke path must pass before the deep behavior suite runs.
     needs: [e2e-opencode]
-    # The manifest selection includes the incident-pool green wrapper and the
-    # historian-eval harness tests, both of which run their cases sequentially
-    # with a cold harness boot per case; 60 minutes is too tight for that plus
-    # the host suite, and the margin absorbs cold-runner boot variance.
+    # The incident-pool and historian-eval harness tests boot cold runners sequentially; 75 minutes covers them, the host suite, and cold-runner variance.
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
@@ -861,16 +819,9 @@ jobs:
       - name: Install workspace deps
         run: bun install --frozen-lockfile
 
-      # Install opencode the same way the Docker image does — the host
-      # suite spawns `opencode serve` from PATH.
+      # The host suite spawns `opencode serve`, which requires OpenCode on `PATH`.
       - name: Install opencode
-        # Float to LATEST (no --version) so CI exercises the opencode version
-        # users actually run and catches upstream breakage as it ships — not at
-        # our release time. (A fixed pin previously hid opencode 1.16's
-        # post-overflow change, commit 7e09660c3, until release; the
-        # overflow-recovery host test is now version-agnostic.) Trade-off: a
-        # known-bad upstream release can turn CI red for unrelated PRs — if that
-        # happens, temporarily re-pin with `--version X.Y.Z` here until it's
+        # CI tests the latest OpenCode release; no `--version` is passed.
         # resolved upstream.
         run: |
           curl -fsSL https://opencode.ai/install | bash
@@ -880,36 +831,27 @@ jobs:
         run: opencode --version
 
       - name: Build OpenCode plugin
-        # Host tests spawn `opencode serve` with a file:// plugin
-        # specifier pointing at packages/plugin/, so dist must exist.
+        # Host tests pass `packages/plugin/` to `opencode serve` as a `file://` plugin, which requires `packages/plugin/dist`.
         run: bun run --cwd packages/plugin build
 
       - name: Build Pi plugin
-        # The OpenCode selection carries cross-harness parity tests that spawn a
-        # Pi runner alongside opencode, and that spawn asserts
-        # packages/pi-plugin/dist/index.js exists before booting.
+        # The OpenCode selection includes cross-harness parity tests that start a Pi runner alongside OpenCode.
+        # The Pi runner asserts that `packages/pi-plugin/dist/index.js` exists before booting.
         run: bun run --cwd packages/pi-plugin build
 
-      # Strip inherited NODE_ENV=test so the spawned opencode subprocess
-      # gets the same logging + runtime behavior as a normal local run
-      # (documented in CONTRIBUTING / project memory).
+      # The workflow removes inherited `NODE_ENV=test` so the spawned `opencode` subprocess uses normal local logging and runtime behavior.
       #
-      # Per-test (and per-hook) timeout bumped to 300s: the first test file
-      # Bun loads on a cold GitHub-hosted runner pays the dependency-resolution
-      # + opencode-binary cold-start cost in its
-      # `beforeAll(TestHarness.create)`, which can exceed Bun's 120s default.
-      # Subsequent files run in 5-10s.
+      # A 300s per-test and per-hook timeout accommodates cold-runner dependency resolution and OpenCode startup.
+      # On cold GitHub-hosted runners, Bun's first test file pays the dependency-resolution and OpenCode cold-start cost.
+      # `beforeAll(TestHarness.create)` incurs the OpenCode binary cold-start cost.
+      # `beforeAll(TestHarness.create)` can exceed Bun's 120s default.
       - name: Run host e2e suite (OpenCode tests only)
         env:
           NODE_ENV: ""
           MC_E2E_MODE: ts
-        # run-test-selection.ts derives the OpenCode list from the mode
-        # manifest, carries the standalone oracles that live outside the
-        # manifest's tests/**/*.test.ts inventory (see standaloneUnitFiles),
-        # and runs the incident-pool green wrapper alone in a second phase
-        # with --max-concurrency 1. Rust is intentionally absent from this job
-        # because its ../commons and ../subconscious path-deps are not checked
-        # out here; the local release gate runs that host group.
+        # The script includes standalone oracles outside the manifest's `tests/**/*.test.ts` inventory.
+        # Rust requires the unchecked-out `../commons` and `../subconscious` path dependencies.
+        # This job excludes the Rust host group because the local release gate runs it.
         run: bun run --cwd packages/e2e-tests test:opencode-e2e
 
   e2e-host-pi:
@@ -924,16 +866,13 @@ jobs:
         with:
           bun-version: latest
 
-      # Pi tests resolve the Pi binary via createRequire against
-      # @earendil-works/pi-coding-agent, which is a workspace dep of
-      # packages/pi-plugin. `bun install` brings it in.
+      # Pi tests resolve the Pi binary with `createRequire` from `packages/pi-plugin`.
+      # `@earendil-works/pi-coding-agent` is a workspace dependency of `packages/pi-plugin`.
       - name: Install workspace deps
         run: bun install --frozen-lockfile
 
-      # pi-cross-harness.test.ts spawns BOTH a Pi runner and an OpenCode
-      # serve to verify cross-harness memory sharing, so this job needs
-      # opencode on PATH too. Float to LATEST like the OpenCode host job
-      # (see that step for the rationale + re-pin escape hatch).
+      # `pi-cross-harness.test.ts` starts both a Pi runner and `opencode serve`.
+      # Cross-harness memory-sharing verification requires `opencode serve`.
       - name: Install opencode
         run: |
           curl -fsSL https://opencode.ai/install | bash
@@ -950,16 +889,14 @@ jobs:
       - name: Build Pi plugin
         run: bun run --cwd packages/pi-plugin build
 
-      # pi-cross-harness also instantiates the OpenCode harness, which
-      # spawns `opencode serve` with a file:// plugin specifier pointing
-      # at packages/plugin/. That dist must exist.
+      # `pi-cross-harness.test.ts` also instantiates the OpenCode harness.
+      # The OpenCode harness starts `opencode serve` with a `file://` plugin specifier for `packages/plugin`.
+      # `packages/plugin/dist` must exist before the harness starts.
       - name: Build OpenCode plugin
         run: bun run --cwd packages/plugin build
 
-      # Per-test timeout bumped to 300s for the same cold-start reason as
-      # the OpenCode host job. Pi historian publish path also crosses an
-      # HTTP boundary into the mock provider, which is slower on shared
-      # runners than on local hardware.
+      # A 300s per-test timeout accommodates cold startup and mock-provider HTTP latency on shared runners.
+      # Pi historian publication crosses an HTTP boundary into the mock provider.
       - name: Run host e2e suite (Pi tests from mode manifest)
         env:
           NODE_ENV: ""
@@ -970,14 +907,11 @@ jobs:
     name: Incident regression pool (supported TS)
     runs-on: ubuntu-latest
     needs: [check-plugin, check-pi-plugin]
-    # Sized for the aggregate sequential deadline, not the happy path. `--mode
-    # ts` runs 10 OpenCode then 4 Pi variants one at a time, each allowed the
-    # 600s budget below, so a run where cases time out can need ~140 minutes on
-    # top of setup. At a lower cap the job is killed mid-schedule and publishes
-    # no report at all, which loses the per-case classification that is the
-    # whole point of this job — strictly worse than a slow red build. Cases
-    # normally finish in seconds, so this bound is only reached when something
-    # is already wrong.
+    # The job timeout covers the aggregate sequential case deadline.
+    # `MC_E2E_MODE=ts` runs 10 OpenCode and 4 Pi variants sequentially, each with a 600s deadline.
+    # The 14 sequential 600s case budgets total 140 minutes before setup.
+    # At a lower cap, the job times out mid-schedule and produces no per-case classification.
+    # A slow red build preserves per-case classifications.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v5
@@ -1018,9 +952,6 @@ jobs:
       - name: Run supported TS incident schedule
         env:
           NODE_ENV: ""
-        # Same 600s per-case budget the host suites use: a cold runner pays Bun
-        # bootstrap plus a fresh harness and `opencode serve` startup inside the
-        # first case, which the 120s default deadline cannot cover.
         run: >-
           bun run --cwd packages/e2e-tests test:incidents --mode ts
           --timeout 600000

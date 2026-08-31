@@ -1,17 +1,12 @@
 /// <reference types="bun-types" />
 
 /**
- * Incident regression: a warm Rust output cache served two tool_use blocks with
- * the same Anthropic id after a queued ctx_reduce drop was consumed on a
- * cache-busting selection pass. Anthropic rejects that request with HTTP 400,
- * so checking only that the transform continued would miss the provider-facing
+ * A warm Rust output cache can serve duplicate Anthropic tool_use IDs when a cache-busting selection pass consumes a queued ctx_reduce drop.
+ * Anthropic rejects duplicate tool_use IDs with HTTP 400.
+ * A continued transform does not prove that Anthropic accepted the request.
  * failure.
  *
- * The scenario deliberately establishes SOFT+ passes first, queues a real
- * agent-facing ctx_reduce drop, then applies pressure until the module consumes
- * that drop on a selection bust. Duplicate detection is per served messages
- * array: the same historical tool call may legitimately be replayed in later
- * requests, but it must occur only once in any one request.
+ * A historical tool call may replay in later requests but may occur only once per served messages array.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -81,8 +76,7 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: duplicate tool-use i
         async () => {
             const sessionId = await h.createSession();
 
-            // Warm the module's output cache with a HARD pass followed by several
-            // SOFT+ defers before introducing the queued drop.
+            // The test requires a HARD pass and three SOFT+ defers before queuing the drop.
             await driveToSteadyState(h, sessionId, 3);
             const warmPasses = await h.waitForRustPasses(4);
             expect(warmPasses.some((pass) => pass.decision === "SOFT+")).toBe(true);
@@ -93,8 +87,7 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: duplicate tool-use i
             expect(tags.length).toBeGreaterThan(0);
             const dropTag = tags[0]!;
 
-            // Make the real model response call ctx_reduce once. OpenCode then
-            // persists the tool call and the plugin queues the requested drop.
+            // OpenCode persists the real model's ctx_reduce tool call, and the plugin queues the requested drop.
             let dropEmitted = false;
             h.mock.addMatcher((body) => {
                 if (dropEmitted || !JSON.stringify(body.system ?? "").includes("## Magic Context")) {
@@ -130,13 +123,10 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: duplicate tool-use i
             await h.sendPrompt(sessionId, `queue drop ${dropTag}: ${h.ballast(1_500)}`);
             expect(dropEmitted).toBe(true);
 
-            // Keep both opencode and McHandler alive with their serialized-output
-            // caches warm, but make the next pass a deterministic cache-busting
-            // selection pass by shortening this session's durable cache TTL.
+            // Shortening this session's durable cache TTL forces the next pass to bypass the warmed serialized-output caches.
             h.setSessionCacheTtl(sessionId, "1");
 
-            // The final wire must prove that the queued drop was consumed, rather
-            // than merely proving that the agent issued the command.
+            // The final wire must show that the queued drop was consumed.
             for (let i = 5; i <= 7; i += 1) {
                 h.mock.setDefault({
                     text: `selection pressure ${i}`,
@@ -156,9 +146,7 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: duplicate tool-use i
             expect(afterDrop.at(-1)?.decision).not.toBe("parked");
             expect(h.lastMainWireSerialized()).toContain(`[dropped §${dropTag}§]`);
 
-            // Check every provider-facing served array, not just the last one. A
-            // duplicate can be introduced only while reconciling a frozen prefix,
-            // so checking the full capture catches a one-pass regression.
+            // The test checks every provider-facing served array because a duplicate tool-use ID can occur before the final array.
             for (const request of h.mainRequests()) {
                 expect(duplicateToolUseIds(request.body.messages ?? [])).toEqual([]);
             }

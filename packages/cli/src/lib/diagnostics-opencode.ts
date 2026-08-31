@@ -1,11 +1,6 @@
-// NOTE: bun:sqlite is loaded lazily inside collectHistorianFailures() via a
-// runtime-gated dynamic import. The CLI runs under Node (npx invocation), so
-// `bun:sqlite` is normally unavailable; we only attempt the import when running
-// under Bun (e.g. someone runs `bun x @cortexkit/magic-context doctor`). A
-// static `import { Database } from "bun:sqlite"` would crash the CLI under
-// Node before any try/catch could intervene because Node's ESM loader rejects
-// `bun:` specifiers during resolution. Historian-failure diagnostics are
-// best-effort: if the DB can't be read, the report still produces all other
+// A static `import { Database } from "bun:sqlite"` crashes the Node CLI before `try/catch` can run.
+// Node's ESM loader rejects `bun:` specifiers during resolution.
+// If the DB cannot be read, the report still includes all other diagnostics.
 // information.
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -55,7 +50,7 @@ export interface DiagnosticReport {
     opencodeInstalled: boolean;
     opencodeInstallKind: "cli" | "desktop" | "none";
     opencodeVersion: string | null;
-    /** Every detected install, with the first detection-ladder rung marked active. */
+    /** `opencodeInstallations` marks the first detection-ladder rung as active. */
     opencodeInstallations: OpenCodeInstallationReport[];
     configPaths: ConfigPaths;
     opencodeConfigHasPlugin: boolean;
@@ -78,9 +73,9 @@ export interface DiagnosticReport {
     conflicts: {
         hasConflict: boolean;
         reasons: string[];
-        /** Resolved MC compaction mode used by the writer/fixer. */
+        /** `compactionEnabled` stores the resolved MC compaction mode used by the writer and fixer. */
         compactionEnabled: boolean;
-        /** Resolved native OpenCode compaction state (auto/prune). */
+        /** `nativeCompaction` stores the resolved native OpenCode `auto` and `prune` states. */
         nativeCompaction: {
             auto: boolean;
             prune: boolean;
@@ -92,58 +87,52 @@ export interface DiagnosticReport {
         sizeKb: number;
     };
     /**
-     * Recent active OpenCode sessions (top 5 by `session.time_updated`). Used
-     * to anchor historian-dump lookups to real project directories and to
-     * power the session picker in the `--issue` flow.
+     * `recentSessions` contains the five most recently updated active OpenCode sessions.
+     * `recentSessions` supplies session choices for the `--issue` picker.
      *
-     * Populated only when bun:sqlite is available (under Bun) and OpenCode's
-     * own DB at ~/.local/share/opencode/opencode.db exists. Empty array on
-     * Node-only runs (and the diagnostics report falls back to the legacy
-     * tmp-dir historian listing).
+     * `recentSessions` is populated only when Bun provides `bun:sqlite` and OpenCode's database exists.
+     * On Node-only runs, `recentSessions` is empty and diagnostics use the legacy tmp-directory historian listing.
      */
     recentSessions: RecentSessionSummary[];
     /**
-     * Historian dumps grouped by project directory. Older dumps under the
-     * legacy harness-scoped tmp dir are surfaced separately as `legacyDumps`
-     * so users with old artifacts still see them in doctor.
+     * `historianDumps` groups historian dumps by project directory.
+     * `legacyDumps` contains dumps from the legacy harness-scoped tmp directory.
      */
     historianDumps: HistorianDumpsReport;
-    /** Most recent historian-failure rows from session_meta across all sessions. */
+    /** `historianFailures` contains the most recent `session_meta` historian-failure rows across all sessions. */
     historianFailures: HistorianFailureSummary[];
     /**
-     * Per-session rollup of the durable `historian_runs` telemetry. Surfaces the
-     * fail/success/noop history that the self-clearing session_meta counter hides.
+     * `historianRunHistory` summarizes durable `historian_runs` telemetry by session.
+     * `historianRunHistory` preserves fail, success, and noop history that the self-clearing `session_meta` counter omits.
      */
     historianRuns: HistorianRunSummary[];
 }
 
 /**
- * Per-project historian-dump bucket built from the recent-sessions list.
+ * Each bucket groups historian dumps for one project directory represented in `recentSessions`.
  *
- * One entry per unique project directory that has at least one dump under
- * `<directory>/.cortexkit/magic-context/historian/`. Sessions sharing a
- * directory roll into the same bucket. Empty buckets are omitted.
+ * A bucket exists only for a project directory containing at least one dump under `<directory>/.cortexkit/magic-context/historian/`.
+ * Sessions that share a project directory use the same bucket.
+ * Empty buckets are omitted.
  */
 export interface ProjectHistorianBucket {
-    /** Project directory the bucket represents. */
+    /** `directory` identifies the project represented by this bucket. */
     directory: string;
-    /** Most recently active session in this project (drives picker label). */
+    /** `mostRecentSession` supplies the picker label for this project. */
     primarySessionId: string;
-    /** All recent session IDs touching this directory. */
+    /** `sessionIds` contains every recent session ID associated with this directory. */
     sessionIds: string[];
-    /** Total dump count in the directory. */
+    /** `dumpCount` is the total number of dumps in this directory. */
     count: number;
-    /** Up to 5 newest dumps with parsed metadata. */
+    /** recent contains at most five newest dumps with parsed metadata. */
     recent: HistorianDumpSummary[];
 }
 
 export interface HistorianDumpsReport {
-    /** Per-project dump buckets, ordered by latest activity. */
+    /** byProject orders project buckets by latest activity. */
     byProject: ProjectHistorianBucket[];
     /**
-     * Legacy harness-scoped tmp-dir listing, kept so users with pre-Phase-3
-     * dumps under `${tmpdir}/opencode/magic-context/historian/` still see
-     * them in doctor output. Empty on fresh installs.
+     * `legacyDumps` includes dumps under `${tmpdir}/opencode/magic-context/historian/`.
      */
     legacyDumps: {
         dir: string;
@@ -154,49 +143,44 @@ export interface HistorianDumpsReport {
 
 export interface RecentSessionSummary {
     sessionId: string;
-    /** Session title from OpenCode (may be empty for fresh sessions). */
+    /** title contains the OpenCode session title and is empty for fresh sessions. */
     title: string;
-    /** Project directory the session lives under. */
+    /* */
     directory: string;
-    /** ISO timestamp of last activity (`session.time_updated`). */
+    /** lastActiveAt contains `session.time_updated` as an ISO timestamp. */
     lastActiveAt: string;
 }
 
 export interface HistorianFailureSummary {
     sessionId: string;
     failureCount: number;
-    /** Sanitized truncated last-error text. May be empty if never set. */
+    /** lastError contains sanitized, truncated error text and is empty when no error was recorded. */
     lastError: string;
-    /** ISO timestamp of last failure, or empty if never failed. */
+    /** lastFailureAt contains the last failure timestamp as ISO text and is empty when no failure occurred. */
     lastFailureAt: string;
 }
 
 /**
- * Per-session rollup of the durable `historian_runs` telemetry table (migration
- * v24). Unlike `session_meta.historian_failure_count` — which is RESET to 0 on
- * every successful run — these rows are never cleared, so a "fails N times then
- * succeeds once" pattern (e.g. a flaky historian model that keeps returning
- * empty/invalid output) stays visible. This is what surfaces the failure history
- * the session_meta counter hides.
+ * historian_runs retains a per-session run history.
+ * historian_runs retains failures after successful runs, unlike `session_meta.historian_failure_count`.
  */
 export interface HistorianRunSummary {
     sessionId: string;
-    /** Counts over the recent window (most-recent runs for this session). */
+    /** Each count covers the session's most recent returned runs. */
     total: number;
     success: number;
     failed: number;
     noop: number;
-    /** Sanitized last failure reason in the window, or empty if none. */
+    /** lastFailureReason contains the sanitized latest failure reason in the returned window, or is empty when none failed. */
     lastFailureReason: string;
-    /** ISO timestamp of the most recent run in the window. */
+    /** lastRunAt contains the latest returned run timestamp as ISO text. */
     lastRunAt: string;
 }
 
-// ── Version + path helpers ──────────────────────────────────────────
 
 function getSelfVersion(): string {
-    // createRequire resolves relative to this module. In source layout this file
-    // lives at src/cli/diagnostics.ts; in bundled layout at dist/cli.js.
+    // createRequire resolves paths relative to this module.
+    // The source module is `src/cli/diagnostics.ts`; the bundled module is `dist/cli.js`.
     const require = createRequire(import.meta.url);
     for (const relPath of ["../../package.json", "../package.json"]) {
         try {
@@ -205,7 +189,6 @@ function getSelfVersion(): string {
                 return pkg.version;
             }
         } catch {
-            // Try next path.
         }
     }
     return "unknown";
@@ -240,7 +223,6 @@ function sanitizeValue(value: unknown): unknown {
     return sanitizeConfigValue(value);
 }
 
-// ── Config + plugin entry detection ────────────────────────────────
 
 function readConfig(path: string): { value: Record<string, unknown> | null; error?: string } {
     if (!existsSync(path)) return { value: null };
@@ -260,30 +242,18 @@ function configHasPluginEntry(config: Record<string, unknown> | null): boolean {
         if (entry === OPENCODE_PLUGIN_NAME) return true;
         if (entry === OPENCODE_PLUGIN_ENTRY_WITH_VERSION) return true;
         if (entry.startsWith(`${OPENCODE_PLUGIN_NAME}@`)) return true;
-        // Local dev paths
         if (entry.includes("opencode-magic-context")) return true;
         return false;
     });
 }
 
 /**
- * Group historian dumps by project directory using the recent-sessions list as
- * the lookup index. For each unique directory, opens
- * `<directory>/.cortexkit/magic-context/historian/` and lists dumps there.
  *
- * Falls back to the legacy harness-scoped tmp-dir layout when recentSessions
- * is empty (Node runs without bun:sqlite) OR when the project-local dir is
- * missing/empty. This keeps doctor useful on:
- *   - Fresh installs where no historian has run yet under the new path
- *   - Pi-only machines (Node, no bun:sqlite, no OpenCode DB)
- *   - Old machines with pre-Phase-3 dumps still in tmp
  */
 function collectHistorianDumps(
     recentSessions: RecentSessionSummary[],
 ): DiagnosticReport["historianDumps"] {
-    // Build per-project buckets from unique directories. We iterate the recent
-    // sessions in time-DESC order, so the first session that touches a given
-    // directory becomes the bucket's primarySessionId.
+    // The query processes sessions in descending time order; the first session for a directory becomes that bucket's primarySessionId.
     const buckets = new Map<string, ProjectHistorianBucket>();
     for (const session of recentSessions) {
         const dir = session.directory;
@@ -292,8 +262,7 @@ function collectHistorianDumps(
         const listing = listDumpsInDir(projectHistorianDir, 5);
         const existing = buckets.get(dir);
         if (existing) {
-            // Same directory, multiple sessions — append session id, keep
-            // the listing we already computed (same path).
+            // When multiple sessions use a directory, append the session ID without recomputing that directory's listing.
             if (!existing.sessionIds.includes(session.sessionId)) {
                 existing.sessionIds.push(session.sessionId);
             }
@@ -323,20 +292,14 @@ function collectHistorianDumps(
 }
 
 /**
- * Read recent active OpenCode sessions from OpenCode's own SQLite DB.
  *
- * Returns the top 5 sessions by `session.time_updated` (descending), filtered
- * to non-archived rows. The list anchors historian-dump lookups to real
- * project directories and powers the `--issue` flow's session picker.
+ * The list limits historian-dump lookups to existing OpenCode sessions.
+ * The session list groups project directories and powers the `--issue` flow's session picker.
  *
- * Same bun:sqlite gating as collectHistorianFailures: only attempts the
- * import under Bun. Returns [] on Node runs (the typical `npx` invocation)
- * and on machines without OpenCode installed. Doctor degrades gracefully —
- * historian dumps fall back to the legacy tmp-dir listing on the empty path.
  */
 async function collectRecentSessions(): Promise<RecentSessionSummary[]> {
-    // env-first: honor XDG/HOME overrides (and sandboxed doctor test runs)
-    // instead of Bun's homedir(), which ignores a runtime HOME override.
+    // Runtime `XDG_DATA_HOME` or `HOME` overrides determine the database path.
+    // Node's `homedir()` honors runtime `HOME` overrides; Bun's does not.
     const dataHome =
         process.env.XDG_DATA_HOME || join(process.env.HOME || homedir(), ".local", "share");
     const opencodeDbPath = join(dataHome, "opencode", "opencode.db");
@@ -369,11 +332,7 @@ async function collectRecentSessions(): Promise<RecentSessionSummary[]> {
         db = new DatabaseClass(opencodeDbPath, { readonly: true });
         const rows = db
             .prepare(
-                // session.time_updated is refreshed within a few seconds of each
-                // new message (verified live), so it's a safe recency proxy.
-                // Filter time_archived to skip user-archived sessions and exclude
-                // parent_id IS NOT NULL to skip subagent child sessions —
-                // historian artifacts live under the parent project, not the
+                // `session.time_updated` orders sessions as the recency proxy.
                 // child's directory.
                 "SELECT id, directory, title, time_updated FROM session " +
                     "WHERE time_archived IS NULL AND parent_id IS NULL " +
@@ -402,30 +361,18 @@ async function collectRecentSessions(): Promise<RecentSessionSummary[]> {
         try {
             db?.close();
         } catch {
-            // ignore close errors
         }
     }
 }
 
 /**
- * Read the most recent historian-failure rows from session_meta.
  *
- * `bun:sqlite` is loaded lazily via a runtime-gated dynamic import so the
- * CLI works under both Bun and Node:
+ * Node must not resolve a `bun:` specifier during module loading.
  *
- *   - Under Bun (typeof Bun !== "undefined"): import("bun:sqlite") succeeds
- *     and we read the failures.
- *   - Under Node (the default for `npx @cortexkit/magic-context doctor`):
- *     we never attempt the import, so Node's ESM loader doesn't see a `bun:`
- *     specifier. The function returns `[]` and the rest of the diagnostics
- *     report builds normally.
+ * Under Node:
  *
- * A static `import { Database } from "bun:sqlite"` at module top would crash
- * the CLI before any try/catch could catch it: Node throws
- * `ERR_UNSUPPORTED_ESM_URL_SCHEME` on `bun:` specifiers during module
- * resolution, which happens before user code runs. The dynamic-import-with-
- * function-string trick (`new Function(...)`) defeats Bun's static analysis
- * so the bundler doesn't try to resolve `bun:sqlite` at build time either.
+ * A top-level `bun:` import makes Node throw before a surrounding try/catch can run.
+ * Node throws `ERR_UNSUPPORTED_ESM_URL_SCHEME` when it resolves a `bun:` specifier during module loading.
  */
 async function collectHistorianFailures(
     storageDirPath: string,
@@ -433,10 +380,6 @@ async function collectHistorianFailures(
     const contextDbPath = join(storageDirPath, "context.db");
     if (!existsSync(contextDbPath)) return [];
 
-    // Runtime gate: only attempt the import under Bun. The historian-failure
-    // section is best-effort diagnostics — losing it under Node is acceptable
-    // because the rest of the report (config, conflicts, log tail, dumps)
-    // already gives users and us enough to triage most issues.
     if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
         return [];
     }
@@ -451,9 +394,7 @@ async function collectHistorianFailures(
 
     let DatabaseClass: DatabaseCtor;
     try {
-        // `new Function(...)` defeats the bundler's static-analysis pass so
-        // no resolver tries to load `bun:sqlite` at build time. At runtime
-        // under Bun this resolves to the built-in `bun:sqlite` module.
+        // Under Bun, the dynamic import resolves `bun:sqlite` as a built-in module.
         const mod = (await new Function("p", "return import(p)")("bun:sqlite")) as {
             Database: DatabaseCtor;
         };
@@ -496,17 +437,13 @@ async function collectHistorianFailures(
         try {
             db?.close();
         } catch {
-            // ignore close errors
         }
     }
 }
 
 /**
- * Per-session rollup of the durable `historian_runs` telemetry (migration v24).
- * Unlike `collectHistorianFailures` (which reads the self-clearing session_meta
- * counter), these rows persist across successes — so a flaky historian that
- * fails repeatedly then occasionally succeeds is still visible here. Best-effort
- * + Bun-gated, mirroring `collectHistorianFailures`.
+ * `historian_runs` persists across successful runs, unlike the self-clearing `session_meta` counter read by `collectHistorianFailures`.
+ * `historian_runs` preserves evidence of intermittent historian failures after later successes.
  */
 async function collectHistorianRuns(storageDirPath: string): Promise<HistorianRunSummary[]> {
     const contextDbPath = join(storageDirPath, "context.db");
@@ -537,8 +474,6 @@ async function collectHistorianRuns(storageDirPath: string): Promise<HistorianRu
     } | null = null;
     try {
         db = new DatabaseClass(contextDbPath, { readonly: true });
-        // Defensive: the table only exists at schema v24+. A pre-v24 DB throws
-        // "no such table" → caught below → empty section (best-effort).
         const aggRows = db
             .prepare(
                 `SELECT session_id,
@@ -562,7 +497,6 @@ async function collectHistorianRuns(storageDirPath: string): Promise<HistorianRu
         }>;
         if (aggRows.length === 0) return [];
 
-        // Most-recent failure reason per session (only for sessions with failures).
         const reasonRows = db
             .prepare(
                 `SELECT session_id, failure_reason, created_at
@@ -606,12 +540,10 @@ async function collectHistorianRuns(storageDirPath: string): Promise<HistorianRu
         try {
             db?.close();
         } catch {
-            // ignore close errors
         }
     }
 }
 
-// ── Main entry ─────────────────────────────────────────────────────
 
 export async function collectDiagnostics(): Promise<DiagnosticReport> {
     const pluginVersion = getSelfVersion();
@@ -625,10 +557,6 @@ export async function collectDiagnostics(): Promise<DiagnosticReport> {
     const logPath = getMagicContextLogPath("opencode");
     const logFileSize = existsSync(logPath) ? statSync(logPath).size : 0;
 
-    // Resolve the MC compaction mode via the same loader + accessor the
-    // plugin uses, so diagnostics never re-derives the compaction decision.
-    // On load failure take the preserve-existing-native-fields branch (false)
-    // and emit a diagnostic, never assuming either mode.
     let compactionEnabled = false;
     try {
         compactionEnabled = isCompactionEnabled(loadPluginConfig(process.cwd()));
