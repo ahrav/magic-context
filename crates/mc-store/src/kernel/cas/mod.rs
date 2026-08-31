@@ -257,10 +257,9 @@ pub(super) fn prepare_layout(root: &Path) -> Result<PathBuf, KernelError> {
         let entry = entry.map_err(|_| KernelError::Io)?;
         let file_type = entry.file_type().map_err(|_| KernelError::Io)?;
         if file_type.is_file() || file_type.is_symlink() {
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| KernelError::Io)?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
             crate::kernel::durable_fs::durable_unlink(&tmp, &name).map_err(|_| KernelError::Io)?;
         }
     }

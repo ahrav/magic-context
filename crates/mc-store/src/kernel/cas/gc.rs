@@ -376,23 +376,5 @@ fn scan_objects(root: &std::path::Path) -> Result<Vec<Candidate>, KernelError> {
 pub(in crate::kernel) fn object_usage(
     artifacts_path: &std::path::Path,
 ) -> Result<u64, KernelError> {
-    let mut bytes = 0_u64;
-    let mut pending = vec![artifacts_path.join("objects")];
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries {
-            let Ok(entry) = entry else { continue };
-            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
-                continue;
-            };
-            if metadata.file_type().is_file() {
-                bytes = bytes.saturating_add(metadata.len());
-            } else if metadata.file_type().is_dir() {
-                pending.push(entry.path());
-            }
-        }
-    }
-    Ok(bytes)
+    super::ingest::regular_file_bytes(&artifacts_path.join("objects")).map_err(|_| KernelError::Io)
 }

@@ -1,6 +1,6 @@
 use std::fs;
 
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -14,10 +14,13 @@ impl KernelStore {
         if !is_artifact_digest(&handle.digest) {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
-        let reader = self
+        let mut reader = self
             .lock_reader()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable))?;
-        let live = reader
+        let snapshot = reader
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable))?;
+        let live = snapshot
             .query_row(
                 "SELECT 1 FROM evidence_meta
                  WHERE evidence_id=?1 AND artifact_digest=?2 AND invalidated_commit_seq IS NULL",
@@ -30,7 +33,7 @@ impl KernelStore {
         if !live {
             return Err(ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable));
         }
-        let tombstoned = reader
+        let tombstoned = snapshot
             .query_row(
                 "SELECT 1 FROM artifact_purge_tombstones WHERE artifact_digest=?1",
                 [&handle.digest],
@@ -39,6 +42,7 @@ impl KernelStore {
             .optional()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable))?
             .is_some();
+        drop(snapshot);
         drop(reader);
         if tombstoned {
             return Err(ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable));
@@ -64,10 +68,13 @@ impl KernelStore {
         if !is_artifact_digest(&handle.digest) {
             return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
         }
-        let reader = self
+        let mut reader = self
             .lock_reader()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable))?;
-        let tombstoned = reader
+        let snapshot = reader
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceUnavailable))?;
+        let tombstoned = snapshot
             .query_row(
                 "SELECT 1 FROM artifact_purge_tombstones WHERE artifact_digest=?1",
                 [&handle.digest],
@@ -81,7 +88,7 @@ impl KernelStore {
                 EligibilityDeniedReason::Tombstoned,
             ));
         }
-        let mut statement = reader
+        let mut statement = snapshot
             .prepare(
                 "SELECT sensitivity_class,provider_egress_class FROM evidence_meta
                  WHERE artifact_digest=?1 AND invalidated_commit_seq IS NULL",
@@ -107,6 +114,7 @@ impl KernelStore {
             });
         }
         drop(statement);
+        drop(snapshot);
         drop(reader);
 
         let Some((sensitivity, egress)) = classification else {
