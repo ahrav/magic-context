@@ -46,16 +46,7 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
         familyId: spec.familyId,
         title: spec.title,
         expectedAnswer: spec.answer,
-        checks: [
-            {
-                id: "check-file",
-                appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
-            },
-            {
-                id: "check-answer",
-                appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
-            },
-        ],
+        checks: ["check-file", "check-answer"],
         criticalCheckIds: ["check-answer"],
         turnScript: [
             { id: "turn-evidence", role: "user", content: spec.evidence },

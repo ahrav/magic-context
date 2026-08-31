@@ -51,9 +51,11 @@ function semanticInput(declaration: ScenarioDeclaration): unknown {
     return { contract: "paired-delta-scenario/v1", ...serializable };
 }
 
+/** Covers the lane's own declaration and scoring code, not just the verifier bodies: `semanticInput` drops the verifier function and this digest previously hashed only the scenario files, so loosening `validateCheckVector` or `parseArmedCellResult` changed what every frozen scenario can score as passing while both fingerprints stayed identical. Hashing stops at the lane boundary — shared primitives reached by import are not covered. commentlint: allow(JUDGE) */
 function verifierBundleDigest(root: string, implementationFile: string): string {
     const hash = createHash("sha256");
     for (const path of [
+        "src/paired-delta/contract.ts",
         "src/paired-delta/scenarios/support.ts",
         implementationFile,
     ]) {

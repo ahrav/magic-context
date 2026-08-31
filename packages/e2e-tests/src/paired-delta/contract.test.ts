@@ -17,12 +17,7 @@ function scenario(overrides: Partial<ScenarioDeclaration> = {}): ScenarioDeclara
         familyId: "fam-demo",
         title: "Recall the buried identifier",
         expectedAnswer: "alpha-17",
-        checks: [
-            {
-                id: "check-shared",
-                appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
-            },
-        ],
+        checks: ["check-shared"],
         criticalCheckIds: ["check-shared"],
         turnScript: [
             { id: "turn-evidence", role: "user", content: "Remember ID alpha-17." },
@@ -66,62 +61,17 @@ describe("paired-delta scenario contract", () => {
             PairedDeltaContractError,
         );
         expect(() =>
-            parseScenarioDeclaration(scenario({
-                checks: [
-                    { id: "check-shared", appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"] },
-                    { id: "check-shared", appliesToArms: ["mc-on"] },
-                ],
-            })),
+            parseScenarioDeclaration(scenario({ checks: ["check-shared", "check-shared"] })),
         ).toThrow(/checks: duplicate/);
     });
 
-    it("rejects unknown arms and critical checks outside the declaration", () => {
+    it("rejects malformed check ids and critical checks outside the declaration", () => {
         expect(() =>
-            parseScenarioDeclaration(scenario({
-                checks: [{ id: "check-shared", appliesToArms: ["mc-on", "future-arm" as never] }],
-            })),
-        ).toThrow(/enum-invalid/);
+            parseScenarioDeclaration(scenario({ checks: ["Check Shared" as never] })),
+        ).toThrow(/checks\[0\]: id-invalid/);
         expect(() =>
             parseScenarioDeclaration(scenario({ criticalCheckIds: ["check-missing"] })),
         ).toThrow(/criticalCheckIds: unknown-check/);
-    });
-
-    it("requires primary and regret-ladder check intersections", () => {
-        expect(() =>
-            parseScenarioDeclaration(scenario({
-                checks: [{ id: "check-shared", appliesToArms: ["mc-on", "r1", "r2", "r3"] }],
-            })),
-        ).toThrow(/checks: primary-intersection-empty/);
-        expect(() =>
-            parseScenarioDeclaration(scenario({
-                checks: [{ id: "check-shared", appliesToArms: ["mc-on", "mc-off", "compaction"] }],
-            })),
-        ).toThrow(/checks: ladder-intersection-empty/);
-    });
-
-    it("rejects empty critical-check and R1 locator lists", () => {
-        expect(() =>
-            parseScenarioDeclaration(scenario({ criticalCheckIds: [] })),
-        ).toThrow(/criticalCheckIds: empty/);
-        expect(() =>
-            parseScenarioDeclaration(scenario({
-                interventions: {
-                    ...scenario().interventions,
-                    r1: { ...scenario().interventions.r1, locatorIds: [] },
-                },
-            })),
-        ).toThrow(/r1\.locatorIds: empty/);
-    });
-
-    it("rejects an R1 query that leaks the expected answer in any casing", () => {
-        const base = scenario();
-        for (const query of ["find alpha-17 now", "find ALPHA-17 now"]) {
-            expect(() =>
-                parseScenarioDeclaration(scenario({
-                    interventions: { ...base.interventions, r1: { ...base.interventions.r1, query } },
-                })),
-            ).toThrow(/r1\.query: contains-answer/);
-        }
     });
 
     it("requires the gold answer wherever an arm must derive it", () => {
@@ -271,32 +221,6 @@ describe("paired-delta scenario contract", () => {
         ).not.toThrow();
     });
 
-    it("requires every scored check to cover every compared arm", () => {
-        expect(() =>
-            parseScenarioDeclaration(scenario({
-                checks: [
-                    {
-                        id: "check-shared",
-                        appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
-                    },
-                    { id: "check-mc-only", appliesToArms: ["mc-on"] },
-                ],
-                criticalCheckIds: ["check-mc-only"],
-            })),
-        ).toThrow(/checks: arm-coverage-incomplete\(check-mc-only\)/);
-        expect(() =>
-            parseScenarioDeclaration(scenario({
-                checks: [
-                    {
-                        id: "check-shared",
-                        appliesToArms: ["mc-on", "mc-off", "compaction", "r1", "r2", "r3"],
-                    },
-                    { id: "check-r1-only", appliesToArms: ["r1"] },
-                ],
-            })),
-        ).toThrow(/checks: arm-coverage-incomplete\(check-r1-only\)/);
-    });
-
     it("rejects an R2 declaration with no gold memory", () => {
         expect(() =>
             parseScenarioDeclaration(scenario({
@@ -339,10 +263,10 @@ describe("paired-delta scenario contract", () => {
     it("requires verifier output to match the arm's declared checks", () => {
         const declaration = parseScenarioDeclaration(scenario());
         expect(() =>
-            validateCheckVector(declaration, "mc-on", [{ id: "check-other", passed: true }]),
+            validateCheckVector(declaration, [{ id: "check-other", passed: true }]),
         ).toThrow(/declaration-mismatch/);
         expect(() =>
-            validateCheckVector(declaration, "mc-on", [
+            validateCheckVector(declaration, [
                 { id: "check-shared", passed: true },
                 { id: "check-shared", passed: true },
             ]),
@@ -353,11 +277,11 @@ describe("paired-delta scenario contract", () => {
         const declaration = parseScenarioDeclaration(scenario());
         for (const vector of [null, undefined, "check-shared", { id: "check-shared" }]) {
             expect(() =>
-                validateCheckVector(declaration, "mc-on", vector as never),
+                validateCheckVector(declaration, vector as never),
             ).toThrow(PairedDeltaContractError);
         }
         expect(() =>
-            validateCheckVector(declaration, "mc-on", [
+            validateCheckVector(declaration, [
                 { id: "check-shared", passed: "yes" as never },
             ]),
         ).toThrow(/checkVector\[0\]\.passed: boolean-required/);

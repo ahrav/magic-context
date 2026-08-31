@@ -8,10 +8,6 @@ export type ArmId = (typeof ARM_IDS)[number];
 export const PRIMARY_ARM_IDS = ["mc-on", "mc-off", "compaction"] as const;
 export type PrimaryArmId = (typeof PRIMARY_ARM_IDS)[number];
 export const REGRET_ARM_IDS = ["mc-on", "r1", "r2", "r3"] as const;
-/** Every arm that appears on either side of a paired subtraction. */
-const COMPARED_ARM_IDS: readonly ArmId[] = [
-    ...new Set<ArmId>([...PRIMARY_ARM_IDS, ...REGRET_ARM_IDS]),
-];
 
 export const RUN_HEALTHS = ["completed", "timeout", "crash", "malformed", "unavailable"] as const;
 export type RunHealth = (typeof RUN_HEALTHS)[number];
@@ -67,11 +63,6 @@ export class PairedDeltaContractError extends Error {
 
 const p = makeContractPrimitives(PairedDeltaContractError);
 
-export interface CheckDeclaration {
-    id: string;
-    appliesToArms: ArmId[];
-}
-
 export interface TurnDeclaration {
     id: string;
     role: "user" | "assistant";
@@ -120,7 +111,7 @@ export interface ScenarioDeclaration {
     familyId: string;
     title: string;
     expectedAnswer: string;
-    checks: CheckDeclaration[];
+    checks: string[];
     criticalCheckIds: string[];
     turnScript: TurnDeclaration[];
     interventions: ScenarioInterventions;
@@ -161,17 +152,9 @@ function parseStringArray(
     const result = p.array(value, label).map((entry, index) =>
         p.staticId(entry, `${label}[${index}]`, pattern));
     p.unique(result, label);
-    /** Matches `parseArmArray`: both call sites name a set the lane must actually act on, and every downstream predicate over an empty list is vacuously true. commentlint: allow(JUDGE) */
+    /** Every call site names a set the lane must act on, and every downstream predicate over an empty list is vacuously true. commentlint: allow(JUDGE) */
     if (result.length === 0) p.fail(`${label}: empty`);
     return result;
-}
-
-function parseArmArray(value: unknown, label: string): ArmId[] {
-    const arms = p.array(value, label).map((entry, index) =>
-        p.enumeration(entry, ARM_IDS, `${label}[${index}]`));
-    p.unique(arms, label);
-    if (arms.length === 0) p.fail(`${label}: empty`);
-    return arms;
 }
 
 export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
@@ -191,38 +174,15 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
         "verifier",
     ], "scenario");
 
-    const checks = p.array(root.checks, "scenario.checks").map((rawCheck, index) => {
-        const label = `scenario.checks[${index}]`;
-        const check = p.record(rawCheck, label);
-        p.exact(check, ["id", "appliesToArms"], label);
-        return {
-            id: p.staticId(check.id, `${label}.id`, CHECK_ID_RE),
-            appliesToArms: parseArmArray(check.appliesToArms, `${label}.appliesToArms`),
-        };
-    });
-    p.unique(checks.map(({ id }) => id), "scenario.checks");
-    if (!checks.some(({ appliesToArms }) =>
-        PRIMARY_ARM_IDS.every((arm) => appliesToArms.includes(arm)))) {
-        p.fail("scenario.checks: primary-intersection-empty");
-    }
-    if (!checks.some(({ appliesToArms }) =>
-        REGRET_ARM_IDS.every((arm) => appliesToArms.includes(arm)))) {
-        p.fail("scenario.checks: ladder-intersection-empty");
-    }
-
-    /** `ArmedCellResult` keeps only aggregate passed/total counts, so a check scored on some compared arms and not others gives them different denominators and the paired subtraction compares unlike ratios — an arm can lead purely by having an extra check. Arm-specific conditions belong in a validity gate that decides `runHealth`, not in the scored set. commentlint: allow(JUDGE) */
-    for (const { id, appliesToArms } of checks) {
-        if (!COMPARED_ARM_IDS.every((arm) => appliesToArms.includes(arm))) {
-            p.fail(`scenario.checks: arm-coverage-incomplete(${id})`);
-        }
-    }
+    /** A flat id list, not per-arm membership: `ArmedCellResult` keeps only aggregate counts, so a check scored on some compared arms and not others gives them different denominators and the paired subtraction compares unlike ratios. Every arm therefore scores the same set, and an arm-specific condition belongs in a validity gate that decides `runHealth`. `parseStringArray` also rejects an empty list, so a scenario always has a denominator. commentlint: allow(JUDGE) */
+    const checks = parseStringArray(root.checks, CHECK_ID_RE, "scenario.checks");
     const criticalCheckIds = parseStringArray(
         root.criticalCheckIds,
         CHECK_ID_RE,
         "scenario.criticalCheckIds",
     );
-    const checksById = new Map(checks.map((check) => [check.id, check]));
-    if (criticalCheckIds.some((id) => !checksById.has(id))) {
+    const checkIds = new Set(checks);
+    if (criticalCheckIds.some((id) => !checkIds.has(id))) {
         p.fail("scenario.criticalCheckIds: unknown-check");
     }
 
@@ -492,13 +452,9 @@ export function parsePairedDeltaManifest(raw: unknown): PairedDeltaManifest {
 
 export function validateCheckVector(
     declaration: ScenarioDeclaration,
-    armId: ArmId,
     results: readonly CheckResult[],
 ): void {
-    const expected = declaration.checks
-        .filter(({ appliesToArms }) => appliesToArms.includes(armId))
-        .map(({ id }) => id)
-        .sort();
+    const expected = [...declaration.checks].sort();
     /** Verifier output is untrusted input, not a parsed artifact: without this revalidation a verifier returning null or a malformed entry raises a bare TypeError that a runner records as a harness failure rather than a scenario failure. commentlint: allow(JUDGE) */
     const actual = p.array(results, "checkVector").map((entry, index) => {
         const label = `checkVector[${index}]`;
