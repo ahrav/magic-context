@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "6ed92732d44bb1079c818a45df24f56421c4cb7af342664fc9e9730766ef35fa";
+    "ca04cce59998b992c65f31d4e2c2281b72e224853b6aa656058d6df2673a50d8";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -219,6 +219,10 @@ pub struct Evaluation {
     pub visibility: VisibilityRow,
     pub sensitivity: Sensitivity,
     pub outcome: Outcome,
+    /// Whether the cited approval is what lifted support to this decision's effective
+    /// maturity. Compared against the carried maturity, so an approval that restores
+    /// support a revoked predecessor had clamped still counts as supplying it.
+    pub support_from_citation: bool,
 }
 
 // policy-digest:evaluator-start
@@ -334,6 +338,7 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         requested_outcome
     };
 
+    let support_from_citation = raises_support && !denied && effective.rank() > ceiling.rank();
     let visibility = visibility_row(effective, disposition);
 
     Ok(Evaluation {
@@ -343,6 +348,7 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         visibility,
         sensitivity,
         outcome,
+        support_from_citation,
     })
 }
 // policy-digest:evaluator-end
@@ -991,16 +997,12 @@ impl Envelope<'_> {
             },
             has_evidence: request.event.evidence_id.is_some(),
         })?;
-        // A citation that did not lift support above what the subject already held
-        // contributed nothing, so it must not displace the approval that did. That
-        // holds for a valid citation too: revoking it would otherwise demote a subject
-        // whose real authority is untouched.
-        let prior_effective = prior.map_or(Maturity::Candidate, |prior| prior.effective_maturity);
-        let effective = evaluation.effective_maturity.get();
-        let supplied_support = approval_valid
-            && effective.rank() > prior_effective.rank()
-            && effective.rank() > automatic_ceiling(source_class, taint_class).rank();
-        let supporting_approval = if supplied_support {
+        // A citation that did not lift support contributed nothing, so it must not
+        // displace the approval that did. That holds for a valid citation too:
+        // revoking it would otherwise demote a subject whose real authority is
+        // untouched. The evaluator answers this against the carried maturity, which
+        // is what an approval restoring clamped support has to be measured against.
+        let supporting_approval = if evaluation.support_from_citation {
             request.event.approval_object_id.clone()
         } else {
             stored
@@ -1415,7 +1417,9 @@ fn enforce_approval_dependent_cap(
         .query_row(
             &format!(
                 "SELECT COUNT(DISTINCT a.subject_object_id) FROM admission_decisions a
+                 JOIN object_registry o ON o.object_id=a.subject_object_id
                  WHERE a.approval_object_id=?1 AND a.subject_object_id IS NOT NULL
+                   AND o.invalidated_commit_seq IS NULL
                    AND a.subject_object_id IS NOT ?2
                    AND a.elevated_support=1
                    AND a.commit_seq IS NOT NULL
