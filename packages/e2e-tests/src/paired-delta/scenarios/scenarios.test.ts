@@ -46,13 +46,25 @@ describe("paired-delta authored scenarios", () => {
             try {
                 mkdirSync(join(root, "result"), { recursive: true });
                 writeFileSync(join(root, "result", "answer.txt"), scenario.expectedAnswer);
+                /** Stand in for the runner's handle-to-publicClaimId mapping: the search turn is served resolved ids, so the declared `mem-*` handles never reach the wire text. commentlint: allow(JUDGE) */
+                const resolvedLocatorIds = scenario.interventions.r1.locatorIds.map(
+                    (_handle, index) => `mcm_${String(index).padStart(32, "0")}`,
+                );
                 const checks = await scenario.verifier({
+                    armId: "r1",
+                    workspacePath: root,
+                    scriptedTurnText: `oracle search complete ${resolvedLocatorIds.join(" ")}`,
+                    resolvedLocatorIds,
+                });
+                validateCheckVector(scenario, "r1", checks);
+                expect(checks.every(({ passed }) => passed)).toBe(true);
+
+                const unmapped = await scenario.verifier({
                     armId: "r1",
                     workspacePath: root,
                     scriptedTurnText: scenario.interventions.r1.locatorIds.join(" "),
                 });
-                validateCheckVector(scenario, "r1", checks);
-                expect(checks.every(({ passed }) => passed)).toBe(true);
+                expect(unmapped.find(({ id }) => id === "check-r1-wire")?.passed).toBe(false);
             } finally {
                 rmSync(root, { recursive: true, force: true });
             }

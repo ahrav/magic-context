@@ -11,6 +11,14 @@ interface ScenarioSpec {
     locatorId: string;
 }
 
+/** Absent or empty resolved ids fail rather than falling back to a symbolic match, so a runner that skips the handle-to-publicClaimId mapping cannot score a retrieval it never performed. commentlint: allow(JUDGE) */
+function r1WirePassed(context: VerifierContext): boolean {
+    const resolved = context.resolvedLocatorIds ?? [];
+    if (resolved.length === 0) return false;
+    const wire = context.scriptedTurnText ?? "";
+    return resolved.every((id) => wire.includes(id));
+}
+
 export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
     const verifier = (context: VerifierContext) => {
         const answerPath = join(context.workspacePath, "result", "answer.txt");
@@ -27,10 +35,7 @@ export function defineScenario(spec: ScenarioSpec): ScenarioDeclaration {
             { id: "check-file", passed: actual !== null },
             { id: "check-answer", passed: actual === spec.answer },
             ...(context.armId === "r1"
-                ? [{
-                    id: "check-r1-wire",
-                    passed: context.scriptedTurnText?.includes(spec.locatorId) ?? false,
-                }]
+                ? [{ id: "check-r1-wire", passed: r1WirePassed(context) }]
                 : []),
         ];
     };

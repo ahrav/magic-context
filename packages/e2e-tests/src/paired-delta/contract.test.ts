@@ -97,6 +97,20 @@ describe("paired-delta scenario contract", () => {
         ).toThrow(/checks: ladder-intersection-empty/);
     });
 
+    it("rejects empty critical-check and R1 locator lists", () => {
+        expect(() =>
+            parseScenarioDeclaration(scenario({ criticalCheckIds: [] })),
+        ).toThrow(/criticalCheckIds: empty/);
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                interventions: {
+                    ...scenario().interventions,
+                    r1: { ...scenario().interventions.r1, locatorIds: [] },
+                },
+            })),
+        ).toThrow(/r1\.locatorIds: empty/);
+    });
+
     it("requires every critical check to cover every compared arm", () => {
         expect(() =>
             parseScenarioDeclaration(scenario({

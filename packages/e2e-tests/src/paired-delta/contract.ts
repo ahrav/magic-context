@@ -90,6 +90,8 @@ export interface VerifierContext {
     armId: ArmId;
     workspacePath: string;
     scriptedTurnText?: string;
+    /** The `publicClaimId` each declared `locatorIds` handle resolved to for this run. A wire assertion must compare against these, not the symbolic handles: the search turn carries resolved ids, so the handles never appear in the result text. commentlint: allow(JUDGE) */
+    resolvedLocatorIds?: readonly string[];
 }
 
 export type ScenarioVerifier = (
@@ -142,6 +144,8 @@ function parseStringArray(
     const result = p.array(value, label).map((entry, index) =>
         p.staticId(entry, `${label}[${index}]`, pattern));
     p.unique(result, label);
+    /** Matches `parseArmArray`: both call sites name a set the lane must actually act on, and every downstream predicate over an empty list is vacuously true. commentlint: allow(JUDGE) */
+    if (result.length === 0) p.fail(`${label}: empty`);
     return result;
 }
 
