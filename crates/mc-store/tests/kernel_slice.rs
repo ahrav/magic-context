@@ -549,3 +549,38 @@ fn corrections_preserve_old_rows_and_reauthor_observation_dependencies() {
         1
     );
 }
+
+#[test]
+fn correction_records_replaced_identifier_redactions_in_events_and_outbox() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    seed_domain(&store);
+    let replaced_object_id = format!("decision-{SECRET}");
+    let mut original = decision(1);
+    original.object_id = replaced_object_id.clone();
+    store
+        .commit(intent("secret-correction-seed", '1'), |envelope| {
+            envelope.insert_decision(original)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let mut replacement = decision(2);
+    replacement.source_revision = 2;
+    store
+        .commit(intent("secret-correction", '2'), |envelope| {
+            envelope.correct_decision(&replaced_object_id, replacement)?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    for owner_kind in ["change_event", "outbox"] {
+        let sql = format!(
+            "SELECT COUNT(*) FROM durable_text_redactions
+             WHERE owner_kind='{owner_kind}' AND field_name='replaced_object_id'"
+        );
+        assert_eq!(inspect_i64(directory.path(), &sql), 1, "{owner_kind}");
+    }
+    assert!(!family_bytes(directory.path())
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+}
