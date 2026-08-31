@@ -24,6 +24,28 @@ pub struct ArtifactGcResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactGcFault {
     AfterReclaiming,
+    Unlink,
+    AfterUnlink,
+}
+
+/// Injection flags carried through a reclaim pass so the private path keeps one
+/// signature in every feature configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::kernel) struct GcFaults {
+    pub after_reclaiming: bool,
+    pub unlink: bool,
+    pub after_unlink: bool,
+}
+
+#[cfg(feature = "test-support")]
+impl From<ArtifactGcFault> for GcFaults {
+    fn from(fault: ArtifactGcFault) -> Self {
+        Self {
+            after_reclaiming: fault == ArtifactGcFault::AfterReclaiming,
+            unlink: fault == ArtifactGcFault::Unlink,
+            after_unlink: fault == ArtifactGcFault::AfterUnlink,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -33,11 +55,47 @@ struct Candidate {
 }
 
 impl KernelStore {
+    /// Normalizes reservations left behind by a writer that died mid-ingest.
+    ///
+    /// A digest with any reference row, invalidated or not, stays `Live`:
+    /// `prepare_reclaim` returns early once a reservation is `Reclaiming`, so
+    /// setting `Reclaiming` here would skip its invalidation-grace,
+    /// `retain_until`, and capture-pin checks and unlink bytes they protect.
+    pub(in crate::kernel) fn prepare_startup_cas_recovery(&self) -> Result<(), KernelError> {
+        let mut writer = self.lock_writer()?;
+        let tx = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| KernelError::Io)?;
+        check_fence(&tx, self.lease_epoch())?;
+        tx.execute(
+            "DELETE FROM artifact_ingestion_reservations
+             WHERE state='Live' AND EXISTS(
+                 SELECT 1 FROM evidence_meta e
+                 WHERE e.artifact_digest=artifact_ingestion_reservations.artifact_digest
+                   AND e.invalidated_commit_seq IS NULL
+             )",
+            [],
+        )
+        .map_err(|_| KernelError::Io)?;
+        tx.execute(
+            "UPDATE artifact_ingestion_reservations
+             SET state='Reclaiming',reclaim_started_at=heartbeat_at
+             WHERE state='Live'
+               AND NOT EXISTS(
+                   SELECT 1 FROM evidence_meta e
+                   WHERE e.artifact_digest=artifact_ingestion_reservations.artifact_digest
+               )",
+            [],
+        )
+        .map_err(|_| KernelError::Io)?;
+        tx.commit().map_err(|_| KernelError::Io)
+    }
+
     pub(in crate::kernel) fn run_artifact_gc(
         &self,
         now: i64,
         hook: Option<&mut dyn FnMut()>,
-        fault_after_reclaiming: bool,
+        faults: GcFaults,
     ) -> Result<ArtifactGcResult, KernelError> {
         let candidates = self.snapshot_gc_candidates()?;
         if let Some(hook) = hook {
@@ -45,7 +103,7 @@ impl KernelStore {
         }
         let mut result = ArtifactGcResult::default();
         for candidate in candidates {
-            match self.reclaim_candidate(&candidate, now, fault_after_reclaiming) {
+            match self.reclaim_candidate(&candidate, now, faults) {
                 Ok(Some(bytes)) => {
                     result.reclaimed_objects += 1;
                     result.reclaimed_bytes = result.reclaimed_bytes.saturating_add(bytes);
@@ -62,7 +120,7 @@ impl KernelStore {
         &self,
         candidate: &Candidate,
         now: i64,
-        fault_after_reclaiming: bool,
+        faults: GcFaults,
     ) -> Result<Option<u64>, KernelError> {
         let mut writer = self.lock_writer()?;
         let tx = writer
@@ -76,10 +134,16 @@ impl KernelStore {
         tx.commit().map_err(|_| KernelError::Io)?;
         drop(writer);
 
-        if fault_after_reclaiming {
+        if faults.after_reclaiming {
             return Err(KernelError::Fault);
         }
+        if faults.unlink {
+            return Err(self.latch_gc_failure());
+        }
         let (removed, bytes) = self.unlink_artifact(&candidate.digest)?;
+        if faults.after_unlink {
+            return Err(KernelError::Fault);
+        }
         self.sweep_digest_temps(&candidate.digest)
             .map_err(|error| self.map_gc_storage_error(error))?;
 
@@ -188,6 +252,8 @@ impl KernelStore {
     }
 }
 
+/// Only reservations from the current `lease_epoch` block reclamation; earlier
+/// epochs do not extend the reference grace period.
 fn prepare_reclaim(
     tx: &rusqlite::Transaction<'_>,
     candidate: &Candidate,
@@ -241,11 +307,12 @@ fn prepare_reclaim(
         return Ok(false);
     }
 
+    let writer_epoch = i64::try_from(lease_epoch).map_err(|_| KernelError::InvalidInput)?;
     let live_reservation_expires_at: Option<i64> = tx
         .query_row(
             "SELECT MAX(lease_expires_at) FROM artifact_ingestion_reservations
-             WHERE artifact_digest=?1 AND state='Live'",
-            [&candidate.digest],
+             WHERE artifact_digest=?1 AND state='Live' AND writer_epoch=?2",
+            params![candidate.digest, writer_epoch],
             |row| row.get(0),
         )
         .map_err(|_| KernelError::Io)?;

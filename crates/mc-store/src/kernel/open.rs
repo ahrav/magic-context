@@ -1,7 +1,7 @@
 use cortexkit_lease::{
     protect_file, FileLeaseStore, LeaseError, LeaseHandle, LeaseKey, LeaseStore,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -542,7 +542,9 @@ pub(super) fn activate_wal(conn: &Connection) -> Result<(), KernelError> {
 
 pub(super) fn stamp_writer_fence(conn: &mut Connection, epoch: u64) -> Result<(), KernelError> {
     let epoch = i64::try_from(epoch).map_err(|_| KernelError::IdentityMismatch)?;
-    let tx = conn.transaction().map_err(|_| KernelError::Io)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| KernelError::Io)?;
     if tx
         .execute(
             "UPDATE writer_fence SET writer_epoch=?1 WHERE id=0",

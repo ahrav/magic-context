@@ -3,6 +3,7 @@ use rusqlite::{params, TransactionBehavior};
 use super::envelope::check_fence;
 use super::open::current_time_ms;
 use super::{KernelError, KernelStore};
+use crate::kernel::cas::gc::GcFaults;
 use crate::kernel::cas::ArtifactGcResult;
 
 const HOUR_MS: i64 = 60 * 60 * 1_000;
@@ -103,14 +104,14 @@ impl KernelStore {
         &self,
         now: i64,
     ) -> Result<StagingMaintenanceResult, KernelError> {
-        self.run_staging_maintenance_inner(now, None, false)
+        self.run_staging_maintenance_inner(now, None, GcFaults::default())
     }
 
     fn run_staging_maintenance_inner(
         &self,
         now: i64,
         hook: Option<&mut dyn FnMut()>,
-        fault_after_reclaiming: bool,
+        faults: GcFaults,
     ) -> Result<StagingMaintenanceResult, KernelError> {
         if now < 0 {
             return Err(KernelError::InvalidInput);
@@ -151,7 +152,7 @@ impl KernelStore {
             .map_err(|_| KernelError::Io)?;
         tx.commit().map_err(|_| KernelError::Io)?;
         drop(writer);
-        let artifact_gc = self.run_artifact_gc(now, hook, fault_after_reclaiming)?;
+        let artifact_gc = self.run_artifact_gc(now, hook, faults)?;
         Ok(StagingMaintenanceResult {
             abandoned,
             deleted_runs,
@@ -165,7 +166,7 @@ impl KernelStore {
         now: i64,
         mut hook: impl FnMut(),
     ) -> Result<StagingMaintenanceResult, KernelError> {
-        self.run_staging_maintenance_inner(now, Some(&mut hook), false)
+        self.run_staging_maintenance_inner(now, Some(&mut hook), GcFaults::default())
     }
 
     #[cfg(feature = "test-support")]
@@ -174,14 +175,11 @@ impl KernelStore {
         now: i64,
         fault: crate::kernel::cas::ArtifactGcFault,
     ) -> Result<StagingMaintenanceResult, KernelError> {
-        self.run_staging_maintenance_inner(
-            now,
-            None,
-            fault == crate::kernel::cas::ArtifactGcFault::AfterReclaiming,
-        )
+        self.run_staging_maintenance_inner(now, None, fault.into())
     }
 
     pub(super) fn run_startup_maintenance(&self) -> Result<(), KernelError> {
+        self.prepare_startup_cas_recovery()?;
         self.run_staging_maintenance(current_time_ms()).map(|_| ())
     }
 }

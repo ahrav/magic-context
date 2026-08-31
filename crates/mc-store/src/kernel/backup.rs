@@ -841,8 +841,8 @@ fn open_live_family(
     if actual_seq != expected_seq {
         return Err(KernelError::InvalidRestore);
     }
-    stamp_writer_fence(&mut writer, lease_epoch)?;
     activate_wal(&writer)?;
+    stamp_writer_fence(&mut writer, lease_epoch)?;
     harden_family(path)?;
     let readers = (0..reader_count)
         .map(|_| open_reader(path))

@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "test-support")]
 use super::ArtifactIngestFault;
 use super::{
-    is_artifact_digest, ArtifactError, ArtifactErrorKind, ArtifactHandle, ArtifactIngestRequest,
-    ProviderEgress, MAX_PAYLOAD_BYTES,
+    is_artifact_digest, ArtifactError, ArtifactErrorKind, ArtifactHandle, ArtifactIngestHook,
+    ArtifactIngestRequest, IngestFaults, ProviderEgress, MAX_PAYLOAD_BYTES,
 };
 use crate::kernel::durable_fs::{
     classify_io, create_new_file, durable_unlink, open_or_create_secure_directory,
@@ -138,7 +138,7 @@ impl KernelStore {
         &self,
         request: ArtifactIngestRequest,
     ) -> Result<ArtifactHandle, ArtifactError> {
-        self.ingest_artifact_inner(request, false, false, None)
+        self.ingest_artifact_inner(request, IngestFaults::default(), None, None)
     }
 
     #[cfg(feature = "test-support")]
@@ -147,12 +147,7 @@ impl KernelStore {
         request: ArtifactIngestRequest,
         fault: ArtifactIngestFault,
     ) -> Result<ArtifactHandle, ArtifactError> {
-        self.ingest_artifact_inner(
-            request,
-            fault == ArtifactIngestFault::AfterDirectorySync,
-            fault == ArtifactIngestFault::AfterEvents,
-            None,
-        )
+        self.ingest_artifact_inner(request, fault.into(), None, None)
     }
 
     #[cfg(feature = "test-support")]
@@ -161,15 +156,26 @@ impl KernelStore {
         request: ArtifactIngestRequest,
         mut hook: impl FnMut(&str),
     ) -> Result<ArtifactHandle, ArtifactError> {
-        self.ingest_artifact_inner(request, false, false, Some(&mut hook))
+        self.ingest_artifact_inner(request, IngestFaults::default(), Some(&mut hook), None)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn ingest_artifact_with_protocol_hook_for_test(
+        &self,
+        request: ArtifactIngestRequest,
+        fault: Option<ArtifactIngestFault>,
+        mut hook: impl FnMut(ArtifactIngestHook),
+    ) -> Result<ArtifactHandle, ArtifactError> {
+        let faults = fault.map(IngestFaults::from).unwrap_or_default();
+        self.ingest_artifact_inner(request, faults, None, Some(&mut hook))
     }
 
     fn ingest_artifact_inner(
         &self,
         request: ArtifactIngestRequest,
-        fault_after_directory_sync: bool,
-        fault_after_events: bool,
+        faults: IngestFaults,
         temp_written_hook: Option<&mut dyn FnMut(&str)>,
+        mut protocol_hook: Option<&mut dyn FnMut(ArtifactIngestHook)>,
     ) -> Result<ArtifactHandle, ArtifactError> {
         if self.cas_is_failed() {
             return Err(ArtifactError::new(ArtifactErrorKind::IngestionFailClosed));
@@ -195,7 +201,16 @@ impl KernelStore {
             name: &temp_name,
             consumed: false,
         };
-        if let Err(error) = write_and_sync(&mut temp, &prepared.bytes) {
+        let write_result = if faults.write {
+            Err(injected_storage_error())
+        } else if faults.file_sync {
+            std::io::Write::write_all(&mut temp, &prepared.bytes)
+                .map_err(classify_io)
+                .and(Err(injected_storage_error()))
+        } else {
+            write_and_sync(&mut temp, &prepared.bytes)
+        };
+        if let Err(error) = write_result {
             return Err(self.map_cas_storage_error(error, ArtifactErrorKind::IngestionFailClosed));
         }
         drop(temp);
@@ -261,12 +276,22 @@ impl KernelStore {
                 ],
             )
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+        if faults.reservation_commit {
+            drop(reservation);
+            return Err(ArtifactError::new(ArtifactErrorKind::ReferenceCommit));
+        }
         reservation
             .commit()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+        if let Some(hook) = protocol_hook.as_mut() {
+            hook(ArtifactIngestHook::AfterReservation);
+        }
 
-        let publish =
-            publish_noreplace_between_locked(&tmp, &temp_name, &shard, &prepared.digest[2..]);
+        let publish = if faults.rename {
+            Err(injected_storage_error())
+        } else {
+            publish_noreplace_between_locked(&tmp, &temp_name, &shard, &prepared.digest[2..])
+        };
         let published_new = match publish {
             Ok(PublishOutcome::Published) => {
                 staged.consume();
@@ -290,6 +315,10 @@ impl KernelStore {
             }
         };
 
+        if let Some(hook) = protocol_hook.as_mut() {
+            hook(ArtifactIngestHook::AfterPublish);
+        }
+
         if let Err(error) = verify_object(&shard, &prepared.digest[2..], &prepared.digest) {
             self.cleanup_failed_reference(
                 &mut writer,
@@ -299,7 +328,7 @@ impl KernelStore {
             );
             return Err(error);
         }
-        if fault_after_directory_sync {
+        if faults.after_directory_sync {
             self.cleanup_failed_reference(
                 &mut writer,
                 &reservation_id,
@@ -324,7 +353,7 @@ impl KernelStore {
             self.lease_epoch(),
             prepared.request.intent.clone(),
             |envelope| insert_reference(envelope, &prepared, &reservation_id),
-            fault_after_events,
+            faults.after_events,
         );
         match commit_result {
             Ok(receipt) if receipt.replayed => {
@@ -689,12 +718,23 @@ fn artifact_is_reclaiming(
 }
 
 fn verify_object(shard: &File, name: &str, digest: &str) -> Result<(), ArtifactError> {
-    let mut object = open_regular_nofollow(shard, name)
+    let object = open_regular_nofollow(shard, name)
         .map_err(|_| ArtifactError::for_digest(ArtifactErrorKind::MissingObject, digest))?;
     let mut bytes = Vec::new();
     object
+        .take(
+            u64::try_from(MAX_PAYLOAD_BYTES)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
         .read_to_end(&mut bytes)
         .map_err(|_| ArtifactError::for_digest(ArtifactErrorKind::MissingObject, digest))?;
+    if bytes.len() > MAX_PAYLOAD_BYTES {
+        return Err(ArtifactError::for_digest(
+            ArtifactErrorKind::CorruptObject,
+            digest,
+        ));
+    }
     if format!("{:x}", Sha256::digest(bytes)) != digest {
         return Err(ArtifactError::for_digest(
             ArtifactErrorKind::CorruptObject,
@@ -743,4 +783,16 @@ fn detection_metadata(detections: &[Detection]) -> Result<Vec<u8>, ArtifactError
             .collect::<Vec<_>>(),
     )
     .map_err(|_| ArtifactError::new(ArtifactErrorKind::InvalidInput))
+}
+
+#[cfg(feature = "test-support")]
+fn injected_storage_error() -> StorageError {
+    classify_io(std::io::Error::from_raw_os_error(
+        rustix::io::Errno::IO.raw_os_error(),
+    ))
+}
+
+#[cfg(not(feature = "test-support"))]
+fn injected_storage_error() -> StorageError {
+    unreachable!("fault injection requires the test-support feature")
 }
