@@ -395,6 +395,10 @@ struct PreparedDecision {
     source_class: SourceClass,
     taint_class: TaintClass,
     event: AdmissionEvent,
+    /// Approval recorded as supporting the decision. An invalid citation cannot
+    /// displace the prior decision's approval, which would strip a validly
+    /// supported subject at its next decision.
+    supporting_approval: Option<String>,
     evaluation: Evaluation,
 }
 
@@ -405,6 +409,13 @@ const MAX_APPROVAL_DEPENDENTS: usize = 1_024;
 /// over an authority graph is unbounded by the per-approval cap alone, and the whole
 /// walk runs in the invalidating transaction.
 const MAX_AUTHORITY_DEMOTIONS: usize = 4_096;
+
+/// Authority-holding dependents one invalidation may demote. Reaching this bound
+/// fails the invalidation, because truncating it would leave an approval that still
+/// grants admissions while its own authority is revoked. Every such dependent is an
+/// accepted decision object, so the bound is not reachable by inflating ordinary
+/// admissions.
+const MAX_AUTHORITY_HOLDER_DEMOTIONS: usize = 1_024;
 
 /// Selects rows of `admission_decisions a` with no later committed decision
 /// for the same subject. `load_prior_decision` expresses this same rule as an
@@ -788,16 +799,21 @@ impl Envelope<'_> {
     /// that are themselves approvals until no live authority remains.
     ///
     /// `visited` bounds the walk over a cyclic authority graph and each level is
-    /// bounded by [`MAX_APPROVAL_DEPENDENTS`], but neither bounds their product, so
-    /// [`MAX_AUTHORITY_DEMOTIONS`] caps the whole transaction.
+    /// bounded by [`MAX_APPROVAL_DEPENDENTS`], but neither bounds their product.
     ///
-    /// Reaching that cap truncates the walk rather than failing. Failing would roll
-    /// back the invalidation that prompted it, leaving the authority active and able
-    /// to grant new admissions, and every retry would meet the same graph — the
-    /// permanently unrevokable state the bound exists to prevent. A truncated walk
-    /// instead leaves descendants at their recorded visibility until their next
-    /// decision, where `evaluate_admission` clamps support to the automatic ceiling.
-    /// The returned flag reports the truncation for the caller's audit.
+    /// Dependents are therefore split by what their demotion protects.
+    /// [`validate_approval`] judges an approval by its own latest row and does not
+    /// examine its ancestors, so a dependent that still holds authority keeps
+    /// granting admissions until this walk demotes it. Those are demoted in full,
+    /// bounded by [`MAX_AUTHORITY_HOLDER_DEMOTIONS`]; a tree exceeding that bound
+    /// fails rather than leave live authority descending from a revoked root.
+    ///
+    /// Dependents that hold no authority can only lag in visibility, and
+    /// `evaluate_admission` clamps their support at their next decision. Those are
+    /// bounded by [`MAX_AUTHORITY_DEMOTIONS`] and truncated rather than failed,
+    /// because failing would roll back the invalidation that prompted the walk and
+    /// leave the root active for every identical retry. The returned flag reports
+    /// the truncation.
     fn demote_authority_dependents(
         &mut self,
         authority_object_id: &str,
@@ -806,41 +822,62 @@ impl Envelope<'_> {
         let mut decisions = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut frontier = vec![authority_object_id.to_string()];
+        let mut authority_holders = 0usize;
+        let mut truncated = false;
         visited.insert(authority_object_id.to_string());
         while let Some(authority) = frontier.pop() {
-            for (subject_object_id, source_class, taint_class) in
-                load_approval_dependents(self, &authority)?
-            {
-                if !visited.insert(subject_object_id.clone()) {
+            let mut leaves = Vec::new();
+            for dependent in load_approval_dependents(self, &authority)? {
+                if !visited.insert(dependent.0.clone()) {
                     continue;
                 }
-                if decisions.len() >= MAX_AUTHORITY_DEMOTIONS {
-                    return Ok((decisions, true));
-                }
-                let request = AdmissionRequest {
-                    candidate_id: None,
-                    subject_object_id: Some(subject_object_id.clone()),
-                    source_class: Some(SourceClass::try_from(source_class.as_str())?),
-                    taint_class: Some(TaintClass::try_from(taint_class.as_str())?),
-                    event: AdmissionEvent {
-                        kind: EventKind::ApprovalRevoked,
-                        trigger_object_id: None,
-                        approval_object_id: None,
-                        evidence_id: None,
-                        reason: reason.to_string(),
-                    },
-                };
-                if let Some(decision) = self.apply_admission(request)? {
-                    decisions.push(decision);
-                }
-                // The demoted subject may itself have granted authority, whose
-                // dependents are now unsupported.
-                if !validate_approval(self, Some(&subject_object_id), None)? {
-                    frontier.push(subject_object_id);
+                if validate_approval(self, Some(&dependent.0), None)? {
+                    authority_holders += 1;
+                    if authority_holders > MAX_AUTHORITY_HOLDER_DEMOTIONS {
+                        return Err(KernelError::AdmissionPolicy);
+                    }
+                    let subject = dependent.0.clone();
+                    self.demote_one_dependent(dependent, reason, &mut decisions)?;
+                    frontier.push(subject);
+                } else {
+                    leaves.push(dependent);
                 }
             }
+            for leaf in leaves {
+                if decisions.len() >= MAX_AUTHORITY_DEMOTIONS {
+                    truncated = true;
+                    break;
+                }
+                self.demote_one_dependent(leaf, reason, &mut decisions)?;
+            }
         }
-        Ok((decisions, false))
+        Ok((decisions, truncated))
+    }
+
+    fn demote_one_dependent(
+        &mut self,
+        dependent: (String, String, String),
+        reason: &str,
+        decisions: &mut Vec<AdmissionDecision>,
+    ) -> Result<(), KernelError> {
+        let (subject_object_id, source_class, taint_class) = dependent;
+        let request = AdmissionRequest {
+            candidate_id: None,
+            subject_object_id: Some(subject_object_id),
+            source_class: Some(SourceClass::try_from(source_class.as_str())?),
+            taint_class: Some(TaintClass::try_from(taint_class.as_str())?),
+            event: AdmissionEvent {
+                kind: EventKind::ApprovalRevoked,
+                trigger_object_id: None,
+                approval_object_id: None,
+                evidence_id: None,
+                reason: reason.to_string(),
+            },
+        };
+        if let Some(decision) = self.apply_admission(request)? {
+            decisions.push(decision);
+        }
+        Ok(())
     }
 
     fn prepare_admission(
@@ -914,11 +951,19 @@ impl Envelope<'_> {
             },
             has_evidence: request.event.evidence_id.is_some(),
         })?;
+        let supporting_approval = if approval_valid {
+            request.event.approval_object_id.clone()
+        } else {
+            stored
+                .as_ref()
+                .and_then(|stored| stored.approval_object_id.clone())
+        };
         Ok(PreparedDecision {
             facts,
             source_class,
             taint_class,
             event: request.event,
+            supporting_approval,
             evaluation,
         })
     }
@@ -939,7 +984,7 @@ impl Envelope<'_> {
                 taint_class: prepared.taint_class,
                 sensitivity: prepared.evaluation.sensitivity,
             },
-            approval_object_id: prepared.event.approval_object_id.clone(),
+            approval_object_id: prepared.supporting_approval.clone(),
         };
         let admission_decision_id = format!("{}:{:020}", self.commit_seq, self.admission_ordinal);
         self.admission_ordinal = self
@@ -956,6 +1001,11 @@ impl Envelope<'_> {
             .map(identity)
             .transpose()?;
         let approval_object_id = prepared
+            .supporting_approval
+            .as_deref()
+            .map(identity)
+            .transpose()?;
+        let cited_approval_object_id = prepared
             .event
             .approval_object_id
             .as_deref()
@@ -988,11 +1038,11 @@ impl Envelope<'_> {
                 "INSERT INTO admission_decisions(
                      admission_decision_id,candidate_id,candidate_kind,candidate_payload_digest,
                      subject_object_id,source_kind,source_id,source_revision,source_class,
-                     taint_class,maturity,effective_maturity,disposition,visibility,outcome,
-                     sensitivity_class,policy_revision,reason,evidence_id,approval_object_id,
-                     commit_seq,decided_at
+                     taint_class,event_kind,maturity,effective_maturity,disposition,visibility,
+                     outcome,sensitivity_class,policy_revision,reason,evidence_id,
+                     approval_object_id,commit_seq,decided_at
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,
-                           ?20,?21,?22)",
+                           ?20,?21,?22,?23)",
                 params![
                     admission_decision_id,
                     prepared.facts.candidate_id(),
@@ -1004,6 +1054,7 @@ impl Envelope<'_> {
                     prepared.facts.source_revision,
                     prepared.source_class.as_str(),
                     prepared.taint_class.as_str(),
+                    prepared.event.kind.as_str(),
                     prepared.evaluation.historical_maturity.as_str(),
                     prepared.evaluation.effective_maturity.get().as_str(),
                     prepared.evaluation.disposition.as_str(),
@@ -1042,6 +1093,8 @@ impl Envelope<'_> {
             "source_class": prepared.source_class.as_str(),
             "taint_class": prepared.taint_class.as_str(),
             "approval_object_id": approval_object_id,
+            "cited_approval_object_id": cited_approval_object_id,
+            "event_kind": prepared.event.kind.as_str(),
         });
         self.changes.push(PendingChange {
             object: ObjectRow {

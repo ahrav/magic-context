@@ -132,11 +132,12 @@ fn seed_approval(root: &std::path::Path) {
              ) VALUES ('approval-decision','approval','adr_accepted',X'7b7d',1,'normal');
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
-                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,visibility,
                  outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
              ) VALUES (
                  'approval-admission','approval','fixture','approval',1,'explicit_user',
-                 'user_explicit','approved','approved','active','automatic','admit','normal',
+                 'user_explicit','accepted_adr','approved','approved','active','automatic',
+                 'admit','normal',
                  1,'fixture',1,1
              );",
         )
@@ -161,12 +162,13 @@ fn seed_dependent_approval(root: &std::path::Path) {
              ) VALUES ('approval-b-decision','approval-b','adr_accepted',X'7b7d',1,'normal');
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
-                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,visibility,
                  outcome,sensitivity_class,policy_revision,reason,approval_object_id,commit_seq,
                  decided_at
              ) VALUES (
                  'approval-b-admission','approval-b','fixture','approval-b',1,'explicit_user',
-                 'user_explicit','approved','approved','active','automatic','admit','normal',
+                 'user_explicit','approve','approved','approved','active','automatic','admit',
+                 'normal',
                  1,'fixture','approval',1,1
              );",
         )
@@ -1158,11 +1160,11 @@ fn approval_dependent_capacity_blocks_new_grants_and_keeps_revocation_possible()
             .prepare(
                 "INSERT INTO admission_decisions(
                      admission_decision_id,subject_object_id,source_kind,source_id,
-                     source_revision,source_class,taint_class,maturity,effective_maturity,
+                     source_revision,source_class,taint_class,event_kind,maturity,effective_maturity,
                      disposition,visibility,outcome,sensitivity_class,policy_revision,reason,
                      approval_object_id,commit_seq,decided_at
                  ) VALUES (?1,?2,'fixture',?2,1,'model_inference','assistant_inference',
-                           'verified','verified','active','explicit_labeled','promote',
+                           'verify','verified','verified','active','explicit_labeled','promote',
                            'normal',1,'fixture','approval',1,1)",
             )
             .unwrap();
@@ -1211,12 +1213,13 @@ fn approval_dependent_capacity_blocks_new_grants_and_keeps_revocation_possible()
             .execute(
                 "INSERT INTO admission_decisions(
                      admission_decision_id,subject_object_id,source_kind,source_id,
-                     source_revision,source_class,taint_class,maturity,effective_maturity,
+                     source_revision,source_class,taint_class,event_kind,maturity,effective_maturity,
                      disposition,visibility,outcome,sensitivity_class,policy_revision,reason,
                      commit_seq,decided_at
                  ) VALUES ('admission-0000-moved','dependent-0000','fixture','dependent-0000',
-                           1,'model_inference','assistant_inference','verified','verified',
-                           'active','explicit_labeled','promote','normal',1,'moved on',1,2)",
+                           1,'model_inference','assistant_inference','verify','verified',
+                           'verified','active','explicit_labeled','promote','normal',1,
+                           'moved on',1,2)",
                 [],
             )
             .unwrap();
@@ -1999,5 +2002,123 @@ fn a_successful_resubmission_with_new_evidence_is_recorded() {
              WHERE subject_object_id='object-evidenced' AND evidence_id='evidence-1'"
         ),
         1
+    );
+}
+
+#[test]
+fn an_invalid_citation_does_not_replace_the_supporting_approval() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "carried");
+    let mut promoted = request("carried");
+    promoted.source_class = Some(SourceClass::ModelInference);
+    promoted.taint_class = Some(TaintClass::AssistantInference);
+    promoted.event.kind = EventKind::Verify;
+    promoted.event.trigger_object_id = None;
+    promoted.event.approval_object_id = Some("approval".to_string());
+    assert_eq!(admit(&store, promoted, "carried", "promote"), "admit");
+
+    // A non-raising request citing an invalid approval must not record it as the
+    // supporting authority, or the next uncited request inherits it and demotes.
+    store
+        .commit(intent("bogus-citation"), |envelope| {
+            let mut forged = subject_request("object-carried", EventKind::Other);
+            forged.source_class = Some(SourceClass::ModelInference);
+            forged.taint_class = Some(TaintClass::AssistantInference);
+            forged.event.approval_object_id = Some("approval-domain-object".to_string());
+            envelope.record_admission(forged)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT approval_object_id FROM admission_decisions
+             WHERE subject_object_id='object-carried'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "approval"
+    );
+
+    // The delayed poisoning path: an uncited follow-up must still see valid support.
+    store
+        .commit(intent("uncited-followup"), |envelope| {
+            let mut followup = subject_request("object-carried", EventKind::Other);
+            followup.source_class = Some(SourceClass::ModelInference);
+            followup.taint_class = Some(TaintClass::AssistantInference);
+            envelope.record_admission(followup)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT effective_maturity FROM admission_decisions
+             WHERE subject_object_id='object-carried'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "verified"
+    );
+}
+
+#[test]
+fn the_requested_event_kind_reaches_the_ledger_and_the_payload() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "kinded", "config_present", 1, "kinded-trigger");
+    let mut config = request("kinded");
+    config.taint_class = Some(TaintClass::CurrentConfig);
+    config.event.kind = EventKind::ConfigObserved;
+    assert_eq!(admit(&store, config, "kinded", "kinded"), "admit");
+
+    // `CodeObserved`, `ConfigObserved`, and `Verify` all resolve to the same state,
+    // so the outcome alone cannot identify which request produced the row.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT event_kind FROM admission_decisions
+             WHERE subject_object_id='object-kinded'"
+        ),
+        "config_observed"
+    );
+    let payload = inspect_text(
+        directory.path(),
+        "SELECT CAST(payload AS TEXT) FROM change_event
+         WHERE CAST(payload AS TEXT) LIKE '%\"admission_decision\"%'",
+    );
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        payload["audit"]["event_kind"], "config_observed",
+        "{payload}"
+    );
+}
+
+#[test]
+fn a_revoked_root_leaves_no_dependent_approval_able_to_grant() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    seed_dependent_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    store
+        .commit(intent("revoke-root"), |envelope| {
+            envelope.revoke_approval("approval", "root authority withdrawn")?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // `approval-b` held authority under `approval`. After revoking the root it must
+    // no longer be able to promote anything, since `validate_approval` reads only
+    // its own latest row.
+    stage(&store, "post-revoke");
+    let mut attempted = request("post-revoke");
+    attempted.source_class = Some(SourceClass::ModelInference);
+    attempted.taint_class = Some(TaintClass::AssistantInference);
+    attempted.event.kind = EventKind::Verify;
+    attempted.event.trigger_object_id = None;
+    attempted.event.approval_object_id = Some("approval-b".to_string());
+    assert_eq!(
+        admit(&store, attempted, "post-revoke", "post-revoke"),
+        "deny"
     );
 }
