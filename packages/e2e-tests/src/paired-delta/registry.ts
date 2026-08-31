@@ -51,30 +51,27 @@ function semanticInput(declaration: ScenarioDeclaration): unknown {
     return { contract: "paired-delta-scenario/v1", ...serializable };
 }
 
-/** Every file a validation rule reads a value from, wherever it lives: `semanticInput` drops the verifier function, so without these a change to a parsing primitive, to `CHARS_PER_TOKEN`, to the search-token bound, or to the claim normalizer would alter what each frozen scenario accepts while both fingerprints stayed identical. Deliberately coarse — a whole file, not the one value consumed from it — because over-triggering a refreeze costs one command while under-triggering hides a semantic change. A direct-read list, not a transitive import closure: resolving the closure would make the digest depend on most of the repository and refreeze the pool on unrelated edits. commentlint: allow(JUDGE) */
-const SHARED_VALIDATION_FILES = [
-    "src/contract-primitives.ts",
-    "src/ballast.ts",
+/** Lane-owned files only, and that boundary is a correctness requirement rather than a tradeoff. A digest input must change only when the pool's own meaning changes; hashing a file the pool does not own breaks that, because `pull_request` CI evaluates the merge commit, so any upstream edit to a shared file makes every entry drift on a branch that touched no scenario — and it fails in CI while passing locally, which is the least debuggable shape available. Shared primitives are guarded by their own tests and by every lane that uses them, not by this fingerprint. Deliberately coarse within the boundary: over-triggering a refreeze costs one command, under-triggering hides a semantic change. commentlint: allow(JUDGE) */
+const LANE_VALIDATION_FILES = [
     "src/paired-delta/contract.ts",
     "src/paired-delta/scenarios/support.ts",
-    "../plugin/src/features/magic-context/search-bounds.ts",
-    "../plugin/src/features/magic-context/memory/normalize-hash.ts",
 ] as const;
 
-/** Read once per root rather than once per scenario: the shared files are identical for every entry, so re-reading them per scenario is pure I/O that grows with the pool. commentlint: allow(JUDGE) */
-function sharedValidationBytes(root: string): ReadonlyArray<readonly [string, Buffer]> {
-    const cached = sharedBytesByRoot.get(root);
+/** Read once per root rather than once per scenario: these files are identical for every entry, so re-reading them per scenario is pure I/O that grows with the pool. commentlint: allow(JUDGE) */
+const laneBytesByRoot = new Map<string, ReadonlyArray<readonly [string, Buffer]>>();
+
+function laneValidationBytes(root: string): ReadonlyArray<readonly [string, Buffer]> {
+    const cached = laneBytesByRoot.get(root);
     if (cached !== undefined) return cached;
-    const bytes = SHARED_VALIDATION_FILES.map((path) =>
+    const bytes = LANE_VALIDATION_FILES.map((path) =>
         [path, readFileSync(resolve(root, path))] as const);
-    sharedBytesByRoot.set(root, bytes);
+    laneBytesByRoot.set(root, bytes);
     return bytes;
 }
-const sharedBytesByRoot = new Map<string, ReadonlyArray<readonly [string, Buffer]>>();
 
 function verifierBundleDigest(root: string, implementationFile: string): string {
     const hash = createHash("sha256");
-    for (const [path, bytes] of sharedValidationBytes(root)) {
+    for (const [path, bytes] of laneValidationBytes(root)) {
         hash.update(path);
         hash.update("\0");
         hash.update(bytes);
