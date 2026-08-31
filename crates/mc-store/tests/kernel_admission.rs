@@ -4686,3 +4686,83 @@ fn a_lineage_rejection_demotes_what_the_rejected_authority_supported() {
         "candidate"
     );
 }
+
+#[test]
+fn a_weak_own_decision_is_not_rescued_by_a_qualifying_lineage_decision() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // The ADR's own decision stops at `verified`, so it never earned approval.
+    // A newer decision on its lineage qualifies on every field.
+    connection
+        .execute_batch(
+            "INSERT INTO object_registry(
+                 object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                 created_commit_seq,sensitivity_class
+             ) VALUES ('weak-adr','decision','approval-domain','fixture','weak-adr',1,1,'normal');
+             INSERT INTO decisions(
+                 decision_id,object_id,decision_kind,decision_payload,created_commit_seq,
+                 sensitivity_class
+             ) VALUES ('weak-adr-decision','weak-adr','adr_accepted',X'7b7d',1,'normal');
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'weak-adr-own','weak-adr','fixture','weak-adr',1,'explicit_user','user_explicit',
+                 'other','verified','verified','active','automatic','admit','normal',1,'fixture',
+                 1,1
+             );
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'weak-adr-zz-lineage',NULL,'fixture','weak-adr',1,'explicit_user',
+                 'user_explicit','other','approved','approved','active','automatic','admit',
+                 'normal',1,'fixture',1,2
+             );",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+    // The lineage row really is the one the governing rule would pick.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT admission_decision_id FROM admission_decisions
+             WHERE source_id='weak-adr'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "weak-adr-zz-lineage"
+    );
+
+    stage(&store, "leans-on-weak");
+    let mut approved = request("leans-on-weak");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("weak-adr".to_string());
+    store
+        .commit(intent("leans-on-weak"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "weak-domain".to_string(),
+                    object_id: "weak-object".to_string(),
+                    name: "name-leans-on-weak".to_string(),
+                },
+            )?;
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='weak-object'"
+        ),
+        0
+    );
+}

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "b8ff2139f24383c705a4c2c42d4ee6313fbf74cf60fd7607c2a1e27b5b8f518b";
+    "69c4dc4b99aaf986fbd88515cfdc50a88f01c1eb8752034bf5e4433e88ee0e30";
 
 /// The enclosing query must bind `o` to `object_registry`.
 /// Serving and approval validation must agree on which decision governs an
@@ -485,9 +485,6 @@ const MAX_LINEAGE_AUTHORITY_BEARERS: usize = 64;
 
 const MAX_AUTHORITY_CHAIN_DEPTH: usize = 64;
 
-/// Whether the object named by `?1` qualifies as a live approval in its own right.
-/// Used per chain member, so it takes the id from the enclosing row rather than a
-/// bound parameter.
 /// The enclosing query must bind `o` to `object_registry`.
 /// The latest decision about the object itself. An object serves only on
 /// standing it earned, so this is a requirement, not a contribution.
@@ -537,6 +534,7 @@ fn approval_row_fields(alias: &str) -> String {
    AND {alias}.source_class='explicit_user'
    AND {alias}.maturity IN ('approved','enforced')
    AND {alias}.effective_maturity IN ('approved','enforced')
+   AND ({alias}.maturity='enforced' OR {alias}.effective_maturity='approved')
    AND {alias}.disposition='active'
    AND {alias}.visibility='automatic'
    AND {alias}.sensitivity_class='normal'
@@ -563,6 +561,9 @@ fn own_decision_qualifies_sql() -> String {
     )
 }
 
+/// Whether the object named by `object_column` qualifies as a live approval in its
+/// own right. Used per chain member, so it takes the id from the enclosing row
+/// rather than a bound parameter.
 fn approval_qualifies_predicate(object_column: &str) -> String {
     let governing = governing_decision_for_object_sql("");
     let own_decision = own_decision_qualifies_sql();
@@ -1839,23 +1840,59 @@ fn validate_trigger(
     }
 }
 
-/// The strongest surface a single stored decision can justify, or `Hidden` when
-/// the row cannot be interpreted. `prefix` selects the column alias group.
+/// Column names for one decision's group in the serving read, so `decided_row`
+/// does not rebuild them per row.
+struct DecidedColumns {
+    maturity: &'static str,
+    effective_maturity: &'static str,
+    disposition: &'static str,
+    visibility: &'static str,
+    taint_class: &'static str,
+    source_class: &'static str,
+    sensitivity_class: &'static str,
+    policy_revision: &'static str,
+}
+
+const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
+    maturity: "d_maturity",
+    effective_maturity: "d_effective_maturity",
+    disposition: "d_disposition",
+    visibility: "d_visibility",
+    taint_class: "d_taint_class",
+    source_class: "d_source_class",
+    sensitivity_class: "d_sensitivity_class",
+    policy_revision: "d_policy_revision",
+};
+
+const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
+    maturity: "s_maturity",
+    effective_maturity: "s_effective_maturity",
+    disposition: "s_disposition",
+    visibility: "s_visibility",
+    taint_class: "s_taint_class",
+    source_class: "s_source_class",
+    sensitivity_class: "s_sensitivity_class",
+    policy_revision: "s_policy_revision",
+};
+
+/// The strongest surface a single stored decision can justify, its sensitivity
+/// ceiling, and whether the row could be interpreted at all. `None` when the
+/// decision is absent.
 fn decided_row(
     row: &rusqlite::Row<'_>,
-    prefix: &str,
+    columns: &DecidedColumns,
 ) -> rusqlite::Result<Option<(VisibilityRow, Sensitivity, bool)>> {
-    let Some(revision) = row.get::<_, Option<i64>>(&*format!("{prefix}policy_revision"))? else {
+    let Some(revision) = row.get::<_, Option<i64>>(columns.policy_revision)? else {
         return Ok(None);
     };
     let taint = row
-        .get::<_, Option<String>>(&*format!("{prefix}taint_class"))?
+        .get::<_, Option<String>>(columns.taint_class)?
         .and_then(|value| TaintClass::try_from(value.as_str()).ok());
     let source = row
-        .get::<_, Option<String>>(&*format!("{prefix}source_class"))?
+        .get::<_, Option<String>>(columns.source_class)?
         .and_then(|value| SourceClass::try_from(value.as_str()).ok());
     let sensitivity = Sensitivity::from_stored(
-        &row.get::<_, Option<String>>(&*format!("{prefix}sensitivity_class"))?
+        &row.get::<_, Option<String>>(columns.sensitivity_class)?
             .unwrap_or_default(),
     );
     // A newer revision may attach meanings this binary cannot see, and a pairing
@@ -1870,15 +1907,15 @@ fn decided_row(
     }
     let floor = taint.map_or(Sensitivity::Secret, sensitivity_floor);
     let stored = row
-        .get::<_, Option<String>>(&*format!("{prefix}visibility"))?
+        .get::<_, Option<String>>(columns.visibility)?
         .and_then(|value| VisibilityRow::try_from(value.as_str()).ok());
     let historical = row
-        .get::<_, Option<String>>(&*format!("{prefix}maturity"))?
+        .get::<_, Option<String>>(columns.maturity)?
         .and_then(|value| Maturity::try_from(value.as_str()).ok());
     let expected = match (
-        row.get::<_, Option<String>>(&*format!("{prefix}effective_maturity"))?
+        row.get::<_, Option<String>>(columns.effective_maturity)?
             .map(|value| Maturity::try_from(value.as_str())),
-        row.get::<_, Option<String>>(&*format!("{prefix}disposition"))?
+        row.get::<_, Option<String>>(columns.disposition)?
             .map(|value| Disposition::try_from(value.as_str())),
     ) {
         // Support can only clamp what history earned, so effective above
@@ -1892,7 +1929,7 @@ fn decided_row(
     };
     Ok(Some((
         served_visibility_row(stored, expected),
-        sensitivity.max(floor),
+        sensitivity.restrictive(floor),
         true,
     )))
 }
@@ -1951,7 +1988,7 @@ impl KernelStore {
                     |row| {
                         let mut object = object_row_from(row)?;
                         let (mut visibility_row_value, mut sensitivity, interpretable) =
-                            decided_row(row, "d_")?.unwrap_or((
+                            decided_row(row, &OWN_DECISION_COLUMNS)?.unwrap_or((
                                 VisibilityRow::AuditOnly,
                                 Sensitivity::Secret,
                                 false,
@@ -1963,15 +2000,16 @@ impl KernelStore {
                         // Neither scope may relax the other: a restriction on one
                         // outlives a later permissive decision on the other, so the
                         // served surface is the stricter of the two.
-                        if let Some((lineage_row, lineage_sensitivity, _)) = decided_row(row, "s_")?
+                        if let Some((lineage_row, lineage_sensitivity, _)) =
+                            decided_row(row, &LINEAGE_DECISION_COLUMNS)?
                         {
                             visibility_row_value = served_visibility_row(
                                 Some(visibility_row_value),
                                 Some(lineage_row),
                             );
-                            sensitivity = sensitivity.max(lineage_sensitivity);
+                            sensitivity = sensitivity.restrictive(lineage_sensitivity);
                         }
-                        object.sensitivity = object.sensitivity.max(sensitivity);
+                        object.sensitivity = object.sensitivity.restrictive(sensitivity);
                         let visibility =
                             surface_visibility(visibility_row_value, surface, object.sensitivity);
                         Ok((object, visibility))
