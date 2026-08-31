@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "8254f84240f14f712536d9823f4624f166fd8fa6715723f18209d0dbed47ba71";
+    "c9be43a21a71d211fd2d0df9a9bb75f770e75d49c72a0da19bf0434681ba0493";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -469,6 +469,62 @@ fn strictest_sensitivity_sql(commit_bound: &str) -> String {
     )
 }
 
+/// Ranks `column` as `Maturity::rank` does. Unrecognized values rank 99.
+fn maturity_rank_sql(column: &str) -> String {
+    let arms = Maturity::ALL
+        .iter()
+        .map(|maturity| format!("WHEN '{}' THEN {}", maturity.as_str(), maturity.rank()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("CASE {column} {arms} ELSE 99 END")
+}
+
+/// A pairing outside `source_allows_taint` ranks -1.
+fn automatic_ceiling_rank_sql(alias: &str) -> String {
+    let arms = SourceClass::ALL
+        .iter()
+        .flat_map(|source| {
+            TaintClass::ALL
+                .iter()
+                .filter(|taint| source_allows_taint(*source, **taint))
+                .map(move |taint| {
+                    format!(
+                        "WHEN ('{}','{}') THEN {}",
+                        source.as_str(),
+                        taint.as_str(),
+                        automatic_ceiling(*source, *taint).rank()
+                    )
+                })
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("CASE ({alias}.source_class,{alias}.taint_class) {arms} ELSE -1 END")
+}
+
+/// Returns whether a same-lineage object decision differs from `latest` in source
+/// or taint class, or has an effective maturity above its recorded maturity.
+fn own_history_inconsistent_sql(latest: &str, commit_bound: &str) -> String {
+    let lineage = same_lineage_as_object("p");
+    let effective = maturity_rank_sql("p.effective_maturity");
+    let historical = maturity_rank_sql("p.maturity");
+    format!(
+        "EXISTS(
+    SELECT 1
+    FROM admission_decisions p
+    WHERE p.subject_object_id=o.object_id
+      AND {lineage}
+      AND p.commit_seq IS NOT NULL
+      AND p.commit_seq>=o.created_commit_seq
+      {commit_bound}
+      AND (
+            p.source_class<>{latest}.source_class
+         OR p.taint_class<>{latest}.taint_class
+         OR {effective}>{historical}
+          )
+)"
+    )
+}
+
 // policy-digest:serving-end
 
 // policy-digest:authority-start
@@ -550,12 +606,17 @@ fn allowed_classification_pairs(alias: &str) -> String {
 /// job. `alias` binds it to `admission_decisions`.
 fn non_restrictive_row_fields(alias: &str) -> String {
     let pairs = allowed_classification_pairs(alias);
+    let effective = maturity_rank_sql(&format!("{alias}.effective_maturity"));
+    let historical = maturity_rank_sql(&format!("{alias}.maturity"));
+    let ceiling = automatic_ceiling_rank_sql(alias);
     format!(
         "{alias}.disposition='active'
    AND {alias}.visibility='automatic'
    AND {alias}.sensitivity_class='normal'
    AND {alias}.policy_revision={POLICY_REVISION}
-   AND {pairs}"
+   AND {pairs}
+   AND {effective}<={historical}
+   AND ({effective}<={ceiling} OR {alias}.approval_object_id IS NOT NULL)"
     )
 }
 
@@ -582,6 +643,8 @@ fn approval_qualifies_predicate(object_column: &str) -> String {
     let lineage = latest_lineage_decision_sql("lin", "");
     let own_fields = approval_row_fields("a");
     let lineage_fields = non_restrictive_row_fields("l");
+    let history_sensitivity = strictest_sensitivity_sql("");
+    let own_history_inconsistent = own_history_inconsistent_sql("a", "");
     format!(
         "EXISTS(
              SELECT 1
@@ -591,6 +654,8 @@ fn approval_qualifies_predicate(object_column: &str) -> String {
              WHERE o.object_id={object_column} AND {APPROVAL_OBJECT_PREDICATE}
                AND {own_fields}
                AND o.sensitivity_class='normal'
+               AND COALESCE({history_sensitivity},'secret')='normal'
+               AND NOT {own_history_inconsistent}
                AND (
                    NOT EXISTS(
                        SELECT 1 FROM admission_decisions l
@@ -2008,6 +2073,8 @@ impl KernelStore {
         let own = latest_own_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
         let lineage = latest_lineage_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
         let history = strictest_sensitivity_sql("AND h.commit_seq<=:governing_as_of");
+        let own_history_inconsistent =
+            own_history_inconsistent_sql("d", "AND p.commit_seq<=:governing_as_of");
         let (tip, rows) = self.read_snapshot(requested, |tx| {
             let mut statement = tx
                 .prepare(&format!(
@@ -2036,7 +2103,8 @@ impl KernelStore {
                                   AND (ad.invalidated_commit_seq IS NULL
                                        OR :governing_as_of<ad.invalidated_commit_seq)
                             ) AS accepted_decision,
-                            {history} AS history_sensitivity_class
+                            {history} AS history_sensitivity_class,
+                            {own_history_inconsistent} AS own_history_inconsistent
                      FROM object_registry o
                      JOIN admission_decisions d
                        ON d.admission_decision_id={own}
@@ -2059,7 +2127,7 @@ impl KernelStore {
                                 Sensitivity::Secret,
                                 false,
                             ));
-                        if !interpretable {
+                        if !interpretable || row.get::<_, bool>("own_history_inconsistent")? {
                             visibility_row_value = VisibilityRow::AuditOnly;
                             sensitivity = Sensitivity::Secret;
                         }

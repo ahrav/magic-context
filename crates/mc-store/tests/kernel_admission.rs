@@ -5542,3 +5542,192 @@ fn a_later_row_cannot_declassify_what_an_earlier_decision_restricted() {
         );
     }
 }
+
+#[test]
+fn a_lineage_row_with_an_impossible_maturity_shape_carries_no_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // Support can only clamp what history earned, so `candidate` history carrying
+    // `verified` support is a shape the evaluator rejects. The pairing is legal and
+    // every stored field is permissive, so only the shape marks the row.
+    connection
+        .execute(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,visibility,
+                 outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'approval-lineage-bad-shape',NULL,'fixture','approval',1,'explicit_user',
+                 'user_explicit','approve','candidate','verified','active','automatic',
+                 'admit','normal',1,'fixture',1,2
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert!(
+        store
+            .visible_as_of(Surface::ExplicitSearch, 1)
+            .unwrap()
+            .rows
+            .iter()
+            .all(|row| row.object.object_id != "approval"),
+        "serving must hide an object governed by a row it cannot interpret"
+    );
+
+    stage(&store, "promoted-by-bad-shape");
+    let mut approved = request("promoted-by-bad-shape");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("approval".to_string());
+    store
+        .commit(intent("promoted-by-bad-shape"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "bad-shape-domain".to_string(),
+                    object_id: "bad-shape-object".to_string(),
+                    name: "name-promoted-by-bad-shape".to_string(),
+                },
+            )?;
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='bad-shape-object'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_newer_normal_lineage_row_does_not_restore_authority_history_restricted() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // An earlier `sensitive` lineage decision followed by a newer `normal` one. Both
+    // rows are otherwise permissive, and the newer one is the latest, so only the
+    // history keeps the approval restricted.
+    connection
+        .execute_batch(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'approval-lineage-a-sensitive',NULL,'fixture','approval',1,'explicit_user',
+                 'user_explicit','approve','verified','verified','active','automatic',
+                 'admit','sensitive',1,'fixture',1,2
+             );
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'approval-lineage-b-normal',NULL,'fixture','approval',1,'explicit_user',
+                 'user_explicit','approve','verified','verified','active','automatic',
+                 'admit','normal',1,'fixture',1,3
+             );",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert!(
+        store
+            .visible_as_of(Surface::AutoInject, 1)
+            .unwrap()
+            .rows
+            .iter()
+            .all(|row| row.object.object_id != "approval"),
+        "history keeps the approval off automatic surfaces"
+    );
+
+    stage(&store, "promoted-by-declassified-approval");
+    let mut approved = request("promoted-by-declassified-approval");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("approval".to_string());
+    store
+        .commit(intent("promoted-by-declassified-approval"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "declassified-approval-domain".to_string(),
+                    object_id: "declassified-approval-object".to_string(),
+                    name: "name-promoted-by-declassified-approval".to_string(),
+                },
+            )?;
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry
+             WHERE object_id='declassified-approval-object'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_relabelled_latest_row_cannot_launder_an_earlier_classification() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let seq = insert_subject(
+        &store,
+        "relabelled",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    drop(store);
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // `evaluate_admission` refuses any change to a prior decision's source or taint
+    // class, so an earlier inference-tainted row under a later trusted-code row is a
+    // history it cannot produce. The id sorts before the real row, which stays latest.
+    connection
+        .execute_batch(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,elevated_support,
+                 commit_seq,decided_at
+             )
+             SELECT '0-earlier-inference-row',subject_object_id,source_kind,source_id,
+                    source_revision,'model_inference','assistant_inference',event_kind,
+                    'candidate','candidate',disposition,visibility,outcome,sensitivity_class,
+                    policy_revision,reason,elevated_support,commit_seq,decided_at
+             FROM admission_decisions WHERE subject_object_id='object-relabelled';",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT source_class||'/'||taint_class FROM admission_decisions
+             WHERE subject_object_id='object-relabelled'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "trusted_local_code/current_code"
+    );
+    for surface in [Surface::AutoInject, Surface::ExplicitSearch] {
+        assert!(
+            store.visible_as_of(surface, seq).unwrap().rows.is_empty(),
+            "a relabelled latest row must not launder an earlier classification"
+        );
+    }
+}
