@@ -201,11 +201,17 @@ impl KernelStore {
             }
             // Set `published` before `sync_directory_fd` so cleanup removes an
             // artifact published before a directory-sync failure.
-            if publish_noreplace_locked(&destination, &temp_name, &final_name)
+            match publish_noreplace_locked(&destination, &temp_name, &final_name)
                 .map_err(|_| KernelError::Io)?
-                == PublishOutcome::AlreadyExists
             {
-                return Err(KernelError::Io);
+                PublishOutcome::AlreadyExists => return Err(KernelError::Io),
+                PublishOutcome::Published => {}
+                // `cleanup_backup_family` retries removal of both the final
+                // artifact and the retained temp link on the error path.
+                PublishOutcome::PublishedTempRetained => {
+                    published = true;
+                    return Err(KernelError::Io);
+                }
             }
             published = true;
             sync_directory_fd(&destination).map_err(|_| KernelError::Io)?;

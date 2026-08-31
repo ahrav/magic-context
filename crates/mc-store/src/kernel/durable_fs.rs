@@ -43,6 +43,10 @@ impl StorageError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PublishOutcome {
     Published,
+    // The rename fallback linked `final_name` but could neither unlink the
+    // temp name nor roll the link back; the caller must remove or retry
+    // removal of the temp link.
+    PublishedTempRetained,
     AlreadyExists,
 }
 
@@ -190,17 +194,13 @@ pub(super) fn publish_noreplace_locked(
         final_name,
         AtFlags::empty(),
     ) {
-        Ok(()) => {
-            match rfs::unlinkat(directory, temp_name, AtFlags::empty()) {
-                Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(PublishOutcome::Published),
-                // When rollback of `final_name` also fails, the publication
-                // stands and the stale temp link is benign residue.
-                Err(unlink_error) => match rfs::unlinkat(directory, final_name, AtFlags::empty()) {
-                    Ok(()) | Err(rustix::io::Errno::NOENT) => Err(classify_errno(unlink_error)),
-                    Err(_) => Ok(PublishOutcome::Published),
-                },
-            }
-        }
+        Ok(()) => match rfs::unlinkat(directory, temp_name, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(PublishOutcome::Published),
+            Err(unlink_error) => match rfs::unlinkat(directory, final_name, AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => Err(classify_errno(unlink_error)),
+                Err(_) => Ok(PublishOutcome::PublishedTempRetained),
+            },
+        },
         Err(rustix::io::Errno::EXIST) => Ok(PublishOutcome::AlreadyExists),
         Err(error) => Err(classify_errno(error)),
     }
