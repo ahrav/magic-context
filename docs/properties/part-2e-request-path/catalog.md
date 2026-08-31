@@ -658,6 +658,7 @@ three exits there is no frame at all, so that remedy never triggers and the
 client burns its full 30-second route deadline. Repeated bind panics therefore
 cost one route deadline each.
 Open questions:
+
 - Is the `CloseWins` silent exit reachable on a generation that stays live
   afterwards, or does every producer of that decision also retire the
   generation? `settle_route` is called from host shutdown, so the host is at
@@ -714,6 +715,7 @@ unbounded growth. The consequence is a stale `PendingEntry` holding a
 generation, which makes `handle_cancel` for that key a live no-op against an
 already-dead task.
 Open questions:
+
 - Does the forced path always drop the `GenerationCore` immediately afterwards?
   `close_generation` removes the connection at `dispatch.rs:1409-1413`, but
   `force_close_all_routes` does not call it. (unresolved, needs sub-part 2f)
@@ -782,6 +784,7 @@ answered. Protocol §10.1 makes an unobserved terminal `outcome_unknown` on the
 client side; the host has no matching classification, so the two ends cannot be
 reconciled after a close.
 Open questions:
+
 - Should routed terminals carry a `written` hook for metering, given the hook
   is a boxed closure per frame? (needs human input)
 
@@ -822,6 +825,7 @@ nothing was answered. Combined with Part 2d's finding that a clean host close
 and a transport failure share one code, the client cannot attribute the loss,
 and any effect the handler already applied is invisible to it.
 Open questions:
+
 - Does any production handler use `output_from_writer` with a computed
   `exact_len` that could disagree with its serializer? That is `mc-module`'s
   side of the boundary. (unresolved, needs an `mc-module` audit)
@@ -879,6 +883,7 @@ at publication with `ProducerError::Underfill` rather than at this gate, which i
 territory. The gap here is specifically the owned path, where declared and written
 are the same field and zero is legal.
 Open questions:
+
 - Is a zero-length `Response` a defect or a supported outcome?
   `handler.rs:220-235` does not state the intent, and
   `OutputBuffer::is_empty()` (`:368-370`) exists as public API, which weakly
@@ -942,6 +947,7 @@ Impact: All four pools are host-global, so one connection can hold every general
 permit. Per-connection fairness is not provided at this layer; if it is
 required, it is required somewhere else and nothing here supplies it.
 Open questions:
+
 - Is per-connection handler-capacity fairness owned anywhere? `connection_permits`
   bounds connection count but not per-connection dispatch share. (unresolved,
   needs sub-part 2f's `runtime.rs` and `config.rs` pass)
@@ -996,6 +1002,7 @@ Impact: Handler-task capacity is reclaimed only by handler cooperation, client
 timeout can hold all 256 general task permits, at which point every other
 route's traffic gets `server_busy` while the host reports itself healthy.
 Open questions:
+
 - Should the host own a request deadline at all, given protocol §11's rule that
   each operation owns exactly one absolute deadline and it assigns the request
   deadline to the client? Adding one would create the multiplied timer §11
@@ -1097,6 +1104,7 @@ the clients it is trying to shed, while backing off their routed traffic. The
 divergence is not merely unchecked, it is **pinned by a CI-executed test**, so it
 is current intended behaviour unless someone changes both the code and that test.
 Open questions:
+
 - Which code does the protocol intend for a `route.open` during shutdown? §12
   step 1 names `server_busy` for routed requests and is silent on `route.open`;
   §8.3 reserves `target_unavailable` for route admission failures such as
@@ -1139,6 +1147,7 @@ requests, so malformed control traffic degrades application throughput on every
 connection, while a capacity-rejection flood is contained per generation. The
 two attack surfaces have different blast radii for the same client behaviour.
 Open questions:
+
 - Protocol §8.3 says a control request is "one consumer request against the
   global unsettled bound", which the semantic path honours. Is charging
   malformed traffic to the *global* pool rather than a per-generation one the
@@ -1190,7 +1199,7 @@ verified claim. None has been tested. **Corrected during disposition: one record
 is CI-tested, though no dominance statement is.** The four `compile_fail` doctests
 bear on the handler API surface rather than on any record here, but
 `tests/lifecycle.rs:570-651` asserts the divergent-codes record exactly and runs
-at `ci.yml:178-179` and `:187`. That record appears in the fourth cluster below,
+at `ci.yml:168-169` on Linux. That record appears in the fourth cluster below,
 and its presence there is the only place a hypothesis could be checked against
 something CI executes today.
 
@@ -1391,6 +1400,7 @@ Impact: a bind path that never yields `route_gone` leaks one map entry per
 connection for the host's lifetime, and the leaked entry keeps routing a reused
 handle to a stale child.
 Open questions:
+
 - Does the host guarantee `route_gone` after a panicking `bind`, or only after
   `Reject` and close? The comment claims all three; the runtime side is outside
   this lens. **Resolved at carry time, and the answer is yes.** The runtime side

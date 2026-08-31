@@ -395,17 +395,31 @@ record asserts that wakes are *delivered*; none asserts that delivery
 
 ### Lens 3: implementability
 
-Four of the six new coverage markers are genuinely reachable on a correct
+Three of the six new coverage markers are genuinely reachable on a correct
 system, two of them already constructed:
 `shm_publish_during_readiness_callback` (`mechanism.ts:211-278`),
 `shm_queued_writes_exceed_one_per_wake` (the `try_send` bypass at
-`client.rs:4041`), `shm_partial_page_shared_with_live_lease`
-(`ring.rs:2337-2353`), and `shm_kick_during_pending_callback`
-(constructible by construction: calling `poll` from inside an
-unacknowledged callback with data visible forces the kick into the pending
-window, `lib.rs:1226-1235`). Two findings on the other two.
+`client.rs:4041`), and `shm_partial_page_shared_with_live_lease`
+(`ring.rs:2337-2353`). Three findings on the other three.
 
-1. **`shm_capacity_signal_hit_parked_epoch` cannot witness its situation**
+1. **`shm_kick_during_pending_callback` needs a race, not a call order**
+   (refinement). The marker was recorded as constructible by calling `poll`
+   from inside an unacknowledged callback with data visible. That construction
+   cannot reach the kick: `poll` takes `try_receive()` first
+   (`lib.rs:1176-1182`), and with data visible that returns `Some(lease)`, so
+   the frame is delivered at `:1241` and the `else` arm holding
+   `arm_data_wait()` and `reactor.kick()` (`:1227-1235`) is skipped entirely.
+   The kick is reachable only on the empty-receive arm, and only when
+   `arm_data_wait()` returns `Ok(false)` — that is, when data or a generation
+   change appears after the empty `try_receive` but before the arm's recheck
+   (`ring.rs:840-852`). Witnessing it therefore requires a concurrent
+   publication or a scheduling seam inside that window, not a call order.
+   *Disposition:* refinement — restate the marker's construction in the
+   fault-map row and the Required-faults line as a race between an empty
+   receive and the arm recheck, and name the seam a test would use to hold that
+   window open.
+
+2. **`shm_capacity_signal_hit_parked_epoch` cannot witness its situation**
    (refinement). The marker is defined as firing "on the release side when
    `signal_wake` swaps a nonzero epoch". Two defects. First, no observation
    point exists: the swap result is internal to `signal_wake`
@@ -422,7 +436,8 @@ window, `lib.rs:1226-1235`). Two findings on the other two.
    that only a loom or shuttle schedule can observe it, or (b) keep the
    marker but rename its claim to block-then-wake coverage and state
    explicitly that F16 has no constructible runtime marker.
-2. **The parked-bridge witness should use observable state** (refinement).
+
+3. **The parked-bridge witness should use observable state** (refinement).
    `shm_read_budget_exhausted_with_parked_bridge` names a park site that is
    not externally distinguishable: the charge poll and the data-wait poll
    block on the same `worker_wake` descriptor (`client.rs:1879-1901`,

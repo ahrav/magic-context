@@ -42,9 +42,38 @@ quarantine.
 
 ## Timing windows and dependencies
 
-None. The check is a pure predicate on the descriptor at attach time. The one
-platform dependency is `/proc/self/fd`, which makes the identity half of the
-gate Linux-shaped; a platform without that readlink would fail closed
+The gate itself is a pure predicate evaluated once, at attach time, and there
+is no window *inside* it. But it is not the whole story, because `O_NONBLOCK`
+is not a property of the descriptor this process holds. Descriptors reach the
+attaching side over `SCM_RIGHTS` (`setup_socket.rs:149` sends,
+`:215-227` receives), which duplicates the *descriptor* while both sides keep
+referring to the **same open file description**. `O_NONBLOCK` is a file-status
+flag living in that shared description, so `fcntl(F_SETFL)` on any descriptor
+naming it — including one the sender retained — clears it for this process too.
+`FD_CLOEXEC` is the opposite case, a per-descriptor flag, which is why
+`set_inheritable`'s `F_SETFD` (`ring.rs:884-906`) carries no equivalent risk.
+
+That leaves a **post-attach mutation window** running from the moment
+`Doorbell::from_fd` returns to the end of the ring's life. A peer that clears
+`O_NONBLOCK` inside it reinstates exactly the failure below, past the gate:
+`drain` (`ring.rs:430-448`) is a bare `read()` that only distinguishes
+`EAGAIN`, and both of its callers invoke it precisely when the eventfd is
+expected to be empty and neither guards it with a `poll` — `arm_data_wait`
+drains at `:846` after establishing that no data is available, and
+`complete_data_wait` drains unconditionally at `:861`. On a descriptor whose
+`O_NONBLOCK` was cleared, that read blocks forever.
+
+Scope of the claim, therefore: **the gate establishes that the descriptor was a
+nonblocking eventfd at attach time, and nothing more.** It does not establish
+that the descriptor stays nonblocking, and the guarantee holds only against a
+peer that never mutates the shared file-status flags after the transfer. A
+hostile peer is in this part's threat model, and the untrusted side is the one
+holding the other descriptor, so the residual exposure is real: a client that
+clears the flag can wedge a host thread inside `drain`. This window is
+uncatalogued and untested; it is a gap, not a resolved question.
+
+The one platform dependency is `/proc/self/fd`, which makes the identity half
+of the gate Linux-shaped; a platform without that readlink would fail closed
 (readlink error maps to `DoorbellFailed`).
 
 ## What a test must construct
@@ -59,6 +88,10 @@ gate Linux-shaped; a platform without that readlink would fail closed
   leaked) is untested.
 - Positive arm: a cross-process attach with genuine doorbells
   (`ring_child_exchange`, `tests/ring.rs:597-626`, does this).
+- The post-attach window: attach with valid doorbells, then clear
+  `O_NONBLOCK` from the descriptor the *other* side retained, then drive an
+  empty `drain` through `arm_data_wait` and assert against an explicit
+  deadline. This has no assertion today and no record owns it.
 
 ## Investigation log
 
@@ -75,8 +108,20 @@ gate Linux-shaped; a platform without that readlink would fail closed
 ### Q: does anything downgrade the flags after attach?
 
 - Sources examined: `set_inheritable` (`ring.rs:884-906`) is the only
-  post-attach fcntl; it touches `FD_CLOEXEC` (F_SETFD), not `O_NONBLOCK`
-  (F_SETFL).
-- Findings: no F_SETFL call exists in the crate outside the unit test.
-- Missing evidence: none.
-- Conclusion: resolved with answer — no.
+  post-attach fcntl in this crate; it touches `FD_CLOEXEC` (F_SETFD), not
+  `O_NONBLOCK` (F_SETFL). `setup_socket.rs:149` and `:215-227` for how the
+  descriptors are transferred.
+- Findings: no F_SETFL call exists in the crate outside the unit test —
+  but that search cannot answer this question. The descriptors arrive over
+  `SCM_RIGHTS`, so the sender's retained descriptor and this one name the same
+  open file description, and `O_NONBLOCK` is a file-status flag on that shared
+  description rather than on either descriptor. A peer process can therefore
+  clear it with `F_SETFL` at any time after the gate passes, and no amount of
+  searching this crate would show it.
+- Missing evidence: nothing pins the flag's value between attach and each
+  `drain`. No test exercises a peer clearing it, and no record owns the
+  resulting window.
+- Conclusion: **corrected — yes, a peer can.** Nothing in *this process*
+  downgrades the flags, which is what the original in-crate search actually
+  established; the earlier "no" over-read that scope. See the post-attach
+  mutation window under Timing windows above.

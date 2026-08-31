@@ -274,7 +274,7 @@ preconditions, and both are legal on a correct system.
 | `shm_read_budget_exhausted_with_parked_bridge` | `read_budget.used == capacity` at the moment a further frame is published, followed by bounded resumption after one `ByteCharge` drop | Backpressure is a legal state; pairs with the release that ends it |
 | `shm_capacity_signal_hit_parked_epoch` | Block-then-wake coverage: `signal_wake` swapped a nonzero parked epoch on the capacity page (fires on every ordinary mid-block wake; F16's arm window has no constructible runtime marker) | The signal side of the handshake working as designed |
 | `shm_partial_page_shared_with_live_lease` | A reclaim ran while a live lease held bytes on a page the released run touched | The exact shape the rounding protects; legal and expected |
-| `shm_kick_during_pending_callback` | `kick` was set while a callback was unacknowledged | The deferral path's precondition, not its failure |
+| `shm_kick_during_pending_callback` | `kick` was set while a callback was unacknowledged. On the `poll` side this needs a race, not a call order: `poll` only reaches the kick when `try_receive()` came back empty and `arm_data_wait()` then returned `Ok(false)` because data or a generation change landed before the arm's recheck (`lib.rs:1176-1182`, `:1227-1235`, `ring.rs:840-852`) | The deferral path's precondition, not its failure |
 
 Do not add `sometimes(wake_was_lost)` or `always(!wake_was_lost)` paired with
 it; a lost-wake marker can only fire by observing the defect. The oracle is

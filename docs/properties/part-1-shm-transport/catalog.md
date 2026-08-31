@@ -3385,7 +3385,9 @@ arm is every cross-process attach (`ring_child_exchange`,
 `Ring::attach` call.
 Guarantee: `Ring::attach` accepts a doorbell descriptor only when it is a live
 nonblocking eventfd, and rejects anything else as `DoorbellFailed` before the
-ring is usable.
+ring is usable. Attach-time only: this says nothing about whether the
+descriptor stays nonblocking afterwards, which holds only for a peer that does
+not mutate the shared file-status flags (see Open questions).
 Check: `always` — at every successful attach, both doorbell descriptors carry
 `O_NONBLOCK` in `F_GETFL` and readlink to `anon_inode:[eventfd]`
 (`ring.rs:397-409`). `always` because the property must hold at every
@@ -3395,13 +3397,21 @@ Fault/timing angle: none at the gate itself. The consequence of a miss is
 timing-shaped: `signal` and `drain` (`ring.rs:416-448`) rely on `EAGAIN` for
 their sparse semantics, so a blocking descriptor converts the first empty
 `drain` (`arm_data_wait`, `:846`) into an unbounded block on the bridge or
-reactor thread.
+reactor thread. The same harm is reachable after a passing gate if a peer
+clears `O_NONBLOCK` on the shared open file description; that window is a
+separate uncovered gap, recorded under Open questions.
 Required faults and enabling state: a peer transferring a non-conforming
 descriptor in a doorbell slot of the setup handshake — fault class F15
 (doorbell fd substitution). No shared state needs preparation.
 Confidence: high — [evidence](evidence/attach-validates-doorbell-eventfds.md).
-Both gate predicates, both attach call sites, and the absence of any
-post-attach `F_SETFL` were read directly.
+Both gate predicates and both attach call sites were read directly. High
+confidence in the attach-time claim only: the guarantee is scoped to the moment
+of attach and does not extend past it, because `O_NONBLOCK` lives in the open
+file description that `SCM_RIGHTS` shares with the sender
+(`setup_socket.rs:149`, `:215-227`), so a peer holding the other descriptor can
+clear it with `F_SETFL` after the gate passes. The earlier reading of "no
+post-attach `F_SETFL`" was an in-crate search and could not establish that
+cross-process property.
 Existing check: `doorbell_attachment_requires_nonblocking_eventfd`
 (`ring.rs:2248-2270`), unit-level against `Doorbell::from_fd` directly; status
 unaudited.
@@ -3413,6 +3423,15 @@ Open questions:
 - The identity half of the gate depends on `/proc/self/fd`; it fails closed
   elsewhere, which couples doorbell attach to Linux. Is that intended for the
   macOS ring path? (needs human input)
+- The post-attach mutation window is uncovered. A peer that clears `O_NONBLOCK`
+  on the shared open file description after attach reinstates the unbounded
+  block this gate exists to prevent, since `drain` (`ring.rs:430-448`) only
+  distinguishes `EAGAIN` and both callers drain when the eventfd is expected to
+  be empty and unguarded by a `poll` (`:846`, `:861`). No record owns that
+  window and no test constructs it. Queue discovery: is the durable fix a
+  re-check of `F_GETFL` before each blocking-capable read, a `poll`-guarded
+  `drain`, or accepting the exposure and scoping the guarantee to a
+  non-mutating peer? (needs human input)
 
 ### wake-published-during-readiness-callback-is-not-lost
 
@@ -3522,9 +3541,18 @@ registered wake signals that wake's eventfd (`client.rs:1711-1725`), and a
 bridge parked in the charge loop observes it on its next poll (`:1879-1901`).
 `always` because the drop-side signal is unconditional given a registered
 wake; the bounded window is one poll wakeup plus one loop iteration. Harness
-proxy: per-write completion within an explicit wall-clock deadline with the
-delivered signal count pinned by the test, since loop passes are not
-externally observable.
+proxy: **receipt of the pending inbound frame** on the bridge's read channel
+within an explicit wall-clock deadline of the `ByteCharge` drop, since loop
+passes are not externally observable. Per-write completion is **not** a valid
+proxy: the loop services `write_rx` at `:1847-1859` *before* it reaches
+`try_recv_with(charge)` at `:1903`, so a write submitted before the park
+completes and reports success while the bridge then parks indefinitely and the
+inbound frame is never admitted — a false pass on exactly the wedge this record
+exists to catch. The test must also account for the other writers of the same
+descriptor: `worker_wake` is signalled by `ByteCharge::drop` (`:1722`),
+`RingWriteSender::try_send` (`:1766`), and `RingWriteSender::drop` (`:1773`), so
+outbound traffic has to be quiesced for the observed resumption to be
+attributable to the charge release rather than merely counted.
 Fault/timing angle: signal-before-park — the drop can land between the failed
 `charge` attempt and the bridge's `poll`. The eventfd absorbs it: the write
 leaves the counter readable, so the later poll returns immediately. No
@@ -3687,7 +3715,13 @@ pass. One documented exception exists: a `wait_until_handled` *error* fires a
 final non-gated callback and terminates the thread (`:184-189`).
 Required faults and enabling state: doorbell or kick edges concurrent with an
 unacknowledged callback — one in-flight callback plus a publisher or a
-`poll`-side `kick` (`lib.rs:1226-1235`). Enabling situation
+`poll`-side `kick` (`lib.rs:1227-1235`). The `poll`-side kick is a race, not a
+call order: `poll` consumes any visible frame at `try_receive()`
+(`lib.rs:1176-1182`) and delivers it, skipping the kick arm entirely, so the
+kick is reached only when the receive came back empty and `arm_data_wait()` then
+returned `Ok(false)` because data or a generation change landed before its
+recheck (`ring.rs:840-852`). A test needs a concurrent publication or a
+scheduling seam holding that window open. Enabling situation
 `shm_kick_during_pending_callback`.
 Confidence: high —
 [evidence](evidence/reactor-callback-is-one-in-flight.md). The CAS, the wait,
