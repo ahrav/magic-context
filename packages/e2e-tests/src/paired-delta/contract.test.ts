@@ -91,6 +91,37 @@ describe("paired-delta scenario contract", () => {
         ).not.toThrow();
     });
 
+    it("rejects an answer that collides with the claim-id prefix", () => {
+        for (const expectedAnswer of ["mcm", "mcm_", "cm"]) {
+            expect(() =>
+                parseScenarioDeclaration(scenario({ expectedAnswer })),
+            ).toThrow(/expectedAnswer: collides-with-claim-id-prefix/);
+        }
+    });
+
+    it("treats an internal decimal point as part of a numeric value", () => {
+        const base = scenario();
+        const withEvidence = (content: string): Partial<ScenarioDeclaration> => ({
+            expectedAnswer: "47",
+            answerMatch: "case-insensitive",
+            turnScript: [
+                { id: "turn-evidence", role: "user", content },
+                ...base.turnScript.slice(1),
+            ],
+            interventions: {
+                ...base.interventions,
+                r2: { memories: [{ claim: content, evidence: content }] },
+                r3: { evidence: content },
+            },
+        });
+        expect(() =>
+            parseScenarioDeclaration(scenario(withEvidence("The ratio is 47.5 exactly."))),
+        ).toThrow(/answer-absent/);
+        expect(() =>
+            parseScenarioDeclaration(scenario(withEvidence("The target is 47."))),
+        ).not.toThrow();
+    });
+
     it("requires the gold answer as a complete value, not a substring", () => {
         const base = scenario();
         /** `alpha-17` inside `alpha-170` must not count as gold. commentlint: allow(JUDGE) */
