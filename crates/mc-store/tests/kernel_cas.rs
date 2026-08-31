@@ -555,3 +555,129 @@ fn reopen_reclaims_stale_temps() {
     let _store = KernelStore::open(root.path()).unwrap();
     assert!(!stale.exists());
 }
+
+fn staged_entries(root: &std::path::Path) -> usize {
+    fs::read_dir(root.join("artifacts/tmp")).unwrap().count()
+}
+
+fn published_objects(root: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut pending = vec![root.join("artifacts/objects")];
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            } else {
+                names.push(entry.file_name().into_string().unwrap());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+fn reservation_count(root: &std::path::Path) -> i64 {
+    Connection::open(root.join("core.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_ingestion_reservations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn repeated_fence_loss_stages_no_surviving_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    store.invalidate_writer_fence_for_test().unwrap();
+
+    for attempt in 0..3 {
+        let error = store
+            .ingest_artifact(request(&format!("fence-{attempt}"), vec![b'p'; 4 * 1024]))
+            .unwrap_err();
+        assert_eq!(error.kind(), ArtifactErrorKind::ReferenceCommit);
+    }
+
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+}
+
+#[test]
+fn replayed_intent_returns_the_committed_reference() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"replayed payload".to_vec();
+
+    let first = store
+        .ingest_artifact(request("replay", payload.clone()))
+        .unwrap();
+    let second = store.ingest_artifact(request("replay", payload)).unwrap();
+
+    assert_eq!(second.digest, first.digest);
+    assert_eq!(second.evidence_id, first.evidence_id);
+    assert_eq!(
+        store.read_artifact(&second).unwrap(),
+        b"replayed payload".to_vec()
+    );
+    assert_eq!(published_objects(root.path()).len(), 1);
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(reservation_count(root.path()), 0);
+}
+
+#[test]
+fn replayed_intent_over_different_bytes_publishes_no_unreferenced_object() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let pinned = format!("{:x}", Sha256::digest(b"pinned-request"));
+
+    let mut first = request("replay-mismatch", b"committed bytes".to_vec());
+    first.intent.request_digest = pinned.clone();
+    let handle = store.ingest_artifact(first).unwrap();
+    let published = published_objects(root.path());
+
+    let mut second = request("replay-mismatch", b"divergent bytes".to_vec());
+    second.intent.request_digest = pinned;
+    second.evidence_id = "evidence-replay-divergent".to_string();
+    second.object_id = "evidence-object-replay-divergent".to_string();
+    let error = store.ingest_artifact(second).unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::InvalidInput);
+    assert_eq!(published_objects(root.path()), published);
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(reservation_count(root.path()), 0);
+    assert_eq!(
+        store.read_artifact(&handle).unwrap(),
+        b"committed bytes".to_vec()
+    );
+}
+
+#[test]
+fn invalidated_classification_still_restricts_re_admission_of_identical_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let payload = b"classified by assertion".to_vec();
+
+    let mut asserted = request("classified", payload.clone());
+    asserted.asserted_sensitivity = Sensitivity::Secret;
+    let first = store.ingest_artifact(asserted).unwrap();
+    invalidate_evidence(root.path(), &first.evidence_id);
+
+    let mut relaxed = request("reclassified", payload);
+    relaxed.asserted_sensitivity = Sensitivity::Normal;
+    let second = store.ingest_artifact(relaxed).unwrap();
+
+    assert_eq!(second.digest, first.digest);
+    assert_eq!(
+        store
+            .artifact_eligibility(&second, ArtifactDestination::Local)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::Secret)
+    );
+}

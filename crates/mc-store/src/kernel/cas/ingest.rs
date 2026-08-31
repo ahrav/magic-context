@@ -12,7 +12,7 @@ use super::{
     MAX_PAYLOAD_BYTES,
 };
 use crate::kernel::durable_fs::{
-    create_new_file, durable_unlink, open_or_create_secure_directory,
+    classify_io, create_new_file, durable_unlink, open_or_create_secure_directory,
     publish_noreplace_between_locked, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
 use crate::kernel::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
@@ -21,6 +21,26 @@ use crate::kernel::redaction::{record, redact, RedactedField};
 use crate::kernel::{KernelError, KernelStore, Sensitivity};
 
 const RESERVATION_MS: i64 = 60 * 60 * 1_000;
+
+struct StagedObject<'a> {
+    directory: &'a File,
+    name: &'a str,
+    consumed: bool,
+}
+
+impl StagedObject<'_> {
+    fn consume(&mut self) {
+        self.consumed = true;
+    }
+}
+
+impl Drop for StagedObject<'_> {
+    fn drop(&mut self) {
+        if !self.consumed {
+            let _ = durable_unlink(self.directory, self.name);
+        }
+    }
+}
 
 struct PreparedArtifact {
     request: ArtifactIngestRequest,
@@ -69,6 +89,9 @@ impl PreparedArtifact {
         let affirmative_provenance = request.provenance.as_ref().is_some_and(|provenance| {
             !provenance.repository_id.trim().is_empty() && !provenance.revision.trim().is_empty()
         });
+        if bytes.len() > MAX_PAYLOAD_BYTES {
+            return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
+        }
         let sensitivity = if !payload_redaction.detections.is_empty() {
             Sensitivity::Secret
         } else if !inspected {
@@ -131,8 +154,6 @@ impl KernelStore {
         let byte_length = u64::try_from(prepared.bytes.len())
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::InvalidInput))?;
 
-        self.check_budget(&prepared.digest, byte_length)?;
-
         let artifacts = File::open(&self.artifacts_path)
             .map_err(|_| self.fail_storage(ArtifactErrorKind::IngestionFailClosed))?;
         let tmp = open_or_create_secure_directory(&artifacts, "tmp")
@@ -142,22 +163,20 @@ impl KernelStore {
         let temp_name = temp_name("artifact");
         let mut temp =
             create_new_file(&tmp, &temp_name).map_err(|error| self.map_storage_error(error))?;
+        let mut staged = StagedObject {
+            directory: &tmp,
+            name: &temp_name,
+            consumed: false,
+        };
         if let Err(error) = write_and_sync(&mut temp, &prepared.bytes) {
-            let mapped = self.map_storage_error(error);
-            let _ =
-                durable_unlink(&tmp, &temp_name).map_err(|cleanup| self.map_storage_error(cleanup));
-            return Err(mapped);
+            return Err(self.map_storage_error(error));
         }
         drop(temp);
 
         let mut writer = self
             .lock_writer()
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-        if let Err(error) = self.check_budget(&prepared.digest, byte_length) {
-            let _ =
-                durable_unlink(&tmp, &temp_name).map_err(|cleanup| self.map_storage_error(cleanup));
-            return Err(error);
-        }
+        self.check_budget(&prepared.digest, byte_length)?;
         let shard = open_or_create_secure_directory(&objects, &prepared.digest[..2])
             .map_err(|error| self.map_storage_error(error))?;
         let now = current_time_ms();
@@ -176,8 +195,6 @@ impl KernelStore {
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?
         {
             drop(reservation);
-            let _ =
-                durable_unlink(&tmp, &temp_name).map_err(|cleanup| self.map_storage_error(cleanup));
             return Err(ArtifactError::for_digest(
                 ArtifactErrorKind::ReAdmissionBlocked,
                 &prepared.digest,
@@ -207,20 +224,22 @@ impl KernelStore {
         let publish =
             publish_noreplace_between_locked(&tmp, &temp_name, &shard, &prepared.digest[2..]);
         let published_new = match publish {
-            Ok(PublishOutcome::Published) => true,
+            Ok(PublishOutcome::Published) => {
+                staged.consume();
+                true
+            }
             Ok(PublishOutcome::AlreadyExists) => {
                 if let Err(error) = durable_unlink(&tmp, &temp_name) {
                     let mapped = self.map_storage_error(error);
                     self.release_reservation(&mut writer, &reservation_id);
                     return Err(mapped);
                 }
+                staged.consume();
                 false
             }
             Err(error) => {
                 let mapped = self.map_storage_error(error);
                 self.release_reservation(&mut writer, &reservation_id);
-                let _ = durable_unlink(&tmp, &temp_name)
-                    .map_err(|cleanup| self.map_storage_error(cleanup));
                 return Err(mapped);
             }
         };
@@ -265,15 +284,40 @@ impl KernelStore {
             fault_after_events,
         );
         match commit_result {
-            Ok(receipt) => {
-                if receipt.replayed {
-                    self.release_reservation(&mut writer, &reservation_id);
+            Ok(receipt) if receipt.replayed => {
+                let committed = committed_digest(&mut writer, &receipt.result);
+                match committed {
+                    Ok(Some(digest)) if digest == prepared.digest => {
+                        self.release_reservation(&mut writer, &reservation_id);
+                        Ok(ArtifactHandle {
+                            digest: prepared.digest,
+                            evidence_id: receipt.result,
+                        })
+                    }
+                    Ok(_) => {
+                        self.cleanup_failed_reference(
+                            &mut writer,
+                            &reservation_id,
+                            &prepared.digest,
+                            published_new,
+                        );
+                        Err(ArtifactError::new(ArtifactErrorKind::InvalidInput))
+                    }
+                    Err(error) => {
+                        self.cleanup_failed_reference(
+                            &mut writer,
+                            &reservation_id,
+                            &prepared.digest,
+                            published_new,
+                        );
+                        Err(error)
+                    }
                 }
-                Ok(ArtifactHandle {
-                    digest: prepared.digest,
-                    evidence_id: redact(&prepared.request.evidence_id).text,
-                })
             }
+            Ok(_) => Ok(ArtifactHandle {
+                digest: prepared.digest,
+                evidence_id: redact(&prepared.request.evidence_id).text,
+            }),
             Err(_) => {
                 self.cleanup_failed_reference(
                     &mut writer,
@@ -287,7 +331,8 @@ impl KernelStore {
     }
 
     fn check_budget(&self, digest: &str, byte_length: u64) -> Result<(), ArtifactError> {
-        let usage = current_usage(&self.artifacts_path)?;
+        let usage = regular_file_bytes(&self.artifacts_path.join("objects"))
+            .map_err(|error| self.map_storage_error(error))?;
         let already_present = fs::symlink_metadata(self.artifact_object_path(digest))
             .is_ok_and(|metadata| metadata.file_type().is_file());
         let projected = usage.saturating_add(if already_present { 0 } else { byte_length });
@@ -418,7 +463,7 @@ fn insert_reference(
         .tx
         .prepare(
             "SELECT sensitivity_class,provider_egress_class FROM evidence_meta
-             WHERE artifact_digest=?1 AND invalidated_commit_seq IS NULL",
+             WHERE artifact_digest=?1",
         )
         .map_err(|_| KernelError::Io)?;
     let rows = statement
@@ -488,8 +533,8 @@ fn insert_reference(
                 retention_class.text,
                 prepared.request.retain_until,
                 first_detection.map(|_| "secret_redaction"),
-                first_detection.map(|detection| detection.detector_id),
-                prepared.redaction_metadata,
+                None::<&str>,
+                first_detection.map(|_| prepared.redaction_metadata.as_slice()),
                 first_detection.map(|detection| detection.detector_id),
                 first_detection.map(|detection| detection.secret_type.as_str()),
                 first_detection
@@ -567,6 +612,20 @@ fn insert_reference(
     Ok(evidence_id.text)
 }
 
+fn committed_digest(
+    writer: &mut Connection,
+    evidence_id: &str,
+) -> Result<Option<String>, ArtifactError> {
+    writer
+        .query_row(
+            "SELECT artifact_digest FROM evidence_meta WHERE evidence_id=?1",
+            [evidence_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))
+}
+
 fn artifact_is_blocked(
     connection: &rusqlite::Transaction<'_>,
     digest: &str,
@@ -593,18 +652,12 @@ fn verify_object(path: &std::path::Path, digest: &str) -> Result<(), ArtifactErr
     Ok(())
 }
 
-fn current_usage(artifacts_path: &std::path::Path) -> Result<u64, ArtifactError> {
-    regular_file_bytes(&artifacts_path.join("objects"))
-}
-
-fn regular_file_bytes(directory: &std::path::Path) -> Result<u64, ArtifactError> {
+fn regular_file_bytes(directory: &std::path::Path) -> Result<u64, StorageError> {
     let mut bytes = 0_u64;
-    let entries = fs::read_dir(directory)
-        .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+    let entries = fs::read_dir(directory).map_err(classify_io)?;
     for entry in entries {
-        let entry = entry.map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+        let entry = entry.map_err(classify_io)?;
+        let metadata = entry.metadata().map_err(classify_io)?;
         if metadata.file_type().is_file() {
             bytes = bytes.saturating_add(metadata.len());
         } else if metadata.file_type().is_dir() {
