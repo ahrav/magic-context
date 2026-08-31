@@ -161,8 +161,10 @@ function writeConfigs(
     const pluginSpec = `file://${pluginEntry}`;
     const extra = opts.openCodeConfigExtra ?? {};
     const contributedProviders = extra.provider;
-    /** Everything in `openCodeConfigExtra` is written into the config an unauthenticated serve reads, not just the provider map, so an MCP `Authorization` header would sit behind the same remotely reachable API. commentlint: allow(JUDGE) */
-    assertConfigHasNoCredentials(extra);
+    /** Every caller-supplied config channel is written to disk beside the others, and all three are `Record<string, unknown>` — an easy mix-up — so each is guarded rather than only the one an unauthenticated serve reads. commentlint: allow(JUDGE) */
+    assertConfigHasNoCredentials(extra, "openCodeConfigExtra");
+    assertConfigHasNoCredentials(opts.magicContextConfig, "magicContextConfig");
+    assertConfigHasNoCredentials(opts.projectMagicContextConfig, "projectMagicContextConfig");
     const extraWithoutProvider = { ...extra };
     delete extraWithoutProvider.provider;
 
@@ -262,7 +264,7 @@ function writeConfigs(
  * `opencode.json` — `extraEnv` remains the only channel that is governed by shape rather
  * than by recognition.
  */
-function assertConfigHasNoCredentials(value: unknown): void {
+function assertConfigHasNoCredentials(value: unknown, label: string): void {
     const seen = new WeakSet<object>();
     const visit = (current: unknown, path: string): void => {
         if (current === null || typeof current !== "object" || seen.has(current)) return;
@@ -287,7 +289,7 @@ function assertConfigHasNoCredentials(value: unknown): void {
             visit(child, childPath);
         }
     };
-    visit(value, "openCodeConfigExtra");
+    visit(value, label);
 }
 
 /**

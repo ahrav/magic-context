@@ -118,8 +118,10 @@ describe("oracle arm presets", () => {
             readFileSync(join(opencode.env.configDir, "opencode.json"), "utf8"),
         ) as { provider?: Record<string, unknown> };
 
+        // The exact key set, not just two lookups: the contributed provider is
+        // merged beside the generated mock, and a stray third entry is a leak.
+        expect(Object.keys(config.provider ?? {}).sort()).toEqual(["anthropic", "mock-anthropic"]);
         expect(config.provider?.anthropic).toEqual(providerBlock.anthropic);
-        expect(config.provider?.["mock-anthropic"]).toBeDefined();
         expect(mock.requests()).toHaveLength(0);
     }, 120_000);
 

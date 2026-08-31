@@ -325,7 +325,13 @@ export class FileRolloutStore implements RolloutStore {
 
     list(): RolloutRecord[] {
         this.acquire();
-        return [...this.load()];
+        try {
+            return [...this.load()];
+        } catch (error) {
+            /** A records file this store cannot parse leaves nothing to release the claim: the run throws, and only an explicit `release()` — which the caller never reaches — would free the path for the corrected retry. commentlint: allow(JUDGE) */
+            this.release();
+            throw error;
+        }
     }
 
     /** Removes this process's claim on the records path. Safe to call when no lock is held. commentlint: allow(JUDGE) */
@@ -772,6 +778,7 @@ export async function runPairedDelta(
                         coordinateResult.regret = computeRegretRungs(
                             scenario,
                             coordinateResult.cells,
+                            fingerprint,
                         );
                         coordinates.push(coordinateResult);
                         break outer;
@@ -780,7 +787,11 @@ export async function runPairedDelta(
                     if (rung === null) coordinateResult.incomplete = true;
                     if (rung?.cell.runHealth !== "completed") break;
                 }
-                coordinateResult.regret = computeRegretRungs(scenario, coordinateResult.cells);
+                coordinateResult.regret = computeRegretRungs(
+                    scenario,
+                    coordinateResult.cells,
+                    fingerprint,
+                );
             }
             coordinateResult.incomplete ||= PRIMARY_ARM_IDS.some(
                 (armId) => coordinateResult.cells[armId]?.cell.runHealth !== "completed",
@@ -794,7 +805,8 @@ export async function runPairedDelta(
         if (reclaimed.some((ok) => !ok)) status = "harness-unreclaimed";
     }
 
-    if (status === "completed" && invalidStoredCoordinates.length > 0) {
+    /** A cap or deadline stop invites a resume; unusable stored records forbid one until the file is inspected, so the stronger warning wins. An unreclaimed harness outranks both, because a live process has to be dealt with before anything is rerun. commentlint: allow(JUDGE) */
+    if (status !== "harness-unreclaimed" && invalidStoredCoordinates.length > 0) {
         status = "invalid-stored-records";
     }
 
@@ -1033,11 +1045,13 @@ function failedRecord(
 export function computeRegretRungs(
     scenario: ScenarioDeclaration,
     records: Partial<Record<ArmId, RolloutRecord>>,
+    /** The run computes this once per scenario; recomputing it hashes the whole turn script again on every coordinate whose ladder fires. commentlint: allow(JUDGE) */
+    scriptFingerprint = baseScriptFingerprint(scenario),
 ): RegretRungs {
     const completed = REGRET_ARM_IDS.map((armId) => records[armId]).filter(
         (record): record is RolloutRecord => record?.cell.runHealth === "completed",
     );
-    const expectedFingerprint = baseScriptFingerprint(scenario);
+    const expectedFingerprint = scriptFingerprint;
     if (completed.some(({ baseScriptFingerprint }) =>
         baseScriptFingerprint !== expectedFingerprint)) {
         return { refusedReason: "base-fingerprint-mismatch" };

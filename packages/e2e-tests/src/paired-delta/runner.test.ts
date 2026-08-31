@@ -923,6 +923,50 @@ describe("paired-delta runner", () => {
         expect(events).not.toContain("create:compaction");
     });
 
+    it("keeps the unusable-records warning over a later cap stop", async () => {
+        const store = new MemoryStore();
+        const first = await runPairedDelta(options(store), dependencies());
+        const stale = store.records.find(({ armId }) => armId === "mc-on");
+        if (!stale || first.records.length !== 3) throw new Error("missing fixture records");
+        stale.echoedModelId = "another-snapshot";
+        // Two coordinates: the first is blocked by the stale record, the second
+        // must then hit the cap.
+        const spent = store.records.reduce((sum, { costUsd }) => sum + costUsd, 0);
+
+        const result = await runPairedDelta(
+            {
+                ...options(store),
+                scenarios: [scenario, { ...scenario, scenarioId: "var-runner-second" }],
+                maxCostUsd: spent,
+            },
+            dependencies(),
+        );
+
+        // A cap stop invites a resume; unusable records forbid one until the file
+        // is inspected, so the stronger warning has to survive.
+        expect(result.invalidStoredCoordinates.length).toBeGreaterThan(0);
+        expect(result.status).toBe("invalid-stored-records");
+    });
+
+    it("releases the records path when the file cannot be parsed", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-unparseable-"));
+        try {
+            const path = join(root, "records.json");
+            writeFileSync(path, JSON.stringify([{ schema: "other/v1" }]));
+
+            expect(() => new FileRolloutStore(path).list()).toThrow(/schema-mismatch/);
+            // The failed claim must not wedge the corrected retry.
+            expect(() => new FileRolloutStore(path).list()).toThrow(/schema-mismatch/);
+
+            writeFileSync(path, JSON.stringify([]));
+            const store = new FileRolloutStore(path);
+            expect(store.list()).toEqual([]);
+            store.release();
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it("classifies a malformed check vector as an exclusion and continues", async () => {
         const result = await runPairedDelta(
             options(),

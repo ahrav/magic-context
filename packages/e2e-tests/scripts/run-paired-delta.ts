@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 
 import { readFileSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import { relative, resolve, sep } from "node:path";
+import { isWithin } from "../../plugin/src/features/magic-context/memory/verification-paths";
 import {
     FileRolloutStore,
     ProviderUnavailableError,
@@ -64,15 +65,13 @@ function parseArgs(argv: string[]): CliArgs {
     return { recordsPath: resolve(recordsPath), resume, maxCostUsd, deadlineMinutes };
 }
 
-/** Returns the worktree-relative path, or null when the target sits outside the worktree and cannot appear in its status. commentlint: allow(JUDGE) */
+/** Returns the worktree-relative POSIX path, or null when the target sits outside the worktree and cannot appear in its status. `isWithin` owns the boundary test, which several e2e modules already share. commentlint: allow(JUDGE) */
 function relativeTo(root: string, target: string): string | null {
     const rooted = resolve(root);
     const path = resolve(target);
-    if (path === rooted) return null;
-    /** `resolve` returns the platform's separator, while a git pathspec always takes `/`. commentlint: allow(JUDGE) */
-    const prefix = rooted.endsWith(sep) ? rooted : `${rooted}${sep}`;
-    if (!path.startsWith(prefix)) return null;
-    return path.slice(prefix.length).split(sep).join("/");
+    if (path === rooted || !isWithin(rooted, path)) return null;
+    /** `relative` returns the platform separator, while a git pathspec always takes `/`. commentlint: allow(JUDGE) */
+    return relative(rooted, path).split(sep).join("/");
 }
 
 /** A resume must not skip coordinates recorded by a different checkout: `bindingMatches` compares `repoCommit`, so a constant would let a post-change smoke report success without executing the changed code. commentlint: allow(JUDGE) */

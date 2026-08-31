@@ -189,6 +189,21 @@ describe("opencode child lifecycle", () => {
                 expect(attempt).toThrow(new RegExp(`a ${format} value at .*x-trace`));
                 expect(attempt).not.toThrow(new RegExp(value.slice(0, 12)));
             }
+            // The sibling config channels are written to disk beside opencode.json,
+            // and confusing them for `openCodeConfigExtra` is easy.
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                    magicContextConfig: { embedding: { apiKey: "sk-live" } },
+                })
+            ).toThrow(/credential-shaped key: magicContextConfig\.embedding\.apiKey/);
+            expect(() =>
+                __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
+                    mockProviderURL: "http://127.0.0.1:4321",
+                    projectMagicContextConfig: { hook: { token: "Bearer sk-live-abcdefghij" } },
+                })
+            ).toThrow(/projectMagicContextConfig\.hook\.token/);
+
             // An ordinary header value still passes.
             expect(() =>
                 __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {
