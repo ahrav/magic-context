@@ -171,13 +171,9 @@ describe("credentialValueFormat", () => {
         expect(credentialValueFormat("Bearer sk-live-abcdefghij")).toBe(
             "HTTP authorization scheme",
         );
-        expect(credentialValueFormat("sk-ant-abcdefghijklmnopqrstuv")).toBe(
-            "Anthropic-style key",
-        );
+        expect(credentialValueFormat("sk-ant-abcdefghijklmnopqrstuv")).toBe("Anthropic-style key");
         expect(credentialValueFormat("ghp_abcdefghijklmnopqrstuvwxyz012345")).toBe("GitHub token");
-        expect(credentialValueFormat("postgres://user:pw@host/db")).toBe(
-            "credential-bearing URI",
-        );
+        expect(credentialValueFormat("postgres://user:pw@host/db")).toBe("credential-bearing URI");
         // The password-only shape, whose username segment is empty.
         expect(credentialValueFormat("redis://:supersecret@cache.internal:6379")).toBe(
             "credential-bearing URI",

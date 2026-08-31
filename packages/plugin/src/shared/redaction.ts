@@ -200,8 +200,8 @@ export function isCredentialBearingConfigKey(key: string): boolean {
         if (qualifier !== undefined) return !STRUCTURAL_KEY_QUALIFIERS.includes(qualifier);
         // A glued name has no segment to read, so the qualifier is matched against the whole
         // word: `hotkey` is a keystroke, `apikey` is a credential.
-        return !STRUCTURAL_KEY_QUALIFIERS.some((word) =>
-            compact === `${word}key` || compact === `${word}keys`
+        return !STRUCTURAL_KEY_QUALIFIERS.some(
+            (word) => compact === `${word}key` || compact === `${word}keys`,
         );
     }
     if (CREDENTIAL_TAIL_WORDS.some(endsWith)) return true;
