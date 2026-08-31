@@ -144,7 +144,7 @@ fn kernel_schema_has_one_ordered_full_shape() {
 const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
 
 const PINNED_SCHEMA_DIGEST: &str =
-    "374757e1a6f85b86ac47a0a0d4a49ed34fb721af215036aaf62c15773ec68c8c";
+    "712b1c7afa34647e01619e4fd633e48a041e710986b5dc3a9aca48e8cf8c33da";
 
 #[test]
 fn cas_control_tables_and_lookup_indexes_are_frozen() {
@@ -441,6 +441,15 @@ fn cas_control_rows_preserve_reclaim_purge_and_backfill_state() {
         .is_err());
     assert!(conn
         .execute(
+            "INSERT INTO artifact_ingestion_reservations(
+                 reservation_id,artifact_digest,artifact_reference,state,writer_epoch,
+                 created_at,heartbeat_at,lease_expires_at
+             ) VALUES ('revive-purged','digest','fresh-ref','Live',7,9,9,10)",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
             "UPDATE artifact_pending_unlinks SET artifact_reference='retargeted'
              WHERE artifact_digest='digest'",
             [],
@@ -475,6 +484,17 @@ fn plain_delete_backfill_barrier_does_not_require_a_purge_tombstone() {
         )
         .unwrap(),
         0
+    );
+
+    assert!(
+        conn.execute(
+            "INSERT INTO artifact_purge_tombstones(
+                 artifact_digest,artifact_reference,operator_id,reason,purged_at,commit_seq
+             ) VALUES ('plain-digest','other-ref','operator-1','secret',3,?1)",
+            [commit_seq],
+        )
+        .is_err(),
+        "a tombstone must match the open barrier reference"
     );
 
     assert!(
