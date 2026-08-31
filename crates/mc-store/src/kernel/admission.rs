@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "b135222515365d5c83331f224411bb8c9781ec9c9055520db284eb588145be81";
+    "57f00fbb0f1d3c10a3e9395fa8b7f4f319639dbd6f7c06c281112a231635ae73";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -403,6 +403,7 @@ struct PreparedDecision {
     evaluation: Evaluation,
 }
 
+// policy-digest:serving-start
 /// The enclosing query must bind `o` to `object_registry`.
 /// The latest decision about the object itself. An object serves only on
 /// standing it earned, so this is a requirement, not a contribution. A decision
@@ -443,6 +444,8 @@ fn latest_lineage_decision_sql(alias: &str, commit_bound: &str) -> String {
 )"
     )
 }
+
+// policy-digest:serving-end
 
 // policy-digest:authority-start
 /// Each approval may support at most 1,024 distinct subjects.
@@ -1829,6 +1832,7 @@ fn validate_trigger(
     }
 }
 
+// policy-digest:serving-start
 /// Column names for one decision's group in the serving read, so `decided_row`
 /// does not rebuild them per row.
 struct DecidedColumns {
@@ -1841,7 +1845,6 @@ struct DecidedColumns {
     sensitivity_class: &'static str,
     policy_revision: &'static str,
     approval_object_id: &'static str,
-    event_kind: &'static str,
     outcome: &'static str,
 }
 
@@ -1855,7 +1858,6 @@ const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
     sensitivity_class: "d_sensitivity_class",
     policy_revision: "d_policy_revision",
     approval_object_id: "d_approval_object_id",
-    event_kind: "d_event_kind",
     outcome: "d_outcome",
 };
 
@@ -1869,7 +1871,6 @@ const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
     sensitivity_class: "s_sensitivity_class",
     policy_revision: "s_policy_revision",
     approval_object_id: "s_approval_object_id",
-    event_kind: "s_event_kind",
     outcome: "s_outcome",
 };
 
@@ -1881,9 +1882,6 @@ fn decided_row(
     columns: &DecidedColumns,
 ) -> rusqlite::Result<Option<(VisibilityRow, Sensitivity, bool)>> {
     let accepted_decision = row.get::<_, bool>("accepted_decision")?;
-    let event = row
-        .get::<_, Option<String>>(columns.event_kind)?
-        .and_then(|value| EventKind::try_from(value.as_str()).ok());
     // Only a row that granted an elevation claims to have earned it. A denial or a
     // demotion carries forward the level its subject already held, and the approval
     // that justified it lives on the earlier row.
@@ -1934,11 +1932,11 @@ fn decided_row(
         // approval, so a row that names none never earned it.
         (Some(Ok(effective)), Some(Ok(disposition)))
             if historical.is_some_and(|historical| effective.rank() <= historical.rank())
-                && match (source, taint, event) {
-                    (Some(source), Some(taint), Some(event)) => {
+                && match (source, taint) {
+                    (Some(source), Some(taint)) => {
                         effective.rank()
                             <= admission_ceiling(
-                                event,
+                                EventKind::AcceptedAdr,
                                 automatic_ceiling(source, taint),
                                 accepted_decision,
                             )
@@ -1960,6 +1958,7 @@ fn decided_row(
     )))
 }
 
+// policy-digest:serving-end
 impl KernelStore {
     /// Serving reads must use this filtered view; `known_as_of` remains an audit/replay view.
     ///
@@ -1992,7 +1991,6 @@ impl KernelStore {
                             d.policy_revision AS d_policy_revision,
                             d.sensitivity_class AS d_sensitivity_class,
                             d.approval_object_id AS d_approval_object_id,
-                            d.event_kind AS d_event_kind,
                             d.outcome AS d_outcome,
                             s.maturity AS s_maturity,
                             s.effective_maturity AS s_effective_maturity,
@@ -2001,7 +1999,6 @@ impl KernelStore {
                             s.policy_revision AS s_policy_revision,
                             s.sensitivity_class AS s_sensitivity_class,
                             s.approval_object_id AS s_approval_object_id,
-                            s.event_kind AS s_event_kind,
                             s.outcome AS s_outcome,
                             EXISTS(
                                 SELECT 1 FROM decisions ad
@@ -3480,6 +3477,17 @@ mod tests {
 
     #[test]
     fn policy_revision_matches_policy_content() {
+        fn sections<'a>(source: &'a str, start: &str, end: &str) -> Vec<&'a str> {
+            let mut found = Vec::new();
+            let mut rest = source;
+            while let Some((_, tail)) = rest.split_once(start) {
+                let (body, remainder) = tail.split_once(end).expect("unterminated section");
+                found.push(body);
+                rest = remainder;
+            }
+            assert!(!found.is_empty(), "no sections found");
+            found
+        }
         fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
             source
                 .split_once(start)
@@ -3553,6 +3561,15 @@ mod tests {
             "// policy-digest:chain-start",
             "// policy-digest:chain-end",
         ));
+        // How persisted rows are interpreted for serving decides what a binary
+        // claiming this revision will show for the same ledger.
+        for serving in sections(
+            source,
+            "// policy-digest:serving-start",
+            "// policy-digest:serving-end",
+        ) {
+            policy.push_str(serving);
+        }
         let digest = format!("{:x}", Sha256::digest(policy));
         assert_eq!(POLICY_REVISION, 1);
         assert_eq!(digest, REVISION_1_SOURCE_DIGEST);

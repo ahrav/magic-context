@@ -5269,3 +5269,58 @@ fn a_denied_event_does_not_hide_the_authority_it_carried_forward() {
         "a denial must not remove what was visible before it"
     );
 }
+
+#[test]
+fn a_later_event_does_not_strip_an_adrs_self_earned_support() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    assert!(store
+        .visible_as_of(Surface::AutoInject, 1)
+        .unwrap()
+        .rows
+        .iter()
+        .any(|row| row.object.object_id == "approval"));
+
+    // A later ordinary event on the still-live ADR writes a row whose event kind is
+    // not `accepted_adr`, while the support it carries remains legitimate.
+    let observed = store
+        .commit(intent("observe-the-adr"), |envelope| {
+            envelope.insert_admission_observation_for_test(
+                "observation-adr",
+                "code_present",
+                "approval-domain",
+                "fixture",
+                "approval",
+                1,
+            )?;
+            let mut request = subject_request("approval", EventKind::CodeObserved);
+            request.source_class = Some(SourceClass::ExplicitUser);
+            request.taint_class = Some(TaintClass::UserExplicit);
+            request.event.trigger_object_id = Some("observation-adr".to_string());
+            envelope.record_admission(request)?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT event_kind||'/'||effective_maturity||'/'
+                    ||COALESCE(approval_object_id,'NULL')
+             FROM admission_decisions WHERE subject_object_id='approval'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "code_observed/approved/NULL"
+    );
+    assert!(
+        store
+            .visible_as_of(Surface::AutoInject, observed)
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.object.object_id == "approval"),
+        "an ordinary later event must not strip an ADR's self-earned support"
+    );
+}
