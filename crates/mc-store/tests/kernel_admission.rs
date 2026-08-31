@@ -4997,3 +4997,179 @@ fn a_failed_domain_admission_still_cascades_authority_loss() {
         "candidate"
     );
 }
+
+#[test]
+fn a_root_accepted_adr_serves_without_citing_an_approval() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    // `admission_ceiling` lifts an accepted decision to `approved` on its own, so
+    // this row legitimately holds support above the automatic ceiling with no
+    // approval named. Serving must not mistake that for unbacked support.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT effective_maturity||'/'||COALESCE(approval_object_id,'NULL')
+             FROM admission_decisions WHERE subject_object_id='approval'"
+        ),
+        "approved/NULL"
+    );
+    assert!(
+        store
+            .visible_as_of(Surface::AutoInject, 1)
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.object.object_id == "approval"),
+        "a root accepted ADR must still serve"
+    );
+}
+
+#[test]
+fn an_ordinary_lineage_observation_leaves_an_approval_and_its_dependents_alone() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "kept-on-approval");
+    let mut approved = request("kept-on-approval");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("approval".to_string());
+    store
+        .commit(intent("promote-kept"), |envelope| {
+            envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "kept-domain".to_string(),
+                    object_id: "kept-object".to_string(),
+                    name: "name-kept-on-approval".to_string(),
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // A harmless source-scoped observation on the approval's lineage.
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    store
+        .stage_candidate(StagingCandidateSpec {
+            extraction_run_id: "run-benign".to_string(),
+            candidate_id: "benign".to_string(),
+            extractor: "fixture".to_string(),
+            source_kind: "fixture".to_string(),
+            source_id: "approval".to_string(),
+            source_revision: 1,
+            candidate_kind: "domain".to_string(),
+            payload: "name-benign".to_string(),
+            provenance: Some(RepositoryProvenance {
+                repository_id: "repo".to_string(),
+                revision: "abc123".to_string(),
+            }),
+            recorded_at: now,
+            lease_expires_at: now + 60_000,
+        })
+        .unwrap();
+    store
+        .commit(intent("benign-lineage-observation"), |envelope| {
+            envelope.insert_admission_observation_for_test(
+                "observation-benign",
+                "code_present",
+                "approval-domain",
+                "fixture",
+                "approval",
+                1,
+            )?;
+            let mut request = request("benign");
+            request.event.trigger_object_id = Some("observation-benign".to_string());
+            envelope.record_admission(request)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    drop(store);
+
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT disposition||'/'||visibility FROM admission_decisions
+             WHERE subject_object_id IS NULL AND source_id='approval'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "active/automatic"
+    );
+    // The approval kept its authority, so nothing it supported was demoted.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT effective_maturity FROM admission_decisions
+             WHERE subject_object_id='kept-object'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "verified"
+    );
+}
+
+#[test]
+fn a_decision_older_than_its_subject_grants_no_standing() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    insert_subject(
+        &store,
+        "anchor",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    let seq = insert_subject(&store, "late", Sensitivity::Normal, None);
+    drop(store);
+    let created: i64 = {
+        let connection = Connection::open_with_flags(
+            directory.path().join("core.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        connection
+            .query_row(
+                "SELECT created_commit_seq FROM object_registry WHERE object_id='object-late'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert!(created > 1, "the object must be created after commit 1");
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // Correct lineage, correct subject, but recorded before the object existed.
+    connection
+        .execute(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'predates-subject','object-late','fixture','source-late',1,'trusted_local_code',
+                 'current_code','other','verified','verified','active','automatic','admit',
+                 'normal',1,'fixture',1,1
+             )",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    for surface in [Surface::AutoInject, Surface::ExplicitSearch] {
+        assert!(
+            store
+                .visible_as_of(surface, seq)
+                .unwrap()
+                .rows
+                .iter()
+                .all(|row| row.object.object_id != "object-late"),
+            "a decision older than its subject must not stand in for one"
+        );
+    }
+}

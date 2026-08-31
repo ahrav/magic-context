@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "8e779a1442d371aae31a6a106504aca6cdcbd5fc7057aaa1fa2382f50cd5db37";
+    "ca93c59df96ff30d4524370c3256fa1e85a2e685482a0bcc2254ce1a1e59d67c";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -405,7 +405,8 @@ struct PreparedDecision {
 
 /// The enclosing query must bind `o` to `object_registry`.
 /// The latest decision about the object itself. An object serves only on
-/// standing it earned, so this is a requirement, not a contribution.
+/// standing it earned, so this is a requirement, not a contribution. A decision
+/// older than the object cannot be about it, whatever it names.
 fn latest_own_decision_sql(alias: &str, commit_bound: &str) -> String {
     let lineage = same_lineage_as_object(alias);
     format!(
@@ -415,6 +416,7 @@ fn latest_own_decision_sql(alias: &str, commit_bound: &str) -> String {
     WHERE {alias}.subject_object_id=o.object_id
       AND {lineage}
       AND {alias}.commit_seq IS NOT NULL
+      AND {alias}.commit_seq>=o.created_commit_seq
       {commit_bound}
     ORDER BY {alias}.commit_seq DESC,{alias}.admission_decision_id DESC
     LIMIT 1
@@ -503,6 +505,18 @@ fn same_lineage_as_object(alias: &str) -> String {
 
 /// The field set a decision must satisfy to carry approval authority, bound to
 /// one `admission_decisions` alias.
+/// What a lineage decision must look like to leave an object's own standing
+/// intact. It only has to withhold nothing; carrying authority is the own row's
+/// job. `alias` binds it to `admission_decisions`.
+fn non_restrictive_row_fields(alias: &str) -> String {
+    format!(
+        "{alias}.disposition='active'
+   AND {alias}.visibility='automatic'
+   AND {alias}.sensitivity_class='normal'
+   AND {alias}.policy_revision={POLICY_REVISION}"
+    )
+}
+
 fn approval_row_fields(alias: &str) -> String {
     format!(
         "{alias}.taint_class='user_explicit'
@@ -524,7 +538,7 @@ fn approval_qualifies_predicate(object_column: &str) -> String {
     let own = latest_own_decision_sql("own", "");
     let lineage = latest_lineage_decision_sql("lin", "");
     let own_fields = approval_row_fields("a");
-    let lineage_fields = approval_row_fields("l");
+    let lineage_fields = non_restrictive_row_fields("l");
     format!(
         "EXISTS(
              SELECT 1
@@ -798,28 +812,21 @@ impl Envelope<'_> {
         ) {
             return Err(KernelError::AdmissionPolicy);
         }
-        let candidate_id = request.candidate_id.clone();
         let reason = request.event.reason.clone();
-        // Both writes below land a candidate-scoped decision on the lineage, which
-        // can unseat an accepted decision that shares it.
-        self.with_authority_cascade(None, candidate_id.as_deref(), &reason, |envelope| {
-            envelope.admit_domain_candidate_write(request, domain)
-        })
-    }
-
-    fn admit_domain_candidate_write(
-        &mut self,
-        request: AdmissionRequest,
-        domain: AdmissionDomainSpec,
-    ) -> Result<AdmissionDecision, KernelError> {
         let prepared = self.prepare_admission(request)?;
-        if prepared.facts.candidate_id().is_none() {
-            return Err(KernelError::AdmissionPolicy);
-        }
+        let candidate_id = prepared
+            .facts
+            .candidate_id()
+            .ok_or(KernelError::AdmissionPolicy)?
+            .to_string();
         if prepared.evaluation.outcome == Outcome::Deny
             || prepared.evaluation.disposition != Disposition::Active
         {
-            return self.write_admission(prepared, None);
+            // This write materializes nothing, so its decision stays candidate-scoped
+            // and can unseat an accepted decision sharing the lineage.
+            return self.with_authority_cascade(None, Some(&candidate_id), &reason, |envelope| {
+                envelope.write_admission(prepared, None)
+            });
         }
         if prepared.facts.candidate_kind.as_deref() != Some("domain")
             || prepared.facts.candidate_payload.as_deref() != Some(domain.name.as_str())
@@ -1833,6 +1840,7 @@ struct DecidedColumns {
     sensitivity_class: &'static str,
     policy_revision: &'static str,
     approval_object_id: &'static str,
+    event_kind: &'static str,
 }
 
 const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
@@ -1845,6 +1853,7 @@ const OWN_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
     sensitivity_class: "d_sensitivity_class",
     policy_revision: "d_policy_revision",
     approval_object_id: "d_approval_object_id",
+    event_kind: "d_event_kind",
 };
 
 const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
@@ -1857,6 +1866,7 @@ const LINEAGE_DECISION_COLUMNS: DecidedColumns = DecidedColumns {
     sensitivity_class: "s_sensitivity_class",
     policy_revision: "s_policy_revision",
     approval_object_id: "s_approval_object_id",
+    event_kind: "s_event_kind",
 };
 
 /// The strongest surface a single stored decision can justify, its sensitivity
@@ -1866,6 +1876,10 @@ fn decided_row(
     row: &rusqlite::Row<'_>,
     columns: &DecidedColumns,
 ) -> rusqlite::Result<Option<(VisibilityRow, Sensitivity, bool)>> {
+    let accepted_decision = row.get::<_, bool>("accepted_decision")?;
+    let event = row
+        .get::<_, Option<String>>(columns.event_kind)?
+        .and_then(|value| EventKind::try_from(value.as_str()).ok());
     let Some(revision) = row.get::<_, Option<i64>>(columns.policy_revision)? else {
         return Ok(None);
     };
@@ -1909,9 +1923,15 @@ fn decided_row(
         // approval, so a row that names none never earned it.
         (Some(Ok(effective)), Some(Ok(disposition)))
             if historical.is_some_and(|historical| effective.rank() <= historical.rank())
-                && match (source, taint) {
-                    (Some(source), Some(taint)) => {
-                        effective.rank() <= automatic_ceiling(source, taint).rank()
+                && match (source, taint, event) {
+                    (Some(source), Some(taint), Some(event)) => {
+                        effective.rank()
+                            <= admission_ceiling(
+                                event,
+                                automatic_ceiling(source, taint),
+                                accepted_decision,
+                            )
+                            .rank()
                             || approval.is_some()
                     }
                     _ => false,
@@ -1960,13 +1980,21 @@ impl KernelStore {
                             d.policy_revision AS d_policy_revision,
                             d.sensitivity_class AS d_sensitivity_class,
                             d.approval_object_id AS d_approval_object_id,
+                            d.event_kind AS d_event_kind,
                             s.maturity AS s_maturity,
                             s.effective_maturity AS s_effective_maturity,
                             s.disposition AS s_disposition,s.visibility AS s_visibility,
                             s.taint_class AS s_taint_class,s.source_class AS s_source_class,
                             s.policy_revision AS s_policy_revision,
                             s.sensitivity_class AS s_sensitivity_class,
-                            s.approval_object_id AS s_approval_object_id
+                            s.approval_object_id AS s_approval_object_id,
+                            s.event_kind AS s_event_kind,
+                            EXISTS(
+                                SELECT 1 FROM decisions ad
+                                WHERE ad.object_id=o.object_id
+                                  AND ad.decision_kind='adr_accepted'
+                                  AND ad.invalidated_commit_seq IS NULL
+                            ) AS accepted_decision
                      FROM object_registry o
                      JOIN admission_decisions d
                        ON d.admission_decision_id={own}
