@@ -74,6 +74,28 @@ describe("paired-delta scenario contract", () => {
         ).toThrow(/criticalCheckIds: unknown-check/);
     });
 
+    it("requires the gold answer as a complete value, not a substring", () => {
+        const base = scenario();
+        /** `alpha-17` inside `alpha-170` must not count as gold. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                turnScript: [
+                    { id: "turn-evidence", role: "user", content: "Remember ID alpha-170." },
+                    ...base.turnScript.slice(1),
+                ],
+            })),
+        ).toThrow(/evidenceTurnId: answer-absent/);
+        /** A trailing sentence period is not a value character, so it still matches. commentlint: allow(JUDGE) */
+        expect(() =>
+            parseScenarioDeclaration(scenario({
+                turnScript: [
+                    { id: "turn-evidence", role: "user", content: "The ID is alpha-17." },
+                    ...base.turnScript.slice(1),
+                ],
+            })),
+        ).not.toThrow();
+    });
+
     it("requires the gold answer wherever an arm must derive it", () => {
         const base = scenario();
         expect(() =>

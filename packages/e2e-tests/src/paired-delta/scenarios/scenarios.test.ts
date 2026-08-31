@@ -105,6 +105,19 @@ describe("paired-delta authored scenarios", () => {
                     workspacePath: root,
                     scriptedTurnText: scenario.interventions.r1.locatorIds.join(" "),
                 })).toBe(false);
+                /** An empty id degenerates the marker to `id=`, which every rendered memory row contains. commentlint: allow(JUDGE) */
+                expect(r1WireDelivered(scenario, {
+                    armId: "r1",
+                    workspacePath: root,
+                    scriptedTurnText: deliveredWire,
+                    resolvedLocatorIds: resolvedLocatorIds.map(() => ""),
+                })).toBe(false);
+                expect(r1WireDelivered(scenario, {
+                    armId: "r1",
+                    workspacePath: root,
+                    scriptedTurnText: deliveredWire,
+                    resolvedLocatorIds: scenario.interventions.r1.locatorIds,
+                })).toBe(false);
             } finally {
                 rmSync(root, { recursive: true, force: true });
             }

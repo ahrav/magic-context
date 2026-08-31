@@ -1,5 +1,6 @@
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { isValidPublicClaimId } from "../../../../plugin/src/features/magic-context/memory/claim-operation-contract";
 import type { ScenarioDeclaration, VerifierContext } from "../contract";
 
 interface ScenarioSpec {
@@ -19,6 +20,8 @@ export function r1WireDelivered(
     const resolved = context.resolvedLocatorIds ?? [];
     if (resolved.length !== declaration.interventions.r1.locatorIds.length) return false;
     if (new Set(resolved).size !== resolved.length) return false;
+    /** Shape-check each id through the production predicate before searching: an empty or malformed value makes the marker degenerate to `id=`, which every rendered memory row contains, so a broken handle-to-claim mapping would satisfy the gate against unrelated rows. commentlint: allow(JUDGE) */
+    if (!resolved.every((id) => isValidPublicClaimId(id))) return false;
     const wire = context.scriptedTurnText ?? "";
     return resolved.every((id) => wire.includes(`id=${id}`));
 }

@@ -4,7 +4,7 @@
     {
       "scenarioId": "var-compaction-deploy-region",
       "semanticFingerprint": "d6a461d654290d50b6495750574cad71e572ca51e2aba11d615dff1d6e8c559c",
-      "verifierBundleDigest": "e93b3d65476dc8d78c975c5758c10a9f0d950e4db2661205936d44d562d9ed62",
+      "verifierBundleDigest": "7a93d98f0f2b841a99b2d96281c089f4de8a22ee5f3bf75ef64ee2ac9ff2406f",
       "runModes": [
         "calibration",
         "weekly",
@@ -14,7 +14,7 @@
     {
       "scenarioId": "var-compaction-feature-state",
       "semanticFingerprint": "2e4b484658045cd892a9097ab9ac3cc51fb806f4faa376989c1781267bc3223a",
-      "verifierBundleDigest": "379d809820e73d3c84ef0b39b515512ca88c23914f84af4092fcfd4b1755468a",
+      "verifierBundleDigest": "d4f4edd2e1426e2a21ce72ccc2471c97d80b4de5be7b3629a49cacad4bb99633",
       "runModes": [
         "release"
       ]
@@ -22,7 +22,7 @@
     {
       "scenarioId": "var-compaction-schema-version",
       "semanticFingerprint": "89097562d6a7212090ab6d0947b63a4415dd50fe6438ffa0c46c260df8940037",
-      "verifierBundleDigest": "2459660ebc8a5da705d409dbaee5a320112aeae7d9d3680cb5322662efb15dcd",
+      "verifierBundleDigest": "b89f30b1a8f72436b0c0097dafdd931546ea7c363ecf0fca7a650993da491458",
       "runModes": [
         "calibration",
         "weekly",
@@ -32,7 +32,7 @@
     {
       "scenarioId": "var-exact-path",
       "semanticFingerprint": "6a0077fcd33421d3828dace69cf8972aa5f7e5d3515e6821f316d23703603c6b",
-      "verifierBundleDigest": "1d3116f0d2a105af595e184ee426739de92d3204d193b61c5f7b354c920f128a",
+      "verifierBundleDigest": "1c0a08e62b141a0f9d236941f7c46604c6c05b4adccde1908dad210848583745",
       "runModes": [
         "release"
       ]
@@ -40,7 +40,7 @@
     {
       "scenarioId": "var-exact-symbol",
       "semanticFingerprint": "77aa3148c69d4d8d4d0d73152be267ec08b056ac0575447e727bba0c4a1bc59c",
-      "verifierBundleDigest": "e895f60246a374c2ffe7e6b473172364bb5c3d2a0f438e0b653b48bf8073a914",
+      "verifierBundleDigest": "0e2b6db08652ad56ac1aa5015be4a73485287cf884aa42eec1a10b3eb737124c",
       "runModes": [
         "calibration",
         "weekly",
@@ -50,7 +50,7 @@
     {
       "scenarioId": "var-exact-ticket",
       "semanticFingerprint": "d38968661424960965d330074ad62ec5a195b6a7df6c5d347dad52f7af78300f",
-      "verifierBundleDigest": "22478dfabf06b74a3618d8eb02e866d1b728a7eb64b99307a253365c07fe171a",
+      "verifierBundleDigest": "a83014140c8ee610466e11a06e3e7837f09d440b4bf3b75d7a393998329e8e3b",
       "runModes": [
         "release"
       ]
@@ -58,7 +58,7 @@
     {
       "scenarioId": "var-rejected-database",
       "semanticFingerprint": "d31aae1c372f77aee43a695bddfeb06a60c9697507e0385ec3180cde4f0af6d9",
-      "verifierBundleDigest": "21208a4b1ce4b044315f7f909c48bd11e4cbae3a192601c4c11042039af13f5a",
+      "verifierBundleDigest": "448b847f908c8ff9ce3d0bb3850b8500abd4b8d97dd33844a7e9a28de61b4963",
       "runModes": [
         "calibration",
         "weekly",
@@ -68,7 +68,7 @@
     {
       "scenarioId": "var-rejected-queue",
       "semanticFingerprint": "9de1f7fb07596e7bb93c1429d94224d77001ed58ab679d29d914b6cfe0ab9c05",
-      "verifierBundleDigest": "f9ed6ce19a6fc6c090a8d4b9b0a4247037f308f86bf7c2ac02bca2cf7aa3654b",
+      "verifierBundleDigest": "351f7ff1dc9d137c414e620a6c7cede78d2c0240434dabbf2cc0d118f3f6d6b2",
       "runModes": [
         "release"
       ]
@@ -76,7 +76,7 @@
     {
       "scenarioId": "var-superseded-owner",
       "semanticFingerprint": "9d2fc9e533aac36a3c2652f1d2074b7a123d2049dfe0a2b623989bf04f0b0b6f",
-      "verifierBundleDigest": "882c4696d7ad3e88a5dbe901f5415df44c8c7c918a995e89495d235d10d44ba9",
+      "verifierBundleDigest": "173d3a34ab5cf2f3c43aa6a5197e693fdf4026d99c82c2537970373c16146b2e",
       "runModes": [
         "release"
       ]
@@ -84,7 +84,7 @@
     {
       "scenarioId": "var-superseded-timeout",
       "semanticFingerprint": "b62ccb8b0d36879f6d71d9c8b3ef893fd1f7f957c11e7855a029f457fdc2a8b4",
-      "verifierBundleDigest": "e8c3d28457a34c2dfabca02cdcd428d7d8a811954d8c78206069e80688600015",
+      "verifierBundleDigest": "815d7d6ea2e08ffaeceebf0bc7b2ea4f3c7960c03b09fdd15f9b451cbc274483",
       "runModes": [
         "calibration",
         "weekly",

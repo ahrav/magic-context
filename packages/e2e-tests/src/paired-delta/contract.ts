@@ -208,9 +208,18 @@ export function parseScenarioDeclaration(raw: unknown): ScenarioDeclaration {
     if (expectedAnswer !== expectedAnswer.trim()) {
         p.fail("scenario.expectedAnswer: not-trimmed");
     }
-    /** Case-folded for the same reason the query guard is: a model reads `sqlite` and `SQLite` as the same token, so gold supplied in either casing is gold supplied. commentlint: allow(JUDGE) */
-    const answerBearing = (text: string): boolean =>
-        text.toLowerCase().includes(expectedAnswer.toLowerCase());
+    /** Case-folded for the same reason the query guard is, and bounded so the answer counts only as a complete value: an unbounded search accepts `47` inside `147`, letting an arm's intervention carry a different identifier while the gold check passes. `.`, `;`, and `,` are not value characters, so a trailing sentence period still matches. commentlint: allow(JUDGE) */
+    const answerBearing = (text: string): boolean => {
+        const haystack = text.toLowerCase();
+        const needle = expectedAnswer.toLowerCase();
+        const valueChar = /[0-9a-z_-]/;
+        for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
+            const before = at === 0 ? "" : haystack[at - 1]!;
+            const after = haystack[at + needle.length] ?? "";
+            if (!valueChar.test(before) && !valueChar.test(after)) return true;
+        }
+        return false;
+    };
     const r1Query = p.string(r1.query, "scenario.interventions.r1.query");
     /** `scriptedCtxSearchTurn` interpolates the query into the model-visible prompt, so a query containing the expected answer lets R1 pass its critical check with no retrieval. Case-folded because a model reads `sqlite` and `SQLite` as the same token. commentlint: allow(JUDGE) */
     if (r1Query.toLowerCase().includes(expectedAnswer.toLowerCase())) {
