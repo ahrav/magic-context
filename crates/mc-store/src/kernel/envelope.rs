@@ -1038,6 +1038,10 @@ impl RedactedCandidate {
     }
 
     fn has_detections(&self) -> bool {
+        let provenance = self
+            .provenance
+            .iter()
+            .flat_map(|(repository_id, revision)| [repository_id, revision]);
         [
             &self.extraction_run_id,
             &self.candidate_id,
@@ -1048,6 +1052,7 @@ impl RedactedCandidate {
             &self.payload,
         ]
         .into_iter()
+        .chain(provenance)
         .any(|field| !field.detections.is_empty())
     }
 
