@@ -80,7 +80,7 @@ No timing window is involved. The property is a missing check on a synchronous
 path, so it holds or fails deterministically for any attach against a flagged
 object. It depends on `quarantine-authority-survives-peer-writes` only in the
 sense that both assume the flag is trustworthy. Platform framing changed with
-#131: the former Linux-only `/proc`-based descriptor transfer (pre-rewrite
+PR #131: the former Linux-only `/proc`-based descriptor transfer (pre-rewrite
 `ring.rs:497-505`) is gone, and `RingAttachment` (`ring.rs:690-699`) now carries
 already-owned descriptors with no `cfg(target_os)` gate of its own; the
 remaining platform-specific code is confined to object creation and sealing

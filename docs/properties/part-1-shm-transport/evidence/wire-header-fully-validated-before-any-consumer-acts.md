@@ -65,7 +65,7 @@ that order. Nothing between `:498` and `:505` reads payload bytes, so both heade
 gates precede every charge, copy, and dispatch. The obligation was stated in the
 pre-#131 doc comment on `validate_inbound_header` ("Classification uses the
 header alone, BEFORE any body admission", former `frame_channel.rs:53-57`); the
-#131 comment trim reduced that comment (`frame_channel.rs:48-49` at HEAD) and
+PR #131 comment trim reduced that comment (`frame_channel.rs:48-49` at HEAD) and
 the explicit statement is gone — the ordering obligation now rests on the code
 alone. A
 role-invalid type with a large declared body must not hold ingress budget or an

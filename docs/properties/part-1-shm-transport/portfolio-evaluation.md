@@ -293,16 +293,28 @@ Two findings.
    `queued-write-needs-no-second-wake` bounds completion in bridge loop
    passes and `released-charges-wake-blocked-readers` in "one poll wakeup
    plus one loop iteration". Neither passes nor iterations are observable
-   from outside `start_ring_bridge`; the enforceable oracle is the one the
-   existing test already uses, per-write wall-clock completion with the
-   signal count pinned (`client.rs:4069-4075`, 250 ms, zero per-write
-   wakes). The internal bound is the right explanation of *why* the
-   wall-clock bound is safe to assert, but the Check lines should name the
-   harness-visible proxy.
-   *Disposition:* refinement — in both records' Check lines, append: "harness
-   proxy: per-write completion within an explicit wall-clock deadline with
-   the delivered signal count pinned by the test, since loop passes are not
-   externally observable."
+   from outside `start_ring_bridge`, so both Check lines should name a
+   harness-visible proxy. The internal bound is the right explanation of *why*
+   the wall-clock bound is safe to assert. The two records need **different**
+   proxies, because they govern opposite directions: the first is an outbound
+   write-queue drain, the second is inbound read-budget capacity and read-loop
+   resumption (`client.rs:1869-1902`).
+   *Disposition:* refinement — in `queued-write-needs-no-second-wake`'s Check
+   line, append: "harness proxy: per-write completion within an explicit
+   wall-clock deadline with the delivered signal count pinned by the test,
+   since loop passes are not externally observable", which is the oracle its
+   existing test already uses (`client.rs:4069-4075`, 250 ms, zero per-write
+   wakes). In `released-charges-wake-blocked-readers`'s Check line, name
+   **receipt of the pending inbound frame** within an explicit deadline of the
+   `ByteCharge` drop instead. Per-write completion is not a valid proxy there:
+   the loop services `write_rx` (`:1847-1859`) before it reaches
+   `try_recv_with(charge)` (`:1903`), so a write submitted before the park
+   completes and reports success while the bridge parks indefinitely and the
+   frame is never admitted. That record's proxy must also require outbound
+   traffic to be quiesced, since `ByteCharge::drop` (`:1722`),
+   `RingWriteSender::try_send` (`:1766`), and `RingWriteSender::drop` (`:1773`)
+   all signal the same descriptor and a pinned count cannot attribute the
+   resumption to the charge release.
 2. **The loom recommendation understates its own cost** (refinement). The
    open question on `capacity-recheck-after-a-wake-race` and leverage item 1
    in `fault-map.md` present a loom model of `signal_wake` against the arm

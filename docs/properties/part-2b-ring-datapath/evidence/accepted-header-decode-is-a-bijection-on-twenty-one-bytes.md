@@ -68,7 +68,7 @@ callers pass exactly 21 bytes (see the reachability note in `catalog.md`), so th
 trailing-byte case is currently structural rather than live.
 
 **Reachability.** Decode direction: the three production `decode_header` call
-sites, `ring_transport.rs:503`, `ring_transport.rs:729` and `client.rs:1908`.
+sites, `ring_transport.rs:503`, `ring_transport.rs:730` and `client.rs:1978`.
 Encode direction: `EnvelopeHeader::encode` at `wire.rs:205`, reached from
 `encode_owned_frame`, whose `EnvelopeHeader { .. }.encode()` chain is `:584-593`
 with the call at `:593`, and from `encode_split_frame`, whose chain is `:622-631`

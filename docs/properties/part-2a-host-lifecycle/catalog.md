@@ -1356,8 +1356,8 @@ Required faults and enabling state: none.
 Confidence: high — verified directly at authoring time, when of `mc-host`'s 26
 integration binaries CI named four: the library tests, two shared-memory
 suites, one negotiation suite, a macOS soak, one filtered macOS library test,
-and doc tests. The macOS steps were removed with every other macOS job by PR
-#131 (merge `5d638e3e8`), which left `ci.yml` Linux-only. `tests/lifecycle.rs`,
+and doc tests. The macOS steps were removed with every other macOS job by
+PR #131 (merge `5d638e3e8`), which left `ci.yml` Linux-only. `tests/lifecycle.rs`,
 `tests/activation.rs`, and `tests/host_roundtrip.rs` appear in no workflow. The
 only `--test lifecycle` match in the workflows is a different crate's
 `lifecycle_cli`.
@@ -2271,8 +2271,8 @@ lifecycle or generation test executes now holds trivially: `ci.yml` at HEAD
 contains only `ubuntu-latest` jobs.
 Existing check: partial, Linux only. `generation.rs:1526` (re-located at HEAD)
 `same_digest_corrupt_target_is_repaired_only_by_validated_exchange` drives the
-branch. The macOS CI job this entry previously described was removed by PR
-#131 (merge `5d638e3e8`); no `generation` or `lifecycle` test body runs on
+branch. The macOS CI job this entry previously described was removed by
+PR #131 (merge `5d638e3e8`); no `generation` or `lifecycle` test body runs on
 macOS because nothing runs on macOS. Status unaudited.
 Impact: the exchange is the store's only repair primitive for a corrupt
 occupant, and it is immediately followed by a deletion. If macOS `RENAME_SWAP`

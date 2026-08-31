@@ -58,9 +58,9 @@ a `Copy` enum (`:219-220`). No `Vec`,
   constructed unconditionally at `runtime.rs:876`, stored non-optionally as
   `HostShared.ring` (`:104`), and `ring.prepare(...)` is called by every
   authenticated connection at `connection.rs:148`.
-- `ring_transport.rs:729`, in `RingClientEndpoint::try_recv_with`, reached in
-  production from `client.rs:1880`.
-- `client.rs:1908`, in `decode_outbound`.
+- `ring_transport.rs:730`, in `RingClientEndpoint::try_recv_with` (declared at
+  `:723`), reached in production from `client.rs:1903`.
+- `client.rs:1978`, in `decode_outbound` (declared at `:1973`).
 
 A fourth site, `ring_transport.rs:593`, sits inside `if let Some(hook)` at
 `:592` and is reached only through the test-only `PublishHook`. `wire.rs` has
