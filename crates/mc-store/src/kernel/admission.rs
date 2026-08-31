@@ -3,7 +3,7 @@ use super::{KernelError, Sensitivity};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "80b81b2481ca58d9c45e910d38fe6eb8424b1bac973bee1d80616e186aa85a3c";
+    "37964fc530e83c8be0ded92cc43bff768a5790f3a34bd2675647ce7328bd07d2";
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -192,6 +192,11 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
     if input.event == EventKind::Enforce && !input.has_evidence {
         return Err(KernelError::AdmissionPolicy);
     }
+    if matches!(input.event, EventKind::Correct | EventKind::Replace)
+        && input.predecessor_sensitivity.is_none()
+    {
+        return Err(KernelError::AdmissionPolicy);
+    }
 
     let current = input
         .prior
@@ -246,20 +251,17 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
         )
         .max(input.predecessor_sensitivity.unwrap_or(Sensitivity::Normal));
 
-    // An unchanged decision retains its recorded outcome.
-    let unchanged_outcome = input.prior.and_then(|prior| {
-        (prior.historical_maturity == historical
+    let state_unchanged = input.prior.is_some_and(|prior| {
+        prior.historical_maturity == historical
             && prior.effective_maturity == effective
             && prior.disposition == disposition
-            && prior.sensitivity == sensitivity)
-            .then_some(prior.outcome)
+            && prior.sensitivity == sensitivity
     });
-    let no_op = unchanged_outcome.is_some();
 
-    let outcome = if let Some(prior_outcome) = unchanged_outcome {
-        prior_outcome
-    } else if denied {
+    let outcome = if denied {
         Outcome::Deny
+    } else if let Some(prior) = input.prior.filter(|_| state_unchanged) {
+        prior.outcome
     } else if historical.rank() > current.rank() || effective.rank() > current_effective.rank() {
         if input.prior.is_some() {
             Outcome::Promote
@@ -269,6 +271,7 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
     } else {
         requested_outcome
     };
+    let no_op = state_unchanged && input.prior.is_some_and(|prior| prior.outcome == outcome);
 
     let visibility = visibility_row(effective, disposition);
 
@@ -581,6 +584,83 @@ mod tests {
     }
 
     #[test]
+    fn a_correction_requires_its_predecessor_sensitivity() {
+        for event in [EventKind::Correct, EventKind::Replace] {
+            let missing = EvaluationInputs {
+                source_class: SourceClass::TrustedLocalCode,
+                taint_class: TaintClass::CurrentCode,
+                prior: None,
+                candidate_sensitivity: Sensitivity::Normal,
+                predecessor_sensitivity: None,
+                approval_valid: true,
+                event,
+                has_evidence: true,
+            };
+            assert_eq!(
+                evaluate_admission(missing),
+                Err(KernelError::AdmissionPolicy),
+                "{event:?}"
+            );
+            assert_eq!(
+                evaluate_admission(EvaluationInputs {
+                    predecessor_sensitivity: Some(Sensitivity::Secret),
+                    ..missing
+                })
+                .unwrap()
+                .sensitivity,
+                Sensitivity::Secret,
+                "{event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_denied_transition_reports_denial_even_when_state_is_unchanged() {
+        let prior = PriorDecision {
+            historical_maturity: Maturity::Verified,
+            effective_maturity: Maturity::Verified,
+            disposition: Disposition::Active,
+            outcome: Outcome::Admit,
+            source_class: SourceClass::TrustedLocalCode,
+            taint_class: TaintClass::CurrentCode,
+            sensitivity: Sensitivity::Normal,
+        };
+        let denied = evaluate_admission(EvaluationInputs {
+            source_class: prior.source_class,
+            taint_class: prior.taint_class,
+            prior: Some(prior),
+            candidate_sensitivity: Sensitivity::Normal,
+            predecessor_sensitivity: None,
+            approval_valid: false,
+            event: EventKind::Approve,
+            has_evidence: true,
+        })
+        .unwrap();
+        assert_eq!(denied.outcome, Outcome::Deny);
+        assert!(!denied.no_op);
+        assert_eq!(denied.historical_maturity, Maturity::Verified);
+        assert_eq!(denied.effective_maturity.get(), Maturity::Verified);
+
+        // A repeated denial is still an unchanged decision.
+        let replayed = evaluate_admission(EvaluationInputs {
+            source_class: prior.source_class,
+            taint_class: prior.taint_class,
+            prior: Some(PriorDecision {
+                outcome: Outcome::Deny,
+                ..prior
+            }),
+            candidate_sensitivity: Sensitivity::Normal,
+            predecessor_sensitivity: None,
+            approval_valid: false,
+            event: EventKind::Approve,
+            has_evidence: true,
+        })
+        .unwrap();
+        assert_eq!(replayed.outcome, Outcome::Deny);
+        assert!(replayed.no_op);
+    }
+
+    #[test]
     fn only_closed_auto_admit_event_set_avoids_approval() {
         for event in EventKind::ALL {
             let result = evaluate_admission(EvaluationInputs {
@@ -588,7 +668,7 @@ mod tests {
                 taint_class: TaintClass::CurrentCode,
                 prior: None,
                 candidate_sensitivity: Sensitivity::Normal,
-                predecessor_sensitivity: None,
+                predecessor_sensitivity: Some(Sensitivity::Normal),
                 approval_valid: false,
                 event: *event,
                 has_evidence: true,
@@ -855,7 +935,7 @@ mod tests {
                     taint_class: prior.taint_class,
                     prior: Some(prior),
                     candidate_sensitivity: Sensitivity::Normal,
-                    predecessor_sensitivity: None,
+                    predecessor_sensitivity: Some(Sensitivity::Normal),
                     approval_valid: false,
                     event: *event,
                     has_evidence: true,
@@ -1023,6 +1103,25 @@ mod tests {
         // An already-enforced record whose artifact is gone must not replay as a no-op.
         assert_eq!(
             evaluate_admission(EvaluationInputs {
+                has_evidence: false,
+                ..replay
+            }),
+            Err(KernelError::AdmissionPolicy)
+        );
+
+        // A denied `Enforce` whose computed state equals its prior must not pass either.
+        assert_eq!(
+            evaluate_admission(EvaluationInputs {
+                prior: Some(PriorDecision {
+                    historical_maturity: Maturity::Candidate,
+                    effective_maturity: Maturity::Candidate,
+                    disposition: Disposition::Active,
+                    outcome: Outcome::Deny,
+                    source_class: SourceClass::TrustedLocalCode,
+                    taint_class: TaintClass::CurrentCode,
+                    sensitivity: Sensitivity::Normal,
+                }),
+                approval_valid: false,
                 has_evidence: false,
                 ..replay
             }),
