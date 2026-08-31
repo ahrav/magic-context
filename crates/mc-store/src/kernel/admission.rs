@@ -565,14 +565,20 @@ impl Envelope<'_> {
         Ok(decision)
     }
 
+    /// Most subjects are not decision objects, and the chain walk cannot make one an
+    /// authority. Settling the object kind first keeps the recursive query off the
+    /// path of every ordinary admission.
     fn subject_grants_authority(
         &self,
         subject_object_id: Option<&str>,
     ) -> Result<bool, KernelError> {
-        match subject_object_id {
-            Some(subject) => validate_approval(self, Some(subject), None),
-            None => Ok(false),
+        let Some(subject) = subject_object_id else {
+            return Ok(false);
+        };
+        if !subject_is_accepted_decision(self, Some(subject))? {
+            return Ok(false);
         }
+        validate_approval(self, Some(subject), None)
     }
 
     /// Quarantine, contradiction, rejection, and supersession break an approval's
