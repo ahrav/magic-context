@@ -3493,12 +3493,24 @@ Exercised: yes — `ring_bridge_drains_inbound_and_queued_writes`
 (`client.rs:4003-4076`) queues eight writes with zero per-write wakes,
 delivers one edge, and bounds every completion at 250 ms.
 Guarantee: once the bridge wakes, every write already queued completes without
-any further wake — k queued writes drain in k loop passes.
+any further **worker-queue** wake — k queued writes drain in k loop passes.
+Scoped to the private `worker_wake` descriptor, and conditional on the
+host-to-peer ring having descriptor and arena capacity for each write. Without
+that capacity the bridge blocks inside `endpoint.send`
+(`client.rs:1851`) → `reserve_until` (`ring_transport.rs:692`,
+`ring.rs:980`), which waits on the peer's `capacity_ready` doorbell until the
+write's deadline (`ring.rs:1035`). That is a *peer* wake, and it is required
+before `wrote` is ever set at `client.rs:1858`, so neither the k-passes bound nor
+"no further wake" holds across a capacity stall. The `wrote { continue; }` logic
+at `:1913-1915` only removes the need for a second `worker_wake` after a send
+that already succeeded.
 Check: `always` — a bridge loop pass that completed a write re-polls the write
 queue without arming or blocking (`wrote` at `:1846`/`:1858`, checked at
 `:1913-1915`), so per-write completion latency is bounded in loop passes, not
-in external events. `always` because the property must hold on every pass;
-the bound (k passes, no second signal) is what a finite test asserts. Harness
+in external events, **given ring capacity**. `always` because the property must
+hold on every pass; the bound (k passes, no second worker signal) is what a
+finite test asserts, and the test must provision enough ring capacity for the
+burst or it is measuring the capacity stall instead. Harness
 proxy: per-write completion within an explicit wall-clock deadline with the
 delivered signal count pinned by the test, since loop passes are not
 externally observable.
@@ -3533,17 +3545,29 @@ Exercised: not yet — no test exhausts the read budget with the bridge parked
 and then releases a charge from another thread; existing `ByteCounter` tests
 (`client.rs:3805-3891`) are synchronous accounting checks that never reach the
 poll arm.
-Guarantee: when a released byte charge frees read-budget capacity, a bridge
-blocked waiting for that capacity resumes within one poll wakeup, admits the
-pending frame, and continues delivery.
+Guarantee: when a released byte charge frees read-budget capacity **sufficient to
+admit the pending frame**, a bridge blocked waiting for that capacity resumes
+within one poll wakeup, admits the pending frame, and continues delivery. A
+release that frees fewer bytes than the pending frame needs wakes the bridge but
+does not discharge the guarantee: the charge closure re-runs
+`read_budget.charge(bytes)` (`client.rs:1873`), fails again, and re-parks. With
+100 of 100 bytes used and an 80-byte frame pending, dropping a 20-byte charge
+produces exactly one more failed attempt. The liveness claim is therefore over
+the *cumulative* release that first satisfies the pending charge, not over any
+single drop.
 Check: `always` — every `ByteCharge::drop` that decrements a counter with a
 registered wake signals that wake's eventfd (`client.rs:1711-1725`), and a
 bridge parked in the charge loop observes it on its next poll (`:1879-1901`).
 `always` because the drop-side signal is unconditional given a registered
-wake; the bounded window is one poll wakeup plus one loop iteration. Harness
-proxy: **receipt of the pending inbound frame** on the bridge's read channel
-within an explicit wall-clock deadline of the `ByteCharge` drop, since loop
-passes are not externally observable. Per-write completion is **not** a valid
+wake; the bounded window is one poll wakeup plus one loop iteration **after a
+release that satisfies the pending charge** — an insufficient release costs one
+extra failed `charge` attempt and re-park, and does not start the window.
+Harness proxy: **receipt of the pending inbound frame** on the bridge's read
+channel within an explicit wall-clock deadline of the release that first frees
+enough bytes for that frame, since loop passes are not externally observable.
+The test must therefore size the released charge against the pending frame, not
+merely drop some charge.
+ Per-write completion is **not** a valid
 proxy: the loop services `write_rx` at `:1847-1859` *before* it reaches
 `try_recv_with(charge)` at `:1903`, so a write submitted before the park
 completes and reports success while the bridge then parks indefinitely and the
@@ -3644,12 +3668,19 @@ every `try_reserve` (`ring.rs:916`) on the unconditionally built ring
 transport; page removal requires only a released whole page, which normal
 traffic produces.
 Status: active
-Exercised: yes — `removal_ranges_exclude_partial_pages_and_split_once_at_wrap`
+Exercised: partial — `removal_ranges_exclude_partial_pages_and_split_once_at_wrap`
 (`ring.rs:2279-2297`) sweeps three page sizes over the pure function including
-the wrap split, and `partial_page_reclaim_preserves_live_neighbor`
-(`:2337-2353`) holds a live lease on a shared page through a reclaim and reads
-its bytes back. The trailing-partial-page exception has never been reached
-with a wrapped cursor.
+the wrap split, and carries the coverage on its own. Its companion
+`partial_page_reclaim_preserves_live_neighbor` (`:2337-2353`) is **vacuous as
+written** and must not be counted: it publishes two 256-byte bodies, releases
+the first, and triggers reclaim with a zero-byte reservation, so the released
+range is `[0, 256)`. On any host whose page size is at least 4096 bytes that
+range contains no whole page, `removal_ranges` returns nothing, and
+`MADV_REMOVE` is never called — so reading the second lease back asserts only
+that an operation which did not run did not corrupt anything. A real arm has to
+release a run containing at least one whole page adjacent to live bytes and
+assert both that removal occurred and that the neighbour survived. The
+trailing-partial-page exception has never been reached with a wrapped cursor.
 Guarantee: `MADV_REMOVE` is applied only to pages every byte of which belongs
 to released frames; a page shared with any live byte — including the wrapped
 tail of a partially released run — is never removed.
@@ -3676,7 +3707,8 @@ ordering of removal before capacity publication were all read directly and
 are pinned by the unit tests named above.
 Existing check: the four Linux unit tests at `ring.rs:2279-2353` plus
 `page_removal_failure_quarantines_before_capacity_publication` (`:2355-2373`);
-all status unaudited.
+all status unaudited, and `partial_page_reclaim_preserves_live_neighbor`
+(`:2337-2353`) is vacuous as written — see Exercised above.
 Impact: silent corruption — a leased frame's bytes read back as zeros after
 validation already passed. The receiver delivers zeroed payload with a valid
 header; nothing downstream can detect it. This is the only record in this
@@ -3686,6 +3718,10 @@ Open questions:
 - The trailing-partial-page exception with a wrapped `arena_write` is
   untested; the guard's soundness argument is recorded in the evidence file
   but unexecuted.
+- The live-neighbour arm needs replacing, not just re-running: sized so the
+  released run contains a whole page, with an assertion that removal actually
+  happened (a resident-page count or a removal counter) so the test cannot pass
+  again by doing nothing.
 
 ### reactor-callback-is-one-in-flight
 
@@ -3700,19 +3736,29 @@ during callback` (`mechanism.ts:211-278`) pins exactly one deferred dispatch
 (`callbacks === 2`), and `pending_callback_waits_for_acknowledgement`
 (`scheduling.rs:320-348`) pins that a control write alone does not release the
 wait. No test lands edges from multiple channels in one pending window.
-Guarantee: the reactor never has two unacknowledged readiness callbacks in
-flight — a second dispatch occurs only after `readiness_handled` re-armed
-every channel and cleared the pending gate.
+Guarantee: **during non-error reactor operation** the reactor never has two
+unacknowledged readiness callbacks in flight — a second dispatch occurs only
+after `readiness_handled` re-armed every channel and cleared the pending gate.
+The `wait_until_handled` error arm is explicitly outside this guarantee, not an
+exception to it: at `scheduling.rs:184-189` the reactor sets `failed`, calls the
+callback again **without** a `pending` compare-exchange and **without** clearing
+the existing `pending` flag, then breaks. With the original callback still
+unacknowledged that is two unacknowledged callbacks in flight, so an
+unqualified `never` would be false at HEAD.
 Check: `always` — a callback is dispatched only through a successful
 `pending` compare-exchange (`scheduling.rs:169-175`) and the reactor blocks in
 `wait_until_handled` (`:52-68`) until `handled()` (`:279-282`) clears the
-flag; assert no dispatch while an acknowledgement is outstanding. `always`
-because the mutual exclusion must hold at every dispatch decision.
+flag; assert no dispatch while an acknowledgement is outstanding. `always` over
+the non-error arms, which is where the compare-exchange is the sole gate. The
+terminal error arm is a separate gapped arm, below.
 Fault/timing angle: edges and kicks arriving during the pending window are the
 hazard. A kick is deferred, not dropped: `wait_until_handled` returning with
 `kick` set rewrites the control eventfd (`:178-181`) for exactly one later
-pass. One documented exception exists: a `wait_until_handled` *error* fires a
-final non-gated callback and terminates the thread (`:184-189`).
+pass. The terminal error arm (`:184-189`) is the gapped case: it fires a final
+non-gated callback over a still-set `pending` flag and terminates the thread.
+Nothing asserts what the JS side may observe from that overlapping pair, and no
+record covers it; it is queued with the acknowledgement-failure gap the Group N
+portfolio evaluation already names.
 Required faults and enabling state: doorbell or kick edges concurrent with an
 unacknowledged callback — one in-flight callback plus a publisher or a
 `poll`-side `kick` (`lib.rs:1227-1235`). The `poll`-side kick is a race, not a

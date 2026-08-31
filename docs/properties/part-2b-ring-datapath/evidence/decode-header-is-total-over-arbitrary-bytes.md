@@ -99,10 +99,10 @@ that no check would catch.
 
 Step one: a caller starts passing a slice whose length is not statically 21.
 Today all three production callers pass an exactly-21-byte array —
-`ring_transport.rs:503` and `:729` pass `&lease.wire_header()`, typed
+`ring_transport.rs:503` and `:730` pass `&lease.wire_header()`, typed
 `[u8; WIRE_V2_HEADER_BYTES]` at `crates/mc-shm-transport/src/lease.rs:152` with
-that constant equal to 21 at `descriptor.rs:10`, and `client.rs:1908` passes
-`header_bytes: &[u8; HEADER_LEN]` narrowed by the `try_into` at `:1907`. A
+that constant equal to 21 at `descriptor.rs:10`, and `client.rs:1978` passes
+`header_bytes: &[u8; HEADER_LEN]` narrowed by the `try_into` at `:1977`. A
 coalescing reader that hands `decode_header` its whole buffer, or a batched
 descriptor that yields a short tail, breaks that.
 

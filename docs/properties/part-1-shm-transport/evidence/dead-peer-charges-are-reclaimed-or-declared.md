@@ -99,15 +99,28 @@ admit is refused, permanently ending shared-memory eligibility for the process.
 
 The reclaim window is bounded by the sentinel, not the ring: it opens at the
 kernel's socket-closure edge on peer exit and closes when `admission.release()`
-runs after the endpoint thread joins. The join itself is bounded because every
-select arm the endpoint can park in is cancellation-aware
-(`ring_transport.rs:441-474`) and the one synchronous wait, `reserve_until`,
-is deadline-bounded by `frame_deadline` (`ring.rs:1035`, `:1043-1044`); so the
-fault-free bound is one socket-closure delivery plus at most one
-`frame_deadline`. Nothing polls for peer liveness on the ring, and the ring
-carries no holder count, attach epoch, heartbeat, or peer pid a reaper could
-read. Depends on `custody-terminal-transition-exactly-once` for release being
-correct at all, and shares its root cause with
+runs after the endpoint thread joins.
+
+**The join is bounded only while the inbound receiver is being drained.** Every
+`select!` arm the endpoint parks in is cancellation-aware
+(`ring_transport.rs:441-474`) and the one synchronous wait, `reserve_until`, is
+deadline-bounded by `frame_deadline` (`ring.rs:1035`, `:1043-1044`) — but
+`receive_one` also awaits a bounded-channel send that is neither:
+`inbound.send(...).await` at `:510-515` (the oversized-control rejection) and
+`:551-556` (the ordinary frame hand-off). Both carry no deadline and no
+cancellation arm. Their `map_err(|_| ReadClose::Cancelled)` fires only when the
+channel is *closed*; on a full channel with a live receiver the send parks
+indefinitely, and cancelling `root` or `read_cancel` cannot wake it. So if the
+connection task retains the receiver without draining it, the endpoint never
+joins and `admission.release()` may never run at all.
+
+The fault-free bound is therefore one socket-closure delivery plus at most one
+`frame_deadline` **given a draining inbound receiver**. Without that
+precondition there is no bound, and the failure mode is a permanently retained
+admission charge rather than a late one. Nothing polls for peer liveness on the
+ring, and the ring carries no holder count, attach epoch, heartbeat, or peer pid
+a reaper could read. Depends on `custody-terminal-transition-exactly-once` for
+release being correct at all, and shares its root cause with
 `attach-reconciles-or-refuses-stale-shared-cursors` and
 `crashed-producer-does-not-wedge-the-sequence`.
 

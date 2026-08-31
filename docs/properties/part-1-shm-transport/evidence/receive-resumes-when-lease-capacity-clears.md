@@ -133,13 +133,27 @@ Then release exactly one lease and assert that the immediately following
 pre-saturation `consumed + 1`, and that its body equals the frame that was pending
 — so recovery cannot be satisfied by delivering some other frame or by skipping
 one. Assert `active_leases` is back to `max_leases - 1` by way of
-`descriptors.receiver_leased`. Add a wake arm that the polling design did not
-need: park a consumer in `wait_for_data` with a deadline well above the expected
-wake latency while the lease set is saturated and a frame is pending, release one
-lease from another lease holder, and assert `wait_for_data` returns `true`
-strictly before the deadline — a lost `data_ready` signal fails this arm as a
-timeout while the bare `try_receive` arm still passes, which is exactly the
-separation that localises a lost wake. Add a multi-lease arm, since
+`descriptors.receiver_leased`. A wake arm is also owed that the polling design did
+not need: park a consumer in `wait_for_data` with a deadline well above the
+expected wake latency while the lease set is saturated and a frame is pending,
+release one lease from another lease holder, and assert `wait_for_data` returns
+`true` strictly before the deadline — a lost `data_ready` signal fails this arm as
+a timeout while the bare `try_receive` arm still passes, which is exactly the
+separation that localises a lost wake.
+
+**That wake arm cannot be built by extending the existing in-process test, and
+needs a harness decision before it is queued as work.** `wait_for_data` blocks
+the calling thread, so the release has to come from somewhere else; but both
+`Ring` (`ring.rs:719-726`) and `ReceiveLease` (`:1688`) carry
+`PhantomData<Rc<()>>` and are therefore neither `Send` nor `Sync`, so neither the
+ring nor a held lease can be moved to a second thread to release it there. The
+arm requires one of: a cross-process harness driving the release over raw
+identities (the shape `tests/ring.rs` already uses for cross-process attach), or
+a scheduling seam inside the wait that lets a single-threaded test interleave a
+release with a parked waiter. Until one is chosen this arm is not implementable
+and must not be recorded as merely unwritten.
+
+Add a multi-lease arm, since
 `max_leases: 1` makes "below the cap" and "zero" the same number and hides an
 off-by-one: with `max_leases: 4`, take four, assert `None`, release one, assert
 exactly one further receive succeeds and the next returns `None` again. Coverage
