@@ -181,24 +181,67 @@ fn symlinks_hash_their_target_without_reading_the_pointee() {
 }
 
 #[test]
-fn oversize_files_are_recorded_by_length() {
+fn large_files_are_content_hashed_so_same_length_edits_differ() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = init_repo(dir.path());
     let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
     set_head(&fixture.repo, "main");
     materialize(&fixture.repo, head);
 
-    let big = vec![b'x'; 33 * 1024 * 1024];
+    let mut big = vec![b'x'; 33 * 1024 * 1024];
     let workdir = fixture.repo.workdir().unwrap().to_path_buf();
     std::fs::write(workdir.join("big.bin"), &big).unwrap();
+    let first = snapshot_checkout(dir.path(), &EvalBudget::unbounded()).unwrap();
 
-    let snapshot = snapshot_checkout(dir.path(), &EvalBudget::unbounded()).unwrap();
-    let entry = snapshot
-        .dirty_entries()
-        .iter()
-        .find(|entry| entry.path == "big.bin")
-        .expect("the large file is dirty");
-    assert_eq!(entry.content_hash, format!("oversize:{}", big.len()));
+    // A same-length edit must change the fingerprint; a length token
+    // would alias the two contents.
+    big[0] = b'y';
+    std::fs::write(workdir.join("big.bin"), &big).unwrap();
+    let edited = snapshot_checkout(dir.path(), &EvalBudget::unbounded()).unwrap();
+    assert_ne!(first.dirty_fingerprint(), edited.dirty_fingerprint());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_parent_directories_cannot_escape_the_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path().join("repo").as_path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+    let workdir = fixture.repo.workdir().unwrap().to_path_buf();
+    std::os::unix::fs::symlink(&outside, workdir.join("link")).unwrap();
+
+    let snapshot = snapshot_checkout(&fixture.root, &EvalBudget::unbounded()).unwrap();
+    assert!(
+        snapshot.worktree_path("link/secret.txt").is_none(),
+        "a symlinked ancestor escapes the worktree"
+    );
+    // The symlink itself stays addressable; only traversal through it is
+    // rejected.
+    assert!(snapshot.worktree_path("link").is_some());
+}
+
+#[test]
+fn conflict_stage_changes_alter_the_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("f.txt", "one\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    write_conflicted_index_entry(&fixture.repo, "f.txt", "base\n", "ours\n", "theirs\n");
+    let budget = EvalBudget::unbounded();
+    let first = snapshot_checkout(dir.path(), &budget).unwrap();
+
+    // Swap only the staged conflict blobs; the worktree file is untouched.
+    write_conflicted_index_entry(&fixture.repo, "f.txt", "base\n", "ours\n", "theirs v2\n");
+    let restaged = snapshot_checkout(dir.path(), &budget).unwrap();
+    assert_ne!(first.dirty_fingerprint(), restaged.dirty_fingerprint());
 }
 
 #[test]

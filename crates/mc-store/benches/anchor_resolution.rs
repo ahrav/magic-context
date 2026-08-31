@@ -49,7 +49,12 @@ fn snapshot_fixture(modified: usize) -> (tempfile::TempDir, FixtureRepo) {
     let dir = tempfile::tempdir().expect("bench fixture dir");
     let fixture = init_repo(dir.path());
     let files: Vec<(String, String)> = (0..TRACKED_FILES)
-        .map(|index| (format!("src/file_{index:03}.txt"), tracked_file_body(index, 0)))
+        .map(|index| {
+            (
+                format!("src/file_{index:03}.txt"),
+                tracked_file_body(index, 0),
+            )
+        })
         .collect();
     let file_refs: Vec<(&str, &str)> = files
         .iter()

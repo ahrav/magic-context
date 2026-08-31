@@ -13,15 +13,14 @@ use super::super::anchor::{AnchorCapture, GitCondition};
 use super::super::scope::GraphOracle;
 use super::checkout::{CheckoutSnapshot, EvalBudget};
 
-/// Version tag for this crate's patch identity. Values are internal
-/// fallback keys: whitespace-stripped per-file content hashes combined
-/// order-independently, never interchangeable with `git patch-id` output.
-pub const PATCH_ID_ALGORITHM: &str = "mc-patch-id-v2";
+/// Identities are internal fallback keys, not `git patch-id` output.
+pub const PATCH_ID_ALGORITHM: &str = "mc-patch-id-v3";
 
-/// Fallback candidates come from the first-parent walk from HEAD, capped, so
-/// resolution cost stays bounded on deep histories. A true match outside the
-/// window is unresolved at that rung.
+/// `CANDIDATE_WINDOW` bounds fallback resolution cost on deep histories.
+/// A true match outside the window is unresolved at that rung.
 pub const CANDIDATE_WINDOW: usize = 512;
+
+const MAX_PATCH_BLOB_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Verdict for one git anchor condition against one checkout snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,11 +90,13 @@ impl<'s> ResolutionLadder<'s> {
                 let start = self.resolve_commit(start_oid, captures.get(start_oid));
                 let end = self.resolve_commit(end_oid, captures.get(end_oid));
                 match (start, end) {
-                    (CommitResolution::Uncertain, _) | (_, CommitResolution::Uncertain) => {
-                        GitConditionOutcome::Uncertain
-                    }
+                    // An unreachable start falsifies the half-open window
+                    // whatever the end resolves to: false dominates unknown.
                     (CommitResolution::NotReachable, _) => {
                         GitConditionOutcome::DoesNotHold { historical: false }
+                    }
+                    (CommitResolution::Uncertain, _) | (_, CommitResolution::Uncertain) => {
+                        GitConditionOutcome::Uncertain
                     }
                     (CommitResolution::Reachable, CommitResolution::NotReachable) => {
                         GitConditionOutcome::Holds
@@ -210,15 +211,16 @@ impl<'s> ResolutionLadder<'s> {
         }
     }
 
-    /// First-parent commits from HEAD, capped at [`CANDIDATE_WINDOW`],
-    /// computed once per request.
+    /// Returns up to [`CANDIDATE_WINDOW`] commits cached in `self.window`.
     fn candidate_window(&self) -> Option<Rc<[ObjectId]>> {
         if let Some(window) = self.window.borrow().as_ref() {
             return Some(Rc::clone(window));
         }
         let repo = self.snapshot.repo();
         let head = ObjectId::from_hex(self.snapshot.head().as_bytes()).ok()?;
-        let walk = repo.rev_walk([head]).first_parent_only().all().ok()?;
+        // The walk follows all parents: a rewrite reachable only through a
+        // merge's non-first parent is still a fallback candidate.
+        let walk = repo.rev_walk([head]).all().ok()?;
         let mut window = Vec::new();
         for info in walk.take(CANDIDATE_WINDOW) {
             if self.budget.is_exhausted() {
@@ -278,6 +280,10 @@ impl<'s> ResolutionLadder<'s> {
     }
 
     fn is_ancestor_or_equal_oid(&self, ancestor: ObjectId, descendant: ObjectId) -> Option<bool> {
+        // Cancellation makes even equal OIDs uncertain.
+        if self.budget.is_exhausted() {
+            return None;
+        }
         if ancestor == descendant {
             return Some(true);
         }
@@ -343,7 +349,7 @@ pub fn compute_patch_id(
         if budget.is_exhausted() {
             return Err(BudgetExhaustedInResolve);
         }
-        let Some(file_hash) = file_change_hash(repo, change) else {
+        let Some(file_hash) = file_change_hash(repo, change, budget)? else {
             return Ok(None);
         };
         file_hashes.push(file_hash);
@@ -404,25 +410,50 @@ impl From<BudgetExhaustedInResolve> for Budget {
 fn file_change_hash(
     repo: &gix::Repository,
     change: &gix::object::tree::diff::ChangeDetached,
-) -> Option<[u8; 32]> {
+    budget: &EvalBudget,
+) -> Result<Option<[u8; 32]>, BudgetExhaustedInResolve> {
     use gix::object::tree::diff::ChangeDetached as Change;
-    let (kind, location, old_id, new_id): (&str, _, Option<ObjectId>, Option<ObjectId>) =
-        match change {
-            Change::Addition { location, id, .. } => ("add", location, None, Some(*id)),
-            Change::Deletion { location, id, .. } => ("delete", location, Some(*id), None),
-            Change::Modification {
-                location,
-                previous_id,
-                id,
-                ..
-            } => ("modify", location, Some(*previous_id), Some(*id)),
-            Change::Rewrite {
-                location,
-                source_id,
-                id,
-                ..
-            } => ("rewrite", location, Some(*source_id), Some(*id)),
-        };
+    use gix::objs::tree::EntryMode;
+    type Side = Option<(ObjectId, EntryMode)>;
+    let (kind, location, old, new): (&str, _, Side, Side) = match change {
+        Change::Addition {
+            location,
+            entry_mode,
+            id,
+            ..
+        } => ("add", location, None, Some((*id, *entry_mode))),
+        Change::Deletion {
+            location,
+            entry_mode,
+            id,
+            ..
+        } => ("delete", location, Some((*id, *entry_mode)), None),
+        Change::Modification {
+            location,
+            previous_entry_mode,
+            previous_id,
+            entry_mode,
+            id,
+        } => (
+            "modify",
+            location,
+            Some((*previous_id, *previous_entry_mode)),
+            Some((*id, *entry_mode)),
+        ),
+        Change::Rewrite {
+            location,
+            source_entry_mode,
+            source_id,
+            entry_mode,
+            id,
+            ..
+        } => (
+            "rewrite",
+            location,
+            Some((*source_id, *source_entry_mode)),
+            Some((*id, *entry_mode)),
+        ),
+    };
     let mut hash = Sha256::new();
     // Derived from the version tag, so a hash change forces a tag change.
     hash.update(PATCH_ID_ALGORITHM.as_bytes());
@@ -431,17 +462,41 @@ fn file_change_hash(
     hash.update(b"\0");
     hash.update(location.as_slice());
     hash.update(b"\0");
-    for id in [old_id, new_id] {
-        match id {
-            Some(id) if !id.is_null() => {
-                let blob = repo.find_blob(id).ok()?;
-                hash_normalized_content(&mut hash, &blob.data);
+    for side in [old, new] {
+        match side {
+            Some((id, mode)) if !id.is_null() => {
+                // Entry kind makes opposite mode-only transitions hash
+                // differently.
+                hash.update((mode.kind() as u16).to_le_bytes());
+                if mode.is_commit() {
+                    hash.update(b"gitlink\0");
+                    hash.update(id.as_slice());
+                } else {
+                    if budget.is_exhausted() {
+                        return Err(BudgetExhaustedInResolve);
+                    }
+                    let Ok(header) = repo.find_header(id) else {
+                        return Ok(None);
+                    };
+                    if header.size() > MAX_PATCH_BLOB_BYTES {
+                        return Ok(None);
+                    }
+                    let Ok(blob) = repo.find_blob(id) else {
+                        return Ok(None);
+                    };
+                    // Fixed-width inner digests keep content boundaries
+                    // unambiguous.
+                    let mut content = Sha256::new();
+                    hash_normalized_content(&mut content, &blob.data);
+                    hash.update(b"blob\0");
+                    hash.update(content.finalize());
+                }
             }
-            _ => hash.update(b"<absent>"),
+            _ => hash.update(b"absent\0"),
         }
         hash.update(b"\0");
     }
-    Some(hash.finalize().into())
+    Ok(Some(hash.finalize().into()))
 }
 
 /// Feeds `bytes` to `hash` without ASCII whitespace, so formatting-only

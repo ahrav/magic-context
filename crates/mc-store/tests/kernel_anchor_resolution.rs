@@ -7,8 +7,8 @@ mod git_fixtures;
 use std::collections::BTreeMap;
 
 use git_fixtures::{
-    commit_snapshot, commit_snapshot_with_modes, init_repo, materialize, set_head_detached,
-    FixtureRepo,
+    commit_snapshot, commit_snapshot_with_modes, commit_tree, init_repo, materialize,
+    set_head_detached, FixtureRepo,
 };
 use mc_store::kernel::applicability::{
     capture_anchor_representation, compute_patch_id, snapshot_checkout, CheckoutSnapshot,
@@ -128,28 +128,30 @@ fn criss_cross_histories_answer_deterministically() {
     let b = commit_snapshot(repo, "side-b", &[root], &[("f.txt", "b\n")], "b", 3);
     // Criss-cross: two merges with the same two parents in opposite order.
     let m1 = commit_snapshot(repo, "merge1", &[a, b], &[("f.txt", "m1\n")], "m1", 4);
-    let _m2 = commit_snapshot(repo, "merge2", &[b, a], &[("f.txt", "m2\n")], "m2", 5);
+    let m2 = commit_snapshot(repo, "merge2", &[b, a], &[("f.txt", "m2\n")], "m2", 5);
 
     let budget = EvalBudget::unbounded();
-    let snapshot = checkout(&fixture, m1);
-    let ladder = ResolutionLadder::new(&snapshot, &budget);
-    // Both sides are ancestors of the merge; two independent ancestry tests
-    // agree regardless of which merge base a merge-base search would pick.
-    for anchor in [a, b, root] {
+    for merge in [m1, m2] {
+        let snapshot = checkout(&fixture, merge);
+        let ladder = ResolutionLadder::new(&snapshot, &budget);
+        // Each anchor is an ancestor of both merges, so evaluation is
+        // independent of merge-base selection and parent order.
+        for anchor in [a, b, root] {
+            assert_eq!(
+                ladder.evaluate(&reachable_from(anchor, BTreeMap::new())),
+                GitConditionOutcome::Holds
+            );
+        }
+        let between = GitCondition::ReachableBetween {
+            start_oid: a.to_string(),
+            end_oid: b.to_string(),
+            captures: BTreeMap::new(),
+        };
         assert_eq!(
-            ladder.evaluate(&reachable_from(anchor, BTreeMap::new())),
-            GitConditionOutcome::Holds
+            ladder.evaluate(&between),
+            GitConditionOutcome::DoesNotHold { historical: true }
         );
     }
-    let between = GitCondition::ReachableBetween {
-        start_oid: a.to_string(),
-        end_oid: b.to_string(),
-        captures: BTreeMap::new(),
-    };
-    assert_eq!(
-        ladder.evaluate(&between),
-        GitConditionOutcome::DoesNotHold { historical: true }
-    );
 }
 
 #[test]
@@ -547,6 +549,200 @@ fn capture_from_another_algorithm_version_is_uncertain() {
         ladder.evaluate(&reachable_from(anchored, captures)),
         GitConditionOutcome::Uncertain,
         "an unreadable fallback is not evidence the anchor moved"
+    );
+}
+
+#[test]
+fn rebase_merged_through_a_second_parent_still_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let base = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "base", 1);
+    let anchored = commit_snapshot(
+        repo,
+        "topic",
+        &[base],
+        &[("f.txt", "one\n"), ("g.txt", "topic change\n")],
+        "anchored",
+        2,
+    );
+    let captures = captures_for(repo, &[anchored]);
+    let advanced = commit_snapshot(repo, "main", &[base], &[("f.txt", "two\n")], "advance", 3);
+    // The rebased equivalent is reachable from HEAD only through the
+    // merge's second parent.
+    let rebased = commit_snapshot(
+        repo,
+        "feature",
+        &[advanced],
+        &[("f.txt", "two\n"), ("g.txt", "topic change\n")],
+        "anchored",
+        4,
+    );
+    let merge = commit_snapshot(
+        repo,
+        "main",
+        &[advanced, rebased],
+        &[("f.txt", "two\n"), ("g.txt", "topic change\n")],
+        "merge",
+        5,
+    );
+
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, merge);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    assert_eq!(
+        ladder.evaluate(&reachable_from(anchored, captures)),
+        GitConditionOutcome::Holds
+    );
+}
+
+#[test]
+fn exhausted_budget_makes_ancestry_verdicts_uncertain() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let head = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "head", 1);
+    let snapshot = checkout(&fixture, head);
+
+    let exhausted = EvalBudget::unbounded();
+    exhausted
+        .interrupt_flag()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let ladder = ResolutionLadder::new(&snapshot, &exhausted);
+    // Anchor equal to HEAD would otherwise short-circuit to `Holds`.
+    assert_eq!(
+        ladder.evaluate(&reachable_from(head, BTreeMap::new())),
+        GitConditionOutcome::Uncertain
+    );
+}
+
+#[test]
+fn unreachable_start_dominates_an_uncertain_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let start = commit_snapshot(repo, "other", &[], &[("f.txt", "one\n")], "start", 1);
+    let head = commit_snapshot(repo, "main", &[], &[("g.txt", "g\n")], "head", 2);
+    // An end OID absent from the odb resolves as uncertain.
+    let missing_end = gix::ObjectId::from_hex("bb".repeat(20).as_bytes()).unwrap();
+
+    let condition = GitCondition::ReachableBetween {
+        start_oid: start.to_string(),
+        end_oid: missing_end.to_string(),
+        captures: BTreeMap::new(),
+    };
+    let budget = EvalBudget::unbounded();
+    let snapshot = checkout(&fixture, head);
+    let ladder = ResolutionLadder::new(&snapshot, &budget);
+    // The unreachable start already falsifies the window.
+    assert_eq!(
+        ladder.evaluate(&condition),
+        GitConditionOutcome::DoesNotHold { historical: false }
+    );
+}
+
+#[test]
+fn opposite_mode_transitions_have_distinct_patch_ids() {
+    use gix::objs::tree::EntryKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let budget = EvalBudget::unbounded();
+
+    let plain = commit_snapshot_with_modes(
+        repo,
+        "a",
+        &[],
+        &[("run.sh", "echo hi\n", EntryKind::Blob)],
+        "plain",
+        1,
+    );
+    let to_exec = commit_snapshot_with_modes(
+        repo,
+        "a",
+        &[plain],
+        &[("run.sh", "echo hi\n", EntryKind::BlobExecutable)],
+        "chmod +x",
+        2,
+    );
+    let exec = commit_snapshot_with_modes(
+        repo,
+        "b",
+        &[],
+        &[("run.sh", "echo hi\n", EntryKind::BlobExecutable)],
+        "exec",
+        3,
+    );
+    let to_plain = commit_snapshot_with_modes(
+        repo,
+        "b",
+        &[exec],
+        &[("run.sh", "echo hi\n", EntryKind::Blob)],
+        "chmod -x",
+        4,
+    );
+    let add_exec = compute_patch_id(repo, to_exec, &budget).unwrap().unwrap();
+    let drop_exec = compute_patch_id(repo, to_plain, &budget).unwrap().unwrap();
+    assert_ne!(
+        add_exec, drop_exec,
+        "opposite mode-only transitions must not share an identity"
+    );
+}
+
+#[test]
+fn nul_bytes_do_not_alias_patch_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let budget = EvalBudget::unbounded();
+
+    let base_one = commit_snapshot(repo, "x", &[], &[("f.bin", "a")], "base", 1);
+    let mod_one = commit_snapshot(repo, "x", &[base_one], &[("f.bin", "\u{0}b")], "edit", 2);
+    let base_two = commit_snapshot(repo, "y", &[], &[("f.bin", "a\u{0}")], "base", 3);
+    let mod_two = commit_snapshot(repo, "y", &[base_two], &[("f.bin", "b")], "edit", 4);
+
+    let one = compute_patch_id(repo, mod_one, &budget).unwrap().unwrap();
+    let two = compute_patch_id(repo, mod_two, &budget).unwrap().unwrap();
+    assert_ne!(one, two, "binary contents must be framed unambiguously");
+}
+
+#[test]
+fn gitlink_changes_keep_a_patch_identity() {
+    use gix::objs::tree::{Entry, EntryKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let repo = &fixture.repo;
+    let budget = EvalBudget::unbounded();
+    let base = commit_snapshot(repo, "main", &[], &[("f.txt", "one\n")], "base", 1);
+
+    let blob = repo.write_blob(b"one\n").unwrap().detach();
+    // The submodule commit OID is absent from the object database.
+    let submodule = gix::ObjectId::from_hex("cc".repeat(20).as_bytes()).unwrap();
+    let mut entries = vec![
+        Entry {
+            mode: EntryKind::Blob.into(),
+            filename: "f.txt".into(),
+            oid: blob,
+        },
+        Entry {
+            mode: EntryKind::Commit.into(),
+            filename: "sub".into(),
+            oid: submodule,
+        },
+    ];
+    entries.sort();
+    let tree = repo
+        .write_object(&gix::objs::Tree { entries })
+        .unwrap()
+        .detach();
+    let child = commit_tree(repo, "main", &[base], tree, "add submodule", 2);
+
+    let patch_id = compute_patch_id(repo, child, &budget).unwrap();
+    assert!(
+        patch_id.is_some(),
+        "a submodule-pointer change has a patch identity"
     );
 }
 

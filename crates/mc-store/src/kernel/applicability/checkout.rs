@@ -8,14 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use gix::bstr::{BStr, ByteSlice};
 use sha2::{Digest, Sha256};
 
-/// Cap that keeps one huge worktree file from dominating a snapshot's memory
-/// or outlasting its deadline. A same-length edit above the cap keeps the
-/// same key.
-const MAX_HASHED_FILE_BYTES: u64 = 32 * 1024 * 1024;
-
-/// Read granularity; large-file hashing checks the deadline after each chunk.
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Worker-thread ceiling for the status scan. Spawn and coordination cost commentlint: allow(JUDGE)
@@ -161,7 +156,7 @@ impl CheckoutSnapshot {
 
     /// Returns only paths contained by the worktree.
     pub fn worktree_path(&self, rela_path: &str) -> Option<PathBuf> {
-        contained_path(self.repo.workdir()?, rela_path)
+        contained_path(self.repo.workdir()?, Path::new(rela_path))
     }
 }
 
@@ -203,6 +198,18 @@ pub fn snapshot_checkout(
         .detach()
         .to_string();
     let dirty_entries = scan_dirty_entries(&repo, budget)?;
+    // A concurrent checkout, reset, or branch switch can pair old HEAD with
+    // new index/worktree state; the scan rejects that inconsistent snapshot.
+    let head_after = repo
+        .head_id()
+        .map_err(|_| SnapshotError::NoHead)?
+        .detach()
+        .to_string();
+    if head_after != head {
+        return Err(SnapshotError::Scan(
+            "HEAD moved during the status scan".to_string(),
+        ));
+    }
     let dirty_fingerprint = fingerprint_entries(&dirty_entries);
     Ok(CheckoutSnapshot {
         repo,
@@ -218,7 +225,19 @@ fn checkout_identity(repo: &gix::Repository) -> Result<String, SnapshotError> {
         .git_dir()
         .canonicalize()
         .map_err(|error| SnapshotError::Open(error.to_string()))?;
-    Ok(git_dir.to_string_lossy().into_owned())
+    // The digest suffix distinguishes non-UTF-8 git-dir paths that share a
+    // lossy string.
+    match git_dir.to_str() {
+        Some(utf8) => Ok(utf8.to_owned()),
+        None => {
+            let raw = git_dir.as_os_str().as_encoded_bytes();
+            Ok(format!(
+                "{}#x{:x}",
+                git_dir.to_string_lossy(),
+                Sha256::digest(raw)
+            ))
+        }
+    }
 }
 
 fn scan_dirty_entries(
@@ -271,26 +290,25 @@ fn index_worktree_entry(
         Item::Modification {
             rela_path, status, ..
         } => {
-            let path = rela_path.to_string();
             let entry = match status {
                 EntryStatus::Conflict { .. } => Some(DirtyEntry {
-                    content_hash: worktree_content_hash(repo, &path, budget)?,
-                    path,
+                    content_hash: conflict_content_hash(repo, rela_path.as_ref(), budget)?,
+                    path: path_string(rela_path.as_ref()),
                     status: "conflicted",
                 }),
                 EntryStatus::Change(Change::Removed) => Some(DirtyEntry {
-                    path,
+                    path: path_string(rela_path.as_ref()),
                     status: "removed",
                     content_hash: "absent".to_string(),
                 }),
                 EntryStatus::Change(_) => Some(DirtyEntry {
-                    content_hash: worktree_content_hash(repo, &path, budget)?,
-                    path,
+                    content_hash: worktree_content_hash(repo, rela_path.as_ref(), budget)?,
+                    path: path_string(rela_path.as_ref()),
                     status: "modified",
                 }),
                 EntryStatus::IntentToAdd => Some(DirtyEntry {
-                    content_hash: worktree_content_hash(repo, &path, budget)?,
-                    path,
+                    content_hash: worktree_content_hash(repo, rela_path.as_ref(), budget)?,
+                    path: path_string(rela_path.as_ref()),
                     status: "intent_to_add",
                 }),
                 // A racy stat with unchanged content is not dirty.
@@ -306,20 +324,32 @@ fn index_worktree_entry(
                 // `UntrackedFiles::Files` emits contained files individually,
                 // so directory entries have no content to hash.
                 return Ok(Some(DirtyEntry {
-                    path: entry.rela_path.to_string(),
+                    path: path_string(entry.rela_path.as_ref()),
                     status: "untracked",
                     content_hash: "directory".to_string(),
                 }));
             }
-            let path = entry.rela_path.to_string();
             Ok(Some(DirtyEntry {
-                content_hash: worktree_content_hash(repo, &path, budget)?,
-                path,
+                content_hash: worktree_content_hash(repo, entry.rela_path.as_ref(), budget)?,
+                path: path_string(entry.rela_path.as_ref()),
                 status: "untracked",
             }))
         }
         // Rewrites are disabled in the scan configuration.
         Item::Rewrite { .. } => Ok(None),
+    }
+}
+
+/// The digest suffix distinguishes non-UTF-8 paths that share a lossy
+/// string.
+fn path_string(rela_path: &BStr) -> String {
+    match rela_path.to_str() {
+        Ok(utf8) => utf8.to_owned(),
+        Err(_) => format!(
+            "{}#x{:x}",
+            rela_path.to_str_lossy(),
+            Sha256::digest(rela_path.as_bytes())
+        ),
     }
 }
 
@@ -341,7 +371,7 @@ fn tree_index_entry(change: &gix::diff::index::Change) -> DirtyEntry {
         } => ("staged_rewritten", location, id.as_ref().to_string()),
     };
     DirtyEntry {
-        path: location.to_string(),
+        path: path_string(location.as_ref()),
         status,
         content_hash: id,
     }
@@ -354,14 +384,18 @@ fn tree_index_entry(change: &gix::diff::index::Change) -> DirtyEntry {
 /// Non-regular files use a fixed token because opening them can block forever.
 fn worktree_content_hash(
     repo: &gix::Repository,
-    rela_path: &str,
+    rela_path: &BStr,
     budget: &EvalBudget,
 ) -> Result<String, SnapshotError> {
     budget.check()?;
     let Some(workdir) = repo.workdir() else {
         return Ok("no-worktree".to_string());
     };
-    let Some(path) = contained_path(workdir, rela_path) else {
+    // A lossy conversion would look up the wrong file for non-UTF-8 names.
+    let Ok(rela_path) = gix::path::try_from_bstr(rela_path) else {
+        return Ok("unreadable".to_string());
+    };
+    let Some(path) = contained_path(workdir, &rela_path) else {
         return Ok("out-of-worktree".to_string());
     };
     // Inspection failures use `unreadable`, distinct from content hashes.
@@ -381,27 +415,16 @@ fn worktree_content_hash(
     if !file_type.is_file() {
         return Ok("not-a-regular-file".to_string());
     }
-    if metadata.len() > MAX_HASHED_FILE_BYTES {
-        return Ok(format!("oversize:{}", metadata.len()));
-    }
     let Ok(mut file) = std::fs::File::open(&path) else {
         return Ok("unreadable".to_string());
     };
     let mut hash = Sha256::new();
     let mut buffer = vec![0u8; HASH_CHUNK_BYTES];
-    let mut hashed: u64 = 0;
     loop {
         budget.check()?;
         match file.read(&mut buffer) {
             Ok(0) => break,
-            Ok(read) => {
-                hashed += read as u64;
-                // The file can grow past the cap mid-read.
-                if hashed > MAX_HASHED_FILE_BYTES {
-                    return Ok(format!("oversize:{hashed}"));
-                }
-                hash.update(&buffer[..read]);
-            }
+            Ok(read) => hash.update(&buffer[..read]),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return Ok("unreadable".to_string()),
         }
@@ -409,20 +432,65 @@ fn worktree_content_hash(
     Ok(format!("{:x}", hash.finalize()))
 }
 
-/// Rejects paths that escape `workdir`. An absolute path would replace
-/// `workdir` outright, and `..` would climb out of it.
-fn contained_path(workdir: &Path, rela_path: &str) -> Option<PathBuf> {
-    if rela_path.is_empty() {
+/// The hash covers the stage-1/2/3 index entries and the worktree content:
+/// replacing a conflict's base, ours, or theirs blob changes the checkout
+/// state even when the worktree file is untouched.
+fn conflict_content_hash(
+    repo: &gix::Repository,
+    rela_path: &BStr,
+    budget: &EvalBudget,
+) -> Result<String, SnapshotError> {
+    use gix::index::entry::Stage;
+
+    let mut hash = Sha256::new();
+    hash.update(b"conflict\0");
+    match repo.index_or_empty() {
+        Ok(index) => {
+            for stage in [Stage::Base, Stage::Ours, Stage::Theirs] {
+                match index.entry_by_path_and_stage(rela_path, stage) {
+                    Some(entry) => {
+                        hash.update(b"stage\0");
+                        hash.update(entry.id.as_slice());
+                        hash.update(entry.mode.bits().to_le_bytes());
+                    }
+                    None => hash.update(b"absent\0"),
+                }
+            }
+        }
+        Err(_) => hash.update(b"index-unreadable\0"),
+    }
+    let worktree = worktree_content_hash(repo, rela_path, budget)?;
+    hash.update(worktree.as_bytes());
+    Ok(format!("conflict:{:x}", hash.finalize()))
+}
+
+/// Rejects paths that escape `workdir`: absolute paths, `..` components,
+/// and symlinked ancestors can resolve outside it.
+fn contained_path(workdir: &Path, rela_path: &Path) -> Option<PathBuf> {
+    if rela_path.as_os_str().is_empty() {
         return None;
     }
-    let candidate = Path::new(rela_path);
-    let escapes = candidate
+    let escapes = rela_path
         .components()
         .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir));
     if escapes {
         return None;
     }
-    Some(workdir.join(candidate))
+    let joined = workdir.join(rela_path);
+    let canonical_workdir = workdir.canonicalize().ok()?;
+    // Canonicalize the deepest existing ancestor so the final component
+    // remains unresolved.
+    let mut ancestor = joined.parent()?;
+    let resolved = loop {
+        match ancestor.canonicalize() {
+            Ok(resolved) => break resolved,
+            Err(_) => ancestor = ancestor.parent()?,
+        }
+    };
+    if !resolved.starts_with(&canonical_workdir) {
+        return None;
+    }
+    Some(joined)
 }
 
 fn fingerprint_entries(entries: &[DirtyEntry]) -> String {
