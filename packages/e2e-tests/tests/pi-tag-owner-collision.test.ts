@@ -1,13 +1,7 @@
 /// <reference types="bun-types" />
 
 /**
- * Pi port of tag-owner-collision.test.ts.
  *
- * Pi and OpenCode share the same context.db schema and composite tool-tag
- * identity: (session_id, callId/message_id, tool_owner_message_id), with
- * harness='pi' on Pi rows. This e2e drives a real Pi RPC process far enough to
- * create/migrate the shared DB, then seeds the storage shape produced by Pi's
- * transcript tagger for reused tool call IDs.
  */
 
 import { Database } from "bun:sqlite";

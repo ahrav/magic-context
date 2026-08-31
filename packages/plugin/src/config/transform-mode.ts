@@ -26,11 +26,9 @@ export function resolveTransformMode(args: ResolveTransformModeArgs): {
         };
     }
 
-    // Rust mode may demand-start the managed native host and hand it the
-    // user's provider credentials. Project (repo-controlled) config alone must
-    // not activate that: the user tier consents either by selecting rust
-    // itself or by supplying a trusted explicit daemon. project-security.ts
-    // documents project-tier `transform_mode` as safe under exactly this gate.
+    // Rust mode requires user-tier consent before activation.
+    // Project-controlled configuration alone must not activate Rust mode.
+    // User-tier Rust selection or a trusted explicit `subc` daemon grants consent.
     if (args.configured === "rust" && !args.userTierConfiguredRust && !args.userTierHasSubc) {
         return {
             mode: "ts",

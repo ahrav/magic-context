@@ -123,8 +123,6 @@ describe("smart-note compiler output bounds", () => {
                 signals: Array.from({ length: 100 }, (_, index) => `signal-${index}`),
             }).signals,
         ).toHaveLength(64);
-        // Few entries but oversized strings: the module rejects a serialized
-        // manifest over 32 KiB at completion, so the compiler must fail first.
         expect(() =>
             normalizeManifest({
                 capabilities: [],
@@ -140,9 +138,7 @@ describe("smart-note compiler output bounds", () => {
 
 describe("wire-limit parity with the Rust module (static)", () => {
     test("MAX_MANIFEST_BYTES matches NOTE_EVALUATOR_MAX_MANIFEST_BYTES", () => {
-        // No codegen or shared constant ties these two literals together, and
-        // drift in the "TS accepts, module rejects" direction wastes a
-        // billable compile prompt before the module refuses the manifest.
+        // TypeScript must reject manifests larger than the module limit.
         const tsSource = readFileSync(path.join(import.meta.dir, "compiler.ts"), "utf8");
         const rustSource = readFileSync(
             path.join(import.meta.dir, "../../../../../../crates/mc-module/src/lib.rs"),

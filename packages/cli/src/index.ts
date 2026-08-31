@@ -4,11 +4,9 @@ import { fileURLToPath } from "node:url";
 import { dispatchCli } from "./dispatch";
 
 /**
- * Whether this module is the process entry point, and whether that is knowable.
  *
- * `unresolved` is deliberately distinct from `module`. Treating an
- * unresolvable path as "not the entry" makes the CLI exit 0 having printed
- * nothing, which is indistinguishable from success to whoever ran the binary.
+ * Classifying an unresolvable path as `module` would make the CLI exit 0 without output.
+ * An exit status of 0 with no output is indistinguishable from success to the binary's caller.
  */
 type EntryKind = "entry" | "module" | "unresolved";
 
@@ -19,8 +17,7 @@ function classifyEntry(): EntryKind {
     // Direct invocation of this exact path needs no syscall and cannot throw.
     if (entry === self) return "entry";
     try {
-        // Resolve both sides so an npm-style bin symlink resolves to this file
-        // instead of looking like an unrelated module.
+        // `realpathSync.native` resolves both paths so npm bin symlinks compare equal to this module.
         return realpathSync.native(entry) === realpathSync.native(self) ? "entry" : "module";
     } catch {
         return "unresolved";
@@ -30,9 +27,9 @@ function classifyEntry(): EntryKind {
 const entryKind = classifyEntry();
 
 if (entryKind === "unresolved") {
-    // Neither side of the comparison resolved, so entry-ness is undecidable —
-    // an unreadable or already-removed bin path reaches here. Report it rather
-    // than exiting 0 with no output.
+    // At least one path could not be resolved, so entry-ness is undecidable.
+    // A removed npm bin symlink produces `unresolved`.
+    // Reporting `unresolved` prevents a silent exit with status 0.
     console.error(
         `magic-context: cannot resolve the invoked path (${process.argv[1]}) to determine whether to run.`,
     );

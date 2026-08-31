@@ -1,5 +1,4 @@
 /**
- * On-disk experimental → dreamer migrations for doctor (mirrors in-memory shim).
  */
 
 export function coercePinKeyFilesValue(value: unknown): Record<string, unknown> | undefined {
@@ -13,8 +12,6 @@ export function coercePinKeyFilesValue(value: unknown): Record<string, unknown> 
 }
 
 /**
- * Migrate experimental.pin_key_files → dreamer.pin_key_files on a parsed config object.
- * Returns true when the config was mutated.
  */
 export function migrateExperimentalPinKeyFilesForDoctor(
     mcConfig: Record<string, unknown>,

@@ -37,14 +37,13 @@ import type { NotificationParams } from "./send-session-notification";
 import { sendUserPrompt } from "./send-session-notification";
 
 /**
- * Track per-session recomp confirmation for Desktop (no dialog available).
- * Stores the timestamp of the first tap and the normalized range argument
- * so switching ranges between taps counts as a new intent requiring fresh
+ * Desktop has no dialog, so recomp confirmations are tracked per session.
+ * Changing ranges requires a fresh confirmation.
  * confirmation.
  */
 interface RecompConfirmation {
     timestamp: number;
-    /** Normalized range arg or "" for full recomp. */
+    /** argsKey stores the normalized range argument or "" for a full recompilation. */
     argsKey: string;
 }
 const recompConfirmationBySession = new Map<string, RecompConfirmation>();
@@ -70,14 +69,11 @@ const RECOMP_USAGE = [
     "- `/ctx-recomp --upgrade` — upgrade legacy v1 compartments to v2 layout (Wave 3 runner)",
 ].join("\n");
 
-/** Parse `/ctx-recomp` arguments.
+/**
  *
  *  Accepted forms:
- *  - empty / whitespace-only → full recomp
- *  - `<start>-<end>`         → partial recomp with explicit inclusive range
- *  - `--upgrade`            → upgrade legacy compartments (dispatch stub until Wave 3)
  *
- *  Returns an error object for unparseable or nonsensical inputs. */
+ * */
 export function parseRecompArgs(
     raw: string,
 ):
@@ -146,34 +142,26 @@ export interface CommandExecuteOutput {
 
 const SENTINEL_PREFIX = "__CONTEXT_MANAGEMENT_";
 
-// Effect HTTP plain-string TypeIds (NOT Symbols), verified against effect 4.x
-// source. Because the guards are `key in obj` checks on string keys, a hand-built
-// object carries them with NO effect import and NO version/realm coupling — it
-// works on the compiled OpenCode binary where effect is unreachable from an
-// external plugin's module resolution.
+// Effect HTTP uses plain-string TypeIds, not Symbols.
+// Effect HTTP guards check string keys, so plugin-built responses need no Effect import.
 const HTTP_SERVER_RESPONSE_TYPE_ID = "~effect/http/HttpServerResponse";
 const HTTP_COOKIES_TYPE_ID = "~effect/http/Cookies";
 const HTTP_BODY_TYPE_ID = "~effect/http/HttpBody";
 const ERROR_REPORTER_IGNORE = "~effect/ErrorReporter/ignore";
 
-/** Prevent OpenCode from forwarding the handled command to the LLM.
+/** The 204 response prevents OpenCode from forwarding the handled command to the LLM.
  *
- *  We throw a normal `Error` (so on any host that does NOT recognize the Effect
- *  HTTP tags it behaves EXACTLY like the prior string sentinel — keeps
- *  .message/.stack, no regression) that ALSO duck-types an Effect
- *  `HttpServerResponse.empty({ status: 204 })`. On OpenCode 1.17.x the HTTP error
- *  boundary recognizes it via the plain-string TypeId
- *  (`isHttpServerResponse` = `"~effect/http/HttpServerResponse" in defect`),
- *  skips the JSON-500 logging path (PR #31551 had un-silenced our old throw), and
- *  writes it as a real 204 — so the handled command neither reaches the LLM nor
- *  leaks an error into the TUI/log.
+ * The thrown `Error` preserves `.message` and `.stack` on hosts that do not recognize the Effect HTTP tags.
+ * The thrown duck-typed 204 Effect response makes OpenCode treat the command as handled without importing Effect.
+ * OpenCode recognizes responses with the `"~effect/http/HttpServerResponse"` TypeId.
+ * OpenCode recognizes `"~effect/http/HttpServerResponse" in defect`.
+ * The HTTP boundary skips JSON-500 logging when it recognizes the response.
+ * The HTTP boundary writes a recognized response as HTTP 204.
  *
- *  Field shape is the minimal set `Response.toWeb` dereferences on the empty-body
- *  path (status / statusText / headers / cookies.cookies / body._tag), traced
- *  through effect 4.x. No effect import — all string keys + primitives.
+ * Response.toWeb's empty-body path requires status, statusText, headers, cookies.cookies, and body._tag.
  *
- *  An official `command.execute.before` handled/cancel/noReply contract remains
- *  the real fix; this is a duck-typed shim until then. */
+ * The shim duck-types an Effect HTTP response because the command hook has no handled, cancel, or no-reply result.
+ * */
 function throwSentinel(command: string): never {
     const sentinel = new Error(`${SENTINEL_PREFIX}${command.toUpperCase()}_HANDLED__`) as Error &
         Record<string, unknown>;
@@ -196,7 +184,7 @@ function getLegacyCompartmentCount(db: Database, sessionId: string): number {
             .get(sessionId) as { count?: number } | undefined;
         return typeof row?.count === "number" ? row.count : 0;
     } catch {
-        // Older test/upgrade schemas may not have the v22 legacy column yet.
+        // The schema compatibility check supports databases without the v22 legacy column.
         return 0;
     }
 }
@@ -232,10 +220,9 @@ function formatRustOperationMessage(
             case "already_in_progress":
                 return `## Magic Wrapup — Skipped\n\n/ctx-wrapup is already running for this session${rounds > 0 ? ` (${rounds} round${rounds === 1 ? "" : "s"} complete)` : ""}. Wait for it to finish, then run /ctx-wrapup again if more history remains.`;
             case "retryable":
-                // The module's nonterminal disposition: progress was made but the
-                // drain stopped short of the keep watermark for a retryable reason.
-                // The TypeScript orchestrator presents the same shape as a Partial
-                // with the prescribed continuation, not a terminal failure.
+                // A nonterminal disposition indicates that the drain made progress but stopped before the keep watermark for a retryable reason.
+                // The orchestrator renders retryable dispositions as Partial rather than Failed.
+                // A retryable disposition instructs the user to rerun /ctx-wrapup instead of reporting failure.
                 return `## Magic Wrapup — Partial\n\n${summary || "Wrapup made progress but stopped before the keep watermark."} Run /ctx-wrapup again to continue.`;
             default:
                 return `## Magic Wrapup — Failed\n\n${summary || "Wrapup failed; try /ctx-wrapup again."}${rounds > 0 ? ` (${rounds} round${rounds === 1 ? "" : "s"})` : ""}`;
@@ -279,7 +266,6 @@ function executeRecompUpgradeStub(db: Database, sessionId: string): string {
         return "## Magic Recomp Upgrade\n\nNothing to upgrade: this session has no legacy compartments.";
     }
 
-    // Legacy --upgrade flag is superseded by the /ctx-session-upgrade command.
     return [
         "## Magic Recomp Upgrade",
         "",
@@ -289,27 +275,21 @@ function executeRecompUpgradeStub(db: Database, sessionId: string): string {
 }
 
 /**
- * Execute /ctx-session-upgrade: upgrade THIS session to the v2 history format.
+ * This command upgrades the current session to the v2 history format.
  *
- * Two halves (locked design):
- *  1. Compartment upgrade — run a full recomp, which rebuilds every legacy v1
- *     compartment into the v2 tiered/scored shape (legacy=0). This is just the
- *     normal full-recomp path; recomp already produces v2 compartments.
- *  2. Memory migration (E3.2) — re-evaluate project memories into the 5-category
- *     taxonomy via a transient historian-model prompt, once per project. Wired
- *     in a follow-up; this command runs the compartment upgrade today and notes
- *     the pending migration step.
+ * The upgrade recompiles session compartments and migrates project memories.
+ * A full recomp rebuilds every legacy v1 compartment into v2 form and leaves no legacy compartments.
+ * The migration classifies project memories into five categories once per project.
+ * The migration uses a transient historian-model prompt once per project.
  *
- * Session-scoped: recomp rebuilds THIS session's compartments. The memory
- * migration is project-scoped and idempotent (guarded once-per-project).
+ * Recomp rebuilds only the current session's compartments.
+ * The shared orchestrator recompiles session compartments before migrating project memories.
  */
 async function executeSessionUpgrade(
     deps: {
-        /** Runs the full session upgrade (compartment recomp → once-per-project
-         *  memory migration) via the shared orchestrator. Optional: unavailable
-         *  when no historian model is configured. The orchestrator gives the
-         *  command path identical model fallback + live progress + terminal
-         *  state as the RPC dialog path (dogfood 2026-05-30 unification). */
+        /**
+         * The command is unavailable when `deps.runUpgrade` is undefined.
+         * */
         runUpgrade?: (sessionId: string) => Promise<string>;
     },
     sessionId: string,
@@ -321,8 +301,7 @@ async function executeSessionUpgrade(
 }
 
 /**
- * Execute /ctx-aug: run sidekick to augment the user's prompt with relevant memories,
- * then send the augmented prompt as a real user message.
+ * /ctx-aug uses Sidekick to augment the user's prompt and sends the result as a user message.
  */
 async function executeAugmentation(
     deps: {
@@ -362,14 +341,12 @@ async function executeAugmentation(
         throwSentinel("CTX-AUG");
     }
 
-    // Step 1: Show "preparing" notification (hidden from LLM)
     await deps.sendNotification(
         sessionId,
         "🔍 Preparing augmentation… this may take 2-10s depending on your sidekick provider.",
         {},
     );
 
-    // Step 2: Run sidekick
     sessionLog(sessionId, "/ctx-aug: running sidekick");
     const sidekickResult = await runSidekick({
         client: deps.sidekick.client,
@@ -381,18 +358,15 @@ async function executeAugmentation(
         language: deps.sidekick.language,
     });
 
-    // Step 3: Build augmented prompt
     let augmentedPrompt: string;
     if (sidekickResult) {
         augmentedPrompt = `${prompt}\n\n<sidekick-augmentation>\n${sidekickResult}\n</sidekick-augmentation>`;
         sessionLog(sessionId, `/ctx-aug: sidekick returned ${sidekickResult.length} chars`);
     } else {
-        // Sidekick returned nothing — send the prompt as-is with a note
         augmentedPrompt = prompt;
         sessionLog(sessionId, "/ctx-aug: sidekick returned no result, sending prompt as-is");
     }
 
-    // Step 4: Send as a real user prompt (will be processed by the model)
     await sendUserPrompt(deps.sidekick.client, sessionId, augmentedPrompt);
 
     throwSentinel("CTX-AUG");
@@ -423,9 +397,7 @@ function summarizeManualDream(s: ManualDreamSummary): string {
     if (s.skippedNoWork.length > 0) lines.push(`Skipped (no work): ${s.skippedNoWork.join(", ")}`);
     if (s.deferredBusy.length > 0)
         lines.push(
-            // "Busy" means the task's DOMAIN lease is held — usually a sibling
-            // task (e.g. a scheduled verify blocking a manual curate), not
-            // this task itself. Say so, or the message reads as a lie.
+            // “Busy” means another task holds the domain lease.
             `Busy: ${s.deferredBusy.join(", ")} — another dream task holds this domain's lease; retry in a minute`,
         );
     if (Object.keys(s.backlogBefore ?? {}).length > 0) {
@@ -457,7 +429,7 @@ async function executeDreaming(
         dreamer?: {
             config: DreamerConfig;
             projectPath: string;
-            /** Run dream tasks NOW (Dreamer v2 per-task scheduler manual path).
+            /**
              *  `task` forces one task ignoring its gate; omitted runs all enabled. */
             runManual: (task?: DreamTaskName) => Promise<ManualDreamSummary>;
         };
@@ -478,7 +450,6 @@ async function executeDreaming(
         throwSentinel("CTX-DREAM");
     }
 
-    // Optional single-task arg: `/ctx-dream verify`.
     const requested = argText?.trim();
     let task: DreamTaskName | undefined;
     if (requested) {
@@ -521,35 +492,34 @@ async function executeDreaming(
 export function createMagicContextCommandHandler(deps: {
     db: Database;
     protectedTags: number;
-    /** Boot-resolved mode; command paths must not re-read configuration. */
+    /** Command paths use boot-resolved mode and must not reread configuration. */
     compactionOff?: boolean;
     executeThresholdPercentage?: number | { default: number; [modelKey: string]: number };
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined };
     historyBudgetPercentage?: number;
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
     getLiveModelKey?: (sessionId: string) => string | undefined;
-    /** Optional live context limit resolver — used for tokens-based threshold display. */
+    /** The optional live context limit resolver supplies token-based threshold displays. */
     getContextLimit?: (sessionId: string) => number | undefined;
     getDreamerProgress?: () =>
         | import("../../features/magic-context/dreamer/task-registry").DreamTaskProgress
         | null;
-    /** Cached U/T token measurement of the final rendered conversation tail, shared by both nudge mechanisms. */
+    /** Both nudge mechanisms share the cached U/T token measurement of the final rendered conversation tail. */
     getTailHygiene?: (sessionId: string) => import("./ctx-reduce-nudge").Channel1State | undefined;
     onFlush?: (sessionId: string) => void;
-    /** Runs /ctx-recomp. When `range` is provided, runs partial recomp over
-     *  that range (snapped to enclosing compartment boundaries). When omitted,
-     *  runs full recomp from message 1 to the protected tail. */
+    /** `/ctx-recomp` recompiles `range` after snapping it to enclosing compartment boundaries.
+     * Without `range`, `/ctx-recomp` recompiles messages 1 through the protected tail. */
     executeRecomp?: (
         sessionId: string,
         options?: { range?: PartialRecompRange },
     ) => Promise<string>;
-    /** Runs /ctx-wrapup over the live raw tail, keeping the newest N raw messages. */
+    /** `/ctx-wrapup` runs over the live raw tail and keeps the newest N raw messages. */
     executeWrapup?: (sessionId: string, options: { messagesToKeep: number }) => Promise<string>;
-    /** Runs the once-per-project 5-cat memory migration for /ctx-session-upgrade.
-     *  Optional: when unavailable, /ctx-session-upgrade still upgrades compartments
-     *  via recomp and skips the memory re-evaluation. */
+    /** `/ctx-session-upgrade` runs the once-per-project five-category memory migration.
+     * When memory migration is unavailable, `/ctx-session-upgrade` still upgrades compartments via recomp and skips memory reevaluation.
+     * */
     runUpgrade?: (sessionId: string) => Promise<string>;
-    /** `/ctx-embed start` — backfill this session's compartment embeddings. */
+    /** `/ctx-embed start` backfills this session's compartment embeddings. */
     executeEmbedHistory?: (
         sessionId: string,
         options?: { signal?: AbortSignal; silent?: boolean },
@@ -561,19 +531,15 @@ export function createMagicContextCommandHandler(deps: {
         text: string,
         params: NotificationParams,
     ) => Promise<void>;
-    /** Configured toast lifetime (ms) forwarded into diagnostics logs. */
+    /** Diagnostics logs receive the configured toast lifetime in milliseconds. */
     toastDurationMs?: number;
     transformMode?: ResolvedTransformMode;
     rustModeModuleClient?: RustModeModuleClient;
     projectRoot?: string;
-    /** Active project identity as stored in `memories.project_path`. */
+    /** `memories.project_path` stores the active project identity. */
     projectPath?: string;
-    /** Resolve the project for the invoking session at call time: the session
-     * can be resumed in (or moved to) a different directory than the hook's
-     * construction-time project, so approval/enforcement must target the
-     * ACTIVE project — the same per-call discipline as `ctx_memory`'s
-     * `toolContext.directory` and Pi's `resolveProject`. Absent resolver
-     * falls back to the construction-time values. */
+    /** The project resolver runs per call because resumed or moved sessions can differ from the construction-time project; it falls back to construction-time values when unavailable.
+     * */
     resolveProjectForSession?: (sessionId: string) => {
         projectPath?: string;
         projectRoot: string;
@@ -588,20 +554,12 @@ export function createMagicContextCommandHandler(deps: {
     dreamer?: {
         config: DreamerConfig;
         projectPath: string;
-        /** Dreamer v2 manual `/ctx-dream` entry — runs tasks now via the per-task
-         *  scheduler (one forced task, or all enabled). Wired in hook.ts. */
+        /** `runManual` runs a requested task, or all enabled tasks, through the per-task scheduler.
+         * */
         runManual: (task?: DreamTaskName) => Promise<ManualRunResult>;
     };
 }) {
-    // Notification delivery MUST NOT bypass the sentinel. Every command path
-    // ends in throwSentinel() (the 204 that suppresses the error-log leak and
-    // stops the command reaching the LLM). If sendNotification throws — RPC down,
-    // client gone, transient post failure — that throw would skip the pending
-    // throwSentinel and the raw command would be forwarded to the model (and a
-    // real error logged). Wrap it once so a delivery failure is logged and
-    // swallowed, never preempting the sentinel. Reassigning the deps method
-    // covers the handler AND the standalone executeAugmentation/executeDreaming,
-    // which receive this same deps reference.
+    // The notification wrapper logs and swallows delivery failures so `throwSentinel` prevents forwarding the raw command to the LLM; it also covers `executeAugmentation` and `executeDreaming`.
     const rawSendNotification = deps.sendNotification;
     deps.sendNotification = async (sessionId, text, params) => {
         try {
@@ -678,8 +636,8 @@ export function createMagicContextCommandHandler(deps: {
             let result = "";
 
             if (isApprove || isEnforce) {
-                // Per-call project resolution: the invoking session may run in
-                // a different project than the hook's construction-time one.
+                // The project resolver runs per call because a resumed session can use a different directory than the construction-time project.
+                // The invoking session may run in a different project than the construction-time project.
                 const resolved = deps.resolveProjectForSession?.(sessionId);
                 const projectPath = resolved ? resolved.projectPath : deps.projectPath;
                 const projectRoot = resolved ? resolved.projectRoot : deps.projectRoot;
@@ -738,8 +696,6 @@ export function createMagicContextCommandHandler(deps: {
                         ? deps.pauseEmbedDrain(sessionId)
                         : "Embedding pause is unavailable.";
                     if (isTuiConnected(sessionId)) {
-                        // Dialog (not a scrollback message) so the sentinel-throw
-                        // stderr leak repaints away, mirroring /ctx-status & /ctx-flush.
                         pushNotification(
                             "action",
                             { action: "show-result-dialog", title: "Embed", message: summary },
@@ -827,7 +783,6 @@ export function createMagicContextCommandHandler(deps: {
                     }
                 }
                 if (isTuiConnected(sessionId)) {
-                    // In TUI, push an RPC action so the TUI poller shows a native dialog
                     pushNotification("action", { action: "show-status-dialog" }, sessionId);
                     sessionLog(sessionId, "command ctx-status: pushed show-status-dialog to TUI");
                     throwSentinel(input.command);
@@ -889,9 +844,6 @@ export function createMagicContextCommandHandler(deps: {
                 } else if (!parsed.ok) {
                     result = `## Magic Wrapup — Invalid Arguments\n\n${parsed.message}`;
                 } else if (rustMode) {
-                    // The requested keep watermark is forwarded unchanged: it counts raw
-                    // messages and the module honors it as given (the TypeScript
-                    // orchestrator imposes no 5/100 clamp, only a floor of 1).
                     const keep = parsed.messagesToKeep;
                     await deps.sendNotification(
                         sessionId,
@@ -953,7 +905,6 @@ export function createMagicContextCommandHandler(deps: {
                     result =
                         "## Magic Recomp\n\n/ctx-recomp is unavailable because the recomp handler is not configured.";
                 } else {
-                    // Desktop double-tap confirmation (no native dialog available).
                     const argsKey =
                         parsedArgs.kind === "partial"
                             ? `${parsedArgs.range.start}-${parsedArgs.range.end}`
@@ -966,7 +917,7 @@ export function createMagicContextCommandHandler(deps: {
                         lastConfirmation.argsKey === argsKey;
 
                     if (confirmationValid) {
-                        // Confirmed — second /ctx-recomp within 60s with same args
+                        // A second /ctx-recomp within 60 seconds with the same arguments confirms recompilation.
                         recompConfirmationBySession.delete(sessionId);
                         if (parsedArgs.kind === "partial") {
                             await deps.sendNotification(
@@ -986,7 +937,6 @@ export function createMagicContextCommandHandler(deps: {
                             result = await deps.executeRecomp(sessionId);
                         }
                     } else {
-                        // First attempt — show warning
                         recompConfirmationBySession.set(sessionId, {
                             timestamp: now,
                             argsKey,
@@ -995,10 +945,10 @@ export function createMagicContextCommandHandler(deps: {
                         const compartmentCount = compartments.length;
 
                         if (parsedArgs.kind === "partial") {
-                            // Compute snap preview so the user sees what will actually be replaced.
+                            // The snap preview uses snapped bounds so users see the range that recompilation replaces.
                             const snap = snapRangeToCompartments(compartments, parsedArgs.range);
                             if ("error" in snap) {
-                                // Clear stale confirmation — a snap error is not a pending intent.
+                                // A snap error clears stale confirmation because it is not a pending intent.
                                 recompConfirmationBySession.delete(sessionId);
                                 result = `## Magic Recomp — Failed\n\n${snap.error}`;
                             } else {
@@ -1047,9 +997,7 @@ export function createMagicContextCommandHandler(deps: {
             }
 
             if (isSessionUpgrade) {
-                // TUI-no-session edge: before the first message, the prompt may
-                // not be bound to a session. Resolve defensively — nothing to
-                // upgrade without a session id.
+                // Before the first message, a TUI prompt may lack a bound session ID.
                 if (!sessionId) {
                     result =
                         "## Session Upgrade\n\nThis prompt is not attached to a session yet — send a message first, then run `/ctx-session-upgrade`.";

@@ -123,10 +123,10 @@ pub(crate) fn rebuild_alignment_tx(tx: &Transaction<'_>) -> Result<AlignmentRebu
             built_through_commit_seq: tip,
         })
         .collect::<Vec<_>>();
-    let result = replace_alignment_projection_tx(tx, &specs)?;
+    let rows = replace_alignment_projection_tx(tx, tip, &specs)?;
     Ok(AlignmentRebuild {
         built_through_commit_seq: tip,
-        rows: result.rows,
+        rows,
         published: true,
     })
 }

@@ -2,14 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { resolveHistoryBudgetTokensForPi } from "./context-handler";
 
 /**
- * Pi parity for the history-budget resolver fix (see OpenCode
- * history-budget.test.ts). Pi already preferred `usageContextLimit` (its
- * reported contextWindow / overflow-detected limit), but the
- * `usagePercentage <= 0` early return bailed BEFORE using it — so on the first
- * pass after restart (percentage=0, contextWindow known) the budget fell
- * through to the 60K default and over-archived history. Fix: only require a
- * positive percentage for the back-derivation FALLBACK, not when a stable
- * limit is present.
+ * `usageContextLimit` takes precedence even when `usagePercentage` is 0.
  */
 
 const ONE_M = 1_000_000;

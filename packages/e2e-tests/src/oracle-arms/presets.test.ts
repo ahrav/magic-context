@@ -33,8 +33,7 @@ afterEach(async () => {
         ...harnesses.splice(0).map((harness) => () => harness.dispose()),
         ...spawned.splice(0).map((opencode) => async () => {
             // Both steps always run: a failed kill must not leak the temp tree,
-            // and a failed removal must not hide a kill error. First failure
-            // wins, matching the cleanup idiom in `spawn.ts`.
+            // A failed removal must not hide a kill error.
             let cleanupError: unknown;
             try {
                 await opencode.kill();
@@ -100,9 +99,6 @@ describe("oracle arm presets", () => {
 
         expect(recipe.extraEnv).toEqual({ ANTHROPIC_API_KEY: "live-test-key" });
         expect(recipe.hostname).toBe("127.0.0.1");
-        // The recipe pins loopback for real-credential runs; this CI spawn uses
-        // a fake key and overrides back to the all-interfaces default because
-        // GitHub-hosted runners sometimes time out Bun's fetch() against a
         // 127.0.0.1-bound server. The override needs the explicit waiver: the
         // spawn guard refuses a secret-shaped extraEnv key off loopback, and
         // "live-test-key" is a fixture value that reaches no real provider.
@@ -130,31 +126,19 @@ describe("oracle arm presets", () => {
             providerBlock: { anthropic: { models: {} } },
         });
 
-        // The recipe's own pairing is what a real-credential caller spreads, so
-        // it must satisfy the guard untouched. Overriding hostname back to the
-        // all-interfaces default is what must fail: that is the shape a partial
-        // options merge or a harness that drops `hostname` degrades into. One
-        // pattern asserts the refused address and the offending key together, so
-        // a message that names only one of them cannot pass.
         await expect(
             spawnOpencode({ mockProviderURL: baseURL, ...recipe, hostname: "0.0.0.0" }),
         ).rejects.toThrow(
             /refusing to bind the unauthenticated serve API to 0\.0\.0\.0 while extraEnv carries ANTHROPIC_API_KEY/,
         );
 
-        // Nothing was allocated: the guard runs at the top of the spawn path,
-        // ahead of Rust-mode provisioning as well as the port, directory, and
-        // config work, so a refused spawn leaves no process to clean up. The
-        // mock recorded no request, which a spawned child would have produced.
+        // The spawn guard rejects before allocating resources.
         expect(mock.requests()).toHaveLength(0);
     }, 30_000);
 
     it("never forwards an ambient secret from the runner environment to the child", () => {
-        // The child inherits the runner's environment wholesale and binds all
-        // interfaces by default, so the loopback guard would be a half measure
-        // if it only policed the explicit channel: a CI job's own credentials
-        // would ride along on every spawn and be served by an unauthenticated
-        // API. These must be dropped regardless of hostname.
+        // Drop inherited secret keys because the child binds all interfaces by default.
+        // Drop inherited secret keys regardless of hostname.
         for (const key of [
             "GITHUB_TOKEN",
             "NPM_TOKEN",
@@ -163,9 +147,6 @@ describe("oracle arm presets", () => {
             "AWS_SESSION_TOKEN",
             "GH_COOKIE",
             "SSH_AUTH_SOCK",
-            // Vendor-prefixed names carrying no secret-shaped word. These match
-            // none of API_KEY, ACCESS_KEY, or PRIVATE_KEY, so a suffix-only rule
-            // would forward them.
             "OPENAI_KEY",
             "GCP_SA_KEY",
             "SSH_KEY",
@@ -182,13 +163,10 @@ describe("oracle arm presets", () => {
             expect(isInheritableEnvKey(key)).toBe(false);
         }
 
-        // Ordinary variables the child genuinely needs still pass through, so
-        // the filter is not vacuously rejecting everything.
         for (const key of ["PATH", "HOME", "LANG", "MAGIC_CONTEXT_LOG_PATH", "MC_E2E_MODE"]) {
             expect(isInheritableEnvKey(key)).toBe(true);
         }
 
-        // The pre-existing strips stay in force alongside the secret rule.
         for (const key of [
             "OPENCODE_SERVER_PASSWORD",
             "OPENCODE_SERVER_USERNAME",

@@ -27,7 +27,7 @@ const OMO_CONFIG_NAMES = [
     "oh-my-opencode.json",
 ] as const;
 
-/** Unified OMO config names (oh-my-openagent >= 4.19.0) */
+/* */
 const OMO_UNIFIED_NAMES = ["omo.jsonc", "omo.json"] as const;
 
 function isRecord(value: unknown): value is JsonObject {
@@ -95,7 +95,6 @@ function collectOmoConfigPaths(directory: string): string[] {
     const paths = new Set<string>();
     const configDir = getOpenCodeConfigPaths({ binary: "opencode" }).configDir;
 
-    // Legacy OMO config names in the OpenCode config dir and project dir
     for (const fileName of OMO_CONFIG_NAMES) {
         const userPath = join(configDir, fileName);
         const projectPath = join(directory, fileName);
@@ -109,8 +108,6 @@ function collectOmoConfigPaths(directory: string): string[] {
         }
     }
 
-    // New unified omo.jsonc (oh-my-openagent >= 4.19.0)
-    // User-level: ~/.omo/omo.jsonc (fallback ~/.omo/omo.json)
     const homeDir = process.env.HOME || homedir();
     const omoHomeDir = join(homeDir, ".omo");
     for (const name of OMO_UNIFIED_NAMES) {
@@ -120,7 +117,6 @@ function collectOmoConfigPaths(directory: string): string[] {
         }
     }
 
-    // Project-level: .omo/omo.jsonc (fallback .omo/omo.json)
     for (const name of OMO_UNIFIED_NAMES) {
         const projectPath = join(directory, ".omo", name);
         if (existsSync(projectPath)) {
@@ -131,7 +127,7 @@ function collectOmoConfigPaths(directory: string): string[] {
     return [...paths];
 }
 
-/** Check if a config path is a unified omo.json(c) path (not legacy). */
+/* */
 function isUnifiedOmoPath(configPath: string): boolean {
     const basename = configPath.split("/").pop() ?? "";
     return basename === "omo.jsonc" || basename === "omo.json";
@@ -162,18 +158,10 @@ function disableCompactionFlags(
 }
 
 /**
- * Options for {@link fixConflicts}.
  *
- * `compactionEnabled` is the boot-resolved MC compaction mode (the result of
- * {@link isCompactionEnabled} on the resolved user-tier config). When `false`
- * (compaction-off mode), the fixer MUST NOT flip `compaction.auto`/`prune` to
- * `false` — native compaction fields are left byte-for-byte as found, because
- * native compaction (or nothing) is the user's chosen window manager. DCP and
- * OMO hook fixes keep their existing policy in BOTH modes.
+ * `false` selects compaction-off mode.
+ * In compaction-off mode, the fixer does not set `compaction.auto` or `compaction.prune` to `false`.
  *
- * Default `true` (mode-on) preserves today's fix behavior for call sites that
- * cannot supply the resolved mode; they fail toward mode-on, never silently
- * skipping the fix.
  */
 export interface FixConflictsOptions {
     compactionEnabled?: boolean;
@@ -190,10 +178,6 @@ export function fixConflicts(
     let removedDcpPlugin = false;
     let disabledOmoHooks = false;
 
-    // Native compaction fields are repaired ONLY when MC compaction is ON. In
-    // compaction-off mode the fixer must not rewrite compaction.auto/prune —
-    // native compaction is the intended manager and pre-existing values are
-    // left byte-for-byte as found.
     const repairCompaction =
         compactionEnabled && (conflicts.compactionAuto || conflicts.compactionPrune);
 

@@ -4,7 +4,7 @@ use mc_store::kernel::{
     AlignmentProjectionSpec, ArtifactDeletionFault, ArtifactDeletionIdentity, ArtifactDeletionKind,
     ArtifactDeletionRequest, ArtifactErrorKind, ArtifactIngestRequest, CommitIntent,
     DecisionEventPayload, DecisionEventSpec, DecisionPayload, DecisionSpec, DomainSpec,
-    KernelErrorKind, KernelStore, ObservationDependencySpec, ObservationPayload, ObservationSpec,
+    KernelError, KernelStore, ObservationDependencySpec, ObservationPayload, ObservationSpec,
     ProviderEgress, RepositoryProvenance, Sensitivity,
 };
 use rusqlite::{Connection, OpenFlags};
@@ -105,7 +105,7 @@ fn projection_rows(root: &std::path::Path) -> Vec<(String, String, String, Strin
     let connection =
         Connection::open_with_flags(root.join("core.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
-    let rows = connection
+    let rows: Vec<(String, String, String, Vec<u8>, i64)> = connection
         .prepare(
             "SELECT decision_id,observation_id,alignment_kind,alignment_payload,
                     built_through_commit_seq
@@ -124,7 +124,19 @@ fn projection_rows(root: &std::path::Path) -> Vec<(String, String, String, Strin
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    rows
+    rows.into_iter()
+        .map(
+            |(decision_id, observation_id, alignment_kind, payload, built_through)| {
+                (
+                    decision_id,
+                    observation_id,
+                    alignment_kind,
+                    String::from_utf8(payload).unwrap(),
+                    built_through,
+                )
+            },
+        )
+        .collect()
 }
 
 fn projection_redactions(root: &std::path::Path) -> Vec<(String, String, String, i64)> {
@@ -305,15 +317,19 @@ fn deletion_replay_repairs_projection() {
         current_slice.decisions[0].evidence_id.as_deref(),
         Some("evidence")
     );
-    store
-        .replace_alignment_projection(&[AlignmentProjectionSpec {
-            decision_id: "decision-1".to_string(),
-            observation_id: "observation-1".to_string(),
-            alignment_kind: "stale".to_string(),
-            alignment_payload: Some("{}".to_string()),
-            built_through_commit_seq: 2,
-        }])
+    // The test inserts directly because `guard_projection_generation` rejects
+    // generations below the stored watermark.
+    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO alignment_projection(
+                 decision_id,observation_id,alignment_kind,alignment_payload,
+                 built_through_commit_seq
+             ) VALUES ('decision-1','observation-1','stale',CAST('{}' AS BLOB),2)",
+            [],
+        )
         .unwrap();
+    drop(connection);
     assert!(!projection_rows(root.path()).is_empty());
 
     let replay = store.delete_artifact(request).unwrap();
@@ -466,7 +482,7 @@ fn projection_failure_rolls_back_the_canonical_mutation_and_receipt() {
             Ok(String::new())
         })
         .unwrap_err();
-    assert_eq!(error.kind(), KernelErrorKind::CorruptCanonicalRow);
+    assert_eq!(error, KernelError::CorruptCanonicalRow);
 
     store
         .commit(intent("unrelated-domain"), |envelope| {
@@ -618,8 +634,8 @@ fn a_corrupt_stored_decision_payload_is_reported_as_canonical_corruption() {
 
     let store = KernelStore::open(root.path()).unwrap();
     assert_eq!(
-        store.slice_as_of(2).unwrap_err().kind(),
-        KernelErrorKind::CorruptCanonicalRow,
+        store.slice_as_of(2).unwrap_err(),
+        KernelError::CorruptCanonicalRow,
         "a corrupt decision payload was reported as a transient storage fault"
     );
 }
@@ -643,13 +659,13 @@ fn a_corrupt_stored_observation_payload_is_reported_as_canonical_corruption() {
 
     let store = KernelStore::open(root.path()).unwrap();
     assert_eq!(
-        store.slice_as_of(2).unwrap_err().kind(),
-        KernelErrorKind::CorruptCanonicalRow,
+        store.slice_as_of(2).unwrap_err(),
+        KernelError::CorruptCanonicalRow,
         "a corrupt observation payload was reported as a transient storage fault"
     );
     assert_eq!(
-        store.alignment_as_of(2).unwrap_err().kind(),
-        KernelErrorKind::CorruptCanonicalRow,
+        store.alignment_as_of(2).unwrap_err(),
+        KernelError::CorruptCanonicalRow,
         "slice and alignment reads disagree about canonical corruption"
     );
 }

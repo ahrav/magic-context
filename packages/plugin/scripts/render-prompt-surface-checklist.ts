@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-/** Render the machine-readable checklist as a reviewable Markdown artifact. */
+/* */
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 

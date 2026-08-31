@@ -20,8 +20,6 @@ describe("boot quiet period", () => {
         scheduleAfterBootQuiet(() => {
             backgroundRuns += 1;
         });
-        // Transform execution remains a direct call and is intentionally not
-        // routed through the background scheduler.
         transformRuns += 1;
 
         jest.advanceTimersByTime(BOOT_QUIET_MS - 1);

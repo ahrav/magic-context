@@ -1,5 +1,3 @@
-//! DG-1..3 differential goldens: TS emits fixtures, Rust consumes them in-process.
-
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;

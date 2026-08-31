@@ -1,15 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Benchmark message FTS path against the live production DB.
  *
- * Measures every step of `searchMessages` independently so we can tell whether
- * the 3-second auto-search slowdown lives in:
- *   1. readRawSessionMessages (reading raw OpenCode session history)
- *   2. getLastIndexedOrdinal (cheap SQL lookup)
- *   3. messagesToInsert.map (CPU work building insert rows)
- *   4. FTS5 INSERT loop (the actual indexing)
- *   5. FTS5 SELECT (the search itself, post-index)
- *   6. unifiedSearch with message source only against already-populated FTS
+ * The script measures each `searchMessages` step independently.
  *
  * Usage:
  *   bun packages/plugin/scripts/benchmark-message-fts.ts <session_id> "<query>"
@@ -93,8 +85,6 @@ function restoreOriginalIndexState(): void {
     })();
 }
 
-// === Step 1: readRawSessionMessages ===
-// We open OpenCode's DB read-only to mirror what the plugin does at runtime.
 const opencodeDbPath = `${process.env.HOME}/.local/share/opencode/opencode.db`;
 const opencodeDb = new Database(opencodeDbPath, { readonly: true });
 
@@ -110,7 +100,6 @@ if (messages.length === 0) {
     process.exit(0);
 }
 
-// === Step 2: getLastIndexedOrdinal ===
 const t3 = performance.now();
 const lastIndexedRow = db
     .prepare("SELECT last_indexed_ordinal FROM message_history_index WHERE session_id = ?")
@@ -121,7 +110,6 @@ console.log(
     `[2] getLastIndexedOrdinal: ${(t4 - t3).toFixed(1)}ms (lastIndexed=${lastIndexedOrdinal} messages.length=${messages.length})`,
 );
 
-// === Step 3: count indexed FTS rows for this session right now ===
 const t5 = performance.now();
 const ftsCount = db
     .prepare("SELECT COUNT(*) AS c FROM message_history_fts WHERE session_id = ?")
@@ -131,17 +119,15 @@ console.log(
     `[3] message_history_fts row count: ${(t6 - t5).toFixed(1)}ms (rows=${ftsCount.c})`,
 );
 
-// === Step 4: only-if-needed indexing path (mimic searchMessages) ===
 if (lastIndexedOrdinal < messages.length) {
     console.log(`\n  --> Index is stale, would insert ${messages.length - lastIndexedOrdinal} rows`);
 
-    // Build insert rows (CPU only, no DB writes)
     const t7 = performance.now();
     const messagesToInsert = messages
         .filter((m) => m.ordinal > lastIndexedOrdinal)
         .filter((m) => m.role === "user" || m.role === "assistant")
         .map((m) => {
-            // Mirror getIndexableContent's text extraction
+            // The extraction matches `getIndexableContent`.
             const texts: string[] = [];
             for (const part of m.parts as Array<{ type?: string; text?: string }>) {
                 if (part?.type === "text" && typeof part.text === "string") {
@@ -161,12 +147,10 @@ if (lastIndexedOrdinal < messages.length) {
         `[4] build insert rows (CPU only): ${(t8 - t7).toFixed(1)}ms (rows=${messagesToInsert.length})`,
     );
 
-    // Total content size (proxy for how heavy the FTS work is)
+    // Total content size estimates FTS workload.
     const totalChars = messagesToInsert.reduce((sum, m) => sum + m.content.length, 0);
     console.log(`    total content chars across ${messagesToInsert.length} rows: ${totalChars} (${(totalChars / 1024).toFixed(1)} KB)`);
 
-    // === Step 5: actually do the FTS inserts in a transaction ===
-    // This is the hot path that's blocking auto-search.
     const insertStmt = db.prepare(
         "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
     );
@@ -182,7 +166,7 @@ if (lastIndexedOrdinal < messages.length) {
         `[5] FTS5 INSERT transaction: ${(t10 - t9).toFixed(1)}ms (${messagesToInsert.length} rows = ${((t10 - t9) / messagesToInsert.length).toFixed(2)}ms/row)`,
     );
 
-    // Roll it back so we can rerun the script idempotently
+    // Restore the session's original index state so reruns do not change it.
     const t11 = performance.now();
     db.prepare("DELETE FROM message_history_fts WHERE session_id = ?").run(sessionId);
     const t12 = performance.now();
@@ -193,8 +177,6 @@ if (lastIndexedOrdinal < messages.length) {
     console.log(`[4-6] SKIPPED — already fully indexed`);
 }
 
-// === Step 7: actual search query (assuming index exists) ===
-// Pre-populate the index for this benchmark run since we just deleted it
 const insertStmt = db.prepare(
     "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
 );
@@ -232,7 +214,6 @@ const searchStmt = db.prepare(
     "SELECT message_ordinal AS messageOrdinal, message_id AS messageId, role, content FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? ORDER BY bm25(message_history_fts), CAST(message_ordinal AS INTEGER) ASC LIMIT ?",
 );
 
-// First query (cold cache)
 const t15 = performance.now();
 const rows1 = searchStmt.all(sessionId, sanitizedQuery, 30);
 const t16 = performance.now();
@@ -240,7 +221,6 @@ console.log(
     `[8] FTS SELECT (cold cache, sanitized="${sanitizedQuery}"): ${(t16 - t15).toFixed(1)}ms (rows=${rows1.length})`,
 );
 
-// Second query (warm cache)
 const t17 = performance.now();
 const rows2 = searchStmt.all(sessionId, sanitizedQuery, 30);
 const t18 = performance.now();

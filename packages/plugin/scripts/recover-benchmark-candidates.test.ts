@@ -113,7 +113,7 @@ function insertUserMessage(db: Database, sessionId: string, text: string): strin
     return messageId;
 }
 
-/** Persisted evidence that auto-search ran past its gates for a message. */
+/* */
 function recordHintDecision(db: Database, sessionId: string, messageId: string): void {
     db.prepare(
         `INSERT INTO session_meta (session_id, auto_search_hint_decisions)
@@ -131,8 +131,7 @@ function bindSession(db: Database, sessionId: string, harness: string): void {
 }
 
 function insertMeasurement(db: Database, sessionId: string, hash: string): void {
-    // project_path matches bindSession's: ownership correlates on
-    // (session_id, project_path), not session_id alone.
+    // Ownership correlates on (session_id, project_path), not session_id alone.
     db.prepare(
         "INSERT INTO embedding_measurement_corpus (session_id, project_path, query_text_hash) VALUES (?, 'git:proj', ?)",
     ).run(sessionId, hash);
@@ -263,8 +262,6 @@ describe("collectSessionCandidates", () => {
             "s1",
             "<system-reminder>noise</system-reminder>How does   compaction work?",
         );
-        // Rows go through the real reconstruction path runRecovery uses, so
-        // this covers row hydration, not just the extraction helpers.
         const candidates = collectSessionCandidates(readRawSessionMessagesFromDb(db, "s1"));
         expect(candidates).toEqual([
             { text: "How does compaction work?", mode: "automatic" },
@@ -277,8 +274,6 @@ describe("collectSessionCandidates", () => {
                 ordinal: 1,
                 id: "m1",
                 role: "user",
-                // Stacked augmentation: the live path skips this message
-                // entirely, so recovery must not record it as automatic.
                 parts: [
                     {
                         type: "text",
@@ -290,7 +285,6 @@ describe("collectSessionCandidates", () => {
                 ordinal: 2,
                 id: "m2",
                 role: "user",
-                // Ignored notification: hasMeaningfulUserText rejects it.
                 parts: [{ type: "text", text: "plugin announcement", ignored: true }],
             },
             {
@@ -302,8 +296,6 @@ describe("collectSessionCandidates", () => {
             {
                 ordinal: 4,
                 id: "m4",
-                // Malformed parent rows page through as role "unknown";
-                // their tool parts must not become explicit candidates.
                 role: "unknown",
                 parts: [
                     {
@@ -347,8 +339,6 @@ describe("collectSessionCandidates", () => {
                 id: "m1",
                 role: "user",
                 parts: [
-                    // A persisted part row holding invalid JSON hydrates as
-                    // null; it must be skipped, not crash the whole message.
                     null,
                     { type: "text", text: "ignored notification", ignored: true },
                 ],
@@ -371,13 +361,8 @@ describe("collectSessionCandidates", () => {
                     },
                     { type: "tool", tool: "ctx_search", state: { status: "completed", input: null } },
                     { type: "tool", tool: "ctx_search", state: { status: "completed", input: { query: 123 } } },
-                    // ID-shaped queries can short-circuit past the measured
-                    // search path; provenance is unknowable, so skipped.
                     { type: "tool", tool: "ctx_search", state: { status: "completed", input: { query: "9101" } } },
-                    // Completed but resolved with a pre-search error string:
-                    // no measurement was produced.
                     { type: "tool", tool: "ctx_search", state: { status: "completed", input: { query: "unresolved project" }, output: "Error: Could not resolve project identity for search." } },
-                    // Never-executed lifecycle states must not become candidates.
                     { type: "tool", tool: "ctx_search", state: { status: "pending", input: { query: "never ran" } } },
                     { type: "tool", tool: "ctx_search", state: { status: "error", input: { query: "failed run" } } },
                     { type: "tool", tool: "other_tool", state: { status: "completed", input: { query: "not ours" } } },
@@ -430,8 +415,6 @@ describe("staging safety", () => {
             StagingError,
         );
 
-        // Reverse containment: a staging root ABOVE a forbidden tree would
-        // let the stale-draft purge recursively delete that tree.
         const above = join(base, "above");
         const nestedDb = join(above, "db-dir");
         mkdirSync(nestedDb, { recursive: true, mode: 0o700 });
@@ -451,16 +434,12 @@ describe("staging safety", () => {
     it("purges drafts older than the TTL and keeps fresh ones", () => {
         const root = ensureStagingRoot(join(tempDir("staging-purge-"), "root"), []);
         const past = (Date.now() - 25 * 60 * 60 * 1000) / 1000;
-        // Recovery-owned entries age out...
         const staleRun = join(root, "run-abc123");
         mkdirSync(staleRun, { mode: 0o700 });
         utimesSync(staleRun, past, past);
         const staleLegacy = join(root, "draft.json");
         writeFileSync(staleLegacy, "{}");
         utimesSync(staleLegacy, past, past);
-        // ...but unrelated entries are not ours to delete, however old:
-        // arbitrary names, run-prefixed files, and run-prefixed directories
-        // that do not match the mkdtemp shape all survive.
         const unrelated = join(root, "precious-notes.txt");
         writeFileSync(unrelated, "keep me");
         utimesSync(unrelated, past, past);
@@ -620,8 +599,6 @@ describe("runRecovery", () => {
                 forbiddenRoots: [],
             }),
         ).rejects.toThrow("history connection busy");
-        // A leaked read transaction would make this BEGIN throw ("cannot
-        // start a transaction within a transaction").
         expect(() => {
             measurementDb.exec("BEGIN");
             measurementDb.exec("ROLLBACK");
@@ -635,9 +612,6 @@ describe("runRecovery", () => {
         const text = "the question after the malformed block";
         bindSession(measurementDb, "s1", "opencode");
         insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
-        // A full page of rows whose time_created hydrates as TEXT precedes
-        // the valid message; SQL-side shape predicates must skip them
-        // rather than reading the empty filtered page as end-of-history.
         for (let i = 0; i < 250; i += 1) {
             historyDb
                 .prepare(
@@ -663,8 +637,6 @@ describe("runRecovery", () => {
         const measurementDb = makeMeasurementDb();
         const historyDb = makeHistoryDb();
         const text = "query that only ever ran in the other session";
-        // s1's row references a hash whose plaintext exists only in s2's
-        // history; the streaming pass must still see s2's hash union.
         bindSession(measurementDb, "s1", "opencode");
         insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
         bindSession(measurementDb, "s2", "opencode");

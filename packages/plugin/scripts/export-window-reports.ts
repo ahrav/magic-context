@@ -20,10 +20,6 @@ type FusiformWindowReport = {
     attempted_tokens_units?: "estimate";
     largest_success_units?: "estimate";
     /**
-     * Only ever `true` or absent in the export. The schema pins absent =
-     * unknown routing (refuses promotion, same as true); an explicit `false`
-     * would PERMIT promotion, a claim our one-directional forwarder detector
-     * cannot support — so this exporter never emits it.
      */
     path_may_forward?: true;
     served_by_hint?: string;

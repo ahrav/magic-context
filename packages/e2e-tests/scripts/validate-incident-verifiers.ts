@@ -49,13 +49,9 @@ export function assertBoundVerifierBytesUnchanged(
 }
 
 /**
- * The executable verifier modules the catalog binds must not drift either.
  *
- * Drift means different bytes for a module the accepted base also bound: that
- * silently changes what scores the pool. A module bound only by the current
- * catalog has no accepted bytes to drift from and is a new case, so it passes. A
- * module bound only by the accepted catalog is rejected — dropping a binding is
- * otherwise the way to exempt a scoring verifier from this gate.
+ * A catalog with no accepted bindings treats every current binding as new.
+ * Reject modules bound only by the accepted catalog; otherwise removing a binding exempts an executable verifier from this gate.
  */
 export function assertCatalogBoundVerifierBytesUnchanged(
     acceptedDigests: Record<string, string>,
@@ -112,17 +108,16 @@ interface TrustedVerifierState {
     catalogBoundDigests: Record<string, string>;
 }
 
-/** Read both digest maps out of one detached worktree at `baseCommit`. */
+/* */
 function readVerifierState(
     worktree: string,
     repoRoot: string,
 ): TrustedVerifierState {
     const e2eRoot = resolve(worktree, "packages/e2e-tests");
     const catalogPath = resolve(e2eRoot, "incidents", "catalog.json");
-    // A tree that predates the catalog binds no executable verifiers, so it
-    // contributes no accepted bytes and every current binding reads as new.
-    // Deleting the catalog from the current tree is still caught, because the
-    // accepted bindings then have no counterpart.
+    // A tree without catalog.json binds no executable verifiers.
+    // Such a tree contributes no accepted bytes, so every current binding is new.
+    // Deleting the current catalog leaves accepted bindings without counterparts.
     const catalogBoundDigests = existsSync(catalogPath)
         ? boundVerifierDigests(
               parseIncidentCatalog(
@@ -154,19 +149,17 @@ function loadTrustedEvidence(baseCommit: string): TrustedVerifierState {
     try {
         evidence = readVerifierState(worktree, worktree);
     } catch (error) {
-        // Clean up, then surface the ORIGINAL evidence failure: a cleanup
-        // error raised here would replace the diagnosis the caller needs.
+        // Suppress cleanup errors when evidence loading fails so they do not replace the evidence error.
         cleanupTrustedWorktree(worktree, parent);
         throw error;
     }
-    // The evidence loaded, so a cleanup failure is now the only failure and
-    // must not be swallowed — a leaked worktree corrupts later validations.
+    // Cleanup failures propagate after evidence loads.
     const cleanupError = cleanupTrustedWorktree(worktree, parent);
     if (cleanupError) throw cleanupError;
     return evidence;
 }
 
-/** Remove the trusted worktree and its parent; returns the failure, if any. */
+/* */
 function cleanupTrustedWorktree(
     worktree: string,
     parent: string,

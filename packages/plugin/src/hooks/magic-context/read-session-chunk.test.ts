@@ -24,7 +24,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     }
     tempDirs.length = 0;
@@ -274,7 +274,7 @@ describe("readSessionChunk", () => {
             //#when
             const ordinal = getProtectedTailStartOrdinal("ses-tail");
 
-            //#then: all 5 user turns are protected
+            // All 5 user turns are protected.
             expect(ordinal).toBe(1);
         });
 
@@ -299,7 +299,7 @@ describe("readSessionChunk", () => {
             //#when
             const ordinal = getProtectedTailStartOrdinal("ses-6turns");
 
-            //#then: the 5th-to-last user message is m-3 at ordinal 3
+            // The 5th-to-last user message is m-3 at ordinal 3.
             expect(ordinal).toBe(3);
         });
 
@@ -315,7 +315,7 @@ describe("readSessionChunk", () => {
             //#when
             const ordinal = getProtectedTailStartOrdinal("ses-few");
 
-            //#then: everything is protected
+            // All messages are protected.
             expect(ordinal).toBe(1);
         });
 
@@ -350,7 +350,7 @@ describe("readSessionChunk", () => {
             //#when
             const ordinal = getProtectedTailStartOrdinal("ses-synthetic");
 
-            //#then: all 4 real user turns are protected because there are fewer than 5
+            // All 4 real user turns are protected because there are fewer than 5.
             expect(ordinal).toBe(1);
         });
 
@@ -377,7 +377,7 @@ describe("readSessionChunk", () => {
             //#when
             const ordinal = getProtectedTailStartOrdinal("ses-mixed");
 
-            //#then: all 4 meaningful user turns are protected because there are fewer than 5
+            // All 4 meaningful user turns are protected because there are fewer than 5.
             expect(ordinal).toBe(1);
         });
     });
@@ -394,10 +394,10 @@ describe("readSessionChunk", () => {
                 { id: "m-5", role: "user", part: { type: "text", text: "protected turn 2" } },
             ]);
 
-            //#when: eligible end is ordinal 3 (protected tail starts at m-3)
+            // The eligible end is ordinal 3 because the protected tail starts at m-3.
             const chunk = readSessionChunk("ses-eligible", 100_000, 1, 3);
 
-            //#then: only m-1 and m-2 are included
+            // The eligible range includes only m-1 and m-2.
             expect(chunk.text).toContain("old work");
             expect(chunk.text).toContain("done");
             expect(chunk.text).not.toContain("protected turn");
@@ -415,7 +415,7 @@ describe("readSessionChunk", () => {
                 { id: "m-4", role: "user", part: { type: "text", text: "tail turn 3" } },
             ]);
 
-            //#when: eligible end excludes m-2 onward
+            // The eligible end excludes m-2 and later messages.
             const chunk = readSessionChunk("ses-hasmore", 100_000, 1, 2);
 
             //#then
@@ -474,7 +474,6 @@ describe("readSessionChunk", () => {
             //#when
             const chunk = readSessionChunk("ses-noise-tail", 100_000, 1);
 
-            //#then: filtered tail noise was scanned, so no semantic work remains.
             expect(chunk.endIndex).toBe(2);
             expect(chunk.text).toContain("eligible work");
             expect(chunk.text).not.toContain("Magic Status");

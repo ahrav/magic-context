@@ -1,12 +1,7 @@
 /**
- * Generate the differential synthetic-todowrite injection golden for the Rust
  * mc-module port.
  *
- * The generator imports the real TypeScript todo-view helpers from packages/plugin
- * with Bun.resolveSync, feeds them a grid of todo-state shapes, and writes the
- * exact normalized state, call id, and result-state content that Rust must match.
  *
- * Run: bun crates/mc-module/gen/gen-injection-golden.ts
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

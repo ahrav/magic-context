@@ -32,7 +32,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     }
     tempDirs.length = 0;
@@ -45,8 +45,7 @@ function useTempDataHome(prefix: string): void {
 }
 
 /**
- * Insert 20 newer tool tags so `realTagNumber` falls OUTSIDE the newest-20
- * skeleton window and a queued drop takes the full-removal path.
+ * `padSkeletonWindow` inserts 20 newer tags so the queued drop uses full removal.
  */
 function padSkeletonWindow(
     db: ReturnType<typeof openDatabase> & object,
@@ -99,8 +98,7 @@ describe("apply operations for tool drops", () => {
         const { targets, batch } = tagMessages("ses-1", messages, tagger, db);
         const toolTagId = tagger.getToolTag("ses-1", "call-1", "m-assistant");
         expect(toolTagId).toBeDefined();
-        // Push the real tag out of the newest-20 skeleton window so this test
-        // exercises the FULL-removal path (deep-history drop).
+        // Padding moves the real tag outside the newest-20 window to exercise full removal.
         padSkeletonWindow(db, toolTagId!);
 
         queuePendingOp(db, "ses-1", toolTagId!, "drop");
@@ -133,8 +131,7 @@ describe("apply operations for tool drops", () => {
         const toolTagId = tagger.getToolTag("ses-1", "call-1", "m-assistant");
         expect(toolTagId).toBeDefined();
 
-        // No padding: the tool is within the newest-20 window, so the agent
-        // drop keeps the structural skeleton (anti-hallucination anchor).
+        // Without padding, the tool remains in the newest-20 window, so the agent drop keeps the structural skeleton.
         queuePendingOp(db, "ses-1", toolTagId!, "drop");
         const didMutate = applyPendingOperations("ses-1", db, targets);
         batch.finalize();
@@ -153,9 +150,7 @@ describe("apply operations for tool drops", () => {
     it("defers a pending/running task part and keeps its long prompt byte-identical (#250 open arc)", () => {
         useTempDataHome("context-tool-drop-pending-task-");
         const db = openDatabase();
-        // Pre-seed a tool tag for the task call so the still-running part binds
-        // into a drop target (mirrors a tag adopted from an earlier pass). The
-        // part itself has NO result output yet — the child is still spawning.
+        // The pre-seeded task tag lets the still-running part bind to a drop target.
         insertTag(db, "ses-1", "call-task", "tool", 123, 7);
         const tagger = createTagger();
         tagger.initFromDb("ses-1", db);
@@ -182,9 +177,7 @@ describe("apply operations for tool drops", () => {
         queuePendingOp(db, "ses-1", 7, "drop");
         const didMutate = applyPendingOperations("ses-1", db, targets);
 
-        // Open arc: the drop is deferred (not applied), the pending op stays
-        // queued, the tag stays active, and the LIVE task part is byte-identical
-        // — the child agent's prompt is never clamped mid-spawn.
+        // Pending drops for incomplete task calls remain queued, keep the tag active, and leave the task part unchanged.
         expect(didMutate).toBe(false);
         expect(JSON.stringify(taskPart)).toBe(pristine);
         expect(taskPart.state.input.prompt).toBe(longPrompt);
@@ -218,21 +211,18 @@ describe("apply operations for tool drops", () => {
         const toolTagId = tagger.getToolTag("ses-1", "call-bg", "m-bg");
         expect(toolTagId).toBeDefined();
 
-        // Snapshot AFTER tagging (tagMessages legitimately prefixes the output
-        // with §N§). The reclaim pass below must not change the live object any
-        // further — this is the byte-identity we assert.
+        // `tagMessages` prefixes the output with `§N§`.
         const pristine = JSON.stringify(taskPart);
 
-        // Within the skeleton window → truncate (skeleton) path, as before.
+        // Within the newest-20 window, the drop uses the skeleton path.
         queuePendingOp(db, "ses-1", toolTagId!, "drop");
         const didMutate = applyPendingOperations("ses-1", db, targets);
         batch.finalize();
 
-        // No reclaim regression: the completed arc still clamps.
         expect(didMutate).toBe(true);
         expect(getTagById(db, "ses-1", toolTagId!)?.dropMode).toBe("truncated");
 
-        // The wire copy now in the array is clamped + sentinelled...
+        // `messages` contains the clamped sentinel copy, while OpenCode retains the unchanged live object for child prompts.
         const wire = messages[0]?.parts[0] as {
             state: { input: Record<string, unknown>; output: string };
         };
@@ -240,8 +230,6 @@ describe("apply operations for tool drops", () => {
         expect(wire.state.output).toBe(`[dropped \u00a7${toolTagId}\u00a7]`);
         expect(wire.state.input.prompt).toBe("Inves...[truncated]");
 
-        // ...but the LIVE object OpenCode still holds is byte-identical (the long
-        // prompt is intact), so a background child spawning from it is unharmed.
         expect(JSON.stringify(taskPart)).toBe(pristine);
         expect(taskPart.state.input.prompt).toBe(longPrompt);
     });
@@ -277,7 +265,7 @@ describe("apply operations for tool drops", () => {
         const tagId = tagger.getToolTag("ses-1", "call-edit", "m-assistant");
         expect(tagId).toBeDefined();
 
-        // Apply as a synthetic edit_marker op (the smart-drops compression path).
+        // Smart-drops compression recognizes synthetic `edit_marker` operations.
         const did = applyPendingOperations(
             "ses-1",
             db,
@@ -295,14 +283,12 @@ describe("apply operations for tool drops", () => {
         const editPart = messages
             .flatMap((m) => m.parts)
             .find((p: any) => p.callID === "call-edit") as any;
-        // filePath preserved verbatim; diff clamped; output → canonical sentinel.
+        // The transform preserves `filePath`, clamps `diff`, and replaces `output` with the canonical sentinel.
         expect(editPart.state.input.filePath).toBe("/Users/me/proj/spec.md");
         expect(editPart.state.input.oldString.endsWith("...[truncated]")).toBe(true);
         expect(editPart.state.output).toBe(`[dropped \u00a7${tagId}\u00a7]`);
 
-        // Snapshot the frozen bytes, then replay via applyFlushedStatuses (the
-        // defer-pass path) on a FRESHLY re-tagged copy of the ORIGINAL message:
-        // it must reproduce the exact same bytes (cache-stable replay).
+        // `applyFlushedStatuses` must reproduce the execute-pass bytes when replaying the original message.
         const frozen = JSON.stringify(editPart);
 
         const replayMessages: MessageLike[] = [
@@ -675,8 +661,7 @@ describe("apply operations for tool drops", () => {
             expect(getTagById(db, "ses-1", userMsgTagId!)?.status).toBe("dropped");
 
             const text = (messages[0]?.parts[0] as { text: string }).text;
-            // ONE canonical placeholder — byte-identical regardless of role/content
-            // so it can never flip across passes and bust the prompt cache.
+            // Drops use one role- and content-independent placeholder so repeated passes preserve prompt-cache bytes.
             expect(text).toBe(`[dropped §${userMsgTagId}§]`);
         });
 
@@ -709,8 +694,7 @@ describe("apply operations for tool drops", () => {
 
             expect(didMutate).toBe(true);
             const text = (messages[0]?.parts[0] as { text: string }).text;
-            // Flushed-status replay produces the SAME canonical placeholder as the
-            // execute-pass drop — byte-identical, no flip across passes.
+            // `applyFlushedStatuses` produces the byte-identical placeholder used by execute-pass drops.
             expect(text).toBe(`[dropped §${userMsgTagId}§]`);
         });
 

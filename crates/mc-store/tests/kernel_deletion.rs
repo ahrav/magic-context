@@ -10,7 +10,7 @@ use mc_store::kernel::{
     CommitIntent, ConsumerAbandonment, DomainSpec, EligibilityDeniedReason, KernelStore,
     ProviderEgress, RepositoryProvenance, Sensitivity,
 };
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 
 fn intent(key: &str) -> CommitIntent {
@@ -1024,15 +1024,14 @@ fn deletion_accepts_the_evidence_id_the_caller_supplied_at_ingestion() {
     let root = tempfile::tempdir().unwrap();
     let store = KernelStore::open(root.path()).unwrap();
     seed_domain(&store);
-    let secret = "AKIAIOSFODNN7EXAMPLE";
-    let external_id = format!("evidence-{secret}");
-    let mut request = ingest_request("redacted-identity", b"redacted-identity");
+    let external_id = "evidence-caller-supplied".to_string();
+    let mut request = ingest_request("caller-identity", b"caller-identity");
     request.evidence_id = external_id.clone();
     let handle = store.ingest_artifact(request).unwrap();
 
     let deletion = store
         .delete_artifact(ArtifactDeletionRequest {
-            intent: intent("delete-redacted-identity"),
+            intent: intent("delete-caller-identity"),
             identity: ArtifactDeletionIdentity::EvidenceId(external_id),
             kind: ArtifactDeletionKind::Delete,
             operator_id: None,
@@ -1189,4 +1188,344 @@ fn a_conflicting_operation_key_leaves_no_durable_purge_record() {
         "a rejected purge left a durable intent record"
     );
     assert!(object_path(root.path(), &second.digest).exists());
+}
+
+#[test]
+fn a_foreign_receipt_replay_never_unlinks_the_artifact() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "foreign", b"foreign");
+    let request = delete_request("foreign", &handle.digest, ArtifactDeletionKind::Purge);
+
+    // A receipt for this exact intent that does not describe a deletion.
+    let connection = inspect(root.path());
+    let commit_seq: i64 = connection
+        .query_row("SELECT MAX(commit_seq) FROM commit_log", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO operation_receipts(
+                 receipt_id,producer,operation_key,request_digest,commit_seq,result_payload,created_at
+             ) VALUES ('foreign-receipt',?1,?2,?3,?4,CAST('unrelated-result' AS BLOB),1)",
+            params![
+                request.intent.producer,
+                request.intent.operation_key,
+                request.intent.request_digest,
+                commit_seq
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert_eq!(
+        store.delete_artifact(request).unwrap_err().kind(),
+        ArtifactErrorKind::ReferenceCommit
+    );
+
+    assert!(
+        object_path(root.path(), &handle.digest).exists(),
+        "a foreign receipt replay unlinked the artifact"
+    );
+    let connection = inspect(root.path());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_purge_tombstones WHERE artifact_digest=?1",
+                [&handle.digest],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert!(connection
+        .query_row(
+            "SELECT invalidated_commit_seq IS NULL FROM evidence_meta WHERE artifact_digest=?1",
+            [&handle.digest],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap());
+}
+
+#[test]
+fn purge_redactions_are_recorded_in_the_durable_ledger() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "ledger", b"ledger");
+    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let mut request = delete_request("ledger", &handle.digest, ArtifactDeletionKind::Purge);
+    request.operator_id = Some(format!("operator {secret}"));
+    request.target_locator = Some(format!("incident://{secret}"));
+    request.reason = Some(format!("leaked {secret}"));
+
+    store.delete_artifact(request).unwrap();
+
+    let recorded: i64 = inspect(root.path())
+        .query_row(
+            "SELECT COUNT(*) FROM durable_text_redactions WHERE field_name IN
+             ('operator_id','target_locator','reason')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        recorded > 0,
+        "redacted purge audit text left no ledger rows"
+    );
+}
+
+#[test]
+fn a_delete_receipt_cannot_authorize_a_purge_unlink() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "kind-bind", b"kind-bind");
+    let delete = delete_request("kind-bind", &handle.digest, ArtifactDeletionKind::Delete);
+    store.delete_artifact(delete.clone()).unwrap();
+
+    // Same digest becomes live again.
+    let readmitted = ingest(&store, "kind-bind-again", b"kind-bind");
+    assert_eq!(readmitted.digest, handle.digest);
+    assert!(object_path(root.path(), &handle.digest).exists());
+
+    // Purge reusing the Delete operation's intent: the barrier id is digest-derived
+    // and therefore identical, so only the kind distinguishes them.
+    let mut purge = delete.clone();
+    purge.kind = ArtifactDeletionKind::Purge;
+    purge.operator_id = Some("operator-1".to_string());
+    purge.target_locator = Some("incident://secret-1".to_string());
+    purge.reason = Some("secret".to_string());
+
+    assert_eq!(
+        store.delete_artifact(purge).unwrap_err().kind(),
+        ArtifactErrorKind::ReferenceCommit
+    );
+
+    assert!(
+        object_path(root.path(), &handle.digest).exists(),
+        "a Delete receipt authorized a Purge unlink"
+    );
+    let connection = inspect(root.path());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM artifact_purge_tombstones WHERE artifact_digest=?1",
+                [&handle.digest],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert!(connection
+        .query_row(
+            "SELECT invalidated_commit_seq IS NULL FROM evidence_meta WHERE object_id=?1",
+            ["object-kind-bind-again"],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap());
+}
+
+#[test]
+fn an_oversized_evidence_identity_is_rejected_before_lookup() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    ingest(&store, "bounded-id", b"bounded-id");
+
+    assert_eq!(
+        store
+            .delete_artifact(ArtifactDeletionRequest {
+                intent: intent("delete-oversized"),
+                identity: ArtifactDeletionIdentity::EvidenceId("e".repeat(4096)),
+                kind: ArtifactDeletionKind::Delete,
+                operator_id: None,
+                target_locator: None,
+                reason: None,
+                deleted_at: 42,
+            })
+            .unwrap_err()
+            .kind(),
+        ArtifactErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn abandoning_two_colliding_consumer_ids_in_one_commit_succeeds() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "collide", b"collide");
+    let barrier_consumer = "x";
+    store
+        .commit(intent("register-collide"), |envelope| {
+            envelope.register_outbox_consumer(barrier_consumer, 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+    let deletion = store
+        .delete_artifact(delete_request(
+            "collide",
+            &handle.digest,
+            ArtifactDeletionKind::Delete,
+        ))
+        .unwrap();
+    // A consumer whose id is the delimiter-join of the first consumer and the barrier.
+    let colliding = format!("{barrier_consumer}:{}", deletion.barrier_id);
+    store
+        .commit(intent("register-colliding"), |envelope| {
+            envelope.register_outbox_consumer(&colliding, 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+
+    store
+        .commit(intent("abandon-both"), |envelope| {
+            for id in [barrier_consumer, colliding.as_str()] {
+                envelope.abandon_outbox_consumer(
+                    id,
+                    ConsumerAbandonment {
+                        operator_id: "operator-1".to_string(),
+                        reason: "retired".to_string(),
+                        abandoned_at: 20,
+                        barrier_id: None,
+                    },
+                )?;
+            }
+            Ok("abandoned".to_string())
+        })
+        .unwrap();
+
+    assert!(
+        store
+            .deletion_barrier(&deletion.barrier_id)
+            .unwrap()
+            .cleared
+    );
+}
+
+#[test]
+fn purging_after_a_completed_delete_barrier_mints_a_new_barrier() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "purge-after-clear", b"purge-after-clear");
+    store
+        .commit(intent("register-search"), |envelope| {
+            envelope.register_outbox_consumer("search", 1)?;
+            Ok("registered".to_string())
+        })
+        .unwrap();
+    let deletion = store
+        .delete_artifact(delete_request(
+            "soft-delete",
+            &handle.digest,
+            ArtifactDeletionKind::Delete,
+        ))
+        .unwrap();
+    store
+        .acknowledge_outbox("search", deletion.commit_seq, 5)
+        .unwrap();
+    assert!(
+        store
+            .deletion_barrier(&deletion.barrier_id)
+            .unwrap()
+            .cleared,
+        "the soft deletion barrier must complete before the purge"
+    );
+
+    // The digest is never re-ingested, so the purge sees no live objects and the
+    // only barrier for the digest is the completed one.
+    let purge = store
+        .delete_artifact(delete_request(
+            "hard-purge",
+            &handle.digest,
+            ArtifactDeletionKind::Purge,
+        ))
+        .unwrap();
+
+    assert_ne!(
+        purge.barrier_id, deletion.barrier_id,
+        "a purge must not reuse the completed barrier's primary key"
+    );
+    assert!(
+        !object_path(root.path(), &handle.digest).exists(),
+        "the purge committed its intent but left the artifact bytes in place"
+    );
+}
+
+#[test]
+fn a_purge_identity_is_validated_before_its_intent_is_durable() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "identity-gate", b"identity-gate");
+    let log = root.path().join("purge-intent.jsonl");
+    let before = fs::read_to_string(&log).unwrap_or_default();
+
+    for mutate in [
+        (|request: &mut ArtifactDeletionRequest| request.intent.producer = String::new())
+            as fn(&mut ArtifactDeletionRequest),
+        |request: &mut ArtifactDeletionRequest| request.intent.operation_key = String::new(),
+        |request: &mut ArtifactDeletionRequest| {
+            request.intent.producer = "producer AKIAIOSFODNN7EXAMPLE".to_string();
+        },
+        |request: &mut ArtifactDeletionRequest| {
+            request.intent.operation_key = "key AKIAIOSFODNN7EXAMPLE".to_string();
+        },
+    ] {
+        let mut request =
+            delete_request("identity-gate", &handle.digest, ArtifactDeletionKind::Purge);
+        mutate(&mut request);
+        assert_eq!(
+            store.delete_artifact(request).unwrap_err().kind(),
+            ArtifactErrorKind::InvalidInput
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap_or_default(),
+            before,
+            "a rejected purge left a durable intent behind"
+        );
+    }
+
+    assert!(object_path(root.path(), &handle.digest).exists());
+}
+
+#[test]
+fn a_purge_retires_an_expired_live_reservation() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "stranded", b"stranded");
+
+    // A crash between the replayed-classification commit and the best-effort
+    // release leaves a `Live` reservation whose lease has since expired.
+    inspect(root.path())
+        .execute(
+            "INSERT INTO artifact_ingestion_reservations(
+                 reservation_id,artifact_digest,artifact_reference,state,writer_epoch,
+                 created_at,heartbeat_at,lease_expires_at
+             ) VALUES ('stranded-reservation',?1,?2,'Live',1,1,1,2)",
+            rusqlite::params![
+                handle.digest,
+                format!("objects/{}/{}", &handle.digest[..2], &handle.digest[2..])
+            ],
+        )
+        .unwrap();
+
+    let purge = store
+        .delete_artifact(delete_request(
+            "stranded",
+            &handle.digest,
+            ArtifactDeletionKind::Purge,
+        ))
+        .unwrap();
+
+    assert_eq!(purge.digest, handle.digest);
+    assert!(
+        !object_path(root.path(), &handle.digest).exists(),
+        "the stranded reservation blocked the purge tombstone"
+    );
 }

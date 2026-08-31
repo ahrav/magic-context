@@ -1,23 +1,18 @@
 /**
- * Resolve the newest effective prompt context (agent + model + variant) for a
- * session by reading recent messages from the OpenCode HTTP API.
+ * The resolver reads recent OpenCode HTTP API messages to determine the agent, model, and variant.
  *
- * WHY: a Channel 2 ceiling nudge sends a synthetic user message via
- * `promptAsync` with `noReply:false` (it DOES trigger an assistant turn).
- * OpenCode's `createUserMessage` resolves variant relative to the chosen
- * agent; passing model alone makes OpenCode pick the default agent whose model
- * check then fails, bypassing the active variant and busting the provider
- * prefix cache the prior turn warmed. So we pass agent + model + variant
- * explicitly, mirroring the resolution AFT/opencode-xtra use for their wake
+ * A Channel 2 ceiling nudge sends a synthetic user message through `promptAsync`.
+ * `promptAsync` with `noReply: false` triggers an assistant turn.
+ * `createUserMessage` resolves variants relative to the selected agent.
+ * Passing only a model makes OpenCode select the default agent.
+ * The default agent's model check fails, bypassing the active variant and invalidating the warmed provider prefix cache.
+ * Passing the agent, model, and variant prevents OpenCode from selecting the default agent.
  * notifications.
  *
- * Walk newest→oldest and merge field-by-field so the newest context-bearing
- * message wins while older messages only fill fields it did not provide. Read
- * BOTH the flat shape (`info.providerID`) used by AssistantMessage and the
- * nested shape (`info.model.providerID`) used by UserMessage.
+ * The resolver merges messages newest-to-oldest so older messages fill only missing fields.
  *
- * Bounded via `query.limit` — the legacy `/session/{id}/message` endpoint
- * hydrates the ENTIRE session without it (30k-45k messages on large sessions).
+ * `query.limit` prevents the legacy endpoint from hydrating the entire session.
+ * Without `query.limit`, the legacy endpoint hydrates the entire session, which can contain 30k–45k messages.
  */
 
 export interface ResolvedPromptContext {

@@ -185,7 +185,7 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(dreamer.prompt).toBeUndefined();
         expect(dreamer.permission).toBeUndefined();
         expect(dreamer.tools).toBeUndefined();
-        // Benign fields survive — a repo may tune its own dreamer model/cadence.
+        // Project configuration may set dreamer.model and dreamer.schedule.
         expect(dreamer.model).toBe("claude-x");
         expect(dreamer.schedule).toBe("0 3 * * *");
 
@@ -202,9 +202,6 @@ describe("stripUnsafeProjectConfigFields", () => {
     });
 
     it("strips sidekick.system_prompt (reprogramming vector via /ctx-aug)", () => {
-        // system_prompt takes precedence over the built-in prompt at
-        // sidekick/agent.ts, so leaving it unstripped reopens the exact
-        // reprogramming vector `prompt` closes.
         const raw: Record<string, unknown> = {
             sidekick: {
                 model: "claude-x",
@@ -226,7 +223,6 @@ describe("stripUnsafeProjectConfigFields", () => {
         const warnings = stripUnsafeProjectConfigFields(raw);
         const compaction = raw.compaction as Record<string, unknown>;
         expect("enabled" in compaction).toBe(false);
-        // Block not deleted wholesale — an empty object remains.
         expect(raw.compaction).toEqual({});
         expect(raw.dreamer).toEqual({ model: "x" });
         expect(warnings.some((w) => w.includes("compaction.enabled"))).toBe(true);
@@ -353,9 +349,6 @@ describe("dropInheritedEmbeddingKeyOnRedirect", () => {
     });
 
     it("keeps the key when the project repeats the user's OWN endpoint (model-only change)", () => {
-        // A project that names the same endpoint as the user (e.g. only to
-        // override `model`) is NOT a redirect — the key was always destined for
-        // that endpoint. Trailing-slash and case differences must not count.
         const userRaw = { embedding: { endpoint: "https://user/v1/", api_key: "USER-SECRET" } };
         const projectRaw = { embedding: { endpoint: "https://USER/v1", model: "other-model" } };
         const merged = {

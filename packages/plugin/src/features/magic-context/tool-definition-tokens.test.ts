@@ -37,7 +37,6 @@ describe("tool-definition-tokens", () => {
         );
         const total = getMeasuredToolDefinitionTokens("anthropic", "claude-sonnet-4.7", "sisyphus");
         expect(total).toBeGreaterThan(0);
-        // Description + serialized params should both contribute.
         expect(total).toBeGreaterThan(5);
     });
 
@@ -51,8 +50,6 @@ describe("tool-definition-tokens", () => {
         const total = getMeasuredToolDefinitionTokens("p", "m", "a") ?? 0;
         expect(total).toBeGreaterThan(0);
 
-        // Removing one tool via a snapshot helper doesn't exist — idempotent
-        // re-record should replace, not add.
         recordToolDefinition("p", "m", "a", "bash", "Run a shell command", {
             type: "object",
         });
@@ -108,7 +105,7 @@ describe("tool-definition-tokens", () => {
     test("handles unserializable parameters without throwing", () => {
         const circular: Record<string, unknown> = {};
         circular.self = circular;
-        // Should not throw even when JSON.stringify would fail.
+        // recordToolDefinition does not throw when JSON.stringify fails.
         recordToolDefinition("p", "m", "a", "bad-tool", "desc", circular);
         const total = getMeasuredToolDefinitionTokens("p", "m", "a") ?? 0;
         // Description still contributes even if params can't be serialized.
@@ -134,7 +131,6 @@ describe("tool-definition-tokens persistence (bug #2)", () => {
         const db = createTestDb();
         try {
             setDatabase(db);
-            // Record a measurement: this writes to both in-memory map and SQLite.
             recordToolDefinition(
                 "anthropic",
                 "claude-sonnet-4.7",
@@ -150,15 +146,14 @@ describe("tool-definition-tokens persistence (bug #2)", () => {
             );
             expect(beforeReset).toBeGreaterThan(0);
 
-            // Simulate a plugin restart: in-memory map cleared but SQLite
-            // retains the row. Reset also drops the persistenceDb reference,
-            // matching the cold-start state before openDatabase() rewires it.
+            // __resetToolDefinitionMeasurements() clears the in-memory map without deleting the SQLite row.
+            // resetMeasurements() preserves the SQLite row and clears persistenceDb.
             __resetToolDefinitionMeasurements();
             expect(
                 getMeasuredToolDefinitionTokens("anthropic", "claude-sonnet-4.7", "sisyphus"),
             ).toBeUndefined();
 
-            // Rehydrate from SQLite. The measurement should be restored.
+            // SQLite rehydration restores the persisted measurement.
             loadToolDefinitionMeasurements(db);
             const afterLoad = getMeasuredToolDefinitionTokens(
                 "anthropic",
@@ -176,8 +171,7 @@ describe("tool-definition-tokens persistence (bug #2)", () => {
         try {
             setDatabase(db);
             recordToolDefinition("p", "m", "a", "bash", "v1 description", { v: 1 });
-            // Read the persisted row directly. We rely on token_count, not the
-            // in-memory map — that's the whole point of this idempotency test.
+            // The query verifies persistence independently of the in-memory map.
             const firstRow = db
                 .prepare(
                     "SELECT token_count FROM tool_definition_measurements WHERE provider_id=? AND model_id=? AND agent_name=? AND tool_id=?",
@@ -187,8 +181,7 @@ describe("tool-definition-tokens persistence (bug #2)", () => {
             const firstCount = firstRow?.token_count ?? 0;
             expect(firstCount).toBeGreaterThan(0);
 
-            // Re-record with a much longer description → larger token count.
-            // INSERT OR REPLACE should update the same row, not insert a new one.
+            // Re-recording the same key must retain one row with the latest token_count.
             recordToolDefinition("p", "m", "a", "bash", "v2 description ".repeat(50), { v: 2 });
 
             const allRows = db
@@ -210,10 +203,7 @@ describe("tool-definition-tokens persistence (bug #2)", () => {
     });
 
     test("recordToolDefinition without setDatabase still updates in-memory map", () => {
-        // Cold path: setDatabase has not been called yet (e.g. during plugin
-        // bootstrap before openDatabase has wired the DB). The call must not
-        // throw, and the in-memory map must still be updated so the live
-        // sidebar shows the correct value before the next restart.
+        // Before setDatabase(), recording must update the in-memory map without throwing.
         recordToolDefinition("p", "m", "a", "bash", "desc", {});
         const total = getMeasuredToolDefinitionTokens("p", "m", "a") ?? 0;
         expect(total).toBeGreaterThan(0);
@@ -226,10 +216,7 @@ describe("tool-definition-tokens fingerprint skip", () => {
     });
 
     test("repeat fire with identical inputs does NOT write to SQLite", () => {
-        // Verifies the hot-path skip: tool.definition fires ~58×/flight and
-        // tool descriptions/params almost never change between flights, so we
-        // skip stringify+tokenize+SQLite when the fingerprint matches the
-        // previous fire's value. SQLite write side-effects are the
+        // Matching fingerprints skip serialization, tokenization, and SQLite writes.
         // observable proof.
         const db = createTestDb();
         try {
@@ -244,9 +231,7 @@ describe("tool-definition-tokens fingerprint skip", () => {
                     .get("bash") as { recorded_at: number }
             ).recorded_at;
 
-            // Mutate the row's recorded_at directly so we can detect a
-            // second write — INSERT OR REPLACE would update it to a new
-            // Date.now() if the skip is broken.
+            // The test mutates recorded_at to detect an unexpected SQLite write.
             db.prepare("UPDATE tool_definition_measurements SET recorded_at=? WHERE tool_id=?").run(
                 1, // Sentinel: any later write will overwrite this.
                 "bash",
@@ -264,7 +249,6 @@ describe("tool-definition-tokens fingerprint skip", () => {
                     .get("bash") as { recorded_at: number }
             ).recorded_at;
             expect(recordedAtAfterSecond).toBe(1); // Sentinel preserved → skip held.
-            // Sanity: first write happened at all.
             expect(recordedAtAfterFirst).toBeGreaterThan(1);
         } finally {
             closeQuietly(db);
@@ -281,7 +265,7 @@ describe("tool-definition-tokens fingerprint skip", () => {
                 "bash",
             );
 
-            // Description length changes → fingerprint differs → re-measure.
+            // A changed description produces a new fingerprint and remeasures the tool.
             recordToolDefinition("p", "m", "a", "bash", "v2 description longer", {
                 type: "object",
             });
@@ -302,9 +286,7 @@ describe("tool-definition-tokens fingerprint skip", () => {
             recordToolDefinition("p", "m", "a", "bash", "desc", { type: "object" });
             const tokensBefore = getMeasuredToolDefinitionTokens("p", "m", "a") ?? 0;
 
-            // Same description length but parameter top-level keys change →
-            // fingerprint differs → re-measure (token count grows because
-            // serialized object got bigger).
+            // Changing parameter keys changes the fingerprint and triggers remeasurement.
             recordToolDefinition("p", "m", "a", "bash", "desc", {
                 type: "object",
                 properties: { command: { type: "string" } },
@@ -353,8 +335,8 @@ describe("tool-definition-tokens fingerprint skip", () => {
         try {
             setDatabase(db);
             recordToolDefinition("p", "m", "a", "bash", "desc", { type: "object" });
-            // Different tool with identical inputs — must NOT be skipped
-            // because the fingerprint map is keyed by toolID inside each
+            // A different toolID with identical inputs must not skip measurement.
+            // The fingerprint map is scoped by toolID within each composite key.
             // {provider,model,agent} key.
             recordToolDefinition("p", "m", "a", "edit", "desc", { type: "object" });
             const snapshot = getToolDefinitionSnapshot();
@@ -365,8 +347,8 @@ describe("tool-definition-tokens fingerprint skip", () => {
     });
 
     test("skip is per-key — different agent always measured", () => {
-        // The (provider,model,agent) composite key isolates measurements,
-        // so the same toolID under a different agent must not be skipped.
+        // The (provider, model, agent) composite key isolates measurements.
+        // A different agent triggers measurement for the same toolID.
         recordToolDefinition("p", "m", "agentA", "bash", "desc", { type: "object" });
         recordToolDefinition("p", "m", "agentB", "bash", "desc", { type: "object" });
         const a = getMeasuredToolDefinitionTokens("p", "m", "agentA") ?? 0;
@@ -376,15 +358,14 @@ describe("tool-definition-tokens fingerprint skip", () => {
     });
 
     test("__resetToolDefinitionMeasurements clears fingerprints too", () => {
-        // After reset, the very next fire must NOT be wrongly skipped just
-        // because the same {key, toolID, fingerprint} happened pre-reset.
+        // Reset clears fingerprints, so the next fire is not skipped.
         const db = createTestDb();
         try {
             setDatabase(db);
             recordToolDefinition("p", "m", "a", "bash", "desc", { type: "object" });
             __resetToolDefinitionMeasurements();
-            // setDatabase again (reset drops the DB ref) and re-fire — must
-            // produce a real measurement, not a no-op.
+            // resetMeasurements clears the database reference; call setDatabase() before re-firing to persist the measurement.
+            // After setDatabase(), re-firing records a measurement rather than skipping it.
             setDatabase(db);
             recordToolDefinition("p", "m", "a", "bash", "desc", { type: "object" });
             const total = getMeasuredToolDefinitionTokens("p", "m", "a") ?? 0;

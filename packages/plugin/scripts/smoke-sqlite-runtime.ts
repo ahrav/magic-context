@@ -1,6 +1,4 @@
-// The script smoke-tests SQLite runtime gates and direct-format
-// classification: off-path source probe, WAL-reset-safety gate, connection
-// contract, and the direct test-database factory. Runs under Bun AND Node.
+// The script runs under Bun and Node.
 // The .ts import extensions support Node's type-stripping loader.
 //   bun packages/plugin/scripts/smoke-sqlite-runtime.ts
 //   node packages/plugin/scripts/smoke-sqlite-runtime.ts

@@ -5,15 +5,20 @@ mod read;
 
 use std::fmt;
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use super::{CommitIntent, RepositoryProvenance, Sensitivity};
-use crate::kernel::durable_fs::open_or_create_secure_directory;
+use crate::kernel::durable_fs::{
+    classify_io, open_or_create_secure_directory, open_secure_directory, StorageError,
+};
 use crate::kernel::{KernelError, KernelStore};
 
 pub(super) const DEFAULT_ARTIFACT_CAP: u64 = 4 * 1024 * 1024 * 1024;
 pub(super) const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const MAX_PAYLOAD_DETECTIONS: usize = 4096;
+pub(super) const MAX_TEXT_FIELD_BYTES: usize = 1024;
 
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +153,8 @@ pub enum ArtifactErrorKind {
     AlignmentRebuild,
     ReclaimInProgress,
     UnredactableSecret,
+    DetectionLimit,
+    TextFieldTooLong,
     InvalidInput,
     PurgeIntent,
     PurgeUnlinkPending,
@@ -262,6 +269,14 @@ impl fmt::Display for ArtifactError {
             }
             ArtifactErrorKind::UnredactableSecret => formatter
                 .write_str("artifact payload holds a recognized secret that cannot be redacted"),
+            ArtifactErrorKind::TextFieldTooLong => write!(
+                formatter,
+                "artifact text field exceeds {MAX_TEXT_FIELD_BYTES} bytes"
+            ),
+            ArtifactErrorKind::DetectionLimit => write!(
+                formatter,
+                "artifact payload exceeds {MAX_PAYLOAD_DETECTIONS} recognized secrets"
+            ),
             ArtifactErrorKind::InvalidInput => formatter.write_str("artifact input is invalid"),
             ArtifactErrorKind::PurgeIntent => {
                 formatter.write_str("artifact purge intent could not be made durable")
@@ -311,11 +326,22 @@ pub(super) fn prepare_layout(root: &Path) -> Result<PathBuf, KernelError> {
 }
 
 impl KernelStore {
-    pub(super) fn artifact_object_path(&self, digest: &str) -> PathBuf {
-        self.artifacts_path
-            .join("objects")
-            .join(&digest[..2])
-            .join(&digest[2..])
+    /// A same-UID process can replace `artifacts` or `objects` with a symlink
+    /// after the store is open, so neither is trusted as a path component.
+    pub(super) fn open_objects_directory(&self) -> Result<File, StorageError> {
+        self.open_artifacts_subdirectory("objects")
+    }
+
+    pub(super) fn open_artifacts_subdirectory(&self, name: &str) -> Result<File, StorageError> {
+        let Some(store_root) = self.artifacts_path.parent() else {
+            return Err(classify_io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact root has no parent directory",
+            )));
+        };
+        let root = File::open(store_root).map_err(classify_io)?;
+        let artifacts = open_secure_directory(&root, "artifacts")?;
+        open_secure_directory(&artifacts, name)
     }
 
     pub(super) fn cas_is_failed(&self) -> bool {
@@ -328,14 +354,12 @@ impl KernelStore {
 
     pub(super) fn map_cas_storage_error(
         &self,
-        error: crate::kernel::durable_fs::StorageError,
+        error: StorageError,
         non_capacity_kind: ArtifactErrorKind,
     ) -> ArtifactError {
         match error {
-            crate::kernel::durable_fs::StorageError::Exhausted(_) => {
-                ArtifactError::new(ArtifactErrorKind::StorageExhausted)
-            }
-            crate::kernel::durable_fs::StorageError::Other(_) => {
+            StorageError::Exhausted(_) => ArtifactError::new(ArtifactErrorKind::StorageExhausted),
+            StorageError::Other(_) => {
                 self.latch_cas_failure();
                 ArtifactError::new(non_capacity_kind)
             }
@@ -346,6 +370,18 @@ impl KernelStore {
         self.latch_cas_failure();
         ArtifactError::new(kind)
     }
+}
+
+pub(super) fn read_capped(source: impl std::io::Read) -> std::io::Result<Option<Vec<u8>>> {
+    let limit = u64::try_from(MAX_PAYLOAD_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    source.take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_PAYLOAD_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 pub(super) fn is_artifact_digest(value: &str) -> bool {
@@ -393,7 +429,7 @@ mod lattice_tests {
 
     #[test]
     fn unrecognized_stored_classes_read_back_restrictive() {
-        assert_eq!(Sensitivity::from_stored("internal"), Sensitivity::Sensitive);
+        assert_eq!(Sensitivity::from_stored("internal"), Sensitivity::Secret);
         assert_eq!(
             ProviderEgress::from_stored("internal"),
             ProviderEgress::LocalOnly

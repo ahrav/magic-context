@@ -1,17 +1,11 @@
 /**
- * Generate the frozen smart-note evaluation characterization golden.
  *
- * Captures CURRENT file-authority lifecycle behavior (transition writes,
- * schedule math, phase selection) by driving the live TS helpers against an
- * in-memory SQLite notes table with a frozen clock and pinned timezone. The
- * TypeScript reducer (evaluation-state.ts) and the Rust reducer
- * (crates/mc-module/src/smart_note_evaluation.rs) both replay this fixture.
  *
- * Run: bun crates/mc-module/gen/gen-smart-note-evaluation-golden.ts
+ * The command `bun crates/mc-module/gen/gen-smart-note-evaluation-golden.ts` runs this generator.
  *
- * Regenerating must produce no diff; any semantic change requires review.
+ * Regeneration must produce no diff.
  */
-// Pin the timezone BEFORE any Date use — cron matching reads local civil time.
+// The process must set `TZ` before any `Date` use because cron matching reads local civil time.
 process.env.TZ = "America/Los_Angeles";
 
 import { Database } from "bun:sqlite";
@@ -42,8 +36,7 @@ const {
 const { nextSmartNoteCheckDueAt } = schedule;
 const { parseSmartNoteManifest } = types;
 
-// Do not edit the legacy writers below: reducers must match this behavior,
-// never the reverse.
+// Reducers must match the legacy writers, not conversely.
 
 const SMART_NOTE_CHECK_POLICY_VERSION =
     types.SMART_NOTE_CHECK_POLICY_VERSION as number;
@@ -242,9 +235,7 @@ function markNoteChecked(db: Database, noteId: number): void {
 }
 
 // ---------------------------------------------------------------------------
-// Constants frozen into the fixture. Values that live as private consts in
-// evaluate-smart-notes.ts / runner.ts are recorded literally here; the Rust
-// port asserts equality against these.
+// The fixture records constants that are private in the TypeScript implementations.
 const CONSTANTS = {
     policy_version: types.SMART_NOTE_CHECK_POLICY_VERSION as number,
     floor_ms: types.SMART_NOTE_CHECK_FLOOR_MS as number,
@@ -252,22 +243,19 @@ const CONSTANTS = {
     default_interval_ms: types.SMART_NOTE_CHECK_DEFAULT_INTERVAL_MS as number,
     max_staleness_ms: types.SMART_NOTE_CHECK_MAX_STALENESS_MS as number,
     liveness_recheck_ms: types.SMART_NOTE_CHECK_LIVENESS_RECHECK_MS as number,
-    // evaluate-smart-notes.ts private caps
     max_compile_per_run: 5,
     max_fallback_per_run: 3,
     max_liveness_per_run: 3,
     max_compilation_failures: 3,
-    // runner.ts private caps
     default_max_checks: 10,
     max_failures_before_reauthor: 3,
-    // storage.ts backoffMs(n) = min(24h, 5 * 2^(n-1) minutes)
     backoff_minutes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) =>
         Math.min(24 * 60, 5 * 2 ** Math.max(0, n - 1)),
     ),
 };
 
 // ---------------------------------------------------------------------------
-// In-memory notes table covering every column the live helpers touch.
+// The in-memory notes table includes every column the live helpers access.
 function newDb(): Database {
     const db = new Database(":memory:");
     db.exec(`CREATE TABLE notes (
@@ -307,7 +295,6 @@ function newDb(): Database {
     return db;
 }
 
-// Lifecycle projection captured for pre/expected state.
 const LIFECYCLE_COLUMNS = [
     "status",
     "ready_at",
@@ -421,8 +408,7 @@ function withFrozenClock<T>(now: number, fn: () => T): T {
 }
 
 // ---------------------------------------------------------------------------
-// Transition cases. Each case replays the exact helper sequence production
-// code (evaluate-smart-notes.ts / runner.ts) runs for one phase outcome.
+// Each transition case replays the helper sequence that production runs for one phase outcome.
 
 interface TransitionCase {
     id: string;
@@ -444,7 +430,6 @@ const ARTIFACT = {
     compiled_check: "function check(cap) { return { met: false }; }",
     manifest_json: JSON.stringify(ARTIFACT_MANIFEST),
     check_hash: "a".repeat(64),
-    // Transition vectors use the test process's timezone, so check_cron must
     // be timezone-invariant.
     check_cron: "* * * * *",
 };
@@ -527,7 +512,6 @@ const compileOutcomeMet = {
 };
 const compileOutcomeFalse = { ...compileOutcomeMet, kind: "compiled_false" };
 
-// --- compile phase
 transitionCase({
     id: "compile_met_fresh",
     phase: "compile",
@@ -592,7 +576,6 @@ transitionCase({
     apply: (db, id, now) => markSmartNoteCompilationFailure(db, id, now, 3),
 });
 
-// --- due phase
 const dueSeed = (id: number, extra: Partial<NoteSeed> = {}): NoteSeed => ({
     id,
     compiled_check: ARTIFACT.compiled_check,
@@ -722,7 +705,6 @@ transitionCase({
     apply: (db, id, now) => markCompiledCheckNetworkFailure(db, id, now, 3),
 });
 
-// --- liveness phase
 const livenessSeed = (id: number, extra: Partial<NoteSeed> = {}): NoteSeed =>
     dueSeed(id, {
         check_false_since_at: BASE - CONSTANTS.max_staleness_ms - 3_600_000,
@@ -782,7 +764,6 @@ transitionCase({
     },
 });
 
-// --- fallback phase
 transitionCase({
     id: "fallback_met",
     phase: "fallback",
@@ -807,8 +788,6 @@ transitionCase({
 });
 
 // ---------------------------------------------------------------------------
-// Schedule cases: nextSmartNoteCheckDueAt in the pinned timezone, including
-// DST spring-forward / fall-back boundaries, clamps, and jitter determinism.
 
 interface ScheduleCase {
     id: string;
@@ -891,8 +870,8 @@ scheduleCase(
     42,
     "c".repeat(64),
 );
-// America/Los_Angeles spring-forward day: the 02:00 local hour does not exist,
-// so a 02:30 schedule must land on the next day's real 02:30.
+// On spring-forward day in America/Los_Angeles, 02:00–02:59 local time does not exist.
+// A 02:30 schedule skipped by spring-forward must next run at 02:30 the following day.
 scheduleCase(
     "dst_spring_forward_skipped_hour",
     "30 2 * * *",
@@ -907,8 +886,8 @@ scheduleCase(
     42,
     "c".repeat(64),
 );
-// America/Los_Angeles fall-back day: the 01:00 local hour repeats; the search
-// must return the first matching instant, not double-fire the repeated hour.
+// On fall-back day in America/Los_Angeles, 01:00–01:59 local time repeats.
+// Cron matching must return the first matching instant and must not double-fire the repeated hour.
 scheduleCase(
     "dst_fall_back_repeated_hour",
     "30 1 * * *",
@@ -938,7 +917,7 @@ scheduleCase(
     42,
     "c".repeat(64),
 );
-// Jitter determinism across ids/hashes.
+// Jitter is deterministic for each note ID and hash.
 scheduleCase(
     "jitter_varies_by_note_id",
     "0 * * * *",
@@ -956,7 +935,6 @@ scheduleCase(
 scheduleCase("jitter_null_hash", "0 * * * *", "2026-06-15T17:23:45Z", 42, null);
 
 // ---------------------------------------------------------------------------
-// Selection cases: phase eligibility, ordering, caps, retina handoff.
 
 interface SelectionCase {
     id: string;

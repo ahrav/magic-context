@@ -125,9 +125,7 @@ function virtualTime(randomValues: number[] = [0]): {
             sleeps.push(ms);
             time += ms;
         },
-        // Each test declares exactly the draws its scenario consumes; an
-        // extra draw is a changed jitter schedule the test must account
-        // for, not a silent repeat of the last declared value.
+        // Tests must declare every `randomValues` draw so an extra draw exposes a jitter-schedule change.
         random: () => {
             if (randomIndex >= randomValues.length) {
                 throw new Error(
@@ -181,18 +179,12 @@ describe("SynapseEmbeddingProvider", () => {
             false,
         ]);
         expect(demands).toBe(1);
-        // The demand waits on a shared cold start, not on one query: a
-        // per-query deadline would detach every waiter mid-startup and demote
-        // the lane while startup still succeeds.
+        // The cold-start demand uses a shared deadline of at least 60,000 ms; per-query deadlines would detach waiters before startup completes.
         expect(deadlines[0]).toBeGreaterThanOrEqual(60_000);
     });
 
     it("does not demand a managed start for an already-aborted caller", async () => {
-        // Creating the initialization flight is what triggers the demand, and the
-        // demand is not given the caller's signal — so an already-cancelled query
-        // could stage and start mc-host, resolve the lane, and arm backfill with
-        // no live waiter. Detaching from an existing flight is different: another
-        // caller owns it.
+        // An already-aborted caller must not create an initialization flight because creating one triggers an uncancelable demand.
         let demands = 0;
         const provider = new SynapseEmbeddingProvider({
             projectRoot: "/repo",
@@ -226,10 +218,7 @@ describe("SynapseEmbeddingProvider", () => {
     });
 
     it("does not re-demand when a managed demand succeeds without a daemon identity", async () => {
-        // A success that omits the identity certifies no incarnation, so the
-        // lane cannot dial. That is a failed demand and must arm the same
-        // backoff; otherwise each later call spawns another native lifecycle
-        // start and storage probe at request rate.
+        // A demand success without an identity cannot dial, so it enters demand backoff.
         let demands = 0;
         const provider = new SynapseEmbeddingProvider({
             projectRoot: "/repo",
@@ -298,11 +287,11 @@ describe("SynapseEmbeddingProvider", () => {
             projectRoot: "/repo",
             session: "fence-required",
             clientFactory: async () => client,
-            // A lifecycle owner is part of the scenario, not scaffolding: it is
-            // the only writer of a certified identity, so a cleared identity is
-            // reachable only on a lane that has one. The injected factory keeps
-            // the origin non-managed until the state below is installed, so this
-            // owner is never invoked.
+            // Injected factories are non-managed, so they cannot invoke a lifecycle owner.
+            // Injected factories are non-managed, so they cannot invoke a lifecycle owner.
+            // Injected factories are non-managed, so they cannot invoke a lifecycle owner.
+            // Injected factories are non-managed, so they cannot invoke a lifecycle owner.
+            // Injected factories are non-managed, so they cannot invoke a lifecycle owner.
             demandStart: async () => ({
                 ok: true,
                 reason: "started",
@@ -312,9 +301,9 @@ describe("SynapseEmbeddingProvider", () => {
         });
         expect(await provider.initialize()).toBe(true);
 
-        // Reproduce the post-rotation state the failure handler installs: the
-        // lane is managed and its certified identity has been cleared. An
-        // omitted expectation would publish unfenced onto the rotated daemon.
+        // The setup reproduces the post-rotation state the failure handler installs: the lane is managed and its certified identity is cleared.
+        // An omitted expectation would publish unfenced onto the rotated daemon.
+        // An omitted expectation would publish unfenced onto the rotated daemon.
         const internals = provider as unknown as {
             connectionOrigin: string;
             compatibleDaemonId: Uint8Array | null;
@@ -323,16 +312,13 @@ describe("SynapseEmbeddingProvider", () => {
         internals.compatibleDaemonId = null;
         const published = client.requests.length;
 
-        // `embed` reports a failed lane as null; the load-bearing assertion is
-        // that no request reached the wire without an expectation.
+        // `embed` returns `null` for a failed lane; no request reaches the wire without an expectation.
         expect(await provider.embed("hello")).toBeNull();
         expect(client.requests.length).toBe(published);
     });
 
     it("dials a managed-default lane that has no lifecycle owner to certify it", async () => {
-        // With no owner configured the lane is dial-only, and no identity is
-        // ever certified, so requiring one would refuse the very first
-        // discovery call against an already-running daemon.
+        // A lane without an owner dials an already-running daemon before any identity is certified.
         const client = new MockSynapseClient();
         const provider = new SynapseEmbeddingProvider({
             projectRoot: "/repo",
@@ -352,7 +338,6 @@ describe("SynapseEmbeddingProvider", () => {
         const discovery = client.requests.find((entry) => entry.method === "models.list");
         expect(discovery).toBeDefined();
         // Nothing certified an incarnation, so the call carries no expectation
-        // and the daemon's own handshake is the only fence available.
         expect(discovery?.expectedDaemonId).toBeUndefined();
     });
 
@@ -396,10 +381,8 @@ describe("SynapseEmbeddingProvider", () => {
         await Promise.resolve();
         await Promise.resolve();
 
-        // A sibling that already re-established the fence and is dispatching
-        // against it keeps that identity while this demand is in flight. Erasing
-        // it here would fail the sibling's resubmission on a fence it had already
-        // proved, and its one restart budget is already spent.
+        // An in-flight demand must not erase a dispatching sibling's re-established identity.
+        // An in-flight demand must not erase a dispatching sibling's re-established identity.
         expect(demands).toBe(1);
         expect(internals.initialized).toBe(false);
         expect(internals.compatibleDaemonId).toEqual(certified);
@@ -429,9 +412,6 @@ describe("SynapseEmbeddingProvider", () => {
         internals.connectionOrigin = "managed-default";
         internals.compatibleDaemonId = rotated;
 
-        // Two operations straddle one rotation: a sibling finishes
-        // re-certifying and installs the replacement identity while this
-        // attempt's request against the rotated generation is still failing.
         client.call = async <Response = unknown>(
             _module: string,
             method: string,
@@ -446,8 +426,6 @@ describe("SynapseEmbeddingProvider", () => {
         };
 
         // The late failure is evidence about the rotated identity alone.
-        // Clearing the replacement would make the sibling's next call refuse
-        // for want of a certified identity after its restart budget is spent.
         expect(await provider.embed("hello")).toBeNull();
         expect(internals.compatibleDaemonId).toEqual(replacement);
         expect(internals.initialized).toBe(true);
@@ -592,10 +570,6 @@ describe("SynapseEmbeddingProvider", () => {
             }
             return { vector: [1, 2, 3], fingerprint: "fp-rotated", table_epoch: 1 } as Response;
         };
-        // The routing probe pins model, fingerprint, and epoch but not dims —
-        // the live catalog omits them — so this provider must rediscover before
-        // its first call while its registration's destination rows are already
-        // keyed to the pinned lane identity.
         const provider = new SynapseEmbeddingProvider({
             connectionFile: "fixture",
             projectRoot: "/repo",
@@ -678,8 +652,7 @@ describe("recommended batch policy", () => {
                     close() {},
                 }) as SynapseClientLike,
         });
-        // 4 items of ~200 chars = ~50 estimated tokens each against a 100-token
-        // budget: pages must split at 2 items even though the row limit is 3.
+        // The page budget limits pages to two items despite the row limit of three.
         const text = "x".repeat(200);
         const items = ["a", "b", "c", "d"].map((id) => ({
             id,
@@ -776,12 +749,9 @@ describe("recommended batch policy", () => {
         });
 
         expect(await provider.initialize()).toBe(true);
-        // Both halves of the measured policy floor, so a fractional budget
-        // still bounds a page instead of leaving the lane unbounded.
         expect(provider.metadata?.recommended_batch).toBe(3);
         expect(provider.metadata?.recommended_token_budget).toBe(1024);
 
-        // A pinned reconstruction floors the same way.
         const pinned = new SynapseEmbeddingProvider({
             connectionFile: "/tmp/unused",
             projectRoot: "/tmp/p",
@@ -919,7 +889,6 @@ describe("connect discovery and retry policy", () => {
         expect(state.hasPromise).toBe(false);
         expect(state.hasClient).toBe(false);
         expect(state.file).toBeNull();
-        // Non-permanent: a later initialize is allowed to reconnect.
         expect(await provider.initialize()).toBe(false);
     });
 
@@ -1027,8 +996,8 @@ describe("connect discovery and retry policy", () => {
 
     it("retries queue-full admission through the deadline under the safety cap", async () => {
         let queryCalls = 0;
-        // A pathologically small served hint (0ms) floors the base at 1ms;
-        // the 64-attempt safety cap binds long before the 5s deadline.
+        // A served 0ms hint floors the base at 1ms; the 64-attempt cap binds before the 5s deadline.
+        // The 64-attempt safety cap binds before the 5 s deadline.
         const time = virtualTime(new Array(63).fill(0));
         const provider = new SynapseEmbeddingProvider({
             connectionFile: "fixture",
@@ -1066,9 +1035,7 @@ describe("connect discovery and retry policy", () => {
         let queryCalls = 0;
         const controller = new AbortController();
         // The injected sleep never settles, so only the abort can end the race.
-        // A delay that ignored the signal would hang here rather than return a
-        // wrong value: the retry ladder waits a served 2s hint, and the whole
-        // point is that an aborted caller must not be held for it.
+        // The retry delay must honor the signal so an aborted caller does not wait for the served 2s hint.
         const provider = new SynapseEmbeddingProvider({
             connectionFile: "fixture",
             projectRoot: "/repo",
@@ -1100,16 +1067,13 @@ describe("connect discovery and retry policy", () => {
         });
 
         expect(await provider.embed("hello", controller.signal)).toBeNull();
-        // The wait was abandoned, so the next attempt was never dispatched.
+        // Abort abandons the retry wait, so the next attempt is never dispatched.
         expect(queryCalls).toBe(1);
     });
 
     it("lets the deadline, not the four-attempt cap, budget queue-full retries", async () => {
         let queryCalls = 0;
-        // The host-served 50ms hint with zero jitter draws: attempts at
-        // t = 0, 50, ..., 300; the next sleep would land on the 350ms
-        // deadline, so the sequence stops after 7 attempts — more than the
-        // generic four-attempt budget, bounded by the deadline instead.
+        // The retry sequence stops after seven attempts because the next 50ms sleep reaches the 350ms deadline.
         const time = virtualTime(new Array(6).fill(0));
         const provider = new SynapseEmbeddingProvider({
             connectionFile: "fixture",
@@ -1144,9 +1108,6 @@ describe("connect discovery and retry policy", () => {
     });
 
     it("gives overlapping embed calls independent retry jitter", async () => {
-        // Two overlapping queries, one jitter draw each: their first-retry
-        // sleeps must differ, otherwise every concurrent caller retries in
-        // lockstep and the jitter buys nothing.
         const time = virtualTime([0.25, 0.75]);
         let queryCalls = 0;
         const provider = new SynapseEmbeddingProvider({
@@ -1191,7 +1152,7 @@ describe("connect discovery and retry policy", () => {
         expect(first).toEqual(new Float32Array([1, 2, 3]));
         expect(second).toEqual(new Float32Array([1, 2, 3]));
         expect(queryCalls).toBe(4);
-        // base 100 jittered by draws 0.25 and 0.75: 150 and 250.
+        // Jitter transforms base 100 with draws 0.25 and 0.75 into 150 and 250.
         expect([...time.sleeps].sort((left, right) => left - right)).toEqual([150, 250]);
         expect(time.sleeps[0]).not.toBe(time.sleeps[1]);
     });
@@ -1239,7 +1200,6 @@ describe("connect discovery and retry policy", () => {
 
     it("retries a host-shutdown cancellation and never condemns the lane", async () => {
         let calls = 0;
-        // One retry sleep, one jitter draw.
         const time = virtualTime([0]);
         const provider = new SynapseEmbeddingProvider({
             connectionFile: "fixture",
@@ -1255,10 +1215,7 @@ describe("connect discovery and retry policy", () => {
                 async call<Response = unknown>(): Promise<Response> {
                     calls += 1;
                     if (calls === 1) {
-                        // The host's teardown rejection: wire code
-                        // `cancelled`, sent while the host restarts. It is
-                        // evidence about one incarnation, so the retry can
-                        // land on the next one.
+                        // The host sends `cancelled` while restarting; the cancellation applies only to the current incarnation, so a retry may reach the next one.
                         const error = new Error("the host is shutting down") as Error & {
                             code: string;
                         };
@@ -1291,8 +1248,7 @@ describe("connect discovery and retry policy", () => {
             clientFactory: async () => ({
                 async call() {
                     calls += 1;
-                    // DOM/undici-style abort: no `code` field at all, the
-                    // classification must come from the error's name.
+                    // A code-less `AbortError` is classified by its `name`.
                     throw Object.assign(new Error("aborted"), { name: "AbortError" });
                 },
                 close() {},
@@ -1356,7 +1312,6 @@ describe("connect discovery and retry policy", () => {
         expect(await provider.embed("hello")).toBeNull();
         const callsAfterFirstRound = listCalls;
         expect(callsAfterFirstRound).toBeGreaterThan(0);
-        // Not a permanent failure: the lane may recover later.
         expect(await provider.initialize()).toBe(false);
         expect(listCalls).toBeGreaterThan(callsAfterFirstRound);
     });
@@ -1364,16 +1319,11 @@ describe("connect discovery and retry policy", () => {
 
 describe("embedItems page budget", () => {
     it("spans submission and polling with one page deadline", async () => {
-        // The page budget is 1s. The submission burns 400ms of it on one
-        // queue_full retry, then the job stays pending forever. Polling must
-        // draw on what is left of that same 1s rather than re-anchoring, so
-        // the whole page settles at the deadline instead of at 1.4s.
+        // A `queue_full` retry consumes 400 ms of the 1 s page budget; pending polling uses the remaining budget, so the page settles at 1 s rather than 1.4 s.
         const pageTimeoutMs = 1_000;
         let batchCalls = 0;
         let resultCalls = 0;
-        // Zero jitter draws; declared generously because the poll ladder's
-        // draw count is a property of the schedule under test, not of the
-        // deadline bound this test pins.
+        // The poll schedule makes no jitter draws before the deadline.
         const time = virtualTime(new Array(64).fill(0));
         const provider = new SynapseEmbeddingProvider({
             connectionFile: "fixture",
@@ -1419,7 +1369,6 @@ describe("embedItems page budget", () => {
                         }
                         if (method !== "embed.result") throw new Error(`unexpected ${method}`);
                         resultCalls += 1;
-                        // The canonical pending shape: no items, no cursor.
                         return { result: { retry_after_ms: 100 } } as Response;
                     },
                     close() {},
@@ -1430,7 +1379,7 @@ describe("embedItems page budget", () => {
         const contentSha256 = createHash("sha256").update(text).digest("hex");
         const vectors = await provider.embedItems([{ id: "a", text, contentSha256 }]);
 
-        // The page never completed, and it gave up inside its own budget.
+        // The page exhausts its budget before completion.
         expect(vectors.size).toBe(0);
         expect(resultCalls).toBeGreaterThan(0);
         expect(time.now()).toBeLessThanOrEqual(pageTimeoutMs);
@@ -1449,9 +1398,8 @@ describe("embedItemsDetailed", () => {
         timeoutMs?: number;
     }
 
-    /** Deterministic host double: embed.batch answers with a job descriptor
-     *  unless a scripted submit failure is set, and embed.result serves
-     *  scripted pages per job. */
+    /**
+     * */
     class DetailedHost implements SynapseClientLike {
         readonly calls: RecordedCall[] = [];
         private jobCounter = 0;
@@ -1544,9 +1492,8 @@ describe("embedItemsDetailed", () => {
         return error;
     }
 
-    /** The client's own pre-publication fence: the authenticated daemon no
-     *  longer matches the certified incarnation, refused before any byte is
-     *  enqueued, so the request never reached the daemon. */
+    /** The client rejects a request before enqueueing when the authenticated daemon differs from the certified incarnation, so the daemon receives no request.
+     * */
     function daemonGenerationChangedError(): Error {
         const error = new Error(
             "authenticated daemon changed after lifecycle compatibility validation",
@@ -1555,8 +1502,8 @@ describe("embedItemsDetailed", () => {
         return error;
     }
 
-    /** The host's answer for a request whose own content it refuses, such as a
-     *  text over the per-input byte cap. */
+    /** The host rejects inputs exceeding the per-input byte cap.
+     * */
     function schemaViolationError(): Error {
         const error = new Error("text exceeds the host per-input cap") as Error & { code: string };
         error.code = "schema_violation";
@@ -1617,9 +1564,8 @@ describe("embedItemsDetailed", () => {
             .all() as Array<Record<string, unknown>>;
     }
 
-    /** Wrap a Database so `insertCompetitor` runs the instant the exact-identity
-     *  page read misses, placing a rival process's row between this attempt's
-     *  read and its create so the partial unique index rejects the insert. */
+    /** The wrapper inserts a competitor row after the exact-identity read misses and before creation, so the partial unique index rejects this attempt's insert.
+     * */
     function raceLedgerCreate(db: Database, insertCompetitor: () => void): Database {
         let raced = false;
         const wrapper = {
@@ -1743,8 +1689,6 @@ describe("embedItemsDetailed", () => {
 
             expect(result.failures).toEqual([]);
             expect(result.receipts).toHaveLength(1);
-            // Widened read: TS narrows the closure-assigned variable to its
-            // initializer type at this point.
             const firstPoll = stateAtFirstPoll as Record<string, unknown> | null;
             expect(firstPoll?.state).toBe("polling");
             expect(firstPoll?.job_id).toBe("job-1");
@@ -1756,8 +1700,7 @@ describe("embedItemsDetailed", () => {
             expect(row.cursor).toBe("cursor-1");
             expect(row.state_version).toBe(result.receipts[0].stateVersion);
             expect(result.receipts[0].vectors.get("memory:2")).toEqual(new Float32Array([4, 5, 6]));
-            // Every reply carried a page, so the immediate-first-poll path
-            // never slept: a ready job pays only wire round trips.
+            // A ready job never sleeps; it pays only wire round trips.
             expect(time.sleeps).toEqual([]);
             expect(host.calls.every((call) => !("deadline_ms" in call.params))).toBe(true);
         } finally {
@@ -1798,11 +1741,10 @@ describe("embedItemsDetailed", () => {
             );
             expect(result.receipts).toHaveLength(1);
             expect(host.resultCalls()).toHaveLength(3);
-            // Exact schedule from the constants: the first poll goes out
-            // immediately, the first pending reply waits the jittered
-            // fast-first seed min(1 * (1 + 0.5), 50) = 1.5, and the second
-            // pending waits the escalated max(10, 1.5 * 1.6) = 10, under
-            // the served 50ms cap.
+            // The first poll is immediate.
+            // The fast-first delay is min(1 * (1 + 0.5), 50) = 1.5 ms.
+            // The pending wait uses max(10, 1.5 * 1.6) = 10 ms.
+            // The 50 ms server cap does not clamp the 1.5 ms fast-first or 10 ms pending delay.
             expect(time.sleeps).toEqual([1.5, 10]);
             expect(ledgerRows(db)[0].state).toBe("ready");
         } finally {
@@ -1835,10 +1777,9 @@ describe("embedItemsDetailed", () => {
 
             expect(result.receipts).toEqual([]);
             expect(result.failures[0]?.code).toBe("timeout");
-            // Exact schedule: an immediate first poll at t=0, then waits of
-            // 30_000 (jitter draw 0), the escalated 30_000 * 1.6 = 48_000,
-            // and the 42_000 remainder of the 120s deadline. Exactly three
-            // polls fit before exhaustion.
+            // The first poll is immediate at t=0.
+            // The next waits are 30_000 ms (jitter draw 0) and 48_000 ms (30_000 * 1.6).
+            // The 120_000 ms deadline leaves a final 42_000 ms wait; only three polls occur before expiry.
             expect(host.resultCalls()).toHaveLength(3);
             expect(time.sleeps).toEqual([30_000, 48_000, 42_000]);
             expect(time.now()).toBe(120_000);
@@ -1850,7 +1791,7 @@ describe("embedItemsDetailed", () => {
     it("bounds the default-configuration poll count over the full 120s deadline", async () => {
         const db = ledgerDb();
         try {
-            // One jitter draw for the fast-first poll; every later delay is
+            // Only the fast-first delay consumes a jitter draw.
             // deterministic escalation.
             const time = virtualTime([0]);
             const host = new DetailedHost();
@@ -1872,10 +1813,8 @@ describe("embedItemsDetailed", () => {
 
             expect(result.receipts).toEqual([]);
             expect(result.failures[0]?.code).toBe("timeout");
-            // Immediate first poll, then escalation and flatline: sleeps 1,
-            // 10, 16, 25.6, ~40.96, then 50ms repeated to the deadline.
-            // That is 1 immediate poll + 5 escalation polls + 2398 flatline
-            // polls = 2404, the ceiling a never-finishing job can cost
+            // The provider polls immediately, then sleeps 1, 10, 16, 25.6, 40.96, and 50 ms until the deadline.
+            // A never-finishing job performs at most 2_404 polls before its deadline.
             // under defaults.
             expect(host.resultCalls()).toHaveLength(2404);
             expect(time.now()).toBe(120_000);
@@ -1995,8 +1934,7 @@ describe("embedItemsDetailed", () => {
 
             const result = await provider.embedItemsDetailed(items, detailedContext(db));
 
-            // The expired retained job is never polled (its deadline makes the
-            // re-derive impossible); the row is obsoleted and a fresh page runs.
+            // The expired retained job is never polled; its deadline makes re-derivation impossible, so the row is obsoleted and a fresh page runs.
             expect(result.failures).toEqual([]);
             expect(result.receipts).toHaveLength(1);
             expect(result.receipts[0].rowId).not.toBe(seeded.rowId);
@@ -2071,9 +2009,7 @@ describe("embedItemsDetailed", () => {
             expect(failed.receipts).toEqual([]);
             expect(failed.failures).toHaveLength(1);
             expect(failed.failures[0].disposition).toBe("retryable");
-            // The retained job's reply is the only thing that failed, so the
-            // ready row retires and no row records a disposition for a page
-            // that was never submitted.
+            // The retained reply is the only failure, so the ready row retires and no row records a disposition for an unsubmitted page.
             expect(ledgerRows(db).map((row) => row.state)).toEqual(["obsolete"]);
 
             const retried = await provider.embedItemsDetailed(items, detailedContext(db));
@@ -2120,9 +2056,8 @@ describe("embedItemsDetailed", () => {
                 expectedStateVersion: seeded.stateVersion,
                 jobId: "job-retained",
             });
-            // The retained job answers with a hash that does not match the
-            // page's content: permanent evidence about that reply, and the page
-            // itself has not been submitted since its vectors were lost.
+            // A retained reply whose hash mismatches the expected hash permanently records failure.
+            // The mismatched hash permanently records failure for the retained reply.
             host.resultPages = (jobId, jobItems) => ({
                 result: {
                     ...ENVELOPE,
@@ -2147,13 +2082,12 @@ describe("embedItemsDetailed", () => {
             const failed = await provider.embedItemsDetailed(items, detailedContext(db));
             expect(failed.receipts).toEqual([]);
             expect(failed.failures.map((failure) => failure.code)).toEqual(["artifact_invalid"]);
-            // Only the ready row is retired. No second row records a
-            // disposition for a page that never reached the daemon.
+            // Only the ready row is retired; no second row records a disposition for a page that never reached the daemon.
             expect(ledgerRows(db).map((row) => row.state)).toEqual(["obsolete"]);
             expect(host.batchCalls()).toEqual([]);
 
-            // The next run opens a fresh page for the same identity and
-            // submits it, so the content is embedded rather than foreclosed.
+            // The next run opens a fresh page for the same identity, and the fresh submission embeds the content.
+            // The fresh submission embeds the content.
             const next = detailedProvider(host);
             const retried = await next.embedItemsDetailed(items, detailedContext(db));
             expect(retried.failures).toEqual([]);
@@ -2212,11 +2146,8 @@ describe("embedItemsDetailed", () => {
         try {
             const host = new DetailedHost();
             const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
-            // One rotation, observed when the retained job's reply reports the
-            // restart. Identity is a function of that generation, not of the
-            // demand count: the lifecycle owner coalesces demands and reports
-            // whichever daemon is live, so every demand raised while recovering
-            // from the same restart must observe the same replacement.
+            // The retained job rotates once when its reply reports a restart.
+            // Daemon identity depends on generation, not demand count; coalesced demands during one restart observe the same replacement.
             let rotated = false;
             host.resultPages = (jobId, items) => {
                 if (jobId === "job-1") {
@@ -2264,7 +2195,7 @@ describe("embedItemsDetailed", () => {
 
             expect(result.failures).toEqual([]);
             expect(result.receipts).toHaveLength(1);
-            // Initial certification plus one bounded rebind for the restart.
+            // The client demands twice: once for certification and once to rebind after the restart.
             expect(demands).toBe(2);
             const batches = host.batchCalls();
             expect(batches).toHaveLength(2);
@@ -2283,8 +2214,8 @@ describe("embedItemsDetailed", () => {
             const daemonIds = [new Uint8Array([1]), new Uint8Array([2])];
             let rotated = false;
             // The client fence refuses the first submission before publishing.
-            // It is `not_sent`, so nothing reached the daemon and the same
-            // request key may be resubmitted against the replacement.
+            // A `not_sent` refusal means no request reached the daemon.
+            // A `not_sent` refusal permits resubmission of the same request key against the replacement daemon.
             host.batchError = (index) => {
                 if (index !== 0) return null;
                 rotated = true;
@@ -2313,19 +2244,18 @@ describe("embedItemsDetailed", () => {
                 detailedContext(db),
             );
 
-            // The fence is absorbed in-page: the page succeeds rather than
-            // being reported as a failure the caller must retry.
+            // The fence is absorbed in-page, so the page succeeds without returning a failure to retry.
             expect(result.failures).toEqual([]);
             expect(result.receipts).toHaveLength(1);
             const batches = host.batchCalls();
             expect(batches).toHaveLength(2);
-            // Same key, so the replacement daemon dedupes rather than
-            // double-embedding, and the retry rides the replacement identity.
+            // The replacement daemon deduplicates the same request key.
+            // The retry uses the replacement daemon identity without double-embedding.
             expect(batches[0].params.request_key).toBe(batches[1].params.request_key);
             expect(batches[1].expectedDaemonId).toEqual(daemonIds[1]);
             // The durable restart budget belongs to observed daemon restarts.
-            // A pre-publication refusal must not consume it, so a genuine
-            // restart afterwards is still absorbable.
+            // A pre-publication refusal does not consume the durable restart budget.
+            // A later observed daemon restart remains absorbable.
             const row = getSynapseLedgerPage(db, result.receipts[0].rowId);
             expect(row?.restartCount ?? 0).toBe(0);
         } finally {
@@ -2351,9 +2281,7 @@ describe("embedItemsDetailed", () => {
             expect(host.batchCalls()).toHaveLength(2);
             const row = ledgerRows(db)[0];
             expect(row.state).toBe("failed");
-            // A retryable row inside a live deadline is handed back to
-            // `pending` with its restart_count intact, so only a permanent
-            // disposition stops the page from resubmitting on every pass.
+            // A permanent `failure_disposition` prevents repeated page resubmission.
             expect(row.failure_disposition).toBe("permanent");
             expect(row.restart_count).toBe(1);
         } finally {
@@ -2387,9 +2315,9 @@ describe("embedItemsDetailed", () => {
                 manifest: spentPage.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
                 deadlineAt: Date.now() + 60_000,
             });
-            // The page's history: it spent its single durable restart, reached
-            // ready under the replacement job, then lost its vectors with the
-            // process. A second restart leaves it no budget to resubmit under.
+            // The page has spent its single durable restart.
+            // The replacement job reached `ready` before returning `module_restarted`.
+            // After a second restart, the page has no restart budget for resubmission.
             let seeded = markSynapseLedgerPolling(db, {
                 rowId: created.rowId,
                 expectedStateVersion: created.stateVersion,
@@ -2444,8 +2372,8 @@ describe("embedItemsDetailed", () => {
                         ),
                     ),
             ).toEqual([]);
-            // The lane stays live: a disabled lane reports `artifact_invalid`
-            // for every later page instead of embedding it.
+            // A disabled lane reports `artifact_invalid`.
+            // The disabled lane reports `artifact_invalid` for every later page instead of embedding it.
             expect(result.receipts).toHaveLength(1);
             expect(result.receipts[0].applicationGroup).toBe("g2");
             expect(result.receipts[0].vectors.size).toBe(1);
@@ -2465,10 +2393,9 @@ describe("embedItemsDetailed", () => {
         const db = ledgerDb();
         try {
             const host = new DetailedHost();
-            // Every submit restarts: the first restart consumes the one
-            // submission-time rebind and resubmits the same request key; the
-            // second propagates. The durable restart CAS never runs, so the
-            // page's single durable restart stays unspent.
+            // The first restart consumes the single submission-time rebind.
+            // The rebind resubmits the same request key.
+            // The second restart propagates without consuming the durable restart budget.
             host.batchError = () => moduleRestartedError();
             const provider = detailedProvider(host);
             const result = await provider.embedItemsDetailed(
@@ -2511,9 +2438,9 @@ describe("embedItemsDetailed", () => {
                 clientFactory: async () => host,
                 demandStart: async () => {
                     demands += 1;
-                    // The abort lands while the managed demand is in flight, so
-                    // `initialize` observes it on its own await and reports the
-                    // plain `false` a rejected `raceSignal` is folded into.
+                    // The abort occurs while the managed demand is in flight.
+                    // `initialize` observes the abort on its own await.
+                    // A rejected `raceSignal` makes `initialize` return `false`.
                     controller.abort();
                     await new Promise((resolve) => setTimeout(resolve, 0));
                     return {
@@ -2524,10 +2451,7 @@ describe("embedItemsDetailed", () => {
                     };
                 },
             });
-            // Certify the lane before installing the managed origin: `initialize`
-            // is the only writer of the identity, and the pre-loop initialize
-            // must return from the already-certified state so the first page
-            // dispatches instead of demanding.
+            // Certifying the lane before installing the managed origin lets pre-loop initialization dispatch the first page without demanding.
             expect(await provider.initialize()).toBe(true);
             const internals = provider as unknown as {
                 connectionOrigin: string;
@@ -2537,12 +2461,8 @@ describe("embedItemsDetailed", () => {
             internals.connectionOrigin = "managed-default";
             internals.compatibleDaemonId = new Uint8Array([7, 7]);
 
-            // Reproduce the state a rotation on an earlier page installs: the
-            // lane is managed and no longer certified, which is precisely the
-            // precondition the per-page re-validation exists to answer. Doing it
-            // from the first page's own response keeps the second page's
-            // `signal.aborted` check ahead of the abort, so the abort can only
-            // be observed inside the re-validation itself.
+            // An earlier page's rotation leaves the lane managed and uncertified.
+            // A managed, uncertified lane requires per-page re-validation.
             host.resultPages = (_jobId, items) => {
                 if (items.some((item) => item.id === "memory:1")) internals.initialized = false;
                 return {
@@ -2567,17 +2487,14 @@ describe("embedItemsDetailed", () => {
                 controller.signal,
             );
 
-            // The first page completed before the identity was invalidated.
+            // The first page returned a receipt even though it invalidated the identity.
             expect(result.receipts).toHaveLength(1);
             expect(result.receipts[0].applicationGroup).toBe("g1");
-            // Exactly one demand: the second page's re-validation.
+            // The second page's re-validation makes exactly one demand.
             expect(demands).toBe(1);
             expect(result.failures).toHaveLength(1);
             const g2 = result.failures[0];
             expect(g2.applicationGroup).toBe("g2");
-            // This read `transport`/`retryable` before the signal was re-checked
-            // after initialization, which invites a retry of a request the caller
-            // withdrew and disagrees with the `cancelled` every later page reports.
             expect(g2.code).toBe("cancelled");
             expect(g2.message).toBe("Synapse request aborted");
             expect(g2.disposition).toBe("retryable");
@@ -2592,9 +2509,7 @@ describe("embedItemsDetailed", () => {
         const db = ledgerDb();
         try {
             const host = new DetailedHost();
-            // Only the first group's job keeps restarting, so that page burns
-            // its single durable restart and goes terminal while the second
-            // group's page reaches the daemon with its own budget intact.
+            // The first group's page exhausts its single durable restart; the second page retains its own budget.
             host.resultPages = (_jobId, items) => {
                 if (items.some((item) => item.id === "memory:1")) return moduleRestartedError();
                 return {
@@ -2622,8 +2537,7 @@ describe("embedItemsDetailed", () => {
             expect(result.failures[0].applicationGroup).toBe("g1");
             expect(result.failures[0].code).toBe("page_terminal");
             expect(result.failures[0].disposition).toBe("permanent");
-            // The lane is still live: a disabled lane reports `artifact_invalid`
-            // for every later page instead of embedding it.
+            // A live lane embeds later pages; a disabled lane returns `artifact_invalid`.
             expect(result.receipts).toHaveLength(1);
             expect(result.receipts[0].applicationGroup).toBe("g2");
             expect(result.receipts[0].vectors.size).toBe(1);
@@ -2642,8 +2556,8 @@ describe("embedItemsDetailed", () => {
         const db = ledgerDb();
         try {
             const host = new DetailedHost();
-            // Only the first group's page carries content the host refuses, so
-            // the second group's page must still reach the daemon.
+            // Only the first group's page contains content the host rejects.
+            // The second group's page reaches the daemon despite the first group's rejection.
             host.batchError = (index) => (index === 0 ? schemaViolationError() : null);
             const provider = detailedProvider(host);
             const result = await provider.embedItemsDetailed(
@@ -2658,13 +2572,12 @@ describe("embedItemsDetailed", () => {
             expect(result.failures[0].applicationGroup).toBe("g1");
             expect(result.failures[0].code).toBe("schema_violation");
             expect(result.failures[0].disposition).toBe("permanent");
-            // A condemned lane answers `artifact_invalid` for every later page
-            // without submitting it, so a served receipt proves the lane lives.
+            // A condemned lane returns `artifact_invalid` without submitting later pages.
+            // A receipt for a later page proves that the lane is not condemned.
             expect(result.receipts).toHaveLength(1);
             expect(result.receipts[0].applicationGroup).toBe("g2");
             expect(result.receipts[0].vectors.size).toBe(1);
             expect(host.batchCalls()).toHaveLength(2);
-            // The lane also stays usable for this project's other scopes.
             expect(provider.isLoaded()).toBe(true);
             expect(await provider.initialize()).toBe(true);
             const rows = ledgerRows(db);
@@ -2707,8 +2620,7 @@ describe("embedItemsDetailed", () => {
 
             const result = await provider.embedItemsDetailed(items, detailedContext(db));
 
-            // The recorded permanent disposition is the page's answer: no new
-            // ledger row, no new daemon job, and the failure stays permanent.
+            // A permanently failed page creates no additional ledger row or daemon job.
             expect(result.receipts).toEqual([]);
             expect(result.failures).toHaveLength(1);
             expect(result.failures[0].disposition).toBe("permanent");
@@ -2752,8 +2664,7 @@ describe("embedItemsDetailed", () => {
 
             const result = await provider.embedItemsDetailed(items, detailedContext(racing));
 
-            // The loser of the create race drives the winner's row instead of
-            // reporting a transport failure for a page that already exists.
+            // The loser of the create race drives the winner's row.
             expect(competitorRowId).toBeGreaterThan(0);
             expect(result.failures).toEqual([]);
             expect(result.receipts).toHaveLength(1);
@@ -2776,8 +2687,7 @@ describe("embedItemsDetailed", () => {
             let winner: Record<string, unknown> | null = null;
             host.resultPages = (jobId, jobItems, index) => {
                 if (index === 0) {
-                    // A sibling process validated the same job and advanced the
-                    // row to ready first, leaving this attempt's version stale.
+                    // A sibling process advanced the same job's row to `ready`, making this attempt's version stale.
                     const live = ledgerRows(db)[0];
                     markSynapseLedgerReady(db, {
                         rowId: live.id as number,
@@ -2801,8 +2711,7 @@ describe("embedItemsDetailed", () => {
 
             const result = await provider.embedItemsDetailed(items, detailedContext(db));
 
-            // Widened read: TS narrows the closure-assigned variable to its
-            // initializer type at this point.
+            // The widened read prevents TypeScript from narrowing a closure-assigned variable to its initial type.
             const winnerRow = winner as Record<string, unknown> | null;
             expect(winnerRow?.state).toBe("ready");
             expect(result.failures).toEqual([]);
@@ -2842,9 +2751,7 @@ describe("embedItemsDetailed", () => {
             let rivalRowId = 0;
             host.resultPages = (_jobId, jobItems, index) => {
                 if (index === 0) {
-                    // The live row for this identity is replaced by one running
-                    // a different job, so the vectors in hand prove nothing
-                    // about the row that now owns the page.
+                    // The provider discards vectors when the live row belongs to a different job.
                     const live = ledgerRows(db)[0];
                     markSynapseLedgerObsolete(db, {
                         rowId: live.id as number,
@@ -2887,7 +2794,7 @@ describe("embedItemsDetailed", () => {
             expect(result.failures).toHaveLength(1);
             expect(result.failures[0].code).toBe("transport");
             expect(result.failures[0].disposition).toBe("retryable");
-            // The rival's row keeps its own version: no receipt claims it.
+            // No receipt claims the rival row.
             const rival = getSynapseLedgerPage(db, rivalRowId);
             expect(rival?.state).toBe("ready");
             expect(rival?.jobId).toBe("job-other");
@@ -3097,8 +3004,6 @@ describe("embedItemsDetailed", () => {
             ]);
             expect(vectors.get("memory:1")).toEqual(new Float32Array([1, 2, 3]));
             expect(host.resultCalls()).toHaveLength(2);
-            // Immediate first poll; the pending reply consumes the 1ms
-            // fast-first seed (jitter draw 0).
             expect(time.sleeps).toEqual([1]);
             expect(host.calls.every((call) => !("deadline_ms" in call.params))).toBe(true);
             expect(ledgerRows(db)).toEqual([]);
@@ -3234,8 +3139,6 @@ describe("embedItemsDetailed", () => {
             expect([...vectors.keys()]).toEqual(["memory:1", "memory:2"]);
             expect(vectors.get("memory:2")).toEqual(new Float32Array([4, 5, 6]));
             expect(cursors).toEqual([null, "cursor-1", "cursor-1"]);
-            // Immediate first poll; the single pending reply consumes the
-            // 1ms fast-first seed (jitter draw 0).
             expect(time.sleeps).toEqual([1]);
             expect(ledgerRows(db)).toEqual([]);
         } finally {
@@ -3245,10 +3148,6 @@ describe("embedItemsDetailed", () => {
 });
 
 describe("canonical request-key golden vectors", () => {
-    // These exact keys are committed in docs/mc-host-wire-protocol.md §7.5.7
-    // and asserted by the Rust unit tests in
-    // crates/mc-host/src/synapse/protocol.rs; both languages must produce
-    // identical bytes or batch idempotency breaks cross-language.
     const sha256Hex = (text: string) => createHash("sha256").update(text).digest("hex");
     const keyFor = (epoch: number, items: { id: string; text: string }[]) =>
         getSynapseBatchRequestKey({

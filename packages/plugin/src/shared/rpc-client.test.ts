@@ -30,7 +30,7 @@ afterEach(async () => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     }
 });
@@ -232,8 +232,7 @@ describe("MagicContextRpcClient", () => {
         await server.start();
         try {
             const client = new MagicContextRpcClient(storageDir, directory);
-            // Real round-trip: client must read the token from the port file and
-            // send it as Bearer auth, or the server returns 401.
+            // The server returns 401 when a request lacks Bearer authentication.
             expect(await client.call<{ pong: boolean }>("ping")).toEqual({ pong: true });
         } finally {
             server.stop();
@@ -247,12 +246,10 @@ describe("MagicContextRpcClient", () => {
         server.handle("ping", async () => ({ pong: true }));
         const port = await server.start();
         try {
-            // Sanity: the port file carries a non-empty token.
             const record = readNewestPortRecord(storageDir, directory);
             expect(typeof record?.token).toBe("string");
             expect((record?.token ?? "").length).toBeGreaterThan(0);
 
-            // A raw fetch with no Authorization header must be rejected.
             const res = await fetch(`http://127.0.0.1:${port}/rpc/ping`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -260,7 +257,7 @@ describe("MagicContextRpcClient", () => {
             });
             expect(res.status).toBe(401);
 
-            // Health stays open (no token required) for discovery.
+            // The /health endpoint requires no token.
             const health = await fetch(`http://127.0.0.1:${port}/health`);
             expect(health.status).toBe(200);
         } finally {

@@ -78,16 +78,12 @@ function terminal(
 }
 
 /**
- * Marks a wait whose bound elapsed before the work settled. Neither a driver
- * result nor a cleanup outcome is a string, so the sentinel cannot collide with a
- * value a bounded wait carries.
+ * `UNSETTLED` cannot collide with driver or cleanup results because neither is a string.
  */
 const UNSETTLED = "unsettled";
 
 /**
- * Awaits `work` for at most `ms`, reporting `UNSETTLED` once the bound elapses.
- * The timer is cleared in a `finally`, so a bound never outlives the wait it
- * guards, whether that wait yields a value, reports the bound, or throws.
+ * `finally` clears the timer after the race settles, preventing it from surviving the wait.
  */
 async function bounded<T>(work: Promise<T>, ms: number): Promise<T | typeof UNSETTLED> {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -148,13 +144,8 @@ export async function runProspectiveCase(input: {
     ) {
         throw new HoldoutContractError(["prospective-runner: execution-coordinate-invalid"]);
     }
-    // The agreement above only proves the three declared platforms match each other. A worker
-    // handed roots and a coordinate that all name a foreign platform satisfies it, and the cell it
-    // records counts as frozen coverage of that platform while the driver ran here. Comparing the
-    // coordinate against the running host keeps the recorded platform the one that executed the
-    // driver. The code is separate from `execution-coordinate-invalid` because the coordinate is
-    // well formed: it names a host this worker is not, so it is rerouted to a matching worker
-    // rather than repaired.
+    // `input.platform` must match the running host so recorded platform coverage names the platform that ran the driver.
+    // A platform that matches both release manifests but not the running host fails with `platform-not-host`.
     if (input.platform !== `${process.platform}-${process.arch}`) {
         throw new HoldoutContractError(["prospective-runner: platform-not-host"]);
     }
@@ -181,23 +172,11 @@ export async function runProspectiveCase(input: {
         }
     };
     /**
-     * Waits for `cleanup` under the execution deadline, reporting the breach when it
      * never settles.
      *
-     * Cleanup is scenario code on every path, not only after an execution timeout, so
-     * an unbounded wait wedges the whole cohort until the outer CI timeout whenever a
-     * driver that returned normally leaves a cleanup that never settles. `timeoutMs` is
-     * the only budget the caller declared, so it bounds this wait too.
+     * The `timeoutMs` cleanup bound prevents a non-settling cleanup from blocking the run.
      *
-     * An unsettled cleanup is not the same evidence as a throwing one. A throwing
-     * cleanup has finished: the workspace is unproven but static, which a crash cell
-     * describes. An unsettled cleanup is still running and can keep writing the
-     * workspace, and the cell it would produce leaves the pair short of "completed",
-     * which `buildPairedFacts` accepts as grounds for another attempt. That attempt
-     * would observe the abandoned cleanup's writes as its own, so isolation is
-     * unprovable and the breach stops the run instead of emitting a cell a retry could
-     * build on. This is the rule `driver-abandoned` already applies to a driver that
-     * survives its drain.
+     * `UNSETTLED` cleanup stops the run because a retry could observe writes from the still-running cleanup; a thrown cleanup is finished and emits a crash cell.
      */
     const settleCleanup = async (): Promise<boolean> => {
         const settled = await bounded(cleanup(), input.timeoutMs);
@@ -226,30 +205,19 @@ export async function runProspectiveCase(input: {
     const raced = await bounded(execution, input.timeoutMs);
     if (raced === UNSETTLED) {
         controller.abort();
-        // Cleanup is scenario code, so it can hang exactly the way a driver can. An unbounded
-        // wait here outlives timeoutMs before the drain below bounds anything, which is the
-        // hang the deadline exists to prevent, so this wait carries the same bound.
+        // `cleanup` uses the same `timeoutMs` bound as the driver because it can also fail to settle.
         const settledCleanup = await bounded(cleanup(), input.timeoutMs);
-        // A driver that ignores the abort signal, and that cleanup cannot terminate, would
-        // otherwise make this await outlive timeoutMs entirely and hang the suite until the
-        // CI job timeout. Draining is best effort and bounded by another timeoutMs.
+        // `bounded` limits the wait for an abort-ignoring driver or non-terminating cleanup to `timeoutMs`.
+        // The drain timeout prevents a non-aborting driver from hanging the run.
         const drained = await bounded(execution, input.timeoutMs);
-        // The bound above trades a hang for a driver that may still hold child processes and
-        // still write the workspace. A returned timeout cell leaves the pair short of
-        // "completed", which `buildPairedFacts` accepts as grounds for another attempt, so
-        // that attempt would run against the abandoned driver's writes and observe them as its
-        // own. Isolation is unprovable once the driver survives the drain, so the breach stops
-        // the run instead of emitting a cell any retry could build on. The driver is reported
-        // first because it is the more specific breach: its own code outlived the deadline,
-        // whereas an unsettled cleanup may be waiting on that same driver.
+        // The runner aborts when the driver remains unsettled after the drain because the driver may still modify the workspace.
+        // The runner aborts when the driver remains unsettled after the drain because the driver may still modify the workspace.
+        // `drained` is checked first because a driver that outlives the deadline is more specific than cleanup waiting on that driver.
         if (drained === UNSETTLED) {
             throw new HoldoutContractError(["prospective-runner: driver-abandoned"]);
         }
-        // A cleanup that never settled is still live and can keep writing the workspace, so
-        // it carries the same unprovable isolation as an abandoned driver and stops the run
-        // for the same reason. Only a settled cleanup distinguishes the timeout terminal from
-        // the crash terminal: it either restored the workspace or threw and left it unproven
-        // but static, and no committed row carries a third outcome.
+        // The runner treats an unsettled cleanup as abandoned because the cleanup may still modify the workspace.
+        // The runner treats an unsettled cleanup as abandoned because the cleanup may still modify the workspace.
         if (settledCleanup === UNSETTLED) {
             throw new HoldoutContractError(["prospective-runner: cleanup-abandoned"]);
         }
@@ -301,13 +269,8 @@ export async function runProspectiveCase(input: {
             reasonCode: "invalid-result",
         });
     }
-    // A verifier is scenario code and its return value reaches here unvalidated, so the
-    // declared array type is no evidence about the container either. `null`, a non-array
-    // object, or an array holding a non-object would throw on `.length`, `.map`, or a
-    // member read, and that throw lands outside the `try` above: it rejects
-    // `runProspectiveCase` and can stop the whole cohort instead of producing the
-    // `invalid-result` cell malformed verifier output is supposed to produce. The
-    // container is proved before any member is read.
+    // The verifier can return arbitrary values, so validate its result as an array before reading members.
+    // The verifier can return arbitrary values, so validate its result as an array before reading members.
     if (
         !Array.isArray(produced) ||
         produced.length === 0 ||
@@ -321,10 +284,8 @@ export async function runProspectiveCase(input: {
         });
     }
     const checks = produced as ReturnType<ProspectiveScenario["verifier"]>;
-    // With the container proved, the declared `boolean` is still no evidence about
-    // `passed`. A truthy non-boolean such as the string "false" satisfies the failure
-    // filter below and would record a pass, so the gate proves the type before any
-    // outcome is derived from it.
+    // `passed` can be non-boolean at runtime, so validate its type before deriving an outcome.
+    // A truthy non-boolean `passed` value, such as `"false"`, would be treated as a pass unless validated as a boolean.
     if (
         checks.some((check) => typeof check.id !== "string") ||
         new Set(checks.map((check) => check.id)).size !== checks.length ||
@@ -348,11 +309,8 @@ export async function runProspectiveCase(input: {
 }
 
 /**
- * Terminal `(runHealth, productOutcome, reasonCode)` triples that
- * `runProspectiveCase` returns, joined by `|` with an absent reason spelled
- * `null`. Committed `outcomes.json` rows are hand-authorable, so the parser
- * refuses triples no runner path emits instead of trusting a row's provenance;
- * otherwise a tampered cell reaches missingness and scorecard adapters as
+ * `outcomes.json` validation rejects terminal triples that no `runProspectiveCase` path emits.
+ * `outcomes.json` validation rejects terminal triples that no `runProspectiveCase` path emits.
  * self-contradictory evidence.
  */
 const ALLOWED_CELL_TERMINALS: ReadonlySet<string> = new Set([
@@ -419,9 +377,8 @@ export function parseProspectiveCellResult(raw: unknown): ProspectiveCellResult 
     if (!ALLOWED_CELL_TERMINALS.has(`${result.runHealth}|${result.productOutcome}|${result.reasonCode ?? "null"}`)) {
         fail("cell: health-reason-mismatch");
     }
-    // Refines an otherwise-permitted terminal: a reason code names a path the runner reaches
-    // before, or instead of, per-check evaluation, and every such call site emits an empty
-    // list. A row carrying both would let check-counting consumers weigh failures the run
+    // The parser requires an empty `failedChecks` array when `reasonCode` identifies a path that bypasses per-check evaluation.
+    // The parser requires an empty `failedChecks` array when `reasonCode` identifies a path that bypasses per-check evaluation.
     // never recorded.
     if (result.reasonCode !== null && result.failedChecks.length > 0) {
         fail("cell: reason-code-checks-invalid");

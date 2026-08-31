@@ -1,23 +1,9 @@
 /// <reference types="bun-types" />
 
 /**
- * Tests for `applyDeferredCompactionMarker` (plan v6 §5).
  *
- * These cover the validation + outcome surface end-to-end against a real
- * OpenCode DB harness (same pattern as compaction-marker-consistency.test.ts):
  *
- *   - applied happy path (no existing marker, validation passes)
- *   - already-current when persisted marker is at the pending ordinal
- *   - stale-skip / compartment-removed when the raw OC message is gone
- *   - stale-skip / compartment-removed when the local compartment row is gone
- *   - stale-skip / target-superseded when the compartment ordinal advanced
- *   - retryable-failure when DB access throws
  *
- * The remove→inject sequencing for the boundary-advance case is exercised
- * indirectly via the "applied" path: when there's no existing marker, we
- * verify inject succeeded. The "retryable on inject null" is covered by
- * deleting the boundary message after validation but before inject can
- * find a target.
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
@@ -180,7 +166,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            // Ignore EBUSY on Windows
+            // Windows can retain database file handles after close, so cleanup ignores EBUSY.
         }
     }
     tempDirs.length = 0;
@@ -195,7 +181,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
         const db = openDatabase();
         insertCompartment(db, "ses-1", 10, "msg-boundary");
-        // Seed session_meta row so the manager can write boundary state into it.
+        // The fixture seeds a `session_meta` row so the manager can write boundary state.
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-1");
 
         const outcome = applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
@@ -204,7 +190,6 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         if (outcome.kind === "applied") {
             expect(outcome.markerOrdinal).toBe(10);
         }
-        // Persisted marker state should now hold the new boundary.
         const persisted = getPersistedCompactionMarkerState(db, "ses-1");
         expect(persisted).not.toBeNull();
         expect(persisted?.boundaryOrdinal).toBe(10);
@@ -323,7 +308,6 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         const db = openDatabase();
         insertCompartment(db, "ses-1", 10, "msg-boundary");
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-1");
-        // Persist an existing marker AT the pending ordinal.
         setPersistedCompactionMarkerState(db, "ses-1", {
             boundaryMessageId: "msg-boundary",
             summaryMessageId: "msg-summary",
@@ -341,7 +325,6 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         );
 
         expect(outcome.kind).toBe("already-current");
-        // Persisted state untouched (no remove/re-inject)
         const persisted = getPersistedCompactionMarkerState(db, "ses-1");
         expect(persisted?.boundaryMessageId).toBe("msg-boundary");
     });
@@ -371,7 +354,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         closeQuietly(opencodeDb);
 
         const db = openDatabase();
-        // No compartment inserted — simulates a recomp that wiped local state
+        // The fixture omits the compartment to simulate recompaction that removed local state.
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-1");
 
         const outcome = applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
@@ -389,10 +372,9 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         closeQuietly(opencodeDb);
 
         const db = openDatabase();
-        // Compartment ends at endMessageId "msg-boundary" but at ordinal 20
-        // (different from the pending blob's ordinal of 10). This simulates
-        // a later partial-recomp resequencing the same boundary message id
-        // to a different ordinal.
+        // A later partial recompaction can resequence `msg-boundary` from pending ordinal 10 to compartment ordinal 20.
+        // A later partial recompaction can resequence `msg-boundary` from pending ordinal 10 to compartment ordinal 20.
+        // A later partial recompaction can resequence `msg-boundary` from pending ordinal 10 to compartment ordinal 20.
         insertCompartment(db, "ses-1", 20, "msg-boundary");
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-1");
 
@@ -410,18 +392,9 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
     });
 
     it("returns `retryable-failure` when injectCompactionMarker cannot find a boundary message", () => {
-        // Trigger this by giving the validator a compartment that points to a
-        // raw msg with NO user role / no time_created < boundary — but with
-        // the boundary message itself missing AFTER validation. Easier path:
-        // insert msg-boundary so validation passes, then close+reopen OC DB
-        // with WAL handles in a state that makes findBoundaryUserMessage fail.
         //
-        // Concretely: the simplest reproducer is a session row in OpenCode
-        // with the boundary message but no preceding user messages — the
-        // marker injector needs a user message AT or BEFORE the boundary to
-        // anchor the compaction part. We insert only the boundary as a
-        // non-user message (assistant role) so findBoundaryUserMessage
-        // returns null and inject returns null, mapping to retryable-failure.
+        // An assistant boundary makes findBoundaryUserMessage return null.
+        // The marker injector returns `null`, mapping to retryable failure.
         const dataHome = useTempDataHome("apply-deferred-retryable-");
         const opencodeDb = createOpenCodeTestDb(dataHome);
         // Insert msg-boundary as an ASSISTANT message — passes validation
@@ -440,23 +413,20 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
         const outcome = applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
 
-        // No user message exists at or before the boundary → inject returns
-        // null → retryable-failure.
+        // No user message at or before the boundary makes `inject` return `null`, a retryable failure.
+        // `inject` returning `null` is a retryable failure.
         expect(outcome.kind).toBe("retryable-failure");
-        // Persisted state remains absent ( we never wrote a marker)
         const persisted = getPersistedCompactionMarkerState(db, "ses-1");
         expect(persisted).toBeNull();
     });
 
     it("returns `retryable-failure` on raw OpenCode DB access errors", () => {
-        // Don't create the opencode dir at all — this makes the writable
-        // OpenCode DB handle fail to open, which throws inside
-        // getOpenCodeMessageById and trips the outer try/catch.
+        // The missing opencode/ directory makes opening the writable OpenCode database fail.
+        // getOpenCodeMessageById propagates the open error to applyDeferredCompactionMarker's outer try/catch.
         const dataHome = mkdtempSync(join(tmpdir(), "apply-deferred-db-err-"));
         tempDirs.push(dataHome);
         process.env.XDG_DATA_HOME = dataHome;
         mkdirSync(join(dataHome, "cortexkit", "magic-context"), { recursive: true });
-        // No opencode/ subdir created.
 
         const db = openDatabase();
         insertCompartment(db, "ses-1", 10, "msg-boundary");
@@ -556,12 +526,8 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
     });
 
     it("no-ops (success) on the pi harness without touching opencode.db", () => {
-        // Pi reaches this function through the recompilation runners both
-        // harnesses share. On a Pi-only install there is no opencode.db (often
-        // not even its parent directory), and the pre-fix behavior was an
-        // `unable to open database file` throw that turned a fully successful
-        // recompilation into a "Failed" report. The gate must return success
-        // without any opencode.db access.
+        // Pi reaches this function through recompilation runners without any `opencode.db` access.
+        // Pi reaches this function through recompilation runners without any `opencode.db` access.
         const dataHome = useTempDataHome("pi-harness-no-oc-db-");
         rmSync(join(dataHome, "opencode"), { recursive: true, force: true });
 
@@ -575,15 +541,15 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         } finally {
             _resetHarnessForTesting();
         }
-        // No opencode.db file may be created as a side effect (an empty file
-        // here would make every later query fail with `no such table`).
+        // Opening a missing `opencode.db` must throw instead of creating an empty database that later fails with `no such table`.
+        // Creating an empty `opencode.db` causes later queries to fail with `no such table`.
         expect(existsSync(join(dataHome, "opencode", "opencode.db"))).toBe(false);
     });
 
     it("fails loud without creating a junk opencode.db when the file is missing on opencode", () => {
-        // Defense-in-depth: even if an OpenCode-harness call somehow runs with
-        // opencode.db missing, the open must throw a diagnosable error instead
-        // of creating an empty database and failing later with `no such table`.
+        // Opening a missing opencode.db must throw instead of creating an empty database.
+        // Opening a missing opencode.db must throw instead of creating an empty database.
+        // Opening a missing `opencode.db` must throw instead of creating an empty database that later fails with `no such table`.
         const dataHome = useTempDataHome("oc-harness-missing-db-");
         rmSync(join(dataHome, "opencode"), { recursive: true, force: true });
         mkdirSync(join(dataHome, "opencode"), { recursive: true });

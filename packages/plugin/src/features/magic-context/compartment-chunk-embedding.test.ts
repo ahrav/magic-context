@@ -224,9 +224,7 @@ describe("compartment chunk embedding core", () => {
         expect(whole[0]).toMatchObject({ windowIndex: 0, startOrdinal: 1, endOrdinal: 3 });
         expect(whole[0]?.text).toBe(text);
 
-        // Budget that fits any single line but not two together → one window per
-        // line on line boundaries. effectiveMax = floor(budget * 0.9); each line is
-        // ~7 tokens, so a budget of ~9 (effective 8) holds exactly one line.
+        // The safety-margined budget fits one canonical line but not two, so chunking emits one line per window.
         const perLineBudget = Math.ceil(
             (estimateTokens("[1] U: alpha beta gamma") + 1) / CHUNK_WINDOW_SAFETY_RATIO,
         );
@@ -240,9 +238,7 @@ describe("compartment chunk embedding core", () => {
     });
 
     test("every window stays under the safety-margined budget (never exceeds the provider ceiling)", () => {
-        // Many short lines so windowing is driven by the token budget, not by
-        // line count. With a ceiling of 200, the effective budget is 180 (90%),
-        // leaving headroom for cross-tokenizer drift below the hard ceiling.
+        // Short lines ensure the token budget, rather than line count, determines windowing.
         const maxInputTokens = 200;
         const effective = Math.floor(maxInputTokens * CHUNK_WINDOW_SAFETY_RATIO);
         const lines = Array.from(
@@ -252,8 +248,6 @@ describe("compartment chunk embedding core", () => {
         const windows = chunkCanonicalText(lines.join("\n"), 1, 60, maxInputTokens);
         expect(windows.length).toBeGreaterThan(1);
         for (const window of windows) {
-            // Each window's own estimate stays at/under the 90% budget, so the
-            // real provider count (which drifts only slightly) stays under the
             // configured ceiling.
             expect(estimateTokens(window.text)).toBeLessThanOrEqual(effective);
         }
@@ -272,9 +266,7 @@ describe("compartment chunk embedding core", () => {
     });
 
     test("splits a single oversized canonical line so no window exceeds the budget (#206)", () => {
-        // One canonical line (a single A: span) far larger than the budget — e.g.
-        // a big file dump rendered into one message. The old chunker emitted this
-        // whole, producing one window that blew past the provider's context window.
+        // A single canonical line can exceed the token budget and must be split.
         const maxInputTokens = 200;
         const effective = Math.floor(maxInputTokens * CHUNK_WINDOW_SAFETY_RATIO);
         const huge = Array.from(
@@ -287,7 +279,6 @@ describe("compartment chunk embedding core", () => {
         const windows = chunkCanonicalText(line, 1, 1, maxInputTokens);
 
         expect(windows.length).toBeGreaterThan(1);
-        // The invariant that #206 violated: NO window may exceed the budget.
         for (const window of windows) {
             expect(estimateTokens(window.text)).toBeLessThanOrEqual(effective);
         }
@@ -296,7 +287,6 @@ describe("compartment chunk embedding core", () => {
             expect(window.startOrdinal).toBe(1);
             expect(window.endOrdinal).toBe(1);
         }
-        // windowIndex stays 1-based and contiguous (stable chunk identity).
         expect(windows.map((w) => w.windowIndex)).toEqual(windows.map((_, i) => i + 1));
     });
 
@@ -434,8 +424,6 @@ describe("compartment chunk embedding core", () => {
             );
             expect(cached).toBe(first);
 
-            // Replacement preserves the row count but advances the maximum id,
-            // so the cheap probe must invalidate the decoded pool.
             writeVector(new Float32Array([0, 1]));
             const replaced = loadCompartmentChunkEmbeddingsForSearch(
                 db,
@@ -513,8 +501,6 @@ describe("compartment chunk embedding core", () => {
                 { memoryEnabled: true, gitCommitEnabled: false },
                 "/repo/fallback",
             );
-            // A thin notification/tool-only compartment: no FTS rows for its span,
-            // and the in-memory source strips to empty (system-reminder + TC line).
             appendCompartments(db, "ses-fallback", [
                 {
                     sequence: 0,
@@ -534,12 +520,10 @@ describe("compartment chunk embedding core", () => {
                     id: compartment.id,
                     startMessage: 5,
                     endMessage: 6,
-                    // Both lines strip away: no [ord] U:/A: meaningful text survives.
                     sourceChunkText: "[5] A: TC: task(Audit oxc engine)",
                 },
             ]);
 
-            // Embedded the summary (title + p1), not the empty raw span.
             expect(embeddedTexts).toEqual([
                 "Executed background oracle audit for oxc engine\nRan the background oracle audit to verify the oxc cutover.",
             ]);

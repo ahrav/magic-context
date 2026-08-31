@@ -72,13 +72,12 @@ describe("ctx_reduce availability (spawn tools map)", () => {
 
     it("does not freeze a fail-open verdict from an array with no user message", () => {
         clearCtxReduceAvailability("ses-no-user-yet");
-        // A pass with no user message at all fails open provisionally...
+        // No-user scans remain provisional until a user message supplies the session policy.
         const provisional = resolveCtxReduceAvailabilityFromMessages("ses-no-user-yet", [
             { info: { role: "assistant" } },
         ]);
         expect(provisional).toEqual({ callable: true, frozen: false });
-        // ...but must NOT lock the session: the real first user message (a
-        // deny-list spawn) still decides the frozen verdict.
+        // The first user tools map freezes the session verdict.
         const final = resolveCtxReduceAvailabilityFromMessages("ses-no-user-yet", [
             { info: { role: "assistant" } },
             userMsg({ "*": false, read: true }),
@@ -214,22 +213,21 @@ describe("OpenCode todowrite permission evaluator", () => {
 });
 
 describe("ctx_reduce process-global registration override (compaction-off #266 S4)", () => {
-    // The override is process-global and boot-resolved. Reset to the
-    // default-true baseline after each test so a compaction-off test cannot
-    // leak a false verdict into a later test in the same bun process.
+    // The override applies process-wide.
+    // `afterEach` resets the process-wide override to `true` so later tests cannot inherit `false`.
+    // `afterEach` resets the process-wide override to `true` so later tests cannot inherit `false`.
     it("when ctx_reduce is not registered globally, every session resolves callable=false frozen=true", () => {
         setCtxReduceRegisteredGlobally(false);
         try {
-            // A normal session with no tools map would otherwise fail-open to
-            // callable=true — the override must force false so unregistration
-            // flows through to guidance, nudges, and §N§ prefix injection.
+            // The override must force `callable=false` so unregistration reaches guidance, nudges, and `§N§` prefix injection.
+            // The override must force `callable=false` so unregistration reaches guidance, nudges, and `§N§` prefix injection.
             clearCtxReduceAvailability("ses-plain-off");
             const verdict = resolveCtxReduceAvailabilityFromMessages("ses-plain-off", [userMsg()]);
             expect(verdict).toEqual({ callable: false, frozen: true });
 
-            // Even a session that explicitly allows ctx_reduce in its spawn
-            // tools map resolves false: the tool is not registered process-
-            // globally, so the per-session map is irrelevant.
+            // Global registration takes precedence over a per-session `ctx_reduce` allow.
+            // Global registration takes precedence over a per-session `ctx_reduce` allow.
+            // Global unregistration overrides the per-session map.
             clearCtxReduceAvailability("ses-allow-off");
             const verdictAllow = resolveCtxReduceAvailabilityFromMessages("ses-allow-off", [
                 userMsg({ "*": false, ctx_reduce: true }),
@@ -252,30 +250,20 @@ describe("ctx_reduce process-global registration override (compaction-off #266 S
     });
 
     it("when ctx_reduce IS registered globally (default), the per-session tools map decides as before", () => {
-        // Default state is registered=true; do not flip it. This is the
-        // back-compat assertion: the override must not change today's
-        // behavior for compaction-on sessions.
+        // With `registered=true`, the per-session tools map determines `ctx_reduce` availability.
         clearCtxReduceAvailability("ses-plain-on");
         const verdict = resolveCtxReduceAvailabilityFromMessages("ses-plain-on", [userMsg()]);
         expect(verdict).toEqual({ callable: true, frozen: true });
     });
 
-    // Spec #266 S4 nudge-silence acceptance: both nudge channels (Channel-1
-    // append + Channel-2 trigger) gate on `ctxReduceCallable` in transform.ts
-    // (line 2254: `if (ctxReduceCallable && deps.channel1StateBySession)`).
-    // That value is resolved from this module. The override forces
-    // callable=false in compaction-off mode, so the nudge gate is closed
-    // naturally — no separate mode gate is needed at the nudge site. The
-    // mutation direction: remove the override (un-gate) → a normal session
-    // fails-open to callable=true → the nudge gate opens → red.
+    // `callable=false` in compaction-off mode closes the nudge gate; no separate mode gate is needed at the nudge site.
     it("nudge gate source: compaction-off resolves callable=false (Channel-1/Channel-2 stay silent)", () => {
         setCtxReduceRegisteredGlobally(false);
         try {
             clearCtxReduceAvailability("ses-nudge-off");
             const verdict = resolveCtxReduceAvailabilityFromMessages("ses-nudge-off", [userMsg()]);
-            // transform.ts reads `ctxReduceAvailability.callable` and gates
-            // both nudge channels on it. callable=false → no Channel-1 append,
-            // no Channel-2 claim.
+            // `callable=false` prevents the Channel-1 append and Channel-2 claim.
+            // `callable=false` prevents the Channel-1 append and Channel-2 claim.
             expect(verdict.callable).toBe(false);
             expect(verdict.frozen).toBe(true);
         } finally {

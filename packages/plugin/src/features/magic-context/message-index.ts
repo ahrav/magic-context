@@ -289,10 +289,9 @@ export function getLastIndexedOrdinal(db: Database, sessionId: string): number {
 }
 
 /**
- * Cheap IDF-lite denominator derived from the session's primary-keyed index
- * tracker. Message ordinals are contiguous through the watermark, so the small
- * approximation error from non-indexable rows is preferable to scanning the
- * global FTS row store for an exact count.
+ * The index watermark provides an IDF-lite denominator.
+ * Message ordinals are contiguous through the watermark.
+ * Non-indexable rows may make the denominator approximate, avoiding a global FTS scan.
  */
 export function getIndexedMessageCorpusSize(
     db: Database,
@@ -311,9 +310,9 @@ export function getDirtyIndexFloor(db: Database, sessionId: string): number | nu
 }
 
 /**
- * Persist the earliest ordinal that an incremental write could leave missing.
- * Callers set this before the FTS transaction so a crash or write failure leaves
- * a durable reconciliation floor instead of an uncovered watermark.
+ * markMessageIndexDirty records the earliest ordinal an incremental write could leave missing.
+ * Callers set the dirty floor before the FTS transaction so crashes and write failures leave durable reconciliation state.
+ * The dirty floor prevents a crash or write failure from leaving an uncovered watermark.
  */
 export function markMessageIndexDirty(db: Database, sessionId: string, floorOrdinal: number): void {
     const dirtyFloor = Math.max(1, Math.floor(floorOrdinal));
@@ -366,9 +365,8 @@ export function deleteIndexedMessage(db: Database, sessionId: string, messageId:
     const row = getCountIndexedMessageStatement(db).get(sessionId, messageId) as CountRow | null;
     const count = typeof row?.count === "number" ? row.count : 0;
 
-    // Full reindex on next search: ordinals are positional (not stable IDs), so removing
-    // a message shifts all subsequent ordinals. Keeping a stale tracker would cause
-    // ensureMessagesIndexed() to skip newly added messages when the count matches.
+    // Deleting a message requires a full reindex on the next search because ordinals are positional rather than stable IDs.
+    // Removing a message shifts all subsequent ordinals; a stale tracker could make ensureMessagesIndexed() skip newly added messages when counts match.
     // Clearing both FTS rows and the tracker forces a complete rebuild on next search.
     clearIndexedMessages(db, sessionId);
     return count;
@@ -422,8 +420,8 @@ function indexSingleMessageInTransaction(
             return false;
         }
 
-        // A covered ordinal is a same-ID edit/redaction. Replace that one FTS
-        // document without moving the contiguous watermark.
+        // A covered ordinal represents a same-ID edit or redaction; the indexer replaces only that ordinal's FTS document.
+        // The indexer replaces the covered ordinal's FTS document without moving the watermark.
         getDeleteMessageFtsStatement(db).run(sessionId, message.id);
         const content = setMessageSource(db, sessionId, message, now);
         if (content.length > 0 && (message.role === "user" || message.role === "assistant")) {
@@ -446,8 +444,7 @@ function indexSingleMessageInTransaction(
     }
 
     // A live event may only extend the already-covered prefix by one ordinal.
-    // Out-of-order events leave their earliest missing ordinal dirty for the
-    // paged reconciler instead of moving the watermark across a hole.
+    // Out-of-order events record their earliest missing ordinal as dirty for the paged reconciler rather than advancing the watermark across a hole.
     if (
         message.ordinal !== currentWatermark + 1 ||
         (dirtyFloor !== null && dirtyFloor !== message.ordinal)
@@ -492,15 +489,11 @@ export function indexSingleMessage(db: Database, sessionId: string, message: Raw
     }
     const dirtyFloorBeforeAttempt = getDirtyIndexFloor(db, sessionId);
 
-    // Persist the reconciliation floor before the replacement transaction. If
-    // DELETE/INSERT or COMMIT fails, the next reconciliation rebuilds this
-    // ordinal from the authoritative source instead of trusting stale FTS bytes.
+    // The indexer persists the reconciliation floor before the replacement transaction so failed DELETE, INSERT, or COMMIT operations trigger reconstruction from the authoritative source.
     markMessageIndexDirty(db, sessionId, Math.min(message.ordinal, currentWatermark + 1));
 
-    // BEGIN IMMEDIATE (not a deferred db.transaction): message_history_fts is a
-    // plain FTS5 table with NO UNIQUE constraint, and the dedup is checked inside
-    // the body. Taking the writer lock up front serializes concurrent terminal
-    // updates so the second transaction sees the first transaction's source state.
+    // BEGIN IMMEDIATE serializes terminal updates because message_history_fts has no UNIQUE constraint and deduplication occurs inside the transaction.
+    // Taking the writer lock up front serializes concurrent terminal updates so the second transaction sees the first transaction's source state.
     db.exec("BEGIN IMMEDIATE");
     let committed = false;
     try {
@@ -518,9 +511,7 @@ export function indexSingleMessage(db: Database, sessionId: string, message: Raw
         if (!committed) {
             try {
                 db.exec("ROLLBACK");
-            } catch {
-                // already closed by an earlier failure
-            }
+            } catch {}
         }
     }
 }
@@ -535,9 +526,8 @@ export function indexMessagesAfterOrdinal(
     const now = Date.now();
     let inserted = 0;
 
-    // The writer lock protects both duplicate checks and the progress row. Each
-    // caller supplies only one bounded source page, so lock hold time is bounded
-    // by that page rather than the full session history.
+    // The writer lock protects both duplicate checks and the progress row.
+    // Each caller supplies one bounded source page, so the lock is held for that page rather than the full session history.
     db.exec("BEGIN IMMEDIATE");
     let committed = false;
     try {
@@ -549,8 +539,8 @@ export function indexMessagesAfterOrdinal(
                 : Math.min(currentWatermark, Math.max(0, dirtyFloor - 1));
 
         if (dirtyFloor !== null && dirtyFloor <= finalWatermark) {
-            // Rebuild only the portion represented by this source snapshot. A
-            // stale snapshot must never delete newer live rows beyond its end.
+            // The rebuild affects only rows represented by this source snapshot.
+            // The rebuild must not delete live rows newer than the source snapshot.
             getDeleteFtsRangeStatement(db).run(sessionId, dirtyFloor, finalWatermark);
             getDeleteMessageSourceRangeStatement(db).run(sessionId, dirtyFloor, finalWatermark);
         }
@@ -599,7 +589,7 @@ export function indexMessagesAfterOrdinal(
                   ? missingFloor
                   : Math.min(missingFloor, preservedFloor);
 
-        // The FTS watermark advances only over contiguous source ordinals. A
+        // The FTS watermark advances only across contiguous source ordinals.
         // dirty floor remains recorded until a source page actually covers it.
         setIndexProgress(db, sessionId, coveredWatermark, nextDirtyFloor, now);
         db.exec("COMMIT");
@@ -608,9 +598,7 @@ export function indexMessagesAfterOrdinal(
         if (!committed) {
             try {
                 db.exec("ROLLBACK");
-            } catch {
-                // already rolled back / no active transaction
-            }
+            } catch {}
         }
     }
     return inserted;
@@ -666,9 +654,7 @@ function persistMessageHistoryOrphanSweepState(
 }
 
 /**
- * Delete old OpenCode FTS sessions that no longer exist in OpenCode's
- * authoritative session table. One bounded keyset page is processed per call;
- * the cursor survives restarts and only resets after a complete pass.
+ * The cleanup cursor survives restarts and resets only after a complete pass.
  */
 export function sweepOrphanedOpenCodeMessageIndexes(
     db: Database,
@@ -699,8 +685,8 @@ export function sweepOrphanedOpenCodeMessageIndexes(
         openCodeDb = null;
     }
     if (!openCodeDb) {
-        // Mirror the git sweep's non-indexable parking: future-date the last
-        // sweep so the normal cooldown arithmetic re-probes after one day.
+        // `last_swept_at` delays the next source probe by `unavailableReprobeMs`.
+        // after `unavailableReprobeMs`.
         persistMessageHistoryOrphanSweepState(db, cursor, now + unavailableReprobeMs - cooldownMs);
         return { status: "source_unavailable", scanned: 0, deleted: 0, cursor };
     }
@@ -753,9 +739,7 @@ export function sweepOrphanedOpenCodeMessageIndexes(
             if (!committed) {
                 try {
                     db.exec("ROLLBACK");
-                } catch {
-                    // already rolled back / no active transaction
-                }
+                } catch {}
             }
         }
 
