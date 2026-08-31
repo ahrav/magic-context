@@ -2322,3 +2322,39 @@ fn an_unvisited_descendant_of_a_revoked_root_grants_nothing() {
     attempted.event.approval_object_id = Some("approval-b".to_string());
     assert_eq!(admit(&store, attempted, "orphan", "orphan"), "deny");
 }
+
+#[test]
+fn the_durable_candidate_binding_lookup_is_indexed() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "planned", "code_present", 1, "planned-trigger");
+    assert_eq!(
+        admit(&store, request("planned"), "planned", "planned"),
+        "admit"
+    );
+
+    // The ledger is append-only, so this lookup must not degrade to a scan as it grows.
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut statement = connection
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT 1 FROM admission_decisions
+             WHERE candidate_ref='planned' AND subject_object_id IS NOT NULL
+               AND commit_seq IS NOT NULL",
+        )
+        .unwrap();
+    let plan = statement
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join(" | ");
+    assert!(
+        plan.contains("idx_admission_candidate_ref"),
+        "expected the candidate_ref index, planner chose: {plan}"
+    );
+}
