@@ -591,3 +591,61 @@ fn correction_records_replaced_identifier_redactions_in_events_and_outbox() {
         .windows(SECRET.len())
         .any(|window| window == SECRET.as_bytes()));
 }
+
+#[test]
+fn corrections_reject_cross_domain_replacements() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    seed_domain(&store);
+    store
+        .commit(intent("second-domain", '1'), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "domain-2".to_string(),
+                object_id: "domain-object-2".to_string(),
+                name: "fixture-2".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "domain-2".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            Ok(String::new())
+        })
+        .unwrap();
+    store
+        .commit(intent("cross-domain-seed", '2'), |envelope| {
+            envelope.insert_decision(decision(1))?;
+            envelope.insert_observation(observation(1, "decision-object-1"))?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    let moved_decision = store
+        .commit(intent("cross-domain-decision", '3'), |envelope| {
+            let mut replacement = decision(2);
+            replacement.domain_id = "domain-2".to_string();
+            replacement.source_revision = 2;
+            envelope.correct_decision("decision-object-1", replacement)?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(moved_decision.kind(), KernelErrorKind::InvalidInput);
+
+    let moved_observation = store
+        .commit(intent("cross-domain-observation", '4'), |envelope| {
+            let mut replacement = observation(2, "decision-object-1");
+            replacement.domain_id = "domain-2".to_string();
+            replacement.source_revision = 2;
+            envelope.correct_observation("observation-object-1", replacement)?;
+            Ok(String::new())
+        })
+        .unwrap_err();
+    assert_eq!(moved_observation.kind(), KernelErrorKind::InvalidInput);
+
+    assert_eq!(
+        inspect_i64(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE invalidated_commit_seq IS NOT NULL"
+        ),
+        0
+    );
+}
