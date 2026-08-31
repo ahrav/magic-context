@@ -466,45 +466,56 @@ const KEY_QUALIFIERS: &[&[u8]] = &[
 ];
 
 fn has_secret_key_token(key: &[u8]) -> bool {
-    key_tokens(key).any(is_secret_key_token)
+    key_tokens(key).any(|token| token_matches_any_key_name(token, SECRET_KEY_WORDS))
 }
 
-fn is_secret_key_token(token: &[u8]) -> bool {
-    SECRET_KEY_WORDS
+// Both qualifier walks run once per token rather than once per candidate split, so cost stays linear in the token length instead of quadratic.
+fn token_matches_any_key_name<Name: AsRef<[u8]>>(token: &[u8], names: &[Name]) -> bool {
+    if names
         .iter()
-        .any(|word| token_matches_key_name(token, word))
-}
-
-fn token_matches_key_name(token: &[u8], name: &[u8]) -> bool {
-    if token.eq_ignore_ascii_case(name) {
+        .any(|name| token.eq_ignore_ascii_case(name.as_ref()))
+    {
         return true;
     }
-    let Some(last) = token.len().checked_sub(name.len()) else {
-        return false;
-    };
-    (0..=last).any(|start| {
-        token[start..start + name.len()].eq_ignore_ascii_case(name)
-            && is_qualifier_sequence(&token[..start])
-            && is_qualifier_sequence(&token[start + name.len()..])
+    let from_start = qualifier_reach(token, false);
+    let to_end = qualifier_reach(token, true);
+    names.iter().any(|name| {
+        let name = name.as_ref();
+        let Some(last) = token.len().checked_sub(name.len()) else {
+            return false;
+        };
+        (0..=last).any(|start| {
+            from_start[start]
+                && to_end[start + name.len()]
+                && token[start..start + name.len()].eq_ignore_ascii_case(name)
+        })
     })
 }
 
-// One undelimited identifier can stack qualifiers on either side of the secret word, as `AWSSECRETACCESSKEY` and `PASSWORDHASH` do, and the whole remainder has to decompose so `monkey` and `keyboard` still fail on `mon` and `board`.
-fn is_qualifier_sequence(part: &[u8]) -> bool {
-    let mut reachable = vec![false; part.len() + 1];
-    reachable[0] = true;
-    for start in 0..part.len() {
-        if !reachable[start] {
+fn qualifier_reach(token: &[u8], reverse: bool) -> Vec<bool> {
+    let mut reach = vec![false; token.len() + 1];
+    let origin = if reverse { token.len() } else { 0 };
+    reach[origin] = true;
+    for step in 0..token.len() {
+        let at = if reverse { token.len() - step } else { step };
+        if !reach[at] {
             continue;
         }
         for qualifier in KEY_QUALIFIERS {
-            let end = start + qualifier.len();
-            if end <= part.len() && part[start..end].eq_ignore_ascii_case(qualifier) {
-                reachable[end] = true;
+            let span = if reverse {
+                at.checked_sub(qualifier.len()).map(|start| (start, at))
+            } else {
+                (at + qualifier.len() <= token.len()).then_some((at, at + qualifier.len()))
+            };
+            let Some((start, end)) = span else {
+                continue;
+            };
+            if token[start..end].eq_ignore_ascii_case(qualifier) {
+                reach[if reverse { start } else { end }] = true;
             }
         }
     }
-    reachable[part.len()]
+    reach
 }
 
 fn key_tokens(key: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -753,10 +764,7 @@ fn local_context_allows(
     if let Some(keys) = &spec.key_names_any {
         add_work(work, before.len(), limits.max_work_bytes)?;
         // Compared per identifier token rather than as a substring, so the `key` inside `monkey` and the `auth` inside `author` do not satisfy the gate.
-        let matched = key_tokens(before).any(|token| {
-            keys.iter()
-                .any(|key| token_matches_key_name(token, key.as_bytes()))
-        });
+        let matched = key_tokens(before).any(|token| token_matches_any_key_name(token, keys));
         return Ok(matched);
     }
     Ok(true)

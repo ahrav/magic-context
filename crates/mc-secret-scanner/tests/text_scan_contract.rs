@@ -492,6 +492,22 @@ fn local_context_key_names_match_case_insensitively() {
     }
 }
 
+/// `secret` is both a key name and a qualifier, so every offset matches the name
+/// and decomposes on its left, while the `zz` tail never decomposes on the right.
+/// A per-offset walk explores all of them before failing.
+#[test]
+fn a_long_undecomposable_key_name_stays_a_non_finding() {
+    let scanner = Scanner::new(ScanProfile::Comprehensive).unwrap();
+    let key = format!("{}zz", "secret".repeat(128));
+    let input = format!("\"{key}\": \"Ab3fGh1jKlMnOpQrStUvWxYz79PqRs24\"");
+    assert!(!scanner
+        .scan(&input)
+        .unwrap()
+        .findings
+        .iter()
+        .any(|finding| finding.rule_id.starts_with("magic-keyed")));
+}
+
 #[test]
 fn anchor_preselection_honours_the_work_budget() {
     let scanner = Scanner::with_limits(
@@ -505,11 +521,9 @@ fn anchor_preselection_honours_the_work_budget() {
     let input = "curl password token secret key auth bearer credential ".repeat(4000);
     let report = scanner.scan(&input).unwrap();
     assert_eq!(report.limits_hit, Some(LimitExhausted::Work));
-    assert!(
-        report.work_bytes <= input.len(),
-        "charged {} bytes against a 1-byte budget",
-        report.work_bytes
-    );
+    // `add_work` charges before it checks, so the preselect charge lands in full
+    // and stops there; anything larger means a later phase also ran.
+    assert_eq!(report.work_bytes, input.len());
     assert_eq!(report.candidates_evaluated, 0);
     assert!(report.findings.is_empty());
 }
