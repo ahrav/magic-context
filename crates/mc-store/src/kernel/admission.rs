@@ -809,9 +809,9 @@ impl Envelope<'_> {
                 "INSERT INTO admission_decisions(
                      admission_decision_id,candidate_id,subject_object_id,source_kind,source_id,
                      source_revision,source_class,taint_class,maturity,effective_maturity,
-                     disposition,visibility,policy_revision,reason,evidence_id,approval_object_id,
-                     commit_seq,decided_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                     disposition,visibility,sensitivity_class,policy_revision,reason,evidence_id,
+                     approval_object_id,commit_seq,decided_at
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                 params![
                     admission_decision_id,
                     prepared.facts.candidate_id,
@@ -825,6 +825,7 @@ impl Envelope<'_> {
                     prepared.evaluation.effective_maturity.get().as_str(),
                     prepared.evaluation.disposition.as_str(),
                     prepared.evaluation.visibility.as_str(),
+                    prepared.evaluation.sensitivity.as_str(),
                     POLICY_REVISION,
                     reason.text,
                     evidence_id,
@@ -997,21 +998,24 @@ fn load_prior_decision(
             row.get::<_, String>(5)?,
             row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<String>>(7)?,
+            row.get::<_, String>(8)?,
         ))
     };
     let row = if let Some(subject_object_id) = facts.subject_object_id.as_deref() {
         envelope.tx.query_row(
             "SELECT latest.admission_decision_id,latest.maturity,latest.effective_maturity,
                     latest.disposition,latest.source_class,latest.taint_class,
-                    latest.approval_object_id,latest.subject_object_id
+                    latest.approval_object_id,latest.subject_object_id,latest.sensitivity_class
              FROM (
                  SELECT admission_decision_id,maturity,effective_maturity,disposition,
-                        source_class,taint_class,approval_object_id,subject_object_id,commit_seq
+                        source_class,taint_class,approval_object_id,subject_object_id,
+                        sensitivity_class,commit_seq
                  FROM admission_decisions
                  WHERE subject_object_id=?1 AND commit_seq IS NOT NULL
                  UNION ALL
                  SELECT admission_decision_id,maturity,effective_maturity,disposition,
-                        source_class,taint_class,approval_object_id,subject_object_id,commit_seq
+                        source_class,taint_class,approval_object_id,subject_object_id,
+                        sensitivity_class,commit_seq
                  FROM admission_decisions
                  WHERE subject_object_id IS NULL AND source_kind=?2 AND source_id=?3
                    AND source_revision=?4 AND commit_seq IS NOT NULL
@@ -1028,7 +1032,7 @@ fn load_prior_decision(
     } else {
         envelope.tx.query_row(
             "SELECT admission_decision_id,maturity,effective_maturity,disposition,source_class,
-                    taint_class,approval_object_id,subject_object_id
+                    taint_class,approval_object_id,subject_object_id,sensitivity_class
              FROM admission_decisions
              WHERE source_kind=?1 AND source_id=?2 AND source_revision=?3
                AND commit_seq IS NOT NULL
@@ -1048,6 +1052,7 @@ fn load_prior_decision(
         taint_class,
         approval_object_id,
         subject_object_id,
+        sensitivity_class,
     )) = row
     else {
         return Ok(None);
@@ -1085,11 +1090,7 @@ fn load_prior_decision(
         .and_then(|value| value.as_str())
         .and_then(|value| Outcome::try_from(value).ok())
         .unwrap_or(Outcome::Deny);
-    let sensitivity = audit
-        .as_ref()
-        .and_then(|audit| audit.get("sensitivity"))
-        .and_then(|value| value.as_str())
-        .map_or(Sensitivity::Secret, Sensitivity::from_stored);
+    let sensitivity = Sensitivity::from_stored(&sensitivity_class);
     let effective_maturity =
         Maturity::try_from(effective_maturity.as_str()).unwrap_or(Maturity::Candidate);
     Ok(Some(StoredAdmission {
@@ -1230,9 +1231,10 @@ impl KernelStore {
     /// — so a newer source-level rejection overrides an earlier object-level
     /// admission.
     ///
-    /// A row is unservable when its stored classification pairing is one the
-    /// evaluator would refuse, or when its `policy_revision` exceeds
-    /// `POLICY_REVISION`. Lower revisions keep the current surface mapping.
+    /// Rows fail closed when the classification pairing is rejected.
+    /// Rows fail closed when `policy_revision` exceeds `POLICY_REVISION`.
+    /// Rows fail closed when the decision's source lineage differs from the registry.
+    /// Lower revisions keep the current surface mapping.
     pub fn visible_as_of(
         &self,
         surface: Surface,
@@ -1244,13 +1246,17 @@ impl KernelStore {
                     "SELECT o.object_id,o.object_kind,o.domain_id,o.source_kind,o.source_id,
                             o.source_revision,o.created_commit_seq,NULL,NULL,o.sensitivity_class,
                             d.effective_maturity,d.disposition,d.visibility,d.taint_class,
-                            d.source_class,d.policy_revision
+                            d.source_class,d.policy_revision,
+                            d.sensitivity_class AS decided_sensitivity
                      FROM object_registry o
                      JOIN admission_decisions d ON d.admission_decision_id=(
                          SELECT latest.admission_decision_id FROM (
                              SELECT a.admission_decision_id,a.commit_seq
                              FROM admission_decisions a
                              WHERE a.subject_object_id=o.object_id
+                               AND a.source_kind=o.source_kind
+                               AND a.source_id=o.source_id
+                               AND a.source_revision=o.source_revision
                                AND a.commit_seq IS NOT NULL
                                AND a.commit_seq<=?1
                              UNION ALL
@@ -1271,6 +1277,9 @@ impl KernelStore {
                        AND EXISTS (
                            SELECT 1 FROM admission_decisions gate
                            WHERE gate.subject_object_id=o.object_id
+                             AND gate.source_kind=o.source_kind
+                             AND gate.source_id=o.source_id
+                             AND gate.source_revision=o.source_revision
                              AND gate.commit_seq IS NOT NULL
                              AND gate.commit_seq<=?1
                        )
@@ -1284,8 +1293,14 @@ impl KernelStore {
                         TaintClass::try_from(row.get::<_, String>("taint_class")?.as_str()).ok();
                     let source =
                         SourceClass::try_from(row.get::<_, String>("source_class")?.as_str()).ok();
+                    // The maximum preserves the strictest known sensitivity.
+                    let decided =
+                        Sensitivity::from_stored(&row.get::<_, String>("decided_sensitivity")?);
                     object.sensitivity = match taint {
-                        Some(taint) => object.sensitivity.max(sensitivity_floor(taint)),
+                        Some(taint) => object
+                            .sensitivity
+                            .max(sensitivity_floor(taint))
+                            .max(decided),
                         None => Sensitivity::Secret,
                     };
                     // A newer revision may attach meanings this binary cannot see,

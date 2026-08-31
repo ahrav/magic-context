@@ -173,10 +173,10 @@ fn seed_approval(root: &std::path::Path) {
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
                  source_class,taint_class,maturity,effective_maturity,disposition,visibility,
-                 policy_revision,reason,commit_seq,decided_at
+                 sensitivity_class,policy_revision,reason,commit_seq,decided_at
              ) VALUES (
                  'approval-admission','approval','fixture','approval',1,'explicit_user',
-                 'user_explicit','approved','approved','active','automatic',1,'fixture',1,1
+                 'user_explicit','approved','approved','active','automatic','normal',1,'fixture',1,1
              );",
         )
         .unwrap();
@@ -1185,11 +1185,11 @@ fn malformed_stored_policy_and_sensitivity_fail_closed_without_read_error() {
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
                  source_class,taint_class,maturity,effective_maturity,disposition,visibility,
-                 policy_revision,reason,commit_seq,decided_at
+                 sensitivity_class,policy_revision,reason,commit_seq,decided_at
              ) VALUES (
                  'bad-sensitivity-decision','object-bad-sensitivity','fixture',
                  'bad-sensitivity',1,'trusted_local_code','current_code','verified','verified',
-                 'active','automatic',1,'fixture',2,2
+                 'active','automatic','normal',1,'fixture',2,2
              );
              INSERT INTO object_registry(
                  object_id,object_kind,domain_id,source_kind,source_id,source_revision,
@@ -1201,11 +1201,11 @@ fn malformed_stored_policy_and_sensitivity_fail_closed_without_read_error() {
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
                  source_class,taint_class,maturity,effective_maturity,disposition,visibility,
-                 policy_revision,reason,commit_seq,decided_at
+                 sensitivity_class,policy_revision,reason,commit_seq,decided_at
              ) VALUES (
                  'inconsistent-decision','object-inconsistent','fixture','inconsistent',1,
                  'trusted_local_code','current_code','verified','verified','rejected',
-                 'automatic',1,'fixture',2,2
+                 'automatic','normal',1,'fixture',2,2
              );",
         )
         .unwrap();
@@ -1439,10 +1439,10 @@ fn stored_classifications_the_evaluator_forbids_never_serve() {
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
                  source_class,taint_class,maturity,effective_maturity,disposition,visibility,
-                 policy_revision,reason,commit_seq,decided_at
+                 sensitivity_class,policy_revision,reason,commit_seq,decided_at
              ) VALUES (
                  'illegal-pair-decision','object-illegal-pair','fixture','illegal-pair',1,
-                 'untrusted_web','current_code','verified','verified','active','automatic',1,
+                 'untrusted_web','current_code','verified','verified','active','automatic','normal',1,
                  'fixture',1,1
              );
              INSERT INTO object_registry(
@@ -1455,10 +1455,10 @@ fn stored_classifications_the_evaluator_forbids_never_serve() {
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
                  source_class,taint_class,maturity,effective_maturity,disposition,visibility,
-                 policy_revision,reason,commit_seq,decided_at
+                 sensitivity_class,policy_revision,reason,commit_seq,decided_at
              ) VALUES (
                  'unknown-source-decision','object-unknown-source','fixture','unknown-source',1,
-                 'future_source','current_code','verified','verified','active','automatic',1,
+                 'future_source','current_code','verified','verified','active','automatic','normal',1,
                  'fixture',1,1
              );",
         )
@@ -1607,5 +1607,218 @@ fn superseded_replacement_serves_only_after_its_own_decision() {
             .map(|row| row.object.object_id.as_str())
             .collect::<Vec<_>>(),
         vec!["object-successor"]
+    );
+}
+
+#[test]
+fn governing_decision_sensitivity_hides_an_object_the_registry_calls_normal() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_from(&store, "plain", "mixed-source");
+    let admitted = store
+        .commit(intent("admit-plain"), |envelope| {
+            envelope.insert_admission_observation_for_test(
+                "observation-plain",
+                "code_present",
+                "domain-mixed",
+                "repo",
+                "mixed-source",
+                1,
+            )?;
+            envelope.admit_domain_candidate(
+                request("plain"),
+                AdmissionDomainSpec {
+                    domain_id: "domain-mixed".to_string(),
+                    object_id: "object-mixed".to_string(),
+                    name: "name-plain".to_string(),
+                },
+            )?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+    let now: i64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap();
+    store
+        .stage_candidate(StagingCandidateSpec {
+            extraction_run_id: "run-secret".to_string(),
+            candidate_id: "secret".to_string(),
+            extractor: "fixture".to_string(),
+            source_kind: "repo".to_string(),
+            source_id: "mixed-source".to_string(),
+            source_revision: 1,
+            candidate_kind: "domain".to_string(),
+            payload: "name-secret".to_string(),
+            provenance: Some(RepositoryProvenance {
+                repository_id: "repo".to_string(),
+                revision: "abc123".to_string(),
+            }),
+            recorded_at: now,
+            lease_expires_at: now + 60_000,
+        })
+        .unwrap();
+    drop(store);
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE candidates SET sensitivity_class='secret' WHERE candidate_id='secret'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+    let governed = store
+        .commit(intent("observe-secret"), |envelope| {
+            let mut request = request("secret");
+            request.event.trigger_object_id = Some("observation-plain".to_string());
+            envelope.record_admission(request)?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+
+    // The registry row is still `normal`; only the governing decision is secret.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT sensitivity_class FROM object_registry WHERE object_id='object-mixed'"
+        ),
+        "normal"
+    );
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT sensitivity_class FROM admission_decisions
+             WHERE subject_object_id IS NULL AND source_id='mixed-source'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "secret"
+    );
+    assert!(store
+        .visible_as_of(Surface::AutoInject, admitted)
+        .unwrap()
+        .rows
+        .iter()
+        .any(|row| row.object.object_id == "object-mixed"));
+    for surface in [Surface::AutoInject, Surface::ExplicitSearch] {
+        assert!(
+            store
+                .visible_as_of(surface, governed)
+                .unwrap()
+                .rows
+                .is_empty(),
+            "a secret governing decision must hide the object it governs"
+        );
+    }
+}
+
+#[test]
+fn decisions_bound_to_another_source_lineage_never_serve() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let seq = insert_subject(
+        &store,
+        "anchor",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    drop(store);
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // A decision naming the anchor object but a foreign source lineage must
+    // neither govern it nor satisfy its own-decision gate.
+    connection
+        .execute_batch(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'alien-lineage-decision','object-anchor','fixture','not-the-anchor-source',9,
+                 'trusted_local_code','current_code','enforced','enforced','active','automatic',
+                 'normal',1,'fixture',1,1
+             );
+             INSERT INTO object_registry(
+                 object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                 created_commit_seq,sensitivity_class
+             ) VALUES (
+                 'object-alien-only','fixture','domain-anchor','fixture','alien-only',1,1,'normal'
+             );
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'alien-only-decision','object-alien-only','fixture','some-other-source',1,
+                 'trusted_local_code','current_code','verified','verified','active','automatic',
+                 'normal',1,'fixture',1,1
+             );",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    // The anchor still serves from its own correctly-bound decision, and the
+    // object whose only decision is foreign never serves at all.
+    assert_eq!(
+        store
+            .visible_as_of(Surface::AutoInject, seq)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.object.object_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["object-anchor".to_string()]
+    );
+}
+
+#[test]
+fn serving_reads_seek_source_decisions_by_lineage_not_by_null_subject() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    insert_subject(
+        &store,
+        "planned",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    drop(store);
+    let connection = Connection::open_with_flags(
+        directory.path().join("core.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    // Without a lineage-ordered partial index SQLite seeks `subject_object_id IS
+    // NULL` and then scans every source decision once per object.
+    let mut statement = connection
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT a.admission_decision_id,a.commit_seq
+             FROM admission_decisions a
+             WHERE a.subject_object_id IS NULL
+               AND a.source_kind=?1 AND a.source_id=?2 AND a.source_revision=?3
+               AND a.commit_seq IS NOT NULL AND a.commit_seq<=?4",
+        )
+        .unwrap();
+    let plan = statement
+        .query_map(
+            rusqlite::params!["fixture", "source-planned", 1_i64, 1_i64],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("idx_admission_source_latest")),
+        "source-level lookup must seek the lineage index: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|step| step.contains("SCAN a")),
+        "source-level lookup must not scan: {plan:?}"
     );
 }
