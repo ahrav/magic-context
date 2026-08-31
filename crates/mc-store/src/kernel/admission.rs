@@ -1020,10 +1020,16 @@ impl Envelope<'_> {
         validate_provenance(source_class, taint_class, facts.provenance_kind.as_deref())?;
         let stored = load_prior_decision(self, &facts)?;
         let prior = stored.as_ref().map(|stored| stored.decision);
+        // `AcceptedAdr` on an accepted decision supplies its own support, so
+        // inheriting a predecessor's approval would make that record's root authority
+        // depend on an ancestor it no longer needs, and a revoked one would block it.
         if request.event.approval_object_id.is_none()
             && !matches!(
                 request.event.kind,
-                EventKind::ApprovalRevoked | EventKind::Correct | EventKind::Replace
+                EventKind::ApprovalRevoked
+                    | EventKind::Correct
+                    | EventKind::Replace
+                    | EventKind::AcceptedAdr
             )
         {
             request.event.approval_object_id = stored
@@ -1051,7 +1057,9 @@ impl Envelope<'_> {
             )?),
             None => None,
         };
-        let trigger_valid = validate_trigger(self, &request.event, &facts)?;
+        let trigger = validate_trigger(self, &request.event, &facts)?;
+        // A trigger cannot admit content classified below itself.
+        let trigger_sensitivity = trigger.flatten().unwrap_or(Sensitivity::Normal);
         // Revocation states the support that survives it rather than letting the
         // evaluator infer one: the automatic ceiling, never above what is held.
         let remaining_support = (request.event.kind == EventKind::ApprovalRevoked).then(|| {
@@ -1068,7 +1076,7 @@ impl Envelope<'_> {
             source_class,
             taint_class,
             prior,
-            candidate_sensitivity: facts.sensitivity,
+            candidate_sensitivity: facts.sensitivity.max(trigger_sensitivity),
             predecessor_sensitivity,
             remaining_support,
             approval_valid,
@@ -1077,7 +1085,7 @@ impl Envelope<'_> {
                 self,
                 facts.subject_object_id(),
             )?,
-            event: if trigger_valid {
+            event: if trigger.is_some() {
                 request.event.kind
             } else {
                 EventKind::Other
@@ -1673,15 +1681,21 @@ fn validate_approval(
 }
 // policy-digest:chain-end
 
+/// A validated trigger reports the sensitivity it carries, which composes into the
+/// admission so an observation cannot admit content less classified than itself.
+///
+/// `None` means the event has no trigger to satisfy, which is not a refusal.
+type TriggerSensitivity = Option<Sensitivity>;
+
 fn validate_trigger(
     envelope: &Envelope<'_>,
     event: &AdmissionEvent,
     facts: &SubjectFacts,
-) -> Result<bool, KernelError> {
+) -> Result<Option<TriggerSensitivity>, KernelError> {
     match event.kind {
         EventKind::CodeObserved | EventKind::ConfigObserved => {
             let Some(trigger_object_id) = event.trigger_object_id.as_deref() else {
-                return Ok(false);
+                return Ok(None);
             };
             let trigger_object_id = identity(trigger_object_id)?;
             let expected = if event.kind == EventKind::CodeObserved {
@@ -1689,21 +1703,28 @@ fn validate_trigger(
             } else {
                 "config_present"
             };
-            envelope
+            let sensitivity: Option<String> = envelope
                 .tx
                 .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1
-                         FROM object_registry o
-                         JOIN observations observed ON observed.object_id=o.object_id
-                         WHERE o.object_id=?1 AND o.object_kind='observation'
-                           AND o.invalidated_commit_seq IS NULL
-                           AND o.source_kind=?3
-                           AND o.source_id=?4
-                           AND o.source_revision=?5
-                           AND observed.observation_kind=?2
-                           AND observed.invalidated_commit_seq IS NULL
-                     )",
+                    "SELECT observed.sensitivity_class
+                     FROM object_registry o
+                     JOIN observations observed ON observed.object_id=o.object_id
+                     LEFT JOIN evidence_meta backing
+                            ON backing.evidence_id=observed.evidence_id
+                     WHERE o.object_id=?1 AND o.object_kind='observation'
+                       AND o.invalidated_commit_seq IS NULL
+                       AND o.source_kind=?3
+                       AND o.source_id=?4
+                       AND o.source_revision=?5
+                       AND observed.observation_kind=?2
+                       AND observed.invalidated_commit_seq IS NULL
+                       AND (
+                           observed.evidence_id IS NULL
+                           OR (
+                               backing.evidence_id IS NOT NULL
+                               AND backing.invalidated_commit_seq IS NULL
+                           )
+                       )",
                     params![
                         trigger_object_id,
                         expected,
@@ -1711,14 +1732,19 @@ fn validate_trigger(
                         facts.source_id,
                         facts.source_revision
                     ],
-                    |row| row.get::<_, bool>(0),
+                    |row| row.get(0),
                 )
-                .map_err(map_sqlite)
+                .optional()
+                .map_err(map_sqlite)?;
+            match sensitivity {
+                Some(class) => Ok(Some(Some(sensitivity_from_ledger(&class)?))),
+                None => Ok(None),
+            }
         }
         // kh8.4 owns the passing-artifact writer. A bare evidence reference cannot
         // establish that contract, so enforcement remains closed until that seam exists.
-        EventKind::Enforce => Ok(false),
-        _ => Ok(true),
+        EventKind::Enforce => Ok(None),
+        _ => Ok(Some(None)),
     }
 }
 
