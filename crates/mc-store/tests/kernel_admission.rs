@@ -3924,3 +3924,158 @@ fn source_level_rejection_strips_an_approval_of_its_authority() {
         0
     );
 }
+
+#[test]
+fn an_approval_restoring_clamped_support_becomes_the_recorded_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    // An independent root, not a dependent of `approval`: revoking `approval` would
+    // invalidate a descendant transitively, so it could not restore anything.
+    {
+        let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=ON;
+                 INSERT INTO object_registry(
+                     object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                     created_commit_seq,sensitivity_class
+                 ) VALUES (
+                     'approval-c','decision','approval-domain','fixture','approval-c',1,1,'normal'
+                 );
+                 INSERT INTO decisions(
+                     decision_id,object_id,decision_kind,decision_payload,created_commit_seq,
+                     sensitivity_class
+                 ) VALUES ('approval-c-decision','approval-c','adr_accepted',X'7b7d',1,'normal');
+                 INSERT INTO admission_decisions(
+                     admission_decision_id,subject_object_id,source_kind,source_id,
+                     source_revision,source_class,taint_class,event_kind,maturity,
+                     effective_maturity,disposition,visibility,outcome,sensitivity_class,
+                     policy_revision,reason,elevated_support,commit_seq,decided_at
+                 ) VALUES (
+                     'approval-c-admission','approval-c','fixture','approval-c',1,'explicit_user',
+                     'user_explicit','accepted_adr','approved','approved','active','automatic',
+                     'admit','normal',1,'fixture',1,1,1
+                 );",
+            )
+            .unwrap();
+    }
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage_with_observation(&store, "restored", "code_present", 1, "restored-trigger");
+
+    // Promote the unmaterialized candidate under `approval`, then revoke it so the
+    // carried support is clamped.
+    let mut promoted = request("restored");
+    promoted.event.kind = EventKind::Approve;
+    promoted.event.trigger_object_id = None;
+    promoted.event.approval_object_id = Some("approval".to_string());
+    store
+        .commit(intent("restored-promote"), |envelope| {
+            let decision = envelope.record_admission(promoted)?;
+            assert_eq!(decision.effective_maturity, Maturity::Approved);
+            Ok(String::new())
+        })
+        .unwrap();
+    store
+        .commit(intent("restored-revoke"), |envelope| {
+            envelope.revoke_approval("approval", "withdrawn")?;
+            Ok(String::new())
+        })
+        .unwrap();
+
+    // Materializing with a different valid approval restores Approved, so that
+    // approval — not the revoked one — is the recorded authority.
+    let mut restored = request("restored");
+    restored.event.kind = EventKind::Approve;
+    restored.event.trigger_object_id = None;
+    restored.event.approval_object_id = Some("approval-c".to_string());
+    store
+        .commit(intent("restored-materialize"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                restored,
+                AdmissionDomainSpec {
+                    domain_id: "domain-restored".to_string(),
+                    object_id: "object-restored".to_string(),
+                    name: "name-restored".to_string(),
+                },
+            )?;
+            assert_eq!(decision.effective_maturity, Maturity::Approved);
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT approval_object_id FROM admission_decisions
+             WHERE subject_object_id='object-restored'"
+        ),
+        "approval-c"
+    );
+
+    // So revoking the approval that actually supports it reaches the object. The
+    // automatic ceiling for this pair is `Verified`, which is still automatically
+    // visible, so the demotion shows in effective maturity rather than visibility.
+    store
+        .commit(intent("restored-revoke-c"), |envelope| {
+            let demoted = envelope.revoke_approval("approval-c", "second withdrawal")?;
+            assert_eq!(demoted.len(), 1, "{demoted:?}");
+            assert_eq!(demoted[0].effective_maturity, Maturity::Verified);
+            assert_eq!(demoted[0].outcome.as_str(), "demote_support");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT effective_maturity FROM admission_decisions
+             WHERE subject_object_id='object-restored'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "verified"
+    );
+    // History is preserved: the object did reach Approved.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT maturity FROM admission_decisions
+             WHERE subject_object_id='object-restored'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "approved"
+    );
+}
+
+#[test]
+fn retiring_a_dependent_releases_approval_capacity() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+    stage(&store, "released");
+    let mut promoted = request("released");
+    promoted.source_class = Some(SourceClass::ModelInference);
+    promoted.taint_class = Some(TaintClass::AssistantInference);
+    promoted.event.kind = EventKind::Verify;
+    promoted.event.trigger_object_id = None;
+    promoted.event.approval_object_id = Some("approval".to_string());
+    assert_eq!(admit(&store, promoted, "released", "promote"), "admit");
+
+    let counted = |root: &std::path::Path| {
+        inspect(
+            root,
+            "SELECT COUNT(DISTINCT a.subject_object_id) FROM admission_decisions a
+             JOIN object_registry o ON o.object_id=a.subject_object_id
+             WHERE a.approval_object_id='approval' AND a.elevated_support=1
+               AND o.invalidated_commit_seq IS NULL",
+        )
+    };
+    assert_eq!(counted(directory.path()), 1);
+
+    // Retiring the dependent must return its slot, matching the fan-out which
+    // already skips invalidated objects.
+    store
+        .commit(intent("retire-dependent"), |envelope| {
+            envelope.retire_domain("object-released")?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(counted(directory.path()), 0);
+}
