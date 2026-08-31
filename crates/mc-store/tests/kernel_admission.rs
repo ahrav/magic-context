@@ -133,12 +133,12 @@ fn seed_approval(root: &std::path::Path) {
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
                  source_class,taint_class,event_kind,maturity,effective_maturity,disposition,visibility,
-                 outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+                 outcome,sensitivity_class,policy_revision,reason,elevated_support,commit_seq,
+                 decided_at
              ) VALUES (
                  'approval-admission','approval','fixture','approval',1,'explicit_user',
                  'user_explicit','accepted_adr','approved','approved','active','automatic',
-                 'admit','normal',
-                 1,'fixture',1,1
+                 'admit','normal',1,'fixture',1,1,1
              );",
         )
         .unwrap();
@@ -163,13 +163,12 @@ fn seed_dependent_approval(root: &std::path::Path) {
              INSERT INTO admission_decisions(
                  admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
                  source_class,taint_class,event_kind,maturity,effective_maturity,disposition,visibility,
-                 outcome,sensitivity_class,policy_revision,reason,approval_object_id,commit_seq,
-                 decided_at
+                 outcome,sensitivity_class,policy_revision,reason,approval_object_id,
+                 elevated_support,commit_seq,decided_at
              ) VALUES (
                  'approval-b-admission','approval-b','fixture','approval-b',1,'explicit_user',
                  'user_explicit','approve','approved','approved','active','automatic','admit',
-                 'normal',
-                 1,'fixture','approval',1,1
+                 'normal',1,'fixture','approval',1,1,1
              );",
         )
         .unwrap();
@@ -1176,10 +1175,10 @@ fn approval_dependent_capacity_blocks_new_grants_and_keeps_revocation_possible()
                      admission_decision_id,subject_object_id,source_kind,source_id,
                      source_revision,source_class,taint_class,event_kind,maturity,effective_maturity,
                      disposition,visibility,outcome,sensitivity_class,policy_revision,reason,
-                     approval_object_id,commit_seq,decided_at
+                     approval_object_id,elevated_support,commit_seq,decided_at
                  ) VALUES (?1,?2,'fixture',?2,1,'model_inference','assistant_inference',
                            'verify','verified','verified','active','explicit_labeled','promote',
-                           'normal',1,'fixture','approval',1,1)",
+                           'normal',1,'fixture','approval',1,1,1)",
             )
             .unwrap();
         for dependent in 0..1_024 {
@@ -1229,11 +1228,11 @@ fn approval_dependent_capacity_blocks_new_grants_and_keeps_revocation_possible()
                      admission_decision_id,subject_object_id,source_kind,source_id,
                      source_revision,source_class,taint_class,event_kind,maturity,effective_maturity,
                      disposition,visibility,outcome,sensitivity_class,policy_revision,reason,
-                     commit_seq,decided_at
+                     elevated_support,commit_seq,decided_at
                  ) VALUES ('admission-0000-moved','dependent-0000','fixture','dependent-0000',
                            1,'model_inference','assistant_inference','verify','verified',
                            'verified','active','explicit_labeled','promote','normal',1,
-                           'moved on',1,2)",
+                           'moved on',0,1,2)",
                 [],
             )
             .unwrap();
@@ -2565,4 +2564,61 @@ fn a_materialized_candidate_cannot_receive_candidate_keyed_decisions() {
         ),
         0
     );
+}
+
+#[test]
+fn an_inert_citation_does_not_consume_approval_capacity() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    // A subject at candidate maturity citing a valid approval derives nothing from
+    // it, so the audit row must not hold a dependent slot.
+    store
+        .commit(intent("inert-citation"), |envelope| {
+            envelope.insert_domain(DomainSpec {
+                domain_id: "inert".to_string(),
+                object_id: "inert-object".to_string(),
+                name: "inert".to_string(),
+                source_kind: "fixture".to_string(),
+                source_id: "inert".to_string(),
+                source_revision: 1,
+                sensitivity: Sensitivity::Normal,
+            })?;
+            let mut inert = subject_request("inert-object", EventKind::Other);
+            inert.source_class = Some(SourceClass::ModelInference);
+            inert.taint_class = Some(TaintClass::AssistantInference);
+            inert.event.approval_object_id = Some("approval".to_string());
+            let decision = envelope.record_admission(inert)?;
+            assert_eq!(decision.effective_maturity, Maturity::Candidate);
+            Ok(String::new())
+        })
+        .unwrap();
+
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM admission_decisions
+             WHERE subject_object_id='inert-object' AND approval_object_id='approval'"
+        ),
+        1,
+        "the citation is still recorded for audit"
+    );
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT elevated_support FROM admission_decisions
+             WHERE subject_object_id='inert-object'"
+        ),
+        0,
+        "but it derives no support from the approval"
+    );
+    // Revocation has nothing to demote for it either.
+    store
+        .commit(intent("revoke-after-inert"), |envelope| {
+            let decisions = envelope.revoke_approval("approval", "withdrawn")?;
+            assert!(decisions.is_empty(), "{decisions:?}");
+            Ok(String::new())
+        })
+        .unwrap();
 }

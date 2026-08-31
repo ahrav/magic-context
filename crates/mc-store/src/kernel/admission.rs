@@ -830,6 +830,14 @@ impl Envelope<'_> {
     ///
     /// An I/O error or a stored source/taint class outside the current vocabulary
     /// still propagates, because neither leaves a coherent transaction to commit.
+    ///
+    /// The walk runs inside the invalidating transaction, and this store admits one
+    /// writer, so revoking a widely cited approval holds that writer for the whole
+    /// cascade — a few statements per dependent, up to [`MAX_AUTHORITY_DEMOTIONS`] of
+    /// them. That is accepted here because authority validity does not depend on the
+    /// walk finishing: [`validate_approval`] reads the chain, so a deferred dependent
+    /// already grants nothing. Chunking the visibility repair across transactions is
+    /// the remaining work, not a correctness gap.
     fn demote_authority_dependents(
         &mut self,
         authority_object_id: &str,
@@ -1048,9 +1056,12 @@ impl Envelope<'_> {
             .as_ref()
             .map(|object| object.object_id.clone())
             .or_else(|| prepared.facts.subject_object_id().map(str::to_string));
-        // A refused decision receives no support from the approval it cites, so it
-        // neither consumes nor tests a dependent slot.
-        if !prepared.evaluation.denied {
+        // An approval only grants support above the automatic ceiling, so a decision
+        // resting at or below it derives nothing from the approval it cites. Stored
+        // rather than re-derived in SQL, which would duplicate the ceiling table.
+        let elevated_support = prepared.evaluation.effective_maturity.get().rank()
+            > automatic_ceiling(prepared.source_class, prepared.taint_class).rank();
+        if elevated_support {
             if let Some(approval) = approval_object_id.as_deref() {
                 enforce_approval_dependent_cap(self, approval, subject_object_id.as_deref())?;
             }
@@ -1067,9 +1078,10 @@ impl Envelope<'_> {
                      candidate_payload_digest,subject_object_id,source_kind,source_id,
                      source_revision,source_class,taint_class,event_kind,maturity,
                      effective_maturity,disposition,visibility,outcome,sensitivity_class,
-                     policy_revision,reason,evidence_id,approval_object_id,commit_seq,decided_at
+                     policy_revision,reason,evidence_id,approval_object_id,elevated_support,
+                     commit_seq,decided_at
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,
-                           ?20,?21,?22,?23,?24)",
+                           ?20,?21,?22,?23,?24,?25)",
                 params![
                     admission_decision_id,
                     prepared.facts.candidate_id(),
@@ -1093,6 +1105,7 @@ impl Envelope<'_> {
                     reason.text,
                     evidence_id,
                     approval_object_id,
+                    elevated_support,
                     self.commit_seq,
                     current_time_ms(),
                 ],
@@ -1389,6 +1402,7 @@ fn enforce_approval_dependent_cap(
                 "SELECT COUNT(DISTINCT a.subject_object_id) FROM admission_decisions a
                  WHERE a.approval_object_id=?1 AND a.subject_object_id IS NOT NULL
                    AND a.subject_object_id IS NOT ?2
+                   AND a.elevated_support=1
                    AND a.commit_seq IS NOT NULL
                    AND {LATEST_SUBJECT_DECISION_PREDICATE}"
             ),
@@ -1444,6 +1458,7 @@ fn load_approval_dependents(
              FROM admission_decisions a
              WHERE a.approval_object_id=?1
                AND a.subject_object_id IS NOT NULL
+               AND a.elevated_support=1
                AND a.commit_seq IS NOT NULL
                AND {LATEST_SUBJECT_DECISION_PREDICATE}
              ORDER BY a.subject_object_id
