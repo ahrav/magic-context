@@ -10,7 +10,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{LazyLock, Mutex, PoisonError, TryLockError};
+use std::time::Instant;
 
 use super::schema::{
     apply_kernel_schema, kernel_schema_digest, kernel_schema_object_inventory,
@@ -24,6 +25,7 @@ use crate::sqlite_runtime::{
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 const READ_POOL_SIZE: usize = 2;
+const WRITER_ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 const RESET_MARKER_PROTOCOL: &str = "mc-kernel-reset-marker-v1";
 const RESET_MARKER_SUFFIX: &str = ".mc-reset";
 const RESET_MARKER_STAGING_SUFFIX: &str = ".staging";
@@ -226,6 +228,34 @@ impl KernelStore {
             return Err(KernelError::InvalidRestore);
         }
         Ok(writer)
+    }
+
+    /// `Mutex::lock` has no timeout, so a deadline-bounded caller polls instead of
+    /// blocking behind an operation that may outlive its own budget.
+    pub(super) fn lock_writer_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, Connection>, KernelError> {
+        loop {
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(KernelError::InvalidRestore);
+            }
+            let guard = match self.writer.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(KernelError::Deadline);
+                    }
+                    std::thread::sleep(WRITER_ACQUIRE_POLL);
+                    continue;
+                }
+            };
+            if self.poisoned.load(Ordering::Acquire) {
+                return Err(KernelError::InvalidRestore);
+            }
+            return Ok(guard);
+        }
     }
 
     pub(super) fn poison(&self) {

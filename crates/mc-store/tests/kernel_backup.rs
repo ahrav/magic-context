@@ -561,9 +561,7 @@ fn evidence_manifest_pin_release_and_stale_reap_are_typed() {
     assert_eq!(default_lifetime, 24 * 60 * 60 * 1_000);
     drop(store);
     let reopened = KernelStore::open(root.path()).unwrap();
-    reopened
-        .run_capture_pin_maintenance_for_test(now + 90_000)
-        .unwrap();
+    reopened.run_capture_pin_maintenance(now + 90_000).unwrap();
     assert!(inspect(root.path())
         .query_row(
             "SELECT released_at IS NOT NULL FROM capture_pins WHERE capture_pin_id=?1",
@@ -1086,4 +1084,72 @@ fn restore_interrupted_after_sidecars_move_keeps_the_live_main_file() {
     assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
     assert!(!recovery_dir.exists());
     assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
+}
+
+#[test]
+fn a_partially_completed_rollback_keeps_the_members_already_restored() {
+    let root = private_dir();
+    let store = KernelStore::open(root.path()).unwrap();
+    insert_domain(&store, 1, Sensitivity::Normal);
+    insert_domain(&store, 2, Sensitivity::Normal);
+    let live_oracle = restore_oracle(root.path());
+
+    let recovery_dir = store.abandon_restore_marker_for_test().unwrap();
+    drop(store);
+    // `restore_displaced_family` moves the main file first, so a recovery directory
+    // holding only sidecars is a rollback that already restored the main file. The
+    // live main file must survive the re-run rather than be deleted as residue.
+    let main = root.path().join("core.sqlite");
+    let live_bytes = fs::read(&main).unwrap();
+    fs::write(recovery_dir.join("core.sqlite-wal"), b"").unwrap();
+    assert!(main.exists());
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    assert_eq!(fs::read(&main).unwrap(), live_bytes);
+    assert_eq!(restore_oracle(root.path()), live_oracle);
+    assert_eq!(reopened.facts(1).unwrap().commit_seq, 2);
+    assert!(!recovery_dir.exists());
+    assert!(!root.path().join("core.sqlite.mc-restore").exists());
+    assert_eq!(insert_domain(&reopened, 3, Sensitivity::Normal), 3);
+}
+
+#[test]
+fn backup_reports_deadline_rather_than_blocking_on_a_held_writer() {
+    let root = private_dir();
+    let destination = private_dir();
+    let store = Arc::new(KernelStore::open(root.path()).unwrap());
+    insert_domain(&store, 1, Sensitivity::Normal);
+
+    let (holding_tx, holding_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            store
+                .commit(intent("hold-the-writer"), |_| {
+                    holding_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok("held".to_string())
+                })
+                .unwrap();
+        })
+    };
+    holding_rx.recv().unwrap();
+
+    let started = Instant::now();
+    let outcome = store.backup(BackupRequest {
+        destination_directory: destination.path().to_path_buf(),
+        deadline: Instant::now() + Duration::from_millis(150),
+        capture_pin_expires_at: None,
+    });
+    let elapsed = started.elapsed();
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+
+    assert_eq!(outcome.unwrap_err(), KernelError::Deadline);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "backup blocked on the writer for {elapsed:?}"
+    );
+    assert!(destination_entries(destination.path()).is_empty());
 }

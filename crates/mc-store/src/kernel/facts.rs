@@ -7,6 +7,9 @@ use super::{KernelError, KernelStore};
 
 pub const MAIN_FILE_WARN_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Sizes are sampled per file outside any transaction, so a concurrent commit or
+/// checkpoint can change them between reads. They describe recent growth for
+/// alerting, not a snapshot consistent with `commit_seq`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelFacts {
     pub commit_seq: i64,
@@ -53,13 +56,13 @@ impl KernelStore {
                 .map_err(|_| KernelError::Io)?,
             _ => None,
         };
+        tx.commit().map_err(|_| KernelError::Io)?;
         let main_file_bytes = file_len(&self.db_path)?;
         let family_bytes = family_sidecars(&self.db_path)
             .iter()
             .try_fold(main_file_bytes, |total, path| {
                 file_len(path).map(|length| total.saturating_add(length))
             })?;
-        tx.commit().map_err(|_| KernelError::Io)?;
         Ok(KernelFacts {
             commit_seq,
             main_file_bytes,

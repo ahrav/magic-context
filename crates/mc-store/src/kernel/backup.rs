@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -123,10 +124,7 @@ impl KernelStore {
         if Instant::now() >= request.deadline {
             return Err(KernelError::Deadline);
         }
-        let mut writer = self.lock_writer()?;
-        if Instant::now() >= request.deadline {
-            return Err(KernelError::Deadline);
-        }
+        let mut writer = self.lock_writer_before(request.deadline)?;
         let capture = capture_state(
             &mut writer,
             self.lease_epoch(),
@@ -260,7 +258,7 @@ impl KernelStore {
         tx.commit().map_err(|_| KernelError::Io)
     }
 
-    pub(super) fn run_capture_pin_maintenance(&self, now_ms: i64) -> Result<(), KernelError> {
+    pub fn run_capture_pin_maintenance(&self, now_ms: i64) -> Result<(), KernelError> {
         let mut writer = self.lock_writer()?;
         let tx = writer
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -288,11 +286,6 @@ impl KernelStore {
         )
         .map_err(|_| KernelError::Io)?;
         tx.commit().map_err(|_| KernelError::Io)
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn run_capture_pin_maintenance_for_test(&self, now_ms: i64) -> Result<(), KernelError> {
-        self.run_capture_pin_maintenance(now_ms)
     }
 
     pub fn restore(&self, backup_path: impl AsRef<Path>) -> Result<i64, KernelError> {
@@ -861,22 +854,34 @@ pub fn verify_backup_with_deadline_for_test(
     )
 }
 
+// `serde_json` cannot round-trip a non-UTF-8 `PathBuf`, and a lossy path would
+// fail the byte-exact comparison in `resume_restore`. The raw `OsStr` bytes do
+// round-trip.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RestoreMarker {
     protocol: String,
-    database_path: PathBuf,
-    recovery_directory: PathBuf,
+    database_path: Vec<u8>,
+    recovery_directory: Vec<u8>,
     marker_digest: String,
 }
 
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
+}
+
 fn restore_marker_digest(marker: &RestoreMarker) -> String {
-    let canonical = format!(
-        "{RESTORE_MARKER_PROTOCOL}\ndatabase_path={}\nrecovery_directory={}",
-        marker.database_path.display(),
-        marker.recovery_directory.display()
-    );
-    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+    let mut hasher = Sha256::new();
+    hasher.update(RESTORE_MARKER_PROTOCOL.as_bytes());
+    hasher.update(b"\ndatabase_path=");
+    hasher.update(&marker.database_path);
+    hasher.update(b"\nrecovery_directory=");
+    hasher.update(&marker.recovery_directory);
+    format!("{:x}", hasher.finalize())
 }
 
 fn valid_recovery_path(path: &Path, recovery_dir: &Path) -> bool {
@@ -896,27 +901,26 @@ pub(super) fn resume_restore(path: &Path) -> Result<(), KernelError> {
     let bytes = fs::read(restore_marker_path(path)).map_err(|_| KernelError::Inconclusive)?;
     let marker: RestoreMarker =
         serde_json::from_slice(&bytes).map_err(|_| KernelError::Inconclusive)?;
+    let recovery_directory = path_from_bytes(&marker.recovery_directory);
     if marker.protocol != RESTORE_MARKER_PROTOCOL
-        || marker.database_path != path
+        || path_from_bytes(&marker.database_path) != path
         || marker.marker_digest != restore_marker_digest(&marker)
-        || !valid_recovery_path(path, &marker.recovery_directory)
-        || !marker.recovery_directory.is_dir()
+        || !valid_recovery_path(path, &recovery_directory)
+        || !recovery_directory.is_dir()
     {
         return Err(KernelError::Inconclusive);
     }
     remove_restore_scratch(path)?;
     // Only remove the live family after a displaced main file exists; otherwise it
     // remains the sole copy.
-    let displaced_main = marker
-        .recovery_directory
-        .join(path.file_name().ok_or(KernelError::Inconclusive)?);
+    let displaced_main =
+        recovery_directory.join(path.file_name().ok_or(KernelError::Inconclusive)?);
     if displaced_main.exists() {
         remove_family(path).map_err(|_| KernelError::Inconclusive)?;
     }
-    restore_displaced_family(path, &marker.recovery_directory)
-        .map_err(|_| KernelError::Inconclusive)?;
+    restore_displaced_family(path, &recovery_directory).map_err(|_| KernelError::Inconclusive)?;
     remove_restore_marker(path)?;
-    cleanup_recovery_dir(path, &marker.recovery_directory);
+    cleanup_recovery_dir(path, &recovery_directory);
     Ok(())
 }
 
@@ -942,8 +946,8 @@ fn remove_restore_scratch(path: &Path) -> Result<(), KernelError> {
 fn publish_restore_marker(path: &Path, recovery_dir: &Path) -> Result<(), KernelError> {
     let mut marker = RestoreMarker {
         protocol: RESTORE_MARKER_PROTOCOL.to_string(),
-        database_path: path.to_path_buf(),
-        recovery_directory: recovery_dir.to_path_buf(),
+        database_path: path_bytes(path),
+        recovery_directory: path_bytes(recovery_dir),
         marker_digest: String::new(),
     };
     marker.marker_digest = restore_marker_digest(&marker);
@@ -1056,14 +1060,14 @@ fn displace_family(path: &Path, recovery_dir: &Path) -> Result<(), KernelError> 
     sync_parent(path)
 }
 
+// The main file moves first; its presence in `recovery_dir` means no member has
+// been restored. Re-running after a crash then skips members already moved back
+// instead of deleting them, keeping a partial rollback idempotent.
 fn restore_displaced_family(path: &Path, recovery_dir: &Path) -> Result<(), KernelError> {
     if !recovery_dir.exists() {
         return Err(KernelError::InvalidRestore);
     }
-    for destination in family_sidecars(path)
-        .into_iter()
-        .chain(std::iter::once(path.to_path_buf()))
-    {
+    for destination in std::iter::once(path.to_path_buf()).chain(family_sidecars(path)) {
         let name = destination.file_name().ok_or(KernelError::Io)?;
         let source = recovery_dir.join(name);
         if source.exists() {
