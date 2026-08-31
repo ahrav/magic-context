@@ -1045,3 +1045,42 @@ fn deletion_accepts_the_evidence_id_the_caller_supplied_at_ingestion() {
     assert_eq!(deletion.digest, handle.digest);
     assert!(!deletion.affected_object_ids.is_empty());
 }
+
+#[test]
+fn a_replayed_deletion_reports_the_generation_it_committed() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = ingest(&store, "replay", b"replay");
+    let request = delete_request("replay", &handle.digest, ArtifactDeletionKind::Delete);
+    let first = store.delete_artifact(request.clone()).unwrap();
+    assert!(!first.already_applied);
+    assert_eq!(first.affected_object_ids, vec!["object-replay".to_string()]);
+
+    // A fresh reference for the same digest is live and was never invalidated.
+    let readmitted = ingest(&store, "replay-again", b"replay");
+    assert_eq!(readmitted.digest, handle.digest);
+
+    let replayed = store.delete_artifact(request).unwrap();
+
+    assert!(replayed.already_applied);
+    assert_eq!(replayed.commit_seq, first.commit_seq);
+    assert_eq!(replayed.barrier_id, first.barrier_id);
+    assert_eq!(
+        replayed.affected_object_ids, first.affected_object_ids,
+        "a replay reported objects the original deletion never invalidated"
+    );
+    assert!(!replayed
+        .affected_object_ids
+        .contains(&"object-replay-again".to_string()));
+    assert!(
+        inspect(root.path())
+            .query_row(
+                "SELECT invalidated_commit_seq IS NULL FROM evidence_meta WHERE object_id=?1",
+                ["object-replay-again"],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap(),
+        "the re-admitted reference should still be live"
+    );
+}

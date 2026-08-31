@@ -101,6 +101,14 @@ struct PurgeIntentLine<'a> {
     timestamp: i64,
 }
 
+/// The committed outcome of one deletion, replayed verbatim when its receipt is
+/// reused so a later re-ingestion is never reported as invalidated.
+#[derive(Serialize, serde::Deserialize)]
+struct DeletionReceiptPayload {
+    barrier_id: String,
+    affected_object_ids: Vec<String>,
+}
+
 /// Operator-supplied purge audit text after secret redaction.
 struct PurgeAuditFields {
     operator_id: RedactedField,
@@ -310,18 +318,27 @@ impl KernelStore {
                     target_locator: &target_locator,
                     deleted_at,
                 });
-                Ok(barrier_id.clone())
+                serde_json::to_string(&DeletionReceiptPayload {
+                    barrier_id: barrier_id.clone(),
+                    affected_object_ids: event_object_ids.clone(),
+                })
+                .map_err(|_| KernelError::Io)
             },
             false,
         )
         .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
 
+        let committed = serde_json::from_str::<DeletionReceiptPayload>(&receipt.result)
+            .unwrap_or_else(|_| DeletionReceiptPayload {
+                barrier_id: state.barrier_id.clone(),
+                affected_object_ids: state.all_object_ids.clone(),
+            });
         let result = ArtifactDeletionResult {
             kind,
             digest: state.digest.clone(),
-            affected_object_ids: state.all_object_ids,
+            affected_object_ids: committed.affected_object_ids,
             commit_seq: receipt.commit_seq,
-            barrier_id: state.barrier_id,
+            barrier_id: committed.barrier_id,
             already_applied: receipt.replayed,
         };
         if kind == ArtifactDeletionKind::Purge {
