@@ -152,8 +152,25 @@ describe("opencode child lifecycle", () => {
                 /credential-shaped key: openCodeConfigExtra\.mcp\.docs\.headers\.Authorization/,
             );
 
-            // `isSecretKey` wants a qualifier before its secret word, so these
-            // credential-bearing header names need naming outright.
+            // Names `isSecretKey` reads as benign: an unlisted qualifier, or no
+            // case transition to split on at all.
+            for (const key of [
+                "masterKey",
+                "dbPassword",
+                "webhookSecret",
+                "signingSecret",
+                "encryptionKey",
+                "idToken",
+                "APIKEY",
+                "apikey",
+            ]) {
+                expect(write({ [key]: "sk-live" })).toThrow(
+                    new RegExp(`credential-shaped key: .*\\.${key}`),
+                );
+            }
+            // Counting keys keep working: `token` alone is not a credential word.
+            expect(write({ maxTokens: 4096, promptTokens: 12, tokenBudget: 7 })).not.toThrow();
+
             for (const header of ["Cookie", "Proxy-Authorization", "set-cookie"]) {
                 expect(() =>
                     __spawnOpencodeTest.writeConfigs(env, "http://127.0.0.1:4321", {

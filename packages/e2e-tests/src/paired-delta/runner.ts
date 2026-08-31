@@ -1,14 +1,15 @@
-import { randomBytes } from "node:crypto";
-import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { canonicalFingerprint } from "../../../plugin/scripts/retrieval-benchmark/canonical-json";
 import { publishJsonAtomically } from "../atomic-publish";
+import { HoldoutContractError } from "../prospective-holdout/contract";
+import { acquireRecoverableLock } from "../prospective-holdout/lock";
 import {
     ARM_IDS,
     PRIMARY_ARM_IDS,
     PairedDeltaContractError,
+    parseArmedCellResult,
     r3PromptEvidence,
-    REASON_CODES,
     REGRET_ARM_IDS,
     RUN_HEALTHS,
     validateCheckVector,
@@ -204,7 +205,6 @@ export async function verifyDualMockResolution(input: {
 
 const RUN_HEALTH_SET: ReadonlySet<string> = new Set(RUN_HEALTHS);
 const ARM_ID_SET: ReadonlySet<string> = new Set(ARM_IDS);
-const REASON_CODE_SET: ReadonlySet<string> = new Set(REASON_CODES);
 
 /**
  * Stored records control spend caps and resume behavior. A record with a
@@ -246,42 +246,18 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
         if (record.costSource !== "observed" && record.costSource !== "estimated") {
             fail("cost-source-invalid");
         }
-        const cell = record.cell as Partial<ArmedCellResult> | undefined;
-        if (
-            cell === null ||
-            typeof cell !== "object" ||
-            typeof cell.runHealth !== "string" ||
-            !RUN_HEALTH_SET.has(cell.runHealth)
-        ) {
-            fail("run-health-invalid");
-        }
-        const armedCell = cell as ArmedCellResult;
-        const counts = [
-            armedCell.checksPassed,
-            armedCell.checksTotal,
-            armedCell.criticalPassed,
-            armedCell.criticalTotal,
-        ];
-        if (
-            armedCell.armId !== record.armId ||
-            typeof armedCell.invalidSuccess !== "boolean" ||
-            counts.some((value) => !Number.isSafeInteger(value) || value < 0) ||
-            armedCell.checksPassed > armedCell.checksTotal ||
-            armedCell.criticalPassed > armedCell.criticalTotal
-        ) {
-            fail("cell-invalid");
-        }
+        /** `parseArmedCellResult` is the contract's own validator, so the store cannot drift from it: it enforces the cross-field rules a local copy kept missing — `criticalTotal <= checksTotal`, `criticalPassed <= checksPassed`, a reason code exactly when the health is not completed, and the reason-to-health pairings `REASON_CODE_HEALTHS` admits. commentlint: allow(JUDGE) */
+        const armedCell = ((): ArmedCellResult => {
+            try {
+                return parseArmedCellResult(record.cell);
+            } catch (error) {
+                if (!(error instanceof PairedDeltaContractError)) throw error;
+                return fail(`cell-invalid: ${error.diagnostics.join(",")}`);
+            }
+        })();
+        if (armedCell.armId !== record.armId) fail("cell-invalid: arm-mismatch");
         if (typeof record.harnessDisposed !== "boolean") {
             fail("harness-disposed-invalid");
-        }
-        if (
-            armedCell.reasonCode !== null &&
-            (
-                typeof armedCell.reasonCode !== "string" ||
-                !REASON_CODE_SET.has(armedCell.reasonCode)
-            )
-        ) {
-            fail("reason-code-invalid");
         }
         const checks = record.checks ?? null;
         if (
@@ -296,14 +272,12 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
         ) {
             fail("checks-invalid");
         }
-        /** A completed record suppresses its live rollout, so its cell must be a shape a completed rollout could actually produce: a reason code, a zero denominator, or a check vector that disagrees with the counts marks storage that was corrupted or hand-edited, and regret scoring would divide by it. commentlint: allow(JUDGE) */
         const vector = checks as CheckResult[];
+        /** A completed record suppresses its live rollout, so its counts must agree with the vector stored beside them: `parseArmedCellResult` validates the cell alone and cannot see the checks. commentlint: allow(JUDGE) */
         if (armedCell.runHealth === "completed") {
             if (
-                armedCell.reasonCode !== null ||
                 /** A live record sets this flag only for a claimed success that failed a critical check, so the combination cannot have been produced by a run and would inflate invalid-success counts. commentlint: allow(JUDGE) */
                 (armedCell.invalidSuccess && armedCell.criticalPassed >= armedCell.criticalTotal) ||
-                armedCell.checksTotal === 0 ||
                 vector.length !== armedCell.checksTotal ||
                 vector.filter((check) => check.passed).length !== armedCell.checksPassed
             ) {
@@ -328,9 +302,8 @@ function parseRolloutRecords(raw: unknown, path: string): RolloutRecord[] {
 /** Two runners over one records path each cache the pre-run array and publish a private snapshot, so the later rename erases the other's record after both paid calls happened — and the erased spend is then repeated on resume. The lock is taken before the first read, because by the time a write conflicts the money is already gone. commentlint: allow(JUDGE) */
 export class RolloutStoreBusyError extends Error {}
 
-/** The pid file cannot separate two stores inside one process, which race exactly as two processes do, so live owners are tracked here as well. Read-only stores never claim ownership, so inspecting a records file never conflicts with the run that owns it. commentlint: allow(JUDGE) */
+/** Read-only stores never claim ownership, so inspecting a records file never conflicts with the run that owns it. commentlint: allow(JUDGE) */
 const ownedRecordPaths = new Set<string>();
-const LOCK_ACQUIRE_ATTEMPTS = 8;
 
 
 export class FileRolloutStore implements RolloutStore {
@@ -339,7 +312,7 @@ export class FileRolloutStore implements RolloutStore {
     private readonly lockPath: string;
     private readonly claim: string;
     private readonly readOnly: boolean;
-    private lockHeld = false;
+    private held: { release(): void } | null = null;
     private readonly releaseOnExit = () => this.release();
 
     constructor(private readonly path: string, options?: { readOnly?: boolean }) {
@@ -355,20 +328,18 @@ export class FileRolloutStore implements RolloutStore {
 
     /** Removes this process's claim on the records path. Safe to call when no lock is held. commentlint: allow(JUDGE) */
     release(): void {
-        if (!this.lockHeld) return;
-        this.lockHeld = false;
+        const held = this.held;
+        if (held === null) return;
+        this.held = null;
         ownedRecordPaths.delete(this.claim);
         process.off("exit", this.releaseOnExit);
-        try {
-            rmSync(this.lockPath, { force: true });
-        } catch {
-            /** A lock file left behind is reclaimed by the next run's liveness check. commentlint: allow(JUDGE) */
-        }
+        held.release();
     }
 
     private acquire(): void {
         /** A read-only store observes the file without claiming it, so a report or an assertion can read records the owning run is still writing. commentlint: allow(JUDGE) */
-        if (this.readOnly || this.lockHeld) return;
+        if (this.readOnly || this.held !== null) return;
+        /** `acquireRecoverableLock`'s nonce is per module, not per instance, so a second store in this process would read its own nonce back and believe it owns the lock. commentlint: allow(JUDGE) */
         if (ownedRecordPaths.has(this.claim)) {
             throw new RolloutStoreBusyError(
                 `rollout store ${this.path} is already owned in this process`,
@@ -376,78 +347,18 @@ export class FileRolloutStore implements RolloutStore {
         }
         /** The records path's directory is created by the first publish, so the lock cannot assume it exists. commentlint: allow(JUDGE) */
         mkdirSync(dirname(this.lockPath), { recursive: true });
-        /** Bounded because each pass either takes the lock, proves a live owner, or removes one stale lock: two runners racing the same stale lock cannot both win, and the loser observes the winner's live pid on its next pass. commentlint: allow(JUDGE) */
-        for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
-            if (this.claimLockFile()) {
-                this.lockHeld = true;
-                ownedRecordPaths.add(this.claim);
-                process.on("exit", this.releaseOnExit);
-                return;
+        try {
+            this.held = acquireRecoverableLock(this.lockPath, {
+                busyCode: `rollout-store-busy:${this.path}`,
+            });
+        } catch (error) {
+            if (error instanceof HoldoutContractError) {
+                throw new RolloutStoreBusyError(`rollout store ${this.path} is in use`);
             }
-        }
-        throw new RolloutStoreBusyError(
-            `rollout store ${this.path} lock could not be claimed`,
-        );
-    }
-
-    /** Returns true when this process now holds the lock. Removing a stale lock is a separate pass, so the creation that follows is still exclusive. commentlint: allow(JUDGE) */
-    private claimLockFile(): boolean {
-        try {
-            writeFileSync(this.lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
-            return true;
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        }
-        const observed = this.readLockOwner();
-        if (observed !== null && this.ownerIsLive(observed)) {
-            throw new RolloutStoreBusyError(
-                `rollout store ${this.path} is in use by pid ${observed}`,
-            );
-        }
-        /** Takeover moves the observed lock aside first: `rename` is atomic, so of two runners reclaiming one stale lock only one moves that file, and the other either finds it gone or finds the winner's new lock and puts it back. commentlint: allow(JUDGE) */
-        const claimed = `${this.lockPath}.claim-${process.pid}-${randomBytes(4).toString("hex")}`;
-        try {
-            renameSync(this.lockPath, claimed);
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
             throw error;
         }
-        const moved = this.readLockOwner(claimed);
-        if (moved !== null && moved !== observed && this.ownerIsLive(moved)) {
-            /** `link` refuses an existing destination, unlike `rename`: a third runner may have claimed the path while this one held the file aside, and replacing its lock would leave two owners. commentlint: allow(JUDGE) */
-            try {
-                linkSync(claimed, this.lockPath);
-            } catch (error) {
-                if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-            }
-            rmSync(claimed, { force: true });
-            throw new RolloutStoreBusyError(
-                `rollout store ${this.path} is in use by pid ${moved}`,
-            );
-        }
-        rmSync(claimed, { force: true });
-        return false;
-    }
-
-    private readLockOwner(path = this.lockPath): number | null {
-        try {
-            const owner = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
-            return Number.isSafeInteger(owner) && owner > 0 ? owner : null;
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-            throw error;
-        }
-    }
-
-    /** A crashed run cannot release its lock, so an owner that no longer exists is not a conflict; `kill(pid, 0)` is the liveness test and `ESRCH` means the process is gone. commentlint: allow(JUDGE) */
-    private ownerIsLive(owner: number): boolean {
-        if (owner === process.pid) return false;
-        try {
-            process.kill(owner, 0);
-            return true;
-        } catch (error) {
-            return (error as NodeJS.ErrnoException).code === "EPERM";
-        }
+        ownedRecordPaths.add(this.claim);
+        process.on("exit", this.releaseOnExit);
     }
 
     put(record: RolloutRecord): void {
@@ -847,6 +758,8 @@ export async function runPairedDelta(
                         coordinates.push(coordinateResult);
                         break outer;
                     }
+                    /** A rung that ran and failed stops the ladder as designed, but one that never ran — an invalid stored record — leaves the coordinate short of the evidence it claims, and only the primary arms feed the `incomplete` derivation below. commentlint: allow(JUDGE) */
+                    if (rung === null) coordinateResult.incomplete = true;
                     if (rung?.cell.runHealth !== "completed") break;
                 }
                 coordinateResult.regret = computeRegretRungs(scenario, coordinateResult.cells);

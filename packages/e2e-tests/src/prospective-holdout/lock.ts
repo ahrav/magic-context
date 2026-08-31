@@ -180,6 +180,26 @@ export function withRecoverableLock<T>(
     options: RecoverableLockOptions,
     operation: () => T,
 ): T {
+    const held = acquireRecoverableLock(lockPath, options);
+    try {
+        return operation();
+    } finally {
+        held.release();
+    }
+}
+
+/**
+ * `acquireRecoverableLock` holds `lockPath` until the returned `release` runs, for a guarded
+ * span the caller cannot express as one operation — a run that interleaves reads and writes
+ * over minutes rather than a single call.
+ *
+ * Acquisition and reclamation are `withRecoverableLock`'s, so both share one definition of
+ * when a lock is abandoned and one takeover sequence.
+ */
+export function acquireRecoverableLock(
+    lockPath: string,
+    options: RecoverableLockOptions,
+): { release(): void } {
     const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
     let reclaimed = false;
     for (;;) {
@@ -195,9 +215,12 @@ export function withRecoverableLock<T>(
         if (Date.now() >= deadline) throw new HoldoutContractError([options.busyCode]);
         Atomics.wait(LOCK_WAIT_SLOT, 0, 0, 5);
     }
-    try {
-        return operation();
-    } finally {
-        releaseLock(lockPath);
-    }
+    let released = false;
+    return {
+        release(): void {
+            if (released) return;
+            released = true;
+            releaseLock(lockPath);
+        },
+    };
 }

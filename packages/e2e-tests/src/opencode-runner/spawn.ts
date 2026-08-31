@@ -250,17 +250,49 @@ function writeConfigs(
 
 }
 
-/** `isSecretKey` needs a qualifier segment before its secret word, so header names that carry a credential without one — `Cookie`, `Proxy-Authorization` — are named here instead. commentlint: allow(JUDGE) */
-const CREDENTIAL_HEADER_NAMES: ReadonlySet<string> = new Set([
+/** `isSecretKey` requires one of its qualifier segments before a secret word, and splits only on case transitions and separators, so compound and glued names — `masterKey`, `dbPassword`, `webhookSecret`, `APIKEY` — read as benign. Config keys need the wider rule: a name whose final word names a credential is one, whatever qualifies it. commentlint: allow(JUDGE) */
+const CREDENTIAL_TAIL_WORDS = [
+    "key",
+    "keys",
+    "secret",
+    "secrets",
+    "password",
+    "passwd",
+    "passphrase",
+    "credential",
+    "credentials",
     "cookie",
-    "set-cookie",
-    "proxy-authorization",
-    "www-authenticate",
-    "proxy-authenticate",
-]);
+    "authorization",
+    "auth",
+    "bearer",
+    "dsn",
+];
+
+/** `token` is the one credential word that also counts things — `maxTokens`, `promptTokens` — so it is credential-shaped only under a qualifier that names an issued credential. commentlint: allow(JUDGE) */
+const TOKEN_CREDENTIAL_QUALIFIERS = [
+    "access",
+    "id",
+    "refresh",
+    "bearer",
+    "auth",
+    "session",
+    "api",
+    "client",
+    "service",
+    "private",
+    "secret",
+    "oauth",
+];
 
 function isCredentialShapedConfigKey(key: string): boolean {
-    return isSecretKey(key) || CREDENTIAL_HEADER_NAMES.has(key.trim().toLowerCase());
+    if (isSecretKey(key)) return true;
+    /** Separators are dropped rather than split on, so a glued `APIKEY` is judged by the same rule as `api_key`. commentlint: allow(JUDGE) */
+    const compact = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (CREDENTIAL_TAIL_WORDS.some((word) => compact.endsWith(word))) return true;
+    if (compact.endsWith("token") || compact.endsWith("tokens")) {
+        return TOKEN_CREDENTIAL_QUALIFIERS.some((qualifier) => compact.startsWith(qualifier));
+    }
+    return false;
 }
 
 /**

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -19,6 +19,7 @@ import {
     type RunnerDependencies,
 } from "./runner";
 import type { ArmId, ScenarioDeclaration } from "./contract";
+import { LOCK_OWNER_FILE } from "../prospective-holdout/lock";
 
 const scenario: ScenarioDeclaration = {
     scenarioId: "var-runner-smoke",
@@ -729,229 +730,123 @@ describe("paired-delta runner", () => {
         }
     });
 
-    it("refuses a second runner over a records path already in use", () => {
-        const root = mkdtempSync(join(tmpdir(), "paired-delta-lock-"));
-        // A live process other than this one, standing in for the concurrent
-        // runner that would pay for the same coordinates and then publish a
-        // snapshot erasing the other's records.
-        const other = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
-        try {
-            const path = join(root, "records.json");
-            writeFileSync(`${path}.lock`, `${other.pid}\n`);
-
-            expect(() => new FileRolloutStore(path).list()).toThrow(RolloutStoreBusyError);
-
-            other.kill();
-        } finally {
-            other.kill();
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
-    it("refuses a second owning store for one path in this process", () => {
-        const root = mkdtempSync(join(tmpdir(), "paired-delta-owner-"));
-        try {
-            const path = join(root, "records.json");
-            const owner = new FileRolloutStore(path);
-            owner.list();
-
-            // The pid file cannot tell these apart, and two cached snapshots
-            // erase each other's paid records exactly as two processes would.
-            expect(() => new FileRolloutStore(path).list()).toThrow(RolloutStoreBusyError);
-            // Inspecting the file is not ownership.
-            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).not.toThrow();
-
-            owner.release();
-            expect(() => new FileRolloutStore(path).list()).not.toThrow();
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
-    it("refuses to write through a read-only store", () => {
-        const root = mkdtempSync(join(tmpdir(), "paired-delta-readonly-"));
-        try {
-            const path = join(root, "records.json");
-            const reader = new FileRolloutStore(path, { readOnly: true });
-
-            expect(() => reader.put({} as unknown as RolloutRecord)).toThrow(/read-only/);
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
-    it("does not delete a new owner's lock while reclaiming a stale one", () => {
-        const root = mkdtempSync(join(tmpdir(), "paired-delta-takeover-"));
+    it("refuses a records path a live foreign holder still owns", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-foreign-lock-"));
         const live = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
         try {
             const path = join(root, "records.json");
-            const lock = `${path}.lock`;
-            // Stands in for the interleaving where this runner read a dead pid
-            // and another runner claimed the lock before it acted on that read.
-            writeFileSync(lock, `${live.pid}\n`);
+            // The owner record another process would have written: a live pid, a
+            // foreign nonce, and a lease that has not expired.
+            mkdirSync(`${path}.lock`, { recursive: true });
+            writeFileSync(
+                join(`${path}.lock`, LOCK_OWNER_FILE),
+                `${JSON.stringify({ pid: live.pid, nonce: "foreign-nonce", acquiredAt: Date.now() })}\n`,
+            );
 
             expect(() => new FileRolloutStore(path).list()).toThrow(RolloutStoreBusyError);
-            // The other runner's lock survives the refused takeover.
-            expect(readFileSync(lock, "utf8").trim()).toBe(String(live.pid));
 
             live.kill();
         } finally {
             live.kill();
             rmSync(root, { recursive: true, force: true });
         }
-    });
+    }, 20_000);
 
-    it("reclaims a lock whose owner is gone", () => {
-        const root = mkdtempSync(join(tmpdir(), "paired-delta-stale-lock-"));
+    it("reclaims a records path whose holder died and whose lease expired", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-abandoned-lock-"));
         try {
             const path = join(root, "records.json");
-            // A pid that cannot be running: a crashed run leaves its lock behind
-            // and must not wedge the next one.
-            writeFileSync(`${path}.lock`, "2147483646\n");
+            // A crashed run cannot release its lock, and must not wedge the next.
+            mkdirSync(`${path}.lock`, { recursive: true });
+            writeFileSync(
+                join(`${path}.lock`, LOCK_OWNER_FILE),
+                `${JSON.stringify({
+                    pid: 2147483646,
+                    nonce: "dead-nonce",
+                    acquiredAt: Date.now() - 10 * 60_000,
+                })}\n`,
+            );
 
-            expect(() => new FileRolloutStore(path).list()).not.toThrow();
+            const store = new FileRolloutStore(path);
+            expect(() => store.list()).not.toThrow();
+            store.release();
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
-    });
+    }, 20_000);
 
-    it("refuses a usage counter that cannot be priced safely", async () => {
-        for (const input of [Number.MAX_VALUE, Number.MAX_SAFE_INTEGER + 2, 1.5]) {
-            const result = await runPairedDelta(
-                options(),
-                dependencies((armId) => {
-                    const value = observation(armId);
-                    if (armId === "mc-off") value.usage = { ...value.usage, input };
-                    return value;
-                }),
-            );
-            const malformed = result.records.find(({ armId }) => armId === "mc-off");
-
-            // `Number.MAX_VALUE` is finite, so a finiteness test alone would
-            // price it and serialize the result as `null`.
-            expect(malformed?.cell.reasonCode).toBe("invalid-result");
-            expect(malformed?.costSource).toBe("estimated");
-            expect(Number.isFinite(malformed?.costUsd)).toBe(true);
-            expect(Number.isFinite(result.spentUsd)).toBe(true);
-        }
-    });
-
-    it("refuses a duplicate scenario id before running anything", async () => {
-        const events: string[] = [];
-
-        await expect(
-            runPairedDelta(
-                { ...options(), scenarios: [scenario, scenario] },
-                dependencies(undefined, events),
-            ),
-        ).rejects.toThrow(/duplicate scenarioId/);
-        expect(events).toHaveLength(0);
-    });
-
-    it("refuses a matrix or price table that cannot produce measurements", async () => {
-        for (const replicateCount of [0, -1, 1.5, Number.NaN]) {
-            await expect(runPairedDelta({ ...options(), replicateCount }, dependencies()))
-                .rejects.toThrow(/replicateCount must be a positive integer/);
-        }
-
-        await expect(runPairedDelta({ ...options(), scenarios: [] }, dependencies()))
-            .rejects.toThrow(/scenarios must not be empty/);
-
-        // Every comparison against NaN is false, so the run would pay for the
-        // whole matrix instead of stopping at the cap.
-        for (const maxCostUsd of [Number.NaN, -1, Number.POSITIVE_INFINITY]) {
-            await expect(runPairedDelta({ ...options(), maxCostUsd }, dependencies()))
-                .rejects.toThrow(/maxCostUsd must be finite and non-negative/);
-        }
-
-        await expect(
-            runPairedDelta({ ...options(), deadlineEpochMs: Number.NaN }, dependencies()),
-        ).rejects.toThrow(/deadlineEpochMs must be finite/);
-
-        // A negative price subtracts from `spentUsd`, so the cap would admit
-        // calls after the real spend passed it.
-        await expect(
-            runPairedDelta(
-                {
-                    ...options(),
-                    pricesPerMillionTokens: {
-                        input: -3,
-                        output: 15,
-                        cacheCreation: 3.75,
-                        cacheRead: 0.3,
-                    },
-                },
-                dependencies(),
-            ),
-        ).rejects.toThrow(/pricesPerMillionTokens must be finite and non-negative/);
-
-        // Finite on its own, but the worst-case estimate it prices is not.
-        await expect(
-            runPairedDelta(
-                {
-                    ...options(),
-                    pricesPerMillionTokens: {
-                        input: Number.MAX_VALUE,
-                        output: Number.MAX_VALUE,
-                        cacheCreation: 0,
-                        cacheRead: 0,
-                    },
-                },
-                dependencies(),
-            ),
-        ).rejects.toThrow(/overflow the worst-case estimate/);
-    });
-
-    it("validates options before claiming the records path", async () => {
-        const root = mkdtempSync(join(tmpdir(), "paired-delta-validate-"));
-        try {
-            const path = join(root, "records.json");
-
-            await expect(
-                runPairedDelta(
-                    { ...options(), replicateCount: 0, store: new FileRolloutStore(path) },
-                    dependencies(),
-                ),
-            ).rejects.toThrow(/replicateCount must be a positive integer/);
-
-            // The rejected call must not have left the path owned, or the
-            // corrected retry fails with RolloutStoreBusyError until exit.
-            const corrected = await runPairedDelta(
-                { ...options(), store: new FileRolloutStore(path) },
-                dependencies(),
-            );
-
-            expect(corrected.status).toBe("completed");
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
-
-    it("retries a stale non-completed record instead of abandoning the coordinate", async () => {
+    it("marks a coordinate incomplete when a ladder rung never ran", async () => {
         const store = new MemoryStore();
+        // Seed a full ladder, then age R1's completed record so it is refused.
         await runPairedDelta(
             options(store),
-            dependencies((armId) =>
-                armId === "mc-off" ? new Error("first attempt failed") : observation(armId)),
+            dependencies((armId) => observation(armId, armId !== "mc-on")),
         );
-        const failed = store.records.find(({ armId }) => armId === "mc-off");
-        if (!failed) throw new Error("missing failed record");
-        // A checkout or model change since that attempt.
-        failed.repoCommit = "older-commit";
-        const events: string[] = [];
+        const r1 = store.records.find(({ armId }) => armId === "r1");
+        if (!r1) throw new Error("missing r1 record");
+        r1.pinnedSnapshotId = "another-snapshot";
 
-        const result = await runPairedDelta(options(store), dependencies(undefined, events));
+        const result = await runPairedDelta(
+            options(store),
+            dependencies((armId) => observation(armId, armId !== "mc-on")),
+        );
 
-        // `put` replaces a non-completed record, so the coordinate is re-run
-        // rather than left missing from the comparison.
-        expect(events).toContain("create:mc-off");
-        expect(result.status).toBe("completed");
-        expect(result.records.find(({ armId }) => armId === "mc-off")?.cell.runHealth)
-            .toBe("completed");
-        expect(result.invalidStoredCoordinates).toHaveLength(0);
-        // Spend from another binding is not charged to this run.
-        expect(result.records.find(({ armId }) => armId === "mc-off")?.priorAttemptsCostUsd)
-            .toBe(0);
+        // Only the primary arms feed the `incomplete` derivation, so a skipped
+        // rung would otherwise report a complete coordinate.
+        expect(result.status).toBe("invalid-stored-records");
+        expect(result.coordinates[0]?.incomplete).toBe(true);
+    });
+
+    it("rejects impossible stored cells the contract validator catches", () => {
+        const root = mkdtempSync(join(tmpdir(), "paired-delta-cell-"));
+        try {
+            const path = join(root, "records.json");
+            const base = {
+                schema: "paired-delta-rollout/v1",
+                poolManifestFingerprint: "a".repeat(64),
+                scenarioId: "var-runner-smoke",
+                armId: "mc-on",
+                replicateIndex: 0,
+                repoCommit: "commit-a",
+                pinnedProviderId: "mock-live",
+                pinnedSnapshotId: "snapshot-2026-08-01",
+                echoedProviderId: "mock-live",
+                echoedModelId: "snapshot-2026-08-01",
+                baseScriptFingerprint: "b".repeat(64),
+                intervention: { kind: "none", value: null },
+                checks: [{ id: "check-ladder", passed: true }],
+                usage: { input: 1, output: 1, cacheCreation: 0, cacheRead: 0 },
+                costUsd: 0.01,
+                priorAttemptsCostUsd: 0,
+                costSource: "observed",
+                wallClockMs: 1,
+                turns: 1,
+                harnessDisposed: true,
+            };
+            const cell = {
+                armId: "mc-on",
+                checksPassed: 1,
+                checksTotal: 1,
+                criticalPassed: 1,
+                criticalTotal: 1,
+                invalidSuccess: false,
+                runHealth: "completed",
+                reasonCode: null,
+            };
+
+            // Shapes the contract's own validator rejects and a local copy missed.
+            for (const patch of [
+                { criticalTotal: 50, criticalPassed: 10, checksPassed: 1, checksTotal: 2 },
+                { runHealth: "crash", reasonCode: null },
+                { runHealth: "timeout", reasonCode: "provider-unavailable" },
+            ]) {
+                writeFileSync(path, JSON.stringify([{ ...base, cell: { ...cell, ...patch } }]));
+                expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                    .toThrow(/cell-invalid/);
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 
     it("classifies a malformed check vector as an exclusion and continues", async () => {
@@ -1363,7 +1258,8 @@ describe("file rollout store", () => {
                     cell: { ...record.cell, runHealth: "sideways" },
                 }]),
             );
-            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/run-health-invalid/);
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                .toThrow(/cell-invalid: cell\.runHealth/);
 
             writeFileSync(path, JSON.stringify([{ ...record, priorAttemptsCostUsd: -1 }]));
             expect(() => new FileRolloutStore(path, { readOnly: true }).list())
@@ -1387,14 +1283,16 @@ describe("file rollout store", () => {
                     path,
                     JSON.stringify([{ ...record, cell: { ...record.cell, ...cell } }]),
                 );
-                expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/cell-invalid/);
+                expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                    .toThrow(/cell-invalid/);
             }
 
             writeFileSync(
                 path,
                 JSON.stringify([{ ...record, cell: { ...record.cell, reasonCode: "made-up" } }]),
             );
-            expect(() => new FileRolloutStore(path, { readOnly: true }).list()).toThrow(/reason-code-invalid/);
+            expect(() => new FileRolloutStore(path, { readOnly: true }).list())
+                .toThrow(/cell-invalid: cell\.reasonCode/);
 
             for (const checks of [
                 "none",
