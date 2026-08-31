@@ -125,7 +125,7 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
             lease_expires_at: 2,
         })
         .unwrap();
-    assert_eq!(unknown.sensitivity, Sensitivity::Sensitive);
+    assert_eq!(unknown.sensitivity, Sensitivity::Secret);
     assert!(!unknown.payload.contains(SECRET));
 
     let proven = store
@@ -147,6 +147,27 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
         })
         .unwrap();
     assert_eq!(proven.sensitivity, Sensitivity::Normal);
+
+    let proven_secret = store
+        .stage_candidate(StagingCandidateSpec {
+            extraction_run_id: "run-proven-secret".to_string(),
+            candidate_id: "candidate-proven-secret".to_string(),
+            extractor: "fixture".to_string(),
+            source_kind: "repository".to_string(),
+            source_id: "tracked-file".to_string(),
+            source_revision: 1,
+            candidate_kind: "observation".to_string(),
+            payload: format!("tracked but leaking {SECRET}"),
+            provenance: Some(RepositoryProvenance {
+                repository_id: "repo".to_string(),
+                revision: "abc123".to_string(),
+            }),
+            recorded_at: 1,
+            lease_expires_at: 2,
+        })
+        .unwrap();
+    assert_eq!(proven_secret.sensitivity, Sensitivity::Secret);
+    assert!(!proven_secret.payload.contains(SECRET));
     let connection = Connection::open_with_flags(
         directory.path().join("core.sqlite"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -165,7 +186,8 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
             .unwrap(),
         [
             ("candidate-proven".to_string(), "normal".to_string()),
-            ("candidate-unknown".to_string(), "sensitive".to_string())
+            ("candidate-proven-secret".to_string(), "secret".to_string()),
+            ("candidate-unknown".to_string(), "secret".to_string())
         ]
     );
     assert_eq!(
@@ -184,7 +206,8 @@ fn staging_requires_affirmative_repository_provenance_for_normal() {
             .unwrap(),
         [
             ("run-proven".to_string(), "normal".to_string()),
-            ("run-unknown".to_string(), "sensitive".to_string())
+            ("run-proven-secret".to_string(), "secret".to_string()),
+            ("run-unknown".to_string(), "secret".to_string())
         ]
     );
     assert!(!family_bytes(directory.path())
