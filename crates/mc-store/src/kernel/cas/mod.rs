@@ -13,6 +13,7 @@ use crate::kernel::{KernelError, KernelStore};
 
 pub(super) const DEFAULT_ARTIFACT_CAP: u64 = 4 * 1024 * 1024 * 1024;
 pub(super) const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const MAX_PAYLOAD_DETECTIONS: usize = 4096;
 
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +110,7 @@ pub enum ArtifactErrorKind {
     ReferenceUnavailable,
     ReferenceCommit,
     UnredactableSecret,
+    DetectionLimit,
     InvalidInput,
 }
 
@@ -205,6 +207,10 @@ impl fmt::Display for ArtifactError {
             }
             ArtifactErrorKind::UnredactableSecret => formatter
                 .write_str("artifact payload holds a recognized secret that cannot be redacted"),
+            ArtifactErrorKind::DetectionLimit => write!(
+                formatter,
+                "artifact payload exceeds {MAX_PAYLOAD_DETECTIONS} recognized secrets"
+            ),
             ArtifactErrorKind::InvalidInput => formatter.write_str("artifact input is invalid"),
         }
     }

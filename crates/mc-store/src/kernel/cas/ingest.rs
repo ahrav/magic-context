@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use super::ArtifactIngestFault;
 use super::{
     is_artifact_digest, read_capped, ArtifactError, ArtifactErrorKind, ArtifactHandle,
-    ArtifactIngestRequest, ProviderEgress, MAX_PAYLOAD_BYTES,
+    ArtifactIngestRequest, ProviderEgress, MAX_PAYLOAD_BYTES, MAX_PAYLOAD_DETECTIONS,
 };
 use crate::kernel::durable_fs::{
     classify_io, create_new_file, durable_unlink, open_or_create_secure_directory,
@@ -104,6 +104,9 @@ impl PreparedArtifact {
         if bytes.len() > MAX_PAYLOAD_BYTES {
             return Err(ArtifactError::new(ArtifactErrorKind::PayloadTooLarge));
         }
+        if payload_redaction.detections.len() > MAX_PAYLOAD_DETECTIONS {
+            return Err(ArtifactError::new(ArtifactErrorKind::DetectionLimit));
+        }
         let sensitivity = if !payload_redaction.detections.is_empty() {
             Sensitivity::Secret
         } else if !inspected {
@@ -166,8 +169,14 @@ impl KernelStore {
         let byte_length = u64::try_from(prepared.bytes.len())
             .map_err(|_| ArtifactError::new(ArtifactErrorKind::InvalidInput))?;
 
-        let artifacts = File::open(&self.artifacts_path)
+        let store_root = self
+            .artifacts_path
+            .parent()
+            .ok_or_else(|| self.fail_storage(ArtifactErrorKind::IngestionFailClosed))?;
+        let root = File::open(store_root)
             .map_err(|_| self.fail_storage(ArtifactErrorKind::IngestionFailClosed))?;
+        let artifacts = open_or_create_secure_directory(&root, "artifacts")
+            .map_err(|error| self.map_storage_error(error))?;
         let tmp = open_or_create_secure_directory(&artifacts, "tmp")
             .map_err(|error| self.map_storage_error(error))?;
         let objects = open_or_create_secure_directory(&artifacts, "objects")
@@ -297,6 +306,17 @@ impl KernelStore {
                 let committed = committed_digest(&mut writer, &receipt.result);
                 match committed {
                     Ok(Some(digest)) if digest == prepared.digest => {
+                        if let Err(error) =
+                            self.merge_replayed_classification(&mut writer, &prepared)
+                        {
+                            self.cleanup_failed_reference(
+                                &mut writer,
+                                &reservation_id,
+                                &prepared.digest,
+                                published_new,
+                            );
+                            return Err(error);
+                        }
                         self.release_reservation(&mut writer, &reservation_id);
                         Ok(ArtifactHandle {
                             digest: prepared.digest,
@@ -361,6 +381,28 @@ impl KernelStore {
     fn fail_storage(&self, kind: ArtifactErrorKind) -> ArtifactError {
         self.latch_cas_failure();
         ArtifactError::new(kind)
+    }
+
+    fn merge_replayed_classification(
+        &self,
+        writer: &mut Connection,
+        prepared: &PreparedArtifact,
+    ) -> Result<(), ArtifactError> {
+        let tx = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+        check_fence(&tx, self.lease_epoch())
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+        merge_stored_classification(
+            &tx,
+            &prepared.digest,
+            prepared.sensitivity,
+            prepared.request.provider_egress,
+        )
+        .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+        tx.commit()
+            .map_err(|_| ArtifactError::new(ArtifactErrorKind::ReferenceCommit))?;
+        Ok(())
     }
 
     fn release_reservation(&self, writer: &mut Connection, reservation_id: &str) {
@@ -466,34 +508,12 @@ fn insert_reference(
         return Err(KernelError::Conflict);
     }
 
-    let mut sensitivity = prepared.sensitivity;
-    let mut egress = prepared.request.provider_egress;
-    let mut statement = envelope
-        .tx
-        .prepare(
-            "SELECT sensitivity_class,provider_egress_class FROM evidence_meta
-             WHERE artifact_digest=?1",
-        )
-        .map_err(|_| KernelError::Io)?;
-    let rows = statement
-        .query_map([&prepared.digest], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|_| KernelError::Io)?;
-    for row in rows {
-        let (stored_sensitivity, stored_egress) = row.map_err(|_| KernelError::Io)?;
-        sensitivity = sensitivity.restrictive(Sensitivity::from_stored(&stored_sensitivity));
-        egress = egress.restrictive(ProviderEgress::from_stored(&stored_egress));
-    }
-    drop(statement);
-    envelope
-        .tx
-        .execute(
-            "UPDATE evidence_meta SET sensitivity_class=?1,provider_egress_class=?2
-             WHERE artifact_digest=?3 AND invalidated_commit_seq IS NULL",
-            params![sensitivity.as_str(), egress.as_str(), prepared.digest],
-        )
-        .map_err(|_| KernelError::Io)?;
+    let (sensitivity, egress) = merge_stored_classification(
+        envelope.tx,
+        &prepared.digest,
+        prepared.sensitivity,
+        prepared.request.provider_egress,
+    )?;
 
     let evidence_id = redact(&prepared.request.evidence_id);
     let object_id = redact(&prepared.request.object_id);
@@ -634,6 +654,38 @@ fn insert_reference(
         audit: None,
     });
     Ok(evidence_id.text)
+}
+
+fn merge_stored_classification(
+    tx: &rusqlite::Transaction<'_>,
+    digest: &str,
+    mut sensitivity: Sensitivity,
+    mut egress: ProviderEgress,
+) -> Result<(Sensitivity, ProviderEgress), KernelError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT sensitivity_class,provider_egress_class FROM evidence_meta
+             WHERE artifact_digest=?1",
+        )
+        .map_err(|_| KernelError::Io)?;
+    let rows = statement
+        .query_map([digest], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| KernelError::Io)?;
+    for row in rows {
+        let (stored_sensitivity, stored_egress) = row.map_err(|_| KernelError::Io)?;
+        sensitivity = sensitivity.restrictive(Sensitivity::from_stored(&stored_sensitivity));
+        egress = egress.restrictive(ProviderEgress::from_stored(&stored_egress));
+    }
+    drop(statement);
+    tx.execute(
+        "UPDATE evidence_meta SET sensitivity_class=?1,provider_egress_class=?2
+         WHERE artifact_digest=?3 AND invalidated_commit_seq IS NULL",
+        params![sensitivity.as_str(), egress.as_str(), digest],
+    )
+    .map_err(|_| KernelError::Io)?;
+    Ok((sensitivity, egress))
 }
 
 fn committed_digest(
