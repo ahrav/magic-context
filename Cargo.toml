@@ -34,3 +34,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 rusqlite = { version = "0.39", features = ["bundled"] }
 regex = "1"
 sha2 = "0.10"
+# Pure-Rust git access avoids subprocesses and libgit2 entirely. The non-default
+# feature set keeps network transports, credential helpers, and filter-driver
+# command execution out of the dependency graph; `status` and `revision` cover
+# dirty scans and ancestry walks. commentlint: allow(JUDGE)
+gix = { version = "0.87", default-features = false, features = ["revision", "status", "sha1", "parallel"] }
+semver = "1"

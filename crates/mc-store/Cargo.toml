@@ -20,6 +20,8 @@ rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+gix = { workspace = true }
+semver = { workspace = true }
 md5 = "0.7"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
@@ -31,4 +33,5 @@ test-support = []
 [dev-dependencies]
 # Self dev-dependency so integration tests see the `test-support` fixtures.
 mc-store = { path = ".", features = ["test-support"] }
+proptest = "1"
 tempfile = "3"
