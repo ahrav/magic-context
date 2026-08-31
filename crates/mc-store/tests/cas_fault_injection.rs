@@ -813,6 +813,52 @@ fn expired_reference_history_reclaims_past_a_prior_epoch_reservation_lease() {
     recover_twice(root.path());
 }
 
+#[test]
+fn startup_retires_a_live_reservation_whose_bytes_are_already_gone() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+    let handle = store
+        .ingest_artifact(ingest_request("retire", b"retire"))
+        .unwrap();
+    let deletion = store
+        .delete_artifact(ArtifactDeletionRequest {
+            kind: ArtifactDeletionKind::Delete,
+            operator_id: None,
+            target_locator: None,
+            reason: None,
+            ..purge_request("retire-delete", &handle.digest)
+        })
+        .unwrap();
+    let deleted_at: i64 = Connection::open(root.path().join("core.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT recorded_at FROM commit_log WHERE commit_seq=?1",
+            [deletion.commit_seq],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store
+        .run_staging_maintenance(deleted_at + 15 * DAY_MS)
+        .unwrap();
+    assert!(!object_path(root.path(), &handle.digest).exists());
+
+    // A re-ingest that crashes after its reservation commits leaves this row with
+    // invalidated history and no bytes on disk.
+    insert_stale_live_reservation(root.path(), &handle.digest, store.lease_epoch());
+    drop(store);
+
+    let reopened = KernelStore::open(root.path()).unwrap();
+    let state = SemanticState::read(root.path());
+    assert!(
+        state.reservations.is_empty(),
+        "reservation with no bytes survived recovery: {:?}",
+        state.reservations
+    );
+    drop(reopened);
+    recover_twice(root.path());
+}
+
 fn insert_stale_live_reservation(root: &Path, digest: &str, lease_epoch: u64) {
     Connection::open(root.join("core.sqlite"))
         .unwrap()

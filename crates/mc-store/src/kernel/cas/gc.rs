@@ -88,6 +88,40 @@ impl KernelStore {
             [],
         )
         .map_err(|_| KernelError::Io)?;
+        // Anything still live here has invalidated references only. The candidate
+        // snapshot selects reclaim state or bytes on disk, so a reservation with
+        // neither is unreachable; retiring it protects no fewer bytes because it
+        // has none, and leaves reference history for `prepare_reclaim` to weigh.
+        let unreachable = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT reservation_id,artifact_digest FROM artifact_ingestion_reservations
+                     WHERE state='Live'",
+                )
+                .map_err(|_| KernelError::Io)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|_| KernelError::Io)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|_| KernelError::Io)?;
+            rows.into_iter()
+                .filter(|(_, digest)| {
+                    is_artifact_digest(digest)
+                        && !fs::symlink_metadata(self.artifact_object_path(digest))
+                            .is_ok_and(|metadata| metadata.file_type().is_file())
+                })
+                .map(|(reservation_id, _)| reservation_id)
+                .collect::<Vec<_>>()
+        };
+        for reservation_id in unreachable {
+            tx.execute(
+                "DELETE FROM artifact_ingestion_reservations WHERE reservation_id=?1",
+                [&reservation_id],
+            )
+            .map_err(|_| KernelError::Io)?;
+        }
         tx.commit().map_err(|_| KernelError::Io)
     }
 
