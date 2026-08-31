@@ -1368,6 +1368,16 @@ fn source_level_rejection_shadows_a_previously_admitted_object() {
         .unwrap()
         .commit_seq;
 
+    let reobserved = store
+        .commit(intent("observe-shadowed-again"), |envelope| {
+            let mut request = subject_request("object-shadowed", EventKind::CodeObserved);
+            request.event.trigger_object_id = Some("observation-first".to_string());
+            envelope.record_admission(request)?;
+            Ok(String::new())
+        })
+        .unwrap()
+        .commit_seq;
+
     assert!(store
         .visible_as_of(Surface::AutoInject, admitted)
         .unwrap()
@@ -1384,6 +1394,141 @@ fn source_level_rejection_shadows_a_previously_admitted_object() {
         .unwrap()
         .rows
         .is_empty());
+    assert!(store
+        .visible_as_of(Surface::AutoInject, reobserved)
+        .unwrap()
+        .rows
+        .is_empty());
+    assert!(store
+        .visible_as_of(Surface::ExplicitSearch, reobserved)
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT disposition FROM admission_decisions
+             WHERE subject_object_id='object-shadowed'
+             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "rejected"
+    );
+}
+
+#[test]
+fn stored_classifications_the_evaluator_forbids_never_serve() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let seq = insert_subject(
+        &store,
+        "anchor",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    drop(store);
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO object_registry(
+                 object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                 created_commit_seq,sensitivity_class
+             ) VALUES (
+                 'object-illegal-pair','fixture','domain-anchor','fixture','illegal-pair',1,1,
+                 'normal'
+             );
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'illegal-pair-decision','object-illegal-pair','fixture','illegal-pair',1,
+                 'untrusted_web','current_code','verified','verified','active','automatic',1,
+                 'fixture',1,1
+             );
+             INSERT INTO object_registry(
+                 object_id,object_kind,domain_id,source_kind,source_id,source_revision,
+                 created_commit_seq,sensitivity_class
+             ) VALUES (
+                 'object-unknown-source','fixture','domain-anchor','fixture','unknown-source',1,1,
+                 'normal'
+             );
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'unknown-source-decision','object-unknown-source','fixture','unknown-source',1,
+                 'future_source','current_code','verified','verified','active','automatic',1,
+                 'fixture',1,1
+             );",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    for surface in [Surface::AutoInject, Surface::ExplicitSearch] {
+        assert_eq!(
+            store
+                .visible_as_of(surface, seq)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row.object.object_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["object-anchor".to_string()]
+        );
+    }
+}
+
+#[test]
+fn newer_policy_revision_fails_closed_while_older_still_serves() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(directory.path()).unwrap();
+    let older = insert_subject(
+        &store,
+        "older-revision",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    let newer = insert_subject(
+        &store,
+        "newer-revision",
+        Sensitivity::Normal,
+        Some(EventKind::CodeObserved),
+    );
+    drop(store);
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "UPDATE admission_decisions SET policy_revision=0
+             WHERE subject_object_id='object-older-revision';
+             UPDATE admission_decisions SET policy_revision=2
+             WHERE subject_object_id='object-newer-revision';",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+
+    assert_eq!(
+        store
+            .visible_as_of(Surface::AutoInject, older)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.object.object_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["object-older-revision".to_string()]
+    );
+    assert_eq!(
+        store
+            .visible_as_of(Surface::ExplicitSearch, newer)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.object.object_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["object-older-revision".to_string()]
+    );
 }
 
 #[test]

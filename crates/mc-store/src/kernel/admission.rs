@@ -980,14 +980,13 @@ fn load_subject_facts(
         .ok_or(KernelError::NotFound)
 }
 
+/// Object subjects include source history because `visible_as_of` evaluates both
+/// histories. Skipping source history lets a later object decision override a
+/// newer source rejection and restore visibility. commentlint: allow(JUDGE)
 fn load_prior_decision(
     envelope: &Envelope<'_>,
     facts: &SubjectFacts,
 ) -> Result<Option<StoredAdmission>, KernelError> {
-    let key = facts.key();
-    if let Some(prior) = envelope.admission_latest.get(&key) {
-        return Ok(Some(prior.clone()));
-    }
     let map_row = |row: &rusqlite::Row<'_>| {
         Ok((
             row.get::<_, String>(0)?,
@@ -997,22 +996,39 @@ fn load_prior_decision(
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     };
     let row = if let Some(subject_object_id) = facts.subject_object_id.as_deref() {
         envelope.tx.query_row(
-            "SELECT admission_decision_id,maturity,effective_maturity,disposition,source_class,
-                    taint_class,approval_object_id
-             FROM admission_decisions
-             WHERE subject_object_id=?1 AND commit_seq IS NOT NULL
-             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1",
-            [subject_object_id],
+            "SELECT latest.admission_decision_id,latest.maturity,latest.effective_maturity,
+                    latest.disposition,latest.source_class,latest.taint_class,
+                    latest.approval_object_id,latest.subject_object_id
+             FROM (
+                 SELECT admission_decision_id,maturity,effective_maturity,disposition,
+                        source_class,taint_class,approval_object_id,subject_object_id,commit_seq
+                 FROM admission_decisions
+                 WHERE subject_object_id=?1 AND commit_seq IS NOT NULL
+                 UNION ALL
+                 SELECT admission_decision_id,maturity,effective_maturity,disposition,
+                        source_class,taint_class,approval_object_id,subject_object_id,commit_seq
+                 FROM admission_decisions
+                 WHERE subject_object_id IS NULL AND source_kind=?2 AND source_id=?3
+                   AND source_revision=?4 AND commit_seq IS NOT NULL
+             ) latest
+             ORDER BY latest.commit_seq DESC,latest.admission_decision_id DESC LIMIT 1",
+            params![
+                subject_object_id,
+                facts.source_kind,
+                facts.source_id,
+                facts.source_revision
+            ],
             map_row,
         )
     } else {
         envelope.tx.query_row(
             "SELECT admission_decision_id,maturity,effective_maturity,disposition,source_class,
-                    taint_class,approval_object_id
+                    taint_class,approval_object_id,subject_object_id
              FROM admission_decisions
              WHERE source_kind=?1 AND source_id=?2 AND source_revision=?3
                AND commit_seq IS NOT NULL
@@ -1031,10 +1047,24 @@ fn load_prior_decision(
         source_class,
         taint_class,
         approval_object_id,
+        subject_object_id,
     )) = row
     else {
         return Ok(None);
     };
+    // A decision written earlier in this envelope has no `change_event` row yet,
+    // so only the cache carries its outcome and sensitivity.
+    let winner = subject_object_id.map_or_else(
+        || AdmissionKey::Source {
+            kind: facts.source_kind.clone(),
+            id: facts.source_id.clone(),
+            revision: facts.source_revision,
+        },
+        AdmissionKey::Object,
+    );
+    if let Some(prior) = envelope.admission_latest.get(&winner) {
+        return Ok(Some(prior.clone()));
+    }
     let payload = envelope
         .tx
         .query_row(
@@ -1199,6 +1229,10 @@ impl KernelStore {
     /// at or before the snapshot — the same prior the writer evaluates against
     /// — so a newer source-level rejection overrides an earlier object-level
     /// admission.
+    ///
+    /// A row is unservable when its stored classification pairing is one the
+    /// evaluator would refuse, or when its `policy_revision` exceeds
+    /// `POLICY_REVISION`. Lower revisions keep the current surface mapping.
     pub fn visible_as_of(
         &self,
         surface: Surface,
@@ -1209,7 +1243,8 @@ impl KernelStore {
                 .prepare(
                     "SELECT o.object_id,o.object_kind,o.domain_id,o.source_kind,o.source_id,
                             o.source_revision,o.created_commit_seq,NULL,NULL,o.sensitivity_class,
-                            d.effective_maturity,d.disposition,d.visibility,d.taint_class
+                            d.effective_maturity,d.disposition,d.visibility,d.taint_class,
+                            d.source_class,d.policy_revision
                      FROM object_registry o
                      JOIN admission_decisions d ON d.admission_decision_id=(
                          SELECT latest.admission_decision_id FROM (
@@ -1245,10 +1280,21 @@ impl KernelStore {
             let rows = statement
                 .query_map([requested], |row| {
                     let mut object = object_row_from(row)?;
-                    object.sensitivity =
-                        match TaintClass::try_from(row.get::<_, String>("taint_class")?.as_str()) {
-                            Ok(taint) => object.sensitivity.max(sensitivity_floor(taint)),
-                            Err(_) => Sensitivity::Secret,
+                    let taint =
+                        TaintClass::try_from(row.get::<_, String>("taint_class")?.as_str()).ok();
+                    let source =
+                        SourceClass::try_from(row.get::<_, String>("source_class")?.as_str()).ok();
+                    object.sensitivity = match taint {
+                        Some(taint) => object.sensitivity.max(sensitivity_floor(taint)),
+                        None => Sensitivity::Secret,
+                    };
+                    // A newer revision may attach meanings this binary cannot see,
+                    // and a pairing the evaluator forbids can only be corruption or
+                    // an out-of-band write.
+                    let interpretable = row.get::<_, i64>("policy_revision")? <= POLICY_REVISION
+                        && match (source, taint) {
+                            (Some(source), Some(taint)) => source_allows_taint(source, taint),
+                            _ => false,
                         };
                     let stored_visibility =
                         VisibilityRow::try_from(row.get::<_, String>("visibility")?.as_str()).ok();
@@ -1261,11 +1307,15 @@ impl KernelStore {
                         }
                         _ => None,
                     };
-                    let visibility = surface_visibility(
-                        served_visibility_row(stored_visibility, expected_visibility),
-                        surface,
-                        object.sensitivity,
-                    );
+                    let visibility = if interpretable {
+                        surface_visibility(
+                            served_visibility_row(stored_visibility, expected_visibility),
+                            surface,
+                            object.sensitivity,
+                        )
+                    } else {
+                        SurfaceVisibility::Hidden
+                    };
                     Ok((object, visibility))
                 })
                 .map_err(map_sqlite)?
