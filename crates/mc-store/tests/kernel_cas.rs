@@ -831,35 +831,67 @@ fn oversized_replaced_object_is_rejected_without_reading_it_whole() {
 }
 
 #[test]
-fn change_payload_redactions_cover_every_emitted_object_field() {
+fn secret_in_an_identity_field_is_refused_rather_than_redacted() {
     let root = tempfile::tempdir().unwrap();
     let store = KernelStore::open(root.path()).unwrap();
     seed_domain(&store);
 
-    let mut tainted = request("ledger", b"ledger payload".to_vec());
-    tainted.object_kind = format!("evidence key={SECRET}");
-    tainted.source_kind = format!("repository token={SECRET}");
-    let handle = store.ingest_artifact(tainted).unwrap();
-    assert!(!handle.digest.is_empty());
-
-    let connection = Connection::open(root.path().join("core.sqlite")).unwrap();
-    let mut statement = connection
-        .prepare(
-            "SELECT DISTINCT field_name FROM durable_text_redactions
-             WHERE owner_kind='outbox' ORDER BY field_name",
-        )
-        .unwrap();
-    let fields = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .map(|row| row.unwrap())
-        .collect::<Vec<_>>();
-    for expected in ["object_kind", "source_kind"] {
-        assert!(
-            fields.iter().any(|field| field == expected),
-            "outbox redaction ledger is missing {expected}: {fields:?}"
-        );
+    for mutate in [
+        (|r: &mut ArtifactIngestRequest| r.evidence_id = format!("evidence key={SECRET}"))
+            as fn(&mut ArtifactIngestRequest),
+        |r: &mut ArtifactIngestRequest| r.object_id = format!("object key={SECRET}"),
+        |r: &mut ArtifactIngestRequest| r.object_kind = format!("evidence key={SECRET}"),
+        |r: &mut ArtifactIngestRequest| r.source_kind = format!("repository key={SECRET}"),
+        |r: &mut ArtifactIngestRequest| r.source_id = format!("src key={SECRET}"),
+    ] {
+        let mut tainted = request("identity-secret", b"identity payload".to_vec());
+        mutate(&mut tainted);
+        let error = store.ingest_artifact(tainted).unwrap_err();
+        assert_eq!(error.kind(), ArtifactErrorKind::InvalidInput);
     }
+
+    assert!(!tree_bytes(root.path())
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+    assert_eq!(reservation_count(root.path()), 0);
+    assert_eq!(staged_entries(root.path()), 0);
+}
+
+#[test]
+fn secret_in_artifact_metadata_raises_the_classification() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    let mut tainted = request("metadata-secret", b"clean payload".to_vec());
+    tainted.media_type = format!("text/plain; key={SECRET}");
+    let handle = store.ingest_artifact(tainted).unwrap();
+
+    assert_eq!(
+        store
+            .artifact_eligibility(&handle, ArtifactDestination::Local)
+            .unwrap(),
+        ArtifactEligibility::Denied(EligibilityDeniedReason::Secret)
+    );
+    assert!(!tree_bytes(root.path())
+        .windows(SECRET.len())
+        .any(|window| window == SECRET.as_bytes()));
+}
+
+#[test]
+fn oversized_intent_field_is_rejected_before_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let store = KernelStore::open(root.path()).unwrap();
+    seed_domain(&store);
+
+    let mut flooded = request("intent-flood", b"small payload".to_vec());
+    flooded.intent.cause = "key=a ".repeat(4000);
+    let error = store.ingest_artifact(flooded).unwrap_err();
+
+    assert_eq!(error.kind(), ArtifactErrorKind::TextFieldTooLong);
+    assert_eq!(staged_entries(root.path()), 0);
+    assert_eq!(published_objects(root.path()), Vec::<String>::new());
+    assert_eq!(reservation_count(root.path()), 0);
 }
 
 #[test]

@@ -19,7 +19,7 @@ use crate::kernel::durable_fs::{
     sync_publish_directories_with, temp_name, write_and_sync, PublishOutcome, StorageError,
 };
 use crate::kernel::envelope::{check_fence, commit_with_writer, ObjectRow, PendingChange};
-use crate::kernel::redaction::{record, redact, RedactedField};
+use crate::kernel::redaction::{identity, record, redact, RedactedField};
 use crate::kernel::{KernelError, KernelStore, Sensitivity};
 
 const RESERVATION_MS: i64 = 60 * 60 * 1_000;
@@ -69,8 +69,25 @@ impl PreparedArtifact {
             request.domain_id.as_str(),
             request.source_kind.as_str(),
             request.source_id.as_str(),
+        ]
+        .into_iter()
+        .any(|field| identity(field).is_err())
+        {
+            return Err(ArtifactError::new(ArtifactErrorKind::InvalidInput));
+        }
+        if [
+            request.evidence_id.as_str(),
+            request.object_id.as_str(),
+            request.object_kind.as_str(),
+            request.domain_id.as_str(),
+            request.source_kind.as_str(),
+            request.source_id.as_str(),
             request.media_type.as_str(),
             request.retention_class.as_str(),
+            request.intent.producer.as_str(),
+            request.intent.operation_key.as_str(),
+            request.intent.actor.as_str(),
+            request.intent.cause.as_str(),
         ]
         .into_iter()
         .any(|field| field.len() > MAX_TEXT_FIELD_BYTES)
@@ -123,7 +140,13 @@ impl PreparedArtifact {
         if payload_redaction.detections.len() > MAX_PAYLOAD_DETECTIONS {
             return Err(ArtifactError::new(ArtifactErrorKind::DetectionLimit));
         }
-        let sensitivity = if !payload_redaction.detections.is_empty() {
+        // A recognized secret anywhere that is stored verbatim-after-redaction must
+        // raise the class, not only one in the payload; otherwise a clean payload
+        // with a leaking media type stays remotely eligible.
+        let metadata_detected = [&request.media_type, &request.retention_class]
+            .into_iter()
+            .any(|field| !redact(field).detections.is_empty());
+        let sensitivity = if !payload_redaction.detections.is_empty() || metadata_detected {
             Sensitivity::Secret
         } else if !inspected {
             request
@@ -382,14 +405,17 @@ impl KernelStore {
                 digest: prepared.digest,
                 evidence_id: redact(&prepared.request.evidence_id).text,
             }),
-            Err(_) => {
+            Err(error) => {
                 self.cleanup_failed_reference(
                     &mut writer,
                     &reservation_id,
                     &prepared.digest,
                     published_new,
                 );
-                Err(ArtifactError::new(ArtifactErrorKind::ReferenceCommit))
+                Err(ArtifactError::new(match error {
+                    KernelError::InvalidInput => ArtifactErrorKind::InvalidInput,
+                    _ => ArtifactErrorKind::ReferenceCommit,
+                }))
             }
         }
     }
@@ -550,12 +576,15 @@ fn insert_reference(
         prepared.request.provider_egress,
     )?;
 
-    let evidence_id = redact(&prepared.request.evidence_id);
-    let object_id = redact(&prepared.request.object_id);
-    let object_kind = redact(&prepared.request.object_kind);
-    let domain_id = redact(&prepared.request.domain_id);
-    let source_kind = redact(&prepared.request.source_kind);
-    let source_id = redact(&prepared.request.source_id);
+    // Identity columns must survive round-trip, so a detected secret is refused
+    // rather than replaced: two ids differing only inside a redacted span would
+    // otherwise collapse onto one placeholder-backed identity.
+    let evidence_id = identity(&prepared.request.evidence_id)?;
+    let object_id = identity(&prepared.request.object_id)?;
+    let object_kind = identity(&prepared.request.object_kind)?;
+    let domain_id = identity(&prepared.request.domain_id)?;
+    let source_kind = identity(&prepared.request.source_kind)?;
+    let source_id = identity(&prepared.request.source_id)?;
     let media_type = redact(&prepared.request.media_type);
     let retention_class = redact(&prepared.request.retention_class);
     envelope
@@ -566,11 +595,11 @@ fn insert_reference(
                  created_commit_seq,sensitivity_class
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
-                object_id.text,
-                object_kind.text,
-                domain_id.text,
-                source_kind.text,
-                source_id.text,
+                object_id,
+                object_kind,
+                domain_id,
+                source_kind,
+                source_id,
                 prepared.request.source_revision,
                 envelope.commit_seq,
                 sensitivity.as_str(),
@@ -588,8 +617,8 @@ fn insert_reference(
                  redaction_metadata,created_commit_seq,sensitivity_class
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
-                evidence_id.text,
-                object_id.text,
+                evidence_id,
+                object_id,
                 prepared.artifact_reference,
                 prepared.digest,
                 i64::try_from(prepared.bytes.len()).map_err(|_| KernelError::InvalidInput)?,
@@ -619,7 +648,7 @@ fn insert_reference(
     record(
         envelope.tx,
         "evidence",
-        &evidence_id.text,
+        &evidence_id,
         "payload",
         &prepared.payload_redaction,
         Some(envelope.commit_seq),
@@ -631,23 +660,7 @@ fn insert_reference(
         record(
             envelope.tx,
             "evidence",
-            &evidence_id.text,
-            name,
-            field,
-            Some(envelope.commit_seq),
-        )?;
-    }
-    for (name, field) in [
-        ("object_id", &object_id),
-        ("object_kind", &object_kind),
-        ("domain_id", &domain_id),
-        ("source_kind", &source_kind),
-        ("source_id", &source_id),
-    ] {
-        record(
-            envelope.tx,
-            "object_registry",
-            &object_id.text,
+            &evidence_id,
             name,
             field,
             Some(envelope.commit_seq),
@@ -666,11 +679,11 @@ fn insert_reference(
     }
     envelope.changes.push(PendingChange {
         object: ObjectRow {
-            object_id: object_id.text.clone(),
-            object_kind: object_kind.text.clone(),
-            domain_id: domain_id.text.clone(),
-            source_kind: source_kind.text.clone(),
-            source_id: source_id.text.clone(),
+            object_id: object_id.clone(),
+            object_kind: object_kind.clone(),
+            domain_id: domain_id.clone(),
+            source_kind: source_kind.clone(),
+            source_id: source_id.clone(),
             source_revision: prepared.request.source_revision,
             created_commit_seq: envelope.commit_seq,
             invalidated_commit_seq: None,
@@ -679,16 +692,10 @@ fn insert_reference(
         },
         kind: "insert",
         replaced_object_id: None,
-        redactions: vec![
-            ("object_id".to_string(), object_id),
-            ("object_kind".to_string(), object_kind),
-            ("domain_id".to_string(), domain_id),
-            ("source_kind".to_string(), source_kind),
-            ("source_id".to_string(), source_id),
-        ],
+        redactions: Vec::new(),
         audit: None,
     });
-    Ok(evidence_id.text)
+    Ok(evidence_id)
 }
 
 fn merge_stored_classification(
