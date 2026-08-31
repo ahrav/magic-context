@@ -81,8 +81,8 @@ describe("fixConflicts", () => {
         const updatedText = readFileSync(configPath, "utf-8");
         const updated = parseJsonc(updatedText) as Record<string, unknown>;
         expect(actions).toEqual(["Disabled auto-compaction", "Removed opencode-dcp plugin"]);
-        expect(updatedText).toContain("keep this file-level comment");
-        expect(updatedText).toContain("keep this compaction comment");
+        expect(updatedText).toContain("The JSONC rewrite preserves this file-level comment");
+        expect(updatedText).toContain("The JSONC rewrite preserves this compaction comment");
         expect(updated.compaction).toEqual({ auto: false, prune: false });
         expect(updated.plugin).toEqual([
             ["@plannotator/opencode@latest", { workflow: "plan-agent" }],
@@ -154,6 +154,7 @@ describe("fixConflicts", () => {
   // top-level comment
   "some-omo-setting": true,
   "[opencode]": {
+    // opencode block comment
     "other_setting": "value"
   }
 }
@@ -196,6 +197,7 @@ describe("fixConflicts", () => {
             writeFileSync(
                 configPath,
                 `{
+  // top-level setting
   "some-omo-setting": true
 }
 `,

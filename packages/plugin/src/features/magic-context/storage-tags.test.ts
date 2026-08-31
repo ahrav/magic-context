@@ -1,4 +1,3 @@
-
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -322,7 +321,6 @@ describe("storage-tags", () => {
             expect(tag?.inputByteSize).toBe(321);
         });
     });
-
 
     describe("#given getActiveTagsBySession", () => {
         it("#when session has mixed statuses #then returns only active rows", () => {

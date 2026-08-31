@@ -484,8 +484,7 @@ export function runSqliteOptimize(db: Database): void {
     try {
         db.exec("PRAGMA analysis_limit=400");
         db.exec("PRAGMA optimize");
-    } catch {
-    }
+    } catch {}
 }
 
 export interface SqliteRuntimeGateReport {

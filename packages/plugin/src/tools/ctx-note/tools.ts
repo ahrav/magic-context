@@ -454,8 +454,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
             // The note-nudger uses the read watermark to suppress reminders after the agent reads notes and until a new note is written.
             try {
                 setNoteLastReadAt(deps.db, sessionId);
-            } catch {
-            }
+            } catch {}
 
             if (sections.length === 0) {
                 return "## Notes\n\nNo session notes or smart notes.";

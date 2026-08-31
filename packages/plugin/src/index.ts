@@ -360,7 +360,7 @@ const server: Plugin = async (ctx) => {
         // Startup retries up to 3 times when OpenCode's provider service is unavailable.
         // The refresh runs fire-and-forget so it never blocks plugin initialization.
         //
-        // The resolver does not schedule periodic refreshes because a later refresh can lower a limit during an active session.
+        // Do NOT refresh periodically. A later refresh can lower a limit during an active session.
         void refreshModelLimitsFromApi(ctx.client, { retries: 3, retryDelayMs: 1000 });
     }
 
@@ -428,12 +428,10 @@ const server: Plugin = async (ctx) => {
                                 markAnnouncementSeen,
                             ),
                         )
-                        .catch(() => {
-                        });
+                        .catch(() => {});
                 }, 8000);
             }
-        } catch {
-        }
+        } catch {}
     }
 
     // `tool.definition` events use the latest chat context because their input contains only `toolID`.

@@ -50,13 +50,11 @@ function resolveCompactionEnabledForWriter(): boolean {
     }
 }
 
-
 function ensureDir(dir: string): void {
     if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
     }
 }
-
 
 export function addPluginToOpenCodeConfig(
     configPath: string,

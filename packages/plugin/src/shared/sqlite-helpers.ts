@@ -14,6 +14,5 @@ export function closeQuietly(db: Database | null | undefined): void {
     if (!db) return;
     try {
         db.close();
-    } catch {
-    }
+    } catch {}
 }

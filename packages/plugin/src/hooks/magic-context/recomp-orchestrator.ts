@@ -212,8 +212,7 @@ export async function runManagedRecomp(
         if (terminalPhase === "done") {
             try {
                 clearEmergencyRecovery(ctx.db, sessionId);
-            } catch {
-            }
+            } catch {}
         }
         setRecompTerminal(
             ctx.liveSessionState,

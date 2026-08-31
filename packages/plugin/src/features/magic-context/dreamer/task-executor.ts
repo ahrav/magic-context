@@ -1267,7 +1267,6 @@ async function runAgenticTask(
             ? getActiveUserMemories(db).map((um) => ({ id: um.id, content: um.content }))
             : undefined;
 
-
     const abortController = new AbortController();
     let leaseLost = false;
     const declareLeaseLost = (): void => {
@@ -1441,8 +1440,7 @@ async function runAgenticTask(
                     rawManifest: rawCurateManifest,
                     reason: describeError(error).brief,
                 });
-            } catch {
-            }
+            } catch {}
         }
         throw error;
     } finally {

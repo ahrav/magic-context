@@ -17,7 +17,6 @@ export interface CuratePromptMemory {
     hasNoFileSentinel: boolean;
 }
 
-
 // The fallback prompt must not contain task-specific instructions.
 // task's instructions.
 export const DREAMER_SYSTEM_PROMPT = `You are a background maintenance agent for the magic-context system, running during a scheduled dream window. Your task and its full instructions arrive in the message below. Never read or quote secrets from .env, credentials, or key files, and never commit — the user handles git.`;
@@ -77,7 +76,6 @@ export const PRIMER_INVESTIGATOR_SYSTEM_PROMPT = `You are a read-only code inves
 ## Rules
 - **Ground every claim in code you actually opened this run.** Open the files the question points at and verify against them. A paraphrase that reads no files is not an answer.
 - **Answer directly and concretely** — name paths, symbols, and mechanisms, in present tense.`;
-
 
 function renderMemoryList(memories: CuratePromptMemory[]): string {
     return memories
@@ -253,7 +251,6 @@ export function validateCurateManifest(
     return actions;
 }
 
-
 export interface RetrospectivePromptEvent {
     sessionId: string;
     kind: string;
@@ -334,7 +331,6 @@ Return only XML in this exact shape:
 </learnings>`;
 }
 
-
 export function buildMaintainDocsPrompt(
     projectPath: string,
     lastDreamAt: string | null,
@@ -389,7 +385,6 @@ ${!existingDocs.structure ? STRUCTURE_TEMPLATE : ""}
 - All file paths in docs point to files that actually exist
 - Docs are at project root: \`${projectPath}/ARCHITECTURE.md\` and \`${projectPath}/STRUCTURE.md\``;
 }
-
 
 const ARCHITECTURE_TEMPLATE = `
 ### ARCHITECTURE.md Template (use when creating from scratch)
@@ -490,7 +485,6 @@ const STRUCTURE_TEMPLATE = `
 **Shared utilities:** \\\`src/shared/\\\`
 **Tests:** co-located with source as \\\`*.test.ts\\\`
 \`\`\``;
-
 
 export function buildDreamTaskPrompt(
     task: DreamingTask,

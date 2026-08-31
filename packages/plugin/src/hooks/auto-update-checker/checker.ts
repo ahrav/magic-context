@@ -159,8 +159,7 @@ function findPackageJsonUp(startPath: string): string | null {
                         JSON.parse(readFileSync(pkgPath, "utf-8")),
                     );
                     if (pkg.success && pkg.data.name === PACKAGE_NAME) return pkgPath;
-                } catch {
-                }
+                } catch {}
             }
             const parent = dirname(dir);
             if (parent === dir) break;
@@ -423,8 +422,7 @@ export function getCachedVersion(_spec?: string | null): string | null {
                 if (!_spec) cachedPackageVersion = pkg.data.version;
                 return pkg.data.version;
             }
-        } catch {
-        }
+        } catch {}
     }
 
     return null;

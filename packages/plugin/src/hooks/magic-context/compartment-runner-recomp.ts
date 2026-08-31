@@ -121,8 +121,7 @@ export function promoteRecompStagingWithM0Mutation(
         if (!finished) {
             try {
                 db.exec("ROLLBACK");
-            } catch {
-            }
+            } catch {}
         }
     }
 }
@@ -169,7 +168,6 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         }
         const sessionDirectory = await resolveSessionDirectory(client, sessionId, directory);
 
-
         const existingStaging = getRecompStaging(db, sessionId);
         let candidateCompartments: CandidateCompartment[] = existingStaging?.compartments ?? [];
         let candidateFacts: Array<{ category: string; content: string }> =
@@ -204,8 +202,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                     updatedAt: Date.now(),
                     note,
                 });
-            } catch {
-            }
+            } catch {}
         };
         emitProgress("Preparing…");
 

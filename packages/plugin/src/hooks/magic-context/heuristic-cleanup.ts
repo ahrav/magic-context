@@ -304,8 +304,7 @@ function buildToolFingerprints(messages: MessageLike[]): Map<string, string> {
                 const fingerprint = `${ownerMsgId}:${info.toolName}:${JSON.stringify(info.args)}`;
                 const compositeKey = `${ownerMsgId}\x00${callId}`;
                 fingerprints.set(compositeKey, fingerprint);
-            } catch {
-            }
+            } catch {}
         }
     }
     return fingerprints;

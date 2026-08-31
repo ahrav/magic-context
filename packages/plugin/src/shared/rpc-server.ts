@@ -147,8 +147,7 @@ export class MagicContextRpcServer {
                 mkdirSync(dir, { recursive: true, mode: 0o700 });
                 try {
                     chmodSync(dir, 0o700);
-                } catch {
-                }
+                } catch {}
             } else {
                 mkdirSync(dir, { recursive: true });
             }
@@ -180,8 +179,7 @@ export class MagicContextRpcServer {
             if (enforcePrivatePermissions) {
                 try {
                     chmodSync(this.portFilePath, 0o600);
-                } catch {
-                }
+                } catch {}
             }
             log(`[rpc] server listening on 127.0.0.1:${this.port}`);
         } catch (err) {
@@ -226,8 +224,7 @@ export class MagicContextRpcServer {
                 );
                 return;
             }
-        } catch {
-        }
+        } catch {}
     }
 
     /** Bun fetch returns undefined after upgrading a request to a WebSocket.

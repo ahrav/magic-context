@@ -112,8 +112,7 @@ export function createAutoUpdateCheckerHook(
         { once: true },
     );
 
-    return async (_input: { event: OpenCodeEvent }) => {
-    };
+    return async (_input: { event: OpenCodeEvent }) => {};
 }
 
 async function maybeRunCheck(
@@ -156,8 +155,7 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): boolean 
                 if (Number.isFinite(last) && Date.now() - last < intervalMs) {
                     return false;
                 }
-            } catch {
-            }
+            } catch {}
         }
         mkdirSync(dirname(file), { recursive: true });
         const tmp = `${file}.tmp.${process.pid}`;
@@ -227,8 +225,7 @@ function consumePendingUpdateMarker(storageDir: string | null, loadedVersion: st
     } catch (err) {
         try {
             rmSync(path, { force: true });
-        } catch {
-        }
+        } catch {}
         warn(`[auto-update-checker] Discarded corrupt pending update marker: ${String(err)}`);
     }
 }

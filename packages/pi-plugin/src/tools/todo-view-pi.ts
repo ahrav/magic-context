@@ -303,8 +303,7 @@ export function renderTodowriteResult(
 			try {
 				const parsed = parseTodos(JSON.parse(text));
 				if (parsed !== null) todos = parsed;
-			} catch {
-			}
+			} catch {}
 		}
 	}
 	const renderedTodos =

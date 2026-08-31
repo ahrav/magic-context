@@ -95,8 +95,7 @@ export function computeM0BlockTokens(
                     `## ${c.start_message}-${c.end_message} · ${c.title}\n${c.content}\n`,
                 );
             }
-        } catch {
-        }
+        } catch {}
     }
 
     return {

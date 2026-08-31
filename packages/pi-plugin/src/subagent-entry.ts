@@ -120,8 +120,7 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 		if (openedDb) {
 			try {
 				openedDb.close();
-			} catch {
-			}
+			} catch {}
 			openedDb = undefined;
 		}
 	});

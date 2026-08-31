@@ -366,5 +366,4 @@ export async function runAutoSearchHint(args: {
 }
 
 /** Session cleanup hook — call on session.deleted. */
-export function clearAutoSearchForSession(_sessionId: string): void {
-}
+export function clearAutoSearchForSession(_sessionId: string): void {}

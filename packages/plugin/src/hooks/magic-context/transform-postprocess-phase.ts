@@ -1459,7 +1459,6 @@ export async function runPostTransformPhase(
         logTransformTiming(args.sessionId, "pp.placeholderNeutralize", tPlaceholder);
     }
 
-
     const tNudgeBlock = performance.now();
 
     if (args.fullFeatureMode && !compactionOff) {
@@ -1649,7 +1648,6 @@ export async function runPostTransformPhase(
         deferredMaterializedSuccessfully ||
         heuristicsRanSuccessfully ||
         pendingOpsRanSuccessfully;
-
 
     if (workExecutedSuccessfully) {
         try {

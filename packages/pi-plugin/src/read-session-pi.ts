@@ -258,8 +258,7 @@ function attachPiPartVersion(
 				enumerable: false,
 				configurable: true,
 			});
-		} catch {
-		}
+		} catch {}
 		return part;
 	});
 }

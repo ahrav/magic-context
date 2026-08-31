@@ -262,8 +262,7 @@ function collectPiRecentSessions(): PiRecentSessionSummary[] {
                     const mtime = statSync(join(slugDir, file)).mtimeMs;
                     const sessionId = file.replace(/\.jsonl$/, "");
                     candidates.push({ sessionId, directory, mtime });
-                } catch {
-                }
+                } catch {}
             }
         }
 

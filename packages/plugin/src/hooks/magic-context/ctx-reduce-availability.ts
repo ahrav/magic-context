@@ -158,7 +158,6 @@ function clearToolAvailability(sessionId: string, toolName: string): void {
     availabilityBySession.delete(cacheKey(toolName, sessionId));
 }
 
-
 export function resolveCtxReduceAvailabilityFromMessages(
     sessionId: string,
     messages: ReadonlyArray<{ info?: { role?: string; tools?: unknown } }>,
@@ -173,7 +172,6 @@ export function resolveCtxReduceAvailability(sessionId: string): CtxReduceAvaila
 export function clearCtxReduceAvailability(sessionId: string): void {
     clearToolAvailability(sessionId, CTX_REDUCE_TOOL);
 }
-
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -341,7 +339,6 @@ export function hasLoggedCtxReducePermissionDeny(sessionId: string): boolean {
 export function markCtxReducePermissionDenyLogged(sessionId: string): void {
     ctxReducePermissionDenyLogged.set(sessionId, true);
 }
-
 
 export function resolveTodowriteAvailabilityFromMessages(
     sessionId: string,

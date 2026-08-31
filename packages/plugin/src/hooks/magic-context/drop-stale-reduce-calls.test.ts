@@ -135,7 +135,6 @@ describe("dropStaleReduceCalls (frozen-set replay)", () => {
         });
     });
 
-
     describe("#given a ctx_reduce call frozen on a prior cache-busting pass", () => {
         describe("#when a later DEFER pass replays with tail growth (detect=false)", () => {
             it("#then re-strips the SAME frozen id and never newly strips a grown-past call", () => {

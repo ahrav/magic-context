@@ -68,7 +68,6 @@ function useTempDataHome(prefix: string): void {
     process.env.XDG_DATA_HOME = dir;
 }
 
-
 interface OcMessage {
     id: string;
     role: string;
@@ -223,7 +222,6 @@ function countSummaryMessages(db: Database, sessionId: string): number {
         .get(sessionId) as { n: number };
     return row.n;
 }
-
 
 describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
     it("deletes the canonical MC lineage: compaction part + summary rows together, never the boundary user row", () => {
@@ -549,7 +547,6 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
         }
     });
 });
-
 
 describe("reconcileCompactionMode — transition algebra", () => {
     it("keeps an unverified cleanup retry durable until the schema becomes verifiable", () => {

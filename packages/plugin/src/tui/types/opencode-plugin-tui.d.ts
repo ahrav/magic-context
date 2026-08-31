@@ -1,4 +1,3 @@
-
 declare module "@opencode-ai/plugin/tui" {
     import type {
         createOpencodeClient as createOpencodeClientV2,

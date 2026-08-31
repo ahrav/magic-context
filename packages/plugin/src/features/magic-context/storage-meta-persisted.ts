@@ -518,8 +518,7 @@ export function getWrapupInProgressState(
         if (!finished) {
             try {
                 db.exec("ROLLBACK");
-            } catch {
-            }
+            } catch {}
         }
     }
     return null;
@@ -563,8 +562,7 @@ export function acquireWrapupInProgress(
         if (!finished) {
             try {
                 db.exec("ROLLBACK");
-            } catch {
-            }
+            } catch {}
         }
     }
 }
@@ -603,8 +601,7 @@ export function updateWrapupInProgress(
         if (!finished) {
             try {
                 db.exec("ROLLBACK");
-            } catch {
-            }
+            } catch {}
         }
     }
 }
@@ -625,8 +622,7 @@ export function releaseWrapupInProgress(db: Database, sessionId: string, holderI
         if (!finished) {
             try {
                 db.exec("ROLLBACK");
-            } catch {
-            }
+            } catch {}
         }
     }
 }
@@ -1909,7 +1905,6 @@ export function clearDetectedContextLimit(db: Database, sessionId: string): void
     })();
 }
 
-
 export interface PersistedCompactionMarkerState {
     boundaryMessageId: string;
     summaryMessageId: string;
@@ -1959,8 +1954,7 @@ export function getPersistedCompactionMarkerState(
                 targetEndMessageId,
             };
         }
-    } catch {
-    }
+    } catch {}
     return null;
 }
 
@@ -1976,7 +1970,6 @@ export function setPersistedCompactionMarkerState(
     ).run(json, state?.targetEndMessageId ?? null, sessionId);
 }
 
-
 export function getStrippedPlaceholderIds(db: Database, sessionId: string): Set<string> {
     const row = db
         .prepare("SELECT stripped_placeholder_ids FROM session_meta WHERE session_id = ?")
@@ -1987,8 +1980,7 @@ export function getStrippedPlaceholderIds(db: Database, sessionId: string): Set<
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed))
             return new Set(parsed.filter((v: unknown) => typeof v === "string"));
-    } catch {
-    }
+    } catch {}
     return new Set();
 }
 
@@ -2275,7 +2267,6 @@ export function addProcessedImageStrippedIds(
     return casMergeStrippedIds(db, sessionId, "processed_image_stripped_ids", ids);
 }
 
-
 /**
  * The payload persists in session_meta.pending_compaction_marker_state between publication and consumption.
  * A background historian or compressor publishes the payload before the transform consumes it.
@@ -2373,7 +2364,6 @@ export function clearPendingCompactionMarkerStateIf(
     return result.changes > 0;
 }
 
-
 /**
  * The persistence layer uses `stableStringify` so the CAS clear compares bytes exactly.
  */
@@ -2413,8 +2403,7 @@ export function getPendingPiCompactionMarkerState(
         if (isPendingPiCompactionMarker(parsed)) {
             return parsed;
         }
-    } catch {
-    }
+    } catch {}
     db.prepare(
         "UPDATE session_meta SET pending_pi_compaction_marker_state = NULL WHERE session_id = ? AND pending_pi_compaction_marker_state = ?",
     ).run(sessionId, raw);

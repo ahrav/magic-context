@@ -47,8 +47,7 @@ afterEach(() => {
     for (const dir of tempDirs) {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-        } catch {
-        }
+        } catch {}
     }
     tempDirs.length = 0;
 });

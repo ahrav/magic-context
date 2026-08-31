@@ -466,8 +466,7 @@ function extractModel(rows: OpenCodeMessageRow[]): {
             const provider = data.providerID ?? data.model?.providerID;
             const modelId = data.modelID ?? data.model?.modelID;
             if (provider && modelId) return { provider, modelId };
-        } catch {
-        }
+        } catch {}
     }
     return { provider: DEFAULT_PROVIDER, modelId: DEFAULT_MODEL };
 }

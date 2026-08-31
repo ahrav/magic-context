@@ -17,7 +17,6 @@ const SCHEMA_FENCE_MARKER = "⚠️ Magic Context is disabled — database is ne
 const ENABLED_MARKER = "✨ Magic Context is now enabled";
 const ANNOUNCEMENT_MARKER = "✨ Magic Context — what's new in";
 
-
 function getDesktopStatePath(): string | null {
     const os = platform();
     const home = homedir();
@@ -67,8 +66,7 @@ function readDesktopState(directory: string): DesktopState {
                 if (typeof serverState.currentSidecarUrl === "string") {
                     sidecarUrl = serverState.currentSidecarUrl;
                 }
-            } catch {
-            }
+            } catch {}
         }
 
         let sessionId: string | null = null;
@@ -103,7 +101,6 @@ function getDesktopState(directory: string): DesktopState {
     }
     return cached;
 }
-
 
 async function deleteMessage(
     serverUrl: string,
@@ -143,7 +140,6 @@ function getServerAuth(): string | undefined {
     return `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
 }
 
-
 type SdkMessage = {
     info?: { id?: string; role?: string; sessionID?: string };
     parts?: Array<{ type?: string; text?: string; ignored?: boolean }>;
@@ -175,7 +171,6 @@ async function getSessionMessages(client: unknown, sessionId: string): Promise<S
     }
     return [];
 }
-
 
 /**
  */

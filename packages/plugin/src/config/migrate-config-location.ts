@@ -66,7 +66,6 @@ export interface ConfigFileMigrationResult {
 const CONFIG_FILE_BASENAME = "magic-context";
 const MOVED_MARKER_SUFFIX = ".MOVED_READPLEASE";
 
-
 function homeDir(): string {
     if (process.platform === "win32") {
         return process.env.USERPROFILE || process.env.HOME || homedir();
@@ -300,7 +299,6 @@ function acquireConfigMigrationLock(lockDir: string): (() => void) | null {
     return null;
 }
 
-
 function atomicCopyConfigFile(sourcePath: string, targetPath: string): void {
     mkdirSync(dirname(targetPath), { recursive: true });
     const tmpPath = join(
@@ -318,13 +316,11 @@ function atomicCopyConfigFile(sourcePath: string, targetPath: string): void {
         if (fd !== null) {
             try {
                 closeSync(fd);
-            } catch {
-            }
+            } catch {}
         }
         try {
             unlinkSync(tmpPath);
-        } catch {
-        }
+        } catch {}
         throw err;
     }
 }
@@ -346,17 +342,14 @@ function atomicWriteConfigFile(targetPath: string, content: string): void {
         if (fd !== null) {
             try {
                 closeSync(fd);
-            } catch {
-            }
+            } catch {}
         }
         try {
             unlinkSync(tmpPath);
-        } catch {
-        }
+        } catch {}
         throw err;
     }
 }
-
 
 function movedMarkerContent(
     targetPath: string,
@@ -432,7 +425,6 @@ function visibleConfigMigrationWarning(
         `Please consolidate manually into ${targetPath}. Paths: ${uniquePaths.join(" ; ")}`
     );
 }
-
 
 export function migrateConfigFile(opts: ConfigFileMigrationOptions): ConfigFileMigrationResult {
     const warnings: string[] = [];

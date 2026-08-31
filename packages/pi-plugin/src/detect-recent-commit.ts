@@ -5,7 +5,6 @@
 
 import { textMentionsRecentCommit } from "@magic-context/core/shared/commit-detection";
 
-
 const COMMIT_LOOKBACK = 5;
 
 /**

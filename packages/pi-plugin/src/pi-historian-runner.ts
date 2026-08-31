@@ -1122,8 +1122,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				if (!published) {
 					try {
 						db.exec("ROLLBACK");
-					} catch {
-					}
+					} catch {}
 				}
 			}
 

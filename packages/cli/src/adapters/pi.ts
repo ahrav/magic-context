@@ -149,8 +149,7 @@ export class PiAdapter implements HarnessAdapter {
             );
             const match = re.exec(output);
             if (match) return match[1] ?? null;
-        } catch {
-        }
+        } catch {}
         return null;
     }
 }

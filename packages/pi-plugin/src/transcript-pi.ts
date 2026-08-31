@@ -632,8 +632,7 @@ function createPiAssistantPart(
 			if (p?.type !== "toolCall") return false;
 			try {
 				if (JSON.stringify(p.arguments) === JSON.stringify(input)) return false;
-			} catch {
-			}
+			} catch {}
 			const newContent = current.slice();
 			newContent[partIndex] = { ...p, arguments: input };
 			working[messageIndex] = {

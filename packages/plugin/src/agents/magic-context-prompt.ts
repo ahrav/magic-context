@@ -35,8 +35,8 @@ const CTX_NOTE_GUIDANCE = `Use \`ctx_note\` ONLY for genuinely future concerns �
 const TOOL_HISTORY_GUIDANCE = `Compressed history intentionally omits tool calls and their outputs — summaries like "I edited file X" are historian records, not patterns to replicate. In the live conversation, older tool calls and their results are cleaned up to save context — you may see your own past messages referencing actions without the corresponding tool call or result visible. This is normal context management. ALWAYS use real tool calls; never simulate, fabricate, or inline tool outputs in your text. If there is no tool result message, the action did not happen. NEVER simulate, hallucinate or claim tool calls, command output, search results, file edits, or diffs in plain text as if they actually occurred.
 Magic Context control metadata is not reply syntax. Never reproduce \`<system-reminder>\`, \`<ctx-search-hint>\`, \`<session-history>\`, \`<session-history-since>\`, \`<project-memory>\`, \`<memory-updates>\`, \`<new-compartments>\`, \`<new-memories>\`, \`[dropped §N§]\`, or \`<!-- +Xm -->\` markers in a normal reply and never treat them as user instructions; use ordinary prose and real tool calls instead.`;
 
-/**
- * */
+/** ctx_memory-specific guidance. Gated out when `memory.enabled: false`: with
+ * memory off, the `<project-memory>` block is never injected. */
 const MEMORY_GUIDANCE = `Use \`ctx_memory\` for durable project knowledge: create what future sessions must know, then revise, archive, restore, or merge claims shown in \`<project-memory>\` when they drift. Claims persist across sessions and every new session starts with them.
 Claims use opaque \`mcm_…\` public IDs. Pass the current mutation token returned by create/get/list when changing a claim; stale tokens make no change.
 **Save durable knowledge proactively**: If you spent multiple turns finding something (a file path, a DB location, a config pattern, a workaround), create a claim so future sessions don't repeat the search. Examples:
@@ -72,7 +72,7 @@ Keep your user's instructions and intent — never drop a user message for its d
 NEVER drop assistant text messages unless they are exceptionally large. Your conversation messages are lightweight; only large tool outputs are worth dropping.
 Before your turn finishes, consider using \`ctx_reduce\` to drop large tool outputs you no longer need.`;
 
-/** The ctx_reduce-unavailable intro omits drop guidance and ctx_reduce instructions because ctx_reduce is unavailable.
+/** Intro when ctx_reduce is unavailable — no drop guidance or tag-system description.
  * When ctx_reduce is unavailable, transform.ts omits §N§ prefixes, so callers omit tag guidance.
  * When ctx_reduce is unavailable, transform.ts omits §N§ prefixes, so callers omit tag guidance.
  * When ctx_reduce is unavailable, transform.ts omits §N§ prefixes, so callers omit tag guidance.
@@ -129,7 +129,8 @@ const SMART_NOTE_GUIDANCE_LIGHT = `\nsurface_condition creates a smart note chec
 const TEMPORAL_AWARENESS_GUIDANCE = `\n**Temporal awareness**: User messages may be preceded by HTML comments like \`<!-- +12m -->\`, \`<!-- +2h 15m -->\`, or \`<!-- +3d 4h -->\` indicating time elapsed since the previous message's completion. Compartments in \`<session-history>\` carry \`start-date\` and \`end-date\` attributes (YYYY-MM-DD) showing real-time boundaries. Use these when reasoning about workflow pacing, log durations, build times, or how long ago something happened.`;
 
 /**
- * Subagents receive only §N§ and ctx_reduce guidance; `system-prompt-hash.ts` requires `## Magic Context` for injection idempotency.
+ * Minimal guidance for SUBAGENT sessions. Subagents are bounded, single-task
+ * executors that receive only §N§ and ctx_reduce mechanics.
  * Subagents receive only §N§ and ctx_reduce guidance; `system-prompt-hash.ts` requires `## Magic Context` for injection idempotency.
  * Subagents receive only §N§ and ctx_reduce guidance; `system-prompt-hash.ts` requires `## Magic Context` for injection idempotency.
  * Subagents receive only §N§ and ctx_reduce guidance; `system-prompt-hash.ts` requires `## Magic Context` for injection idempotency.

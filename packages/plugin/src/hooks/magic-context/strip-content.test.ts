@@ -1107,7 +1107,6 @@ describe("strip-content", () => {
         });
 
         describe("#given providerID gate (anthropic-only workaround)", () => {
-
             it("#then is a no-op when providerID is undefined", () => {
                 const u = message("m-u", "user", [{ type: "text", text: "hi" }]);
                 const a1 = message("m-a1", "assistant", [

@@ -511,8 +511,7 @@ export function indexSingleMessage(db: Database, sessionId: string, message: Raw
         if (!committed) {
             try {
                 db.exec("ROLLBACK");
-            } catch {
-            }
+            } catch {}
         }
     }
 }
@@ -599,8 +598,7 @@ export function indexMessagesAfterOrdinal(
         if (!committed) {
             try {
                 db.exec("ROLLBACK");
-            } catch {
-            }
+            } catch {}
         }
     }
     return inserted;
@@ -741,8 +739,7 @@ export function sweepOrphanedOpenCodeMessageIndexes(
             if (!committed) {
                 try {
                     db.exec("ROLLBACK");
-                } catch {
-                }
+                } catch {}
             }
         }
 

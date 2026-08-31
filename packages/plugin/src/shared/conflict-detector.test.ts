@@ -66,7 +66,6 @@ describe("detectConflicts", () => {
         writeFileSync(join(projectDir, "opencode.json"), JSON.stringify({ plugin: plugins }));
     }
 
-
     describe("DCP detection", () => {
         it("matches the canonical @tarquinen/opencode-dcp package", () => {
             writeProjectConfig(["@tarquinen/opencode-dcp"]);
@@ -98,7 +97,6 @@ describe("detectConflicts", () => {
             expect(result.conflicts.dcpPlugin).toBe(false);
         });
     });
-
 
     describe("OMO detection", () => {
         it("matches the canonical oh-my-opencode package", () => {
@@ -282,7 +280,6 @@ describe("detectConflicts", () => {
             expect(result.hasConflict).toBe(false);
         });
     });
-
 
     it("returns no conflicts for an empty plugin list", () => {
         writeProjectConfig([]);

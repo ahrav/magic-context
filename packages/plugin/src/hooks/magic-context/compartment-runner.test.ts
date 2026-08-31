@@ -73,16 +73,14 @@ afterEach(() => {
     for (const dir of tempDirs) {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-        } catch {
-        }
+        } catch {}
     }
     tempDirs.length = 0;
 
     const dumpDir = join(tmpdir(), "magic-context-historian");
     try {
         rmSync(dumpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-    } catch {
-    }
+    } catch {}
 });
 
 function openTestDb() {
@@ -2689,8 +2687,7 @@ describe("registerActiveCompartmentRun", () => {
         let rejectCompressor: ((err: unknown) => void) | undefined;
         const pending = new Promise<void>((_, reject) => {
             rejectCompressor = reject;
-        }).catch(() => {
-        });
+        }).catch(() => {});
 
         registerActiveCompartmentRun(sessionId, pending);
         expect(getActiveCompartmentRun(sessionId)).toBeDefined();

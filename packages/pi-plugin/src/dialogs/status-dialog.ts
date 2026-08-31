@@ -475,8 +475,7 @@ export function buildPiStatusDetail(
 		if (typeof sysPrompt === "string" && sysPrompt.length > 0) {
 			systemPromptTokens = estimateTokens(sysPrompt);
 		}
-	} catch {
-	}
+	} catch {}
 
 	const tags = getTagsBySession(deps.db, sessionId);
 	const activeTags = tags.filter((tag) => tag.status === "active");

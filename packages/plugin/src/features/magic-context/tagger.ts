@@ -469,8 +469,7 @@ export function createTagger(): Tagger {
             if (tagTokenCountIsNull(db, sessionId, tagNumber)) {
                 backfillTagTokenCounts(db, sessionId, tagNumber, tokenThunk());
             }
-        } catch {
-        }
+        } catch {}
     }
 
     function assignToolTag(

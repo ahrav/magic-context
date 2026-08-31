@@ -87,8 +87,7 @@ function findTokenizerImportPaths(): { tokenizerPath: string; encodingPath: stri
                 tokenizerPath: realpathSync(join(packageRoot, tokenizerTarget)),
                 encodingPath: realpathSync(join(packageRoot, encodingTarget)),
             };
-        } catch {
-        }
+        } catch {}
     }
     return undefined;
 }

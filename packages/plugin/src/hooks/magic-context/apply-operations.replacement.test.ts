@@ -4,7 +4,6 @@ import { describe, expect, it } from "bun:test";
 import { buildReplacementContent } from "./apply-operations";
 
 describe("buildReplacementContent — one canonical placeholder", () => {
-
     it("is a pure function of tagId — no target/content needed", () => {
         expect(buildReplacementContent(42)).toBe("[dropped \u00a742\u00a7]");
         expect(buildReplacementContent(100413)).toBe("[dropped \u00a7100413\u00a7]");

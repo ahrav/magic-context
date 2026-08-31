@@ -299,8 +299,7 @@ export function applyMigrateSession(
     } catch (error) {
         try {
             deps.opencodeDb.exec("ROLLBACK");
-        } catch {
-        }
+        } catch {}
         throw error;
     }
 
@@ -361,8 +360,7 @@ export function applyMigrateSession(
         if (txBegan) {
             try {
                 deps.contextDb.exec("ROLLBACK");
-            } catch {
-            }
+            } catch {}
         }
         // compensateOpenCode() undoes the committed OpenCode change after a context.db failure.
         compensateOpenCode();
@@ -375,7 +373,6 @@ export function applyMigrateSession(
         chunkEmbeddingsRestamped,
     };
 }
-
 
 function defaultContextDbPath(): string {
     return join(getMagicContextStorageDir(), "context.db");
@@ -482,8 +479,7 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
             opencodeDb.exec("PRAGMA busy_timeout=5000");
             contextDb.exec("PRAGMA foreign_keys=ON");
             contextDb.exec("PRAGMA busy_timeout=5000");
-        } catch {
-        }
+        } catch {}
         const deps = realDeps(opencodeDb, contextDb);
         const plan = planMigrateSession(sessionId, expandedTo, deps);
         const transport = new McHostModuleTransport();

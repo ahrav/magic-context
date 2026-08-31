@@ -86,8 +86,7 @@ function attachRawPartVersion(value: unknown, timeUpdated: number | undefined): 
             enumerable: false,
             configurable: true,
         });
-    } catch {
-    }
+    } catch {}
     return value;
 }
 
