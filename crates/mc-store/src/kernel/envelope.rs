@@ -1049,6 +1049,14 @@ fn insert_domain(
     Ok(())
 }
 
+/// Column projection consumed by [`object_row_from`], aliased on `o`.
+///
+/// The mapper reads positional columns, so every query it maps must select
+/// exactly this projection.
+pub(super) const OBJECT_ROW_COLUMNS: &str = "o.object_id,o.object_kind,o.domain_id,o.source_kind,\
+     o.source_id,o.source_revision,o.created_commit_seq,o.invalidated_commit_seq,\
+     o.superseded_by,o.sensitivity_class";
+
 pub(super) fn object_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRow> {
     let sensitivity: String = row.get(9)?;
     Ok(ObjectRow {

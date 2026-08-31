@@ -1,8 +1,11 @@
-use super::envelope::{object_row_from, DomainSpec, Envelope, ObjectRow, PendingChange};
+use super::envelope::{
+    object_row_from, DomainSpec, Envelope, ObjectRow, PendingChange, OBJECT_ROW_COLUMNS,
+};
 use super::redaction::{identity, record, redact};
 use super::{map_sqlite, KernelError, Sensitivity};
 use crate::current_time_ms;
 use rusqlite::{params, OptionalExtension};
+use sha2::{Digest, Sha256};
 
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
@@ -327,8 +330,7 @@ pub fn evaluate_admission(input: EvaluationInputs) -> Result<Evaluation, KernelE
 // policy-digest:evaluator-end
 
 struct SubjectFacts {
-    candidate_id: Option<String>,
-    subject_object_id: Option<String>,
+    subject: AdmissionKey,
     source_kind: String,
     source_id: String,
     source_revision: i64,
@@ -341,12 +343,8 @@ struct SubjectFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum AdmissionKey {
+    Candidate(String),
     Object(String),
-    Source {
-        kind: String,
-        id: String,
-        revision: i64,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -362,6 +360,32 @@ struct PreparedDecision {
     event: AdmissionEvent,
     evaluation: Evaluation,
 }
+
+/// Each approval may support at most 1,024 distinct subjects.
+const MAX_APPROVAL_DEPENDENTS: usize = 1_024;
+
+/// Selects rows of `admission_decisions a` with no later committed decision
+/// for the same subject. `load_prior_decision` expresses this same rule as an
+/// ordered single-row seek; the two formulations must stay equivalent.
+const LATEST_SUBJECT_DECISION_PREDICATE: &str = "NOT EXISTS (
+    SELECT 1 FROM admission_decisions newer
+    WHERE newer.subject_object_id=a.subject_object_id
+      AND newer.commit_seq IS NOT NULL
+      AND (
+          newer.commit_seq>a.commit_seq
+          OR (
+              newer.commit_seq=a.commit_seq
+              AND newer.admission_decision_id>a.admission_decision_id
+          )
+      )
+)";
+
+/// Grant validation and revocation share this live-approval definition so an
+/// object honored as an approval is always revocable.
+const APPROVAL_OBJECT_PREDICATE: &str = "o.object_kind='decision'
+   AND o.invalidated_commit_seq IS NULL
+   AND d.decision_kind='adr_accepted'
+   AND d.invalidated_commit_seq IS NULL";
 
 impl Envelope<'_> {
     #[cfg(feature = "test-support")]
@@ -424,9 +448,7 @@ impl Envelope<'_> {
         &mut self,
         request: AdmissionRequest,
     ) -> Result<Option<AdmissionDecision>, KernelError> {
-        if request.subject_object_id.is_some()
-            && matches!(request.event.kind, EventKind::Correct | EventKind::Replace)
-        {
+        if matches!(request.event.kind, EventKind::Correct | EventKind::Replace) {
             return Err(KernelError::AdmissionPolicy);
         }
         let prepared = self.prepare_admission(request)?;
@@ -454,10 +476,7 @@ impl Envelope<'_> {
         domain: AdmissionDomainSpec,
     ) -> Result<AdmissionDecision, KernelError> {
         let prepared = self.prepare_admission(request)?;
-        if prepared.facts.candidate_id.is_none()
-            || prepared.facts.subject_object_id.is_some()
-            || prepared.evaluation.no_op
-        {
+        if prepared.facts.candidate_id().is_none() || prepared.evaluation.no_op {
             return Err(KernelError::AdmissionPolicy);
         }
         if prepared.evaluation.outcome == Outcome::Deny
@@ -512,17 +531,24 @@ impl Envelope<'_> {
         replacement: AdmissionDomainSpec,
     ) -> Result<AdmissionDecision, KernelError> {
         let prepared = self.prepare_admission(request)?;
-        if prepared.facts.candidate_id.is_some()
-            || prepared.evaluation.no_op
+        let AdmissionKey::Object(replaced_object_id) = prepared.facts.subject.clone() else {
+            return Err(KernelError::AdmissionPolicy);
+        };
+        if prepared.evaluation.no_op
             || !matches!(prepared.event.kind, EventKind::Correct | EventKind::Replace)
         {
             return Err(KernelError::AdmissionPolicy);
         }
-        let replaced_object_id = prepared
-            .facts
-            .subject_object_id
-            .clone()
-            .ok_or(KernelError::AdmissionPolicy)?;
+        // A replacement cannot bypass a predecessor with a quarantined,
+        // rejected, or contradicted disposition.
+        if load_prior_decision(self, &prepared.facts)?.is_some_and(|stored| {
+            matches!(
+                stored.decision.disposition,
+                Disposition::Quarantined | Disposition::Rejected | Disposition::Contradicted
+            )
+        }) {
+            return Err(KernelError::AdmissionPolicy);
+        }
         self.correct_domain(
             &replaced_object_id,
             DomainSpec {
@@ -561,8 +587,6 @@ impl Envelope<'_> {
         approval_object_id: &str,
         reason: &str,
     ) -> Result<Vec<AdmissionDecision>, KernelError> {
-        const MAX_DEPENDENTS: usize = 1_024;
-
         if reason.trim().is_empty() {
             return Err(KernelError::AdmissionPolicy);
         }
@@ -570,14 +594,12 @@ impl Envelope<'_> {
         let approval = self
             .tx
             .query_row(
-                "SELECT o.object_id,o.object_kind,o.domain_id,o.source_kind,o.source_id,
-                        o.source_revision,o.created_commit_seq,NULL,NULL,o.sensitivity_class
-                 FROM object_registry o
-                 JOIN decisions d ON d.object_id=o.object_id
-                WHERE o.object_id=?1 AND o.object_kind='decision'
-                   AND o.invalidated_commit_seq IS NULL
-                   AND d.decision_kind='adr_accepted'
-                   AND d.invalidated_commit_seq IS NULL",
+                &format!(
+                    "SELECT {OBJECT_ROW_COLUMNS}
+                     FROM object_registry o
+                     JOIN decisions d ON d.object_id=o.object_id
+                     WHERE o.object_id=?1 AND {APPROVAL_OBJECT_PREDICATE}"
+                ),
                 [approval_object_id.as_str()],
                 object_row_from,
             )
@@ -587,26 +609,17 @@ impl Envelope<'_> {
         let dependents = {
             let mut statement = self
                 .tx
-                .prepare(
+                .prepare(&format!(
                     "SELECT a.subject_object_id,a.source_class,a.taint_class
                      FROM admission_decisions a
                      WHERE a.approval_object_id=?1
                        AND a.subject_object_id IS NOT NULL
                        AND a.commit_seq IS NOT NULL
-                       AND NOT EXISTS (
-                           SELECT 1 FROM admission_decisions newer
-                           WHERE newer.subject_object_id=a.subject_object_id
-                             AND newer.commit_seq IS NOT NULL
-                             AND (
-                                 newer.commit_seq>a.commit_seq
-                                 OR (
-                                     newer.commit_seq=a.commit_seq
-                                     AND newer.admission_decision_id>a.admission_decision_id
-                                 )
-                             )
-                       )
-                     ORDER BY a.subject_object_id",
-                )
+                       AND {LATEST_SUBJECT_DECISION_PREDICATE}
+                     ORDER BY a.subject_object_id
+                     LIMIT {limit}",
+                    limit = MAX_APPROVAL_DEPENDENTS + 1
+                ))
                 .map_err(map_sqlite)?;
             let rows = statement
                 .query_map([approval_object_id.as_str()], |row| {
@@ -621,7 +634,7 @@ impl Envelope<'_> {
                 .map_err(map_sqlite)?;
             rows
         };
-        if dependents.len() > MAX_DEPENDENTS {
+        if dependents.len() > MAX_APPROVAL_DEPENDENTS {
             return Err(KernelError::AdmissionPolicy);
         }
         let registry = self
@@ -713,7 +726,7 @@ impl Envelope<'_> {
         let approval_valid = validate_approval(
             self,
             request.event.approval_object_id.as_deref(),
-            facts.subject_object_id.as_deref(),
+            facts.subject_object_id(),
         )?;
         let trigger_valid = validate_trigger(self, &request.event, &facts)?;
         let evaluation = evaluate_admission(EvaluationInputs {
@@ -786,17 +799,30 @@ impl Envelope<'_> {
         let subject_object_id = materialized
             .as_ref()
             .map(|object| object.object_id.clone())
-            .or(prepared.facts.subject_object_id.clone());
+            .or_else(|| prepared.facts.subject_object_id().map(str::to_string));
+        if let Some(approval) = approval_object_id.as_deref() {
+            enforce_approval_dependent_cap(self, approval, subject_object_id.as_deref())?;
+        }
+        let candidate_payload_digest = prepared
+            .facts
+            .candidate_payload
+            .as_deref()
+            .map(|payload| format!("{:x}", Sha256::digest(payload)));
         self.tx
             .execute(
                 "INSERT INTO admission_decisions(
-                     admission_decision_id,candidate_id,subject_object_id,source_kind,source_id,
-                     source_revision,source_class,taint_class,maturity,disposition,visibility,
-                     policy_revision,reason,evidence_id,approval_object_id,commit_seq,decided_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                     admission_decision_id,candidate_id,candidate_kind,candidate_payload_digest,
+                     subject_object_id,source_kind,source_id,source_revision,source_class,
+                     taint_class,maturity,effective_maturity,disposition,visibility,outcome,
+                     sensitivity,policy_revision,reason,evidence_id,approval_object_id,
+                     commit_seq,decided_at
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,
+                           ?20,?21,?22)",
                 params![
                     admission_decision_id,
-                    prepared.facts.candidate_id,
+                    prepared.facts.candidate_id(),
+                    prepared.facts.candidate_kind,
+                    candidate_payload_digest,
                     subject_object_id,
                     source_kind,
                     source_id,
@@ -804,8 +830,11 @@ impl Envelope<'_> {
                     prepared.source_class.as_str(),
                     prepared.taint_class.as_str(),
                     prepared.evaluation.historical_maturity.as_str(),
+                    prepared.evaluation.effective_maturity.get().as_str(),
                     prepared.evaluation.disposition.as_str(),
                     prepared.evaluation.visibility.as_str(),
+                    prepared.evaluation.outcome.as_str(),
+                    prepared.evaluation.sensitivity.as_str(),
                     POLICY_REVISION,
                     reason.text,
                     evidence_id,
@@ -854,6 +883,12 @@ impl Envelope<'_> {
             redactions: vec![("reason".to_string(), reason)],
             audit: Some(audit),
         });
+        if let Some(object) = materialized.as_ref() {
+            self.admission_latest.insert(
+                AdmissionKey::Object(object.object_id.clone()),
+                latest.clone(),
+            );
+        }
         self.admission_latest.insert(latest_key, latest);
         Ok(AdmissionDecision {
             admission_decision_id,
@@ -869,14 +904,21 @@ impl Envelope<'_> {
 
 impl SubjectFacts {
     fn key(&self) -> AdmissionKey {
-        self.subject_object_id.as_ref().map_or_else(
-            || AdmissionKey::Source {
-                kind: self.source_kind.clone(),
-                id: self.source_id.clone(),
-                revision: self.source_revision,
-            },
-            |object_id| AdmissionKey::Object(object_id.clone()),
-        )
+        self.subject.clone()
+    }
+
+    fn candidate_id(&self) -> Option<&str> {
+        match &self.subject {
+            AdmissionKey::Candidate(candidate_id) => Some(candidate_id),
+            AdmissionKey::Object(_) => None,
+        }
+    }
+
+    fn subject_object_id(&self) -> Option<&str> {
+        match &self.subject {
+            AdmissionKey::Candidate(_) => None,
+            AdmissionKey::Object(object_id) => Some(object_id),
+        }
     }
 }
 
@@ -914,8 +956,7 @@ fn load_candidate_facts(
         serde_json::from_slice(&provenance).map_err(|_| KernelError::AdmissionPolicy)?;
     let payload = String::from_utf8(payload).map_err(|_| KernelError::AdmissionPolicy)?;
     Ok(SubjectFacts {
-        candidate_id: Some(candidate_id),
-        subject_object_id: None,
+        subject: AdmissionKey::Candidate(candidate_id),
         source_kind: source_kind.ok_or(KernelError::AdmissionPolicy)?,
         source_id: source_id.ok_or(KernelError::AdmissionPolicy)?,
         source_revision: source_revision.ok_or(KernelError::AdmissionPolicy)?,
@@ -943,8 +984,7 @@ fn load_subject_facts(
             [subject_object_id.as_str()],
             |row| {
                 Ok(SubjectFacts {
-                    candidate_id: None,
-                    subject_object_id: Some(subject_object_id.clone()),
+                    subject: AdmissionKey::Object(subject_object_id.clone()),
                     domain_id: row.get(0)?,
                     source_kind: row.get(1)?,
                     source_id: row.get(2)?,
@@ -969,98 +1009,104 @@ fn load_prior_decision(
     if let Some(prior) = envelope.admission_latest.get(&key) {
         return Ok(Some(prior.clone()));
     }
-    let row = if let Some(subject_object_id) = facts.subject_object_id.as_deref() {
-        envelope.tx.query_row(
-            "SELECT admission_decision_id,maturity,disposition,source_class,taint_class,
-                    approval_object_id
-             FROM admission_decisions
-             WHERE subject_object_id=?1 AND commit_seq IS NOT NULL
-             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1",
-            [subject_object_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            },
-        )
-    } else {
-        envelope.tx.query_row(
-            "SELECT admission_decision_id,maturity,disposition,source_class,taint_class,
-                    approval_object_id
-             FROM admission_decisions
-             WHERE source_kind=?1 AND source_id=?2 AND source_revision=?3
-               AND commit_seq IS NOT NULL
-             ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1",
-            params![facts.source_kind, facts.source_id, facts.source_revision],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            },
-        )
-    }
-    .optional()
-    .map_err(map_sqlite)?;
-    let Some((decision_id, maturity, disposition, source_class, taint_class, approval_object_id)) =
-        row
-    else {
-        return Ok(None);
+    let (filter, key_value) = match &key {
+        AdmissionKey::Candidate(candidate_id) => ("candidate_id=?1", candidate_id.as_str()),
+        AdmissionKey::Object(object_id) => ("subject_object_id=?1", object_id.as_str()),
     };
-    let payload = envelope
+    let row = envelope
         .tx
         .query_row(
-            "SELECT payload FROM change_event WHERE object_id=?1
-             ORDER BY commit_seq DESC,ordinal DESC LIMIT 1",
-            [decision_id],
-            |row| row.get::<_, Vec<u8>>(0),
+            &format!(
+                "SELECT maturity,effective_maturity,disposition,outcome,source_class,
+                        taint_class,sensitivity,policy_revision,approval_object_id
+                 FROM admission_decisions
+                 WHERE {filter} AND commit_seq IS NOT NULL
+                 ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+            ),
+            [key_value],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
         )
         .optional()
         .map_err(map_sqlite)?;
-    let audit = payload
-        .as_deref()
-        .and_then(|payload| serde_json::from_slice::<serde_json::Value>(payload).ok())
-        .and_then(|payload| payload.get("audit").cloned());
-    let outcome = audit
-        .as_ref()
-        .and_then(|audit| audit.get("outcome"))
-        .and_then(|value| value.as_str())
-        .and_then(|value| Outcome::try_from(value).ok())
-        .unwrap_or(Outcome::Deny);
-    let sensitivity = audit
-        .as_ref()
-        .and_then(|audit| audit.get("sensitivity"))
-        .and_then(|value| value.as_str())
-        .map_or(Sensitivity::Secret, Sensitivity::from_stored);
-    let effective_maturity = audit
-        .as_ref()
-        .and_then(|audit| audit.get("effective_maturity"))
-        .and_then(|value| value.as_str())
-        .and_then(|value| Maturity::try_from(value).ok())
-        .unwrap_or(Maturity::Candidate);
+    let Some((
+        maturity,
+        effective_maturity,
+        disposition,
+        outcome,
+        source_class,
+        taint_class,
+        sensitivity,
+        policy_revision,
+        approval_object_id,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    // Rows with a different `policy_revision` are rejected because their
+    // encoded values may have different semantics.
+    if policy_revision != POLICY_REVISION {
+        return Err(KernelError::AdmissionPolicy);
+    }
     Ok(Some(StoredAdmission {
         decision: PriorDecision {
-            historical_maturity: Maturity::try_from(maturity.as_str())
-                .unwrap_or(Maturity::Candidate),
-            effective_maturity,
-            disposition: Disposition::try_from(disposition.as_str())
-                .unwrap_or(Disposition::Quarantined),
-            outcome,
+            historical_maturity: Maturity::try_from(maturity.as_str())?,
+            effective_maturity: Maturity::try_from(effective_maturity.as_str())?,
+            disposition: Disposition::try_from(disposition.as_str())?,
+            outcome: Outcome::try_from(outcome.as_str())?,
             source_class: SourceClass::try_from(source_class.as_str())?,
             taint_class: TaintClass::try_from(taint_class.as_str())?,
-            sensitivity,
+            sensitivity: sensitivity_from_ledger(&sensitivity)?,
         },
         approval_object_id,
     }))
+}
+
+/// Strict counterpart of [`Sensitivity::from_stored`] for ledger rows: an
+/// unknown value is an error, never a substituted default.
+fn sensitivity_from_ledger(value: &str) -> Result<Sensitivity, KernelError> {
+    match value {
+        "normal" => Ok(Sensitivity::Normal),
+        "sensitive" => Ok(Sensitivity::Sensitive),
+        "secret" => Ok(Sensitivity::Secret),
+        _ => Err(KernelError::AdmissionPolicy),
+    }
+}
+
+/// Enforces [`MAX_APPROVAL_DEPENDENTS`] distinct dependent subjects per
+/// approval object. `subject_object_id` is excluded from the count so repeat
+/// decisions for an existing dependent stay admissible.
+fn enforce_approval_dependent_cap(
+    envelope: &Envelope<'_>,
+    approval_object_id: &str,
+    subject_object_id: Option<&str>,
+) -> Result<(), KernelError> {
+    let dependents: i64 = envelope
+        .tx
+        .query_row(
+            "SELECT COUNT(DISTINCT subject_object_id) FROM admission_decisions
+             WHERE approval_object_id=?1 AND subject_object_id IS NOT NULL
+               AND subject_object_id IS NOT ?2",
+            params![approval_object_id, subject_object_id],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite)?;
+    let cap = i64::try_from(MAX_APPROVAL_DEPENDENTS).map_err(|_| KernelError::AdmissionPolicy)?;
+    if dependents >= cap {
+        return Err(KernelError::AdmissionPolicy);
+    }
+    Ok(())
 }
 
 fn validate_provenance(
@@ -1103,33 +1149,21 @@ fn validate_approval(
     envelope
         .tx
         .query_row(
-            "SELECT EXISTS(
-                 SELECT 1
-                 FROM object_registry o
-                 JOIN decisions d ON d.object_id=o.object_id
-                 JOIN admission_decisions a ON a.subject_object_id=o.object_id
-                 WHERE o.object_id=?1 AND o.object_kind='decision'
-                   AND o.invalidated_commit_seq IS NULL
-                   AND d.decision_kind='adr_accepted'
-                   AND d.invalidated_commit_seq IS NULL
-                   AND a.taint_class='user_explicit'
-                   AND a.maturity IN ('approved','enforced')
-                   AND a.disposition='active'
-                   AND a.visibility='automatic'
-                   AND a.commit_seq IS NOT NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM admission_decisions newer
-                       WHERE newer.subject_object_id=a.subject_object_id
-                         AND newer.commit_seq IS NOT NULL
-                         AND (
-                             newer.commit_seq>a.commit_seq
-                             OR (
-                                 newer.commit_seq=a.commit_seq
-                                 AND newer.admission_decision_id>a.admission_decision_id
-                             )
-                         )
-                   )
-             )",
+            &format!(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM object_registry o
+                     JOIN decisions d ON d.object_id=o.object_id
+                     JOIN admission_decisions a ON a.subject_object_id=o.object_id
+                     WHERE o.object_id=?1 AND {APPROVAL_OBJECT_PREDICATE}
+                       AND a.taint_class='user_explicit'
+                       AND a.effective_maturity IN ('approved','enforced')
+                       AND a.disposition='active'
+                       AND a.visibility='automatic'
+                       AND a.commit_seq IS NOT NULL
+                       AND {LATEST_SUBJECT_DECISION_PREDICATE}
+                 )"
+            ),
             [approval_object_id],
             |row| row.get::<_, bool>(0),
         )

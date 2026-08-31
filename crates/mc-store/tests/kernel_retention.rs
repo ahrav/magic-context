@@ -198,10 +198,11 @@ fn staging_cleanup_preserves_exact_denormalized_admission_facts() {
         .execute(
             "INSERT INTO admission_decisions(
                  admission_decision_id,candidate_id,source_kind,source_id,source_revision,
-                 source_class,taint_class,maturity,disposition,visibility,policy_revision,
-                 reason,decided_at
+                 source_class,taint_class,maturity,effective_maturity,disposition,visibility,
+                 outcome,sensitivity,policy_revision,reason,decided_at
              ) VALUES ('admission','candidate','fixture','source',7,'normal','tainted',
-                       'candidate','accepted','explicit',9,'proof',11)",
+                       'candidate','candidate','accepted','explicit','admit','normal',9,
+                       'proof',11)",
             [],
         )
         .unwrap();
