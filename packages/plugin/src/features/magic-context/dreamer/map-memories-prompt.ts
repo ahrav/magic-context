@@ -11,18 +11,12 @@ import {
 } from "./manifest-parser";
 
 /**
- * map-memories prompt + host-side helpers.
  *
- * map-memories is a ONE-TIME backfill: it locates the repo file(s) that back
- * each project memory (or marks it file-independent), recording the mapping so
- * the verify task can run incrementally from the start (verify reads "which
- * files changed since this memory's verification" — without a mapping, the first
- * verify would have to check the whole pool and time out, the cold-start trap).
+ * The mapping lets verify check only files changed since each memory's last verification.
+ * The host records each memory's backing-file mapping.
+ * Without a mapping, the first verify checks the whole pool and can time out.
  *
- * The agent only LOCATES backing files; the host parses its single XML manifest
- * and appends exact-revision applicability paths (mapped, not yet content-
- * verified). The prompt was calibrated in the shadow harness on real claim
- * pools (DeepSeek-v4-Flash); see .alfonso/plans/dreamer-v2-rework.md.
+ * The agent locates backing files; the host parses the XML manifest and appends exact-revision applicability paths.
  */
 
 export const MAP_MEMORIES_SYSTEM_PROMPT = `You are a memory mapper for the magic-context system. You map project memories to the repository files that back them.
@@ -49,23 +43,17 @@ Rules:
 - Prefer the most specific file(s); do not pad with tangential files. Most memories map to one file; some to a few.
 - When you genuinely cannot find any local backing and it is not clearly external, still emit the memory with independent="true" (do not drop it).`;
 
-// CONTEXT GUARD: seed at most this many candidate PATHS per memory (path strings
-// only — never file contents, which is what blows up context). The agent
-// confirms these instead of blind-searching to find them. ~half the pool names a
-// path; the seed is a free assist for that half, not load-bearing.
+// Seed at most three path strings per memory to bound context.
+// The seeder includes paths, never file contents, to stay within the context limit.
 export const MAX_SEED_PATHS_PER_MEMORY = 3;
 
-// Repo-relative path-like tokens with a source/code extension. Deliberately
-// narrow: a multi-segment path (a/b/c.ts), optionally wrapped in backticks. We
-// only SEED what the memory already names; the agent still confirms (paths can
-// be stale/renamed → the host validates existence before seeding).
-// NOTE: built FRESH per call via matchAll — a shared /g regex carries lastIndex
-// across calls and silently skips matches at the start of later inputs.
+// Seed only paths named by the memory; validate their existence before seeding because paths can be stale or renamed.
+// Each call creates a new regex because a shared /g regex retains lastIndex across calls and skips initial matches in later inputs.
 const PATH_PATTERN =
     "`?((?:[\\w.-]+\\/)+[\\w.-]+\\.(?:ts|tsx|js|jsx|mjs|cjs|rs|go|py|json|jsonc|sql|toml|sh))`?";
 
-/** Extract candidate backing-file paths a memory NAMES, keep only those that
- *  EXIST in the repo, dedupe, cap. Pure host-side seeding — no LLM, no contents. */
+/**
+ * The seeder does not read file contents or call an LLM. */
 export function extractMemoryCandidatePaths(content: string, repoDir: string): string[] {
     const found = new Set<string>();
     const root = path.resolve(repoDir);
@@ -77,7 +65,7 @@ export function extractMemoryCandidatePaths(content: string, repoDir: string): s
         try {
             if (existsSync(abs) && statSync(abs).isFile()) found.add(rel);
         } catch {
-            /* unreadable → skip */
+            /* */
         }
         if (found.size >= MAX_SEED_PATHS_PER_MEMORY) break;
     }
@@ -120,7 +108,6 @@ export interface ParsedMemoryMapping {
     independent: boolean;
 }
 
-// Built fresh per call — a shared /g regex carries lastIndex across inputs.
 const MEMORY_ELEMENT_PATTERN = "<memory\\b([^>]*)(?:\\/>|>([\\s\\S]*?)<\\/memory>)";
 const NESTED_FILE_PATTERN = "<file\\b([^>]*)\\/?>";
 
@@ -138,18 +125,15 @@ function mappingsBody(text: string): string {
         return extractCompleteManifestBody(text, "mappings");
     } catch (error) {
         const described = describeUnrecognizedManifestShape(text, "mappings", "memory");
-        // Wrong root / JSON is a format miss, not truncation. Keep the original
-        // "closing root" error so a length-capped `<mappings>` still looks like
-        // truncation rather than an unrecognized shape.
+        // Treat a wrong root or JSON as format errors, not truncation, so a length-capped `<mappings>` reports truncation rather than an unrecognized shape.
         if (!described.startsWith("parsed zero entries")) throw new Error(described);
         throw error;
     }
 }
 
-/** Parse the agent's complete `<mappings>` manifest. A missing root close tag is
- *  treated as truncation and rejects the whole batch. `independent` is honored
- *  only for the explicit sentinel; a missing `files` attribute is never treated
- *  as file-independent (that silently excluded memories from verify). Nested
+/** A missing `</mappings>` rejects the whole batch as truncation.
+ * The parser honors `independent` only when it equals `"true"`.
+ * Do not treat a missing `files` attribute as file-independent; doing so excludes the memory from verify.
  *  `<file path="…"/>` children are accepted as an unambiguous alias. */
 export function parseMapMemoriesManifest(text: string): ParsedMemoryMapping[] {
     const out: ParsedMemoryMapping[] = [];
@@ -191,8 +175,8 @@ export function parseMapMemoriesManifest(text: string): ParsedMemoryMapping[] {
     return out;
 }
 
-/** Retry-time contract: non-empty parse + exact id coverage. Apply still
- *  re-asserts coverage as the final belt. */
+/**
+ * */
 export function validateMapMemoriesManifest(
     text: string,
     expectedIds: ReadonlySet<string>,

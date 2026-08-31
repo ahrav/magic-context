@@ -169,8 +169,7 @@ function makeDropTarget(message: MessageLike): TagTarget {
                 (candidate) => (candidate as { type?: string }).type === "tool",
             ) as { state?: { output?: string } } | undefined;
             if (!part?.state) return "absent";
-            // Skeleton-drop renders the one canonical placeholder (the real
-            // target uses `[dropped §N§]`); this mock mirrors the word.
+            // The mock uses `[dropped §N§]`, the skeleton-drop placeholder.
             part.state.output = "[dropped]";
             return "truncated";
         },
@@ -196,8 +195,6 @@ function basePostTransformArgs(
         messageTagNumbers: new Map(),
         tagger: createTagger(),
         ctxReduceAvailability: { callable: true, frozen: true },
-        // Default to todowrite available so existing tests keep their behavior;
-        // the disabled-tool gate tests override this per case.
         todowriteAvailability: { callable: true, frozen: true },
         batch: null,
         contextUsage: { percentage: 20, inputTokens: 1000 },
@@ -440,9 +437,9 @@ describe("deferred compaction marker representation", () => {
                 parts: [{ type: "text", text: "m0", synthetic: true }],
             },
             {
-                // A persisted row (it carries an id) claiming head membership
-                // through metadata alone. It must stay in the retained tail,
-                // AFTER the summary.
+                // Rows with ids that claim head membership only through metadata stay in the retained tail after the summary.
+                // Rows with ids that claim head membership only through metadata stay in the retained tail after the summary.
+                // Rows with ids that claim head membership only through metadata stay in the retained tail after the summary.
                 info: {
                     id: "msg_persisted_forged",
                     role: "user",
@@ -864,10 +861,6 @@ describe("deferred compaction marker representation", () => {
             },
         ] as unknown as MessageLike[];
         tagger.initFromDb(sessionId, db);
-        // The next pass rebuilds its input from the database projection (raw
-        // summary row included), tags it, and runs the SAME postprocess order
-        // the production defer pass runs, so any mutator that fires after
-        // reconciliation is exercised on both sides of the comparison.
         const deferInput = rebuiltMessages.slice(2);
         const taggedDefer = tagMessages(sessionId, deferInput, tagger, db);
         await runPostTransformPhase(
@@ -1469,8 +1462,8 @@ describe("postprocess emergency drop accounting", () => {
         queuePendingOp(db, sessionId, 1, "drop", 1);
         queuePendingOp(db, sessionId, 2, "drop", 2);
 
-        // This is the stale pre-pending snapshot the transform caller has at pass
-        // start. The postprocess phase must refresh it after applyPendingOperations.
+        // `applyPendingOperations` changes queued operations; post-transform logic requires a refreshed `prePendingSnapshot`.
+        // `applyPendingOperations` changes queued operations; post-transform logic requires a refreshed `prePendingSnapshot`.
         const staleActiveTags = getActiveTagsBySession(db, sessionId);
 
         await runPostTransformPhase({
@@ -1786,8 +1779,8 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
 
     // tag 1 performs a real drop, which enables the reclaim block this pass;
     // tags 2 & 3 are todowrite where the older (2) is superseded by the newer
-    // (3). watermark=1 makes the age-based sweep skip tags 2/3, so only the
-    // smart-drops supersession path can touch them.
+    // With watermark 1, the age-based sweep skips tags 2 and 3.
+    // Only smart-drop supersession can affect tags 2 and 3.
     function seedTodowriteSession(sessionId: string): {
         trigger: MessageLike;
         older: MessageLike;
@@ -1889,8 +1882,8 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
     };
 
     function materializeBaseline(sessionId: string) {
-        // Fold a baseline m[0] so the session is past first_render and markers are
-        // captured; subsequent passes only HARD-fold on a real marker change.
+        // The baseline m[0] fold moves the session past `first_render` and captures markers.
+        // A marker change triggers a hard fold on subsequent passes.
         injectM0M1({
             db,
             sessionId,
@@ -1980,14 +1973,13 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         const sessionId = "ses-hardfold-drain";
         materializeBaseline(sessionId);
 
-        // A tool tag + a queued drop for it, exactly as a prior execute pass left.
         const message = makeToolMessage("tool-1");
         insertTag(db, sessionId, "tool-1", "tool", 4000, 1, 0, "bash");
         queuePendingOp(db, sessionId, 1, "drop", 1);
         const targets = new Map<number, TagTarget>([[1, makeDropTarget(message)]]);
 
-        // Scheduler says DEFER (below execute threshold), but the model key changed
-        // → m[0] will HARD-fold this pass. The fold should pull the queued drop in.
+        // The model-key change triggers a hard fold even though the scheduler defers.
+        // The hard fold must materialize the queued drop.
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, [message], {
                 schedulerDecision: "defer",
@@ -2013,12 +2005,11 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
     });
 
     it("drains queued pending ops on an m[0] HARD-fold pass EVEN WHILE the historian runs", async () => {
-        // The double-bust fix: a HARD fold (e.g. system-prompt change) re-caches
-        // m[0] this pass, so the prefix is busting regardless. If the historian is
-        // mid-run, the compartmentRunning veto USED to block the drain → it spilled
-        // into a second bust ~a turn later. The fold-fold bypass must drain into
-        // the one unavoidable bust instead. canRunCompartments=true + a registered
-        // active run makes compartmentRunning=true.
+        // A hard fold drains queued drops even while a historian runs, preventing a second cache bust.
+        // A hard fold drains queued drops even while a historian runs, preventing a second cache bust.
+        // A hard fold drains queued drops even while a historian runs, preventing a second cache bust.
+        // A hard fold drains queued drops even while a historian runs, preventing a second cache bust.
+        // The historian's promise never resolves, keeping it running.
         db = createDirectTestDatabase().db;
         const sessionId = "ses-hardfold-drain-while-historian";
         materializeBaseline(sessionId);
@@ -2028,7 +2019,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         queuePendingOp(db, sessionId, 1, "drop", 1);
         const targets = new Map<number, TagTarget>([[1, makeDropTarget(message)]]);
 
-        // Historian in progress for this session (never resolves during the test).
+        // The historian remains in progress for this session because its promise never resolves.
         registerActiveCompartmentRun(sessionId, new Promise<void>(() => {}));
 
         await runPostTransformPhase(
@@ -2051,7 +2042,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         );
 
         // Despite the historian running, the hard fold drained the queued drop
-        // into this pass (no second bust later).
+        // The hard fold drains the queued drop in the same pass, so no second bust occurs.
         expect(getTagsBySession(db, sessionId).find((t) => t.tagNumber === 1)?.status).toBe(
             "dropped",
         );
@@ -2124,9 +2115,9 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
     });
 
     it("does NOT drain while the historian runs on a NON-busting defer pass", async () => {
-        // Counterpart: same historian-running condition, but NO hard fold and NOT
-        // an execute pass → the compartmentRunning veto still holds (don't mutate
-        // the bytes the historian is reading on a pass that isn't busting anyway).
+        // A non-busting defer pass preserves bytes while the historian reads them.
+        // A non-busting defer pass preserves bytes while the historian reads them.
+        // A non-busting defer pass preserves bytes while the historian reads them.
         db = createDirectTestDatabase().db;
         const sessionId = "ses-nofold-historian-novdrain";
         materializeBaseline(sessionId);
@@ -2169,7 +2160,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         queuePendingOp(db, sessionId, 1, "drop", 1);
         const targets = new Map<number, TagTarget>([[1, makeDropTarget(message)]]);
 
-        // Same defer pass but markers UNCHANGED → no hard fold → drop stays queued.
+        // Unchanged markers prevent a hard fold, so the defer pass leaves the drop queued.
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, [message], {
                 schedulerDecision: "defer",
@@ -2243,8 +2234,8 @@ describe("postprocess empty-sentinel provider gate", () => {
             }),
         );
 
-        // Non-canonical provider: reasoning must stay intact (no "[cleared]"
-        // string reaching a wire that won't sentinelize it).
+        // Non-canonical providers retain reasoning because they do not sentinelize "[cleared]".
+        // Non-canonical providers retain reasoning because they do not sentinelize "[cleared]".
         expect(oldThinking.thinking).toBe("real reasoning content");
     });
 
@@ -2277,8 +2268,8 @@ describe("postprocess empty-sentinel provider gate", () => {
             }),
         );
 
-        // Canonical anthropic: cleared to "[cleared]" then sentinelized to empty
-        // text (OpenCode drops empty text before the wire).
+        // Canonical Anthropic clears reasoning to "[cleared]" before sentinelizing it to an empty string.
+        // OpenCode drops empty text before the wire.
         expect(oldMsg.parts).toEqual([{ type: "text", text: "" }]);
     });
 
@@ -2336,8 +2327,6 @@ describe("postprocess empty-sentinel provider gate", () => {
             },
         ] as unknown as MessageLike[];
 
-        // First-strip now requires a cache-busting (execute) pass; the id is
-        // then frozen so it replays on later defer passes.
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, messages, {
                 watermark: 1,
@@ -2844,8 +2833,6 @@ describe("final message representation", () => {
         );
         expect(JSON.stringify(acceptedTarget.parts)).toBe(acceptedBytes);
 
-        // Pass N: the same persisted assistant is no longer newest, but a defer
-        // cannot alter bytes that Anthropic already accepted while it was exempt.
         const transitionedDefer = buildMessages(true);
         const deferTarget = findMessage(transitionedDefer, "assistant-transitioned");
         await runPostTransformPhase(
@@ -2857,8 +2844,6 @@ describe("final message representation", () => {
         expect(JSON.stringify(deferTarget.parts)).toBe(acceptedBytes);
         expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
 
-        // Pass N+1: execute is the existing cache-busting gate, so first
-        // application and persistence happen together.
         const bustMessages = buildMessages(true);
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, bustMessages, {
@@ -2873,8 +2858,6 @@ describe("final message representation", () => {
         );
         expect(getMergedReasoningStrippedIds(db, sessionId).has("assistant-newest")).toBe(false);
 
-        // Pass N+2: OpenCode rebuilt every object, but id-keyed replay reproduces
-        // the stripped wire exactly without opening detection on the defer.
         const replayMessages = buildMessages(true);
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, replayMessages, {
@@ -3413,10 +3396,6 @@ const TODO_ACTIVE_STATE = JSON.stringify([
 ]);
 
 /**
- * Drive the REAL runPostTransformPhase todo-synthesis block (B7) with an
- * explicit todowrite-availability verdict and scheduler decision, so the
- * disabled-tool gate is exercised against production code rather than a mirror.
- * `schedulerDecision: "execute"` is a cache-busting pass; `"defer"` replays.
  */
 async function runTodoGatePass(args: {
     sessionId: string;
@@ -3470,7 +3449,6 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
     it("(a) busting pass with todowrite filtered out injects nothing and clears the persisted anchor", async () => {
         db = createDirectTestDatabase().db;
         const sessionId = "ses-todo-gate-bust";
-        // Stale state + anchor persisted from before the tool was disabled.
         updateSessionMeta(db, sessionId, { lastTodoState: TODO_ACTIVE_STATE });
         setPersistedTodoSyntheticAnchor(
             db,
@@ -3488,9 +3466,7 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
             todowriteAvailability: UNAVAILABLE,
         });
 
-        // No synthetic pair for a tool the session does not have...
         expect(findTodoPart(messages)).toBeNull();
-        // ...and the anchor is gone so later defers have nothing to replay.
         expect(getPersistedTodoSyntheticAnchor(db, sessionId)).toBeNull();
     });
 
@@ -3501,8 +3477,6 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
         const callId = computeSyntheticCallId(TODO_ACTIVE_STATE);
         setPersistedTodoSyntheticAnchor(db, sessionId, callId, "a1", TODO_ACTIVE_STATE);
 
-        // Defer pass while unavailable: the persisted pair is still replayed
-        // (removal only rides a busting pass, so the cached prefix stays warm).
         const deferMessages = buildTodoGateMessages(sessionId);
         await runTodoGatePass({
             sessionId,
@@ -3511,8 +3485,6 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
             todowriteAvailability: UNAVAILABLE,
         });
 
-        // Exact part bytes: the replayed part equals a fresh build from the
-        // PERSISTED snapshot, anchored at the persisted message.
         const replayed = findTodoPart(deferMessages);
         expect(replayed).not.toBeNull();
         const expectedPart = buildSyntheticTodoPart(TODO_ACTIVE_STATE);
@@ -3521,15 +3493,12 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
             message.parts.some((part) => isSyntheticTodoPart(part)),
         );
         expect(anchoredMessage?.info.id).toBe("a1");
-        // Anchor survives the defer pass untouched.
         expect(getPersistedTodoSyntheticAnchor(db, sessionId)).toEqual({
             callId,
             messageId: "a1",
             stateJson: TODO_ACTIVE_STATE,
         });
 
-        // Next cache-busting pass detects the unavailable verdict and removes
-        // the pair: nothing injected and the anchor is cleared.
         const bustMessages = buildTodoGateMessages(sessionId);
         await runTodoGatePass({
             sessionId,
@@ -3559,7 +3528,6 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
         expect(JSON.stringify(part)).toBe(
             JSON.stringify(buildSyntheticTodoPart(TODO_ACTIVE_STATE)),
         );
-        // Anchor persisted for later defer replays, as before.
         const anchor = getPersistedTodoSyntheticAnchor(db, sessionId);
         expect(anchor?.messageId).toBe("a1");
         expect(anchor?.stateJson).toBe(TODO_ACTIVE_STATE);
@@ -3608,11 +3576,9 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
             sessionId,
             messages,
             schedulerDecision: "execute",
-            // No first user message processed yet → provisional fail-open verdict.
             todowriteAvailability: { callable: true, frozen: false },
         });
 
-        // Fail-open: injection proceeds exactly as the available case.
         expect(findTodoPart(messages)).not.toBeNull();
         expect(getPersistedTodoSyntheticAnchor(db, sessionId)?.stateJson).toBe(TODO_ACTIVE_STATE);
     });
@@ -3620,12 +3586,6 @@ describe("todo synthesis — disabled todowrite tool gate", () => {
 
 describe("reconcileMarkerRepresentation on rust-mode output heads", () => {
     it("#then inserts the summary after the module-encoded m0/m1 head, never ahead of m0", () => {
-        // The Rust module's m0/m1 encode produces ID-less synthetic user
-        // messages WITHOUT the TS lane's info.syntheticHead flag. The head
-        // walk must still recognize them: requiring the flag spliced the
-        // compaction summary in at index 0 — an assistant ahead of m0 —
-        // which fails the rust-mode m0 wire invariant on every pass for
-        // sessions carrying persisted marker state.
         db = createDirectTestDatabase().db;
         const sessionId = "ses-marker-rust-head";
         const state = {

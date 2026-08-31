@@ -1,20 +1,12 @@
 /// <reference types="bun-types" />
 
 /**
- * Tagger composite-identity tests for v3.3.1 Layer C.
  *
- * Covers the new `assignToolTag`/`getToolTag` API surface introduced
- * by the tag-owner identity fix:
  *
- *   - Composite key `(sessionId, callId, ownerMsgId)` produces distinct
- *     tags when two assistant turns reuse the same callId.
- *   - Lazy adoption claims a NULL-owner row left by Layer B backfill
- *     for sessions that hadn't been backfilled yet.
- *   - Multi-NULL-row collision deviation: when legacy data has multiple
- *     NULL-owner rows for the same callId (rare but observed in the
- *     user's 370MB DB), partial UNIQUE on `idx_tags_tool_composite`
- *     forces only one to be adopted at a time. The remaining rows stay
- *     NULL and are picked up by subsequent observations.
+ * A tool tag is unique per `(sessionId, callId, ownerMsgId)`.
+ * A matching NULL-owner row is claimed on the first composite-key observation.
+ * A partial unique index permits only one NULL-owner row to be adopted for each owner.
+ * Remaining NULL-owner rows require observations with different owners.
  *   - `initFromDb` reload preserves composite-key bindings.
  */
 
@@ -81,8 +73,6 @@ describe("tagger composite identity", () => {
     });
 
     it("lazy adoption: NULL-owner row gets claimed on first composite-key observation", () => {
-        //#given — pre-insert a legacy NULL-owner row (simulates pre-v10 data
-        // that hasn't been backfilled yet).
         const sessionId = "ses-1";
         db.prepare(
             "INSERT INTO tags (session_id, message_id, type, byte_size, tag_number, harness, tool_owner_message_id) VALUES (?, ?, 'tool', 100, 1, 'opencode', NULL)",
@@ -102,12 +92,7 @@ describe("tagger composite identity", () => {
     });
 
     it("multi-NULL-row collision deviation: only one row is adopted, remaining stay NULL", () => {
-        //#given — legacy data with TWO NULL-owner rows for the same callId
-        // (the rare collision artifact observed in the user's 370MB DB).
-        // Partial UNIQUE on (session_id, message_id, tool_owner_message_id)
-        // WHERE type='tool' AND tool_owner_message_id IS NOT NULL means once
-        // the lowest-numbered row is adopted, no second row can adopt the
-        // SAME owner — only different owners can adopt.
+        // The partial unique index permits one non-NULL `tool_owner_message_id` per `(sessionId, callId, ownerMsgId)`.
         const sessionId = "ses-1";
         db.prepare(
             "INSERT INTO tags (session_id, message_id, type, byte_size, tag_number, harness, tool_owner_message_id) VALUES (?, ?, 'tool', 100, 1, 'opencode', NULL)",
@@ -118,15 +103,13 @@ describe("tagger composite identity", () => {
 
         const tagger = createTagger();
 
-        //#when — first observation claims the lowest-numbered row
+        // The first observation claims one NULL-owner row.
         const tag1 = tagger.assignToolTag(sessionId, "read:32", "msg-A", 100, db);
 
-        //#then — adoption picked tag 1 (lowest), tag 2 remains NULL
         expect(tag1).toBe(1);
         const remaining = getNullOwnerToolTag(db, sessionId, "read:32");
         expect(remaining?.tagNumber).toBe(2);
 
-        //#when — second observation with different owner claims the next NULL row
         const tag2 = tagger.assignToolTag(sessionId, "read:32", "msg-B", 200, db);
 
         //#then
@@ -151,7 +134,6 @@ describe("tagger composite identity", () => {
     });
 
     it("initFromDb does NOT bind NULL-owner rows in memory", () => {
-        //#given — pre-insert a NULL-owner row, then create a tagger.
         const sessionId = "ses-1";
         db.prepare(
             "INSERT INTO tags (session_id, message_id, type, byte_size, tag_number, harness, tool_owner_message_id) VALUES (?, ?, 'tool', 100, 7, 'opencode', NULL)",
@@ -162,11 +144,11 @@ describe("tagger composite identity", () => {
         //#when
         tagger.initFromDb(sessionId, db);
 
-        //#then — NULL-owner row is NOT bound to any composite key, so a
-        // probe with any owner returns undefined. The lazy-adoption DB
-        // path will discover and claim it on the next assignToolTag call.
+        // A NULL-owner row is not bound to a composite key.
+        // `getToolTag` ignores unowned rows until `assignToolTag` claims one.
+        // `assignToolTag` claims an unowned row for the observed owner.
         expect(tagger.getToolTag(sessionId, "read:32", "msg-X")).toBeUndefined();
-        // But the row is still discoverable via the helper.
+        // `getNullOwnerToolTag` returns the remaining unowned row.
         expect(getNullOwnerToolTag(db, sessionId, "read:32")?.tagNumber).toBe(7);
     });
 
@@ -175,8 +157,6 @@ describe("tagger composite identity", () => {
         const sessionId = "ses-1";
         const tagger = createTagger();
 
-        //#when / then — TS narrowing catches at compile time; runtime guard
-        // is the safety net for any caller that bypasses TS via `as any`.
         expect(() =>
             (tagger.assignTag as unknown as (...args: unknown[]) => number)(
                 sessionId,
@@ -198,7 +178,6 @@ describe("tagger composite identity", () => {
 
         //#then
         expect(tagger.getToolTag(sessionId, "read:32", "msg-A")).toBe(42);
-        // No DB row was created.
         expect(getTagsBySession(db, sessionId)).toHaveLength(0);
     });
 });

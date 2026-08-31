@@ -94,14 +94,13 @@ describe("note-nudger", () => {
             content: "Already-seen note.",
         });
 
-        // Simulate agent running ctx_note(read) shortly after the note was added.
+        // `ctx_note(read)` advances `note_last_read_at` after the note activity.
         setNoteLastReadAt(db, "ses-read-watermark", note.updatedAt + 1000);
 
         onNoteTrigger(db, "ses-read-watermark", "commit_detected");
-        // First peek records the trigger-time message so it gets deferred.
+        // `peekNoteNudgeText` records the trigger message ID so that message's nudge is deferred.
         expect(peekNoteNudgeText(db, "ses-read-watermark", "u-1", undefined, true)).toBeNull();
-        // Subsequent peek on a new user message: the read watermark is newer
-        // than all note activity AND the read is still visible → suppress.
+        // `getNoteNudgeText` suppresses the nudge when `note_last_read_at` exceeds all note activity and the read remains visible.
         expect(peekNoteNudgeText(db, "ses-read-watermark", "u-2", undefined, true)).toBeNull();
     });
 
@@ -115,13 +114,9 @@ describe("note-nudger", () => {
         // Agent ran ctx_note(read) — watermark advances past note activity.
         setNoteLastReadAt(db, "ses-read-dropped", note.updatedAt + 1000);
 
-        // A work-boundary trigger fires (commit/historian/todos).
         onNoteTrigger(db, "ses-read-dropped", "historian_complete");
-        // Defer first peek (trigger-time message).
         expect(peekNoteNudgeText(db, "ses-read-dropped", "u-1", undefined, false)).toBeNull();
-        // Subsequent peek: read watermark is newer than note activity, BUT the
-        // read is NO LONGER visible (compactified, ctx_reduce'd, or aged out).
-        // The agent has lost note visibility, so re-surface the reminder.
+        // `getNoteNudgeText` re-surfaces the nudge when the read is no longer visible, even when `note_last_read_at` is newer than note activity.
         expect(peekNoteNudgeText(db, "ses-read-dropped", "u-2", undefined, false)).toContain(
             "You have 1 deferred note",
         );
@@ -134,15 +129,12 @@ describe("note-nudger", () => {
             content: "Old note already seen.",
         });
 
-        // Agent read notes right after the older note was written, well before
-        // the new note arrived. Use a small forward jump so real-world clocks
-        // can't accidentally push a same-millisecond `addNote` past this mark.
+        // `setNoteLastReadAt` records a read watermark before the new note so equal `Date.now()` timestamps cannot suppress it.
         const readAt = older.updatedAt + 1;
         setNoteLastReadAt(db, "ses-new-activity", readAt);
 
         // A new note must land strictly after the recorded read watermark.
-        // `addNote` uses `Date.now()` which may share a millisecond with the
-        // first insert on fast hardware, so stamp its timestamps explicitly.
+        // The test sets the new note's timestamp explicitly when inserts can share a millisecond because `addNote` uses `Date.now()`.
         const newerAt = readAt + 1;
         db.prepare(
             `INSERT INTO notes (type, status, content, session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
@@ -156,10 +148,8 @@ describe("note-nudger", () => {
         );
 
         onNoteTrigger(db, "ses-new-activity", "historian_complete");
-        // Defer first peek (trigger-time message).
         expect(peekNoteNudgeText(db, "ses-new-activity", "u-1")).toBeNull();
-        // On the next user message, the nudge fires because one note is newer
-        // than the last read watermark.
+        // `getNoteNudgeText` delivers the nudge on the next user message when a note is newer than `note_last_read_at`.
         expect(peekNoteNudgeText(db, "ses-new-activity", "u-2")).toContain(
             "You have 2 deferred notes",
         );

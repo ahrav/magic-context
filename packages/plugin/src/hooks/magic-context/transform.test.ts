@@ -125,7 +125,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* Windows cleanup ignores EBUSY. */
         }
     }
     tempDirs.length = 0;
@@ -137,12 +137,12 @@ function makeTempDir(prefix: string): string {
     return dir;
 }
 
-// Points both XDG_DATA_HOME (plugin storage) and XDG_CACHE_HOME (OpenCode's
-// models.json cache read by `models-dev-cache.ts`) at the same temp directory.
-// Tests that only touch plugin storage don't care about the cache isolation;
-// tests that exercise model-capability lookup (e.g., interleaved.field gating)
-// can write a synthetic models.json into <temp>/opencode/models.json and have
-// models-dev-cache read it.
+// Both `XDG_DATA_HOME` and `XDG_CACHE_HOME` use the temp directory so `models-dev-cache.ts` reads `<temp>/opencode/models.json`.
+// Both `XDG_DATA_HOME` and `XDG_CACHE_HOME` use the temp directory so `models-dev-cache.ts` reads `<temp>/opencode/models.json`.
+// Plugin-storage-only tests do not require cache isolation.
+// Model-capability tests require cache isolation.
+// Model-capability tests can write a synthetic `<temp>/opencode/models.json`.
+// `models-dev-cache.ts` reads `<temp>/opencode/models.json`.
 function useTempDataHome(prefix: string): void {
     const dir = makeTempDir(prefix);
     process.env.XDG_DATA_HOME = dir;
@@ -425,7 +425,7 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — tagging happens, but the deleted rolling-nudge no longer appends.
+        // Tagging occurs, but the deleted rolling nudge does not append.
         expect(text(messages[2], 0)).not.toContain("Context at ~45%");
         expect(text(messages[0], 0)).toStartWith("§1§ ");
         expect(text(messages[1], 0)).toContain("§2§ ");
@@ -466,7 +466,7 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — no user message pushed (80% nudge handled by promptAsync in hook.ts)
+        // promptAsync handles the 80% nudge without pushing a user message.
         expect(messages).toHaveLength(2);
     });
 
@@ -603,11 +603,9 @@ describe("createTransform", () => {
             droppedCarrierTag!.tagNumber,
             "dropped",
         );
-        // Placeholder stripping now requires a cache-busting pass to detect new
-        // empty shells. After the three-set refactor, an explicit-flush
-        // simulation seeds `pendingMaterializationSessions` (read by
-        // postprocess `isExplicitFlush`) — that's what gates heuristic
-        // execution and `isCacheBustingPass`.
+        // Placeholder stripping requires a cache-busting pass to detect new empty shells.
+        // Explicit-flush simulation seeds `pendingMaterializationSessions` for `postprocess`'s `isExplicitFlush`.
+        // `postprocess`'s `isExplicitFlush` gates heuristic execution and `isCacheBustingPass`.
         const flushedHistory = new Set<string>(["ses-compartment-dropped-carrier"]);
         const flushedMaterialization = new Set<string>(["ses-compartment-dropped-carrier"]);
         replaceAllCompartments(db, "ses-compartment-dropped-carrier", [
@@ -658,15 +656,15 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — with sentinel stripping, the carrier + 2 uncovered messages survive:
-        // [synthetic-history-carrier, m-4 (sentineled because it was dropped), m-5].
+        // With sentinel stripping, `[synthetic-history-carrier, m-4, m-5]` survive; `m-4` carries a dropped-message sentinel.
+        // With sentinel stripping, `[synthetic-history-carrier, m-4, m-5]` survive; `m-4` carries a dropped-message sentinel.
         expect(text(messages[0]!, 0)).toContain("<session-history>");
         expect(text(messages[0]!, 0)).toContain("Summarized earlier work.");
         expect(messages[0]?.info.id).toBeUndefined();
         expect(messages).toHaveLength(3);
-        // m-4 was dropped; its assistant text now carries the sentinel shape.
-        // Default (no providerID set) → `[dropped]` sentinel for non-anthropic
-        // safety. Anthropic-only optimization (text="") is covered separately.
+        // m-4 was dropped; its assistant text carries the sentinel shape.
+        // Without `providerID`, non-Anthropic messages use the `[dropped]` sentinel; Anthropic uses empty text.
+        // Anthropic replaces sentinels with empty text.
         expect(messages[1]?.info.id).toBe("m-4");
         expect(messages[1]?.parts).toEqual([{ type: "text", text: "[dropped]" }]);
         expect(text(messages[2]!, 0)).toContain("new 5");
@@ -777,17 +775,17 @@ describe("createTransform", () => {
     });
 
     it("fires the tiered emergency drop at 85% on a reclaimable tail", async () => {
-        //#given a large tool output in the tail so there is something to reclaim.
-        // The tiered drop is target-driven: at 85% it reclaims down toward 30% of
-        // working space. A tiny tool output (as the old need-blind drop assumed)
-        // is correctly NOT dropped now — there must be real tail tokens to free.
+        // A large tail tool output provides reclaimable tokens.
+        // At 85%, tiered dropping reclaims toward 30% of working space.
+        // Tiny tool output remains because the tail lacks enough tokens to reclaim.
+        // Tiny tool output remains because the tail lacks enough tokens to reclaim.
         useTempDataHome("context-transform-force-materialize-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
         const db = openDatabase();
-        // Realistic ~200KB tool output (~50k tokens). NOT a single repeated char:
-        // BPE tokenizes "x".repeat(200k) pathologically slowly (~17s) AND yields
-        // only ~6k tokens, so it never matched the "~50k tokens" intent. Real
-        // content of the same size tokenizes in ~7ms and hits the real token mass.
+        // The fixture uses varied 200 KB text because BPE encodes "x".repeat(200_000) as roughly 6,000 tokens rather than 50,000.
+        // BPE encodes `"x".repeat(200_000)` as roughly 6,000 tokens rather than 50,000.
+        // The fixture uses varied text so it contains roughly 50,000 tokens.
+        // The fixture uses varied text so it contains roughly 50,000 tokens.
         const bigOutput = "const value = compute(input, options); // step output line\n".repeat(
             3400,
         );
@@ -821,7 +819,7 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — the newest-window emergency arm keeps a structural skeleton.
+        // Emergency dropping retains the messages needed to preserve the newest window's structure.
         expect(messages).toHaveLength(2);
         expect(messages[0]?.info.id).toBe("m-user");
         expect(messages[1]?.info.id).toBe("m-assistant");
@@ -873,12 +871,12 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — Anthropic sentinel replacement preserves array length;
-        // empty-text sentinels are dropped at the wire by OpenCode's Anthropic adapter.
+        // Anthropic sentinel replacement preserves array length; OpenCode's Anthropic adapter removes empty-text sentinels at the wire.
+        // OpenCode's Anthropic adapter drops empty-text sentinels at the wire.
         expect(messages[1].parts).toHaveLength(5);
         // The live text part survives unchanged
         expect(text(messages[1], 0)).toContain("visible answer");
-        // Structural noise parts are replaced with empty-text sentinels
+        // Sentinel stripping replaces structural noise parts with empty-text sentinels.
         const sentineledParts = (
             messages[1].parts as Array<{ type: string; text?: string }>
         ).filter((p) => p.type === "text" && p.text === "");
@@ -926,8 +924,6 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — copilot's OpenCode path does not filter empty text parts, so no
-        // empty sentinel may be inserted between a tool_use and its following result.
         expect(messages[1].parts[1]).toEqual({ type: "step-finish", text: "done" });
         expect(
             (messages[1].parts as Array<{ type?: string; text?: string }>).some(
@@ -1035,7 +1031,7 @@ describe("createTransform", () => {
             },
         ];
 
-        //#when — first pass recovers provider from OpenCode DB; second reuses the warmed map.
+        // First pass recovers the provider from the OpenCode DB; second reuses the warmed map.
         const coldMessages = buildMessages();
         await transform({}, { messages: coldMessages });
         expect(liveModelBySession.get(sessionId)?.providerID).toBe("anthropic");
@@ -1099,8 +1095,8 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — main transform stripped step-start with the recovered provider,
-        // and postprocess used that same provider for the whole-message sentinel.
+        // The recovered provider causes `transform` to strip `step-start`.
+        // Postprocess uses the recovered provider to select the whole-message sentinel.
         expect(messages[1].parts[1]).toEqual({ type: "text", text: "" });
         expect(messages[2].parts).toEqual([{ type: "text", text: "" }]);
     });
@@ -1140,12 +1136,6 @@ describe("createTransform", () => {
         await transform({}, { messages: firstPass });
 
         const db = openDatabase();
-        // Push the real tool tag out of the newest-20 skeleton window (the
-        // db7bc0a tool-skeleton change keeps a truncated tool_use/tool_result
-        // pair for drops within that window) so this test keeps exercising
-        // the FULL-removal path it documents. Mirrors padSkeletonWindow in
-        // apply-operations.tool-drop.test.ts — upstream updated that file's
-        // tests for the new behavior but missed this one.
         for (let i = 1; i <= 20; i += 1) {
             insertTag(db, "ses-1", `call-pad-${i}`, "tool", 10, 2 + i);
         }
@@ -1167,11 +1157,7 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages: secondPass });
 
-        //#then — user message shell is preserved (turn boundary) as the canonical
-        // [dropped §N§] placeholder; the tool tag is padded OUT of the newest-20
-        // skeleton window above, so the tool-only assistant takes the legacy
-        // FULL-removal path and its shell is stripped. (The in-window skeleton path
-        // is covered in apply-operations.tool-drop.test.ts.)
+        // The tool tag lies outside the newest-20 skeleton window.
         expect(secondPass).toHaveLength(1);
         expect(secondPass[0]?.info.role).toBe("user");
         const userShellText = (secondPass[0]?.parts[0] as { text: string }).text;
@@ -1186,9 +1172,8 @@ describe("createTransform", () => {
         //#given
         useTempDataHome("context-transform-flushed-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
-        // Placeholder stripping requires a cache-busting pass. After the
-        // three-set refactor, an explicit-flush simulation seeds
-        // `pendingMaterializationSessions` (postprocess `isExplicitFlush`).
+        // Placeholder stripping requires a cache-busting pass.
+        // `pendingMaterializationSessions` makes postprocess treat the pass as an explicit flush.
         const historyRefreshSessions = new Set<string>();
         const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
@@ -1224,9 +1209,6 @@ describe("createTransform", () => {
         updateTagStatus(db, "ses-1", 2, "dropped");
         const pendingOps = getPendingOps(db, "ses-1");
         expect(pendingOps).toHaveLength(0);
-        // Three-set refactor: flush simulation now seeds the persistent
-        // pending-materialization signal (read by postprocess as
-        // isExplicitFlush) plus history-refresh (consumed by transform).
         pendingMaterializationSessions.add("ses-1");
         historyRefreshSessions.add("ses-1");
 
@@ -1244,12 +1226,8 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages: secondPass });
 
-        //#then — sentinel replacement preserves array length;
-        // the user message stays, assistant message neutralized to a sentinel.
         expect(secondPass).toHaveLength(2);
         expect(text(secondPass[0], 0)).toStartWith("\u00a71\u00a7 ");
-        // Assistant message (previously dropped) now carries a single sentinel
-        // part. Test doesn't set providerID → `[dropped]` (safe non-anthropic).
         expect(secondPass[1].parts).toEqual([{ type: "text", text: "[dropped]" }]);
     });
 
@@ -1288,18 +1266,14 @@ describe("createTransform", () => {
         await transform({}, { messages });
 
         //#then
-        // Unit B: subagents share the process-global ctx_reduce tool, so with
-        // ctx_reduce enabled (the default here) they DO get the §N§ prefix and
-        // self-manage tool bloat. DB tag records exist either way.
+        // Subagents share the process-global `ctx_reduce` tool.
+        // `DB` tag records exist whether or not subagents self-manage tool bloat.
         expect(text(messages[0], 0)).toStartWith("\u00a71\u00a7 ");
         expect(getTagsBySession(db, "ses-sub")).toHaveLength(1);
         expect(scheduler.shouldExecute).toHaveBeenCalled();
     });
 
     it("fully skips the transform for Magic Context's own hidden children", async () => {
-        //#given — a session flagged as an internal MC child (historian/dreamer/
-        // sidekick/migration). Unlike a generic subagent, these get ZERO
-        // transform work: no tagging, scheduler never consulted, messages
         // untouched.
         useTempDataHome("context-transform-internal-child-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "execute" as const) };
@@ -1323,7 +1297,7 @@ describe("createTransform", () => {
         });
 
         const db = openDatabase();
-        // isSubagent is also true for these (parentID set), but the
+        // Internal MC children can also have `isSubagent: true`.
         // internal-child flag must take precedence and skip BEFORE any work.
         updateSessionMeta(db, "ses-historian-child", { isSubagent: true });
 
@@ -1337,7 +1311,6 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — message untouched, NO tags written, scheduler never consulted.
         expect(text(messages[0], 0)).toBe("historian chunk prompt");
         expect(getTagsBySession(db, "ses-historian-child")).toHaveLength(0);
         expect(scheduler.shouldExecute).not.toHaveBeenCalled();
@@ -1435,12 +1408,10 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — memory block appears inside session-history alongside compartments
         const injected = text(messages[0]!, 0);
         expect(injected).toContain("<session-history>");
         expect(injected).toContain("<project-memory>");
         expect(injected).toContain("Always use Bun");
-        // A legacy compartment without a U: line decays to a title-only heading.
         expect(injected).toMatch(/## \d+-\d+ · Setup/);
     });
 
@@ -1538,9 +1509,6 @@ describe("createTransform", () => {
 
         await transform({}, { messages: secondPass });
 
-        // Sentinel replacement preserves array length. Unit B: subagents with
-        // ctx_reduce enabled DO get the §N§ prefix on user text.
-        // Test doesn't set providerID → `[dropped]` sentinel.
         expect(secondPass).toHaveLength(2);
         expect(text(secondPass[0], 0)).toStartWith("\u00a71\u00a7 ");
         expect(secondPass[1].parts).toEqual([{ type: "text", text: "[dropped]" }]);
@@ -1548,18 +1516,16 @@ describe("createTransform", () => {
     });
 
     it("fires the tiered emergency floor for subagents at >=85% (Phase 2 CRIT#5)", async () => {
-        // Merge-blocking guarantee: Phase 2 removed routine age-based tool drops,
-        // so the ONLY tool floor a subagent has is the tiered emergency drop. It
-        // must fire for subagents at >=85% (the force-materialize threshold) even
-        // though forceMaterialization/m[0] materialization stays primary-only.
-        // Without this, a subagent's context would grow unchecked to overflow.
+        // For subagents, the tiered emergency drop is the only tool-output floor.
+        // For subagents, the tiered emergency drop is the only tool-output floor.
+        // For subagents, the tiered emergency drop triggers at >=85% even though force materialization remains primary-only.
+        // `forceMaterialization`/`m[0]` materialization remains primary-only.
         useTempDataHome("context-transform-subagent-rerun-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "execute" as const) };
         const db = openDatabase();
         updateSessionMeta(db, "ses-sub-rerun", { isSubagent: true });
         const lastHeuristicsTurnId = new Map<string, string>();
-        // Realistic ~200KB output (~50k tokens) — see the sibling test's note on
-        // why a single repeated char is a tokenizer pathology to avoid here.
+        // Varied 200 KB output avoids tokenizer pathology caused by repeated single-character text.
         const bigOutput = "const value = compute(input, options); // step output line\n".repeat(
             3400,
         );
@@ -1596,17 +1562,16 @@ describe("createTransform", () => {
         ];
         await transform({}, { messages });
 
-        // The oldest large tool output is dropped by the tiered emergency drop —
-        // proves the floor fires for a subagent at 85%.
+        // The tiered emergency drop drops the oldest large tool output.
         const subagentTags = getTagsBySession(db, "ses-sub-rerun");
         const firstToolTag = subagentTags.find((t) => t.messageId === "call-1");
         expect(firstToolTag?.status).toBe("dropped");
     });
 
     it("Unit B: subagent (ctx_reduce on) gets a Channel 1 baseline snapshot", async () => {
-        // Channel 1 (in-turn tool-output nudge) is gated on ctx_reduce being
-        // effective, NOT on fullFeatureMode — so subagents that share the
-        // process-global ctx_reduce tool DO get a baseline + nudges.
+        // Channel 1 is enabled when `ctx_reduce` is effective, regardless of `fullFeatureMode`.
+        // Subagents share the process-global `ctx_reduce` tool, so they receive a Channel 1 baseline and nudges.
+        // Subagents share the process-global `ctx_reduce` tool, so they receive a Channel 1 baseline and nudges.
         useTempDataHome("context-transform-sub-ch1-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
         const db = openDatabase();
@@ -1643,7 +1608,7 @@ describe("createTransform", () => {
                 ],
             },
         );
-        // Baseline recorded → Channel 1 is active for this subagent.
+        // A recorded baseline activates Channel 1 for the subagent.
         expect(channel1StateBySession.has("ses-sub-ch1")).toBe(true);
     });
 
@@ -1693,10 +1658,7 @@ describe("createTransform", () => {
     });
 
     it("Unit B: primary without callable ctx_reduce gets NO Channel 1 baseline (latent-gap fix)", async () => {
-        // A primary whose tool allow-list denies ctx_reduce has no §N§ prefix and
-        // no tool to act on a nudge — it must NOT get a Channel 1 baseline (which
-        // would nudge it to call a tool it lacks). Pre-Unit-B this was gated on
-        // fullFeatureMode (true for this primary) and leaked.
+        // A primary whose tool allow-list denies `ctx_reduce` receives no Channel 1 baseline because it cannot act on a nudge.
         useTempDataHome("context-transform-noreduce-ch1-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
         const db = openDatabase();
@@ -1737,7 +1699,7 @@ describe("createTransform", () => {
                 ],
             },
         );
-        // No baseline → Channel 1 correctly inert when ctx_reduce is unavailable.
+        // Channel 1 remains inert without a baseline when `ctx_reduce` is unavailable.
         expect(channel1StateBySession.has("ses-noreduce-ch1")).toBe(false);
     });
 
@@ -1800,8 +1762,7 @@ describe("createTransform", () => {
             },
         ];
 
-        // First pass tags only. The first user message explicitly allows ctx_reduce,
-        // freezing the availability gate in the reduce-enabled state.
+        // The first user message allows `ctx_reduce`, freezing the availability gate as enabled.
         await transform({}, { messages });
         const firstTag = getTagsBySession(db, sessionId).find(
             (tag) => tag.messageId === "m-drop:p0",
@@ -1820,14 +1781,11 @@ describe("createTransform", () => {
     });
 
     it("preserves once-per-turn guard for primary sessions (does NOT re-run heuristics within one turn)", async () => {
-        // Cache-stability regression: primary sessions MUST NOT re-run
-        // heuristics mid-turn because mid-turn rewrites bust Anthropic prompt
-        // cache across the user's tool-call sequence. Symmetric counterpart
-        // to the subagent rerun test above.
+        // Primary sessions do not rerun heuristics mid-turn because rewrites invalidate the Anthropic prompt cache.
         useTempDataHome("context-transform-primary-once-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "execute" as const) };
         const db = openDatabase();
-        // No isSubagent override — defaults to primary session.
+        // isSubagent defaults to the primary session.
         const lastHeuristicsTurnId = new Map<string, string>();
         const transform = createTransform({
             tagger: createTagger(),
@@ -1893,9 +1851,8 @@ describe("createTransform", () => {
         ];
         await transform({}, { messages: secondPass });
 
-        // Primary session: once-per-turn guard MUST hold. The first tool's
-        // tag stays `active` even though it would be drop-eligible by age.
-        // This protects provider cache across the user's tool-call sequence.
+        // The `call-1` tag stays `active` even though its age makes it drop-eligible.
+        // The once-per-turn guard preserves the provider cache across a user's tool-call sequence.
         const primaryTags = getTagsBySession(db, "ses-primary-once");
         const firstPrimaryToolTag = primaryTags.find((t) => t.messageId === "call-1");
         expect(firstPrimaryToolTag?.status).toBe("active");
@@ -1905,9 +1862,7 @@ describe("createTransform", () => {
 
     it("tags content that was injected before the transform runs, verifying injector-before-tagger ordering", async () => {
         //#given
-        // This test documents the required hook ordering:
-        // contextInjectorMessagesTransform must run BEFORE magicContext so that
-        // injected content (AGENTS.md, README.md) is included in the tagging pass.
+        // contextInjectorMessagesTransform runs before magicContext so injected AGENTS.md and README.md are tagged.
         useTempDataHome("context-transform-ordering-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
         const transform = createTransform({
@@ -1927,7 +1882,6 @@ describe("createTransform", () => {
             protectedTags: 0,
         });
 
-        // Simulate content that context-injector would have prepended before this transform runs
         const injectedPrefix = "[AGENTS.md context injected by context-injector]\n";
         const messages: TestMessage[] = [
             {
@@ -1940,8 +1894,6 @@ describe("createTransform", () => {
         await transform({}, { messages });
 
         //#then
-        // The injected prefix must be present inside the tagged content, proving that
-        // tagging happened AFTER injection (i.e. injector ran first, tagger ran second).
         const taggedText = text(messages[0], 0);
         expect(taggedText).toStartWith("\u00a71\u00a7 ");
         expect(taggedText).toContain(injectedPrefix);
@@ -2004,10 +1956,8 @@ describe("createTransform", () => {
         ];
         await transform({}, { messages: secondPass });
 
-        // The dropped part gets the canonical [dropped §N§] placeholder (byte-stable
-        // across passes); the user-role message is never whole-message stripped (the
-        // role guard in stripDroppedPlaceholderMessages), so the turn boundary
-        // survives for AI SDK's Anthropic adapter. The sibling part is untouched.
+        // Dropped parts use byte-stable [dropped §N§] placeholders across passes.
+        // `stripDroppedPlaceholderMessages` never strips a user-role message as a whole.
         expect(text(secondPass[0], 0)).toBe("[dropped \u00a71\u00a7]");
         expect(text(secondPass[0], 1)).toStartWith("\u00a72\u00a7 ");
         expect(text(secondPass[0], 1)).toContain("actual user message");
@@ -2075,9 +2025,8 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages: secondPass });
 
-        //#then — under Anthropic the cleared thinking becomes an empty sentinel;
-        // then the dropped-placeholder-only assistant is neutralized to one empty
-        // whole-message sentinel (filtered before the wire by OpenCode).
+        // Under Anthropic, cleared thinking becomes an empty sentinel.
+        // Under Anthropic, a dropped-placeholder-only assistant message becomes one empty whole-message sentinel.
         expect(secondPass).toHaveLength(2);
         expect(text(secondPass[0], 0)).toContain("user prompt");
         expect(secondPass[1].parts).toEqual([{ type: "text", text: "" }]);
@@ -2155,7 +2104,7 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages });
 
-        //#then — fail-open: message preserved despite tagger init failure.
+        // The message is preserved when tagger initialization fails.
         expect(text(messages[0], 0)).toBe("still works");
     });
 
@@ -2194,10 +2143,10 @@ describe("createTransform", () => {
             },
         ];
 
-        //#when — must not throw despite the scheduler error.
+        // The transform does not throw when the scheduler throws.
         await transform({}, { messages });
 
-        //#then — tagging still happened (fail-open).
+        // Tagging proceeds when tagger initialization fails.
         expect(text(messages[0], 0)).toStartWith("§1§ ");
     });
 
@@ -2235,14 +2184,12 @@ describe("createTransform", () => {
             },
         ];
 
-        //#when — first pass resets stale percentage to 0
+        // The first pass resets stale context usage to 0.
         await transform({}, { messages });
 
-        //#then — first pass resets persisted usage; 0/0 is not cached in the map
-        // (loadPersistedUsage returns null for 0/0 values)
+        // A persisted 0/0 usage value is not cached because loadPersistedUsage returns null.
         expect(contextUsageMap.has("ses-lazy")).toBe(false);
 
-        //#when — simulate message.updated setting real usage, then second pass loads it
         contextUsageMap.delete("ses-lazy");
         updateSessionMeta(db, "ses-lazy", {
             lastResponseTime: 1_000,
@@ -2251,7 +2198,7 @@ describe("createTransform", () => {
         });
         await transform({}, { messages });
 
-        //#then — second pass lazy-loads from DB
+        // The transform lazily loads persisted usage from the database.
         const entry2 = contextUsageMap.get("ses-lazy");
         expect(entry2?.usage.percentage).toBe(50);
         expect(entry2?.usage.inputTokens).toBe(100_000);
@@ -2290,20 +2237,17 @@ describe("createTransform", () => {
             },
         ];
 
-        //#when — first pass to tag
         await transform({}, { messages });
 
-        //#then — tags created, content tagged
         const tags = getTagsBySession(db, "ses-no-usage");
         expect(tags.length).toBe(3);
 
-        //#when — mark a tag as dropped and run second pass
         const toolTag = tags.find((t) => t.type === "tool");
         if (toolTag) updateTagStatus(db, "ses-no-usage", toolTag.tagNumber, "dropped");
 
         await transform({}, { messages });
 
-        //#then — dropped tag's content is replaced even without usage data
+        // Dropped-tag content is replaced even without usage data.
         expect(toolOutput(messages[1], 1)).toBe("");
     });
 });
@@ -2423,7 +2367,7 @@ describe("createTransform protected tail", () => {
         //#when
         await transform({}, { messages });
 
-        //#then: no historian session created and flag was cleared
+        // The transform clears historyRefreshSessions without creating a historian session.
         expect(createSession).not.toHaveBeenCalled();
         const meta = getOrCreateSessionMeta(db, "ses-pt-flag");
         expect(meta.compartmentInProgress).toBe(false);
@@ -2480,12 +2424,12 @@ describe("createTransform protected tail", () => {
         //#when
         await transform({}, { messages });
 
-        //#then: historian was not started despite being at 95%
+        // The transform does not start a historian session at 95% context usage.
         expect(createSession).not.toHaveBeenCalled();
     });
 
     it("clears stale compartmentInProgress when no eligible history exists", async () => {
-        //#given — stale compartmentInProgress with no raw history to resume
+        // No raw history is available to resume when `compartmentInProgress` is stale.
         useTempDataHome("transform-protected-tail-pending-");
         createOpenCodeDbForTransform("ses-pt-pending", []);
         const db = openDatabase();
@@ -2527,12 +2471,10 @@ describe("createTransform protected tail", () => {
             },
         ];
 
-        //#when — first pass initializes session, then set stale flag
         await transform({}, { messages });
         updateSessionMeta(db, "ses-pt-pending", { compartmentInProgress: true });
         expect(getOrCreateSessionMeta(db, "ses-pt-pending").compartmentInProgress).toBe(true);
 
-        //#when — second pass detects stale flag, clears it (no eligible history to resume)
         await transform({}, { messages });
 
         //#then
@@ -2581,7 +2523,7 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
             clearReasoningAge: 50,
             protectedTags: 0,
             liveModelBySession,
-            // Mirror production: getModelKey derives from the live model map.
+            // `getModelKey` derives its key from the live model map to match runtime model resolution.
             getModelKey: (id: string) => {
                 const m = liveModelBySession.get(id);
                 return m ? `${m.providerID}/${m.modelID}` : undefined;
@@ -2592,10 +2534,7 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
         return { transform, abort, prompt };
     }
 
-    // Production shape on a live switch: the array still ends with the OLD
-    // model's assistant response (flat info.providerID/modelID), then the NEW
-    // user message carrying the just-selected model nested under info.model.
-    // liveModelBySession was already flipped to NEW by chat.message.
+    // On a live switch, the last assistant response uses OLD's flat `info.providerID` and `info.modelID`.
     function switchTurnMessages(sessionId: string) {
         return [
             {
@@ -2631,8 +2570,6 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
             { id: "m-raw-2", role: "assistant", text: "recent 2" },
         ]);
         const db = openDatabase();
-        // Persisted usage from the PREVIOUS (large, 512k) model: 300k input,
-        // ~58%, well under any threshold. lastObservedModelKey = OLD model.
         updateSessionMeta(db, "ses-shrink", {
             lastContextPercentage: 58,
             lastInputTokens: 300_000,
@@ -2649,10 +2586,9 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
 
         const overflow = getOverflowState(db, "ses-shrink");
-        // Armed THIS pass so the existing bump-to-95% compacts before the
-        // oversized request is sent (not one pass late from the provider error).
+        // The detector arms before the 95% bump so compaction occurs before the oversized request.
         expect(overflow.needsEmergencyRecovery).toBe(true);
-        // Flag-only: no catalog/auth limit pinned into detected_context_limit.
+        // No catalog or auth limit is stored in `detected_context_limit`.
         expect(overflow.detectedContextLimit).toBe(0);
         expect(overflow.emergencyRecoveryOrigin).toBe("proactive_model_shrink");
         expect(abort).not.toHaveBeenCalled();
@@ -2698,7 +2634,6 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
             { id: "m-raw-1", role: "user", text: "recent 1" },
         ]);
         const db = openDatabase();
-        // Same (new) model, last input under the 272k cap.
         updateSessionMeta(db, "ses-fits", {
             lastContextPercentage: 73,
             lastInputTokens: 200_000,
@@ -2738,9 +2673,8 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
             { id: "m-raw-1", role: "user", text: "recent 1" },
         ]);
         const db = openDatabase();
-        // The last input (300k) was ACCEPTED by this same model, so a now-lower
-        // catalog reading (272k) is a stale/regressed limit, not a real overflow.
-        // Arming here would cause a gratuitous compaction + cache bust.
+        // NEW accepted a 300k input.
+        // Arming would compact and bust the cache despite no overflow.
         updateSessionMeta(db, "ses-same", {
             lastContextPercentage: 90,
             lastInputTokens: 300_000,
@@ -2813,10 +2747,8 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
         });
         await seedNewModelLimit(272_000);
 
-        // liveModelBySession = NEW (chat.message set it). The newest user message
-        // carries NO info.model, so the resolver must fall back to the live map
-        // (NEW), NOT the OLD last-assistant. If it fell to the assistant, the
-        // detector would mis-resolve to OLD and the arm would not fire.
+        // `chat.message` carries no `info.model`, so the resolver falls back to `liveModelBySession`.
+        // Without the live-map fallback, the detector resolves `OLD_KEY` and does not trigger.
         const { transform } = makeTransform(db, "ses-nomodel", NEW_MODEL, {
             percentage: 58,
             inputTokens: 300_000,
@@ -2836,7 +2768,6 @@ describe("createTransform shrinking model-switch overflow pre-arm", () => {
                         parts: [{ type: "text", text: "old model reply" }],
                     },
                     {
-                        // newest user, no info.model
                         info: { id: "m-user-1", role: "user", sessionID: "ses-nomodel" },
                         parts: [{ type: "text", text: "continue" }],
                     },

@@ -23,8 +23,8 @@ function record(startedAt: number): RpcPortFileRecord {
 }
 
 function procStat(startTimeTicks: number): string {
-    // After the closing command-name parenthesis, field 3 is `state` and field
-    // 22 is the twentieth value in the suffix.
+    // After the command-name closing parenthesis, field 3 is `state`.
+    // Field 22 is the twentieth value after the command-name parenthesis.
     return `${PID} (opencode) S ${Array.from({ length: 18 }, () => "0").join(" ")} ${startTimeTicks}`;
 }
 
@@ -243,8 +243,7 @@ describe("isPidIdentityPlausible", () => {
             }),
         });
 
-        // The mocked process start is 1,100,000ms. The 120s tolerance is part of
-        // the contract because port-file creation follows process startup.
+        // The 120-second tolerance accounts for port-file creation after process startup.
         expect(isPidIdentityPlausible(record(1_000_000))).toBe("plausible");
     });
 

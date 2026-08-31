@@ -31,10 +31,6 @@ export interface BundledIssueReport {
 }
 
 /**
- * Drop log lines that reference a session ID OTHER than `sessionId`.
- * See logs-opencode.ts for the rationale; this Pi variant uses the same
- * approach because Pi historian logs include the OpenCode-style `ses_*`
- * shape for its own child sessions and that's what the picker presents.
  */
 function filterLogLinesBySession(lines: string[], sessionId: string | null): string[] {
     if (!sessionId) return lines;
@@ -59,12 +55,7 @@ export async function bundleIssueReport(
     const logLines = filterLogLinesBySession(allLogLines, options.sessionFilter ?? null);
     const recentLog = sanitizeLogContent(logLines.slice(-LOG_TAIL_LINES).join("\n")).trim();
 
-    // Pull the most recent 20 ERROR-shaped lines into their own dedicated
-    // section. See logs-opencode.ts and issue-body.ts for the full
-    // rationale: this section survives even when the main log block is
-    // truncated to fit GitHub's ~64KB issue body limit. We scan a wide
-    // window so that a flood of debug noise after the error doesn't push
-    // the cause out of view.
+    // The error scan uses 4,000 lines so trailing log output does not exclude earlier errors.
     const errorScanWindow = sanitizeLogContent(logLines.slice(-4000).join("\n"));
     const recentErrorLines = extractRecentErrors(errorScanWindow, 20);
 
@@ -95,10 +86,6 @@ export async function bundleIssueReport(
         "```",
     ].join("\n");
 
-    // Cap the body at GitHub's ~64KB issue limit. If the rendered report
-    // is already short enough this is a pass-through; otherwise the main
-    // log block gets shrunk from the top (older lines first) and a
-    // truncation marker inserted. The error section above survives intact.
     const bodyMarkdown = capBodyToGithubLimit(rawBodyMarkdown);
 
     const cwd = options.cwd ?? process.cwd();

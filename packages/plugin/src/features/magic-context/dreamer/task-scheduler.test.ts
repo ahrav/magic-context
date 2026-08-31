@@ -40,7 +40,7 @@ function cfg(
     return { task, schedule, timeoutMinutes: 20, ...extra };
 }
 
-/** Give a project active claims so memory-domain gates pass. */
+/** Active claims satisfy memory-domain gates. */
 let memorySeq = 0;
 function seedActiveMemory(d: Database, project = PROJECT): void {
     memorySeq += 1;
@@ -58,7 +58,6 @@ describe("task-scheduler — manual lease wait", () => {
         const leaseKey = leaseKeyFor("curate", PROJECT);
         const otherHolder = "other-process";
         expect(acquireLease(db, otherHolder, leaseKey)).toBe(true);
-        // Free the lease shortly after the manual run starts waiting.
         setTimeout(() => releaseLease(db as Database, otherHolder, leaseKey), 150);
 
         let executed = 0;
@@ -120,7 +119,6 @@ describe("task-scheduler — planDueTasks", () => {
         const now = Date.UTC(2026, 0, 1, 12, 0); // midday
         const due = planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], now);
         expect(due).toHaveLength(0);
-        // A row was seeded with a future next_due.
         const state = getTaskScheduleState(db, PROJECT, "verify");
         expect(state?.nextDueAt).not.toBeNull();
         expect(state?.nextDueAt).toBeGreaterThan(now);
@@ -135,8 +133,8 @@ describe("task-scheduler — planDueTasks", () => {
 
     it("prunes retired task rows not in the canonical config set", () => {
         db = freshDb();
-        // Simulate stale rows from old scheduler configurations so pruning can
-        // remove task names that are no longer canonical.
+        // The scheduler prunes stale rows from obsolete scheduler configurations.
+        // Pruning removes task names absent from the canonical configuration.
         for (const task of ["improve", "consolidate", "archive-stale", "render-mural"] as const) {
             writeTaskScheduleState(db, {
                 projectPath: PROJECT,
@@ -151,7 +149,7 @@ describe("task-scheduler — planDueTasks", () => {
                 retrospectiveWatermarkMs: null,
             });
         }
-        // A plan pass with the canonical config set must delete them.
+        // A plan pass with the canonical config set deletes stale task-schedule rows.
         planDueTasks(
             db,
             PROJECT,
@@ -161,7 +159,7 @@ describe("task-scheduler — planDueTasks", () => {
         for (const task of ["improve", "consolidate", "archive-stale", "render-mural"] as const) {
             expect(getTaskScheduleState(db, PROJECT, task)).toBeNull();
         }
-        // Canonical tasks survive.
+        // Pruning preserves rows for canonical task names.
         expect(getTaskScheduleState(db, PROJECT, "verify")).not.toBeNull();
         expect(getTaskScheduleState(db, PROJECT, "curate")).not.toBeNull();
     });
@@ -182,7 +180,7 @@ describe("task-scheduler — planDueTasks", () => {
         expect(removed).toBe(2);
         expect(getTaskScheduleState(db, orphan, "verify")).toBeNull();
         expect(getTaskScheduleState(db, orphan, "curate")).toBeNull();
-        // The unrelated project is untouched.
+        // Pruning preserves task-schedule rows for other projects.
         expect(getTaskScheduleState(db, PROJECT, "verify")).not.toBeNull();
     });
 
@@ -195,7 +193,6 @@ describe("task-scheduler — planDueTasks", () => {
 
     it("a past next_due_at is collected as due", () => {
         db = freshDb();
-        // Seed then force the row's next_due into the past.
         const now = Date.now();
         planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], now);
         writeTaskScheduleState(db, {
@@ -212,14 +209,13 @@ describe("task-scheduler — planDueTasks", () => {
         expect(due.map((d) => d.config.task)).toEqual(["verify"]);
     });
 
-    // ── Config-authoritative reconciliation (Oracle P0 #1) ──────────────
+    // Config-authoritative reconciliation
     it("disabling a task AFTER it was seeded forces next_due_at NULL (no stale fire)", () => {
         db = freshDb();
         const now = Date.now();
-        // Seed enabled, force it due.
         planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], now);
         forceDue(db, "verify", now);
-        // Now the config disables it. The stale past-due slot must NOT fire.
+        // A disabled config prevents a stale past-due slot from firing.
         const due = planDueTasks(db, PROJECT, [cfg("verify", "")], now);
         expect(due).toHaveLength(0);
         expect(getTaskScheduleState(db, PROJECT, "verify")?.nextDueAt).toBeNull();
@@ -228,10 +224,9 @@ describe("task-scheduler — planDueTasks", () => {
     it("enabling a task that was seeded NULL (disabled) makes it due-eligible", () => {
         db = freshDb();
         const now = Date.UTC(2026, 0, 1, 12, 0);
-        // Seed disabled → next_due NULL.
         planDueTasks(db, PROJECT, [cfg("maintain-docs", "")], now);
         expect(getTaskScheduleState(db, PROJECT, "maintain-docs")?.nextDueAt).toBeNull();
-        // Now enable it: a fresh next_due is computed (future, not immediate).
+        // Enabling the task computes a future next_due instead of running it immediately.
         planDueTasks(db, PROJECT, [cfg("maintain-docs", "0 3 * * *")], now);
         const state = getTaskScheduleState(db, PROJECT, "maintain-docs");
         expect(state?.nextDueAt).not.toBeNull();
@@ -244,7 +239,7 @@ describe("task-scheduler — planDueTasks", () => {
         const now = Date.UTC(2026, 0, 1, 12, 0);
         planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], now);
         const before = getTaskScheduleState(db, PROJECT, "verify")?.nextDueAt;
-        // Switch to hourly: next_due must move earlier (next top-of-hour).
+        // An hourly schedule moves next_due to the next top of the hour.
         planDueTasks(db, PROJECT, [cfg("verify", "0 * * * *")], now);
         const after = getTaskScheduleState(db, PROJECT, "verify");
         expect(after?.schedule).toBe("0 * * * *");
@@ -256,7 +251,7 @@ describe("task-scheduler — planDueTasks", () => {
         db = freshDb();
         const now = Date.now();
         const due = now - 1000;
-        // Simulate a pre-column row: live next_due in the past, schedule NULL.
+        // A NULL schedule with a past next_due remains due.
         writeTaskScheduleState(db, {
             projectPath: PROJECT,
             task: "verify",
@@ -268,7 +263,7 @@ describe("task-scheduler — planDueTasks", () => {
             retryCount: 0,
         });
         const collected = planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], now);
-        // The past-due slot is preserved (NOT recomputed into the future) and fires.
+        // The scheduler preserves the past-due slot and fires it.
         expect(collected.map((d) => d.config.task)).toEqual(["verify"]);
         const state = getTaskScheduleState(db, PROJECT, "verify");
         expect(state?.schedule).toBe("0 3 * * *");
@@ -276,7 +271,7 @@ describe("task-scheduler — planDueTasks", () => {
     });
 });
 
-/** Force a task due by overwriting its seeded next_due into the past. */
+/* */
 function forceDue(d: Database, task: DreamTaskRuntimeConfig["task"], now: number): void {
     const prior = getTaskScheduleState(d, PROJECT, task);
     writeTaskScheduleState(d, {
@@ -350,7 +345,7 @@ describe("task-scheduler — runDueTasksForProject", () => {
         db = freshDb();
         seedActiveMemory(db);
         const now = Date.now();
-        // curate is gateless, so the mocked executor (and its patch) always runs.
+        // curate has no memory-domain gate, so the mocked executor runs without seeded memory.
         const tasks = [cfg("curate", "0 3 * * *")];
         planDueTasks(db, PROJECT, tasks, now);
         forceDue(db, "curate", now);
@@ -397,7 +392,6 @@ describe("task-scheduler — runDueTasksForProject", () => {
         const tasks = [cfg("verify", "0 3 * * *")];
         planDueTasks(db, PROJECT, tasks, now);
         forceDue(db, "verify", now);
-        // Hold the memory-domain lease from "another process".
         expect(acquireLease(db, "other-holder", leaseKeyFor("verify", PROJECT))).toBe(true);
 
         let ran = false;
@@ -416,7 +410,7 @@ describe("task-scheduler — runDueTasksForProject", () => {
     it("different domains run CONCURRENTLY (memory + smart-notes both execute)", async () => {
         db = freshDb();
         seedActiveMemory(db);
-        // pending smart note for the evaluate-smart-notes gate
+        // The pending smart note satisfies the evaluate-smart-notes gate.
         db.prepare(
             `INSERT INTO notes (type, project_path, content, status, created_at, updated_at)
              VALUES ('smart', ?, 'n', 'pending', 1, 1)`,
@@ -518,9 +512,9 @@ describe("task-scheduler — runDueTasksForProject", () => {
             error: "rate limit",
         });
 
-        // Force due ONCE; a transient failure leaves next_due in the past, so the
-        // task stays due across ticks without re-forcing (re-forcing would reset
-        // retry_count, which is the bug this exercises).
+        // A transient failure keeps `next_due` in the past, so retries remain due across ticks; re-forcing resets `retry_count`.
+        // The task stays due across ticks without re-forcing; re-forcing resets `retry_count`.
+        // Re-forcing resets retry_count.
         planDueTasks(db, PROJECT, tasks, now);
         forceDue(db, "verify", now);
         // Attempts 1..3 keep next_due in the past (retry next tick).
@@ -531,7 +525,7 @@ describe("task-scheduler — runDueTasksForProject", () => {
             expect(s?.lastRunAt).toBeNull();
             expect(s?.nextDueAt).toBeLessThan(now); // still due
         }
-        // Attempt 4 exceeds MAX_TASK_RETRIES=3 → advance + reset.
+        // Attempt 4 exceeds `MAX_TASK_RETRIES = 3`, advances `next_due`, and resets `retry_count`.
         await runDueTasksForProject({ db, projectIdentity: PROJECT, tasks, executor, now });
         const s = getTaskScheduleState(db, PROJECT, "verify");
         expect(s?.retryCount).toBe(0);
@@ -584,7 +578,7 @@ describe("task-scheduler — runManualDream", () => {
 
     it("a single task arg FORCE-runs it ignoring the activity gate", async () => {
         db = freshDb();
-        // No active memories → verify's gate would normally fail. Forced runs anyway.
+        // Forced `verify` runs bypass its memory gate.
         const tasks = [cfg("verify", "0 3 * * *")];
         let ran = false;
         const executor = async (): Promise<TaskExecOutcome> => {
@@ -623,7 +617,7 @@ describe("task-scheduler — runManualDream", () => {
 
     it("reports gate-skipped tasks in the all-enabled run", async () => {
         db = freshDb();
-        // No active memories → verify gate fails; it is enabled but skipped.
+        // Without active memories, the scheduler skips the enabled `verify` task because its gate fails.
         const tasks = [cfg("verify", "0 3 * * *")];
         const executor = async (): Promise<TaskExecOutcome> => ({ status: "completed" });
         const result = await runManualDream({ db, projectIdentity: PROJECT, tasks, executor });

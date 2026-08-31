@@ -741,8 +741,6 @@ fn number_to_i64(value: &Value) -> Option<i64> {
 }
 
 fn chrono_like_timestamp_ms(text: &str) -> Option<i64> {
-    // Keep the codec dependency-free: use the stable digits in ISO-8601 strings only as a
-    // deterministic fallback when the AgentMessage timestamp is absent.
     let digits: String = text.chars().filter(|ch| ch.is_ascii_digit()).collect();
     digits.get(..14)?.parse::<i64>().ok()
 }

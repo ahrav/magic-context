@@ -9,46 +9,14 @@ import {
 import type { PendingOp, TagEntry } from "../../features/magic-context/types";
 import type { TagTarget } from "./tag-messages";
 
-// Max characters kept from the original user content when a user-message tag
-// is dropped. ~250 characters maps to ~50 Claude tokens (1 token ≈ 4-5 chars
-// for English prose). Keeps the ai-tokenizer dependency in scripts only.
-
 /**
- * Agent-initiated (ctx_reduce) drops of a tool call within the newest N tool
- * calls keep a structural skeleton — the tool_use/tool_result pair survives
- * with the canonical `[dropped §N§]` placeholder as its output — instead of
- * being removed outright. (Long input arg VALUES are separately clamped with
- * `...[truncated]`: that's value-shortening, not a drop, so it keeps its own
  * marker.)
  *
- * WHY: when every recent tool call vanishes from the wire, models (especially
- * smaller ones) lose the anchors showing what they actually did and start
- * hallucinating fake tool-call shapes (the §N§ cargo-culting failure mode).
- * Keeping skeletons in the recent band structurally prevents that class.
- * Older drops still remove the full structure — deep history needs no anchors.
+ * Recent skeletons preserve tool-call context.
  *
- * CACHE SAFETY: the mode is decided once, at drop time (always a
- * cache-busting pass), persisted in `tags.drop_mode`, and replayed
- * byte-identically by `applyFlushedStatuses` on every later pass. A skeleton
- * is NEVER demoted to a full drop afterwards — that second mutation would be
- * a mid-prefix rewrite on some later pass (the volatile-boundary bust class).
- * Emergency drops use the same newest-window skeleton rule as agent drops;
- * heuristic dedup stays full-drop because dedup keeps the newest duplicate's
- * full content as the nearby anchor.
  */
 export const RECENT_TOOL_SKELETON_WINDOW = 20;
 
-// ONE canonical placeholder for every non-tool (message) drop, on every path,
-// every pass. It is a PURE function of tagId — it reads NO message content, role,
-// or window state. That is the whole point: any version that derived bytes from
-// the current (already-mutated) content re-derived a DIFFERENT placeholder across
-// passes (e.g. `[dropped §N§]` on one pass, `[truncated §N§]\n…` on the next),
-// which on a defer pass changes a tail message's bytes and busts the entire
-// prompt-cache prefix after it. This exact divergence caused repeated cache
-// catastrophes. The bytes here are byte-identical to heuristic-cleanup.ts's
-// `[dropped §${n}§]`, so the two drop paths can never disagree. (We deliberately
-// dropped the old user-text preview variant — a minor nicety that was the sole
-// source of the instability.)
 export function buildReplacementContent(tagId: number): string {
     return `[dropped \u00a7${tagId}\u00a7]`;
 }
@@ -61,10 +29,6 @@ export function applyPendingOperations(
     preloadedPendingOps?: ReturnType<typeof getPendingOps>,
     syntheticPendingOps: PendingOp[] = [],
     /**
-     * Smart-drops: tag ids to compress as an edit_marker (an edit/write
-     * superseded by a later edit to the same file) instead of a full/skeleton
-     * drop. Synthetic-only: these are selected for the current apply pass;
-     * replay reads the frozen drop_mode, not this set.
      */
     editMarkerTagIds: ReadonlySet<number> = new Set(),
 ): boolean {
@@ -90,9 +54,7 @@ export function applyPendingOperations(
             ...syntheticPendingOps.map((op) => ({ op, synthetic: true })),
         ];
 
-        // Newest-K tool calls at THIS moment — the skeleton window. Computed
-        // once per apply pass over all tool tags (any status: the window
-        // reflects conversation recency, not droppability).
+        // The skeleton window reflects conversation recency, not droppability.
         const skeletonWindow = new Set(
             tags
                 .filter((tag) => tag.type === "tool")
@@ -116,20 +78,12 @@ export function applyPendingOperations(
             const isToolTag = tagTypeById.get(pendingOp.tagId) === "tool";
 
             if (synthetic) {
-                // Synthetic two-pass reclaim must never persist a DB-only drop for
-                // a tag that is absent/incomplete on this pass's visible wire. It
-                // only rides an already-mutating pass when the target can actually
-                // reclaim bytes right now; real pending ops keep their legacy
-                // absent persistence semantics for user-requested ctx_reduce.
                 if (!isToolTag || target?.canDrop?.() !== true) continue;
             }
 
             let shouldPersistDrop = false;
             if (isToolTag) {
                 if (editMarkerTagIds.has(pendingOp.tagId)) {
-                    // Superseded edit/write: compress to a filePath-preserving
-                    // marker even when the tag is inside the recent skeleton
-                    // window. Frozen as drop_mode="edit_marker", replayed by mode.
                     const markResult = target?.editMarker?.() ?? "absent";
                     if (markResult === "incomplete" || markResult === "absent") {
                         continue;

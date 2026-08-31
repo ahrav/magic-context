@@ -15,9 +15,6 @@ import { openDatabase } from "../storage";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { SIDEKICK_SYSTEM_PROMPT, stripThinkingBlocks } from "./core";
 
-// Re-export the system prompt so existing call sites that import from this
-// module keep working. The canonical location is now `./core` so the
-// pi-plugin can pull it without depending on OpenCode-specific imports.
 export { SIDEKICK_SYSTEM_PROMPT };
 
 export async function runSidekick(deps: {

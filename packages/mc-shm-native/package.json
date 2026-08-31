@@ -1,23 +1,33 @@
 {
-  "name": "@magic-context/mc-shm-native",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@cortexkit/mc-shm-native",
+  "version": "0.38.0",
   "type": "module",
-  "main": "index.ts",
+  "main": "index.js",
   "types": "index.ts",
   "exports": {
-    ".": "./index.ts"
+    ".": {
+      "types": "./index.ts",
+      "bun": "./index.ts",
+      "import": "./index.js"
+    }
   },
   "scripts": {
-    "build": "cargo build -p mc-shm-native && cp -f ../../target/debug/libmc_shm_native.$(test \"$(uname -s)\" = Darwin && echo dylib || echo so) ./mc_shm_native.node",
+    "build": "bun run build:native && bun run build:js",
+    "build:native": "test \"$(uname -s)-$(uname -m)\" = Linux-x86_64 && cargo build --release -p mc-shm-native && cp -f ../../target/release/libmc_shm_native.so ./mc_shm_native.node",
+    "build:js": "bun build index.ts --outfile index.js --target node --format esm",
     "build:source": "bun run build",
     "test": "bun test tests",
     "test:bun": "bun test tests",
     "test:node": "node --experimental-transform-types tests/runtime.ts",
     "test:capability:bun": "bun tests/capability.ts",
     "test:capability:node": "node --experimental-transform-types tests/capability.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepack": "bun run build:js"
   },
+  "files": [
+    "index.js",
+    "index.ts"
+  ],
   "devDependencies": {
     "@types/node": "^22.20.0",
     "typescript": "^5.8.0"

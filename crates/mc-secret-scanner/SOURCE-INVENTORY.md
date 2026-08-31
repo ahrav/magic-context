@@ -23,7 +23,39 @@ License: MIT. The complete notice is in `NOTICE`.
 | `crates/scanner-engine/src/engine/window_validate.rs` | `0b8b88e0daab93cc07044b85c4f1c7d105e7d7f3` | `a362a1c1c3addbd937e0591032dd655c69559bd1eaff66e1fa1c861f1e715299` | `crates/mc-secret-scanner/src/evaluator.rs` | Rewritten direct candidate evaluation and confidence flow |
 | `LICENSE` | `00b501fa03e6a1b190c0a4a2f2ef66fd57431a3c` | `96afec54cd8f9e6497c91826a6f9576e7ae92c3c3dd68c4c0b170d9b996e2e2d` | `crates/mc-secret-scanner/NOTICE` | Verbatim license terms with attribution |
 
-Local overlay: `crates/mc-secret-scanner/conservative_overlay.yaml`, SHA-256
-`8d04fbe0c261ab42bb0370138a42e25437889e8048620b0601bfb9619da140a9`.
-It is original Magic Context compatibility policy and is not copied from
-Gossip-rs.
+Destinations under `crates/mc-secret-scanner/src/` are unmet. This tree carries the
+pinned corpus, the local overlay, `NOTICE`, and the drift check, so those rows
+record where each adapted source belongs and the digest it must be adapted from.
+The drift check verifies digests and provenance; it does not verify adaptation.
+
+Local overlay: `crates/mc-secret-scanner/conservative_overlay.yaml`.
+
+Overlay SHA-256: `3166dc57a4020b90981871aa4df8e26dabbf2ef3ed92b1e41e1d6feaced628b5`
+
+The overlay is original Magic Context compatibility policy and is not copied from
+Gossip-rs. Its vendor rules reuse the lengths, alphabets, entropy floors, and
+offline validators of the corpus rule for the same credential, so a credential
+matched by both rule sets resolves to one verdict. Two bounded departures from
+that parity are deliberate:
+
+- Where a corpus rule terminates on an explicit delimiter class, the overlay
+  terminates on `\b`. The two accept the same candidates except one followed
+  immediately by `-`, which the corpus rejects and the overlay accepts.
+- The format and keyed-value rules (`magic-jwt`, `magic-bearer-token`,
+  `magic-keyed-*`) are local policy for text the corpus does not cover, so they
+  are broader by construction and carry their own `value_suppressors_any`.
+
+Anchor matching is case-insensitive, and the pinned corpus already depends on
+this: `aiza`, `t3blbkfj`, and `zxlk` are the only anchors recorded for regexes
+that match `AIza`, `T3BlbkFJ`, and `ZXlK`, so `gcp-api-key`, `openai-api-key`,
+and `jwt-base64` cannot fire under a case-sensitive prefilter. Overlay anchors
+therefore record one form per literal; enumerating case variants would not be a
+substitute, because a mixed-case key such as `Api_Key` has more variants than a
+list can hold.
+
+The overlay's `key_group`, `value_group`, and `reject_scalars` fields are a local
+schema extension read by the rewritten parser this inventory maps to
+`crates/mc-secret-scanner/src/rules.rs`. The corpus header comment describes the
+upstream field set only, and it warns that unknown fields are ignored silently,
+so a parser that drops these three degrades the keyed-value rules to matching on
+the whole `"key": "value"` span instead of the value.

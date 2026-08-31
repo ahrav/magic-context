@@ -4,14 +4,10 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
-/// Maximum body accepted by the version-2 wire contract.
 ///
-/// Derived from the host's own cap rather than restated: this value gates
-/// output preparation while `mc-host` gates frame admission, so a literal here
-/// could drift and make the two disagree about what fits on the wire.
+/// `MAX_WIRE_BODY_BYTES` mirrors `mc_host::MAX_FRAME_BODY_LEN` so output preparation and frame admission use the same limit.
 pub const MAX_WIRE_BODY_BYTES: usize = mc_host::MAX_FRAME_BODY_LEN as usize;
 
-/// Successful response body prepared without an encoded output buffer.
 #[derive(Clone)]
 pub struct PreparedOutput {
     source: PreparedSource,
@@ -37,7 +33,7 @@ enum PreparedSegmentSource {
     Served(crate::transform::ServedMessage),
 }
 
-/// One immutable, already encoded transform message.
+/// PreparedSegment represents one immutable encoded transform message.
 #[derive(Clone)]
 pub struct PreparedSegment {
     source: PreparedSegmentSource,
@@ -61,7 +57,7 @@ impl PreparedSegment {
         }
     }
 
-    /// Constructs a deliberately inconsistent segment for length-check tests.
+    /// Creates a segment with caller-supplied `measured_len` for length-check tests.
     #[doc(hidden)]
     pub fn inconsistent_for_test(bytes: Arc<[u8]>, measured_len: usize) -> Self {
         Self {
@@ -88,11 +84,8 @@ impl fmt::Debug for PreparedSegment {
 }
 
 impl PreparedOutput {
-    /// Retains a JSON value and encodes it only on the write phase.
     ///
-    /// Measurement counts the serialized length without keeping the bytes, so
-    /// nothing is retained outside the host's reservation; see
-    /// [`PreparedOutput::measure`] for why the serializer runs twice.
+    /// Measurement serializes JSON without retaining encoded bytes so large bodies remain within the host reservation.
     pub fn json(value: Value) -> Self {
         Self {
             source: PreparedSource::Json(Arc::new(value)),
@@ -129,14 +122,7 @@ impl PreparedOutput {
 
     /// Measures this immutable source exactly before output reservation.
     ///
-    /// JSON sources are counted, not collected. `measure` runs BEFORE the host's
-    /// resident-byte reservation, so retaining the encoded body here would hold
-    /// up to `MAX_WIRE_BODY_BYTES` outside the very budget the reservation
-    /// exists to enforce: concurrent large responses would each own a full
-    /// uncharged copy and could exhaust process memory while every one of them
-    /// respected its charge. The serializer therefore runs twice — once to size
-    /// the reservation, once to fill it — and `write_to`'s length check turns
-    /// any disagreement between the two passes into an error rather than a
+    /// JSON measurement does not retain encoded bytes because it precedes the host's resident-byte reservation.
     /// short body.
     pub fn measure(&self) -> Result<MeasuredOutput<'_>, PreparedOutputError> {
         let (source, len) = match &self.source {
@@ -202,7 +188,6 @@ impl fmt::Debug for PreparedOutput {
     }
 }
 
-/// Successful, typed-error, and streamed dispatch settlements.
 pub enum PreparedOutcome {
     Response(PreparedOutput),
     Error { code: String, message: String },
@@ -223,15 +208,11 @@ impl fmt::Debug for PreparedOutcome {
     }
 }
 
-/// Exact measurement tied to the immutable source that produced it.
 pub struct MeasuredOutput<'a> {
     source: MeasuredSource<'a>,
     len: usize,
 }
 
-/// Source view captured at measurement time. JSON arrives already encoded
-/// (measurement is the single serialization pass); the other variants borrow
-/// the prepared source and stream it during the write.
 enum MeasuredSource<'a> {
     Json(&'a Value),
     Exact(&'a [u8]),
@@ -252,10 +233,7 @@ impl MeasuredOutput<'_> {
         let mut destination = BoundedWriter::new(destination, self.len);
         match &self.source {
             MeasuredSource::Json(value) => {
-                // Serializing straight into the destination means a destination
-                // failure reaches us wrapped in serde's error type. Unwrap it so
-                // callers keep the write-versus-serialize distinction they had
-                // when this path copied a pre-encoded buffer.
+                // `write_to` unwraps serde's wrapped I/O errors so callers can distinguish destination failures from serialization failures.
                 serde_json::to_writer(&mut destination, value).map_err(|error| {
                     if error.is_io() {
                         PreparedOutputError::Write(error.into())
@@ -347,8 +325,8 @@ fn checked_body_len(
 
 /// Measures a JSON value's exact encoded length without retaining the bytes.
 ///
-/// The cap is enforced as bytes are produced, so an over-cap body fails during
-/// counting rather than after a full encode.
+/// Serialization stops when encoded output exceeds `MAX_WIRE_BODY_BYTES`.
+/// Serialization stops when encoded output exceeds `MAX_WIRE_BODY_BYTES`.
 fn measure_json(value: &Value) -> Result<usize, PreparedOutputError> {
     let mut writer = CountingWriter::default();
     let result = serde_json::to_writer(&mut writer, value).map_err(PreparedOutputError::Serialize);
@@ -427,9 +405,7 @@ enum CountFailure {
     TooLarge(usize),
 }
 
-/// Counts (and optionally collects) bytes against the wire cap. The cap check
-/// precedes any buffering, so a collecting writer never allocates past the
-/// cap before reporting `TooLarge`.
+/// CountingWriter rejects writes that exceed MAX_WIRE_BODY_BYTES.
 #[derive(Default)]
 struct CountingWriter {
     len: usize,

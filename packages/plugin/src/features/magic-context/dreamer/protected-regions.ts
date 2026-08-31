@@ -1,5 +1,5 @@
 export interface EnforceProtectedRegionsResult {
-    /** The text to persist (candidate, repaired candidate, or original on reject). */
+    /** Text to persist after protected-region enforcement. */
     text: string;
     violated: boolean;
 }
@@ -10,11 +10,11 @@ const PROTECTED_END_TOKEN = "mc:protected END";
 export interface ProtectedBlock {
     /** Full identifying start-marker line (the line containing mc:protected START). */
     startMarkerLine: string;
-    /** Bytes from START line through END line inclusive. */
+    /** Protected region including its START and END lines. */
     block: string;
 }
 
-/** Extract every mc:protected region from `text`, keyed by the full START marker line. */
+/* */
 export function extractProtectedBlocks(text: string): ProtectedBlock[] {
     const lines = text.split("\n");
     const blocks: ProtectedBlock[] = [];
@@ -90,8 +90,8 @@ function spliceProtectedBlock(
 }
 
 /**
- * Enforce that every mc:protected region present in `original` is byte-identical
- * in `candidate`. Returns the text to actually write and whether a violation was repaired.
+ * Each protected region from `original` must match exactly in `candidate`.
+ * The function returns the text to write and whether it repaired a violation.
  */
 export function enforceProtectedRegions(
     original: string,

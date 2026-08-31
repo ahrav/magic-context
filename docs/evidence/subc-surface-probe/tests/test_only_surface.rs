@@ -1,5 +1,3 @@
-//! Test-classified surface: subc-transport server/keygen items used ONLY by
-//! mc-module's historian_producer unit tests, plus the consumer items used by
 //! tests/real_daemon.rs.
 use std::{net::SocketAddr, time::Duration};
 
@@ -20,9 +18,6 @@ fn assert_clone<T: Clone>() {}
 fn assert_partial_eq<T: PartialEq>() {}
 fn assert_error<T: std::error::Error>() {}
 
-/// Every trait bound the compiler-closure pass folded into an inventory row
-/// must exist on the published types, not only in the hand-edited stubs.
-/// Compiling these instantiations is the proof; the function body never runs.
 fn amended_trait_bounds_exist_in_published_sources() {
     assert_debug::<ErrorBody>();
     assert_debug::<RouteTarget>();
@@ -49,13 +44,9 @@ fn amended_trait_bounds_exist_in_published_sources() {
 async fn test_only_items_have_published_shapes() {
     amended_trait_bounds_exist_in_published_sources();
 
-    // The producer's liveness check needs `Ping` and `==`/`!=` on `FrameType`;
-    // comparing distinct variants exercises `PartialEq` without a
     // self-comparison.
     assert_ne!(FrameType::Ping, FrameType::Request);
 
-    // mc-module's unit tests compare `manifest().consumes` with `assert_eq!`,
-    // so `ConsumerRole` must support equality between separately constructed
     // values.
     let consumes = ConsumerRole::ServiceClient {
         of: vec!["thalamus".to_string()],
@@ -98,7 +89,6 @@ async fn test_only_items_have_published_shapes() {
         let _ = read_frame(&mut stream).await;
     });
 
-    // real_daemon.rs consumer shapes.
     let options = ConsumerOptions {
         handshake_timeout: Duration::from_secs(2),
         call_timeout: Duration::from_secs(60),

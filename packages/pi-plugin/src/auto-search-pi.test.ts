@@ -53,9 +53,7 @@ describe("runAutoSearchHintForPi", () => {
 
 	it("reuses the per-turn cached hint for the same user message id", async () => {
 		const db = createTestDb();
-		// A message-source fragment carries no memory ids, so the persisted
-		// hint replays without a policy lookup; memory-backed replay gating
-		// is covered by the persisted-hints policy test below.
+		// No memory fragments contributed, so replay needs no policy check.
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
 			async () => [
 				{
@@ -285,12 +283,7 @@ describe("runAutoSearchHintForPi", () => {
 	});
 
 	it("resolves the anchor by reference when the positional entryIds is stale (post-splice)", async () => {
-		// Simulates the runPipeline splice: `entryIds` was resolved against a
-		// PRE-splice array where the latest user message sat at a higher index.
-		// After the splice, the latest user message is at index 0 of the current
-		// array, but the stale positional entryIds[0] points at a DIFFERENT,
-		// now-removed message's id ("entry-OLD-WRONG"). The reference-keyed map
-		// must win and anchor the hint to the real id ("entry-REAL").
+		// The code must resolve entry IDs by message reference after a splice because positional indices refer to the pre-splice array.
 		const db = createTestDb();
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
 			async () => [memoryResult()],
@@ -298,9 +291,7 @@ describe("runAutoSearchHintForPi", () => {
 		try {
 			const latest = userMessage("explain the historian cache wiring", 1);
 			const currentMessages = [latest];
-			// Stale positional array (wrong id at index 0).
 			const stalePositionalEntryIds = ["entry-OLD-WRONG"];
-			// Splice-safe reference map: the actual current message -> real id.
 			const entryIdByRef = new Map<object, string>([
 				[latest as object, "entry-REAL"],
 			]);
@@ -314,10 +305,8 @@ describe("runAutoSearchHintForPi", () => {
 				options: baseOptions,
 			});
 
-			// The hint was injected onto the latest message...
+			// The persisted decision must use the reference-mapped ID rather than entryIds[0].
 			expect(textOf(currentMessages[0])).toContain("<ctx-search-hint>");
-			// ...and the persisted decision is keyed to the REAL id, not the stale
-			// positional one — proving reference resolution took precedence.
 			const decisions = getAutoSearchHintDecisions(db, "ses-auto");
 			expect(decisions.some((d) => d.messageId === "entry-REAL")).toBe(true);
 			expect(decisions.some((d) => d.messageId === "entry-OLD-WRONG")).toBe(
@@ -330,12 +319,7 @@ describe("runAutoSearchHintForPi", () => {
 	});
 
 	it("does NOT fall back to stale positional entryIds when the ref-map MISSES", async () => {
-		// When a ref-map is supplied but the current latest user message is NOT in
-		// it (e.g. an injection-cloned object, or a synthetic prepend), the resolver
-		// must treat it as unresolved — NOT silently use the stale positional
-		// entryIds[i], which after a splice points at a different message. A wrong
-		// anchor would persist a decision against the wrong turn and replay the hint
-		// onto the wrong message on later passes.
+		// If a supplied reference map lacks the latest user message, do not fall back to entryIds[i]; the stale index can persist and replay a hint for another turn.
 		const db = createTestDb();
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
 			async () => [memoryResult()],
@@ -344,8 +328,7 @@ describe("runAutoSearchHintForPi", () => {
 			const latest = userMessage("explain the historian cache wiring", 1);
 			const currentMessages = [latest];
 			const stalePositionalEntryIds = ["entry-STALE-WRONG"];
-			// Ref-map present but does NOT contain `latest` (simulates a clone/
-			// synthetic the map was not built for).
+			// The reference map omits `latest` to simulate a cloned or synthetic message.
 			const entryIdByRef = new Map<object, string>([
 				[{} as object, "entry-SOMETHING-ELSE"],
 			]);
@@ -359,9 +342,8 @@ describe("runAutoSearchHintForPi", () => {
 				options: baseOptions,
 			});
 
-			// No hint injected (unresolved → degraded, no fresh anchor)...
+			// An unresolved message must not receive a hint or persist a decision under entryIds[i].
 			expect(textOf(currentMessages[0])).not.toContain("<ctx-search-hint>");
-			// ...and crucially NO decision was persisted to the stale positional id.
 			const decisions = getAutoSearchHintDecisions(db, "ses-auto");
 			expect(decisions.some((d) => d.messageId === "entry-STALE-WRONG")).toBe(
 				false,

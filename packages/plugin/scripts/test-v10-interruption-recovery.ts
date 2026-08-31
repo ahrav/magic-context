@@ -1,28 +1,18 @@
 /**
- * Test interruption recovery for v10 migration + backfill.
  *
- * Simulates the user-visible failure mode "OpenCode crashes during
- * upgrade and is restarted later" by:
+ * The test simulates an OpenCode crash during upgrade followed by a restart.
  *
- *   Phase 1 — kill mid-migration (SIGKILL during the 29-second window):
- *     Spawn a subprocess that runs openDatabase() against a pre-v10
- *     copy. Watch the DB until backfill_state has at least N completed
- *     rows (proving migration v10 already committed and backfill is
- *     mid-flight), then SIGKILL. Verify the partial state on disk:
- *       - schema_migrations should contain v10 (migration was atomic)
- *       - tool_owner_backfill_state has some 'completed' rows + maybe
- *         a few 'running' rows whose lease hasn't expired
- *       - tags table is mid-state: some have owners, others NULL
+ * The test kills the subprocess during the 29-second backfill window after v10 commits.
+ * `completed` rows in `tool_owner_backfill_state` prove that v10 committed and the backfill started.
+ * The atomic migration records v10 in schema_migrations.
+ * `tool_owner_backfill_state` has completed rows; any running rows have unexpired leases.
+ * Some `tags.tool_owner_message_id` values are populated and others are NULL.
  *
- *   Phase 2 — resume on next openDatabase():
- *     With LEASE_DURATION_MS expired (or by manually clearing the
- *     stale 'running' rows), call openDatabase() again. Verify the
- *     backfill resumes only the unfinished sessions and reaches the
- *     same final coverage as a clean run.
+ * The backfill resumes only after running leases expire or are cleared.
+ * The backfill resumes only unfinished sessions and reaches the same final coverage as a clean run.
  *
  * Usage:
- *   bun packages/plugin/scripts/test-v10-interruption-recovery.ts \
- *     --src ~/.local/share/cortexkit/magic-context/context.db.before-zwsp-cleanup.bak \
+ * Run `bun packages/plugin/scripts/test-v10-interruption-recovery.ts --src <pre-v10-backup> --oc <opencode.db>`.
  *     --oc ~/.local/share/opencode/opencode.db
  */
 
@@ -235,7 +225,6 @@ process.exit(0);
 async function main() {
     const args = parseArgs();
 
-    // Set up playground
     const playground = join(tmpdir(), `v10-interrupt-${Date.now()}`);
     const mcDir = storageSubtreePath(playground);
     const ocDir = join(playground, "opencode");
@@ -255,7 +244,6 @@ async function main() {
     const beforeTags = resetMcDbToPreV10(mcPath);
     console.log(`Pre-v10 reset complete (${beforeTags.toLocaleString()} tool tags).`);
 
-    // ============== PHASE 1: KILL MID-MIGRATION ==============
     console.log(`\n=== Phase 1: kill subprocess after 8 seconds ===\n`);
     const phase1Start = Date.now();
     const result1 = await spawnOpenDatabaseSubprocess(playground, 8000);
@@ -267,7 +255,6 @@ async function main() {
     const snap1 = snapshot(mcPath);
     console.log(snapshotSummary(snap1, "After SIGKILL"));
 
-    // Verify partial state expectations
     const v10Applied = snap1.schemaVersions.includes(10);
     const someBackfillProgress = snap1.completed > 0;
     const someStillNull = snap1.rowsNullOwner > 0;
@@ -281,10 +268,6 @@ async function main() {
         `  running rows present (lease):  ${hasRunningRows ? "✅ (will recover after lease expiry)" : "ℹ️  no running rows — clean session boundary"}`,
     );
 
-    // ============== PHASE 2: RESUME ==============
-    // To avoid waiting 5 real minutes for lease expiry, expire the
-    // 'running' leases manually. This simulates what would naturally
-    // happen on the user's NEXT openDatabase() call after waiting.
     console.log(`\n=== Phase 2: simulate post-lease-expiry restart ===\n`);
     const expireDb = new Database(mcPath);
     const expireResult = expireDb
@@ -307,7 +290,6 @@ async function main() {
     const snap2 = snapshot(mcPath);
     console.log(snapshotSummary(snap2, "After resume"));
 
-    // Compare against the clean-run final state
     console.log(`\n--- Phase 2 invariants ---`);
     const allBackfillFinished = snap2.running === 0 && snap2.pending === 0;
     const finalCoverageHigh = snap2.rowsOwned / snap2.totalToolTags > 0.95;

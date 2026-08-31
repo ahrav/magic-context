@@ -39,8 +39,6 @@ export interface TailHygieneMeasurement {
 }
 
 /**
- * Cheap served-array shape used in production to catch a write after the tail
- * walk without repeating its content hashing and token accounting.
  */
 export interface TailHygieneStructuralSignature {
     messageCount: number;
@@ -57,9 +55,9 @@ export interface TailHygieneBaseline {
     computedAt: number;
     evaluable: boolean;
     generationInvalidated: boolean;
-    /** Measurements from the last full walk; defer passes compare against this immutable prefix. */
+    /** baselineParts contains immutable measurements from the last full walk; defer passes compare against them. */
     baselineParts: TailHygienePartMeasurement[];
-    /** Signature of the array served by the current pass, including valid appended deltas. */
+    /** contentSignature represents the array served by the current pass, including valid appended deltas. */
     contentSignature: string;
 }
 
@@ -392,9 +390,6 @@ function fileContentAndTokens(part: Record<string, unknown>): { content: string;
 }
 
 /**
- * Capture a low-cost structural signature of the exact messages about to be
- * served. It intentionally does not hash content: production needs a cheap
- * last-writer alarm, while the full content-hash assertion remains a dev check.
  */
 export function tailHygieneStructuralSignature(
     messages: readonly MessageLike[],
@@ -614,8 +609,6 @@ export function refreshTailHygieneBaseline(input: {
     ) {
         const part = measured.parts[index];
         turnDeltaT += part.tokens;
-        // The recency reserve always contains the newest completed tool output,
-        // so that output grows total mass T without growing reclaimable mass U.
         if (part.kind !== "toolOutput") turnDeltaU += part.uTokens;
     }
     return {

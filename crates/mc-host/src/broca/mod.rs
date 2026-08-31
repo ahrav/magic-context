@@ -1,13 +1,5 @@
-//! The Broca LLM-runner component: the third fixed `management_surface`
-//! target of the direct profile (R1), implementing exactly the five
-//! operations `HistorianProducer` consumes — `session.send`,
-//! `session.subscribe`, `run.status`, `run.cancel`, and `session.delete`
 //! (R3, R28).
 //!
-//! The component is the thin host adapter: it validates route identity at
-//! bind (R4), strictly decodes each body before any state exists (R3), and
-//! translates between `RequestCtx` and the [`supervisor::Supervisor`], which
-//! owns every run, cap, replay log, and lifecycle decision.
 
 pub mod backend;
 pub mod config;
@@ -36,9 +28,8 @@ pub const BROCA_MODULE_ID: &str = "broca";
 
 pub struct BrocaComponent {
     supervisor: Arc<Supervisor>,
-    /// Route handle -> bind-validated session key. Requests carry only the
-    /// handle, so this map is how a body-less identity (subscribe, delete)
-    /// resolves its session scope.
+    /// Each route handle maps to the session key validated at bind time.
+    /// The map resolves body-less `subscribe` and `delete` requests to their session scope.
     routes: Arc<Mutex<HashMap<RouteHandle, SessionKey>>>,
     route_fingerprints: Arc<Mutex<HashMap<RouteHandle, BTreeMap<String, String>>>>,
     credential_verifier: Option<Arc<CredentialVerifier>>,
@@ -61,9 +52,6 @@ impl CredentialVerifier {
             Harness::OpenCode => "opencode",
             Harness::Pi => "pi",
         };
-        // The same alias map used for row selection and fingerprint
-        // derivation; a divergent local copy here would look presented
-        // fingerprints up under a name the client never binds.
         let canonical = subprocess::canonical_provider(harness_name, provider)
             .map_err(|error| error.subreason())?;
         let expected = self
@@ -103,9 +91,6 @@ impl BrocaComponent {
         }
     }
 
-    /// The shared supervisor, cloned by tests before the component moves
-    /// into a composite so caps and charges stay observable from outside
-    /// the running host.
     pub fn supervisor(&self) -> Arc<Supervisor> {
         Arc::clone(&self.supervisor)
     }
@@ -157,12 +142,7 @@ impl CompositeComponent for BrocaComponent {
     }
 
     fn resources(&self) -> ResourceDeclaration {
-        // The fixed reserved-class declaration (R13, KTD2): 96 pending, 96
-        // tasks, and the 64 MiB retained budget the supervisor enforces
-        // internally plus the two retention classes that live outside that
-        // budget — the route-identity map and live backend transcript
-        // capture. Constants rather than limits so a test-shrunken
-        // supervisor still declares the product contract.
+        // These constants declare the product contract independently of the supervisor limit.
         ResourceDeclaration {
             reserved_handler_tasks: config::RESERVED_HANDLER_TASKS,
             reserved_pending_requests: config::RESERVED_PENDING_REQUESTS,
@@ -173,9 +153,9 @@ impl CompositeComponent for BrocaComponent {
     }
 
     async fn bind(&self, route: RouteHandle, identity: RouteIdentity) -> BindOutcome {
-        // R4: the route claims scope runs but grants no authority, so the
-        // only checks are the ones the supervisor's key needs to be
-        // well-formed. Messages stay value-free (R19).
+        // Route claims scope runs but grant no authority.
+        // Request validation requires only fields needed to construct the supervisor key.
+        // Messages carry no authority-bearing values.
         if identity.project_root.as_os_str().is_empty() || !identity.project_root.is_absolute() {
             return BindOutcome::Reject {
                 code: "invalid_identity".to_owned(),
@@ -204,10 +184,7 @@ impl CompositeComponent for BrocaComponent {
             .routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The declared route-identity headroom covers exactly
-        // MAX_BOUND_ROUTES identities; binding past it would retain bytes
-        // outside the published reservation whenever the host's own route
-        // limit is configured higher.
+        // Binding beyond `MAX_BOUND_ROUTES` retains bytes outside the reservation when the host route limit is higher.
         if routes.len() >= config::MAX_BOUND_ROUTES && !routes.contains_key(&route) {
             return BindOutcome::Reject {
                 code: "queue_full".to_owned(),
@@ -226,13 +203,7 @@ impl CompositeComponent for BrocaComponent {
         let Some(key) = self.key_of_route(ctx.route) else {
             return app_error("internal_error", "route is not bound to a broca session");
         };
-        // Parser scratch is reserved BEFORE decoding (KTD2): `parse_request`
-        // materializes owned prompt/system/model strings up to the body
-        // size, and up to the full callback fan-in could otherwise hold
-        // those copies outside the resident-byte budget before learning the
-        // pool is exhausted. The reservation depends only on the body
-        // length, so decode strictness is unchanged for admitted requests;
-        // the supervisor charges only what it retains.
+        // The handler reserves `ctx.body.len() + 512` bytes before parsing so parser allocations count against resident capacity.
         let Some(_scratch) = ctx.try_reserve_resident(ctx.body.len() + 512) else {
             return app_error(
                 "queue_full",
@@ -245,14 +216,7 @@ impl CompositeComponent for BrocaComponent {
         };
         match request {
             Request::Send(send) => {
-                // Contract precedence (`harness_unavailable.reasons_by_precedence`):
-                // descriptor_absent, descriptor_invalid, closure_incomplete, and
-                // argument_variant_invalid all rank ahead of every credential
-                // reason. The backend owns that verdict, so it is asked before the
-                // credential snapshot is verified — otherwise a startup with no
-                // usable descriptor and no provider row answered
-                // `credential_missing`, which names a remedy that cannot fix the
-                // descriptor the run actually lacks.
+                // The handler checks harness availability before credentials because descriptor failures take precedence over credential failures.
                 if let Some(reason) = self.supervisor.harness_unavailable_reason(key.harness) {
                     return app_error("harness_unavailable", reason);
                 }
@@ -294,8 +258,8 @@ impl CompositeComponent for BrocaComponent {
                 loop {
                     let unit = tokio::select! {
                         biased;
-                        // Request cancellation detaches only this waiter
-                        // (R9): the subscription drops below and the run
+                        // Cancelling a request drops its `Subscription` without cancelling the run.
+                        // Dropping the `Subscription` detaches the waiter without cancelling the run.
                         // continues untouched.
                         () = ctx.cancelled() => break,
                         unit = subscription.next() => unit,
@@ -308,7 +272,7 @@ impl CompositeComponent for BrocaComponent {
                         break;
                     }
                     if ctx.stream(item, false).await.is_err() {
-                        // Route closure or TCP loss: same detach rule.
+                        // Route closure and TCP loss drop the `Subscription` without cancelling the run.
                         break;
                     }
                 }
@@ -318,10 +282,8 @@ impl CompositeComponent for BrocaComponent {
     }
 
     async fn route_gone(&self, route: RouteHandle) {
-        // The host has already completed or force-aborted this route's
-        // request tasks, which dropped their `Subscription` waiters; only
-        // the identity mapping remains to clean up. Runs outlive their
-        // routes by design (R9).
+        // After route shutdown, the handler removes only the identity mapping; dropped `Subscription` waiters do not cancel runs.
+        // Runs outlive their routes.
         self.routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -350,12 +312,8 @@ impl CompositeComponent for BrocaComponent {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-        // Local state is drained either way, but a run whose process-group
-        // teardown was never proven may leave a provider descendant alive —
-        // and its crash record names this still-live process as owner, so a
-        // successor host skips it as live and never sweeps the orphan. The
-        // shutdown must fail so the runtime reports the host as not
-        // gracefully drained instead of vouching for work it cannot prove
+        // Shutdown fails when process-group teardown is unproven because a provider descendant may remain alive.
+        // Shutdown fails when process-group teardown is unproven.
         // stopped.
         if unresolved > 0 {
             return Err(ShutdownError(format!(
@@ -369,13 +327,8 @@ impl CompositeComponent for BrocaComponent {
 
 impl SecondaryComponent for BrocaComponent {
     async fn initialize(&self) -> Result<(), InitError> {
-        // The crash-ownership registry proves process identity through
-        // Linux `/proc` semantics (stat starttime, boot_id, group-member
-        // scans). No other platform provides those proofs, so the
-        // component refuses to initialize with a named platform error
-        // instead of surfacing an incidental `/proc` read failure from the
-        // sweep — and the post-spawn registration path that would kill
-        // every run before prompt delivery stays unreachable.
+        // The crash-ownership registry requires Linux `/proc` start times, boot IDs, and process-group scans to prove process identity.
+        // The handler rejects unsupported platforms before attempting `/proc` reads.
         if cfg!(not(target_os = "linux")) {
             return Err(InitError(
                 "broca requires Linux: crash-ownership records and sweeps \
@@ -383,29 +336,13 @@ impl SecondaryComponent for BrocaComponent {
                     .to_owned(),
             ));
         }
-        // No artifact to load: the deterministic or subprocess backend was
-        // constructed by the caller, and run state is process-local (R11).
         //
-        // Kill harness process groups a crashed predecessor left behind.
-        // This belongs here, not in `new`: initialization runs after the
-        // runtime holds the exclusive instance lock, so the predecessor is
-        // provably gone. Sweeping at construction would race — a
-        // predecessor still alive then has its entries skipped (live
-        // owner), and if it crashes while the successor is still retrying
-        // the lock, nothing would ever sweep them.
         //
-        // A sweep that cannot prove it finished fails startup rather than
-        // proceeding: recovery treats an unknown run as `missing` and may
-        // refire it, so an unverified registry could let a duplicate
-        // billable run race a surviving provider descendant. Refusing to
-        // start is recoverable; a double-billed refire is not.
         subprocess::group_registry::sweep_orphaned_groups().map_err(|err| {
             InitError(format!(
                 "broca could not sweep crash-orphaned process groups: {err}"
             ))
         })?;
-        // Same pass, same reason: a crash skips PrivateDir cleanup, leaving
-        // a run's hidden prompt and transcript on disk (R17/R19).
         subprocess::group_registry::sweep_orphaned_run_dirs().map_err(|err| {
             InitError(format!(
                 "broca could not sweep crash-orphaned run directories: {err}"

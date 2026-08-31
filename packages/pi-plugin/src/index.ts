@@ -1,23 +1,14 @@
 /**
- * Magic Context — Pi coding agent extension.
  *
- * Loaded once per Pi session via `pi.extensions` in package.json. Boots
- * Magic Context's shared SQLite store and registers session lifecycle
- * hooks: tools, transform pipeline (tagging + drops), historian trigger,
- * /ctx-aug command, system-prompt injection, dreamer scheduling, and
+ * Pi loads this extension once per session from `pi.extensions`.
  * agent_end cleanup.
  *
- * Storage: shares one SQLite database with the OpenCode plugin at
+ * Pi and OpenCode share `~/.local/share/cortexkit/magic-context/context.db`.
  *   ~/.local/share/cortexkit/magic-context/context.db
- * so project memories, embedding cache, dreamer runs, and other
- * project-scoped state are visible across both harnesses. Session-scoped
- * tables carry a `harness` column ('opencode' or 'pi') so per-session
- * data stays correctly attributed.
+ * Session-scoped tables use `harness` values `opencode` or `pi` to attribute each row to its harness.
  *
- * Config: read from the shared CortexKit location —
- *   $cwd/.cortexkit/magic-context.jsonc (project) and
- *   ~/.config/cortexkit/magic-context.jsonc (user) via `loadPiConfig()`.
- *   Falls back to schema defaults when neither file exists.
+ * `loadPiConfig()` reads project config from `$cwd/.cortexkit/magic-context.jsonc` and user config from `~/.config/cortexkit/magic-context.jsonc`.
+ * `loadPiConfig()` uses schema defaults when neither config file exists.
  */
 
 import { createRequire } from "node:module";
@@ -188,35 +179,17 @@ const managedDemandStart = createLazyManagedDemandStart({
 });
 
 // ---------------------------------------------------------------------------
-// Process-global init latch (issue #247)
 //
-// `@gotgenes/pi-subagents` runs child agent sessions IN-PROCESS inside the
-// parent Pi process. Each child inherits the parent's user packages, so Pi
-// re-imports and re-runs this extension factory for every child session. The
-// existing recursion guard (`MAGIC_CONTEXT_PI_SUBAGENT=1`) only covers
-// SPAWNED subprocess children because in-process children share the parent's
-// env without that variable. Without a process-wide signal, every in-process
-// child re-ran the full Magic Context init — opening the DB, wiring timers /
-// watchers / event handlers, and scheduling background session scans. Four
-// parallel children fanned out concurrent `SessionManager.listAll` scans over
-// ~392 JSONL sessions and crashed the parent with heap OOM.
+// `@gotgenes/pi-subagents` creates child sessions in the parent process, so a process-global latch prevents duplicate initialization.
+// `MAGIC_CONTEXT_PI_SUBAGENT=1` excludes spawned subagents but not in-process children, which inherit the parent environment.
 //
-// The latch below is a `Symbol.for` key on `globalThis` so it survives the
-// duplicate module instances Pi's jiti loader creates per session
-// (`moduleCache: false` resets module-level state on every re-import, but a
-// Symbol.for key is process-global). The first init in this process sets it;
-// every later init in the same process (in-process child, or a second factory
-// call from any source) sees it set and no-ops with the SAME contract as a
-// spawned subagent child — no watchers, no timers, no background scans. The
+// The latch uses `Symbol.for` on `globalThis` so duplicate module instances share it.
+// Later initializations register no watchers, timers, or background scans.
 // parent's already-registered extension instance keeps serving its session.
 //
-// Dispose / re-arm: Pi fires `session_shutdown` (reason "reload") before a
-// `/reload` re-imports extensions, and (reason "shutdown") when the user
-// leaves the session. Each AgentSession owns its own ExtensionRunner, so a
-// child session's `session_shutdown` only fires handlers the CHILD registered
-// (none, because the child no-op'd) — it cannot clear the parent's latch.
-// We clear the latch in the parent's `session_shutdown` handler so a `/reload`
-// legitimately re-initializes, while ephemeral in-process children never touch
+// Pi clears the parent's latch on `session_shutdown` so `/reload` can initialize a new extension.
+// Child `session_shutdown` events cannot invoke the parent's handlers.
+// A no-op child registers no shutdown handler and cannot clear the parent's latch.
 // it.
 // ---------------------------------------------------------------------------
 const PI_ACTIVE_LATCH = Symbol.for("magic-context.pi.active");
@@ -257,9 +230,9 @@ export function signalPiDeferredCompactionMarkerDrain(sessionId: string): void {
 }
 
 /**
- * Pi native compaction invalidates MC's cached m[0]/m[1] bytes. In normal mode
- * MC still owns compaction and cancels this event; compaction-off mode clears
- * only that cache and deliberately returns no cancellation result.
+ * Pi native compaction invalidates Magic Context's cached `m[0]` and `m[1]` bytes.
+ * In normal mode, Magic Context cancels Pi's event because Magic Context owns compaction.
+ * Compaction-off mode clears Pi's `m[0]` and `m[1]` cache without cancelling the event.
  */
 export async function handlePiSessionBeforeCompact(args: {
 	db: ContextDatabase;
@@ -358,10 +331,9 @@ function applyCompatiblePiTodoCapture(args: {
 }
 
 /**
- * Capture a `todowrite` args.todos payload only when it matches Magic Context's
- * exact todo enum contract. Third-party Pi extensions can reuse the same tool
- * name, so incompatible shapes must not update `last_todo_state` or the
- * transcript render cache.
+ * Capture `todowrite` payloads only when they match Magic Context's task-list enum contract.
+ * Third-party Pi extensions can reuse the `todowrite` tool name.
+ * Incompatible `todowrite` payloads must not update `last_todo_state` or the transcript render cache.
  */
 export function capturePiTodowriteArgsIfCompatible(args: {
 	db: ContextDatabase;
@@ -379,9 +351,8 @@ export function capturePiTodowriteArgsIfCompatible(args: {
 }
 
 /**
- * Scan an assistant `message_end` payload for the first compatible `todowrite`
- * call. This keeps interop with third-party tools that share the name but only
- * captures state when their payload matches Magic Context's todo enums exactly.
+ * Capture only the first compatible `todowrite` call from an assistant `message_end` payload.
+ * Accepting compatible payloads preserves interoperation with third-party tools that share the `todowrite` name.
  */
 export function capturePiTodowriteMessageIfCompatible(args: {
 	db: ContextDatabase;
@@ -425,14 +396,11 @@ function warn(message: string, data?: unknown): void {
 	log(`${PREFIX} WARN ${message}`, data);
 }
 
-// Migrate config from the legacy per-harness locations to the shared CortexKit
-// location BEFORE any loadPiConfig. The loader prefers the shared CortexKit
-// paths and only falls back to Pi-owned legacy files when that base is absent.
-// Memoized per directory so the per-cwd switch sites don't re-run the
-// (idempotent, lock-guarded) migration on every pass. Fails open.
+// The loader checks shared CortexKit paths before Pi-owned legacy files.
+// The loader falls back to Pi-owned legacy files only when no shared CortexKit base exists.
+// Cache each directory's migration result to avoid rerunning the idempotent, lock-guarded migration at every per-cwd switch.
 const migratedConfigDirs = new Set<string>();
-// Memoized per directory so repeated /cd lookups do not spam the same config
-// summary/warning lines on every hot-path config resolution.
+// Deduplicate config summaries and warnings by resolved directory when `args.dedupe` is true.
 const loggedPiConfigDirs = new Set<string>();
 function ensureConfigLocationsMigrated(dir: string): void {
 	if (migratedConfigDirs.has(dir)) return;
@@ -498,10 +466,6 @@ function resolvePiPressureContextLimit(args: {
 	piContextWindow: number;
 	model?: { provider?: string; id?: string; maxTokens?: number };
 }): number {
-	// Pi reports the model's context window directly (ctx.getContextUsage() /
-	// ctx.model.contextWindow) — its own authoritative source. We no longer
-	// consult models.dev for Pi. Sanity-bound the reported value so a transient
-	// garbage window can't poison pressure (mirrors OpenCode's SDK sane bound).
 	let detectedContextLimit: number | undefined;
 	try {
 		const overflowState = getOverflowState(args.db, args.sessionId);
@@ -563,11 +527,6 @@ export async function persistPiPressureFromMessageEnd(args: {
 			observedSafeInputTokens > 0 &&
 			pressure.inputTokens <= observedSafeInputTokens * 2
 		) {
-			// Pi resolves the window from its own runtime, not a cache we could
-			// reload — so a >100% reading with a known-good safe baseline means
-			// Pi's reported contextWindow is genuinely wrong. There's nothing to
-			// re-fetch; surface the alert (overflow detection still captures a
-			// real lower cap separately).
 			if (!meta.cacheAlertSent) {
 				updates.cacheAlertSent = true;
 				const safeTokens = Math.max(
@@ -600,7 +559,7 @@ export async function persistPiPressureFromMessageEnd(args: {
 	updateSessionMeta(args.db, args.sessionId, updates);
 }
 
-/** Plugin version from package.json. */
+/* */
 const PLUGIN_VERSION: string = (() => {
 	try {
 		const req = createRequire(import.meta.url);
@@ -610,22 +569,16 @@ const PLUGIN_VERSION: string = (() => {
 	}
 })();
 
-/** Lock the harness at module load. Safe to import this file in tests; the
- * lock is idempotent and will throw only on a conflicting reset. */
+/**
+ * */
 setHarness("pi");
 
 // ---------------------------------------------------------------------------
 // Config-driven resolvers
 //
-// Step 5b replaced the env-var stop-gaps with `loadPiConfig()`, which reads
-// the shared CortexKit config paths (project `.cortexkit/`, user `~/.config/`)
-// and falls back to Pi-owned legacy files only until migration completes. The
 // resolvers below
-// adapt the schema-shaped config into the Pi-specific options the various
-// registration helpers expect.
+// Each resolver returns `undefined` when its feature is disabled, allowing registration helpers to short-circuit.
 //
-// Each resolver returns `undefined` when the relevant feature is disabled
-// in config, so the registration helpers can short-circuit cleanly.
 // ---------------------------------------------------------------------------
 
 export function resolveSidekickFromConfig(
@@ -649,18 +602,13 @@ export function resolveSidekickFromConfig(
 export function resolveHistorianFromConfig(
 	config: MagicContextConfig,
 ): PiHistorianOptions | undefined {
-	// Defensive: schema declares `historian` required with default {}, but the
-	// runtime config can come from a malformed JSONC merge that drops the
-	// field. Fall back to undefined-safe access so plugin load never crashes.
+	// Malformed JSONC merges can omit `historian` despite its schema default; use undefined-safe access.
 	const historian = config.historian as HistorianConfig | undefined;
 	if (historian?.disable === true) return undefined;
 	const model = historian?.model?.trim();
 	if (!model || model.length === 0) return undefined;
 
-	// The historian chunk budget is anchored to the HISTORIAN model because
-	// it bounds one summarizer call. The trigger budget is intentionally NOT
-	// derived at startup: Pi resolves it per context pass from the live main
-	// session model + effective execute threshold to match OpenCode.
+	// `historianContextLimit` uses the historian model because the model bounds one summarizer call; Pi resolves the trigger budget per context pass from the live main-session model and effective execute threshold to match OpenCode.
 	const historianContextLimit = resolveHistorianContextLimit(model);
 	const historianChunkTokens = deriveHistorianChunkTokens(
 		historianContextLimit,
@@ -674,16 +622,10 @@ export function resolveHistorianFromConfig(
 		fallbackModels,
 		historianChunkTokens,
 		timeoutMs: config.historian_timeout_ms,
-		// `historian.two_pass` runs an editor pass after a successful
-		// first pass to clean low-signal U: lines and cross-compartment
-		// duplicates. Mirrors OpenCode's config flag — defaults to false
-		// on the schema side because the editor pass adds a second
-		// historian round-trip's latency and token cost. Enable for
-		// long sessions where chunk dedupe matters more than speed.
+		// `historian.two_pass` runs an editor pass after the first pass to remove low-signal `U:` lines and cross-compartment duplicates. It defaults to false because the second historian round trip adds latency and token cost.
 		twoPass: historian?.two_pass === true,
-		// Pi only: explicit thinking level for historian subagent invocations.
-		// When set, passed as --thinking <level> to Pi subprocess.
-		// Required for providers like GitHub Copilot that apply bad defaults.
+		// Pi uses the configured thinking level for historian subagent invocations.
+		// `PiSubagentRunner` passes `thinkingLevel` as `--thinking <level>` to the Pi subprocess.
 		thinkingLevel: historian?.thinking_level,
 		executeThresholdPercentage: config.execute_threshold_percentage,
 		executeThresholdTokens: config.execute_threshold_tokens,
@@ -718,12 +660,7 @@ export function resolveDreamerFromConfig(
 }
 
 /**
- * Pi extension default export. Called once per Pi session.
  *
- * Registers the full Magic Context Pi runtime: tools, transform pipeline
- * (tagging + drops), historian trigger, nudges, auto-search hint,
- * /ctx-aug command, system-prompt injection, and dreamer scheduling.
- * All driven by the user's `magic-context.jsonc` (Pi convention paths).
  */
 export default async function (pi: ExtensionAPI): Promise<void> {
 	if (process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV] === "1") {
@@ -732,14 +669,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		);
 		return;
 	}
-	// In-process child guard (issue #247): `@gotgenes/pi-subagents` runs child
-	// agent sessions in the SAME process as the parent. They share the parent's
-	// env (so the spawned-child env guard above never fires) and re-trigger this
-	// factory for every child session. The process-global latch marks that the
-	// full Magic Context runtime is already active in this process; a second
-	// init no-ops with the same contract as a spawned subagent (no watchers, no
-	// timers, no background scans). The parent's registered instance keeps
-	// serving. See the latch block above for the dispose / `/reload` re-arm path.
+	// `@gotgenes/pi-subagents` runs child agent sessions in the parent process.
+	// Child sessions inherit the parent's environment and re-run this factory, so the spawned-child guard does not run.
+	// The process-global latch records that the full Magic Context runtime is active in this process.
+	// A second initialization starts no watchers, timers, or background scans.
+	// Disposal and `/reload` re-arm the latch for a later registration.
 	if (isPiMagicContextActiveInProcess()) {
 		log(
 			`${PREFIX} in-process re-init detected (Magic Context already active in this process); skipping full extension registration`,
@@ -750,9 +684,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	markPiMagicContextActive();
 	beginBootQuietPeriod();
 
-	// Resolve the user-tier storage policy before opening the shared database.
-	// Project config cannot alter it, so every project in this process shares the
-	// operator's chosen owner-private or externally managed permission policy.
+	// The runtime resolves the user-tier storage policy before opening the shared database because project config cannot alter it.
+	// Every project in this process uses the operator's owner-private or externally managed permission policy.
 	const bootProjectDir = process.cwd();
 	ensureConfigLocationsMigrated(bootProjectDir);
 	const bootConfig = loadPiConfig({ cwd: bootProjectDir });
@@ -776,10 +709,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		db = null;
 	}
 
-	// openDatabase() returns null on the schema fence (DB newer than this binary).
-	// Genuine open/migration exceptions are caught above. Either way Magic Context
-	// cannot operate — when fail_closed_blocking is on (default), register a loud
-	// blocking surface instead of silently skipping hooks (native compaction).
+	// `openDatabaseAsync()` returns `null` when the persisted schema is newer than this binary supports.
+	// `openDatabaseAsync()` signals unsupported newer schemas with `null`; the catch handles thrown database-open and migration failures.
+	// When fail_closed_blocking is on (the default), Magic Context registers a blocking surface.
+	// The blocking surface prevents Magic Context from silently skipping hooks.
 	if (!db) {
 		const projectDirForConfig = process.cwd();
 		ensureConfigLocationsMigrated(projectDirForConfig);
@@ -846,9 +779,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 }
 
 /**
- * Full Pi Magic Context registration after a successful storage open.
- * Extracted so a healed re-probe from the fail-closed surface can start the
- * runtime without requiring a process restart.
+ * The fail-closed surface can re-probe and start the runtime without a process restart.
  */
 async function startPiMagicContextRuntime(
 	pi: ExtensionAPI,
@@ -857,20 +788,13 @@ async function startPiMagicContextRuntime(
 ): Promise<void> {
 	const db = database;
 
-	// Capture boot project for initial config load and logging only. Runtime
-	// identity/path resolution uses ctx.cwd per hook/command so session cwd
-	// switches follow the active project without reloading config.
+	// The boot project affects only initial config loading and logging.
+	// Identity and path resolution use `ctx.cwd` for each hook and command, so cwd switches follow the active project without reloading config.
 	const projectDir = process.cwd();
 	const seenDreamerProjectIdentities = new Set<string>();
-	// Step 5b: load the user's full magic-context.jsonc config. The loader
-	// reads the shared CortexKit project/user paths, validates them through the
-	// shared Zod schema, falls back to Pi-owned legacy files only while migration
-	// is incomplete, and uses defaults for invalid fields per-key. It returns
-	// the merged config plus warnings.
+	// Invalid config fields use defaults per key.
 	//
-	// We surface warnings via the standard `warn()` channel so users see
-	// them in the magic-context log. Loading never throws — bad config
-	// gracefully degrades to defaults.
+	// `warn()` surfaces invalid-config warnings to users.
 	ensureConfigLocationsMigrated(projectDir);
 	const { config, warnings, loadedFromPaths, registrationPromptSurface } =
 		loadPiConfig({
@@ -891,8 +815,7 @@ async function startPiMagicContextRuntime(
 		`loaded v${PLUGIN_VERSION} | harness=pi | db=${dbPath} | ` +
 			`project=${projectIdentity} | dir=${projectDir}`,
 	);
-	// Pi tools are registered once per process, so this mode is intentionally
-	// boot-resolved rather than following later /cd project config changes.
+	// Pi registers tools once per process, so compaction registration does not follow later /cd config changes.
 	const compactionOff = !isCompactionEnabled(config);
 	setCtxReduceRegisteredGlobally(!compactionOff);
 	if (!compactionOff) {
@@ -912,8 +835,8 @@ async function startPiMagicContextRuntime(
 			);
 		}
 	}
-	// The allowlist is user-tier only, so configure all child runners once at
-	// boot. Project config is stripped before this merged config is returned.
+	// Pi configures child-runner extensions once at boot because the allowlist is user-tier only.
+	// The returned merged config strips project-level subagent extension settings.
 	configurePiSubagentExtensions(config.pi?.subagent_extensions);
 	logPiConfigLoad({
 		dir: projectDir,
@@ -922,9 +845,7 @@ async function startPiMagicContextRuntime(
 		dedupe: true,
 	});
 
-	// Reapply boot-resolved storage and SQLite settings in case config changed
-	// between the initial open and runtime registration. cache_size / mmap_size
-	// take effect live; future opens in this process pick them up via
+	// setSqlitePragmaConfig supplies cache_size and mmap_size to future opens in this process.
 	// setSqlitePragmaConfig.
 	setStoragePrivatePermissionEnforcement(
 		config.storage.enforce_private_permissions,
@@ -935,12 +856,9 @@ async function startPiMagicContextRuntime(
 	});
 	applySqliteTuningPragmas(db);
 
-	// Debug data-collection toggle: keep subagent child sessions instead of
-	// deleting on success (parity with the OpenCode plugin).
+	// keep_subagents preserves child sessions after successful completion.
 	setKeepSubagents(config.keep_subagents === true);
 
-	// Top-level disable: when `enabled: false` is set in config, register
-	// nothing — same fail-closed posture the OpenCode plugin uses.
 	if (!config.enabled) {
 		info("plugin DISABLED via config (enabled: false) — skipping registration");
 		return;
@@ -963,10 +881,8 @@ async function startPiMagicContextRuntime(
 		dreamerEnabled: boolean;
 	};
 
-	// Per-cwd runtime deps. Pi can switch projects mid-process (`/cd`,
-	// multi-root), while tools and slash commands are registered only once.
-	// Resolve all project-sensitive config through this memoized accessor so
-	// every invocation reads the active cwd's config instead of the launch cwd's.
+	// Pi resolves runtime dependencies per cwd because /cd and multi-root sessions can switch projects while registrations remain process-wide.
+	// The memoized project-dependency accessor resolves project-sensitive configuration for the active cwd.
 	const projectDepsByDir = new Map<string, ResolvedPiProjectDeps>();
 
 	const buildContextOptions = (
@@ -1100,42 +1016,20 @@ async function startPiMagicContextRuntime(
 	const todowriteOverlayEnabled =
 		todowriteEnabled && bootProjectDeps.config.todowrite.overlay !== false;
 
-	// Register the agent-facing tools. Reuses the same business logic
-	// the OpenCode plugin uses (insertMemory, unifiedSearch, addNote, …)
-	// via the shared cortexkit DB. Cross-harness memory sharing is automatic
-	// because both plugins resolve the same project identity for the same
 	// directory.
-	// Pi registers tools, commands, and widgets once at extension boot. Therefore
-	// `todowrite.enabled` follows the boot project's config: after `/cd` into a
-	// project with a different value, users need `/reload` or a Pi restart for the
-	// tool/command/overlay surface to change, matching Pi's registration lifecycle.
+	// Pi registers tools and slash commands once per process.
 	registerMagicContextTools(pi, {
 		db,
 		ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
-		// Main extension entry never gets the dreamer-only ctx_memory
-		// surface — those actions are reserved for dreamer subagents
-		// loaded via subagent-entry.ts with the
 		// `--magic-context-dreamer-actions` flag.
 		allowDreamerActions: false,
-		// ALWAYS register ctx_memory in the main entry. Pi is a single REPL that
-		// can `/cd` between projects, but tool registration happens once at boot,
-		// so gating registration on the BOOT project's memory.enabled would
-		// mismatch the per-project prompt (which re-resolves memory.enabled each
-		// pass): start in a memory-off project and switch to a memory-on one and
-		// the tool would be absent while the prompt advertises it. The tool's
-		// own per-call guard (ctx-memory.ts, getProjectEmbeddingSnapshot) refuses
-		// when the CURRENT project has memory off, so always-register is correct.
-		// (The subagent entry still uses memoryToolEnabled to keep ctx_memory off
-		// the retrieval-only sidekick, a separate security concern.)
+		// Pi registers tools once per process even though /cd can change projects.
 		memoryToolEnabled: true,
 		protectedTags: config.protected_tags ?? 20,
 		resolveProtectedTags: (ctx) =>
 			resolveCurrentProjectDeps(ctx).config.protected_tags ?? 20,
 		resolveProjectIdentity: (ctx) =>
 			resolveCurrentProjectDeps(ctx).projectIdentity,
-		// Smart notes (surface_condition) only work when dreamer is
-		// running — otherwise the note sits `pending` forever with no
-		// path to surface. Match the user's dreamer config flag.
 		dreamerEnabled: isDreamerRunnable(config),
 		resolveDreamerEnabled: (ctx) =>
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
@@ -1177,9 +1071,6 @@ async function startPiMagicContextRuntime(
 			: "registered todowrite overlay: DISABLED (todowrite.enabled=false or todowrite.overlay=false)",
 	);
 
-	// Register the per-LLM-call transform pipeline. Tags eligible message
-	// parts via the shared Tagger and applies queued drops from
-	// `pending_ops` so /ctx-flush and ctx_reduce work against Pi sessions.
 	registerPiContextHandler(pi, bootProjectDeps.contextOptions);
 	info(
 		bootProjectDeps.historianConfig
@@ -1192,8 +1083,6 @@ async function startPiMagicContextRuntime(
 			: "registered auto-search hint: DISABLED (memory.auto_search.enabled=false)",
 	);
 
-	// Register /ctx-aug once, but resolve sidekick config from the active cwd
-	// every invocation so `/cd` follows the current project's model/language.
 	registerCtxAugCommand(
 		pi,
 		(ctx) => resolveCurrentProjectDeps(ctx).sidekickConfig,
@@ -1204,8 +1093,6 @@ async function startPiMagicContextRuntime(
 			: "registered /ctx-aug (sidekick disabled — set sidekick.disable=false and sidekick.model in config)",
 	);
 
-	// Register the shared renderer before any command can append a status entry.
-	// Plain custom entries render in interactive Pi without entering model context.
 	const statusEntryRendererAvailable = registerCtxStatusEntryRenderer(pi);
 	info(
 		statusEntryRendererAvailable
@@ -1213,9 +1100,6 @@ async function startPiMagicContextRuntime(
 			: "ctx-status entry renderer unavailable; using legacy visible-message fallback",
 	);
 
-	// Step 5c: register the diagnostic/admin slash commands so Pi reaches
-	// command-surface parity with the OpenCode plugin. Their user-facing output
-	// uses model-invisible custom entries when the runtime can render them.
 	const recompRunner = new PiSubagentRunner();
 	const wrapupRunner = new PiSubagentRunner();
 	const upgradeRunner = new PiSubagentRunner();
@@ -1260,10 +1144,6 @@ async function startPiMagicContextRuntime(
 	registerCtxFlushCommand(pi, { db, compactionOff });
 	info("registered /ctx-flush");
 
-	// Approval/enforcement resolve against the identity-owning ROOT, not the
-	// invoking cwd: a /cd into a subdirectory of the same repository keeps
-	// the ancestor-resolved identity, and artifact paths must canonicalize
-	// against that same root or in-repo paths read as escapes.
 	const resolveCommandProject = (ctx: { cwd: string }) => ({
 		projectDir: resolveProjectRootDirectory(ctx.cwd),
 		projectIdentity: resolveCurrentProjectDeps(ctx).projectIdentity,
@@ -1341,9 +1221,6 @@ async function startPiMagicContextRuntime(
 	});
 	info("registered /ctx-wrapup");
 
-	// E6b/E6c: /ctx-session-upgrade — full recomp (legacy→v2 tiered) + once-per-
-	// project memory migration into the 5-category taxonomy. Own runner instance
-	// for the same isolation reasons as /ctx-recomp.
 	registerCtxSessionUpgradeCommand(pi, {
 		...historianCommandDeps(bootProjectDeps, upgradeRunner),
 		allowHomeProject: bootProjectDeps.config.allow_home_project,
@@ -1398,10 +1275,6 @@ async function startPiMagicContextRuntime(
 	});
 	info("registered /ctx-embed");
 
-	// Register Pi project with the singleton dreamer timer. When dreamer is
-	// disabled in config (default) this is a no-op. When enabled, the timer
-	// schedules dream runs based on config.dreamer.schedule and uses
-	// PiSubagentRunner to spawn child sessions for each task.
 	const dreamerConfig = bootProjectDeps.dreamerConfig;
 	if (dreamerConfig) {
 		registerPiDreamerProject({
@@ -1428,36 +1301,18 @@ async function startPiMagicContextRuntime(
 		);
 	}
 
-	// Inject the magic-context guidance block into the system prompt for every agent
-	// turn, then run hash-detection + sticky-date freezing so the
-	// resulting prompt stays cache-stable across turns when nothing
-	// material has changed.
 	//
-	// Pi has prefix caching the same way OpenCode does — every major
-	// LLM provider (Anthropic, OpenAI, Codex, GitHub Copilot, etc.)
-	// caches the system prompt portion of the prefix. Drift between
-	// turns busts the cache and the user pays full input price for the
-	// next call. The protections here mirror OpenCode's
-	// `experimental.chat.system.transform` handler in
 	// `system-prompt-hash.ts`.
 	pi.on("before_agent_start", async (event, ctx) => {
-		// Match OpenCode's first-prompt lazy-load boundary so synchronous token
-		// estimates below never depend on a virtual bundled-module resolution base.
 		await preloadTokenizer();
-		// Startup release announcement (Pi parity with OpenCode TUI dialog +
-		// Desktop ignored message). Fires once per ANNOUNCEMENT_VERSION across
-		// the whole machine — persistence file is shared with the OpenCode
-		// plugin via `getMagicContextStorageDir()/last_announced_version`.
+		// The extension shows each ANNOUNCEMENT_VERSION once per machine.
+		// Pi and OpenCode share the persistence file, so an announcement appears once per machine.
+		// Pi and OpenCode share `getMagicContextStorageDir()/last_announced_version` to suppress duplicate announcements.
 		//
-		// Skipped silently when:
-		//   - announcement constants are empty (bugfix-only release)
-		//   - the current ANNOUNCEMENT_VERSION was already dismissed (here or
-		//     in OpenCode TUI/Desktop)
-		//   - ctx.hasUI is false (print/rpc subagent — no point notifying)
+		// The extension suppresses announcements when the announcement constants are empty.
+		// The extension suppresses announcements when Pi or OpenCode has dismissed `ANNOUNCEMENT_VERSION`.
 		//
-		// Fire-and-forget: storage write happens inside markAnnouncementSeen,
-		// any failure is swallowed. Worst case is a duplicate notification
-		// the next time the user starts an interactive Pi session.
+		// markAnnouncementSeen writes storage asynchronously and swallows failures; a failure can cause a duplicate notification at the next interactive Pi startup.
 		try {
 			if (ctx.hasUI && shouldShowAnnouncement()) {
 				// URLs render as plain text. Modern terminals auto-detect and
@@ -1475,15 +1330,14 @@ async function startPiMagicContextRuntime(
 					featureText,
 				];
 				if (ANNOUNCEMENT_FOOTER && ANNOUNCEMENT_FOOTER.trim().length > 0) {
-					// Blank-line separator distinguishes the persistent footer
-					// (Discord invite, etc.) from the version-specific bullets.
+					// The blank line separates the persistent footer from version-specific bullets.
 					sections.push("", ANNOUNCEMENT_FOOTER);
 				}
 				ctx.ui.notify(sections.join("\n"), "info");
 				markAnnouncementSeen(ANNOUNCEMENT_VERSION);
 			}
 		} catch {
-			// Never block agent start on announcement delivery.
+			// Announcement-delivery failures do not block agent startup.
 		}
 
 		try {
@@ -1495,19 +1349,14 @@ async function startPiMagicContextRuntime(
 			const effectiveConfig = effectiveProjectDeps.config;
 			seenDreamerProjectIdentities.add(currentProject.projectIdentity);
 
-			// Re-register the dreamer for the CURRENT project. The boot-time
-			// registration above used process.cwd(), but Pi can switch projects
-			// mid-process (`/cd`, multi-root). Without this, a switched-into
-			// project is never dreamed and `/ctx-dream` there throws
-			// "not registered". registerPiDreamerProject is idempotent for the
-			// same identity+dir, and rebuilds against the new checkout when the
-			// directory changed (worktree/clone of the same repo).
+			// The initial `registerPiDreamerProject` call uses `process.cwd()`, but Pi can switch projects.
+			// Pi can switch projects mid-process (`/cd`, multi-root).
+			// Without registration, a switched-into project is never dreamed and `/ctx-dream` throws "not registered".
+			// `registerPiDreamerProject` is idempotent for the same identity and directory.
+			// `registerPiDreamerProject` rebuilds when the directory changes for the same repository identity.
 			//
-			// All project-sensitive config comes from resolveCurrentProjectDeps(ctx),
-			// the same per-cwd accessor used by tools, commands, and the context
-			// pipeline. A switched-into project may carry its own config (different
-			// model/schedule, or its own `dreamer.disable`), so boot config must not
-			// leak into this registration.
+			// A switched-into project may carry its own config, so use `resolveCurrentProjectDeps(ctx)`.
+			// A switched-into project may carry its own config, so boot config must not leak into this registration.
 			const effectiveDreamerConfig = effectiveProjectDeps.dreamerConfig;
 			if (effectiveDreamerConfig) {
 				try {
@@ -1527,9 +1376,7 @@ async function startPiMagicContextRuntime(
 					warn("before_agent_start: registerPiDreamerProject threw:", err);
 				}
 			} else {
-				// The current checkout disables the dreamer. Any existing registration
-				// for this identity may have been created while another checkout's
-				// config was active, so tear it down explicitly here.
+				// An existing registration may use configuration from a different checkout.
 				try {
 					unregisterPiDreamerProject({
 						projectIdentity: currentProject.projectIdentity,
@@ -1538,9 +1385,8 @@ async function startPiMagicContextRuntime(
 					warn("before_agent_start: unregisterPiDreamerProject threw:", err);
 				}
 			}
-			// Pi exposes `sessionManager.getSessionId()` once a session is
-			// active. We resolve it here defensively because before_agent_start
-			// fires once per agent turn.
+			// `sessionManager.getSessionId()` is available only after Pi creates a session.
+			// `before_agent_start` resolves the session ID because it fires once per agent turn.
 			const sm = ctx.sessionManager;
 			let sessionId: string | undefined;
 			if (sm !== undefined) {
@@ -1550,29 +1396,18 @@ async function startPiMagicContextRuntime(
 					try {
 						const id = getId.call(sm);
 						if (typeof id === "string" && id.length > 0) sessionId = id;
-					} catch {
-						// Fail open — sessionId stays undefined.
-					}
+					} catch {}
 				}
 			}
 			if (sessionId) {
 				trackSessionForProject(currentProject.projectIdentity, sessionId);
 
-				// Re-arm a pending Pi compaction-marker drain on session ACTIVATION,
-				// not just at process startup. session_before_switch clears the
-				// in-memory deferred-refresh/materialization sets for the outgoing
-				// session (those Sets are per-process and would otherwise leak); but
-				// the durable pending marker in session_meta survives. On switch-BACK
-				// the marker would then sit undrained (the drain is signal-driven, and
-				// startup-only rehydration never re-fires). Re-signal here when this
-				// session has a durable pending marker so the next eligible materializing
-				// pass drains it, using the same deferred signal shape as startup.
+				// A session switch clears the outgoing session's deferred-refresh and materialization sets to prevent cross-session leakage.
+				// The durable pending marker in `session_meta` survives a session switch.
+				// The durable marker requires a signal-driven drain; startup rehydration does not rerun on switch-back.
+				// A session switch re-signals a durable pending marker so the next eligible materializing pass drains it.
 				//
-				// Gate on the same APIs the drain itself requires
-				// (sessionManager.appendCompaction + getBranch): when they're
-				// unavailable the drain skips-and-PRESERVES the signal, so re-signaling
-				// every turn would keep an undrainable signal armed. Only re-arm when the
-				// marker can actually be applied.
+				// The drain re-arms only when `appendCompaction` and `getBranch` are available; otherwise it preserves its signal.
 				try {
 					const smForDrain = sm as {
 						appendCompaction?: unknown;
@@ -1589,13 +1424,10 @@ async function startPiMagicContextRuntime(
 						signalPiDeferredCompactionMarkerDrain(sessionId);
 					}
 				} catch {
-					// Best-effort: a read failure must not block agent start.
+					// A pending-marker read failure must not block agent start.
 				}
 
-				// E6d: one-time upgrade reminder for sessions with legacy (pre-v2)
-				// compartments. Model-invisible (ctx.ui.notify), self-gating via the
-				// durable + per-process guards in the shared helper. Only when the
-				// historian can run (so /ctx-session-upgrade is actionable).
+				// The reminder path targets sessions with legacy pre-v2 compartments only when the historian can run.
 				if (
 					!compactionOff &&
 					ctx.hasUI &&
@@ -1610,23 +1442,21 @@ async function startPiMagicContextRuntime(
 								return "sent";
 							},
 							getNotificationParams: () => ({}),
-							// Pi's ctx.ui.notify is a TRANSIENT toast (no scrollback),
-							// so the durable stamp must not suppress after one missed
-							// toast — re-prompt each Pi start until the session upgrades.
+							// Pi's `ctx.ui.notify` toast is transient and absent from scrollback.
+							// The durable `session_meta` marker must not suppress reminders after one missed toast.
+							// The durable `session_meta` marker re-prompts each Pi start until the session upgrades.
 							deliveryPersists: false,
 						},
 						sessionId,
 					).catch(() => {
-						// Never block agent start on reminder delivery.
+						// Reminder-delivery failures do not block agent startup.
 					});
 				}
 			}
 
-			// Use effectiveConfig (re-resolved from the CURRENT checkout's cwd on
-			// a project switch) for every system-prompt decision below — a
-			// switched-into project may carry its own .cortexkit/magic-context.jsonc
-			// (memory/docs/key-files/injection toggles). Reusing boot `config`
-			// would render the launch project's adjuncts in the new checkout.
+			// The handler resolves `effectiveConfig` from the current checkout after a project switch.
+			// A switched-into project may contain `.cortexkit/magic-context.jsonc`.
+			// Reusing boot `config` would render the launch project's adjuncts in the new checkout.
 			if (effectiveConfig.system_prompt_injection?.enabled === false) {
 				return;
 			}
@@ -1640,20 +1470,16 @@ async function startPiMagicContextRuntime(
 				return;
 			}
 
-			// PEEK the system-prompt refresh signal. Set by:
 			//   - `/ctx-flush`
-			//   - dreamer publication of new ARCHITECTURE.md / STRUCTURE.md
-			//   - user-memory promotion (dreamer)
-			//   - hash-change detection on the previous turn (signaled below)
+			// Dreamer publication of `ARCHITECTURE.md` or `STRUCTURE.md` sets the refresh signal.
+			// Dreamer user-memory promotion sets the refresh signal.
+			// Hash-change detection on the previous turn sets the refresh signal.
 			//
-			// When set, we re-read disk-backed adjuncts on this turn. When
-			// not set, cached values are reused.
+			// When the refresh signal is set, the handler reloads disk-backed adjuncts.
+			// When the refresh signal is unset, the handler reuses cached values.
 			//
-			// PEEK-then-drain-on-success (Oracle audit Round 8 #6): we
-			// only `clearSystemPromptRefresh(...)` AFTER the rebuild
-			// (`buildMagicContextBlock` + `processSystemPromptForCache`)
-			// completes successfully. If either throws, the flag survives
-			// so the next prompt retries the rebuild.
+			// The handler clears the refresh signal only after `buildMagicContextBlock` and `processSystemPromptForCache` succeed.
+			// `buildMagicContextBlock` or `processSystemPromptForCache` failures preserve the signal for retry on the next prompt.
 			const isCacheBusting = sessionId
 				? hasSystemPromptRefresh(sessionId)
 				: true; // first-pass-no-session: act as cache-busting (force fresh read)
@@ -1697,10 +1523,8 @@ async function startPiMagicContextRuntime(
 				language: effectiveConfig.language,
 				promptSurfacePreset: promptSurface.preset,
 				primaryGuidanceOverride: promptSurface.primaryOverride,
-				// Stable user memories rendered as <user-profile> — dreamer
-				// promotes recurring observations into this set, then the
-				// system prompt surfaces them across all sessions in the
-				// project. Gated on dreamer.user_memories.enabled.
+				// Dreamer promotes recurring observations to stable memories, which render as `<user-profile>`.
+				// The handler renders user memories only when `dreamer.user_memories.enabled` is true.
 				userMemoriesEnabled: userMemoryCollectionEnabled(
 					effectiveConfig.dreamer,
 				),
@@ -1708,20 +1532,14 @@ async function startPiMagicContextRuntime(
 				existingSystemPrompt: event.systemPrompt,
 			});
 
-			// Compose the final system prompt: base prompt from Pi + our
-			// magic-context block. We always run hash detection on the
-			// composed string so even sessions with no data block (e.g.
-			// memories disabled, no docs, no key files) still get
-			// sticky-date freezing and hash-change tracking.
+			// When `sessionId` is present, the handler hashes `composedPrompt` even without `block` so cache tracking freezes the sticky date and detects changes.
 			const composedPrompt = composeMagicContextSystemPrompt(
 				event.systemPrompt,
 				block,
 			);
 
 			if (!sessionId) {
-				// No session id yet — return the composed prompt without
-				// cache logic. The next turn (with a session id) will
-				// compute the first hash and set sticky date.
+				// Without `sessionId`, the handler skips cache processing; a later turn with `sessionId` initializes the hash and sticky date.
 				if (block) return { systemPrompt: composedPrompt };
 				return;
 			}
@@ -1735,22 +1553,17 @@ async function startPiMagicContextRuntime(
 			});
 
 			if (result.hashChanged) {
-				// Real prompt-content or preset change. Signal all three
-				// independent refresh sets so the next pi.on("context") event
-				// rebuilds <session-history> + lets queued ops
-				// materialize, AND the next before_agent_start refreshes
-				// adjuncts (since this turn's adjunct read used the
-				// cached values that are now potentially stale).
+				// When `hashChanged`, the handler queues history, system-prompt, and pending-materialization refreshes because this turn may have read stale cached adjuncts.
+				// The next `pi.on("context")` rebuilds `<session-history>` and materializes queued operations.
+				// The next `before_agent_start` refreshes adjuncts.
 				signalPiHistoryRefresh(sessionId);
 				signalPiSystemPromptRefresh(sessionId);
 				signalPiPendingMaterialization(sessionId);
 			}
 
-			// PEEK-then-drain-on-success (Oracle audit Round 8 #6):
-			// drain only if the start-of-pass peek was true. Using the
-			// CAPTURED boolean (not a re-read of the set) so that a
-			// signal added later in the same pass — e.g. `result.hashChanged`
-			// just above — survives to the next prompt for retry.
+			// The handler clears the refresh signal only when the pass-start `isCacheBusting` was true.
+			// The handler uses the pass-start `isCacheBusting` value rather than rereading the refresh set.
+			// Using the pass-start `isCacheBusting` value preserves signals raised during the pass, including `result.hashChanged`, for the next prompt.
 			if (isCacheBusting) {
 				clearSystemPromptRefresh(sessionId);
 			}
@@ -1763,68 +1576,35 @@ async function startPiMagicContextRuntime(
 	});
 	info("registered before_agent_start system prompt injector");
 
-	// agent_end MUST be fire-and-forget for in-flight historian / dreamer
+	// The `agent_end` handler must not await in-flight historian or Dreamer work.
 	// runs.
 	//
-	// REGRESSION FIXED HERE: Earlier code awaited `awaitInFlightHistorians()`
-	// inside this handler with the (incorrect) assumption that Pi's event
-	// fanout is synchronous and ignores returned Promises. In reality
-	// pi-coding-agent's `extensions/runner.js` does `await handler(event, ctx)`
-	// for every extension `agent_end` handler, and `agent-session.js`
-	// awaits its own emit before delivering the UI-facing `agent_end`.
-	// The TUI loader stops only after that UI event. Net effect: every
-	// turn that triggered a historian (a 30s+ background subagent) left
-	// the user staring at "Working..." with `historian` pinned in the
-	// footer until the background run finished — the OPPOSITE of the
-	// "compact in the background while the main agent keeps working"
-	// invariant magic-context is supposed to provide.
+	// The `agent_end` handler must not await `awaitInFlightHistorians()` because Pi awaits extension handlers before delivering the UI-facing `agent_end` event.
+	// `extensions/runner.js` awaits each `agent_end` handler.
+	// `agent-session.js` awaits its emit before delivering the UI-facing `agent_end` event.
+	// Awaiting an in-flight historian delays TUI completion until the background run finishes.
+	// Historian compacts in the background while the main agent continues.
+	// Magic-context requires background compaction while the main agent continues.
 	//
-	// Why fire-and-forget is safe in interactive mode:
-	//   - The Pi process stays alive between turns. The next turn's
-	//     `pi.on("context")` handler checks `inFlightHistorian.has(sessionId)`
-	//     and skips re-firing while a previous historian is still
-	//     running, so we never double-spawn.
-	//   - Historian publication paths register the run promise in
-	//     `inFlightHistorian` so emergency 95% waits and `session_shutdown`
-	//     drainage can still join the background work when actually
+	// Interactive Pi remains alive between turns, so background historians can continue.
+	// The `context` handler prevents duplicate historian runs for a `sessionId`.
+	// Historian publication paths register each run in `inFlightHistorian`.
+	// `inFlightHistorian` lets 95% waits and `session_shutdown` join active runs.
 	//     needed.
-	//   - All work historian does is durable (compartment + fact rows,
-	//     publish marker, signalPiHistoryRefresh). Even if the user
-	//     closes Pi mid-historian and the subprocess gets killed, the
-	//     next session start re-evaluates and either picks up where the
-	//     prior run left off or recovers from `historian_failure_count`.
+	// After an interrupted historian, the next session resumes or uses `historian_failure_count` recovery.
 	//
-	// `pi --print` (single-turn, exits after agent_end) is the one mode
-	// where backgrounding is genuinely incompatible with subprocess
-	// lifetime — Pi's process exits and SIGKILLs the still-running
-	// historian. That tradeoff is intentional: print mode is for
-	// scripting / one-shot tasks where blocking the user's interactive
-	// shell on a 30s historian is also wrong, just in a different way.
-	// We let print mode skip the wait too. Users who want guaranteed
-	// historian completion in print mode should run interactive Pi
+	// `pi --print` exits after `agent_end`, killing any background historian.
 	// instead.
 	pi.on("agent_end", (event, ctx) => {
-		// Synchronous return — DO NOT await background work here.
-		// awaitInFlightHistorians()/awaitInFlightDreamers() are still
-		// invoked at session_shutdown where they belong (and where pi
-		// gives us a window before tearing down stdio). Errors from
-		// background runs are handled by their own try/catch chains
-		// (runPiHistorian wraps everything; spawnPiHistorianRun's
-		// .finally cleans up the inFlight map).
+		// The `agent_end` handler must return synchronously and must not await background work.
+		// `session_shutdown` awaits in-flight historians and dreamers before stdio teardown.
+		// Each background run handles its own errors.
 		log("agent_end: returning synchronously (background work continues)");
 
-		// Channel 2 (ceiling) nudge delivery — the Pi analog of OpenCode's
-		// event-handler delivery on terminal message.updated. The pipeline
-		// records a `pending` intent near the threshold; deliver it here at the
-		// turn boundary via sendMessage(followUp). Internally CAS-gated to one
-		// delivery per tail-reset cycle, and no-ops unless `pending`.
-		// Fire-and-forget; never block agent_end.
+		// The pipeline records a `pending` intent near the threshold, and the `agent_end` handler delivers it through `sendMessage(followUp)` at the turn boundary.
+		// `maybeDeliverChannel2Pi` uses CAS to deliver at most once per tail-reset cycle and only when the intent is `pending`.
 		//
-		// Deliver ONLY on a clean final stop. Pi emits agent_end for error /
-		// aborted responses and for retry attempts too (agent-loop); delivering
-		// on those would inject the follow-up mid-retry and consume the cycle
-		// before the turn actually completed. OpenCode's equivalent gates on
-		// finish === "stop". Mirror that with the final assistant's stopReason.
+		// `agent_end` delivers a follow-up only when the final assistant `stopReason` is `"stop"`; error, aborted, and retry events could inject a follow-up mid-retry and consume the cycle.
 		try {
 			const msgs = (
 				event as { messages?: Array<{ role?: string; stopReason?: string }> }
@@ -1842,30 +1622,13 @@ async function startPiMagicContextRuntime(
 		}
 	});
 
-	// Tool-execution-start hook: detect note-nudge triggers from
-	// agent tool usage. Mirrors OpenCode's `tool.execute.after` hook in
-	// `hook-handlers.ts` (`createToolExecuteAfterHook`). We use Pi's
-	// `tool_execution_start` event because (a) it fires before the tool
-	// runs (so we can inspect args without waiting for output, matching
-	// OpenCode's `tool.execute.before`/`after` that have full args
-	// available), and (b) `tool_execution_end` is fire-and-forget and
-	// could race with the next pipeline pass.
+	// `tool_execution_start` exposes `event.args` before tool output.
+	// `tool_execution_end` is fire-and-forget and can race with the next pipeline pass.
 	//
-	// What we wire:
 	//
-	//   - `todowrite` with all-terminal todos → `todos_complete` trigger.
-	//     The agent's `todos` arg is an array of {id, content, status}
-	//     items. Note nudges should fire only when EVERY item is in a
-	//     terminal state (`completed` or `cancelled`) — firing on every
-	//     todowrite is too eager since agents call it repeatedly during
-	//     work to mark intermediate progress.
+	// Firing note nudges for every `todowrite` is premature because agents use repeated calls to record intermediate progress.
 	//
-	//   - `ctx_note` (any action) → `clearNoteNudgeState(sessionId)`.
-	//     The agent already saw / acted on notes, so we kill any
-	//     pending sticky reminder for this session right away. Subagents
-	//     never deliver note nudges (gated upstream in postprocess),
-	//     so we still skip the trigger for them. Mirrors OpenCode's
-	//     `if (typedInput.tool === "ctx_note") clearNoteNudgeState(...)`.
+	// `postprocess` prevents subagents from delivering note nudges.
 	pi.on("tool_execution_start", async (event, ctx) => {
 		try {
 			const sessionId = ctx.sessionManager.getSessionId();
@@ -1882,17 +1645,7 @@ async function startPiMagicContextRuntime(
 					? getOrCreateSessionMeta(db, sessionId)
 					: null;
 
-				// Synthetic-todowrite snapshot capture (Pi parity with
-				// OpenCode hook-handlers.ts:386-401). Persist normalized
-				// state on EVERY todowrite call so the transform-time
-				// injection path in pi-pipeline.ts always has a current
-				// snapshot to replay on the next cache-busting pass.
-				// Render-safe: this only stores validated todos in shared
-				// session state and the local tool-call cache; it does not
-				// mutate Pi messages. Subagents skip — they do not get synthetic
-				// todowrite injection. Foreign Pi extensions can share the
-				// `todowrite` name, so only the exact Magic Context todo
-				// shape updates the stored snapshot.
+				// The capture persists normalized state on every `todowrite` call so the transform-time injection path has a current snapshot.
 				capturePiTodowriteArgsIfCompatible({
 					db,
 					sessionId,
@@ -1918,8 +1671,7 @@ async function startPiMagicContextRuntime(
 				clearNoteNudgeTriggerAndCooldown(db, sessionId);
 			}
 		} catch (err) {
-			// tool-event hook is opportunistic; failure should not break
-			// the agent loop.
+			// The `tool_execution_start` handler ignores failures to avoid interrupting tool execution.
 			log(
 				`tool_execution_start hook failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
 			);
@@ -1940,22 +1692,12 @@ async function startPiMagicContextRuntime(
 		}
 	});
 
-	// Channel 1 (ctx_reduce in-turn nudge), Pi parity with OpenCode's
-	// `tool.execute.after` → `output.output` append. `tool_result` lets an
-	// extension REPLACE the recorded tool result content; returning the original
-	// content plus an appended `<system-reminder>` block persists to the session
-	// JSONL (via `appendMessage` on `message_end`) and replays verbatim on every
-	// later `context` pass — "free sticky", no anchor/CAS/replay machinery. The
-	// metric baseline is computed in the pipeline (`pi.on("context")`) and read
-	// here, exactly mirroring OpenCode's transform→tool.execute.after split.
+	// `ctx_reduce` reminders are appended to tool results during the turn.
+	// Returning the original content plus a `<system-reminder>` block replaces the recorded result with the appended content.
 	pi.on("tool_result", async (event, ctx) => {
 		try {
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (typeof sessionId !== "string" || sessionId.length === 0) return;
-			// Channel 2 mid-turn delivery: a pending ceiling intent steers a
-			// queued user message into the NEXT STEP of the in-flight turn so
-			// the agent is warned while the pile is still growing (agent_end
-			// stays as the idle fallback). No-ops unless pending + revalidated.
 			if (compactionOff) return;
 			const block = maybeChannel1ReminderForToolResult({
 				db,
@@ -1973,31 +1715,16 @@ async function startPiMagicContextRuntime(
 		}
 	});
 
-	// In normal mode MC owns compaction and cancels Pi's native hook. In
-	// compaction-off mode the same hook must return nothing: native Pi compaction
-	// is the selected context manager and cancelling it would leave no manager.
 	pi.on("session_before_compact", async (_event, ctx) =>
 		handlePiSessionBeforeCompact({ db, compactionOff, ctx }),
 	);
 
-	// Strip injected `§N§` tag prefix from assistant text BEFORE Pi
-	// persists the message to disk and renders it to the UI. Mirrors
-	// OpenCode's `experimental.text.complete` handler which scrubs the
-	// prefix from `output.text` before the assistant message lands in
 	// `opencode.db`.
 	//
-	// Pi's `agent-session.ts` emits `message_end` to extensions BEFORE
-	// calling `sessionManager.appendMessage(event.message)`. Mutating
-	// the message reference in this handler is therefore visible to
-	// the persistence call — same effect as OpenCode's hook on a
+	// Mutating `event.message` changes the message persisted by `sessionManager.appendMessage`.
 	// different harness.
 	//
-	// Why this matters: LLMs frequently mimic the `§N§` prefix they
-	// see on prior assistant messages and emit `§4§ Yes...` at the
-	// start of a fresh response. The mimicry is harmless for cache
-	// (we re-strip and re-inject on the next transform pass), but the
-	// stored text is what Pi's UI renders — without this scrub, users
-	// see internal tag IDs at the start of every assistant turn.
+	// Unstripped prefixes appear in assistant responses in Pi's UI.
 	pi.on("message_end", async (event, ctx) => {
 		try {
 			const msg = event.message as unknown;
@@ -2010,11 +1737,7 @@ async function startPiMagicContextRuntime(
 			warn("message_end: stripTagPrefixFromAssistantMessage threw:", err);
 		}
 
-		// Update last_response_time + last_input_tokens + last_context_percentage
-		// so the scheduler's TTL gating can decide between execute and defer
-		// on the next transform pass. Without this, every Pi pass would either
-		// always execute (stale lastResponseTime=0 → TTL elapsed) or always
-		// defer (no usage data) — neither matches OpenCode parity.
+		// The scheduler state lets TTL gating choose execution or deferral on the next transform pass.
 		try {
 			const sm = ctx.sessionManager as
 				| { getSessionId?: () => string | undefined }
@@ -2045,15 +1768,8 @@ async function startPiMagicContextRuntime(
 				message: event.message,
 				cacheTtlConfig: resolveCurrentProjectDeps(ctx).config.cache_ttl,
 			});
-			// Compute pressure with OpenCode-equivalent semantics: pull
-			// the assistant's `usage` field and use
-			// `input + cacheRead + cacheWrite` (NOT output) divided by
-			// the effective context limit. The window comes from Pi's own
-			// runtime — `getContextUsage().contextWindow`, falling back to
-			// `ctx.model.contextWindow` if usage hasn't populated — NOT
-			// models.dev. `session_meta.detected_context_limit` still overrides
-			// it (in persistPiPressureFromMessageEnd) so post-overflow pressure
-			// reflects the real, lower limit. See `pi-pressure.ts` for rationale.
+			// `session_meta.detected_context_limit` overrides `piContextWindow` after an overflow.
+			// `persistPiPressureFromMessageEnd` uses `session_meta.detected_context_limit` for post-overflow pressure.
 			const piUsage = ctx.getContextUsage?.();
 			const piContextWindow =
 				piUsage &&
@@ -2083,24 +1799,15 @@ async function startPiMagicContextRuntime(
 				},
 			});
 
-			// Synthetic-todowrite capture (Pi parity with OpenCode
-			// hook-handlers.ts `tool.execute.after` for `todowrite`).
 			//
-			// Why message_end and not tool_execution_start:
-			//   Pi's `tool_execution_start` only fires for tools Pi has
-			//   actually executed (i.e. tools the agent registered).
-			//   The mocked todowrite in tests — and any user-driven
-			//   custom todowrite-shaped tool that isn't in Pi's registry
-			//   — would not trigger `tool_execution_start`. Reading the
-			//   assistant message at `message_end` catches every
-			//   todowrite-shaped `toolCall` block regardless of whether
-			//   Pi could execute it locally, matching what OpenCode
-			//   captures via `tool.execute.after` on every visible tool
+			// `message_end` captures unregistered tools; `tool_execution_start` does not.
+			// `tool_execution_start` fires only for tools registered with Pi.
+			// A todowrite-shaped tool absent from Pi's registry does not trigger tool_execution_start.
+			// Reading the assistant message at message_end also captures unregistered todowrite-shaped tools.
 			//   call.
 			//
-			// Cache safety: pure DB write, no message mutation.
-			// Subagents skip — they don't get synthetic todowrite
-			// injection downstream (mirrors OpenCode `fullFeatureMode`
+			// `capturePiTodowriteMessageIfCompatible` writes only to the database and does not mutate the message.
+			// Subagents skip capture because they do not receive downstream synthetic todowrite injection.
 			// gate).
 			try {
 				const sessionMetaForTodo = getOrCreateSessionMeta(db, sessionId);
@@ -2121,21 +1828,12 @@ async function startPiMagicContextRuntime(
 			warn("message_end: persist session_meta usage failed:", err);
 		}
 
-		// Overflow recovery: if Pi's assistant message ended with a
-		// provider context-overflow error (`message.errorMessage` matches
-		// a known overflow pattern), record the recovery flag in
-		// session_meta so the next transform pass treats this session as
-		// "needs emergency recovery" — historian fires immediately, drop-
-		// all-tools applies, and pressure math uses the real
-		// detected_context_limit if the error reported one.
+		// When `message.errorMessage` matches a known context-overflow pattern, the handler records emergency recovery in `session_meta`.
+		// The next transform pass uses the recovery flag in `session_meta` to perform emergency recovery.
+		// Emergency recovery invokes the historian immediately and drops all tools.
+		// Pressure calculations use `detected_context_limit` when the overflow error reports one.
 		//
-		// Pi populates `errorMessage` on the assistant message when the
-		// underlying API call fails (we saw exactly this pattern in the
-		// Codex `context_length_exceeded` failure that motivated this
-		// work). The provider-agnostic `detectOverflow` helper from
-		// shared core matches Anthropic, OpenAI, Codex/OpenAI, xAI,
-		// Cerebras, GitHub Copilot, OpenRouter, Ollama, vLLM, Mistral,
-		// MiniMax, Kimi, Gemini, and a generic fallback.
+		// `detectOverflow` recognizes provider-specific context-overflow errors and a generic fallback.
 		try {
 			if (compactionOff) return;
 			const sm = ctx.sessionManager as
@@ -2185,34 +1883,22 @@ async function startPiMagicContextRuntime(
 		}
 	});
 
-	// Unregister project from dreamer timer on session shutdown. Pi's
-	// `/reload` command tears down extensions and re-runs this default
-	// export — without unregistering, the dreamer timer would hold a
-	// stale reference to the previous extension instance.
+	// The shutdown handler unregisters the project so `/reload` cannot leave the dreamer timer pointing to the prior extension instance.
+	// `/reload` tears down extensions and re-runs the default export.
 	//
-	// IMPORTANT: We do NOT close the SQLite handle here. `openDatabase()`
-	// caches handles in a process-lifetime Map keyed by path; closing
-	// the handle invalidates the cache entry, but the Map still returns
-	// the closed handle on the next `openDatabase()` call after reload,
-	// causing every tool/hook to fail with "database is not open". The
-	// DB handle is intentionally process-lifetime — Pi's `/reload`
-	// re-runs the extension code but keeps the host process alive, so
-	// the cached handle is still valid across reload boundaries.
+	// The shutdown handler must not close the SQLite handle because `openDatabase()` caches handles by path.
+	// `openDatabase()` stores handles in a process-lifetime Map keyed by path.
+	// Closing the handle does not remove its cached Map entry.
+	// After reload, `openDatabase()` returns the closed cached handle.
+	// Every tool and hook then fails with "database is not open".
+	// The database handle remains valid across `/reload` because the host process stays alive.
 	pi.on("session_shutdown", async (_event, ctx) => {
-		// Bounded drain of in-flight historian / dreamer runs that were
-		// kicked off by recent turns. We moved the drain here from
-		// `agent_end` because Pi awaits agent_end handlers and was
-		// stalling the UI loader on every turn that triggered historian.
-		// session_shutdown only fires when the user is actually leaving
-		// the session, so a brief wait is acceptable — and lets the
-		// JSONL session state reach a consistent compartment boundary
-		// before the process exits.
+		// The shutdown handler waits up to 5 seconds for each historian, recomp, and dreamer drain.
+		// Pi awaits agent_end handlers; draining there stalls UI loading on turns that trigger historian.
+		// `session_shutdown` also fires for `/reload`.
 		//
-		// 5-second cap protects interactive shutdown from a hung
-		// subagent. In `pi --print` mode the process exits after
-		// agent_end before this handler fires anyway, so the cap
-		// doesn't help that mode (and we don't pretend it does — see
-		// the comment block on the agent_end handler above).
+		// The 5-second cap prevents a hung run from blocking shutdown.
+		// In pi --print mode, the process exits after agent_end and before session_shutdown fires.
 		const SHUTDOWN_DRAIN_MS = 5_000;
 		try {
 			await withTimeout(awaitInFlightHistorians(), SHUTDOWN_DRAIN_MS);
@@ -2236,15 +1922,11 @@ async function startPiMagicContextRuntime(
 		} catch (err) {
 			warn("shutdown: unregisterPiDreamerProject threw:", err);
 		}
-		// Clear per-session system-prompt adjunct caches (sticky date,
-		// project docs, user profile, key files). Pi's
-		// `_extensionRunner.invalidate` resets module state on session
-		// swap, but on plain shutdown the maps would otherwise hold
-		// their last entries. Best-effort: if sessionId can't be
-		// resolved we just skip — Pi resets module state on /reload
+		// Pi resets module state on session swap through _extensionRunner.invalidate.
+		// On plain shutdown, per-session maps would retain their last entries.
+		// Pi resets module state on /reload.
 		// anyway.
 		try {
-			// SAFETY: sessionManager and getSessionId are checked before use.
 			const sm = (
 				ctx as unknown as {
 					sessionManager?: { getSessionId?: () => string | undefined };
@@ -2255,36 +1937,18 @@ async function startPiMagicContextRuntime(
 			if (typeof sessionId === "string" && sessionId.length > 0) {
 				clearPiSystemPromptSession(sessionId);
 				promptSurfaceGuidanceEpochs.clear(sessionId);
-				// Drain context-handler session-keyed maps too. Without
-				// this, sessions accumulate state across `session_shutdown`
-				// in long-lived Pi processes that re-init the extension.
+				// Long-lived Pi processes can reinitialize the extension after `session_shutdown`, so the handler clears per-session maps.
 				clearContextHandlerSession(sessionId);
 			}
 		} catch {
 			// best-effort cleanup
 		}
-		// Re-arm the process-global init latch (issue #247). Pi fires
-		// `session_shutdown` (reason "reload") before a `/reload` re-imports
-		// extensions, and (reason "shutdown") when the user leaves the
-		// session. Each AgentSession owns its own ExtensionRunner, so an
-		// in-process child's `session_shutdown` only fires handlers the
-		// CHILD registered — and a child that no-op'd via the latch
-		// registered none, so it cannot clear the parent's latch. Clearing
-		// here lets a `/reload` legitimately re-initialize the full runtime,
-		// while ephemeral in-process children never touch it.
+		// `session_shutdown` with reason `reload` fires before `/reload` re-imports the extension.
 		clearPiMagicContextActive();
 	});
 
-	// Pi has no `session_deleted` event, but `session_before_switch`
-	// fires when the user switches to a different session within the
-	// same Pi process. That's the right moment to drain caches keyed
-	// by the OUTGOING session id — without this, every session swap
-	// in a long-running Pi process leaks one entry per cache, and
-	// after dozens of swaps the maps balloon. Cleanup here mirrors
-	// OpenCode's `session.deleted` handler in `event-handler.ts`.
 	pi.on("session_before_switch", (_event, ctx) => {
 		try {
-			// SAFETY: sessionManager and getSessionId are checked before use.
 			const sm = (
 				ctx as unknown as {
 					sessionManager?: { getSessionId?: () => string | undefined };
@@ -2296,28 +1960,18 @@ async function startPiMagicContextRuntime(
 				typeof outgoingSessionId === "string" &&
 				outgoingSessionId.length > 0
 			) {
-				// Clear ONLY the in-memory per-session maps (the actual leak that
-				// grows one entry per swap). Do NOT clear the durable DB m[0] cache
-				// here: session_before_switch is REVERSIBLE (the user can switch
-				// back), unlike OpenCode's session.deleted. The DB cache is bounded
-				// (one session_meta row per session) and self-invalidates via
-				// epoch/version/docs-hash checks in mustMaterializePi, so preserving
-				// it lets a switch-back reuse the cached prefix instead of forcing a
-				// full m[0] re-materialization (an avoidable prompt-cache bust).
+				// `session_before_switch` clears in-memory per-session maps so they do not retain one entry per session swap.
+				// `session_before_switch` must not clear durable state: users can return to the prior session.
 				clearPiSystemPromptSession(outgoingSessionId);
 				promptSurfaceGuidanceEpochs.clear(outgoingSessionId);
 				clearContextHandlerSession(outgoingSessionId);
 			}
-		} catch {
-			// best-effort — Pi proceeds with the switch regardless
-		}
+		} catch {}
 	});
 }
 
 /**
- * Format `execute_threshold_percentage` for the boot log. The config accepts
- * either a bare number or a per-model map (`{ default: 65, "provider/model": 50 }`);
- * naive interpolation printed the map form as `[object Object]%`.
+ * `formatExecuteThresholdForLog` formats per-model maps explicitly to avoid `[object Object]%`.
  */
 function formatExecuteThresholdForLog(
 	value: number | { default: number; [modelKey: string]: number } | undefined,

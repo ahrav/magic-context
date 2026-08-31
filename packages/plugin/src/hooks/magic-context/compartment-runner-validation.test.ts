@@ -13,10 +13,10 @@ describe("buildHistorianFailureNotice", () => {
         const notice = buildHistorianFailureNotice(1, "Historian returned no assistant output.");
         expect(notice.toLowerCase()).toContain("transient");
         expect(notice.toLowerCase()).toContain("retry automatically");
-        // Must NOT alarm the user or ask them to act on a single transient blip.
+        // A single transient failure must not alarm the user or request action.
         expect(notice).not.toContain("magic-context.jsonc");
         expect(notice).not.toContain("needs attention");
-        // The raw error is internal noise for the transient case — not surfaced.
+        // A transient failure notice does not include the raw error.
         expect(notice).not.toContain("no assistant output");
     });
 
@@ -30,7 +30,7 @@ describe("buildHistorianFailureNotice", () => {
         expect(notice).toContain(String(HISTORIAN_PERSISTENT_FAILURE_THRESHOLD));
         // The persistent case surfaces the real error so the user can diagnose.
         expect(notice).toContain("ProviderModelNotFoundError");
-        // Still reassures that the conversation keeps working.
+        // The persistent notice reassures the user that the conversation keeps working.
         expect(notice.toLowerCase()).toContain("keeps working");
     });
 });
@@ -46,12 +46,12 @@ describe("buildHistorianRepairPrompt", () => {
 });
 
 /**
- * Gap healing is intentionally proof-based: only a range classified as tool-only by
- * the chunk reader can be absorbed. An unclassified gap may contain narrative and must
- * reject so the runner can re-read it without advancing the durable boundary.
+ * The runner absorbs only ranges that the chunk reader classifies as tool-only.
+ * An unclassified gap may contain narrative.
+ * The runner rejects unclassified gaps and re-reads them without advancing the durable boundary.
  */
 
-/** Build a minimal valid historian XML output from compartment specs. */
+/* */
 function buildXml(
     compartments: Array<{ start: number; end: number; title?: string }>,
     unprocessedFrom: number | null = null,
@@ -66,7 +66,7 @@ function buildXml(
     return `<output>\n${inner}\n${meta}\n</output>`;
 }
 
-/** Minimal chunk stub with ordinal metadata. */
+/* */
 function buildChunk(
     startIndex: number,
     endIndex: number,
@@ -332,8 +332,7 @@ describe("tiered historian output validation", () => {
     });
 
     test("accepts a mismatched-close compartment (issue #246) that strict parsing stranded as tierless", () => {
-        // The lenient parser runs FIRST: <p1> closed by </p2> now yields a real
-        // p1, so validation passes (legacy=0 path) instead of retrying forever.
+        // The lenient parser accepts `<p1>` closed by `</p2>` as `p1`.
         const mangledXml = `<output><compartment start="1" end="2" title="mangled" importance="55"><p1>\nfull narrative\n</p2>\n<p2>condensed</p2><p3>outcome</p3><p4/></compartment></output>`;
 
         const result = validateHistorianOutput(mangledXml, "ses-test", buildChunk(1, 2), [], 0);

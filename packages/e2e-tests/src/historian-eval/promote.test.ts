@@ -12,19 +12,13 @@ function corpusRaw(count = 10): Record<string, unknown>[] {
     return Array.from({ length: count }, (_, index) => {
         const raw = validScenarioRaw();
         raw.id = `hse-scenario-${index}`;
-        // The release tuple rejects duplicate SEMANTIC fingerprints, not just
-        // duplicate ids: a scenario copied under a new name would silently
-        // double-weight one evaluation in every aggregate. So each clone needs
-        // distinct semantic content. Appending to the opening turn keeps the
-        // gold and hard-negative spans (which the freeze lint requires to be
-        // authored before the epilogue) intact.
+        // The release tuple rejects duplicate semantic fingerprints, not only duplicate IDs.
+        // Duplicate semantic fingerprints would double-weight an evaluation in aggregates.
+        // Appending to the opening turn preserves the authored spans before the epilogue.
         const turns = (raw.transcript as { turns: Array<{ user: string }> }).turns;
         turns[0].user = `${turns[0].user} Filed under ticket ${index}.`;
-        // Promotion requires the corpus-wide family union to be complete, so the
-        // clones cycle through every family. Only the family LABEL moves: the
-        // absent predicate keeps the reference scenario's authored text, which the
-        // freeze lint requires to appear before the epilogue and to not contradict
-        // any gold claim.
+        // Promotion requires every `HARD_NEGATIVE_FAMILIES` member to appear in the corpus.
+        // The absent predicate retains the reference text so it remains before the epilogue and consistent with every gold claim.
         const family = HARD_NEGATIVE_FAMILIES[index % HARD_NEGATIVE_FAMILIES.length];
         raw.families = [family];
         const gold = raw.gold as { expectedAbsent: Array<Record<string, unknown>> };
@@ -34,10 +28,8 @@ function corpusRaw(count = 10): Record<string, unknown>[] {
 }
 
 /**
- * Approvals bound to the WHOLE release under review — version, tuple, and
- * tombstones — which is what `parseApproval`/`parseManifest` verify. The two
+ * Approval fingerprints bind the release version, tuple, and tombstones.
  * approvers must differ: one actor holding both seats collapses two reviews
- * into one judgement.
  */
 function approvalsFor(
     scenariosRaw: Record<string, unknown>[],
@@ -61,7 +53,7 @@ function withRoot(run: (root: string) => void): void {
     }
 }
 
-/** Canonical digest of a whole directory tree: sorted relative paths + bytes. */
+/* */
 function treeDigest(dir: string): string {
     const hash = createHash("sha256");
     const walk = (relative: string): void => {
@@ -112,7 +104,6 @@ describe("promoteRelease", () => {
             const stale = JSON.parse(JSON.stringify(approvals));
             stale[0].releaseFingerprint = "0".repeat(64);
             expect(() => promoteRelease({ ...base, approvals: stale })).toThrow(/stale-or-foreign-release/);
-            // Free-form approval metadata rejects (exact keys).
             const noisy = JSON.parse(JSON.stringify(approvals));
             noisy[1].note = "lgtm";
             expect(() => promoteRelease({ ...base, approvals: noisy })).toThrow(/fields-invalid/);
@@ -124,9 +115,7 @@ describe("promoteRelease", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
             const approvals = approvalsFor(scenarios);
-            // Append rather than replace: the original wording grounds the
-            // scenario's hard-negative predicate, and dropping it would trip
-            // the freeze lint before the approval binding is ever checked.
+            // The test appends rather than replaces because the original wording grounds the hard-negative predicate.
             const turns = (scenarios[0].transcript as { turns: Array<{ user: string }> }).turns;
             turns[0].user = `${turns[0].user} Edited after approval.`;
             expect(() =>
@@ -139,8 +128,7 @@ describe("promoteRelease", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
             const approvals = approvalsFor(scenarios);
-            // Still an authored span in the claim's source range, so the freeze
-            // lint stays clean and the approval binding is what rejects.
+            // The span remains within the claim's source range, so freeze lint accepts it.
             (
                 scenarios[0].gold as { expectedClaims: Array<{ predicate: { value: string } }> }
             ).expectedClaims[0].predicate.value = "in-process LRU";
@@ -153,21 +141,16 @@ describe("promoteRelease", () => {
     test("refuses a corpus whose recomputed mutation battery is not green", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
-            // A one-character predicate survives its own near-miss perturbation
-            // ("y" is a substring of "y-alt-"), so the battery flags the matcher as
-            // non-discriminating. Added as an EXTRA claim that no probe references:
-            // weakening a probe-backed claim would instead trip the freeze lint,
-            // which requires each probe's answer to be required by its backing
-            // claim, and the battery would never run.
+            // `y` remains a substring of `y-alt-`, exposing a non-discriminating matcher.
+            // The test uses an unprobed extra claim so freeze lint does not reject a weakened probe-backed claim first.
             (
                 scenarios[0].gold as {
                     expectedClaims: Array<Record<string, unknown>>;
                 }
             ).expectedClaims.push({
                 id: "exp-nondiscriminating",
-                // A category no other claim uses: the parser rejects two
-                // same-category predicates where one contains the other, and a
-                // single character is contained by almost anything.
+                // The added predicate uses a unique category because containment is invalid within a category.
+                // The validator rejects same-category predicates when one contains the other.
                 category: "NAMING",
                 predicate: { kind: "normalized-substring", value: "y" },
                 sourceTurnRange: [1, 1],
@@ -188,8 +171,7 @@ describe("promoteRelease", () => {
             const scenarios = corpusRaw();
             (scenarios[0].transcript as { turns: Array<{ user: string }> }).turns[0].user =
                 "the key lives at /home/someone/secrets.pem";
-            // Malformed schema on the same artifact: the privacy diagnostic
-            // must win because the scan runs first.
+            // Predicate order determines matches when predicates overlap.
             delete scenarios[0].probes;
             expect(() =>
                 promoteRelease({ scenarios, approvals: [], releasesRoot: root, releaseVersion: "v1" }),
@@ -249,9 +231,8 @@ describe("promoteRelease", () => {
     test("never modifies an existing release (whole-tree byte identity); tombstones persist into vN+1", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
-            // `effective` is the tombstone set the manifest will actually carry
-            // (inherited ∪ new), which is what approvals bind to — for v3 that
-            // is v2's inherited id even though the caller passes none.
+            // Approvals bind `effective`, the union of inherited and new tombstones.
+            // `effective` includes v2's inherited tombstone ID for v3 even when the caller supplies none.
             const promote = (
                 version: string,
                 tombstones: string[] = [],
@@ -270,8 +251,8 @@ describe("promoteRelease", () => {
             expect(() => promote("v1")).toThrow(/version already installed/);
             expect(treeDigest(join(root, "v1"))).toBe(v1Digest);
 
-            // v2 tombstones a scenario: it must leave the corpus and its id
-            // must persist in the manifest.
+            // The v2 corpus omits the tombstoned scenario and retains its ID.
+            // The tombstoned scenario's ID must persist in the manifest.
             const v2Corpus = corpusRaw().filter((raw) => raw.id !== "hse-scenario-0");
             const extra = validScenarioRaw();
             extra.id = "hse-scenario-replacement";
@@ -280,8 +261,7 @@ describe("promoteRelease", () => {
             const v2 = loadRelease(join(root, "v2"));
             expect(v2.manifest.tombstones).toEqual(["hse-scenario-0"]);
 
-            // v3 promoted with NO explicit tombstones still inherits v2's:
-            // the success path of tombstone persistence (R12).
+            // v3 inherits v2's tombstones when the caller supplies no explicit tombstones.
             promote("v3", [], v2Corpus, ["hse-scenario-0"]);
             expect(loadRelease(join(root, "v3")).manifest.tombstones).toEqual(["hse-scenario-0"]);
 
@@ -303,8 +283,7 @@ describe("promoteRelease", () => {
                 });
             promote("v1");
             rmSync(join(root, "v1", RELEASE_FILES.manifest));
-            // A skipped v1 would silently drop its tombstones from every
-            // later release, re-admitting retracted scenarios.
+            // Skipping v1 would drop its tombstones from later releases and re-admit retracted scenarios.
             expect(() => promote("v2")).toThrow(/no readable manifest/);
         });
     });
@@ -319,11 +298,9 @@ describe("promoteRelease", () => {
                 releaseVersion: "v1",
                 tombstones: ["hse-retired"],
             });
-            // Stands in for a deliberate privacy or sanitizer bump: v1's manifest
-            // now carries a tuple this lane no longer implements. `parseManifest`
-            // pins those constants, so re-certifying v1 while promoting v2 would
-            // make it unparseable and block every later promotion — exactly when
-            // its tombstones still have to be carried forward.
+            // v1's manifest contains a release tuple unsupported by the current parser.
+            // `parseManifest` rejects release tuples unsupported by the current parser.
+            // `parseManifest` rejects v1's obsolete tuple, so v1 cannot be re-certified while later releases must inherit its tombstones.
             const manifestPath = join(root, "v1", RELEASE_FILES.manifest);
             const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
                 releaseTuple: { privacyPolicyVersion: string };
@@ -351,10 +328,9 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            // v1's tree copied under a numerically later name. Prior releases are
-            // ordered by DIRECTORY, so v100 sorts newest while its manifest still
-            // reports v1; succession would compare v2 against v1 and admit it,
-            // leaving the immutable v100 numerically later than the release that
+            // Prior releases are ordered by directory name, so a copied v1 tree named `v100` sorts newest despite its v1 manifest.
+            // The succession check would compare v2 with manifest version v1 and admit v2.
+            // Admitting v2 would leave immutable v100 numerically later than v2, the release that supersedes it.
             // supersedes it.
             cpSync(join(root, "v1"), join(root, "v100"), { recursive: true });
             const next = corpusRaw();
@@ -382,10 +358,8 @@ describe("promoteRelease", () => {
             const evidence = JSON.parse(readFileSync(evidencePath, "utf8")) as {
                 scenarios: Array<{ scenarioId: string }>;
             };
-            // The fingerprint still matches the scenario's content, so a
-            // fingerprint-only lookup accepts the entry — while every id-keyed
-            // diagnostic, and the published artifact itself, now attributes this
-            // scenario's mutation results to a different one.
+            // A fingerprint-only lookup would accept the entry because its fingerprint still matches the scenario content.
+            // Every ID-keyed diagnostic and the published artifact would attribute the mutation results to a different scenario.
             evidence.scenarios[0].scenarioId = "hse-mislabeled";
             writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
             expect(() => loadRelease(releaseDir)).toThrow(/scenario-id-mismatch/);
@@ -405,10 +379,9 @@ describe("promoteRelease", () => {
             const evidence = JSON.parse(readFileSync(evidencePath, "utf8")) as {
                 scenarios: Array<Record<string, unknown>>;
             };
-            // Cloning a real entry keeps full class coverage and stays green, so
-            // the per-entry parser and the artifact-level green flag both accept
-            // it; only its identity is new. That is phantom mutation coverage the
-            // artifact anchor would authenticate rather than contradict.
+            // A cloned real entry preserves full class coverage.
+            // The per-entry parser accepts the cloned entry, and the artifact-level green flag remains true.
+            // The cloned entry has a new identity, creating phantom mutation coverage.
             evidence.scenarios.push({
                 ...evidence.scenarios[0],
                 scenarioId: "hse-phantom",
@@ -428,12 +401,8 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            // Publication and the caller's out-of-band recording are separate
-            // stores, so a crash between them can leave v1 installed with no
-            // anchor recorded. Re-promoting cannot recover it — the version is
-            // occupied and releases are immutable — but the anchor is a pure
-            // function of the published manifest and evidence, so it can be
-            // recomputed from the installed tree.
+            // A crash between publication and out-of-band anchor recording can leave v1 installed without a recorded anchor.
+            // Re-promotion cannot recover a missing anchor because releases are immutable.
             const reread = loadRelease(promoted.releaseDir);
             const recomputed = releaseArtifactFingerprint(reread.manifest, reread.mutationEvidence, reread.scenarios);
             expect(recomputed).toBe(promoted.artifactFingerprint);
@@ -460,10 +429,8 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            // The whole vN entry replaced by a link. Every read follows it and the
-            // child checks then see an ordinary tree, so without a check on the
-            // directory itself the release passes while its bytes stay mutable
-            // outside the releases root.
+            // Replacing the release directory with a symlink makes child checks inspect an external tree.
+            // The loader must reject a symlinked release directory because its target remains mutable outside releasesRoot.
             const outside = join(root, "release-elsewhere");
             renameSync(releaseDir, outside);
             symlinkSync(outside, releaseDir);
@@ -484,17 +451,15 @@ describe("promoteRelease", () => {
             const scenario = JSON.parse(readFileSync(scenarioPath, "utf8")) as {
                 trigger: { ballastTokensPerTurn: number };
             };
-            // Swap one lint-clean pressure recipe for another. `scenarioFingerprint`
-            // excludes trigger pressure by design, so the manifest tuple and the
-            // mutation evidence are both unchanged.
+            // Changing trigger pressure leaves scenarioFingerprint unchanged.
+            // scenarioFingerprint excludes trigger pressure, leaving the manifest tuple and mutation evidence unchanged.
             scenario.trigger.ballastTokensPerTurn += 100;
             writeFileSync(scenarioPath, `${JSON.stringify(scenario, null, 2)}\n`);
 
-            // Every in-directory check still accepts the edited release: nothing
-            // inside it can see the change.
+            // In-directory checks do not detect edits to trigger pressure.
             expect(loadRelease(promoted.releaseDir).manifest.releaseVersion).toBe("v1");
-            // Only the external anchor catches it. Otherwise two runs labelled with
-            // the same frozen release would execute different historian schedules.
+            // Only the external artifact anchor detects the changed trigger pressure.
+            // Without the external artifact anchor, the same release label can execute different historian schedules.
             expect(() =>
                 loadRelease(promoted.releaseDir, {
                     expectedArtifactFingerprint: promoted.artifactFingerprint,
@@ -512,14 +477,13 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            // Promotion scanned this corpus against the lists in force then, which
-            // cannot cover a list that has grown since — and an externally
-            // assembled release never passed that gate at all. The strict consumer
-            // path had no way to apply either list.
+            // Strict loading must apply the current tombstone lists because promotion used earlier tombstone lists.
+            // Strict loading must apply tombstone lists added after promotion.
+            // Strict loading must also validate externally assembled releases that bypass promotion.
             expect(() => loadRelease(releaseDir)).not.toThrow();
             expect(() => loadRelease(releaseDir, { forbiddenTokens: ["Filed under ticket"] })).toThrow(/^privacy\./);
             expect(() => loadRelease(releaseDir, { forbiddenIdentifiers: ["operator-a"] })).toThrow(/^privacy\./);
-            // A list that matches nothing in the release leaves it loadable.
+            // A tombstone list that matches no release scenario leaves the release loadable.
             expect(() =>
                 loadRelease(releaseDir, { forbiddenTokens: ["absent-codename"], forbiddenIdentifiers: ["nobody"] }),
             ).not.toThrow();
@@ -529,11 +493,10 @@ describe("promoteRelease", () => {
     test("the artifact anchor is order-independent, so promotion and read-back agree", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
-            // Ids where one is a prefix of the other, so lexicographic FILENAME
-            // order and id order genuinely disagree: `-` sorts before the `.` of
-            // `.json`, putting `hse-alpha-beta.json` first while `hse-alpha` sorts
-            // first as an id. Handed to the promoter reversed, so the operator's
-            // array order matches neither.
+            // Prefix-related IDs can sort differently by filename and by ID.
+            // `-` sorts before the `.` in `.json`, so filename order can differ from ID order.
+            // `hse-alpha-beta.json` sorts before `hse-alpha.json`, while `hse-alpha` sorts before `hse-alpha-beta` as an ID.
+            // The test passes the scenarios in reverse order to distinguish caller order from both filename and ID order.
             scenarios[0].id = "hse-alpha-beta";
             scenarios[1].id = "hse-alpha";
             const shuffled = [...scenarios].reverse();
@@ -543,9 +506,7 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            // The value promotion hands back for out-of-band recording must be the
-            // one a consumer recomputes, or an authenticated load rejects a release
-            // that is perfectly valid.
+            // Promotion must return the fingerprint that consumers recompute, or authenticated loading rejects a valid release.
             const reread = loadRelease(promoted.releaseDir);
             expect(releaseArtifactFingerprint(reread.manifest, reread.mutationEvidence, reread.scenarios)).toBe(
                 promoted.artifactFingerprint,
@@ -578,18 +539,15 @@ describe("promoteRelease", () => {
                     releaseVersion: "v2",
                 });
 
-            // This read does not go through `loadRelease`, so it had none of its
-            // symlink checks. A linked release resolves outside the releases root,
-            // where its tombstone list stays mutable: dropping an id there would
-            // shrink the inherited set and re-admit a retired scenario.
-            // `v1-elsewhere` is not `RELEASE_VERSION_RE`-shaped, so it is not
-            // itself read as a release.
+            // `promoteRelease` must validate prior release directories as `loadRelease` does.
+            // A symlinked release can expose a mutable external tombstone list.
+            // Removing an ID from the external tombstone list re-admits a retired scenario.
+            // The symlink target lies outside releasesRoot, where its tombstone list remains mutable.
             const outsideDir = join(root, "v1-elsewhere");
             renameSync(join(root, "v1"), outsideDir);
             symlinkSync(outsideDir, join(root, "v1"));
             expect(promoteV2).toThrow(/release\.v1: not-a-real-directory/);
 
-            // And the manifest alone replaced by a link.
             rmSync(join(root, "v1"));
             renameSync(outsideDir, join(root, "v1"));
             const manifestPath = join(root, "v1", RELEASE_FILES.manifest);
@@ -602,11 +560,6 @@ describe("promoteRelease", () => {
 
     test("refuses a corpus that omits hard-negative families, however clean each scenario is", () => {
         withRoot((root) => {
-            // Ten unique, lint-clean scenarios inside the size budget, every one
-            // declaring the same family. Per-scenario lint and the battery only
-            // ever assert what a scenario claims, so nothing else in the pipeline
-            // notices that user-correction, prompt-injection, and the rest are
-            // absent from the release entirely.
             const single = HARD_NEGATIVE_FAMILIES[0];
             const scenarios = corpusRaw().map((raw) => {
                 raw.families = [single];
@@ -634,12 +587,6 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            // `parseManifest` accepts the broad `^v\d+$` shape, so an externally
-            // assembled release can declare `v01` — which shares an ordinal with
-            // `v1`, letting two directories claim one release position. Rebinding
-            // the approvals makes it internally CONSISTENT at v01, which is the
-            // case the promoter refuses to create and the loader must refuse to
-            // certify; leaving them bound to v1 would only prove the approval
             // check works.
             const manifestPath = join(releaseDir, RELEASE_FILES.manifest);
             const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
@@ -672,29 +619,16 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            // A copied release tree: internally valid and internally consistent —
-            // canonical bytes, matching tuple, green evidence, approvals bound to
-            // the version the manifest declares — and nothing above compares that
-            // version with the directory it now sits in. Left unchecked the lane
-            // runs this corpus as v2 while labelling its report v1, and prior-release
-            // traversal reads the same tree as v2.
             const copy = join(root, "v2");
             cpSync(releaseDir, copy, { recursive: true });
             expect(() => loadRelease(copy)).toThrow(
                 /release\.manifest\.releaseVersion: declares v1 in directory v2/,
             );
-            // `basename` is lexical, so a terminal `.`, a trailing separator, or a
-            // `..` component names the same tree while yielding a basename the
-            // version guard skips. The path is resolved before the basename is
-            // taken, so every spelling of the directory binds to v2.
             for (const spelling of [join(copy, "."), `${copy}/`, join(copy, "..", "v2")]) {
                 expect(() => loadRelease(spelling)).toThrow(
                     /release\.manifest\.releaseVersion: declares v1 in directory v2/,
                 );
             }
-            // The genuine install still loads: the check is about the pairing, not
-            // the tree, and the promoter's own review and staging directories are
-            // not version-named so they stay unaffected.
             expect(loadRelease(releaseDir).manifest.releaseVersion).toBe("v1");
         });
     });
@@ -708,8 +642,6 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            // `v01` matches `RELEASE_VERSION_RE` and shares v1's ordinal, so the
-            // two would sort to the same release position.
             cpSync(join(root, "v1"), join(root, "v01"), { recursive: true });
             const next = corpusRaw();
             expect(() =>
@@ -733,16 +665,12 @@ describe("promoteRelease", () => {
                     releasesRoot: root,
                     releaseVersion: version,
                 });
-            // A concurrent promoter's lock. Publishing under a stale lineage
-            // snapshot could put a retired scenario in a numerically later
-            // release, and the staging sweep would delete the other promoter's
             // in-flight candidate.
             mkdirSync(root, { recursive: true });
             const lockPath = join(root, ".promote.lock");
             writeFileSync(lockPath, "pid 999999\n");
             expect(() => promote("v1")).toThrow(/another promotion holds \.promote\.lock/);
 
-            // Cleared, promotion proceeds and leaves no lock behind.
             rmSync(lockPath);
             promote("v1");
             expect(existsSync(lockPath)).toBe(false);
@@ -808,7 +736,6 @@ describe("promoteRelease", () => {
             });
             const evidencePath = join(releaseDir, RELEASE_FILES.evidence);
             const evidence = JSON.parse(readFileSync(evidencePath, "utf8"));
-            // A hand-edited "green" shell with no per-result backing.
             evidence.scenarios[0].results = [];
             writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
             expect(() => loadRelease(releaseDir)).toThrow(/mutation evidence/);
@@ -827,9 +754,6 @@ describe("promoteRelease", () => {
             const manifestPath = join(releaseDir, RELEASE_FILES.manifest);
             const original = readFileSync(manifestPath, "utf8");
 
-            // Duplicate member: JSON.parse keeps the LAST value while a human
-            // reviewer reads the FIRST, and fingerprints are computed over
-            // parsed values — only the canonical-byte check can catch this.
             const duplicated = original.replace(
                 '"releaseVersion": "v1"',
                 '"releaseVersion": "v9",\n  "releaseVersion": "v1"',
@@ -838,8 +762,6 @@ describe("promoteRelease", () => {
             writeFileSync(manifestPath, duplicated);
             expect(() => loadRelease(releaseDir)).toThrow(/non-canonical-bytes/);
 
-            // Re-serialized bytes (trailing whitespace) with identical parsed
-            // values also reject: an installed release is byte-immutable.
             writeFileSync(manifestPath, `${original}\n`);
             expect(() => loadRelease(releaseDir)).toThrow(/non-canonical-bytes/);
         });
@@ -856,12 +778,8 @@ describe("promoteRelease", () => {
                     releaseVersion: version,
                 });
             promote("v2");
-            // Installing v1 after v2 would let a later tombstone-carrying
-            // release sit BELOW an immutable release that still serves the
-            // retired scenario, so the vN+1 errata rule could never retire it.
             expect(() => promote("v1")).toThrow(/not-later-than-previous/);
             expect(readdirSync(root)).toEqual(["v2"]);
-            // Forward is still allowed.
             promote("v3");
             expect(readdirSync(root).sort()).toEqual(["v2", "v3"]);
         });
@@ -891,8 +809,6 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            // A separately assembled or truncated release must not pass the
-            // strict path with a corpus promotion would have rejected.
             rmSync(join(releaseDir, RELEASE_FILES.scenariosDir, "hse-scenario-0.json"));
             expect(() => loadRelease(releaseDir)).toThrow(/outside the 10-30 budget/);
         });
@@ -907,8 +823,6 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            // Entry names from an externally assembled tree never went through
-            // the privacy scan, so they must not reach diagnostics or logs.
             const secret = "ghp-deadbeefsecrettoken.txt";
             writeFileSync(join(releaseDir, secret), "tamper\n");
             let message = "";
@@ -932,9 +846,7 @@ describe("promoteRelease", () => {
                 releasesRoot: root,
                 releaseVersion: "v1",
             });
-            // Bytes moved outside the installed vN directory: name-only checks
-            // pass and every read follows the link, so what later runs load
-            // could change without touching the "immutable" tree.
+            // Symlink targets outside the installed directory can change without modifying the installed tree.
             const manifestPath = join(releaseDir, RELEASE_FILES.manifest);
             const outside = join(root, "manifest-elsewhere.json");
             renameSync(manifestPath, outside);
@@ -958,7 +870,6 @@ describe("promoteRelease", () => {
             symlinkSync(outside, scenarioPath);
             expect(() => loadRelease(releaseDir)).toThrow(/not-a-regular-file/);
 
-            // And the whole directory replaced by a link.
             const dirPath = join(releaseDir, RELEASE_FILES.scenariosDir);
             const outsideDir = join(root, "scenarios-elsewhere");
             renameSync(dirPath, outsideDir);
@@ -978,14 +889,10 @@ describe("promoteRelease", () => {
             });
             const anchor = promoted.artifactFingerprint;
             expect(anchor).toMatch(/^[0-9a-f]{64}$/);
-            // The untampered release matches its recorded anchor.
             expect(
                 loadRelease(promoted.releaseDir, { expectedArtifactFingerprint: anchor }).manifest.releaseVersion,
             ).toBe("v1");
 
-            // Rewrite only the approver: the release fingerprint the approvals
-            // carry is unchanged, so every in-directory consistency check still
-            // passes and the release loads as approved.
             const manifestPath = join(promoted.releaseDir, RELEASE_FILES.manifest);
             const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
             manifest.approvals.privacy.approver = "attacker";
@@ -1008,10 +915,6 @@ describe("promoteRelease", () => {
             });
             const evidencePath = join(promoted.releaseDir, RELEASE_FILES.evidence);
             const evidence = JSON.parse(readFileSync(evidencePath, "utf8"));
-            // Every required class present, applicable, and green, with the
-            // scenario fingerprints preserved: internally consistent evidence
-            // for a battery that never ran. The parser cannot tell the
-            // difference, so only the anchor can.
             for (const entry of evidence.scenarios) {
                 entry.results = entry.results.map((result: { mutationClass: string }) => ({
                     mutationClass: result.mutationClass,
@@ -1031,8 +934,6 @@ describe("promoteRelease", () => {
     test("a tombstone carrying a denied token is refused before publication", () => {
         withRoot((root) => {
             const scenarios = corpusRaw();
-            // Scenario-id shaped, so the schema accepts it; the id is then
-            // written verbatim into this and every later immutable manifest.
             expect(() =>
                 promoteRelease({
                     scenarios,

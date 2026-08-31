@@ -97,32 +97,22 @@ describe("boundary execution Pi integration", () => {
 	});
 
 	it("16. a prior deferred flag does NOT promote a defer decision to execute (parity with OpenCode contract #4)", () => {
-		// Regression: Pi previously force-promoted schedulerDecision defer→execute
-		// whenever a deferred-execute flag existed and the pass wasn't mid-turn,
-		// diverging from OpenCode (which treats the flag as drain-on-success ONLY
-		// and never re-raises execute — boundary-execution-integration.test.ts #4).
-		// The idempotent scheduler re-issues execute on the next non-mid-turn pass
-		// while pressure holds, so no override is needed. Model the post-fix
-		// contract: a base-defer pass stays defer regardless of the flag's presence,
-		// and the flag is preserved (drained later only when work genuinely runs).
+		// A base-defer pass stays defer regardless of the flag's presence.
+		// Preserve the pending flag until executed work clears it.
 		const db = createDb();
 		ensureSessionMetaRow(db, "s1");
 		setDeferredExecutePendingIfAbsent(db, "s1", flag());
 
-		// base=defer → applyMidTurnDeferral yields defer; the flag must NOT change it.
 		const decision = applyMidTurnDeferral({
 			base: "defer",
 			bypassReason: "none",
 			midTurn: false,
 		});
-		// The removed Pi-only promotion would have done: if (flag && effective ===
-		// "defer" && !midTurn) effective = "execute". Assert that does NOT happen —
-		// the effective decision stays defer even with the flag present.
+		// A pending flag must not promote a non-mid-turn defer to execute.
 		const flagExists = peekDeferredExecutePending(db, "s1") !== null;
 		expect(flagExists).toBe(true);
 		expect(decision.midTurnAdjustedSchedulerDecision).toBe("defer");
 
-		// Flag preserved (drain-on-success only): no execute ran this pass.
 		expect(peekDeferredExecutePending(db, "s1")?.id).toBe("flag-1");
 	});
 });

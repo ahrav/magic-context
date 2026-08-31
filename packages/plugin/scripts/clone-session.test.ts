@@ -1,4 +1,3 @@
-/// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -282,7 +281,6 @@ function makeFixture(): { opencodePath: string; contextPath: string; sourceSessi
     const insertFixtureTag = context.prepare(
         "INSERT INTO tags (session_id, message_id, type, status, byte_size, tag_number, harness, tool_owner_message_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     );
-    // A prior session makes the source tag's global id differ from its per-session tag number.
     insertFixtureTag.run("ses_other", "msg_other:p0", "message", "active", 1, 99, "opencode", null);
     const sourceTag = insertFixtureTag.run(
         sourceSessionId,

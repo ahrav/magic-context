@@ -1,14 +1,8 @@
 /**
- * Compaction Marker Manager
  *
- * Coordinates compaction marker injection/update/removal with historian
- * publication. Called after compartments are published. Always-on since
- * v0.21.4 — the `compaction_markers` config knob was removed because the
- * feature is required for sane transform performance on long sessions.
+ * The manager runs marker mutations after compartment publication.
  *
- * The marker summary text is a static placeholder — the real <session-history>
- * is injected by the transform pipeline via inject-compartments.ts. The marker
- * exists solely to make OpenCode's filterCompacted stop at the boundary so the
+ * The marker makes `filterCompacted` stop at the boundary.
  * transform receives only the live tail.
  */
 
@@ -43,7 +37,7 @@ import type { Database } from "../../shared/sqlite";
 import { Database as SqliteDb } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 
-/** Static placeholder. The real session-history comes from transform injection. */
+/** The transform injects the real session history. */
 export const MARKER_SUMMARY_TEXT =
     "[Compacted by magic-context — session history is managed by the plugin]";
 
@@ -67,11 +61,9 @@ function persistMarkerStateAndDropReplacedTag(
 }
 
 /**
- * Result of draining one persisted marker request.
  *
  * Applied, already-current, and stale requests can clear their pending blob.
- * Retryable failures keep both the blob and deferred-history signal so the
- * next consuming pass can repeat the deterministic mutation.
+ * Retryable failures keep the pending blob and deferred-history signal so the next consuming pass can repeat the deterministic mutation.
  */
 export type MarkerUpdateOutcome =
     | {
@@ -86,49 +78,34 @@ export type MarkerUpdateOutcome =
     | { kind: "retryable-failure"; error: Error };
 
 /**
- * Validate that a deferred pending-marker target is still the right thing to
- * apply. Plan v6 §5 two-step check:
+ * `pending` must still identify the published compartment.
  *
- *   1. PRIMARY: raw OpenCode message at `pending.endMessageId` must still
- *      exist. If recomp / revert / partial-recomp wiped that message between
- *      publication and the consuming pass, the deferred target is gone.
- *   2. SECONDARY: a compartment row in our own DB must still have
- *      `end_message_id == pending.endMessageId` AND
- *      `end_message == pending.ordinal`. Catches the case where the raw
- *      message survives but compartmentalization changed (recomp redistributed
- *      boundaries, partial recomp resequenced).
+ * The raw OpenCode message at `pending.endMessageId` must exist; recompilation, revert, or partial recompilation can remove the deferred target before the consuming pass.
+ * Matching both fields detects compartmentalization changes that preserve the raw message but resequence or redistribute boundaries.
  *
  * Returns `"ok"` only when both checks pass.
- * Returns `"compartment-removed"` when either the raw message or the
- * compartment row is gone.
- * Returns `"target-superseded"` when the compartment row exists at the
- * boundary endMessageId but its ordinal differs from `pending.ordinal` (a
- * later publish moved past us).
+ * Return `"compartment-removed"` when the raw message or compartment row is absent.
+ * Return `"target-superseded"` when the row at `pending.endMessageId` has an ordinal other than `pending.ordinal`.
  *
- * Throws on DB-access failures (locked OpenCode DB, missing attach) — caller's
- * outer try/catch maps that to `retryable-failure`.
+ * The consuming pass maps DB-access failures to `retryable-failure`.
  */
 function validatePendingTarget(
     db: Database,
     sessionId: string,
     pending: PendingCompactionMarker,
 ): "ok" | "compartment-removed" | "target-superseded" {
-    // 1. PRIMARY: raw OpenCode message must still exist. May throw on DB
-    //    failure; caller catches and returns retryable-failure.
+    // `getOpenCodeMessageById` may throw on DB failure; the outer catch returns `retryable-failure`.
     const ocMessage = getOpenCodeMessageById(sessionId, pending.endMessageId);
     if (!ocMessage) {
         return "compartment-removed";
     }
 
-    // 2. SECONDARY: compartment row keyed by endMessageId.
     const compartments = getCompartmentsByEndMessageId(db, sessionId, pending.endMessageId);
     if (compartments.length === 0) {
         return "compartment-removed";
     }
     if (compartments.length > 1) {
-        // Schema doesn't enforce UNIQUE(session_id, end_message_id), but the
-        // historian's validation effectively makes them unique. >1 here means
-        // a future schema/validation bug; loud-fail rather than guess.
+        // Multiple compartments for one `endMessageId` return `compartment-removed` rather than selecting one.
         log(
             `[magic-context][${sessionId}] WARNING: ${compartments.length} compartments share endMessageId=${pending.endMessageId} — schema invariant violated; treating as stale`,
         );
@@ -136,9 +113,6 @@ function validatePendingTarget(
     }
     const compartment = compartments[0];
     if (compartment.endMessage !== pending.ordinal) {
-        // Same end-message id but different ordinal — a later publish already
-        // moved the marker past us. Skip this stale pending and let the newer
-        // publish's drain heal.
         return "target-superseded";
     }
     return "ok";
@@ -191,10 +165,7 @@ function existingMarkerAlreadyCoversTarget(
         return true;
     }
 
-    // A strictly higher ordinal normally means a newer direct/recomp publish has
-    // already advanced the marker. If the new target id column proves the stored
-    // target is not actually after this pending/direct target, the state is
-    // inconsistent and should be repaired rather than preserved.
+    // A different ordinal means the deferred target no longer matches the published compartment.
     if (existing.targetEndMessageId !== null) {
         const targetCompare = compareOpenCodeMessagesByCanonicalOrder(
             sessionId,
@@ -210,21 +181,15 @@ function existingMarkerAlreadyCoversTarget(
 }
 
 /**
- * Apply a deferred compaction-marker mutation owned by a specific pending
- * blob. Called from the transform postprocess drain — see
- * `transform-postprocess-phase.ts` Plan v6 §1.
  *
  * Returns one of four outcomes; the drain interprets each:
- *   - `applied`         → CAS-clear pending (we did the work)
+ * `applied` → CAS-clear pending.
  *   - `already-current` → CAS-clear pending (boundary already at this ordinal)
  *   - `stale-skip`      → CAS-clear pending (target gone or superseded)
- *   - `retryable-failure` → KEEP pending (transient failure; next consuming
- *                          pass will retry; another publish may overwrite
- *                          blob and that publish's drain heals)
+ * `retryable-failure` → Keep pending; retry on the next consuming pass.
  *
- * Retrying the full sequence is safe. Removal is a no-op when rows are already
- * absent, and injection uses deterministic IDs with exact-row upserts, so a
- * committed marker whose context-state write failed is reused rather than duplicated.
+ * Removal is a no-op for absent rows; deterministic IDs and exact-row upserts make retries idempotent.
+ * Deterministic IDs and exact-row upserts reuse a committed marker when its context-state write failed.
  */
 export function applyDeferredCompactionMarker(
     db: Database,
@@ -233,9 +198,8 @@ export function applyDeferredCompactionMarker(
     directory?: string,
 ): MarkerUpdateOutcome {
     try {
-        // Stale-target check FIRST — cheap and avoids any state mutation when
-        // the target is already gone. The check may throw on DB failure;
-        // outer catch turns that into retryable-failure.
+        // The manager validates stale targets before mutating state; DB failures return `retryable-failure`.
+        // If stale-target validation throws on a DB failure, the outer catch returns `retryable-failure`.
         const validation = validatePendingTarget(db, sessionId, pending);
         if (validation !== "ok") {
             sessionLog(
@@ -255,14 +219,10 @@ export function applyDeferredCompactionMarker(
                 pending.endMessageId,
             )
         ) {
-            // Marker already at this boundary (or further). Nothing to do.
             return { kind: "already-current" };
         }
 
-        // Resolve the replacement boundary BEFORE removing the existing marker.
-        // If the target no longer maps to a user boundary (e.g. raw rows changed
-        // under us), leave the old marker intact so OpenCode keeps its current
-        // cache boundary instead of seeing a needless no-marker/full-history pass.
+        // The manager resolves the replacement boundary first so an unmapped target leaves the existing marker intact.
         const boundary = findBoundaryUserMessage(sessionId, pending.endMessageId);
         if (!boundary) {
             return {
@@ -273,14 +233,10 @@ export function applyDeferredCompactionMarker(
             };
         }
 
-        // Remove old marker if present. `removeCompactionMarker` returns false
-        // only when the DELETE transaction itself failed (e.g. SQLITE_BUSY).
-        // Keep the summary id so its tag drops atomically when marker state advances.
+        // The manager passes the old summary ID when advancing marker state so its tag is removed.
         const removedSummaryMessageId = existing?.summaryMessageId ?? null;
-        // No-op success on already-missing rows is fine — that's why retry is
-        // safe. False here means we couldn't even attempt the delete cleanly;
-        // bail to retryable WITHOUT calling inject (avoids leaving two marker
-        // rows for the same boundary).
+        // An already-missing row is a successful no-op; return `false` only when the DELETE transaction fails.
+        // On delete failure, return `retryable-failure` without injecting a replacement marker.
         if (existing) {
             const removed = removeCompactionMarker(existing);
             if (!removed) {
@@ -297,9 +253,6 @@ export function applyDeferredCompactionMarker(
             );
         }
 
-        // Inject new marker. The boundary was pre-resolved above, so a null
-        // return here means the INSERT transaction failed and rolled back
-        // cleanly (no half-write); retrying is safe.
         const result = injectCompactionMarker({
             sessionId,
             endOrdinal: pending.ordinal,
@@ -337,13 +290,6 @@ export function applyDeferredCompactionMarker(
         };
     } catch (err) {
         // Thrown paths:
-        //   - getWritableOpenCodeDb() (attached DB missing/locked)
-        //   - getOpenCodeMessageById() raw SELECT failure
-        //   - getCompartmentsByEndMessageId() local SELECT failure
-        //   - setPersistedCompactionMarkerState() UPDATE failure
-        // All retryable. Note: findBoundaryUserMessage() returning null is
-        // handled before any old-marker removal and does NOT flow through this
-        // catch unless the OpenCode DB query itself throws.
         const error = err instanceof Error ? err : new Error(String(err));
         sessionLog(
             sessionId,
@@ -355,13 +301,11 @@ export function applyDeferredCompactionMarker(
 }
 
 /**
- * After historian publishes new compartments, inject or move the compaction marker.
- * Only moves the boundary forward; summary text is a static placeholder.
+ * The manager injects or moves the compaction marker after historian publishes new compartments.
+ * The manager only moves the boundary forward; the summary text is a static placeholder.
  *
- * Plan v6: callers in incremental / recomp / partial-recomp paths invoke this
- * directly only when they are NOT deferring (i.e.
- * `preserveInjectionCacheUntilConsumed === false`). Deferred path uses
- * `applyDeferredCompactionMarker` from postprocess drain.
+ * Direct calls require `preserveInjectionCacheUntilConsumed === false`.
+ * When `preserveInjectionCacheUntilConsumed` is true, the postprocess drain uses `applyDeferredCompactionMarker`.
  */
 export function updateCompactionMarkerAfterPublication(
     db: Database,
@@ -369,13 +313,11 @@ export function updateCompactionMarkerAfterPublication(
     lastCompartmentEnd: number,
     directory?: string,
 ): boolean {
-    // OpenCode-only: this writes marker rows into opencode.db. Pi reaches this
-    // function through the recompilation runners both harnesses share, but Pi
-    // writes its native marker via a separate path (see pi-recomp-marker.ts),
-    // and on a Pi-only install the opencode.db parent directory may not exist
-    // at all — SQLite then throws `unable to open database file`, which turned
-    // a fully successful recompilation into a scary "Failed" report. There is
-    // nothing to update on Pi, so report success.
+    // Pi reaches this function through shared recompilation runners.
+    // Pi writes its native marker through `pi-recomp-marker.ts`.
+    // On Pi-only installs, the `opencode.db` parent directory may not exist.
+    // `opencode.db` open failures must not fail recompilation on Pi-only installs.
+    // `updateCompactionMarkerAfterPublication` has no OpenCode marker to update, so it returns success.
     if (getHarness() !== "opencode") {
         return true;
     }
@@ -405,14 +347,12 @@ export function updateCompactionMarkerAfterPublication(
             )
         ) {
             // Same/newer boundary — nothing to do (placeholder text never changes).
-            // Already current = success.
             return true;
         }
     }
 
-    // Resolve the new boundary before mutating the existing marker. If the
-    // target is stale or no user exists at/before it, leave the old marker in
-    // place to avoid needless cache churn and history-boundary loss.
+    // `applyDeferredCompactionMarker` leaves the old marker intact when the target is stale or no user exists at or before it.
+    // Retaining the old marker avoids cache churn and history-boundary loss.
     const boundary = findBoundaryUserMessage(sessionId, targetEndMessageId);
     if (!boundary) {
         sessionLog(
@@ -423,12 +363,9 @@ export function updateCompactionMarkerAfterPublication(
     }
 
     if (existing) {
-        // Boundary moved forward — remove old marker and inject new one.
-        // removeCompactionMarker returns false on failure (it does NOT throw),
-        // so honor the boolean: only clear persisted state after a SUCCESSFUL
-        // removal. Clearing it on a failed removal would orphan the old marker
-        // rows AND, if the injection below also fails, lose the durable retry
-        // path entirely. On removal failure we abort WITHOUT clearing — the
+        // `removeCompactionMarker` can return `false`; clear persisted state only after it returns `true`.
+        // Clearing persisted state after a failed removal would orphan the old marker rows.
+        // If injection also fails, clearing persisted state loses the durable retry path.
         // caller (and the next pass) can retry against the still-persisted state.
         const removed = removeCompactionMarker(existing);
         if (!removed) {
@@ -471,13 +408,12 @@ export function updateCompactionMarkerAfterPublication(
         );
         return true;
     }
-    // Injection failed after boundary preflight (e.g. OpenCode DB write error).
-    // Report failure so callers preserve any pending retry state.
+    // `false` preserves callers' pending retry state.
     return false;
 }
 
 /**
- * Remove the compaction marker for a session (e.g. on session.deleted).
+ * `removeCompactionMarkerForSession` runs during session deletion.
  */
 export function removeCompactionMarkerForSession(db: Database, sessionId: string): void {
     const existing = getPersistedCompactionMarkerState(db, sessionId);
@@ -487,9 +423,7 @@ export function removeCompactionMarkerForSession(db: Database, sessionId: string
             setPersistedCompactionMarkerState(db, sessionId, null);
             sessionLog(sessionId, "compaction-marker: removed on session cleanup");
         } catch (error) {
-            // Clear state anyway on session deletion — orphaned rows in OpenCode's DB
-            // are acceptable since the session is being deleted, and retaining stale
-            // persisted state for a deleted session causes worse problems.
+            // Session deletion clears persisted state even when marker removal fails; orphaned OpenCode rows are acceptable.
             setPersistedCompactionMarkerState(db, sessionId, null);
             sessionLog(
                 sessionId,
@@ -501,11 +435,10 @@ export function removeCompactionMarkerForSession(db: Database, sessionId: string
 }
 
 /**
- * Result of a fork-orphan marker hygiene pass (#263).
  *
- * `removed` counts foreign markers deleted this pass. `failed` signals that at
- * least one deletion was attempted but could not complete (e.g. SQLITE_BUSY);
- * the caller treats that as "retry on the next degraded pass" and never as a
+ * `removed` counts foreign markers deleted this pass.
+ * `failed` indicates that at least one attempted deletion did not complete.
+ * `failed` causes the caller to retry during the next degraded pass.
  * fatal error.
  */
 export interface OrphanMarkerReconcileResult {
@@ -514,54 +447,34 @@ export interface OrphanMarkerReconcileResult {
 }
 
 /**
- * Fork-orphan compaction-marker hygiene (#263).
  *
- * OpenCode's `/fork` copies the parent session's message rows into the fork —
- * including the parent's magic-context compaction-marker rows — but does NOT
- * inherit magic-context's durable state (PARITY.md gap #25: OpenCode re-mints
- * message ids on fork, so entry-id-keyed migration is unsafe). The fork then
- * injects its own fresh marker at its own (much older) historian boundary, and
- * `filterCompacted` — which walks newest→oldest and stops at the FIRST marker
- * it sees (opencode message-v2.ts `filterCompacted`) — honours the NEWER
- * orphan instead of ours. The visible window is cut at the orphan, our boundary
- * message falls below the cut, and inject-compartments degrades with no
- * recovery path while context usage climbs.
+ * OpenCode's `/fork` copies parent magic-context compaction-marker rows without copying persisted marker state.
+ * OpenCode re-mints message IDs on fork, so entry-ID-keyed migration is unsafe.
+ * `filterCompacted` honors the orphan marker before the newly injected marker.
+ * The orphan hides the boundary message, causing `inject-compartments` to degrade.
  *
- * A marker row in opencode.db for this session that the durable state does not
- * recognize as its own current marker is a fork-orphan. This pass scans for
- * them and removes the ones that actively outrank ours:
+ * A fork-orphan is a session marker not identified by persisted state as the current marker.
  *
- *   - not owned: `part.id != persisted.compactionPartId`
- *   - magic-context-shaped: carries one of OUR summary messages
- *     (providerID="magic-context") — OpenCode-native /compact markers carry the
- *     real provider id and are never touched
- *   - newer than ours: its boundary message sorts AFTER ours in canonical
- *     order, which is exactly the case where `filterCompacted` stops at the
- *     orphan first. Older foreign markers are harmless (ours already wins) and
- *     are left alone to keep the repair minimally invasive.
+ * Reconciliation treats only markers with `magic-context` summary lineage as fork-orphans.
+ * Only boundaries that sort after the owned boundary can outrank the owned marker.
  *
- * Removal is idempotent (plain DELETEs) so concurrent processes racing on the
- * same orphan converge on the same end state; the only guarded invariant is
- * never deleting our own marker, re-checked against freshly-read persisted
+ * Plain DELETEs make concurrent orphan removal idempotent.
  * state below.
  *
- * Cost gate: callers invoke this only when degraded mode fires (never on every
- * pass), so steady state pays nothing. Any failure is swallowed and reported
- * via the result so the next degraded pass retries.
+ * Callers invoke reconciliation only during degraded mode, so steady-state passes perform no database work.
+ * `failed` causes the next degraded pass to retry.
  */
 export function reconcileForkOrphanedCompactionMarkers(
     db: Database,
     sessionId: string,
 ): OrphanMarkerReconcileResult {
-    // Markers live in opencode.db; Pi writes its native marker via a separate
-    // path and has no rows here to reconcile.
+    // Only OpenCode sessions have marker rows in `opencode.db` to reconcile.
     if (getHarness() !== "opencode") {
         return { removed: 0, failed: false };
     }
 
     try {
-        // Our own marker must exist in durable state; without it we have no
-        // ownership anchor to diff against (and nothing to defend).
+        // Without persisted marker state, the function cannot identify or protect its own marker.
         const owned = getPersistedCompactionMarkerState(db, sessionId);
         if (!owned) {
             return { removed: 0, failed: false };
@@ -575,17 +488,10 @@ export function reconcileForkOrphanedCompactionMarkers(
             if (marker.compactionPartId === owned.compactionPartId) {
                 continue; // our own marker
             }
-            // A marker without our summary lineage is either an OpenCode-native
-            // /compact or a half-written row. filterCompacted only stops at a
-            // user message that has BOTH a compaction part and a completed
-            // summary, so a part-only row cannot outrank us; and we must never
-            // delete a native compaction. Skip it.
             if (marker.summaryMessageIds.length === 0) {
                 continue;
             }
-            // Only repair orphans that actively outrank ours. If ordering cannot
-            // be established (a referenced message vanished mid-pass), be
-            // conservative and leave the row for the next pass.
+            // Reconciliation skips markers unless canonical ordering proves their boundaries are newer than the owned boundary.
             const ordering = compareOpenCodeMessagesByCanonicalOrder(
                 sessionId,
                 marker.boundaryMessageId,
@@ -595,9 +501,7 @@ export function reconcileForkOrphanedCompactionMarkers(
                 continue;
             }
 
-            // Re-read persisted state right before mutating: if our marker
-            // advanced between the scan and now, make sure we still don't touch
-            // anything the current state owns.
+            // Reconciliation re-reads persisted state before deletion to avoid deleting a marker that became owned after the scan.
             const currentOwned = getPersistedCompactionMarkerState(db, sessionId);
             if (!currentOwned || marker.compactionPartId === currentOwned.compactionPartId) {
                 continue;
@@ -626,9 +530,7 @@ export function reconcileForkOrphanedCompactionMarkers(
         }
         return { removed, failed };
     } catch (error) {
-        // opencode.db missing/locked, schema drift, etc. Never fatal: degraded
-        // mode simply persists until the next retry, and layer-B re-anchor keeps
-        // injection alive in the meantime.
+        // Reconciliation treats a missing, locked, or schema-incompatible `opencode.db` as nonfatal.
         sessionLog(
             sessionId,
             "compaction-marker hygiene: scan failed (will retry on next degraded pass):",
@@ -639,49 +541,25 @@ export function reconcileForkOrphanedCompactionMarkers(
 }
 
 /**
- * Close the writable OpenCode DB connection used for marker injection.
  */
 export function closeCompactionMarkerConnection(): void {
     closeCompactionMarkerDb();
 }
 
 /**
- * Startup consistency check for compaction markers.
  *
- * Magic Context persists marker state in context.db's `session_meta`, while the
- * actual marker rows (compaction part + summary message + summary part) live in
- * OpenCode's separate `opencode.db`. There is no cross-DB transaction between
- * the two stores, so a crash between writes — or any external cleanup of
- * OpenCode's DB — can leave the two in an inconsistent state:
  *
- * - Phantom state: persisted in context.db but the referenced rows no longer
- *   exist in opencode.db. On next publication, the manager tries to remove a
- *   marker that isn't there, ignores the failure, and re-injects, but the
- *   stale persisted state can also confuse readers that trust it.
- * - Orphaned rows: rows in opencode.db exist without matching context.db
- *   state. Those can't be surfaced from here (we don't track them), but the
- *   natural-healing path already handles them: the next historian publication
- *   moves the boundary forward and the new injection replaces the orphans by
- *   moving filterCompacted past them.
+ * A missing referenced row leaves phantom persisted state.
  *
- * This function scans all persisted marker states and, for each one, verifies
- * that the referenced rows still exist in opencode.db. If any referenced row
- * is missing, it treats the marker as inconsistent, attempts to remove
- * whatever rows ARE still present (best-effort cleanup of half-written
- * markers), and clears the persisted state so the next publication can
  * re-inject cleanly.
  *
- * Called once at plugin startup. Safe to call multiple times (idempotent).
  */
 export function checkCompactionMarkerConsistency(db: Database): void {
     const opencodeDbPath = join(getDataDir(), "opencode", "opencode.db");
     let opencodeDb: SqliteDb;
     try {
-        // Read-only + immutable-less: we only need read access for the existence
-        // check. OpenCode may also be running, so avoid exclusive locks.
         opencodeDb = new SqliteDb(opencodeDbPath, { readonly: true });
     } catch (error) {
-        // OpenCode DB missing or inaccessible — nothing to reconcile.
         log(
             `[magic-context] compaction-marker consistency check skipped: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -706,10 +584,7 @@ export function checkCompactionMarkerConsistency(db: Database): void {
             const state = getPersistedCompactionMarkerState(db, row.session_id);
             if (!state) continue;
 
-            // Check all 3 referenced rows. Use `!= null` (not `!== null`):
-            // bun:sqlite's .get() returns `undefined` for a missing row, so a
-            // strict `!== null` is always true and a deleted OpenCode row would
-            // be treated as present — leaving stale marker state never reconciled.
+            // `bun:sqlite` returns `undefined` for missing rows, so the row-existence check uses `!= null`; `!== null` would treat a deleted row as present.
             const boundaryExists = checkMessage.get(state.boundaryMessageId) != null;
             const summaryMessageExists = checkMessage.get(state.summaryMessageId) != null;
             const compactionPartExists = checkPart.get(state.compactionPartId) != null;
@@ -720,23 +595,11 @@ export function checkCompactionMarkerConsistency(db: Database): void {
 
             if (allPresent) continue;
 
-            // Inconsistent — best-effort clean up any surviving half-written rows,
-            // then clear persisted state so next publication can re-inject.
             //
-            // Only clear persisted state after verified successful cleanup.
-            // If `removeCompactionMarker` fails (DB locked, IO error), keeping
-            // persisted state lets a retry on the
-            // next startup try again; clearing would leave orphaned rows in
-            // OpenCode's DB that filterCompacted still respects. The natural
-            // healing path via the next historian publication still exists as
-            // a backup when the state IS cleared after a success.
             let removedOk = false;
             try {
                 removedOk = removeCompactionMarker(state);
             } catch (error) {
-                // Partial failure during half-written cleanup is expected and
-                // not worth warning about — we just want to get the DBs back
-                // into a consistent state.
                 sessionLog(
                     row.session_id,
                     "compaction-marker consistency: partial cleanup of half-written marker failed:",

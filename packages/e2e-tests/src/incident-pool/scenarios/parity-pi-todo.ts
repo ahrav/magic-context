@@ -230,12 +230,10 @@ function baseSetup(
 /**
  * The id of the newest assistant message an injector may anchor to.
  *
- * The Pi injector appends the synthetic pair to the newest assistant message
- * that did not abort or error, and persists THAT message's id, so it is the only
- * legal anchor for a pair built from the same history. Deriving it here from
- * Pi's own message fields keeps the expectation independent of the injector: a
- * check that only requires a nonempty id accepts any string, and one that reused
- * the injector's own id helper would agree with it however it were derived.
+ * The Pi injector appends each synthetic pair to the newest non-aborted, non-error assistant message.
+ * The persisted anchor id must identify the newest non-aborted, non-error assistant message in the same history.
+ * The expected-anchor check derives the anchor from Pi message fields rather than injector helpers to remain independent of injector implementation.
+ * A nonempty-id check accepts arbitrary ids, and injector helpers cannot independently validate injector-derived ids.
  */
 function latestReplayableAssistantId(
     messages: readonly Record<string, unknown>[],
@@ -275,8 +273,7 @@ async function preparePiCacheBust(
     const callId = computeSyntheticCallId(stateJson);
     const probe = await captureTodoState(adapter, STATE_X_TODOS);
     const pressureUsedRealBytes = await primeNextTurnAsCacheBust(adapter);
-    // Snapshot before the bust turn: the request that injects the pair is built
-    // from this history, so the anchor must name a message already in it.
+    // Capture the anchor before the bust turn because the injecting request uses the pre-bust history.
     const expectedAnchorId = latestReplayableAssistantId(await h.getMessages());
     const body = await sendAndCaptureMainRequest(adapter, "Pi cache-bust turn");
     return {
@@ -362,11 +359,7 @@ export async function drivePiTodoCapture(
             missingPriorityAdapter,
             MISSING_PRIORITY_TODOS,
         );
-        // Capture-side state is only half the behavior. Persisting `medium` and
-        // then omitting or mis-serializing it on the provider wire is the defect
-        // an agent would actually see, and no other variant covers it: the
-        // injection case drives STATE_X_TODOS, whose priorities are all
-        // explicit. Drive the defaulted state through a bust and read the pair.
+        // The check verifies that a defaulted `medium` priority persists in the provider pair after a cache bust.
         const missingPriorityState = normalizedTodoJson(MISSING_PRIORITY_TODOS);
         await primeNextTurnAsCacheBust(missingPriorityAdapter);
         const missingPriorityBust = await sendAndCaptureMainRequest(
@@ -395,14 +388,12 @@ export async function drivePiTodoCapture(
                     pairTodoInput(missingPriorityPair),
                     MISSING_PRIORITY_TODOS,
                 ) &&
-                // The agent reads the RESULT, so a correct defaulted input
-                // beside a stale result is still a contradictory pair.
+                // The validation rejects pairs whose tool results do not match the defaulted input.
                 wireTodosMatch(
                     pairToolResultTodos(missingPriorityPair),
                     MISSING_PRIORITY_TODOS,
                 ) &&
-                // Looking the expected pair up by id cannot see another beside
-                // it, and the durable read is identical either way.
+                // The validation requires exactly one pair because an ID lookup cannot detect a second pair.
                 missingPriorityBust !== null &&
                 injectedTodoPairs(missingPriorityBust).length === 1,
         };
@@ -482,29 +473,18 @@ export async function drivePiTodoInjection(
             todoWriteExecuted: prepared.toolExecuted,
             pressureUsedRealBytes: prepared.pressureUsedRealBytes,
             providerRequestCaptured: prepared.body !== null,
-            // A correct pair beside a second injected one satisfies a bare
-            // existence check, and neither the id nor the anchor assertion can
-            // see the extra pair, so duplicate or conflicting todos could reach
-            // the agent unnoticed.
+            // The validation requires exactly one injected pair because existence alone permits conflicting duplicate todos.
             syntheticPairPresent:
                 pair !== null &&
                 prepared.body !== null &&
                 injectedTodoPairs(prepared.body).length === 1,
-            // The call id is a hash of the normalized state, so matching it
-            // proves the id was DERIVED from the right state, not that the pair
-            // carries it. Both halves are compared: the agent reads the tool
-            // result, so a correct input beside a fabricated result is still a
+            // The validation compares both the call ID and pair contents because the hash alone does not prove that the pair carries that state.
             // contradictory pair.
             deterministicCallIdMatched:
                 pair?.callId === prepared.callId &&
                 wireTodosMatch(pairTodoInput(pair), STATE_X_TODOS) &&
                 wireTodosMatch(pairToolResultTodos(pair), STATE_X_TODOS),
-            // A nonempty anchor id proves nothing: an implementation that
-            // persists the correct call id and state alongside an arbitrary
-            // message id satisfies the catalog's invalid "correct provider bytes
-            // linked to the wrong persisted anchor" shape, and the defer pass
-            // then re-anchors somewhere else or drops the pair. Require the id
-            // of the message the pair was actually appended to.
+            // The validation requires the persisted anchor ID to equal the message ID receiving the pair because a nonempty ID does not establish that link.
             persistedAnchorMatched:
                 prepared.meta?.todo_synthetic_call_id === prepared.callId &&
                 prepared.expectedAnchorId !== null &&
@@ -634,12 +614,12 @@ export async function drivePiTodoDeferReplay(
         const newerBytes = newerDefer
             ? syntheticPairBytes(newerDefer, newer.callId)
             : null;
-        // Deferral means the newer state is not on the wire AT ALL, not merely
-        // that the frozen pair survived beside it. Byte-comparing the old call
-        // id cannot see a second pair injected for the newer state, and the
-        // durable fields stay frozen in that case too, so without a count the
-        // case reads as deferred while already exposing the newer todos. Count
-        // injected pairs by their deterministic call-id prefix: a real executed
+        // Deferral omits the newer state from the wire.
+        // Checking the old call ID cannot detect a newer-state pair.
+        // A second newer-state pair can coexist with the frozen pair.
+        // Frozen durable fields cannot reveal an injected newer-state pair.
+        // The validation counts injected pairs to reject deferred requests that expose newer todos.
+        // The call-ID prefix distinguishes synthetic injected pairs from replayed todowrite pairs.
         // todowrite pair replayed in history is not a second injection.
         const newerDeferPairCount = newerDefer
             ? injectedTodoPairs(newerDefer).length
@@ -649,8 +629,8 @@ export async function drivePiTodoDeferReplay(
         const legacyAdapter = piAdapter(h);
         const legacyAnchorExisted =
             legacy.meta?.todo_synthetic_call_id === legacy.callId;
-        // The anchor the frozen pair is already replayed at. Healing rebuilds the
-        // deleted state json and must keep pointing here.
+        // The frozen pair is replayed at `legacyPreHealAnchorId`.
+        // Healing must retain `legacyPreHealAnchorId` after rebuilding deleted state JSON.
         const legacyPreHealAnchorId =
             legacy.meta?.todo_synthetic_anchor_message_id ?? null;
         updatePiTodoMeta(
@@ -692,28 +672,19 @@ export async function drivePiTodoDeferReplay(
                 newer.body !== null &&
                 legacy.body !== null,
             firstReplayPresent: bytes0 !== null && bytes1 !== null,
-            // Byte-equality across the two defer passes proves the replay is
-            // stable, not that what is replayed is right: this variant declares
-            // no `blocked_by` dependency on the injection variant, so a
-            // consistently malformed pair would otherwise publish a resolution
+            // Identical defer-pass bytes do not prove that the replay payload is correct.
             // candidate here.
             byteIdenticalReplay:
                 bytes0 !== null &&
                 bytes1 === bytes0 &&
                 wireTodosMatch(pairTodoInput(pair0), STATE_X_TODOS) &&
                 wireTodosMatch(pairToolResultTodos(pair0), STATE_X_TODOS) &&
-                // Both passes must carry exactly one injected pair: the byte and
-                // payload checks resolve the expected call id, so a conflicting
-                // second pair on either wire is invisible to them, and the
-                // durable identity fields cannot see a provider-only duplicate.
+                // Expected-call-ID payload checks cannot detect a second conflicting pair.
+                // A second provider-only pair is invisible to durable identity fields.
                 replayPairCounts.every((count) => count === 1),
-            // Comparing the two reads only to each other is satisfied by two
-            // nulls, so an implementation that replays the deterministic pair
-            // while persisting no anchor at all reads as stable — the catalog's
-            // invalid "replay compared while no synthetic anchor was persisted"
-            // shape. Two identical but wrong state values pass for the same
-            // reason. Anchor both reads to the expected values, then require
-            // T1 to still equal T0.
+            // Compare each read with the expected persisted state; two null reads also match each other.
+            // Persisting no anchor can appear stable when both reads are null.
+            // Two identical but incorrect state values can satisfy a comparison between the two reads.
             durableReplayIdentityStable:
                 metaT0?.todo_synthetic_call_id === replay.callId &&
                 replay.expectedAnchorId !== null &&
@@ -738,17 +709,9 @@ export async function drivePiTodoDeferReplay(
                 newerMeta.todo_synthetic_state_json ===
                     normalizedTodoJson(STATE_X_TODOS),
             legacyAnchorExisted,
-            // A rebuilt pair plus a correct state json is not a healed anchor:
-            // the durable linkage is the third field, and leaving it unset is
-            // the catalog's invalid wrong-persisted-state-linkage shape.
+            // A rebuilt pair with correct state JSON does not restore the deleted anchor.
             //
-            // Nonempty is not enough either — an unrelated message id admits the
-            // same invalid shape. Healing must PRESERVE the anchor recorded
-            // before the heal, because that is the message the frozen pair is
-            // replayed at; re-anchoring elsewhere changes the wire position on
-            // later defers. So compare against the pre-heal value rather than
-            // `legacy.expectedAnchorId`, which names the newest assistant of the
-            // heal turn and is not where the original pair lives.
+            // Healing must preserve the anchor recorded before the heal.
             legacyAnchorHealed:
                 legacyBytes !== null &&
                 legacyDeferBytes === legacyBytes &&
@@ -921,21 +884,8 @@ const PI_IMPLEMENTATION_FILES = [
     "packages/pi-plugin/src/index.ts",
     "packages/pi-plugin/src/context-handler.ts",
     "packages/pi-plugin/src/pi-todo-inject.ts",
-    // Every Pi variant drives the real todowrite tool: the cases assert
-    // `toolName === "todowrite"`, which depends on the registration in
-    // tools/index.ts, and the capture case asserts missing-priority behavior,
-    // which is the optional `priority` in the todowrite schema. Without these
-    // the verdict could change while the digest stayed constant.
     "packages/pi-plugin/src/tools/index.ts",
     "packages/pi-plugin/src/tools/todowrite.ts",
-    // The Pi injector is only the wire adapter. It imports the deterministic
-    // call id and the byte-exact synthetic pair (`computeSyntheticCallId`,
-    // `buildSyntheticTodoPart`, terminal-state handling) from the shared view
-    // module, and the durable anchor read/write/clear functions from the
-    // persisted metadata module — `storage-meta.ts` only re-exports those.
-    // Every Pi variant's verdict turns on that behavior, so without these two
-    // the call id, pair bytes, or anchor persistence could change while both
-    // the implementation and selected-set digests stayed constant.
     "packages/plugin/src/hooks/magic-context/todo-view.ts",
     "packages/plugin/src/features/magic-context/storage-meta-persisted.ts",
 ];

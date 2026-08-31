@@ -1,21 +1,16 @@
 /**
- * Strict versioned benchmark report contract (KTD11).
  *
- * A report separates two identity channels. `semantic` holds only
- * run-independent identity — policy versions, release fingerprints, harness
- * configuration — and `semanticFingerprint` hashes exactly that section
- * through canonical JSON, so neither object-key order nor any run-local
- * working directory can change it. `evidence` holds every attempt
- * (real-clock timestamps, working directories, diagnostics) and every raw
- * per-scenario sample, so all aggregates are recomputable; `evidenceDigest`
- * hashes the whole report, evidence included.
+ * `semantic` stores run-independent identity; `semanticFingerprint` hashes that section through canonical JSON.
+ * `semanticFingerprint` uses canonical JSON, so object-key order does not change it.
+ * `evidence.attempts` contains only stable terminal attempts; open attempts are excluded.
+ * Raw per-scenario samples make aggregates recomputable.
+ * `evidenceDigest` hashes the whole report, including evidence.
  *
- * The candidate-pool section is the versioned unjudged top-K artifact that
- * `magic-context-u51` consumes: unjudged results stay visible without ever
- * becoming implicit negative labels.
+ * The candidate pool is the versioned unjudged top-K artifact consumed by `magic-context-u51`.
+ * `magic-context-u51` keeps unjudged results visible without treating them as negative labels.
  *
- * Incomplete or incompatible evidence can never produce a pass:
- * `passEligibility` is the only pass gate this module exports and it fails
+ * Incomplete or incompatible evidence cannot produce a pass.
+ * `passEligibility` is the only pass gate this module exports and fails closed.
  * closed.
  */
 
@@ -98,7 +93,7 @@ const scenarioSchema = z.strictObject({
     mode: z.enum(["explicit", "automatic"]),
     partition: z.enum(["development", "holdout"]),
     paraphraseGroup: z.string().min(1),
-    /** Raw physical ranking exactly as the surface returned it. */
+    /** `rankedPhysical` preserves the exact physical ranking returned by the surface. */
     rankedPhysical: z.array(z.string().min(1)),
     deliveredPhysical: z.array(z.string().min(1)),
     deliveredTokens: z.number().int().nonnegative().nullable(),
@@ -110,7 +105,7 @@ const scenarioSchema = z.strictObject({
         "below-threshold",
         "timeout",
     ]),
-    /** Raw per-scenario latency samples; summaries are recomputable. */
+    /** Raw per-scenario latency samples allow summaries to be recomputed. */
     latencySamplesMs: z.array(z.number().min(0)),
     queryEmbedPurpose: z.enum(["query", "passage"]).nullable(),
     metrics: scenarioMetricsSchema,
@@ -143,11 +138,10 @@ const caseEvidenceSchema = z.strictObject({
             status: z.enum(["verified", "not-attempted", "not-applicable"]),
         }),
     ),
-    /** True when the case's sourceLanes are narrower than the mode's full
-     *  source set; such cases stay diagnostic and their scenarios are
-     *  excluded from gate macro-averages (R52). */
+    /** Cases whose `sourceLanes` are narrower than the mode's full source set remain diagnostic and are excluded from gate macro-averages.
+     * */
     laneRestricted: z.boolean(),
-    /** Diagnostic p50/p95 over the case's trace-disabled samples (R27);
+    /** Diagnostic p50 and p95 are computed from the case's trace-disabled samples.
      *  the regression policy recomputes percentiles from raw samples. */
     latencySummary: z
         .strictObject({
@@ -162,12 +156,12 @@ export type CaseEvidence = z.infer<typeof caseEvidenceSchema>;
 
 const attemptSchema = z.strictObject({
     attemptId: z.string().min(1),
-    /** Stable terminal statuses only — an open attempt is not evidence. */
+    /** `evidence.attempts` contains only stable terminal attempts; open attempts are excluded. */
     status: z.enum(["completed", "failed", "interrupted"]),
     startedAtEpochMs: z.number().nonnegative(),
     endedAtEpochMs: z.number().nonnegative().nullable(),
-    /** Real-clock and run-local detail lives here, in evidence, never in
-     *  the semantic section. */
+    /** `evidence` holds real-clock and run-local detail; `semantic` never does.
+     * */
     workingDirectory: z.string().nullable(),
     diagnostics: z.array(z.string()),
 });
@@ -184,7 +178,7 @@ const candidatePoolSchema = z.strictObject({
             locator: z.string().min(1),
             documentId: z.string().min(1).nullable(),
             canonicalId: z.string().min(1).nullable(),
-            /** Unjudged stays unjudged — never an implicit grade 0. */
+            /** Unjudged results never receive an implicit grade 0. */
             status: z.enum(["unjudged", "unresolved"]),
         }),
     ),
@@ -203,8 +197,8 @@ const reportSchema = z.strictObject({
             syntheticProfiles: fingerprintSchema,
             manifest: fingerprintSchema,
         }),
-        /** Harness configuration identity. Callers must not put run-local
-         *  paths or clocks here; those belong in evidence.attempts. */
+        /** `semantic` identifies harness configuration; callers must store run-local paths and clocks in `evidence.attempts`.
+         * */
         config: z.record(z.string(), jsonValueSchema),
     }),
     evidence: z.strictObject({
@@ -229,9 +223,8 @@ export function parseReport(value: unknown): BenchmarkReport {
     return parsed.data;
 }
 
-/** Deterministic semantic/config fingerprint: hashes ONLY the semantic
- *  section (canonical JSON sorts keys, so insertion order is irrelevant).
- *  Attempts, timestamps, and working directories cannot reach it. */
+/**
+ * Attempts, timestamps, and working directories cannot affect `semanticFingerprint`. */
 export function semanticFingerprint(report: BenchmarkReport): string {
     return canonicalFingerprint({
         schemaVersion: report.schemaVersion,
@@ -239,15 +232,14 @@ export function semanticFingerprint(report: BenchmarkReport): string {
     });
 }
 
-/** Hashes the whole report, attempts included. */
+/* */
 export function evidenceDigest(report: BenchmarkReport): string {
     return canonicalFingerprint(report);
 }
 
 /**
- * Compute the report status from expected coverage: every expected scenario
- * present exactly once and at least one completed attempt. A duplicate
- * scenario is structurally invalid; anything missing is incomplete.
+ * Each scenario query ID must be unique, and at least one attempt must be completed.
+ * A missing expected query ID returns "incomplete".
  */
 export function computeReportStatus(input: {
     expectedQueryIds: readonly string[];
@@ -268,8 +260,6 @@ export function computeReportStatus(input: {
 }
 
 /**
- * The only pass gate this module exports. Fails closed: anything other than
- * a complete report over compatible evidence is ineligible, with stable
  * reason codes.
  */
 export function passEligibility(
@@ -282,10 +272,8 @@ export function passEligibility(
     return { eligible: reasons.length === 0, reasons };
 }
 
-/** Per-(partition, mode) macro aggregates recomputed from report evidence.
- *  Scenarios from lane-restricted cases are excluded, so per-source-lane
- *  cells never move a gate macro-average (R52); their raw scenario metrics
- *  stay in the report evidence as diagnostics. */
+/**
+ * */
 export function aggregateReportQuality(report: BenchmarkReport): MacroAggregate[] {
     const laneRestrictedCases = new Set(
         report.evidence.cases
@@ -311,10 +299,6 @@ export function aggregateReportQuality(report: BenchmarkReport): MacroAggregate[
 }
 
 /**
- * `magic-context-u51` consumes this versioned, unjudged top-K candidate-pool
- * artifact. Judged entries and duplicate aliases are excluded; unresolved
- * locators are retained with their status so the follow-up release can
- * account for them.
  */
 export function buildCandidatePool(input: {
     topK: number;

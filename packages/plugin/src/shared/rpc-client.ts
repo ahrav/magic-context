@@ -28,7 +28,7 @@ export class MagicContextRpcClient {
         this.legacyPortFilePath = legacyRpcPortFilePath(storageDir, directory);
     }
 
-    /** Call an RPC method. Retries port resolution if the server isn't ready yet. */
+    /* */
     async call<T = Record<string, unknown>>(
         method: string,
         params: Record<string, unknown> = {},
@@ -88,7 +88,7 @@ export class MagicContextRpcClient {
         throw new Error("Magic Context RPC server not available");
     }
 
-    /** Check if the RPC server is reachable. */
+    /* */
     async isAvailable(): Promise<boolean> {
         try {
             const port = await this.resolvePort();
@@ -100,8 +100,8 @@ export class MagicContextRpcClient {
 
     /** Resolve the live server's port + bearer token (for opening the WS push
      *  channel). Reuses the same health-checked port-file discovery as `call`,
-     *  so the WS client and the HTTP client always agree on which server instance
-     *  (and token) to use. Returns null when no live server is found. */
+     * so the WS client and HTTP client use the same discovery and health-check rules.
+     * */
     async resolveEndpoint(): Promise<{
         port: number;
         token: string | null;
@@ -149,8 +149,7 @@ export class MagicContextRpcClient {
             for (const entry of readdirSync(this.portDir)) {
                 if (!entry.startsWith("port-") || !entry.endsWith(".json")) continue;
                 const record = parseRpcPortFile(readFileSync(join(this.portDir, entry), "utf-8"));
-                // A denied liveness probe still leaves this as a candidate; the
-                // mandatory health check below confirms whether its RPC server is reachable.
+                // A denied liveness probe leaves the port-file entry as a candidate; the mandatory health check below confirms that its RPC server is reachable.
                 if (!record || isPidAlive(record.pid) === "dead") continue;
                 records.push(record);
             }
@@ -162,11 +161,10 @@ export class MagicContextRpcClient {
             const legacy = parseRpcPortFile(readFileSync(this.legacyPortFilePath, "utf-8"));
             if (legacy && (!legacy.pid || isPidAlive(legacy.pid) !== "dead")) records.push(legacy);
         } catch {
-            // Legacy discovery is optional.
+            // Absence of the legacy port file does not prevent discovery.
         }
 
-        // A TUI and its server plugin normally share a process. Prefer that exact
-        // process before considering another live OpenCode instance for the project.
+        // Discovery prefers the current process's server before another live OpenCode instance for the project.
         records.sort((a, b) => {
             const aLocal = a.pid === process.pid ? 1 : 0;
             const bLocal = b.pid === process.pid ? 1 : 0;
@@ -183,8 +181,7 @@ export class MagicContextRpcClient {
             if (!response.ok) return false;
             const body = (await response.json()) as { pid?: unknown; instance_id?: unknown };
             if (body.pid !== record.pid) return false;
-            // v0.32 health responses predate instance ids. A missing id is the
-            // one-release discovery bridge; an id that is present must still match.
+            // v0.32 health responses omit instance IDs; the health check accepts a missing ID and requires any present ID to match.
             return (
                 body.instance_id === undefined ||
                 record.instance_id === undefined ||

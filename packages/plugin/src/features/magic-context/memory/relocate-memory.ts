@@ -21,7 +21,6 @@ import {
 import { resolveProjectId } from "./storage-claims";
 
 // ---------------------------------------------------------------------------
-// Direct claim relocation (U7)
 // ---------------------------------------------------------------------------
 
 export type ClaimRelocationMode = "copy" | "move";
@@ -123,11 +122,9 @@ function conservativeRelocationProvenance(
 }
 
 /**
- * Copy or move project-memory claims across numeric projects as one U2
- * operation. Every source token is validated before target work begins. A
- * stale token therefore stores one zero-effect receipt for the whole batch.
- * Targets receive fresh conservative evidence and explicit derivation
- * lineage; source evidence, approvals, and maturity are never inherited.
+ * A batch with a stale token stores one zero-effect receipt.
+ * Targets receive fresh conservative evidence.
+ * Targets receive explicit derivation lineage; source evidence, approvals, and maturity are never inherited.
  */
 export function relocateProjectMemoryClaims(
     db: Database,
@@ -145,11 +142,10 @@ export function relocateProjectMemoryClaims(
     }
     const relation: ClaimDerivationRelation = input.mode === "move" ? "moved_from" : "copied_from";
     const nowMs = input.nowMs ?? Date.now();
-    // The resolved actor is part of the request identity, as it is for every other
-    // claim mutation. It is written into the target's initial lifecycle event and,
-    // for a move, the source's too, so omitting it here would let the same
-    // producer/operation key replay under a different actor and silently keep the
-    // first actor's audit records instead of reporting an identity conflict.
+    // The resolved actor is part of the request identity.
+    // Target initialization records the resolved actor in the target's initial lifecycle event.
+    // A move records the resolved actor in the source lifecycle event.
+    // Reusing a producer and operation key with a different actor reports an identity conflict rather than retaining the original actor's audit records.
     const request = {
         actor: input.actor ?? producer.producer,
         mode: input.mode,
@@ -168,7 +164,6 @@ export function relocateProjectMemoryClaims(
             const seen = new Set<string>();
             const sources: ValidatedRelocationSource[] = [];
 
-            // Validate the complete source vector before writing any target row.
             for (const token of input.sourceTokens) {
                 if (seen.has(token.publicClaimId)) {
                     throw new ClaimOperationInputError(
@@ -211,8 +206,8 @@ export function relocateProjectMemoryClaims(
                 targetRevision: string;
             }> = [];
 
-            // Build every target first. Any failure rolls the savepoint back,
-            // and no move source has been archived yet.
+            // The operation builds every target before retiring any move source; any failure rolls back the savepoint.
+            // No move source is archived before target construction completes.
             for (const source of sources) {
                 const existing = activeTargetForSource(db, targetProjectId, source);
                 if (existing) {

@@ -1,13 +1,8 @@
 /**
- * Isolated parent runner (U2, KTD2, KTD3, KTD9, R6, R13).
+ * The parent runs each case in an isolated child process.
  *
- * The parent snapshots the catalog, full adjudication ledger, selected set,
- * selected baseline events, and one run nonce; spawns each case in a fresh
- * owner-only workspace and its own process group with an allowlisted
- * environment; and accepts exactly one bounded, schema-versioned envelope on
- * a parent-only result channel (a dedicated fd-3 pipe that product/provider
- * descendants do not inherit). stdout/stderr flow to capped teardown-deleted
- * diagnostic sinks and are NEVER parsed as verdicts.
+ * The parent snapshots the catalog and full adjudication ledger before executing cases.
+ * The parent never parses child stdout or stderr as verdicts.
  */
 
 import { spawn } from "node:child_process";
@@ -59,7 +54,7 @@ export const DEFAULT_DIAGNOSTIC_CAP_BYTES = 256 * 1024;
 export const DEFAULT_CASE_TIMEOUT_MS = 120_000;
 
 // ---------------------------------------------------------------------------
-// Child result envelope: one bounded, schema-versioned message per child.
+// Each child sends one bounded, schema-versioned result envelope.
 // ---------------------------------------------------------------------------
 
 export interface CaseEnvelope {
@@ -234,7 +229,7 @@ export function parseCaseEnvelope(raw: unknown): CaseEnvelope {
 }
 
 // ---------------------------------------------------------------------------
-// Selection and run snapshot (KTD9).
+// The parent snapshots selection inputs before executing cases.
 // ---------------------------------------------------------------------------
 
 export interface SelectedCase {
@@ -271,19 +266,18 @@ export interface RunSnapshot {
 export interface BuildSnapshotInput {
     catalog: IncidentCatalog;
     ledger: LedgerState;
-    /** Raw ledger lines; hashed into the full-ledger fingerprint. */
+    /** The parent hashes raw ledger lines into the full-ledger fingerprint. */
     adjudicationLines: readonly string[];
     harness: Harness;
     lanes: readonly Lane[];
-    /** Optional exact variant selection; absent means every matching variant. */
+    /** `variantIds` is optional; when absent, selection includes every matching variant. */
     variantIds?: readonly string[];
-    /** variantId -> implementation-bundle digest for every executable case. */
+    /** `implementationDigests` maps every executable variant ID to its implementation-bundle digest. */
     implementationDigests: ReadonlyMap<string, string>;
 }
 
 /**
- * Select the executable variants for one harness/lane request. Inapplicable
- * harnesses stay OUTSIDE the selected set with their documented reason; a
+ * Harnesses remain outside the selected set with an exclusion reason.
  * selected variant with a missing or stale baseline is a hard error.
  */
 export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
@@ -333,8 +327,8 @@ export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
                 continue;
             }
             const history = input.ledger.byIdentity.get(variant.id) ?? null;
-            // No later event can reverse a retirement, so a retired variant
-            // would otherwise stay scheduled and scored forever.
+            // A retirement cannot be reversed by later events.
+            // Without explicit retirement handling, retired variants remain scheduled and scored forever.
             if (history?.retired) {
                 excluded.push({
                     variantId: variant.id,
@@ -396,10 +390,7 @@ export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
                 entry.baselineEventId,
             ] as const,
     );
-    // `variantIds` is an EXACT selection, so a requested id that filtered out
-    // (typo, retired, wrong lane, wrong harness) must be a hard error. Without
-    // this, one surviving id keeps the selection nonempty and the run reports
-    // green while silently omitting the rest of the request.
+    // `variantIds` is an exact selection: every requested ID that is filtered out causes a hard error.
     if (requestedVariants) {
         const selectedIds = new Set(selected.map((entry) => entry.variantId));
         const reasonById = new Map(
@@ -431,20 +422,19 @@ export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// Case execution: fresh workspace, own process group, fd-3 result channel.
 // ---------------------------------------------------------------------------
 
 export interface RunCaseOptions {
-    /** Full argv of the child bootstrap (fake children in tests). */
+    /** Tests may replace the child bootstrap with a fake argv. */
     argv: string[];
     timeoutMs: number;
-    /** Where the fresh case workspace is created. */
+    /* */
     workspaceParentDir: string;
-    /** Parent environment the allowlist filters (default process.env). */
+    /** `parentEnv` is the environment the allowlist filters; it defaults to `process.env`. */
     baseEnv?: Record<string, string | undefined>;
-    /** Static case-specific configuration merged after the allowlist. */
+    /** The parent merges static case-specific configuration after applying the allowlist. */
     extraEnv?: Record<string, string>;
-    /** Provider endpoints exported to the child; each MUST be loopback. */
+    /** The parent exports only loopback provider endpoints to the child. */
     providerEndpoints?: Record<string, string>;
     diagnosticCapBytes?: number;
 }
@@ -474,13 +464,12 @@ function sleep(ms: number): Promise<void> {
     return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
 
-/** SIGKILL the case's process group, then join: poll until the group is
- *  empty so no descendant can write a late marker or retain a lock. */
+/** The parent sends SIGKILL to the case process group, then polls until the group is empty.
+ * The parent waits for an empty process group so descendants cannot write late markers or retain locks. */
 async function killAndJoinProcessGroup(pid: number): Promise<void> {
     try {
         process.kill(-pid, "SIGKILL");
     } catch {
-        // Group already gone.
     }
     const deadline = Date.now() + 2_000;
     for (;;) {
@@ -522,7 +511,7 @@ function spawnCaseProcess(
             rejectOutcome(new Error("case argv must name a command"));
             return;
         }
-        // detached => own process group so termination covers descendants.
+        // Setting `detached` creates a process group, so termination covers descendants.
         const child = spawn(command, args, {
             cwd,
             env,
@@ -574,7 +563,7 @@ function spawnCaseProcess(
                 if (child.pid !== undefined)
                     process.kill(-child.pid, "SIGKILL");
             } catch {
-                // Child exited between the deadline and the kill.
+                // `process.kill` may fail if the child exits after the deadline.
             }
         }, timeoutMs);
 
@@ -584,7 +573,7 @@ function spawnCaseProcess(
             clearTimeout(timer);
             if (child.pid !== undefined)
                 await killAndJoinProcessGroup(child.pid);
-            // Drain buffered pipe data; the group is dead, so this is bounded.
+            // The parent drains buffered pipe data after the process group is empty, so draining is bounded.
             await Promise.race([
                 Promise.all([
                     streamDone(channel),
@@ -639,8 +628,8 @@ function unhealthyResult(
     };
 }
 
-/** Structurally complete `unavailable` fact for an applicable selected case
- *  whose prerequisite is missing — published, never scored (R6). */
+/** A selected case with a missing prerequisite produces a complete, unscored `unavailable` result.
+ * */
 export function unavailableCaseResult(
     selected: SelectedCase,
 ): IncidentCaseResult {
@@ -653,7 +642,7 @@ function sameCheckSet(a: readonly string[], b: readonly string[]): boolean {
     return b.every((id) => set.has(id));
 }
 
-/** Classify one accepted envelope against the run snapshot (KTD8, KTD9). */
+/* */
 function classifyEnvelope(
     snapshot: RunSnapshot,
     selected: SelectedCase,
@@ -733,8 +722,7 @@ function classifyOutcome(
     }
     const text = outcome.envelopeBytes.toString("utf8");
     const lines = text.split("\n").filter((line) => line.trim().length > 0);
-    // A child that exits without an envelope crashed, whatever it printed to
-    // stdout — forged stdout success is never parsed as a verdict.
+    // The parent treats a child that exits without an envelope as crashed and never parses stdout as a verdict.
     if (lines.length === 0)
         return unhealthyResult(selected, "crash", "exited_without_envelope");
     if (lines.length > 1)
@@ -774,10 +762,7 @@ const ISOLATION_ENV_KEYS = new Set([
     "USERPROFILE",
     "HOMEDRIVE",
     "HOMEPATH",
-    // `buildCaseEnv` relocates this into the case-owned home precisely so a real
-    // one's `credentials.toml` never reaches a child. `extraEnv` is spread AFTER
-    // that relocation, so leaving it out here would let a caller hand the
-    // developer's Cargo directory straight back.
+    // `buildCaseEnv` sets `CARGO_HOME` to the workspace before applying `extraEnv`; callers must not restore the developer's `CARGO_HOME`.
     "CARGO_HOME",
     "RUSTUP_HOME",
 ]);
@@ -797,13 +782,7 @@ export function assertSafeExtraEnv(extraEnv: Record<string, string>): void {
 }
 
 /**
- * Endpoint variables a case may repoint at its own loopback stub. Names are
- * allowlisted by shape, not merely checked for a loopback value: this map is
- * spread into the relocated child environment, so an unconstrained name can
- * carry a perfectly valid loopback URL and still overwrite an isolation
- * variable (`HOME`) or restore behavior the isolation layer strips
- * (`HTTPS_PROXY`). The key guard runs as well, so a name that matches the
- * shape but collides with a stripped variable is still refused.
+ * The endpoint allowlist permits only approved endpoint-variable names and rejects names that collide with stripped variables; otherwise merged loopback URLs could overwrite `HOME` or restore stripped `HTTPS_PROXY`.
  */
 const PROVIDER_ENDPOINT_NAME_RE = /^MC_E2E_[A-Z0-9_]*(?:URL|ENDPOINT)$/;
 
@@ -821,9 +800,6 @@ export function assertSafeProviderEndpointNames(
 }
 
 /**
- * Run one selected case in full isolation and return its terminal result
- * plus a numeric diagnostics summary (counters only — no output bytes). The
- * workspace and every diagnostic sink are deleted before this returns.
  */
 export async function runCaseInIsolation(
     snapshot: RunSnapshot,
@@ -882,8 +858,8 @@ export async function runCaseInIsolation(
     };
 }
 
-/** Execute every selected case (sequentially — cases own real stores and
- *  process groups) and build the structurally complete report. */
+/** The parent executes selected cases sequentially because cases own real stores and process groups, then builds a structurally complete report.
+ * */
 export async function runIncidentPool(
     snapshot: RunSnapshot,
     runCase: (selected: SelectedCase) => Promise<IncidentCaseResult>,

@@ -26,7 +26,7 @@ afterEach(() => {
 });
 
 describe("OMP binary discovery", () => {
-    /** A real OMP package root plus a fake `bun` on PATH; HOME has no OMP. */
+    /* */
     function makePackageRoot(): { root: string; binDir: string } {
         const root = mkdtempSync(join(tmpdir(), "mc-omp-package-"));
         roots.push(root);

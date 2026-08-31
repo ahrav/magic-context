@@ -77,7 +77,6 @@ describe("auto-search-runner", () => {
                 options: baseOptions,
             });
 
-            // Three passes on the same user message id → exactly one search call.
             expect(spy).toHaveBeenCalledTimes(1);
         } finally {
             spy.mockRestore();
@@ -226,7 +225,6 @@ describe("auto-search-runner", () => {
     });
 
     test("timeout path: returns without hanging transform and does NOT inject a hint", async () => {
-        // Hanging search: never resolves.
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
             () => new Promise(() => {}) as unknown as ReturnType<typeof searchModule.unifiedSearch>,
         );
@@ -249,16 +247,13 @@ describe("auto-search-runner", () => {
             const elapsed = Date.now() - started;
 
             expect(winner).toBe("done");
-            // Must complete within the 3s AUTO_SEARCH_TIMEOUT_MS + some slack.
+            // runAutoSearchHint must complete within 4,000 ms.
             expect(elapsed).toBeLessThan(4_000);
             // Timeout must not inject a hint into the user message.
             expect(findUserPromptText(messages[0])).not.toContain("<ctx-search-hint>");
 
-            // Timeout is RETRYABLE: it does NOT persist a permanent no-hint
-            // decision, so a later pass (with the user message still at the tail)
-            // re-attempts the search rather than being suppressed forever. The
-            // live-tail gate (user message must be the last element) is what bounds
-            // re-search to new-turn passes, not a cached no-hint decision.
+            // A timeout does not persist a no-hint decision, so a later live-tail pass retries the search.
+            // The live-tail gate searches only when the user message is the last element.
             await runAutoSearchHint({
                 sessionId: "s1",
                 db,
@@ -281,11 +276,8 @@ describe("auto-search-runner", () => {
             },
         );
         try {
-            // Note: <system-reminder> content is DROPPED entirely (depth-aware
-            // parser — content is plugin/host noise, never user data).
-            // Generic paired tags like <instruction> have their MARKUP stripped
-            // but their TEXT CONTENT preserved (see the generic-XML test below)
-            // because pasted user content in arbitrary tags can carry signal.
+            // `<system-reminder>` content is dropped entirely because it is plugin or host noise, never user data.
+            // Generic paired tags like `<instruction>` have their markup stripped but preserve text content because arbitrary tagged user content can carry signal.
             const rawText = [
                 "§12345§ <!-- +5m -->",
                 "<system-reminder>CONTEXT REMINDER — 42%</system-reminder>",
@@ -303,10 +295,8 @@ describe("auto-search-runner", () => {
             expect(capturedPrompt).toBe(
                 "this is the actual user prompt text that should be embedded",
             );
-            // Plugin-internal markers are gone.
             expect(capturedPrompt).not.toContain("§");
             expect(capturedPrompt).not.toContain("<!--");
-            // system-reminder block and its content are gone.
             expect(capturedPrompt).not.toContain("<system-reminder>");
             expect(capturedPrompt).not.toContain("CONTEXT REMINDER");
         } finally {
@@ -315,17 +305,9 @@ describe("auto-search-runner", () => {
     });
 
     /**
-     * Regression for the nested-system-reminder leak observed in production.
      *
-     * Live LMStudio embedding logs showed the orphan tail
-     * `Please address this message and continue with your tasks.\n</system-reminder>`
-     * arriving as the embedded query. Root cause: the previous non-greedy regex
-     * matched from the OUTER open tag to the FIRST close tag (which was the
-     * INNER one), leaving the outer close tag and the text between the inner
-     * close and outer close as the "user prompt".
      *
-     * The depth-aware parser must drop ALL nested system-reminder content,
-     * keeping only text outside every level.
+     * A depth-aware parser drops nested system-reminder content and retains only text outside every reminder level.
      */
     test("strips nested system-reminders without leaking the outer reminder's tail or close tag", async () => {
         let capturedPrompt = "";
@@ -336,9 +318,6 @@ describe("auto-search-runner", () => {
             },
         );
         try {
-            // Mirrors the real-world structure: outer reminder wrapping an
-            // inner reminder whose content is a background-task notification,
-            // followed by the outer reminder's "Please address..." tail.
             const rawText = [
                 "actual user typed text before the noise",
                 "<system-reminder>",
@@ -361,9 +340,6 @@ describe("auto-search-runner", () => {
                 options: baseOptions,
             });
 
-            // Both the inner reminder content AND the outer-reminder tail
-            // ("Please address this message...") must be dropped. Only text
-            // outside every reminder level survives.
             expect(capturedPrompt).not.toContain("Please address this message");
             expect(capturedPrompt).not.toContain("BACKGROUND TASK");
             expect(capturedPrompt).not.toContain("</system-reminder>");
@@ -384,9 +360,7 @@ describe("auto-search-runner", () => {
             },
         );
         try {
-            // Malformed input: close tag with no matching open tag. The
-            // depth-aware parser must drop it silently rather than leaving
-            // it as embedded text.
+            // Unmatched closing `</system-reminder>` tags remain user text.
             const rawText =
                 "real user prompt</system-reminder> with a leftover close tag from a truncated parent";
             const messages: MessageLike[] = [makeUserMsg("u-orphan", rawText)];
@@ -440,11 +414,7 @@ describe("auto-search-runner", () => {
             },
         );
         try {
-            // Mix of plugin-known tags (instruction, ctx-search-hint),
-            // plugin-unknown tags (custom-tag, deferred_notes), pasted code
-            // markup (Component, props), comments with non-temporal content,
-            // and self-closing tags. The generic stripper must remove all
-            // tags while preserving any text between paired tags as data the
+            // The parser preserves text between non-plugin paired tags because pasted user content can carry signal.
             // user typed.
             const rawText = [
                 "<!-- arbitrary comment with note -->",
@@ -463,19 +433,17 @@ describe("auto-search-runner", () => {
                 options: baseOptions,
             });
 
-            // All markup is gone…
             expect(capturedPrompt).not.toContain("<");
             expect(capturedPrompt).not.toContain(">");
             expect(capturedPrompt).not.toContain("<!--");
             expect(capturedPrompt).not.toContain("arbitrary comment");
             expect(capturedPrompt).not.toContain("deferred_notes");
 
-            // Plugin-owned blocks and their content are excluded from
+            // The embedding query excludes plugin-owned blocks because they are not user-provided search signal.
             // embeddings.
             expect(capturedPrompt).not.toContain("You have 7 deferred notes");
 
-            // Preserve text between non-plugin paired tags because pasted
-            // code and quoted logs can contain embedding-relevant text.
+            // The parser preserves text between non-plugin paired tags because pasted code and quoted logs can be embedding-relevant.
             expect(capturedPrompt).toContain("data the user wants embedded");
             expect(capturedPrompt).toContain("real user question about");
             expect(capturedPrompt).toContain("usage");
@@ -540,13 +508,10 @@ describe("auto-search-runner", () => {
                 options: baseOptions,
             });
 
-            // Existing augmentation block present → suppressed → no search call.
-            // This is the regression for the dead isSuppressedContext bug: the
-            // check used to run on post-stripped text (where the tag is already
-            // gone) and would never suppress. Now it runs on raw parts.
+            // Suppression checks must inspect raw parts because stripped text no longer contains augmentation tags.
             expect(spy).toHaveBeenCalledTimes(0);
 
-            // Second pass on same message still doesn't search — skip is cached.
+            // The cache records the no-search decision by message ID to prevent repeated searches on later passes.
             await runAutoSearchHint({
                 sessionId: "s1",
                 db,
@@ -564,7 +529,7 @@ describe("auto-search-runner", () => {
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
             (_db, _s, _p, _prompt, options) => {
                 capturedSignal = (options as { signal?: AbortSignal } | undefined)?.signal;
-                // Hang forever — simulates a stuck embedding fetch.
+                // The mocked search never resolves to simulate a stuck request.
                 return new Promise(() => {}) as unknown as ReturnType<
                     typeof searchModule.unifiedSearch
                 >;
@@ -583,7 +548,6 @@ describe("auto-search-runner", () => {
             });
 
             expect(capturedSignal).toBeDefined();
-            // After the 3s timeout fires, the controller is aborted.
             expect(capturedSignal?.aborted).toBe(true);
         } finally {
             spy.mockRestore();
@@ -608,7 +572,7 @@ describe("auto-search-runner", () => {
                 options: baseOptions,
             });
 
-            // Never calls search for too-short prompts, and caches the skip.
+            // The system skips too-short prompts and caches the skip.
             expect(spy).toHaveBeenCalledTimes(0);
         } finally {
             spy.mockRestore();
@@ -618,9 +582,7 @@ describe("auto-search-runner", () => {
     test("skips ignored plugin-internal messages — does not embed announcements/warnings", async () => {
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
         try {
-            // Mimic the startup announcement (or any sendIgnoredMessage payload) —
-            // text part with `ignored: true`. These are persisted as ordinary
-            // user-role messages but must NEVER reach the embedding endpoint.
+            // Ignored user-role messages must not reach the embedding endpoint.
             const announcement = {
                 info: { id: "u_announcement", role: "user" },
                 parts: [
@@ -640,7 +602,7 @@ describe("auto-search-runner", () => {
                 options: baseOptions,
             });
 
-            // No meaningful user message → no search call → no embedding hit.
+            // The system skips search and embedding when no meaningful user message exists.
             expect(spy).toHaveBeenCalledTimes(0);
         } finally {
             spy.mockRestore();
@@ -656,10 +618,7 @@ describe("auto-search-runner", () => {
             },
         );
         try {
-            // Realistic shape: an OpenCode user message can carry MULTIPLE parts.
-            // If an upstream extension ever attaches an ignored notification part
-            // alongside the real prompt, the embedded query must contain only the
-            // real prompt — the ignored part must be excluded from `collectUserPromptParts`.
+            // The embedding query excludes ignored parts so they cannot contribute to the embedding query.
             const mixed = {
                 info: { id: "u_mixed", role: "user" },
                 parts: [
@@ -685,9 +644,7 @@ describe("auto-search-runner", () => {
 
             expect(spy).toHaveBeenCalledTimes(1);
             expect(capturedQuery).toBeDefined();
-            // The real prompt is in the embedded query…
             expect(capturedQuery ?? "").toContain("historian decides when to run");
-            // …and the ignored announcement is NOT.
             expect(capturedQuery ?? "").not.toContain("Magic Context");
             expect(capturedQuery ?? "").not.toContain("announcement bullet");
         } finally {
@@ -696,9 +653,6 @@ describe("auto-search-runner", () => {
     });
 
     test("fresh hints record no claim fragments", async () => {
-        // R12: while no retrieval projection exists, a fresh hint decision
-        // must not bind claim fragments even if a memory-shaped result leaks
-        // into the delivered set.
         const content = "the historian runs on overflow";
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
             async () =>

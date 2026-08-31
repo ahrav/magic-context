@@ -1,9 +1,8 @@
-//! Host-owned connection-file schema and secure discovery.
 //!
-//! Reads stay anchored to open directory and file descriptors. The path is
-//! traversed without following links, the owner-only regular file is bounded
-//! before JSON parsing, and a canonical-name replacement during the read is
-//! rejected. Connection key bytes never appear in formatting or errors.
+//! Reads remain anchored to open directory and file descriptors.
+//! Traversal never follows links.
+//! Reads reject canonical-name replacement.
+//! Connection key bytes never appear in formatting or errors.
 
 use std::{
     error::Error,
@@ -23,23 +22,17 @@ use crate::{
     wire::PROTOCOL_VERSION,
 };
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const MIN_KEY_LEN: usize = 32;
 pub const KEY_LEN: usize = 32;
 pub const DAEMON_ID_LEN: usize = 16;
 pub const MAX_CONNECTION_FILE_LEN: usize = 65_536;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Endpoint {
-    pub host: String,
-    pub port: u16,
-}
-
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     pub schema: u32,
     pub wire_version: u8,
-    pub endpoints: Vec<Endpoint>,
+    pub setup_socket: String,
     pub key: Vec<u8>,
     pub daemon_id: [u8; DAEMON_ID_LEN],
     pub pid: u32,
@@ -51,7 +44,7 @@ impl fmt::Debug for ConnectionInfo {
         f.debug_struct("ConnectionInfo")
             .field("schema", &self.schema)
             .field("wire_version", &self.wire_version)
-            .field("endpoints", &self.endpoints)
+            .field("setup_socket", &self.setup_socket)
             .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
             .field("daemon_id", &self.daemon_id)
             .field("pid", &self.pid)
@@ -74,12 +67,8 @@ impl ConnectionInfo {
                 supported: PROTOCOL_VERSION,
             });
         }
-        let endpoint = self
-            .endpoints
-            .first()
-            .ok_or(ConnectionFileError::Invalid("missing endpoint"))?;
-        if endpoint.host != "127.0.0.1" || endpoint.port == 0 {
-            return Err(ConnectionFileError::Invalid("invalid loopback endpoint"));
+        if self.setup_socket.is_empty() || !Path::new(&self.setup_socket).is_absolute() {
+            return Err(ConnectionFileError::Invalid("invalid setup socket path"));
         }
         if self.key.len() != KEY_LEN {
             return Err(ConnectionFileError::InvalidKeyLength {
@@ -187,8 +176,6 @@ impl Error for ConnectionFileError {
     }
 }
 
-/// Reads one secure connection-file snapshot. Validation completes before a
-/// caller can use its endpoint, so invalid versions never reach a dial.
 pub fn read_for_client(path: impl AsRef<Path>) -> Result<ConnectionInfo, ConnectionFileError> {
     let path = path.as_ref();
     let (parent, name) = open_parent(path)?;
@@ -243,11 +230,6 @@ fn open_parent(path: &Path) -> Result<(OwnedFd, OsString), ConnectionFileError> 
         .ok_or_else(|| ConnectionFileError::InvalidPath {
             path: path.to_path_buf(),
         })?;
-    // Anchor open, ancestor-safety proof, and component classification are shared
-    // with `instance::secure_runtime_dir`. The walks themselves are not: that one
-    // creates and tightens the host's own runtime directory, while this one is
-    // read-only discovery. Only the hardening rules are common, and those are the
-    // part that must never drift.
     let mut current = crate::instance::open_safe_anchor(path)
         .map_err(|source| io_error("open_anchor", path, source.into()))?
         .ok_or_else(|| ConnectionFileError::Insecure {
@@ -281,10 +263,6 @@ fn validate_directory(
 ) -> Result<(), ConnectionFileError> {
     let stat =
         rustix::fs::fstat(fd).map_err(|source| io_error("fstat_parent", path, source.into()))?;
-    // `mode_bits` and not `stat.st_mode`: `st_mode` is `u16` on Darwin and `u32`
-    // on Linux, so mixing it with the `u32` type constants compiles on one target
-    // and not the other. Every other mode check in this crate already goes
-    // through that helper.
     let mode = mode_bits(&stat);
     let directory = (mode & S_IFMT) == S_IFDIR;
     let private = stat.st_uid == rustix::process::geteuid().as_raw() && mode & 0o077 == 0;
@@ -301,12 +279,8 @@ fn open_file(
     name: &OsString,
     path: &Path,
 ) -> Result<OwnedFd, ConnectionFileError> {
-    // `NONBLOCK` so a special file reaches metadata validation instead of
-    // stalling here: opening a FIFO for reading blocks until a writer appears,
-    // which is before `checked_stat` gets to reject it as non-regular — so the
-    // fail-closed contract never runs and the caller hangs. It cannot leak into
-    // the read: `checked_stat` proves `S_IFREG` first, and a regular file never
-    // reports `EAGAIN`. The TypeScript reader passes the same flag.
+    // Opening a FIFO for reading blocks until a writer appears.
+    // `checked_stat` cannot reject a FIFO until `open` returns.
     openat(
         parent,
         name,
@@ -348,11 +322,8 @@ fn io_error(op: &'static str, path: &Path, source: io::Error) -> ConnectionFileE
 mod tests {
     use super::*;
 
-    /// `st_mode` is `u16` on Darwin and `u32` on Linux, so mode arithmetic against
-    /// this crate's `u32` type constants compiles on one target and not the other.
-    /// `mode_bits` is the cfg-gated widening that makes it portable, and reading
-    /// `st_mode` directly bypassed it — a break no Linux build could catch, which
-    /// is why it reached CI as a macOS-only failure.
+    /// `mode_bits` widens `st_mode` to match this crate's `u32` mode constants on Darwin and Linux.
+    /// `mode_bits` widens `st_mode` to match this crate's `u32` mode constants on Darwin and Linux.
     #[test]
     fn mode_arithmetic_goes_through_the_portable_accessor() {
         for source in [
@@ -364,10 +335,7 @@ mod tests {
                 .next()
                 .expect("production source");
             for (number, line) in production.lines().enumerate() {
-                // Prose may name the field while explaining why not to use it.
                 let code = line.split("//").next().unwrap_or("");
-                // The accessor's own two cfg branches are the one place that may
-                // touch the field.
                 if code.contains("u32::from(stat.st_mode)") || code.trim() == "stat.st_mode" {
                     continue;
                 }
@@ -385,10 +353,7 @@ mod tests {
         ConnectionInfo {
             schema: SCHEMA_VERSION,
             wire_version: PROTOCOL_VERSION,
-            endpoints: vec![Endpoint {
-                host: "127.0.0.1".to_owned(),
-                port: 1,
-            }],
+            setup_socket: "/tmp/mc-host.sock".to_owned(),
             key: vec![7; KEY_LEN],
             daemon_id: [8; DAEMON_ID_LEN],
             pid: 9,
@@ -396,14 +361,11 @@ mod tests {
         }
     }
 
-    /// A FIFO at the configured path must be rejected, not waited on. Without
-    /// `NONBLOCK` the open itself parks until a writer appears, so this call
-    /// never returns and `Client::connect` hangs with it.
+    /// A FIFO at the configured path must be rejected rather than waited on.
+    /// `NONBLOCK` lets metadata validation reject a FIFO before `open` blocks.
     ///
-    /// The scratch directory is chmodded to owner-only on purpose: `open_parent`
-    /// requires a private leaf parent, so a default-mode temp directory is
-    /// rejected before `open_file` runs and the test would pass without ever
-    /// reaching the open under test.
+    /// `open_parent` rejects a default-mode temp directory before `open_file` runs.
+    /// `open_parent` rejects a group- or world-writable leaf parent.
     #[test]
     fn a_fifo_is_rejected_rather_than_blocking_the_open() {
         use std::os::unix::fs::PermissionsExt;
@@ -414,12 +376,6 @@ mod tests {
             .expect("owner-only scratch dir");
         let path = dir.join("subc-connection.json");
         let _ = std::fs::remove_file(&path);
-        // The POSIX `mkfifo` utility, not rustix: rustix gates both `mknodat` and
-        // `mkfifoat` away from Apple targets, and this crate is
-        // `deny(unsafe_code)`, so calling `mkfifo(2)` directly is not available
-        // either. The rejection matters just as much on macOS, so the test stays
-        // compiled on every platform rather than being cfg'd out on the one whose
-        // absence let a build break reach CI unnoticed.
         let made = std::process::Command::new("mkfifo")
             .arg(&path)
             .status()
@@ -429,9 +385,7 @@ mod tests {
             .expect("owner-only fifo");
 
         // No writer is ever opened, so a blocking open can never complete.
-        // Bounded on a worker thread rather than called directly: a regression
-        // hangs instead of returning, and this turns that into a failure rather
-        // than a wedged suite.
+        // A worker thread lets the test fail on a blocking FIFO open without wedging the suite.
         let (tx, rx) = std::sync::mpsc::channel();
         let probe = path.clone();
         std::thread::spawn(move || {

@@ -1,25 +1,16 @@
 /**
- * Versioned timing contract (U4: R55-R57, KTD8/KTD10).
+ * Timing contract.
  *
- * Two independent concerns, deliberately separated:
  *
- * 1. Percentiles. ONE versioned nearest-rank rule computes p50/p95 from
- *    retained raw samples; summaries always carry their samples so any
- *    aggregate can be recomputed from raw evidence (R60, KTD10).
+ * `LatencySummary` retains raw samples so callers can recompute percentiles.
  *
- * 2. Trace accounting. Report-facing validation over U1's
- *    `analyzeSearchTrace`: the temporal-conservation invariant (union of
- *    in-root intervals + uncovered root time = root wall time) is validated
- *    separately from containment exclusives and the dependency critical
- *    path, and summed inclusive stage durations are NEVER treated as
- *    elapsed time (R56). Invalid interval graphs — parent cycles, unknown
- *    parents, duplicate span ids, children outside their parent, spans
- *    outside the root, negative durations, missing/duplicate roots — reject
- *    deterministically before any number is reported.
+ * `coveredMs + uncoveredMs` equals `rootDurationMs`.
+ * Trace validation enforces `coveredMs + uncoveredMs = rootDurationMs`.
+ * Trace validation checks containment exclusives and the dependency critical path independently of temporal conservation.
  *
- * Work evidence (R57): decoded vector bytes are summed from exact per-span
- * BLOB/buffer byte counters; fixture index-build time is carried as a
- * separate field and never folded into query latency.
+ * `decodedVectorBytes` sums exact decoded BLOB and vector-buffer bytes across spans.
+ * `indexBuildMs` records fixture index-build time separately from query latency.
+ * Query latency excludes fixture index-build time.
  */
 
 import {
@@ -34,9 +25,6 @@ export const TIMING_POLICY_VERSION = "retrieval-timing-policy/v1";
 export class TimingError extends Error {}
 
 /**
- * The one versioned percentile rule: nearest-rank over a sorted ascending
- * copy, rank = ceil(p/100 * n), one-based. No interpolation, so a reported
- * percentile is always an actually observed sample.
  */
 export function nearestRankPercentile(samples: readonly number[], percentile: number): number {
     if (samples.length === 0) {
@@ -59,7 +47,7 @@ export interface LatencySummary {
     sampleCount: number;
     p50Ms: number;
     p95Ms: number;
-    /** Raw samples retained in observation order (KTD10, R60). */
+    /* */
     samplesMs: readonly number[];
 }
 
@@ -74,49 +62,47 @@ export function summarizeLatency(samplesMs: readonly number[]): LatencySummary {
 }
 
 // ---------------------------------------------------------------------------
-// Report-facing trace accounting.
 // ---------------------------------------------------------------------------
 
 export interface WorkEvidence {
-    /** Exact decoded BLOB/vector-buffer bytes summed across spans (R57). */
+    /** `decodedVectorBytes` sums exact decoded BLOB and vector-buffer bytes across spans. */
     decodedVectorBytes: number;
-    /** Warm cache vector-buffer bytes touched across spans. */
+    /** `cachedVectorBytes` counts warm-cache vector-buffer bytes touched across spans. */
     cachedVectorBytes: number;
     vectorCount: number;
-    /** Fixture index-build time; separate evidence, never query latency. */
+    /** `indexBuildMs` records fixture index-build time separately from query latency. */
     indexBuildMs: number | null;
 }
 
 export interface TraceTimingEvidence {
     timingPolicyVersion: typeof TIMING_POLICY_VERSION;
-    /** Root wall time — the ONLY elapsed-time figure (R56). */
+    /** `rootDurationMs` measures elapsed time for the root trace. */
     rootDurationMs: number;
-    /** Temporal union of in-root observed intervals. */
+    /** `coveredMs` measures the temporal union of observed intervals within the root. */
     coveredMs: number;
-    /** Uninstrumented root time. Conservation: covered + uncovered = root. */
+    /** `uncoveredMs` measures uninstrumented root time, and `coveredMs + uncoveredMs` equals `rootDurationMs`. */
     uncoveredMs: number;
-    /** Sum of clipped inclusive child durations. May exceed rootDurationMs;
-     *  a diagnostic only, never elapsed time. */
+    /** The clipped inclusive-child-duration sum may exceed `rootDurationMs` and is diagnostic only.
+     * */
     inclusiveSumMs: number;
     overlapMs: number;
-    /** Containment exclusives: per-span duration minus its direct children's
-     *  temporal union. Separate diagnostic from conservation. */
+    /** A containment exclusive equals a span's duration minus the temporal union of its direct children.
+     * Containment exclusives diagnose a property separate from temporal conservation. */
     exclusive: readonly {
         spanId: number;
         stage: SearchTraceStage;
         lane: SearchTraceLane;
         exclusiveMs: number;
     }[];
-    /** Dependency critical path: separate diagnostic, never forced to
-     *  partition wall time (KTD8). */
+    /** The dependency critical path is diagnostic; it need not partition wall time.
+     * */
     criticalPathMs: number;
     criticalPath: readonly number[];
     work: WorkEvidence;
 }
 
-/** Structural interval-graph validation beyond `analyzeSearchTrace`:
- *  duplicate ids, unknown parents, parent cycles, child-outside-parent, and
- *  non-root spans outside the root window all reject deterministically. */
+/**
+ * */
 function validateIntervalGraph(spans: readonly SearchTraceSpan[]): void {
     const byId = new Map<number, SearchTraceSpan>();
     for (const span of spans) {
@@ -151,8 +137,7 @@ function validateIntervalGraph(spans: readonly SearchTraceSpan[]): void {
             current = byId.get(current.parentId);
         }
     }
-    // Root coverage: every non-root span must lie within the root window,
-    // parented or not — a span outside the root breaks conservation.
+    // A span outside the root rejects, whether parented or not.
     if (root) {
         for (const span of spans) {
             if (span.id === root.id) continue;
@@ -164,11 +149,7 @@ function validateIntervalGraph(spans: readonly SearchTraceSpan[]): void {
 }
 
 /**
- * Validate one completed trace graph and produce report-facing timing and
- * work evidence. Delegates clock-domain, duration, single-root, and
- * dependency-cycle rejection to U1's `analyzeSearchTrace`, then enforces
- * the containment structure a report may rely on, and finally checks the
- * temporal-conservation invariant within `toleranceMs` (clock resolution).
+ * `toleranceMs` bounds the allowed temporal-conservation gap.
  */
 export function traceTimingEvidence(
     spans: readonly SearchTraceSpan[],

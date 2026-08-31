@@ -1,26 +1,20 @@
 /**
- * Todo state synthesis — synthetic todowrite injection.
+ * This module injects synthetic `todowrite` parts to expose task-list state.
  *
- * Instead of inventing a custom `<current-todos>` block (which agents would
- * need to learn to parse), we synthesize a realistic `todowrite` tool part
- * and inject it into the latest assistant message on cache-busting passes.
- * The agent reads it through their existing todowrite-tracking mental model:
- * the wire shape is identical to OpenCode's stored todowrite tool parts
- * (`{type: "tool", callID, tool: "todowrite", state: {input, output, ...}}`).
+ * The module uses a `todowrite` tool part rather than a custom block so agents can use existing task-list tracking.
+ * The code injects the synthetic part into the latest assistant message on cache-busting passes.
+ * Agents read the injected part through their existing `todowrite` tracking model.
+ * The synthetic part uses the same wire shape as stored OpenCode `todowrite` parts.
  *
  * Cache safety:
- *   - Snapshot capture (in hook-handlers.ts on tool.execute.after) writes DB
- *     only — no message mutation.
- *   - Injection happens in transform-postprocess-phase.ts AFTER tagging and
- *     AFTER applyPendingOperations, so the synthetic part never gets tagged
- *     and is invisible to ctx_reduce and heuristic cleanup.
- *   - The synthetic callID is deterministic (sha256(stateJson)) so a stable
- *     snapshot produces a stable wire shape across passes; on defer passes we
- *     re-inject the same part at the same anchor, idempotent via callID match.
+ * Snapshot capture in `hook-handlers.ts` on `tool.execute.after` writes only to the DB; it does not mutate messages.
+ * Injection in `transform-postprocess-phase.ts` runs after tagging and `applyPendingOperations`.
+ * Injection runs after `applyPendingOperations`, so tagging cannot process the synthetic part.
+ * The synthetic part is invisible to `ctx_reduce` and heuristic cleanup.
+ * A stable `stateJson` produces a stable `callID` across passes.
+ * On defer passes, injection reuses the same part at the same anchor.
+ * A matching `callID` makes reinjection idempotent.
  *
- * Wire shape verified against:
- *   - OpenCode source: ~/Work/OSS/opencode/packages/opencode/src/tool/todo.ts
- *   - Production OpenCode DB sample: part where data LIKE '%"tool":"todowrite"%'
  */
 
 import { createHash } from "node:crypto";
@@ -71,28 +65,20 @@ export const TERMINAL_STATUSES = new Set<TodoStatus>([
 ]);
 
 /**
- * The set of statuses real OpenCode `todowrite` excludes when computing the
- * tool-part `title` (e.g. "3 todos"). OpenCode counts only `completed` as
- * "done"; cancelled todos still appear in the title's active count.
+ * `title` treats only `completed` todos as done; cancelled todos remain in its active count.
  *
- * Source: ~/Work/OSS/opencode/packages/opencode/src/tool/todo.ts:47-52.
  */
 export const TITLE_DONE_STATUSES = new Set<TodoStatus>([TODO_STATUS_COMPLETED]);
 
 const SYNTHETIC_CALL_ID_PREFIX = "mc_synthetic_todo_";
 
 /**
- * Normalize a `todowrite` args.todos array into a stable JSON string.
- * Returns `null` if the input is not a valid todo array.
+ * `normalizeTodoStateJson` returns stable JSON for valid task-list arrays.
+ * `normalizeTodoStateJson` returns `null` when `todos` is not a valid work-item array.
  *
- * Some Pi users disable Magic Context's built-in `todowrite` and install a
- * third-party tool with the same name. Capture stays interoperable when that
- * tool emits Magic Context's exact todo shape, but it must fail closed for any
- * other status or priority values so bad state never reaches synthetic replay.
+ * `normalizeTodoStateJson` returns `null` for unsupported statuses and priorities.
  *
- * Used by the snapshot capture path (`hook-handlers.ts`) to produce a
- * deterministic representation that survives JSON round-tripping with
- * stable field order.
+ * `normalizeTodoStateJson` preserves field order across JSON round-trips.
  */
 export function normalizeTodoStateJson(todos: unknown): string | null {
     if (!Array.isArray(todos)) return null;
@@ -111,18 +97,7 @@ export function normalizeTodoStateJson(todos: unknown): string | null {
 }
 
 /**
- * A synthetic OpenCode tool part matching the wire shape of a real
- * `todowrite` tool result.
  *
- * NOTE — deliberate field omissions vs OpenCode `ToolPart`:
- *   - `id`, `sessionID`, `messageID`: OpenCode generates these from
- *     `Identifier.ascending(...)` for parts that originate from real tool
- *     calls and persist to the OpenCode DB. The synthetic part is
- *     transform-only (never persisted to OpenCode's DB), so these fields
- *     would be meaningless. The OpenCode wire serializer
- *     (`MessageV2.toModelMessagesEffect`) only reads `part.state.*`,
- *     `part.callID`, `part.tool`, and `part.metadata` — none of the
- *     omitted fields participate in wire serialization. Verified against
  *     ~/Work/OSS/opencode/packages/opencode/src/session/message-v2.ts:851-884.
  */
 export interface SyntheticTodoPart {
@@ -137,33 +112,27 @@ export interface SyntheticTodoPart {
         metadata: { todos: TodoItem[]; truncated: false };
         time: { start: number; end: number };
     };
-    /** Marker so other plugin code can detect synthetic parts and skip them. */
+    /** `syntheticTodoMarker` lets plugin code skip synthetic parts. */
     syntheticTodoMarker: true;
 }
 
 /**
- * Build a synthetic todowrite tool part from a normalized state JSON.
- * Returns `null` if the state is empty or all todos are terminal — in
- * those cases the agent doesn't need a reminder.
+ * The function returns `null` when the state is empty or every task-list item is terminal.
  */
 export function buildSyntheticTodoPart(stateJson: string): SyntheticTodoPart | null {
     const todos = parseTodoState(stateJson);
     if (todos === null || todos.length === 0) return null;
 
-    // Skip if every todo is terminal — agent has nothing in flight, no point reminding.
     if (todos.every((t) => TERMINAL_STATUSES.has(t.status))) return null;
 
     const callID = computeSyntheticCallId(stateJson);
-    // Match OpenCode's `${todos.length - completed.length} todos` exactly:
-    // exclude only `completed`, NOT `cancelled`. See todo.ts:47-52.
+    // The title text matches OpenCode's `${todos.length - completed.length} todos` expression.
+    // The count excludes only completed todos, not cancelled todos, per the planning-tool contract.
     const activeCount = todos.filter((t) => !TITLE_DONE_STATUSES.has(t.status)).length;
 
-    // Match OpenCode's todowrite output exactly: pretty-printed JSON of the full todos array.
-    // See ~/Work/OSS/opencode/packages/opencode/src/tool/todo.ts:46-52.
+    // The output matches OpenCode's todowrite output: pretty-printed JSON of the full todos array.
     const output = JSON.stringify(todos, null, 2);
 
-    // `time.start === time.end` is a deliberate signal that this is synthetic.
-    // OpenCode itself never produces a zero-duration tool execution.
     const ts = 0;
 
     return {
@@ -183,17 +152,8 @@ export function buildSyntheticTodoPart(stateJson: string): SyntheticTodoPart | n
 }
 
 /**
- * Compute a deterministic call_id from the snapshot JSON. Stable for stable
- * state; identical state across passes produces identical callID, which
- * gives byte-identical wire shape on both cache-busting and defer passes.
  *
- * Format chosen to clearly distinguish from real provider-generated IDs:
- *   - Anthropic: `toolu_<24 base62 chars>`
- *   - OpenAI:    `call_<random>`
- *   - Synthetic: `mc_synthetic_todo_<16 hex chars>`
  *
- * Providers do not validate callID format — they only require matching IDs
- * between tool_use and tool_result.
  */
 export function computeSyntheticCallId(stateJson: string): string {
     const hash = createHash("sha256").update(stateJson).digest("hex").slice(0, 16);
@@ -201,8 +161,7 @@ export function computeSyntheticCallId(stateJson: string): string {
 }
 
 /**
- * Detect whether a part is a synthetic todo part this module produced.
- * Used to skip synthetic parts during tagging and other tool-walk passes.
+ * Tagging and tool-walk passes skip synthetic parts.
  */
 export function isSyntheticTodoPart(part: unknown): boolean {
     if (part === null || typeof part !== "object") return false;
@@ -213,10 +172,7 @@ export function isSyntheticTodoPart(part: unknown): boolean {
         tool?: unknown;
     };
     if (p.syntheticTodoMarker === true) return true;
-    // Defensive fallback: detect by callID prefix in case the marker field
-    // gets stripped during serialization somewhere downstream. Tightened to
-    // also require the part to look like a todowrite tool part — a stray
-    // object with a synthetic-prefixed callID elsewhere should not match.
+    // Require `type === "tool"` and `tool === "todowrite"` so unrelated objects with matching `callID` prefixes do not match.
     return (
         p.type === "tool" &&
         p.tool === "todowrite" &&

@@ -9,9 +9,6 @@ import { Database } from "../../shared/sqlite";
 import { resolveIsSubagentFromOpenCodeDb } from "./resolve-subagent-fallback";
 
 /**
- * Regression tests for the subagent-detection fallback that bridges the race
- * between OpenCode creating a session and the async `session.created` event
- * reaching our handler.
  */
 describe("resolveIsSubagentFromOpenCodeDb", () => {
     let tempDir: string;
@@ -23,7 +20,6 @@ describe("resolveIsSubagentFromOpenCodeDb", () => {
         originalXdg = process.env.XDG_DATA_HOME;
         process.env.XDG_DATA_HOME = tempDir;
 
-        // Build the OpenCode DB at the path the helper resolves to.
         const dbDir = join(tempDir, "opencode");
         mkdirSync(dbDir, { recursive: true });
         openCodeDb = new Database(join(dbDir, "opencode.db"));
@@ -54,7 +50,7 @@ describe("resolveIsSubagentFromOpenCodeDb", () => {
         try {
             rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     });
 
@@ -81,10 +77,6 @@ describe("resolveIsSubagentFromOpenCodeDb", () => {
     });
 
     it("returns null when the session row doesn't exist yet", () => {
-        // OpenCode normally writes the session row synchronously as part of
-        // Session.create() before returning the ID, so this case should be
-        // rare. But when it happens, we must return null (not false) so
-        // callers default to primary behavior without storing a bogus flag.
         expect(resolveIsSubagentFromOpenCodeDb("ses_missing")).toBe(null);
     });
 });

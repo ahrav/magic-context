@@ -46,8 +46,6 @@ describe("Pi compaction-off mode", () => {
 			},
 		});
 		try {
-			// The first turn creates the isolated context.db. It must complete before
-			// the fixture seeds memory used by the following additive-only pass.
 			await h.sendPrompt(
 				`initialize additive Pi context ${h.ballast(40_000)}`,
 				{

@@ -41,7 +41,7 @@ afterEach(() => {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
         } catch {
-            /* Ignore EBUSY on Windows */
+            /* */
         }
     }
     tempDirs.length = 0;
@@ -55,11 +55,7 @@ function useTempDataHome(prefix: string): void {
 function createTestTransform(sessionId: string) {
     const shouldExecute = mock<Scheduler["shouldExecute"]>(() => "defer");
     const scheduler: Scheduler = { shouldExecute };
-    // Force providerID="anthropic" so the merged-assistants strip workaround
-    // runs in this test fixture (the workaround is gated on canonical
-    // Anthropic to prevent Kimi/Moonshot rejections; this test specifically
-    // validates Opus 4.7's position-0 thinking invariant interaction with
-    // pruning, so it needs the gate to be open).
+    // Canonical Anthropic exercises the merged-assistant strip required for Opus 4.7 position-0 thinking.
     const liveModelBySession = new Map<string, { providerID: string; modelID: string }>([
         [sessionId, { providerID: "anthropic", modelID: "claude-opus-4-7" }],
     ]);
@@ -284,8 +280,8 @@ describe("createTransform index staleness regressions", () => {
         const watermarkTag = Math.max(...tags.map((tag) => tag.tagNumber));
         updateTagStatus(db, sessionId, watermarkTag, "dropped");
 
-        // The processed-image strip first-fires only on a cache-busting (execute)
-        // pass, which freezes its id; afterwards it replays on every defer pass.
+        // The processed-image strip assigns its ID only during execute passes.
+        // The processed-image strip replays with that ID on defer passes.
         shouldExecute.mockImplementationOnce(() => "execute");
         const bustPass = buildMessages();
         await transform({}, { messages: bustPass });
@@ -298,9 +294,7 @@ describe("createTransform index staleness regressions", () => {
         const filePartAfterReplay = firstDeferPass[0].parts[1];
         const toolPartAfterReplay = firstDeferPass[2].parts[0] as ToolPart;
         expect(filePartAfterReplay).toEqual({ type: "text", text: "" });
-        // Errored-tool truncation was REMOVED — the error text must be left
-        // untouched and byte-identical across passes (its watermark-gated
-        // first-truncation on an arbitrary pass was a cache-bust source).
+        // Errored tool output remains byte-identical across passes.
         expect(toolPartAfterReplay.state.error).toBe(longError);
 
         const secondDeferPass = buildMessages();
@@ -403,19 +397,11 @@ describe("createTransform index staleness regressions", () => {
 
         await transform({}, { messages: secondPass });
 
-        // The tool drop removed m-assistant-call and m-tool-drop via pruneEmptyMessages, so array shifts:
-        // [0]=m-user, [1]=m-reason-a, [2]=m-reason-b, [3]=m-drop
         // clearReasoningAge=2: maxTag=6, ageCutoff=4; m-reason-a (tag 2 <=4) is cleared then stripped
         expect(
             secondPass[1].parts.some((p) => (p as ThinkingPart).thinking === "reasoning a"),
         ).toBe(false);
-        // m-reason-b is now at index 2 after dropped messages were pruned — becoming the
-        // second assistant in a consecutive run with m-reason-a and m-drop. The merged-
-        // assistants workaround (stripReasoningFromMergedAssistants) strips thinking from
-        // every assistant except the first in a run to keep Opus 4.7's position-0 thinking
-        // invariant, so m-reason-b's thinking is correctly removed even though its tag 5 is
-        // above the watermark ageCutoff=4. This tests the interaction between pruning and
-        // merge-strip, not the watermark path.
+        // After pruning, m-reason-b is the second assistant in the run, so the merged-assistant strip removes its thinking despite tag 5 > ageCutoff 4.
         expect(
             secondPass[2].parts.some((p) => (p as ThinkingPart).thinking === "reasoning b"),
         ).toBe(false);
