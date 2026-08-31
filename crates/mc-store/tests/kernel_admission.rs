@@ -4766,3 +4766,81 @@ fn a_weak_own_decision_is_not_rescued_by_a_qualifying_lineage_decision() {
         0
     );
 }
+
+#[test]
+fn a_newer_own_decision_does_not_outrank_a_lineage_rejection_for_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_approval(directory.path());
+    let connection = Connection::open(directory.path().join("core.sqlite")).unwrap();
+    // The ADR is rejected at lineage scope, then records a newer own decision that
+    // qualifies on every field. Serving still withholds it, so authority must too.
+    connection
+        .execute_batch(
+            "INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'approval-a-lineage-reject',NULL,'fixture','approval',1,'explicit_user',
+                 'user_explicit','explicit_reject','approved','approved','rejected','review_only',
+                 'reject','normal',1,'fixture',1,2
+             );
+             INSERT INTO admission_decisions(
+                 admission_decision_id,subject_object_id,source_kind,source_id,source_revision,
+                 source_class,taint_class,event_kind,maturity,effective_maturity,disposition,
+                 visibility,outcome,sensitivity_class,policy_revision,reason,commit_seq,decided_at
+             ) VALUES (
+                 'approval-z-own-later','approval','fixture','approval',1,'explicit_user',
+                 'user_explicit','other','approved','approved','active','automatic','admit',
+                 'normal',1,'fixture',1,3
+             );",
+        )
+        .unwrap();
+    drop(connection);
+    let store = KernelStore::open(directory.path()).unwrap();
+    // The own row really is the newer of the two.
+    assert_eq!(
+        inspect_text(
+            directory.path(),
+            "SELECT admission_decision_id FROM admission_decisions
+             WHERE source_id='approval' ORDER BY commit_seq DESC,admission_decision_id DESC LIMIT 1"
+        ),
+        "approval-z-own-later"
+    );
+    // And serving withholds the ADR, because the lineage rejection still applies.
+    assert!(store
+        .visible_as_of(Surface::ExplicitSearch, 1)
+        .unwrap()
+        .rows
+        .iter()
+        .all(|row| row.object.object_id != "approval"));
+
+    stage(&store, "leans-on-rejected-lineage");
+    let mut approved = request("leans-on-rejected-lineage");
+    approved.source_class = Some(SourceClass::ModelInference);
+    approved.taint_class = Some(TaintClass::AssistantInference);
+    approved.event.kind = EventKind::Verify;
+    approved.event.trigger_object_id = None;
+    approved.event.approval_object_id = Some("approval".to_string());
+    store
+        .commit(intent("leans-on-rejected-lineage"), |envelope| {
+            let decision = envelope.admit_domain_candidate(
+                approved,
+                AdmissionDomainSpec {
+                    domain_id: "rejected-lineage-domain".to_string(),
+                    object_id: "rejected-lineage-object".to_string(),
+                    name: "name-leans-on-rejected-lineage".to_string(),
+                },
+            )?;
+            assert_eq!(decision.outcome.as_str(), "deny");
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(
+        inspect(
+            directory.path(),
+            "SELECT COUNT(*) FROM object_registry WHERE object_id='rejected-lineage-object'"
+        ),
+        0
+    );
+}

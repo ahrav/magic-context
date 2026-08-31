@@ -11,37 +11,7 @@ use sha2::{Digest, Sha256};
 pub const POLICY_REVISION: i64 = 1;
 #[cfg(test)]
 const REVISION_1_SOURCE_DIGEST: &str =
-    "1d42ade668d79de167644fb03e635333ace015aa7431fb19c08bffa7606e8cbc";
-
-/// The enclosing query must bind `o` to `object_registry`.
-/// Serving and approval validation must agree on which decision governs an
-/// object, or one of them honors a rejection the other ignores. `commit_bound`
-/// pins serving to a snapshot; authority checks pass an empty bound to read the
-/// latest committed decision.
-fn governing_decision_for_object_sql(commit_bound: &str) -> String {
-    let lineage = same_lineage_as_object("a");
-    format!(
-        "(
-    SELECT latest.admission_decision_id FROM (
-        SELECT a.admission_decision_id,a.commit_seq
-        FROM admission_decisions a
-        WHERE a.subject_object_id=o.object_id
-          AND {lineage}
-          AND a.commit_seq IS NOT NULL
-          {commit_bound}
-        UNION ALL
-        SELECT a.admission_decision_id,a.commit_seq
-        FROM admission_decisions a
-        WHERE a.subject_object_id IS NULL
-          AND {lineage}
-          AND a.commit_seq IS NOT NULL
-          {commit_bound}
-    ) latest
-    ORDER BY latest.commit_seq DESC,latest.admission_decision_id DESC
-    LIMIT 1
-)"
-    )
-}
+    "8e779a1442d371aae31a6a106504aca6cdcbd5fc7057aaa1fa2382f50cd5db37";
 
 // policy-digest:vocabulary-start
 macro_rules! string_enum {
@@ -436,17 +406,17 @@ struct PreparedDecision {
 /// The enclosing query must bind `o` to `object_registry`.
 /// The latest decision about the object itself. An object serves only on
 /// standing it earned, so this is a requirement, not a contribution.
-fn latest_own_decision_sql(commit_bound: &str) -> String {
-    let lineage = same_lineage_as_object("a");
+fn latest_own_decision_sql(alias: &str, commit_bound: &str) -> String {
+    let lineage = same_lineage_as_object(alias);
     format!(
         "(
-    SELECT a.admission_decision_id
-    FROM admission_decisions a
-    WHERE a.subject_object_id=o.object_id
+    SELECT {alias}.admission_decision_id
+    FROM admission_decisions {alias}
+    WHERE {alias}.subject_object_id=o.object_id
       AND {lineage}
-      AND a.commit_seq IS NOT NULL
+      AND {alias}.commit_seq IS NOT NULL
       {commit_bound}
-    ORDER BY a.commit_seq DESC,a.admission_decision_id DESC
+    ORDER BY {alias}.commit_seq DESC,{alias}.admission_decision_id DESC
     LIMIT 1
 )"
     )
@@ -456,17 +426,17 @@ fn latest_own_decision_sql(commit_bound: &str) -> String {
 /// The latest source-scoped decision for an object's lineage. A rejection here
 /// binds every object on the lineage, including one whose own later decision
 /// would otherwise serve.
-fn latest_lineage_decision_sql(commit_bound: &str) -> String {
-    let lineage = same_lineage_as_object("a");
+fn latest_lineage_decision_sql(alias: &str, commit_bound: &str) -> String {
+    let lineage = same_lineage_as_object(alias);
     format!(
         "(
-    SELECT a.admission_decision_id
-    FROM admission_decisions a
-    WHERE a.subject_object_id IS NULL
+    SELECT {alias}.admission_decision_id
+    FROM admission_decisions {alias}
+    WHERE {alias}.subject_object_id IS NULL
       AND {lineage}
-      AND a.commit_seq IS NOT NULL
+      AND {alias}.commit_seq IS NOT NULL
       {commit_bound}
-    ORDER BY a.commit_seq DESC,a.admission_decision_id DESC
+    ORDER BY {alias}.commit_seq DESC,{alias}.admission_decision_id DESC
     LIMIT 1
 )"
     )
@@ -547,44 +517,37 @@ fn approval_row_fields(alias: &str) -> String {
     )
 }
 
-/// The enclosing query must bind `o` to `object_registry`.
-/// An object earns standing only from a decision about itself. A lineage
-/// decision can restrict it, but never supply standing the object lacks, and a
-/// row that does not qualify on its own supplies none either.
-fn own_decision_qualifies_sql() -> String {
-    let fields = approval_row_fields("own");
-    let lineage = same_lineage_as_object("own");
-    format!(
-        "EXISTS (
-    SELECT 1 FROM admission_decisions own
-    WHERE own.subject_object_id=o.object_id
-      AND {lineage}
-      AND own.commit_seq IS NOT NULL
-      AND {fields}
-)"
-    )
-}
-
 /// Whether the object named by `object_column` qualifies as a live approval in its
 /// own right. Used per chain member, so it takes the id from the enclosing row
 /// rather than a bound parameter.
 fn approval_qualifies_predicate(object_column: &str) -> String {
-    let governing = governing_decision_for_object_sql("");
-    let own_decision = own_decision_qualifies_sql();
-    let governing_fields = approval_row_fields("a");
+    let own = latest_own_decision_sql("own", "");
+    let lineage = latest_lineage_decision_sql("lin", "");
+    let own_fields = approval_row_fields("a");
+    let lineage_fields = approval_row_fields("l");
     format!(
         "EXISTS(
              SELECT 1
              FROM object_registry o
              JOIN decisions d ON d.object_id=o.object_id
-             JOIN admission_decisions a ON a.admission_decision_id={governing}
+             JOIN admission_decisions a ON a.admission_decision_id={own}
              WHERE o.object_id={object_column} AND {APPROVAL_OBJECT_PREDICATE}
-               AND {governing_fields}
+               AND {own_fields}
                AND o.sensitivity_class='normal'
-               AND {own_decision}
+               AND (
+                   NOT EXISTS(
+                       SELECT 1 FROM admission_decisions l
+                       WHERE l.admission_decision_id={lineage}
+                   )
+                   OR EXISTS(
+                       SELECT 1 FROM admission_decisions l
+                       WHERE l.admission_decision_id={lineage} AND {lineage_fields}
+                   )
+               )
          )"
     )
 }
+
 // policy-digest:authority-end
 
 impl Envelope<'_> {
@@ -1956,8 +1919,8 @@ impl KernelStore {
         surface: Surface,
         requested: i64,
     ) -> Result<VisibleAsOf, KernelError> {
-        let own = latest_own_decision_sql("AND a.commit_seq<=:governing_as_of");
-        let lineage = latest_lineage_decision_sql("AND a.commit_seq<=:governing_as_of");
+        let own = latest_own_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
+        let lineage = latest_lineage_decision_sql("a", "AND a.commit_seq<=:governing_as_of");
         let (tip, rows) = self.read_snapshot(requested, |tx| {
             let mut statement = tx
                 .prepare(&format!(
