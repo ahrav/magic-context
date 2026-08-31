@@ -356,13 +356,15 @@ fn checkout_identity(repo: &gix::Repository) -> Result<String, SnapshotError> {
         .canonicalize()
         .map_err(|error| SnapshotError::Open(error.to_string()))?;
     // The digest suffix distinguishes non-UTF-8 git-dir paths that share a
-    // lossy string.
+    // lossy string, and the tag keeps the two encodings disjoint: a checkout commentlint: allow(JUDGE)
+    // whose valid path reads exactly like some lossy rendering would commentlint: allow(JUDGE)
+    // otherwise share an identity with the bytes it stands for. commentlint: allow(JUDGE)
     match git_dir.to_str() {
-        Some(utf8) => Ok(utf8.to_owned()),
+        Some(utf8) => Ok(format!("utf8:{utf8}")),
         None => {
             let raw = git_dir.as_os_str().as_encoded_bytes();
             Ok(format!(
-                "{}#x{:x}",
+                "lossy:{}#x{:x}",
                 git_dir.to_string_lossy(),
                 Sha256::digest(raw)
             ))
@@ -765,7 +767,9 @@ fn worktree_mode_tag(repo: &gix::Repository, rela_path: &BStr) -> &'static str {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 != 0 {
+        // Git reads executability from the owner bit alone, so a file that is commentlint: allow(JUDGE)
+        // group-executable only is still mode 100644 to it. commentlint: allow(JUDGE)
+        if metadata.permissions().mode() & 0o100 != 0 {
             return "exec";
         }
     }

@@ -884,3 +884,70 @@ fn shallow_boundaries_alter_the_fingerprint() {
         unshallowed.dirty_fingerprint()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn only_the_owner_bit_classifies_executability() {
+    use gix::index::entry::Flags;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(
+        &fixture.repo,
+        "main",
+        &[],
+        &[("tool.sh", "#!/bin/sh\n")],
+        "seed",
+        1,
+    );
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    // Assume-valid keeps the status walk out of it, so the mode tag is what
+    // carries the change into the key.
+    let mut index = fixture.repo.open_index().expect("index opens");
+    let position = index
+        .entry_index_by_path("tool.sh".into())
+        .expect("entry exists");
+    index.entries_mut()[position].flags |= Flags::ASSUME_VALID;
+    index
+        .write(gix::index::write::Options::default())
+        .expect("index writes");
+
+    let path = fixture.repo.workdir().unwrap().join("tool.sh");
+    let budget = EvalBudget::unbounded();
+
+    // Group-executable only: git records this as 100644.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o650)).unwrap();
+    let group_only = snapshot_checkout(dir.path(), &budget).unwrap();
+
+    // Adding the owner bit moves git's mode to 100755 with the bytes, index
+    // id, path, and status all unchanged.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let owner_too = snapshot_checkout(dir.path(), &budget).unwrap();
+
+    assert_ne!(
+        group_only.dirty_fingerprint(),
+        owner_too.dirty_fingerprint(),
+        "gaining the owner execute bit must move the key"
+    );
+}
+
+#[test]
+fn checkout_identities_tag_their_encoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = init_repo(dir.path());
+    let head = commit_snapshot(&fixture.repo, "main", &[], &[("a.txt", "a\n")], "seed", 1);
+    set_head(&fixture.repo, "main");
+    materialize(&fixture.repo, head);
+
+    let snapshot = snapshot_checkout(dir.path(), &EvalBudget::unbounded()).unwrap();
+    // A valid path carries its own namespace, so it cannot collide with the
+    // lossy rendering of a byte path that reads the same way.
+    assert!(
+        snapshot.identity().starts_with("utf8:"),
+        "{}",
+        snapshot.identity()
+    );
+}
