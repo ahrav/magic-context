@@ -127,7 +127,12 @@ impl Envelope<'_> {
     ) -> Result<DecisionEventOutcome, KernelError> {
         let decision_id = redact(decision_id);
         let spec = RedactedEvent::new(spec)?;
-        require_live_evidence(self.tx, spec.evidence_id.as_ref())?;
+        require_optional_live(
+            self.tx,
+            "evidence_meta",
+            "evidence_id",
+            spec.evidence_id.as_ref(),
+        )?;
         let object = load_live_decision_object(self.tx, &decision_id.text)?;
         let ordinal = self
             .tx
@@ -682,13 +687,6 @@ fn require_parents(
     require_optional_live(tx, "propositions", "proposition_id", proposition_id)?;
     require_optional_live(tx, "scopes", "scope_id", scope_id)?;
     require_optional_live(tx, "anchors", "anchor_id", anchor_id)?;
-    require_optional_live(tx, "evidence_meta", "evidence_id", evidence_id)
-}
-
-fn require_live_evidence(
-    tx: &Transaction<'_>,
-    evidence_id: Option<&RedactedField>,
-) -> Result<(), KernelError> {
     require_optional_live(tx, "evidence_meta", "evidence_id", evidence_id)
 }
 
